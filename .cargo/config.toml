@@ -6,7 +6,7 @@ target = "aarch64-unknown-none"
 runner = "qemu-system-aarch64 -machine virt -cpu cortex-a53 -smp 1 -m 128M -net none -device ramfb -display vnc=127.0.0.1:0 -serial mon:stdio -kernel"
 rustflags = [
     "-C", "linker=rust-lld",
-    "-C", "link-arg=-Tlinker.ld",
+    "-C", "link-arg=-Tboards/qemu-virt/linker.ld",
     "-C", "relocation-model=static",
     "-C", "link-arg=-z", "-C", "link-arg=max-page-size=4096",
 ]

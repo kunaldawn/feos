@@ -1,0 +1,9 @@
+[package]
+name = "feos-driver-pl011"
+description = "ARM PrimeCell PL011 UART driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+feos-hal = { workspace = true }

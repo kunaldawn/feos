@@ -1,0 +1,9 @@
+[package]
+name = "feos-console"
+description = "Registered text console and print macros for feos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+feos-sync = { workspace = true }

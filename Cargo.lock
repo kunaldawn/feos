@@ -3,12 +3,96 @@
 version = 4
 
 [[package]]
-name = "feos"
+name = "feos-app"
 version = "0.1.0"
 dependencies = [
+ "feos-gfx",
+ "feos-hal",
+]
+
+[[package]]
+name = "feos-apps"
+version = "0.1.0"
+dependencies = [
+ "feos-app",
+ "feos-console",
  "feos-gfx",
 ]
 
 [[package]]
+name = "feos-arch-aarch64"
+version = "0.1.0"
+dependencies = [
+ "feos-hal",
+]
+
+[[package]]
+name = "feos-board-qemu-virt"
+version = "0.1.0"
+dependencies = [
+ "feos-console",
+ "feos-driver-fw-cfg",
+ "feos-driver-pl011",
+ "feos-driver-ramfb",
+ "feos-gfx",
+ "feos-hal",
+]
+
+[[package]]
+name = "feos-console"
+version = "0.1.0"
+dependencies = [
+ "feos-sync",
+]
+
+[[package]]
+name = "feos-driver-fw-cfg"
+version = "0.1.0"
+
+[[package]]
+name = "feos-driver-pl011"
+version = "0.1.0"
+dependencies = [
+ "feos-hal",
+]
+
+[[package]]
+name = "feos-driver-ramfb"
+version = "0.1.0"
+dependencies = [
+ "feos-driver-fw-cfg",
+]
+
+[[package]]
 name = "feos-gfx"
+version = "0.1.0"
+
+[[package]]
+name = "feos-hal"
+version = "0.1.0"
+
+[[package]]
+name = "feos-kernel"
+version = "0.1.0"
+dependencies = [
+ "feos-app",
+ "feos-apps",
+ "feos-arch-aarch64",
+ "feos-board-qemu-virt",
+ "feos-console",
+ "feos-shell",
+]
+
+[[package]]
+name = "feos-shell"
+version = "0.1.0"
+dependencies = [
+ "feos-app",
+ "feos-apps",
+ "feos-console",
+ "feos-gfx",
+]
+
+[[package]]
+name = "feos-sync"
 version = "0.1.0"

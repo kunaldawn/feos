@@ -1,0 +1,10 @@
+[package]
+name = "feos-app"
+description = "Application interface (App trait and runtime context) for feos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+feos-gfx = { workspace = true }
+feos-hal = { workspace = true }

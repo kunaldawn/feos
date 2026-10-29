@@ -1,8 +1,0 @@
-[package]
-name = "feos-gfx"
-version = "0.1.0"
-edition = "2021"
-description = "A small dependency-free 2D graphics library for the feos kernel"
-license = "MIT OR Apache-2.0"
-
-[dependencies]

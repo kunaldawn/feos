@@ -1,8 +1,7 @@
 target/
-ecs-os/
-docs/
 .git/
 .gitignore
+docs/
 Dockerfile
 .dockerignore
 README.md

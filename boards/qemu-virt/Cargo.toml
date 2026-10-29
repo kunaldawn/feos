@@ -1,0 +1,14 @@
+[package]
+name = "feos-board-qemu-virt"
+description = "Board support package for the QEMU aarch64 virt machine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+feos-console = { workspace = true }
+feos-driver-fw-cfg = { workspace = true }
+feos-driver-pl011 = { workspace = true }
+feos-driver-ramfb = { workspace = true }
+feos-gfx = { workspace = true }
+feos-hal = { workspace = true }

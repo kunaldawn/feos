@@ -1,0 +1,8 @@
+[package]
+name = "feos-hal"
+description = "Hardware abstraction traits shared by feos drivers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

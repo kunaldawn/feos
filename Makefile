@@ -10,20 +10,31 @@ QEMU_FLAGS   ?= -machine virt -cpu cortex-a53 -smp 1 -m 128M -net none -device r
 # host through X11/XWayland; "vnc=0.0.0.0:0" serves the display over VNC.
 FEOS_DISPLAY ?= gtk
 
-.PHONY: all build run clean test test-gfx docker-build docker-run docker-run-vnc docker-shell
+.PHONY: all build check run clean test test-gfx test-sync \
+        docker-build docker-run docker-run-vnc docker-shell
 
 all: build
 
+# `default-members = ["kernel"]` in the workspace manifest means this builds
+# the bootable kernel and everything it pulls in.
 build:
 	cargo build --$(PROFILE)
+
+check:
+	cargo check --workspace
 
 run: build
 	$(QEMU) $(QEMU_FLAGS) -display $(QEMU_DISPLAY) -kernel $(KERNEL)
 
-test: test-gfx
+test: test-gfx test-sync
 
+# Host-side tests. Architecture and board crates contain AArch64 assembly or
+# MMIO, so the test set is explicit rather than `--workspace`.
 test-gfx:
 	cargo test -p feos-gfx --target x86_64-unknown-linux-gnu
+
+test-sync:
+	cargo test -p feos-sync --target x86_64-unknown-linux-gnu
 
 clean:
 	cargo clean

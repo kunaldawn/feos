@@ -1,0 +1,9 @@
+[package]
+name = "feos-arch-aarch64"
+description = "AArch64 CPU primitives: boot entry, exception vectors, PSCI and the generic timer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+feos-hal = { workspace = true }

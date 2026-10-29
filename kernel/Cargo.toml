@@ -1,0 +1,21 @@
+[package]
+name = "feos-kernel"
+description = "The feos bootable kernel binary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "feos"
+path = "src/main.rs"
+# The kernel binary cannot be linked against a host test harness.
+test = false
+bench = false
+
+[dependencies]
+feos-app = { workspace = true }
+feos-apps = { workspace = true }
+feos-arch-aarch64 = { workspace = true }
+feos-board-qemu-virt = { workspace = true }
+feos-console = { workspace = true }
+feos-shell = { workspace = true }

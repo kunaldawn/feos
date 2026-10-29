@@ -1,0 +1,123 @@
+//! Registered text console and the `print!` / `println!` macros.
+//!
+//! The kernel does not assume a particular UART. A board (or any other piece
+//! of early boot code) installs a byte sink and an optional byte source with
+//! [`set_writer`] and [`set_reader`]; everything else prints through the
+//! macros and reads input with [`read_byte`].
+//!
+//! This keeps console plumbing out of drivers and lets the same kernel run on
+//! a board with a PL011, an SBI console, or a memory-backed test console.
+//!
+//! # Locking
+//!
+//! [`_print`] serializes whole formatting operations with a [`SpinLock`].
+//! Panic and exception handlers use [`_print_unlocked`], which bypasses the
+//! lock so a fault taken while the console is held can still be reported.
+
+#![no_std]
+
+use core::fmt::{self, Write};
+use core::mem::transmute;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+use feos_sync::SpinLock;
+
+/// Receives a chunk of text from the console.
+pub type WriteFn = fn(&str);
+
+/// Returns the next input byte, or `None` if the device has no data.
+pub type ReadFn = fn() -> Option<u8>;
+
+static WRITER: AtomicUsize = AtomicUsize::new(0);
+static READER: AtomicUsize = AtomicUsize::new(0);
+static PRINT_LOCK: SpinLock<()> = SpinLock::new(());
+
+/// Installs the text sink used by `print!` and `println!`.
+///
+/// The writer receives raw bytes as UTF-8 text and is responsible for any
+/// newline translation the hardware needs (the QEMU board turns `\n` into
+/// `\r\n` for the PL011).
+pub fn set_writer(writer: WriteFn) {
+    WRITER.store(writer as usize, Ordering::Release);
+}
+
+/// Installs the byte source used by [`read_byte`].
+pub fn set_reader(reader: ReadFn) {
+    READER.store(reader as usize, Ordering::Release);
+}
+
+/// Reads one byte from the registered console, if any is available.
+pub fn read_byte() -> Option<u8> {
+    let address = READER.load(Ordering::Acquire);
+    if address == 0 {
+        return None;
+    }
+
+    // SAFETY: only `set_reader` writes this atomic, and it stores a valid
+    // `ReadFn` (a plain function pointer is `usize`-sized).
+    let reader: ReadFn = unsafe { transmute::<usize, ReadFn>(address) };
+    reader()
+}
+
+fn writer() -> Option<WriteFn> {
+    let address = WRITER.load(Ordering::Acquire);
+    if address == 0 {
+        return None;
+    }
+
+    // SAFETY: only `set_writer` writes this atomic, and it stores a valid
+    // `WriteFn` (a plain function pointer is `usize`-sized).
+    Some(unsafe { transmute::<usize, WriteFn>(address) })
+}
+
+struct Sink;
+
+impl Write for Sink {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        if let Some(writer) = writer() {
+            writer(text);
+        }
+        Ok(())
+    }
+}
+
+/// Serialized console output used by the print macros.
+#[doc(hidden)]
+pub fn _print(args: fmt::Arguments) {
+    // A panic while the lock is held is handled by `_print_unlocked`, so this
+    // guard cannot deadlock the panic path.
+    let _guard = PRINT_LOCK.lock();
+    let _ = Sink.write_fmt(args);
+}
+
+/// Lock-free console output for panic and exception handlers.
+///
+/// # Safety
+/// This is safe to call from Rust, but it is only appropriate on paths that
+/// must not block. It may interleave with normal output.
+#[doc(hidden)]
+pub fn _print_unlocked(args: fmt::Arguments) {
+    let mut sink = Sink;
+    let _ = sink.write_fmt(args);
+}
+
+/// Prints to the registered console without a trailing newline.
+///
+/// Output is discarded when no writer has been installed yet.
+#[macro_export]
+macro_rules! print {
+    ($($arg:tt)*) => {
+        $crate::_print(format_args!($($arg)*))
+    };
+}
+
+/// Prints to the registered console with a trailing newline.
+#[macro_export]
+macro_rules! println {
+    () => {
+        $crate::print!("\n")
+    };
+    ($($arg:tt)*) => {
+        $crate::print!("{}\n", format_args!($($arg)*))
+    };
+}

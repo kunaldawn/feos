@@ -1,16 +1,37 @@
 [workspace]
-members = ["gfx"]
+resolver = "2"
+members = [
+    "kernel",
+    "arch/*",
+    "boards/*",
+    "drivers/*/*",
+    "libs/*",
+    "apps/*",
+]
+# `cargo build` from the repository root builds the bootable kernel. Use
+# `-p <crate>` (or `--workspace`) to build libraries, drivers and apps.
+default-members = ["kernel"]
 
-[package]
-name = "feos"
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-description = "A tiny bare-metal Rust kernel skeleton for the QEMU aarch64 virt machine"
 license = "MIT OR Apache-2.0"
 
-[dependencies]
-feos-gfx = { path = "gfx" }
+[workspace.dependencies]
+feos-app = { path = "libs/app" }
+feos-apps = { path = "apps/commands" }
+feos-arch-aarch64 = { path = "arch/aarch64" }
+feos-board-qemu-virt = { path = "boards/qemu-virt" }
+feos-console = { path = "libs/console" }
+feos-driver-fw-cfg = { path = "drivers/firmware/fw-cfg" }
+feos-driver-pl011 = { path = "drivers/serial/pl011" }
+feos-driver-ramfb = { path = "drivers/display/ramfb" }
+feos-gfx = { path = "libs/gfx" }
+feos-hal = { path = "libs/hal" }
+feos-shell = { path = "apps/shell" }
+feos-sync = { path = "libs/sync" }
 
+# A kernel cannot unwind. These profiles apply to every workspace crate.
 [profile.dev]
 panic = "abort"
 

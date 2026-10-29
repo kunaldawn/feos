@@ -1,0 +1,11 @@
+[package]
+name = "feos-apps"
+description = "Built-in feos shell applications"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+feos-app = { workspace = true }
+feos-console = { workspace = true }
+feos-gfx = { workspace = true }

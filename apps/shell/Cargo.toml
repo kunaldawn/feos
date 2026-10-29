@@ -1,0 +1,12 @@
+[package]
+name = "feos-shell"
+description = "Line-oriented serial shell for feos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+feos-app = { workspace = true }
+feos-apps = { workspace = true }
+feos-console = { workspace = true }
+feos-gfx = { workspace = true }
