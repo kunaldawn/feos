@@ -55,6 +55,54 @@ pub trait Power: Sync {
     fn system_reset(&self) -> !;
 }
 
+/// An audio output device.
+///
+/// Drivers own the DMA buffers and present a simple "play this block" API.
+/// Samples are interleaved signed 16-bit PCM at [`sample_rate`] and
+/// [`channels`]; [`play`] blocks until the hardware has consumed the block.
+///
+/// [`sample_rate`]: Audio::sample_rate
+/// [`channels`]: Audio::channels
+/// [`play`]: Audio::play
+pub trait Audio: Sync {
+    /// Playback sample rate in Hz.
+    fn sample_rate(&self) -> u32;
+
+    /// Number of interleaved channels (usually 2).
+    fn channels(&self) -> u16;
+
+    /// Returns `true` when a device is present and configured.
+    fn is_ready(&self) -> bool;
+
+    /// Plays one interleaved PCM block, blocking until it has been consumed.
+    ///
+    /// Blocks longer than [`max_samples`](Audio::max_samples) are rejected
+    /// with [`AudioError::TooLong`]; callers should size their buffers to the
+    /// device limit.
+    fn play(&self, samples: &[i16]) -> Result<(), AudioError>;
+
+    /// Stops playback immediately and discards queued samples.
+    fn stop(&self);
+
+    /// Maximum number of interleaved samples accepted by one [`play`] call.
+    ///
+    /// [`play`]: Audio::play
+    fn max_samples(&self) -> usize;
+}
+
+/// Errors reported by an [`Audio`] device.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AudioError {
+    /// No audio device was found or it failed to initialise.
+    Unavailable,
+    /// The block was empty.
+    Empty,
+    /// The block is longer than [`Audio::max_samples`].
+    TooLong,
+    /// The device did not finish the transfer in time.
+    Timeout,
+}
+
 /// CPU identification and idle behaviour.
 pub trait Cpu: Sync {
     /// Current exception level (0..=3).

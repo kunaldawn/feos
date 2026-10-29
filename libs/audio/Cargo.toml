@@ -1,0 +1,8 @@
+[package]
+name = "feos-audio"
+description = "A small dependency-free audio synthesis and mixing library for the feos kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

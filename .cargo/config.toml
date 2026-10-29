@@ -2,8 +2,10 @@
 target = "aarch64-unknown-none"
 
 [target.aarch64-unknown-none]
-# `cargo run` builds and then hands the ELF to QEMU's `virt` machine.
-runner = "qemu-system-aarch64 -machine virt -cpu cortex-a53 -smp 1 -m 128M -net none -device ramfb -display vnc=127.0.0.1:0 -serial mon:stdio -kernel"
+# `cargo run` builds and then hands the ELF to scripts/qemu.sh, which boots the
+# `virt` machine with ramfb, the Intel HDA audio device and a QEMU audio
+# backend. Set FEOS_DISPLAY / FEOS_AUDIODEV in the environment to override.
+runner = "scripts/qemu.sh"
 rustflags = [
     "-C", "linker=rust-lld",
     "-C", "link-arg=-Tboards/qemu-virt/linker.ld",

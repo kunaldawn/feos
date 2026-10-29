@@ -21,9 +21,12 @@ license = "MIT OR Apache-2.0"
 feos-app = { path = "libs/app" }
 feos-apps = { path = "apps/commands" }
 feos-arch-aarch64 = { path = "arch/aarch64" }
+feos-audio = { path = "libs/audio" }
 feos-board-qemu-virt = { path = "boards/qemu-virt" }
 feos-console = { path = "libs/console" }
 feos-driver-fw-cfg = { path = "drivers/firmware/fw-cfg" }
+feos-driver-intel-hda = { path = "drivers/audio/intel-hda" }
+feos-driver-pci = { path = "drivers/bus/pci" }
 feos-driver-pl011 = { path = "drivers/serial/pl011" }
 feos-driver-ramfb = { path = "drivers/display/ramfb" }
 feos-gfx = { path = "libs/gfx" }

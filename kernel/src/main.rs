@@ -56,6 +56,22 @@ pub extern "C" fn kmain(dtb: usize) -> ! {
 
     println!();
     let services = &feos_arch_aarch64::AARCH64;
+
+    let audio = board::init_audio(services);
+    match audio.as_ref() {
+        Some(audio) => println!(
+            "[audio] Intel HDA ready: {} Hz, {} channel(s), codec {:#x} (DAC {}, pin {})",
+            audio.device.sample_rate(),
+            audio.device.channels(),
+            audio.codec.vendor_id,
+            audio.codec.dac,
+            audio.codec.pin
+        ),
+        None => println!(
+            "[audio] no Intel HDA codec (start QEMU with -device intel-hda -device hda-output)"
+        ),
+    }
+
     let platform = Platform {
         board: BoardInfo {
             name: board::NAME,
@@ -67,6 +83,7 @@ pub extern "C" fn kmain(dtb: usize) -> ! {
         clock: services,
         power: services,
         cpu: services,
+        audio: audio.as_ref().map(|audio| audio.device),
     };
     feos_shell::run(display, &platform)
 }

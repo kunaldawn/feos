@@ -15,6 +15,7 @@ name = "feos-apps"
 version = "0.1.0"
 dependencies = [
  "feos-app",
+ "feos-audio",
  "feos-console",
  "feos-gfx",
 ]
@@ -27,11 +28,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "feos-audio"
+version = "0.1.0"
+
+[[package]]
 name = "feos-board-qemu-virt"
 version = "0.1.0"
 dependencies = [
  "feos-console",
  "feos-driver-fw-cfg",
+ "feos-driver-intel-hda",
+ "feos-driver-pci",
  "feos-driver-pl011",
  "feos-driver-ramfb",
  "feos-gfx",
@@ -47,6 +54,18 @@ dependencies = [
 
 [[package]]
 name = "feos-driver-fw-cfg"
+version = "0.1.0"
+
+[[package]]
+name = "feos-driver-intel-hda"
+version = "0.1.0"
+dependencies = [
+ "feos-hal",
+ "feos-sync",
+]
+
+[[package]]
+name = "feos-driver-pci"
 version = "0.1.0"
 
 [[package]]

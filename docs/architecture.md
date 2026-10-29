@@ -14,7 +14,7 @@ device.
 | HAL | `libs/hal` | nothing | Device and system-service traits shared by drivers, architectures and apps |
 | Drivers | `drivers/<class>/<name>` | `libs/hal`, other drivers | One device per crate; MMIO base comes from the constructor |
 | Libraries | `libs/<name>` | other `libs/*` only | Reusable, hardware-independent code |
-| Board | `boards/<board>` | drivers, libraries | Machine memory map, device instances, console/display wiring |
+| Board | `boards/<board>` | drivers, libraries | Machine memory map, device instances, console/display/audio wiring |
 | Apps | `apps/*` | `libs/*` only | Shell commands and their UI; never hardware access |
 | Kernel | `kernel` | board, arch, libraries, apps | Boot sequence, panic handler, platform services, shell launch |
 
@@ -31,7 +31,8 @@ Every workspace crate uses the `feos-` prefix. Crates that fill a role use
 - `feos-arch-aarch64`
 - `feos-board-qemu-virt`
 - `feos-driver-pl011`, `feos-driver-fw-cfg`, `feos-driver-ramfb`
-- `feos-hal`, `feos-sync`, `feos-console`, `feos-gfx`, `feos-app`
+- `feos-driver-pci`, `feos-driver-intel-hda`
+- `feos-hal`, `feos-sync`, `feos-console`, `feos-gfx`, `feos-audio`, `feos-app`
 - `feos-apps`, `feos-shell`
 - `feos-kernel` (binary name: `feos`)
 
@@ -48,7 +49,7 @@ kept out of directory names (`drivers/serial/pl011`, not
 3. **Libraries never depend on a board, driver, or the kernel.**
 4. **Apps never touch MMIO or architecture registers directly.** They use
    `feos-console`, `feos-gfx`, and the `Platform` services (`Clock`, `Power`,
-   `Cpu`, board facts) passed through `Context`.
+   `Cpu`, `Audio`, board facts) passed through `Context`.
 5. **The kernel contains no device logic.** If `kernel/src/main.rs` starts
    growing a driver, it belongs in `drivers/` or `boards/`.
 
@@ -112,16 +113,39 @@ Copy `boards/qemu-virt`, change the constants, and update:
 3. The linker script path in `.cargo/config.toml` (or pass it per build).
 
 The kernel's `main.rs` should not need any other changes; it only calls board
-functions such as `init_console`, `init_display`, `framebuffer_addr`,
-`kernel_range`, and `bss_range`.
+functions such as `init_console`, `init_display`, `init_audio`,
+`framebuffer_addr`, `kernel_range`, and `bss_range`.
+
+## The audio path
+
+Audio crosses the same layers as graphics:
+
+1. `feos-audio` renders and mixes 16-bit PCM in a caller-owned buffer. It is
+   hardware-independent and host-testable.
+2. `feos-driver-pci` reads PCIe ECAM configuration space. Because the kernel
+   boots without firmware, it also sizes and assigns the HDA controller's BAR
+   and enables memory decoding plus bus mastering.
+3. `feos-driver-intel-hda` resets the controller, sets up the CORB/RIRB command
+   rings, discovers the codec's DAC and output pin, and plays one block through
+   an output stream descriptor. Its rings, BDL and PCM buffer are static, so no
+   allocator is involved.
+4. The board owns the controller instance and assigns the BAR address; the
+   kernel exposes the initialised `&dyn Audio` in `Platform`.
+5. `tone` synthesizes a chord with `feos-audio` and calls `Audio::play`; the
+   driver polls the stream's completion bit and returns when the block has been
+   consumed.
+
+The MMU is off, so DMA addresses are the static buffers' virtual addresses.
+When paging is added, the driver must translate them before writing the BDL and
+stream registers.
 
 ## Testing strategy
 
 Bare-metal code cannot be tested on the host when it executes privileged
 instructions or touches MMIO. The split makes most logic host-testable:
 
-- `libs/gfx`, `libs/sync`, and future pure libraries run `cargo test` on the
-  host.
+- `libs/gfx`, `libs/audio`, `libs/sync`, and future pure libraries run
+  `cargo test` on the host.
 - Drivers are intentionally thin register accessors; they can be exercised in
   QEMU.
 - The kernel is tested by booting `make run` (or `make docker-run`).

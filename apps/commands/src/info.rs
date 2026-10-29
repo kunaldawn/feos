@@ -49,5 +49,15 @@ impl App for Info {
             ),
             None => println!("  graphics        : unavailable (no -device ramfb)"),
         }
+
+        match platform.audio {
+            Some(audio) if audio.is_ready() => println!(
+                "  audio           : Intel HDA {} Hz, {} ch, max {} samples",
+                audio.sample_rate(),
+                audio.channels(),
+                audio.max_samples()
+            ),
+            _ => println!("  audio           : unavailable (no -device intel-hda)"),
+        }
     }
 }

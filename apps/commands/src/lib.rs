@@ -16,6 +16,7 @@ pub mod info;
 pub mod power;
 pub mod sleep;
 pub mod splash;
+pub mod tone;
 pub mod ui;
 pub mod uptime;
 
@@ -28,6 +29,7 @@ pub static REGISTRY: &[&dyn App] = &[
     &info::Info,
     &gfx::Gfx,
     &splash::Splash,
+    &tone::Tone,
     &uptime::Uptime,
     &sleep::Sleep,
     &clear::Clear,

@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 feos-console = { workspace = true }
 feos-driver-fw-cfg = { workspace = true }
+feos-driver-intel-hda = { workspace = true }
+feos-driver-pci = { workspace = true }
 feos-driver-pl011 = { workspace = true }
 feos-driver-ramfb = { workspace = true }
 feos-gfx = { workspace = true }

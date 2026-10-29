@@ -18,7 +18,7 @@
 #![no_std]
 
 use feos_gfx::Canvas;
-use feos_hal::{Clock, Cpu, Power};
+use feos_hal::{Audio, Clock, Cpu, Power};
 
 /// The version shared by every crate in the workspace.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -47,6 +47,8 @@ pub struct Platform {
     pub power: &'static dyn Power,
     /// CPU identification.
     pub cpu: &'static dyn Cpu,
+    /// Audio output device, when the board found one.
+    pub audio: Option<&'static dyn Audio>,
 }
 
 /// Everything an app is allowed to see when it runs.

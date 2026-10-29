@@ -10,10 +10,12 @@
 #![no_std]
 
 use feos_driver_fw_cfg::FwCfg;
+use feos_driver_intel_hda::{CodecInfo, IntelHda};
+use feos_driver_pci::PciEcam;
 use feos_driver_pl011::Pl011;
 use feos_driver_ramfb::Ramfb;
 use feos_gfx::Canvas;
-use feos_hal::Serial;
+use feos_hal::{Audio, Clock, Serial};
 
 /// Human-readable board name, shown by the `info` app.
 pub const NAME: &str = "QEMU aarch64 virt";
@@ -23,6 +25,23 @@ pub const CONSOLE_BASE: usize = 0x0900_0000;
 
 /// fw_cfg MMIO window on the `virt` machine.
 pub const FW_CFG_BASE: usize = 0x0902_0000;
+
+/// PCIe ECAM (configuration space) window on the `virt` machine.
+///
+/// QEMU places the high ECAM region at 256 GiB + 16 MiB.
+pub const PCIE_ECAM_BASE: usize = 0x40_1000_0000;
+
+/// Address assigned to BAR0 of the Intel HDA controller.
+///
+/// This lies in the low PCIe MMIO window (`0x1000_0000..0x3eff_0000`) and is
+/// 16 KiB aligned, matching the controller's BAR size. Firmware-less boots
+/// leave BARs unprogrammed, so the board assigns this address itself.
+pub const HDA_BAR0: usize = 0x1000_0000;
+
+/// Intel vendor ID.
+const PCI_VENDOR_INTEL: u16 = 0x8086;
+/// ICH6 HD Audio controller device ID.
+const PCI_DEVICE_ICH6_HDA: u16 = 0x2668;
 
 /// Start of guest RAM.
 pub const RAM_BASE: usize = 0x4000_0000;
@@ -92,6 +111,42 @@ pub fn init_display() -> Option<Canvas<'static>> {
         unsafe { core::slice::from_raw_parts_mut(ptr, DISPLAY_WIDTH * DISPLAY_HEIGHT) };
 
     Canvas::new(pixels, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_WIDTH)
+}
+
+/// The board's Intel HDA controller.
+///
+/// Its command rings and PCM buffer live in this static. The controller is
+/// initialised by [`init_audio`] and then shared with apps through
+/// `feos-hal`'s [`Audio`] trait.
+pub static AUDIO: IntelHda = IntelHda::new();
+
+/// A discovered audio device and its codec details.
+pub struct AudioDevice {
+    /// Playback interface handed to apps.
+    pub device: &'static dyn Audio,
+    /// Codec nodes found during initialisation.
+    pub codec: CodecInfo,
+}
+
+/// Finds the Intel HDA controller on the PCI bus and brings it up.
+///
+/// Returns `None` when QEMU was started without `-device intel-hda` (or the
+/// codec does not answer). The board assigns BAR0 itself because the kernel
+/// boots without PCI firmware.
+pub fn init_audio(clock: &'static dyn Clock) -> Option<AudioDevice> {
+    let pci = PciEcam::new(PCIE_ECAM_BASE);
+    let controller = pci.find(PCI_VENDOR_INTEL, PCI_DEVICE_ICH6_HDA)?;
+
+    if !controller.assign_memory_bar(0, HDA_BAR0 as u64) {
+        return None;
+    }
+    controller.enable();
+
+    let codec = AUDIO.init(HDA_BAR0, clock)?;
+    Some(AudioDevice {
+        device: &AUDIO,
+        codec,
+    })
 }
 
 extern "C" {
