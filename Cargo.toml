@@ -1,0 +1,21 @@
+[workspace]
+members = ["gfx"]
+
+[package]
+name = "feos"
+version = "0.1.0"
+edition = "2021"
+description = "A tiny bare-metal Rust kernel skeleton for the QEMU aarch64 virt machine"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+feos-gfx = { path = "gfx" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1

@@ -1,0 +1,8 @@
+target/
+ecs-os/
+docs/
+.git/
+.gitignore
+Dockerfile
+.dockerignore
+README.md
