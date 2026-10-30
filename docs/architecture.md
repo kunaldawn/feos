@@ -39,7 +39,8 @@ Every workspace crate uses the `feos-` prefix. Crates that fill a role use
 - `feos-board-qemu-virt`
 - `feos-driver-pl011`, `feos-driver-fw-cfg`, `feos-driver-ramfb`
 - `feos-driver-pci`, `feos-driver-intel-hda`, `feos-driver-gicv2`
-- `feos-hal`, `feos-sync`, `feos-console`, `feos-gfx`, `feos-audio`, `feos-app`
+- `feos-hal`, `feos-sync`, `feos-console`, `feos-gfx`, `feos-gui`,
+  `feos-audio`, `feos-app`
 - `feos-apps`, `feos-shell`
 - `feos-kernel` (binary name: `feos`)
 
@@ -55,8 +56,9 @@ kept out of directory names (`drivers/serial/pl011`, not
    (`Pl011::new(0x0900_0000)`, `FwCfg::new(0x0902_0000)`).
 3. **Libraries never depend on a board, driver, or the kernel.**
 4. **Apps never touch MMIO or architecture registers directly.** They use
-   `feos-console`, `feos-gfx`, and the `Platform` services (`Clock`, `Power`,
-   `Cpu`, `Audio`, `Processes`, board facts) passed through `Context`.
+   `feos-console`, `feos-gfx`, `feos-gui`, and the `Platform` services
+   (`Clock`, `Power`, `Cpu`, `Audio`, `Processes`, board facts) passed through
+   `Context`.
 5. **The kernel contains no device logic.** If `kernel/src/main.rs` starts
    growing a driver, it belongs in `drivers/` or `boards/`. The scheduler is
    policy, not a device: it lives in `kernel/src/sched.rs` and reaches the GIC
@@ -176,6 +178,24 @@ not isolated user processes. There is no per-process page table, no syscall
 boundary, and no recovery from a fault inside a background app; adding EL0 and
 an address space would turn the same scheduler into a real process switcher.
 
+## The GUI path
+
+`feos-gui` is a pure library above `feos-gfx`; it never talks to a device:
+
+1. A board driver supplies a `feos_gfx::Canvas` over the framebuffer. On the
+   QEMU board this is the ramfb XRGB8888 buffer.
+2. An app owns its persistent state — `InteractionState`, `TextBuffer`,
+   `WindowState`, booleans, sliders — and passes it to widgets each frame.
+3. `Ui` clips drawing through a `Painter`, computes deterministic row/column/
+   grid layout, and turns pointer and keyboard `Event`s into hover, press,
+   click, drag, scroll and focus changes.
+4. The app decides what to do with each `Response`; `Ui` never owns a widget
+   tree, allocates, or calls `unsafe`.
+
+The current board has no mouse or keyboard driver, so the `gui` app renders a
+static dashboard frame. Adding an input driver only requires feeding `Event`s
+into `Input` and clearing them per frame; the widget layer is already complete.
+
 ## The audio path
 
 Audio crosses the same layers as graphics:
@@ -205,8 +225,8 @@ stream registers.
 Bare-metal code cannot be tested on the host when it executes privileged
 instructions or touches MMIO. The split makes most logic host-testable:
 
-- `libs/gfx`, `libs/audio`, `libs/sync`, and future pure libraries run
-  `cargo test` on the host.
+- `libs/gfx`, `libs/gui`, `libs/audio`, `libs/sync`, and future pure libraries
+  run `cargo test` on the host.
 - Drivers are intentionally thin register accessors; they can be exercised in
   QEMU.
 - The kernel is tested by booting `make run` (or `make docker-run`). The

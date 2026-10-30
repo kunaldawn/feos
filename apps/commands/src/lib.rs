@@ -11,6 +11,7 @@
 pub mod clear;
 pub mod echo;
 pub mod gfx;
+pub mod gui;
 pub mod help;
 pub mod info;
 pub mod kill;
@@ -36,6 +37,7 @@ pub static REGISTRY: &[&dyn App] = &[
     &kill::Kill,
     &tick::Tick,
     &gfx::Gfx,
+    &gui::Gui,
     &splash::Splash,
     &tone::Tone,
     &uptime::Uptime,

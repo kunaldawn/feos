@@ -18,6 +18,7 @@ dependencies = [
  "feos-audio",
  "feos-console",
  "feos-gfx",
+ "feos-gui",
 ]
 
 [[package]]
@@ -93,6 +94,13 @@ dependencies = [
 [[package]]
 name = "feos-gfx"
 version = "0.1.0"
+
+[[package]]
+name = "feos-gui"
+version = "0.1.0"
+dependencies = [
+ "feos-gfx",
+]
 
 [[package]]
 name = "feos-hal"

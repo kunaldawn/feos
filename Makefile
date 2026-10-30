@@ -28,7 +28,7 @@ QEMU_FLAGS   ?= -machine virt -cpu cortex-a53 -smp 1 -m 128M -net none -device r
 # host through X11/XWayland; "vnc=0.0.0.0:0" serves the display over VNC.
 FEOS_DISPLAY ?= gtk
 
-.PHONY: all build check run clean test test-gfx test-audio test-sync \
+.PHONY: all build check run clean test test-gfx test-gui test-audio test-sync \
         audio-demo docker-build docker-run docker-run-vnc docker-audio docker-shell
 
 all: build
@@ -45,12 +45,15 @@ run: build
 	mkdir -p target/audio
 	$(QEMU) $(QEMU_FLAGS) -display $(QEMU_DISPLAY) -kernel $(KERNEL)
 
-test: test-gfx test-audio test-sync
+test: test-gfx test-gui test-audio test-sync
 
 # Host-side tests. Architecture and board crates contain AArch64 assembly or
 # MMIO, so the test set is explicit rather than `--workspace`.
 test-gfx:
 	cargo test -p feos-gfx --target x86_64-unknown-linux-gnu
+
+test-gui:
+	cargo test -p feos-gui --target x86_64-unknown-linux-gnu
 
 test-audio:
 	cargo test -p feos-audio --target x86_64-unknown-linux-gnu

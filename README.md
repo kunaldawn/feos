@@ -31,7 +31,7 @@ kernel  ->  boards  ->  drivers  ->  libs/hal
    |
    +------>  arch (aarch64)  ->  libs/hal
    +------>  apps  ->  libs/app  ->  libs/hal
-   |                    apps  ->  libs/gfx, libs/console
+   |                    apps  ->  libs/gfx, libs/gui, libs/console
    +------>  libs/hal
 ```
 
@@ -100,6 +100,7 @@ app registry).
 │   ├── sync/                   # feos-sync: SpinLock and friends
 │   ├── console/                # feos-console: registered console + macros
 │   ├── gfx/                    # feos-gfx: dependency-free 2D graphics
+│   ├── gui/                    # feos-gui: immediate-mode widgets, layout, charts
 │   ├── audio/                  # feos-audio: PCM buffers, mixing, synthesis
 │   └── app/                    # feos-app: App trait, Context, Platform
 │
@@ -108,6 +109,7 @@ app registry).
     │   └── src/
     │       ├── help.rs  echo.rs  info.rs  uptime.rs  sleep.rs
     │       ├── clear.rs  gfx.rs  splash.rs  tone.rs  power.rs
+    │       ├── gui.rs          # feos-gui dashboard demo
     │       ├── spawn.rs  ps.rs  kill.rs  tick.rs
     │       ├── ui.rs           # splash screen and test card renderer
     │       └── lib.rs          # REGISTRY and find()
@@ -163,6 +165,8 @@ change.
 - QEMU `ramfb` framebuffer: 1024x768 linear **XRGB8888** in guest RAM
 - `feos-gfx`: a `no_std` 2D library with pixels, rectangles, Bresenham lines,
   circles, gradients, blitting, and an 8x8 bitmap font
+- `feos-gui`: a `no_std`, allocation-free immediate-mode GUI toolkit with
+  widgets, linear layout, scrolling, text input, charts, windows and dialogs
 - `feos-audio`: a `no_std` 16-bit PCM library with sample buffers, saturating
   mixing, fades, and sine/square/triangle/sawtooth/noise synthesis
 - `tone` shell command: synthesizes a chord with `feos-audio` and plays it
@@ -173,7 +177,7 @@ change.
 - PSCI over `HVC` for clean `poweroff` / `reboot`
 - Interactive serial shell with line editing (backspace, Ctrl-C)
 - App registry with per-command crates/modules and aliases
-- Host unit tests for the graphics, audio, and synchronization libraries
+- Host unit tests for the graphics, GUI, audio, and synchronization libraries
 - Docker image containing Rust, QEMU with GTK (window) and VNC display support
 
 ## Quick start (Docker)
@@ -192,9 +196,10 @@ Requirements for the window: an X11 or Wayland (XWayland) session and a
 `qemu-system-gui` build inside the image (already installed by the
 `Dockerfile`). On Wayland the window appears through XWayland.
 
-Then use the `gfx` command in the serial shell to redraw the test card, and
-`tone` to play an A-major chord through the emulated Intel HDA codec. Use the
-`poweroff` command (or `Ctrl-A` then `X`) to leave QEMU.
+Then use the `gfx` command in the serial shell to redraw the test card,
+`gui` to render the widget and chart dashboard, and `tone` to play an A-major
+chord through the emulated Intel HDA codec. Use the `poweroff` command (or
+`Ctrl-A` then `X`) to leave QEMU.
 
 `make docker-run` wires the guest's HDA codec to a host backend. On Linux with
 `/dev/snd`, the Makefile passes `--device /dev/snd` and QEMU uses ALSA, so
@@ -286,6 +291,7 @@ default NIC would load.
 | `echo <text>` | Print text back                                      |
 | `info`        | Board, exception level, MIDR, timer, memory, display, audio |
 | `gfx`         | Draw the graphics test card (`demo` is an alias)     |
+| `gui`         | Draw the feos-gui dashboard (`desktop`, `dashboard`) |
 | `splash`      | Redraw the boot splash                               |
 | `tone [ms]`   | Play an A-major chord for `ms` (default 1500, max 3000; `play` alias) |
 | `uptime`      | Milliseconds since the counter started               |
@@ -377,7 +383,71 @@ The library is host-testable:
 ```sh
 make test
 # equivalent to:
-cargo test -p feos-gfx -p feos-audio -p feos-sync --target x86_64-unknown-linux-gnu
+cargo test -p feos-gfx -p feos-gui -p feos-audio -p feos-sync --target x86_64-unknown-linux-gnu
+```
+
+## The GUI library
+
+`feos-gui` (in `libs/gui/`) builds a small desktop toolkit on top of
+`feos-gfx`. It is `no_std`, has no allocator, no `unsafe`, and no dependencies
+beyond `feos-gfx`. The model is **immediate mode**: an app rebuilds its
+interface every frame, widgets return a `Response`, and state that must survive
+between frames lives in caller-owned structs.
+
+```rust
+use feos_gfx::{Canvas, Rect};
+use feos_gui::InteractionState;
+use feos_gui::prelude::*;
+
+let mut pixels = [0u32; 480 * 320];
+let mut canvas = Canvas::new(&mut pixels, 480, 320, 480).unwrap();
+let theme = Theme::dark();
+let input = Input::new();
+let mut state = InteractionState::<8>::new();
+let mut volume = 0.6f32;
+let mut enabled = true;
+
+let mut ui = Ui::new(&mut canvas, &theme, &input, &mut state);
+ui.desktop_background(ui.canvas_rect());
+let panel = Rect::new(24, 24, 280, 180);
+ui.card(panel, "Settings", |ui| {
+    ui.label_muted("APPEARANCE");
+    ui.checkbox(&mut enabled, "Enable notifications");
+    ui.slider(&mut volume, 0.0, 1.0);
+    if ui.primary_button("Apply").clicked {
+        // handle the click
+    }
+});
+```
+
+Key pieces:
+
+- `Ui` — the frame handle. It owns a clipped `Painter`, the active theme,
+  input, and interaction state. Widgets are inherent methods, so custom
+  widgets can mix freely with the built-in ones.
+- `InteractionState<N>` — fixed-capacity hover/active/focus/tab-order table
+  and scroll offsets. It never grows; extra regions degrade gracefully.
+- `LayoutStack` / `ui.column`, `ui.row`, `ui.grid` — deterministic linear
+  layout. No constraint solver and no allocations.
+- `Painter` — clipping, rounded rectangles, alpha blending, shadows, and
+  text drawing/wrapping/ellipsis over `feos_gfx::Canvas`.
+- `Input` / `Event` — pointer, wheel and keyboard events for a future board
+  driver. The current QEMU board has no mouse or keyboard device, so the `gui`
+  demo renders one frame from static state.
+- Widgets — labels, headings, paragraphs, buttons, checkboxes, radios, toggles,
+  sliders, progress bars, badges, separators, text fields with selection and
+  UTF-8 editing, panels, cards, scroll areas, tabs, windows, dialogs, lists,
+  tooltips, and a desktop background.
+- Charts — line, area, bar and sparkline series over caller-provided slices.
+- `WindowState` — draggable and resizable window geometry, also caller-owned.
+
+Everything is fallible only at the edges: `Canvas::new` validates the buffer,
+while widgets simply clip or skip work when there is no room.
+
+```sh
+make test-gui
+# equivalent to:
+cargo test -p feos-gui --target x86_64-unknown-linux-gnu
 ```
 
 ## The audio library
