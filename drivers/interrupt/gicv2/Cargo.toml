@@ -1,0 +1,9 @@
+[package]
+name = "feos-driver-gicv2"
+description = "ARM GICv2 interrupt controller driver for feos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+feos-hal = { workspace = true }

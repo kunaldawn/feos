@@ -8,10 +8,12 @@
 #![no_std]
 #![no_main]
 
+mod sched;
+
 use core::panic::PanicInfo;
 
 use feos_app::{BoardInfo, Platform};
-use feos_arch_aarch64::{cpu, exceptions};
+use feos_arch_aarch64::{cpu, exceptions, irq, timer};
 use feos_board_qemu_virt as board;
 use feos_console::println;
 
@@ -84,8 +86,50 @@ pub extern "C" fn kmain(dtb: usize) -> ! {
         power: services,
         cpu: services,
         audio: audio.as_ref().map(|audio| audio.device),
+        processes: &sched::PROCESSES,
     };
-    feos_shell::run(display, &platform)
+
+    // Background processes read the platform through this static.
+    sched::set_platform(platform);
+    sched::init();
+
+    irq::set_handler(on_irq);
+    board::init_interrupts();
+    println!(
+        "[sched] GICv2 distributor {:#x}, CPU interface {:#x}, timer IRQ {}",
+        board::GIC_DIST_BASE,
+        board::GIC_CPU_BASE,
+        board::TIMER_IRQ
+    );
+    println!(
+        "[sched] preemptive round-robin at 100 Hz, {} process slots",
+        feos_app::MAX_PROCESSES
+    );
+
+    // Timer ticks and IRQ delivery begin here; the shell is PID 1 and the
+    // currently running process.
+    sched::start(100);
+
+    feos_shell::run(display, sched::platform())
+}
+
+/// Handles the periodic timer interrupt and lets the scheduler choose a
+/// process.
+fn on_irq(frame: &mut irq::TrapFrame) {
+    let controller = board::interrupts();
+    let id = controller.acknowledge();
+
+    if id == board::TIMER_IRQ {
+        timer::tick();
+    }
+
+    // Acknowledge before switching stacks so the controller can deliver the
+    // next interrupt to whichever process runs next.
+    if id < 1020 {
+        controller.end(id);
+    }
+
+    sched::preempt(frame);
 }
 
 /// Reports a synchronous exception or interrupt and lets the arch crate halt.

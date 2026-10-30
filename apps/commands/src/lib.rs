@@ -13,9 +13,13 @@ pub mod echo;
 pub mod gfx;
 pub mod help;
 pub mod info;
+pub mod kill;
 pub mod power;
+pub mod ps;
 pub mod sleep;
+pub mod spawn;
 pub mod splash;
+pub mod tick;
 pub mod tone;
 pub mod ui;
 pub mod uptime;
@@ -27,6 +31,10 @@ pub static REGISTRY: &[&dyn App] = &[
     &help::Help,
     &echo::Echo,
     &info::Info,
+    &ps::Ps,
+    &spawn::Spawn,
+    &kill::Kill,
+    &tick::Tick,
     &gfx::Gfx,
     &splash::Splash,
     &tone::Tone,

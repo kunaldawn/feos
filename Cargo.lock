@@ -37,6 +37,7 @@ version = "0.1.0"
 dependencies = [
  "feos-console",
  "feos-driver-fw-cfg",
+ "feos-driver-gicv2",
  "feos-driver-intel-hda",
  "feos-driver-pci",
  "feos-driver-pl011",
@@ -55,6 +56,13 @@ dependencies = [
 [[package]]
 name = "feos-driver-fw-cfg"
 version = "0.1.0"
+
+[[package]]
+name = "feos-driver-gicv2"
+version = "0.1.0"
+dependencies = [
+ "feos-hal",
+]
 
 [[package]]
 name = "feos-driver-intel-hda"
@@ -99,6 +107,7 @@ dependencies = [
  "feos-arch-aarch64",
  "feos-board-qemu-virt",
  "feos-console",
+ "feos-hal",
  "feos-shell",
 ]
 

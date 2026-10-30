@@ -103,6 +103,28 @@ pub enum AudioError {
     Timeout,
 }
 
+/// A programmable interrupt controller.
+///
+/// The kernel installs one implementation at boot and enables the interrupts
+/// it needs (today: the generic timer tick used by the scheduler). Handlers
+/// acknowledge the interrupt, service it, and then end it so the controller
+/// can deliver the next one.
+pub trait InterruptController: Sync {
+    /// Enables delivery of one interrupt ID.
+    fn enable(&self, irq: u32);
+
+    /// Disables delivery of one interrupt ID.
+    fn disable(&self, irq: u32);
+
+    /// Returns the ID of the highest-priority pending interrupt.
+    ///
+    /// A spurious interrupt is reported as `1023`.
+    fn acknowledge(&self) -> u32;
+
+    /// Signals end-of-interrupt for a previously acknowledged ID.
+    fn end(&self, irq: u32);
+}
+
 /// CPU identification and idle behaviour.
 pub trait Cpu: Sync {
     /// Current exception level (0..=3).

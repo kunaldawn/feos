@@ -3,7 +3,8 @@
 A tiny bare-metal **Rust** operating-system skeleton for the **aarch64** QEMU
 `virt` machine, organised as a multi-crate workspace. It boots at EL1, installs
 exception vectors, talks to the PL011 serial port, brings up a **ramfb**
-framebuffer, draws a splash screen, and drops into a small interactive shell.
+framebuffer, draws a splash screen, starts a preemptive round-robin scheduler,
+and drops into a small interactive shell.
 
 Everything can be built and run inside Docker, so the only host requirement is
 Docker.
@@ -30,13 +31,16 @@ kernel  ->  boards  ->  drivers  ->  libs/hal
    |
    +------>  arch (aarch64)  ->  libs/hal
    +------>  apps  ->  libs/app  ->  libs/hal
-                       apps  ->  libs/gfx, libs/console
+   |                    apps  ->  libs/gfx, libs/console
+   +------>  libs/hal
 ```
 
 Nothing points back up the stack: an architecture crate never knows about a
 board, a driver never knows about the kernel, and an app never owns hardware.
 That is what makes it possible to add a second board, a second display driver,
-or a second shell app without touching unrelated code.
+or a second shell app without touching unrelated code. The kernel's scheduler
+is the one piece of policy that lives above the layers: it consumes the
+architecture IRQ entry and the `Processes` service defined in `libs/app`.
 
 Apps also never mention a real architecture or board. The kernel hands them a
 `feos_app::Platform` containing the board facts and the `Clock`, `Power`, `Cpu`
@@ -63,14 +67,17 @@ app registry).
 ├── docs/                       # screenshots and architecture notes
 │
 ├── kernel/                     # feos-kernel: the bootable binary (bin: feos)
-│   └── src/main.rs             # kmain, panic handler, wiring only
+│   └── src/
+│       ├── main.rs             # kmain, IRQ handler, panic handler, wiring
+│       └── sched.rs            # process table and round-robin scheduler
 │
 ├── arch/
 │   └── aarch64/                # feos-arch-aarch64
 │       └── src/
 │           ├── boot.S          # _start: CPU setup, BSS, jump to kmain
-│           ├── vectors.S       # 16-entry EL1 exception vector table
+│           ├── vectors.S       # exception table + recoverable IRQ entry
 │           ├── exceptions.rs   # vector install, FaultInfo, handler hook
+│           ├── irq.rs          # TrapFrame, IRQ dispatch, mask helpers
 │           ├── cpu.rs          # halt, current EL, MIDR
 │           ├── psci.rs         # poweroff / reboot
 │           └── timer.rs        # generic timer helpers
@@ -85,7 +92,8 @@ app registry).
 │   ├── firmware/fw-cfg/        # feos-driver-fw-cfg
 │   ├── display/ramfb/          # feos-driver-ramfb
 │   ├── bus/pci/                # feos-driver-pci: PCIe ECAM + BAR assignment
-│   └── audio/intel-hda/        # feos-driver-intel-hda: Intel HDA playback
+│   ├── audio/intel-hda/        # feos-driver-intel-hda: Intel HDA playback
+│   └── interrupt/gicv2/        # feos-driver-gicv2: GICv2 distributor + CPU interface
 │
 ├── libs/
 │   ├── hal/                    # feos-hal: device + system-service traits
@@ -100,6 +108,7 @@ app registry).
     │   └── src/
     │       ├── help.rs  echo.rs  info.rs  uptime.rs  sleep.rs
     │       ├── clear.rs  gfx.rs  splash.rs  tone.rs  power.rs
+    │       ├── spawn.rs  ps.rs  kill.rs  tick.rs
     │       ├── ui.rs           # splash screen and test card renderer
     │       └── lib.rs          # REGISTRY and find()
     └── shell/                  # feos-shell: line editor + dispatcher
@@ -143,7 +152,14 @@ change.
 - `feos-hal` device traits (`Serial`, `Audio`) and system-service traits
   (`Clock`, `Power`, `Cpu`) that keep apps board- and architecture-independent
 - Registered console with `print!` / `println!` and panic-safe output
-- AArch64 exception vector table with an ESR/ELR/FAR diagnostic dump
+- AArch64 exception vector table with an ESR/ELR/FAR diagnostic dump, plus a
+  recoverable IRQ entry that saves and restores a full 800-byte `TrapFrame`
+- GICv2 driver behind an `InterruptController` HAL trait, with Group 0 and the
+  timer PPI wired up by the board
+- Preemptive round-robin scheduler: eight process slots, 16 KiB stacks, and a
+  100 Hz generic-timer tick; the shell is PID 1
+- `spawn`, `ps`, `kill`, and `tick` commands for running and inspecting
+  background processes
 - QEMU `ramfb` framebuffer: 1024x768 linear **XRGB8888** in guest RAM
 - `feos-gfx`: a `no_std` 2D library with pixels, rectangles, Bresenham lines,
   circles, gradients, blitting, and an 8x8 bitmap font
@@ -152,7 +168,8 @@ change.
 - `tone` shell command: synthesizes a chord with `feos-audio` and plays it
   through the HDA codec
 - Boot splash and an interactive graphics test card
-- Generic timer (`CNTPCT_EL0`) for uptime and busy-wait sleeps
+- Generic timer (`CNTPCT_EL0`) for uptime, busy-wait sleeps, and the scheduler
+  tick (`CNTP_TVAL_EL0`)
 - PSCI over `HVC` for clean `poweroff` / `reboot`
 - Interactive serial shell with line editing (backspace, Ctrl-C)
 - App registry with per-command crates/modules and aliases
@@ -273,9 +290,52 @@ default NIC would load.
 | `tone [ms]`   | Play an A-major chord for `ms` (default 1500, max 3000; `play` alias) |
 | `uptime`      | Milliseconds since the counter started               |
 | `sleep <ms>`  | Busy-wait for the given number of milliseconds       |
+| `spawn <cmd> [args]` | Run a registered command as a background process |
+| `ps`          | List processes and their state (`procs`, `processes`) |
+| `kill <pid>`  | Stop a background process (the shell cannot be killed) |
+| `tick [count] [ms]` | Print periodic ticks; useful with `spawn`       |
 | `clear`       | Clear the terminal (ANSI escape)                     |
 | `poweroff`    | PSCI SYSTEM_OFF; QEMU exits (`shutdown` alias)       |
 | `reboot`      | PSCI SYSTEM_RESET (`reset` alias)                    |
+
+## Processes and scheduling
+
+Processes in feos are **kernel threads**, not isolated user processes: they
+share the kernel address space, all run at EL1, and each has its own 16 KiB
+stack and saved register frame. The process table has eight slots in `.bss`;
+slot 0 is the shell, which is always PID 1 and is never reused.
+
+The board initializes a GICv2 and enables the EL1 physical timer PPI (IRQ 30).
+The timer fires at 100 Hz, the architecture's IRQ stub saves a full `TrapFrame`
+on the interrupted stack, and `kernel/src/sched.rs` swaps that frame for the
+next runnable process's frame. Returning from the exception therefore resumes a
+different process. Scheduling is a plain round-robin; there are no priorities
+and no blocking wait queues.
+
+Try it from the shell:
+
+```text
+feos> spawn tick 8 200
+started pid 2: tick
+feos> spawn tick 8 200
+started pid 3: tick
+feos> ps
+  PID  STATE    NAME
+*   1  running  shell
+    2  ready    tick
+    3  ready    tick
+feos> kill 2
+killed pid 2
+```
+
+The ticks from PIDs 2 and 3 interleave with the prompt because both apps are
+busy-waiting and the timer preempts them. `spawn` looks the command up in the
+normal app registry, so any command can run in the background. Background apps
+receive their own argument string and the `Platform` services (clock, power,
+CPU, audio, processes), but no framebuffer: graphics apps such as `gfx` and
+`splash` should stay in the foreground. A process exits when its `App::run`
+returns; the scheduler frees the slot on the next timer tick so it can be
+reused by a later `spawn`.
 
 ## The graphics library
 
@@ -482,10 +542,13 @@ its peak level, so a non-zero peak confirms the DSP path ran.
    assigns BAR0, enables bus mastering, and initialises the driver: reset,
    CORB/RIRB setup, codec discovery, 48 kHz stereo format. The shell receives
    the resulting `&dyn Audio` in `Platform`.
-7. Faults land in the vector table, which forwards a `FaultInfo` to the kernel's
+7. `kmain` installs the IRQ handler, asks the board to initialize the GICv2 and
+   enable timer PPI 30, creates the shell as PID 1, and starts the 100 Hz tick.
+   Unmasking IRQs is the point where the shell becomes preemptible.
+8. Faults land in the vector table, which forwards a `FaultInfo` to the kernel's
    reporter: `ESR_EL1`, `ELR_EL1`, `FAR_EL1`, `SPSR_EL1`, and the stack
-   pointer, then halts.
-8. `poweroff` issues PSCI `SYSTEM_OFF` over `HVC`; QEMU exits.
+   pointer, then halts. IRQs take the separate recoverable path described above.
+9. `poweroff` issues PSCI `SYSTEM_OFF` over `HVC`; QEMU exits.
 
 ## Notes and limitations
 
@@ -495,22 +558,35 @@ its peak level, so a non-zero peak confirms the DSP path ran.
   (3 MiB).
 - No double buffering, alpha blending, or hardware acceleration; the font is
   ASCII-only (non-ASCII falls back to `?`).
-- No heap, no GIC/timer interrupts, single core. The vector table is ready for
-  interrupts when a GIC driver is added.
+- Single core. All processes share one address space and run at EL1, so there
+  is no memory protection or privilege boundary between them; a fault in any
+  process halts the machine.
+- Eight process slots including the shell, 16 KiB per spawned stack, and no
+  heap. `spawn` copies at most 96 bytes of arguments into the process table.
+- Round-robin has no priorities, blocking sleep, or wait/join. `sleep` and
+  `tick` busy-wait and rely on preemption, and a process cannot wait for
+  another to exit.
+- Background processes get no framebuffer, and apps share crate-level statics:
+  avoid running the same stateful app (for example `tone`, which owns a static
+  PCM buffer) in two processes at once.
 - Audio is playback-only and interrupt-free: one HDA output stream, fixed
   48 kHz/16-bit stereo, no hardware volume or jack detection, and a three-second
-  maximum block while the driver waits for completion. QEMU's `hda-output`
+  maximum block while the driver waits for completion. The scheduler can
+  preempt the polling loop, but the HDA stream keeps running and playback
+  resumes when the `tone` process is next scheduled. QEMU's `hda-output`
   codec is required (`hda-duplex` has a capture path that can fail to start).
 - Debian's `qemu-system-arm` prints
   `Could not open option rom 'vgabios-ramfb.bin'` when `ramfb` starts. That ROM
   is x86 firmware and is unused on aarch64; the warning is harmless.
 
-Natural extensions: identity-map the kernel with caches enabled, add a GICv3 +
-`CNTP` timer tick and an animation loop, implement a bump allocator, add a
-`virtio-gpu` driver for larger modes, add interrupt-driven HDA playback with a
-mixer and hardware volume control, or parse the device tree. Each of these fits
-into an existing layer: `libs/` for the allocator, `drivers/` for GIC,
-virtio-gpu and audio, and `apps/` for an animation or audio app.
+Natural extensions: identity-map the kernel with caches enabled, add an EL0
+user mode with per-process page tables and a syscall boundary, add blocking
+sleep/wait queues and priorities to the scheduler, support GICv3/ITS, implement
+a bump allocator, add a `virtio-gpu` driver for larger modes, add
+interrupt-driven HDA playback with a mixer and hardware volume control, or
+parse the device tree. Each of these fits into an existing layer: `libs/` for
+the allocator and scheduler policy, `drivers/` for GICv3, virtio-gpu and audio,
+and `apps/` for an animation or audio app.
 
 ## License
 

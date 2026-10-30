@@ -37,6 +37,87 @@ pub struct BoardInfo {
     pub bss_range: (usize, usize),
 }
 
+/// Maximum number of processes the kernel can track at once.
+pub const MAX_PROCESSES: usize = 8;
+
+/// Maximum length of a process name, in bytes.
+pub const PROCESS_NAME_MAX: usize = 24;
+
+/// Maximum argument string length copied into a new process, in bytes.
+pub const PROCESS_ARGS_MAX: usize = 96;
+
+/// Lifecycle state of a process.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProcessState {
+    /// Runnable, waiting for the scheduler.
+    Ready,
+    /// Currently executing.
+    Running,
+    /// Finished; its slot can be reused.
+    Exited,
+}
+
+/// Snapshot of one process for `ps`-style inspection.
+#[derive(Clone, Copy)]
+pub struct ProcessInfo {
+    /// Process identifier (the main shell is PID 1).
+    pub pid: u32,
+    /// Current lifecycle state.
+    pub state: ProcessState,
+    /// UTF-8 process name, `name_len` bytes long.
+    pub name: [u8; PROCESS_NAME_MAX],
+    /// Number of valid bytes in `name`.
+    pub name_len: u8,
+}
+
+impl ProcessInfo {
+    /// An empty entry, useful for initializing a snapshot array.
+    pub const EMPTY: Self = Self {
+        pid: 0,
+        state: ProcessState::Exited,
+        name: [0; PROCESS_NAME_MAX],
+        name_len: 0,
+    };
+
+    /// Returns the process name as a string.
+    pub fn name(&self) -> &str {
+        core::str::from_utf8(&self.name[..self.name_len as usize]).unwrap_or("?")
+    }
+}
+
+/// Reasons a process could not be started.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SpawnError {
+    /// Every process slot is in use.
+    NoFreeSlot,
+    /// The argument string did not fit in the process table.
+    ArgsTooLong,
+}
+
+/// Kernel process-management service.
+///
+/// Each process has its own stack and saved register context. The kernel
+/// preempts processes on a timer tick and round-robins between them, so an app
+/// launched with [`spawn`](Processes::spawn) runs concurrently with the shell
+/// and with other background apps.
+///
+/// Background processes receive their own argument string and the [`Platform`]
+/// services, but no framebuffer: graphics apps should run in the foreground.
+pub trait Processes: Sync {
+    /// Starts `app` in a new process with `args`.
+    fn spawn(&self, app: &'static dyn App, args: &str) -> Result<u32, SpawnError>;
+
+    /// Stops the process with `pid`. Returns `false` when it does not exist or
+    /// is the main shell process.
+    fn kill(&self, pid: u32) -> bool;
+
+    /// PID of the process calling this method.
+    fn current(&self) -> u32;
+
+    /// Copies a snapshot of live processes into `out` and returns its length.
+    fn snapshot(&self, out: &mut [ProcessInfo]) -> usize;
+}
+
 /// Services the kernel makes available to every app.
 pub struct Platform {
     /// Static board facts.
@@ -49,6 +130,8 @@ pub struct Platform {
     pub cpu: &'static dyn Cpu,
     /// Audio output device, when the board found one.
     pub audio: Option<&'static dyn Audio>,
+    /// Process creation and inspection.
+    pub processes: &'static dyn Processes,
 }
 
 /// Everything an app is allowed to see when it runs.

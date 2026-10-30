@@ -19,6 +19,7 @@ use feos_hal::{Clock, Cpu, Power};
 pub mod boot;
 pub mod cpu;
 pub mod exceptions;
+pub mod irq;
 pub mod psci;
 pub mod timer;
 

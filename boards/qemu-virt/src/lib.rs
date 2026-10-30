@@ -10,18 +10,31 @@
 #![no_std]
 
 use feos_driver_fw_cfg::FwCfg;
+use feos_driver_gicv2::GicV2;
 use feos_driver_intel_hda::{CodecInfo, IntelHda};
 use feos_driver_pci::PciEcam;
 use feos_driver_pl011::Pl011;
 use feos_driver_ramfb::Ramfb;
 use feos_gfx::Canvas;
-use feos_hal::{Audio, Clock, Serial};
+use feos_hal::{Audio, Clock, InterruptController, Serial};
 
 /// Human-readable board name, shown by the `info` app.
 pub const NAME: &str = "QEMU aarch64 virt";
 
 /// PL011 UART0 on the `virt` machine.
 pub const CONSOLE_BASE: usize = 0x0900_0000;
+
+/// GICv2 distributor on the `virt` machine.
+pub const GIC_DIST_BASE: usize = 0x0800_0000;
+
+/// GICv2 CPU interface for the boot CPU.
+pub const GIC_CPU_BASE: usize = 0x0801_0000;
+
+/// Non-secure EL1 physical timer PPI (16 + 14).
+///
+/// QEMU's default `virt` configuration has no GIC security extensions, so the
+/// physical timer is PPI 30 and is acknowledged as a Group 0 interrupt.
+pub const TIMER_IRQ: u32 = 30;
 
 /// fw_cfg MMIO window on the `virt` machine.
 pub const FW_CFG_BASE: usize = 0x0902_0000;
@@ -57,6 +70,20 @@ pub const DISPLAY_HEIGHT: usize = 768;
 
 /// The single UART exposed by the machine.
 pub static UART0: Pl011 = Pl011::new(CONSOLE_BASE);
+
+/// The GICv2 controller used by the timer tick.
+pub static INTERRUPT_CONTROLLER: GicV2 = GicV2::new(GIC_DIST_BASE, GIC_CPU_BASE);
+
+/// Initializes the GIC and enables the timer interrupt.
+pub fn init_interrupts() {
+    INTERRUPT_CONTROLLER.init();
+    INTERRUPT_CONTROLLER.enable(TIMER_IRQ);
+}
+
+/// Returns the interrupt controller shared with the kernel IRQ handler.
+pub fn interrupts() -> &'static dyn InterruptController {
+    &INTERRUPT_CONTROLLER
+}
 
 /// The ramfb scanout buffer. Page aligned as required by the device.
 #[repr(align(4096))]

@@ -25,6 +25,7 @@ feos-audio = { path = "libs/audio" }
 feos-board-qemu-virt = { path = "boards/qemu-virt" }
 feos-console = { path = "libs/console" }
 feos-driver-fw-cfg = { path = "drivers/firmware/fw-cfg" }
+feos-driver-gicv2 = { path = "drivers/interrupt/gicv2" }
 feos-driver-intel-hda = { path = "drivers/audio/intel-hda" }
 feos-driver-pci = { path = "drivers/bus/pci" }
 feos-driver-pl011 = { path = "drivers/serial/pl011" }
