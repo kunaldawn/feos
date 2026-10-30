@@ -185,16 +185,49 @@ an address space would turn the same scheduler into a real process switcher.
 1. A board driver supplies a `feos_gfx::Canvas` over the framebuffer. On the
    QEMU board this is the ramfb XRGB8888 buffer.
 2. An app owns its persistent state — `InteractionState`, `TextBuffer`,
-   `WindowState`, booleans, sliders — and passes it to widgets each frame.
+   `WindowState`, component state such as `SelectState` or `TableResponse`
+   inputs, booleans, sliders — and passes it to widgets each frame.
 3. `Ui` clips drawing through a `Painter`, computes deterministic row/column/
    grid layout, and turns pointer and keyboard `Event`s into hover, press,
    click, drag, scroll and focus changes.
 4. The app decides what to do with each `Response`; `Ui` never owns a widget
    tree, allocates, or calls `unsafe`.
 
+The library has two layers. `widgets` contains the small primitives: text,
+buttons, inputs, panels, tabs, windows, dialogs and charts. `components`
+composes those primitives into the pieces an app puts on a screen: selects,
+menus, tables, trees, timelines, alerts, toasts, toolbars, pagination,
+accordions, split panes, drawers and popovers. It also carries a
+Windows/Fluent-inspired set with WinUI naming: `NavigationView`, `TabView`,
+`MenuBar`, `CommandBar`, `ListView`, `GridView`, `FlipView`, `PipsPager`,
+`InfoBar`, `InfoBadge`, `Persona`, `SettingsCard`, `HeroBanner`,
+`TeachingTip`, `Flyout`, `Calendar`, `DatePicker`, `TimePicker`,
+`AutoSuggestBox`, `ToggleButton`, `SplitButton`, `DropDownButton` and
+`HyperlinkButton`. The advanced set adds password and multiline fields, range
+sliders, knobs, tag and mention inputs, hotkey recorders, cascaders, transfer
+lists and drop zones. Composition patterns include avatar groups, presence
+badges, group boxes, property grids, log/code/diff viewers, chat and comment
+threads, result pages, selector bars, pivots, title bars, floating action
+buttons, bottom sheets, popconfirms, command palettes, swipe actions,
+pull-to-refresh, annotated scrollbars and zoom controls. Additional charts
+cover pie/donut, scatter, radar, heatmap, funnel, bullet, treemap and
+candlestick views. Both layers are inherent methods on `Ui`, so an app can mix
+them with custom widgets. See
+[`libs/gui/src/components/README.md`](../libs/gui/src/components/README.md) for
+the full component reference.
+
+Floating surfaces (select popups, menus, popovers, drawers, dialogs and toasts)
+paint immediately rather than registering an overlay. Apps therefore draw them
+late in the frame; the toolkit keeps no hidden z-order. Component state is
+fixed-capacity and caller-owned, matching the rest of the toolkit. Components
+that need more room than their container simply clip.
+
 The current board has no mouse or keyboard driver, so the `gui` app renders a
-static dashboard frame. Adding an input driver only requires feeding `Event`s
-into `Input` and clearing them per frame; the widget layer is already complete.
+static dashboard frame with an overview, charts, a classic component gallery
+and a Fluent gallery showing the newer collection, navigation and overlay
+controls, and a Patterns gallery for advanced composition and chart types.
+Adding an input driver only requires feeding `Event`s into `Input` and clearing
+them per frame; the widget layer is already complete.
 
 ## The audio path
 

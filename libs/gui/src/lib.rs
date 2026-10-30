@@ -3,7 +3,7 @@
 //! It sits directly on top of [`feos_gfx`] and turns a raw XRGB8888
 //! framebuffer into a small desktop toolkit: input events, a clipped painter,
 //! a constraint-free layout engine, persistent interaction state, themed
-//! widgets, charts and draggable windows.
+//! widgets, a reusable component library, charts and draggable windows.
 //!
 //! # Design
 //!
@@ -60,6 +60,7 @@
 #![forbid(unsafe_code)]
 
 pub mod chart;
+pub mod components;
 pub mod geometry;
 pub mod id;
 pub mod input;
@@ -72,7 +73,10 @@ pub mod theme;
 pub mod ui;
 pub mod widgets;
 
+mod math;
+
 pub use chart::{Chart, ChartPoint, Series, SeriesKind};
+pub use components::*;
 pub use geometry::{Align, Padding, RectExt, VerticalAlign};
 pub use id::Id;
 pub use input::{Event, Input, Key, Modifiers, MouseButton};
@@ -88,9 +92,20 @@ pub use widgets::*;
 /// The widgets, types and traits most apps need in one import.
 pub mod prelude {
     pub use crate::{
-        Align, Chart, ChartPoint, Event, Id, Input, InteractionState, Key, Metrics, Modifiers,
-        MouseButton, Padding, Palette, RectExt, Response, Sense, Series, SeriesKind, TextBuffer,
-        TextEditState, Theme, Ui, VerticalAlign, WindowState,
+        AccordionState, Align, AutoSuggestResponse, AutoSuggestState, Axis, CalendarResponse,
+        CalendarState, Candle, CascaderState, Chart, ChartPoint, ChatMessage, ChipResponse, Column,
+        ColumnWidth, CommandBarResponse, CommandBarState, CommandItem, CommandPaletteState,
+        ConfirmResult, DiffKind, DiffLine, DrawerSide, DrawerState, Event, FlipItem,
+        FlyoutPlacement, FlyoutState, FunnelStage, GridItem, Hotkey, Icon, Id, InfoBarResponse,
+        Input, InteractionState, Key, ListItem, ListResponse, ListState, MenuBarMenu,
+        MenuBarResponse, MenuBarState, MenuEntry, MenuResponse, MenuState, Metrics, Modifiers,
+        MouseButton, NavItem, NavigationViewResponse, NavigationViewState, Padding, Palette,
+        PieSlice, PopoverState, Presence, PullState, RadarSeries, RangeSliderState, RangeValue,
+        RectExt, Response, ScatterPoint, SelectState, Sense, Series, SeriesKind,
+        SplitButtonResponse, SplitResponse, SplitState, SwipeResponse, SwipeState, TabViewResponse,
+        TabViewState, TableResponse, TagSet, TeachingTipState, TextBuffer, TextEditState, Theme,
+        TimelineItem, Toast, ToastQueue, Tone, TransferState, TreeRow, TreeState, TreemapItem, Ui,
+        VerticalAlign, WindowState, ZoomState,
     };
     pub use feos_gfx::{Canvas, Color, Point, Rect, Size};
 }

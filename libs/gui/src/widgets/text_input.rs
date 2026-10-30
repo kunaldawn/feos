@@ -20,9 +20,50 @@ impl<'a, 'b, 's, const N: usize> Ui<'a, 'b, 's, N> {
         buffer: &mut TextBuffer<M>,
         placeholder: &str,
     ) -> Response {
+        let rect = self.allocate(220, self.theme.metrics.control_height);
+        self.text_input_at(buffer, rect, placeholder, 0, 0)
+    }
+
+    /// A text field inside an explicit rectangle with room reserved for
+    /// leading and trailing decorations.
+    ///
+    /// Components such as the search box use the insets to place an icon or a
+    /// clear button without overlapping the editable text.
+    pub(crate) fn text_input_at<const M: usize>(
+        &mut self,
+        buffer: &mut TextBuffer<M>,
+        rect: Rect,
+        placeholder: &str,
+        left_inset: i32,
+        right_inset: i32,
+    ) -> Response {
+        self.text_input_at_impl(buffer, rect, placeholder, left_inset, right_inset, false)
+    }
+
+    /// A masked text field used by [`Ui::password_box`](crate::Ui::password_box).
+    pub(crate) fn text_input_at_masked<const M: usize>(
+        &mut self,
+        buffer: &mut TextBuffer<M>,
+        rect: Rect,
+        placeholder: &str,
+        left_inset: i32,
+        right_inset: i32,
+    ) -> Response {
+        self.text_input_at_impl(buffer, rect, placeholder, left_inset, right_inset, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn text_input_at_impl<const M: usize>(
+        &mut self,
+        buffer: &mut TextBuffer<M>,
+        rect: Rect,
+        placeholder: &str,
+        left_inset: i32,
+        right_inset: i32,
+        masked: bool,
+    ) -> Response {
         let metrics = self.theme.metrics;
         let palette = self.theme.palette;
-        let rect = self.allocate(220, metrics.control_height);
         let id = self.next_id();
         let mut response = self.interact(id, rect, Sense::focus());
         response.changed = false;
@@ -103,10 +144,13 @@ impl<'a, 'b, 's, const N: usize> Ui<'a, 'b, 's, N> {
             },
         );
 
+        let left_inset = left_inset.max(0);
+        let right_inset = right_inset.max(0);
         let inner = Rect::new(
-            rect.x + metrics.padding_x,
+            rect.x + metrics.padding_x + left_inset,
             rect.y + 2,
-            rect.width.saturating_sub((metrics.padding_x * 2) as u32),
+            rect.width
+                .saturating_sub((metrics.padding_x * 2 + left_inset + right_inset) as u32),
             rect.height.saturating_sub(4),
         );
         let scale = metrics.font_scale;
@@ -115,8 +159,16 @@ impl<'a, 'b, 's, const N: usize> Ui<'a, 'b, 's, N> {
         let text = buffer.as_str();
 
         let cursor = buffer.cursor().min(text.len());
-        let caret_x = self.painter.text_width(&text[..cursor], scale);
-        let text_width = self.painter.text_width(text, scale);
+        let (caret_x, text_width) = if masked {
+            let advance = 8 * scale as i32;
+            let before = text[..cursor].chars().count() as i32 * advance;
+            (before, text.chars().count() as i32 * advance)
+        } else {
+            (
+                self.painter.text_width(&text[..cursor], scale),
+                self.painter.text_width(text, scale),
+            )
+        };
         let max_scroll = (text_width - inner.width as i32 + 4).max(0);
         let mut scroll = self.state.scroll_offset(id);
         if caret_x - scroll > inner.width as i32 - 4 {
@@ -130,8 +182,18 @@ impl<'a, 'b, 's, const N: usize> Ui<'a, 'b, 's, N> {
 
         let old_clip = self.painter.push_clip(inner);
         if let Some((start, end)) = buffer.selection() {
-            let x0 = self.painter.text_width(&text[..start], scale) - scroll;
-            let x1 = self.painter.text_width(&text[..end], scale) - scroll;
+            let advance = 8 * scale as i32;
+            let (x0, x1) = if masked {
+                (
+                    text[..start].chars().count() as i32 * advance - scroll,
+                    text[..end].chars().count() as i32 * advance - scroll,
+                )
+            } else {
+                (
+                    self.painter.text_width(&text[..start], scale) - scroll,
+                    self.painter.text_width(&text[..end], scale) - scroll,
+                )
+            };
             self.painter.fill_rect(
                 Rect::new(
                     inner.x + x0,
@@ -149,8 +211,17 @@ impl<'a, 'b, 's, const N: usize> Ui<'a, 'b, 's, N> {
         } else {
             palette.text
         };
-        self.painter
-            .draw_text(inner.x - scroll, baseline, content, color, scale);
+        if masked && !text.is_empty() {
+            let advance = 8 * scale as i32;
+            let mut x = inner.x - scroll;
+            for _ in 0..text.chars().count() {
+                self.painter.draw_char(x, baseline, '*', color, scale);
+                x += advance;
+            }
+        } else {
+            self.painter
+                .draw_text(inner.x - scroll, baseline, content, color, scale);
+        }
 
         if response.focused {
             let caret = inner.x + caret_x - scroll;

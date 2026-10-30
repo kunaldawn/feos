@@ -358,6 +358,15 @@ pub fn format_f32(value: f32, decimals: usize, out: &mut [u8]) -> &str {
     buffer.into_str()
 }
 
+/// Formats an unsigned integer into `out`.
+///
+/// Returns the formatted prefix when `out` is too small rather than panicking.
+pub fn format_u32(value: u32, out: &mut [u8]) -> &str {
+    let mut buffer = FixedBuf::new(out);
+    let _ = write!(&mut buffer, "{}", value);
+    buffer.into_str()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,7 +407,7 @@ mod tests {
         assert!(buffer.insert_str("abcd"));
         assert!(!buffer.insert('e'));
         assert_eq!(buffer.as_str(), "abcd");
-        assert!(buffer.insert_str("é") == false);
+        assert!(!buffer.insert_str("é"));
     }
 
     #[test]

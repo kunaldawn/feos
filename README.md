@@ -166,7 +166,8 @@ change.
 - `feos-gfx`: a `no_std` 2D library with pixels, rectangles, Bresenham lines,
   circles, gradients, blitting, and an 8x8 bitmap font
 - `feos-gui`: a `no_std`, allocation-free immediate-mode GUI toolkit with
-  widgets, linear layout, scrolling, text input, charts, windows and dialogs
+  widgets, a Windows/Fluent-inspired component library, linear layout,
+  scrolling, text input, charts, windows and dialogs
 - `feos-audio`: a `no_std` 16-bit PCM library with sample buffers, saturating
   mixing, fades, and sine/square/triangle/sawtooth/noise synthesis
 - `tone` shell command: synthesizes a chord with `feos-audio` and plays it
@@ -291,7 +292,7 @@ default NIC would load.
 | `echo <text>` | Print text back                                      |
 | `info`        | Board, exception level, MIDR, timer, memory, display, audio |
 | `gfx`         | Draw the graphics test card (`demo` is an alias)     |
-| `gui`         | Draw the feos-gui dashboard (`desktop`, `dashboard`) |
+| `gui`         | Draw the feos-gui dashboard and component gallery (`desktop`, `dashboard`) |
 | `splash`      | Redraw the boot splash                               |
 | `tone [ms]`   | Play an A-major chord for `ms` (default 1500, max 3000; `play` alias) |
 | `uptime`      | Milliseconds since the counter started               |
@@ -438,8 +439,59 @@ Key pieces:
   sliders, progress bars, badges, separators, text fields with selection and
   UTF-8 editing, panels, cards, scroll areas, tabs, windows, dialogs, lists,
   tooltips, and a desktop background.
-- Charts — line, area, bar and sparkline series over caller-provided slices.
+- Components — search fields, selects, menus, segmented controls, numeric
+  steppers, ratings, colour pickers, form fields, alerts, toasts, spinners,
+  skeletons, empty states, loading overlays, progress rings, confirmation
+  dialogs, toolbars, status bars, breadcrumbs, pagination, step indicators,
+  tables, key/value lists, timelines, trees, stat cards, avatars, chips,
+  accordions, split panes, drawers, popovers and a built-in icon set.
+- Windows/Fluent-inspired components — `NavigationView`, `TabView`,
+  `MenuBar`, `CommandBar`, `ListView`, `GridView`, `FlipView`, `PipsPager`,
+  `InfoBar`, `InfoBadge`, `Persona`, `SettingsCard`, `HeroBanner`,
+  `TeachingTip`, `Flyout`, context menus, `Calendar`/`DatePicker`/
+  `TimePicker`, `AutoSuggestBox`, `ToggleButton`, `SplitButton`,
+  `DropDownButton`, `HyperlinkButton` and radio groups. They follow WinUI
+  behaviour and naming where practical while keeping the same caller-owned,
+  allocation-free state model.
+- Advanced inputs — password boxes, multiline text areas, two-thumb range
+  sliders, rotary knobs, tag editors, hotkey recorders, cascaders, transfer
+  lists, file drop zones and `@mention` fields.
+- Patterns — avatar groups, presence badges, group boxes, property grids, log,
+  code and diff viewers, comment/chat threads, result pages, selector bars,
+  pivots, title bars, floating action buttons, back-to-top controls, bottom
+  sheets, popconfirms, command palettes, swipe actions, pull-to-refresh,
+  annotated scrollbars and zoom controls.
+- Charts — line, area, bar and sparkline series over caller-provided slices,
+  plus pie, donut, scatter, radar, heatmap, funnel, bullet, treemap and
+  candlestick charts. All chart data is caller-owned and allocation-free.
+
+The library now exposes well over 100 reusable components and widgets, and the
+same list keeps growing without changing the layering rules: `Ui` methods,
+caller-owned state and a clipped painter. The full component inventory lives in
+[`libs/gui/src/components/README.md`](libs/gui/src/components/README.md).
 - `WindowState` — draggable and resizable window geometry, also caller-owned.
+
+Components are still inherent methods on `Ui`, and their state is caller-owned
+the same way widget state is. There is no hidden widget tree or z-order stack:
+popups, menus, drawers, popovers and toasts paint inline, so draw them late in
+the frame when they need to float over other content.
+
+```rust
+let mut select = SelectState::new();
+let mut theme_choice = 0;
+let mut page = 0;
+let mut tabs = TabViewState::from_titles(["Overview", "Details", "Activity"]);
+let mut menu = MenuBarState::new();
+let mut list = ListState::<8>::new();
+
+ui.menu_bar(&mut menu, &[MenuBarMenu::new("File", &file_entries)]);
+ui.list_view(list_rect, &items, &mut list);
+ui.tab_view(&mut tabs, panel, |ui, _content| {
+    ui.label("Content for the active tab");
+});
+ui.select(&mut select, &mut theme_choice, &["Dark", "Light"], "Theme");
+ui.pagination(&mut page, 8);
+```
 
 Everything is fallible only at the edges: `Canvas::new` validates the buffer,
 while widgets simply clip or skip work when there is no room.

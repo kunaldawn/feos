@@ -87,6 +87,12 @@ impl<'a, 'b, 's, const N: usize> Ui<'a, 'b, 's, N> {
         self.button_at(rect, text, true)
     }
 
+    /// A filled accent button with an explicit width.
+    pub fn primary_button_sized(&mut self, width: i32, text: &str) -> Response {
+        let rect = self.allocate_sized(width, self.theme.metrics.control_height);
+        self.button_at(rect, text, true)
+    }
+
     /// Draws a button into a caller-provided rectangle.
     pub fn button_at(&mut self, rect: Rect, text: &str, primary: bool) -> Response {
         let id = self.next_id();

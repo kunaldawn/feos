@@ -301,6 +301,70 @@ impl<'a, 'buf> Painter<'a, 'buf> {
         }
     }
 
+    /// Draws a filled polygon using an even-odd scanline fill.
+    ///
+    /// The polygon is implicitly closed. Self-intersecting polygons follow the
+    /// even-odd rule. The scanline intersection buffer is fixed, so extremely
+    /// complex polygons degrade to the first 128 crossings rather than
+    /// allocating.
+    pub fn fill_polygon(&mut self, points: &[Point], color: Color) {
+        if points.len() < 3 {
+            return;
+        }
+        let clip = self.clip;
+        let mut min_y = i32::MAX;
+        let mut max_y = i32::MIN;
+        for point in points {
+            min_y = min_y.min(point.y);
+            max_y = max_y.max(point.y);
+        }
+        min_y = min_y.max(clip.y);
+        max_y = max_y.min(clip.bottom_i32() - 1);
+        let mut crossings = [0i32; 128];
+        for y in min_y..=max_y {
+            let scan = y as f32 + 0.5;
+            let mut count = 0usize;
+            for index in 0..points.len() {
+                let a = points[index];
+                let b = points[(index + 1) % points.len()];
+                let ay = a.y as f32;
+                let by = b.y as f32;
+                if (ay <= scan && by > scan) || (by <= scan && ay > scan) {
+                    let t = (scan - ay) / (by - ay);
+                    let x = a.x as f32 + t * (b.x - a.x) as f32;
+                    if count < crossings.len() {
+                        crossings[count] = if x >= 0.0 { x as i32 } else { x as i32 - 1 };
+                        count += 1;
+                    }
+                }
+            }
+            if count < 2 {
+                continue;
+            }
+            let xs = &mut crossings[..count];
+            // Insertion sort keeps this allocation-free and the crossing
+            // counts are small for UI-style polygons.
+            for i in 1..xs.len() {
+                let value = xs[i];
+                let mut j = i;
+                while j > 0 && xs[j - 1] > value {
+                    xs[j] = xs[j - 1];
+                    j -= 1;
+                }
+                xs[j] = value;
+            }
+            let mut index = 0;
+            while index + 1 < count {
+                let x0 = xs[index].max(clip.x);
+                let x1 = xs[index + 1].min(clip.right_i32());
+                if x1 > x0 {
+                    self.fill_rect(Rect::new(x0, y, (x1 - x0) as u32, 1), color);
+                }
+                index += 2;
+            }
+        }
+    }
+
     /// Draws a horizontal line, clipped.
     pub fn hline(&mut self, x0: i32, x1: i32, y: i32, color: Color) {
         if x0 <= x1 {
@@ -736,5 +800,19 @@ mod tests {
         painter.shadow(Rect::new(6, 6, 18, 18), 4, 4, 160);
         assert_ne!(canvas.pixel(15, 27), Some(Color::WHITE));
         assert_ne!(canvas.pixel(15, 15), Some(Color::WHITE));
+    }
+
+    #[test]
+    fn polygons_fill_their_interior_and_respect_clipping() {
+        let mut pixels = [0u32; 20 * 20];
+        let mut canvas = canvas(&mut pixels, 20, 20);
+        let mut painter = Painter::new(&mut canvas);
+        painter.fill_polygon(
+            &[Point::new(2, 2), Point::new(18, 2), Point::new(10, 18)],
+            Color::RED,
+        );
+        assert_eq!(canvas.pixel(10, 6), Some(Color::RED));
+        assert_eq!(canvas.pixel(3, 16), Some(Color::BLACK));
+        assert_eq!(canvas.pixel(1, 1), Some(Color::BLACK));
     }
 }
