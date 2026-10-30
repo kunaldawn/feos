@@ -30,6 +30,7 @@ FEOS_DISPLAY ?= gtk
 
 .PHONY: all build check run clean test test-gfx test-gui test-audio test-sync \
         test-json test-yaml test-image test-audio-codec test-compress test-archive \
+        test-h264 test-video \
         audio-demo docker-build docker-run docker-run-vnc docker-audio docker-shell
 
 all: build
@@ -46,7 +47,7 @@ run: build
 	mkdir -p target/audio
 	$(QEMU) $(QEMU_FLAGS) -display $(QEMU_DISPLAY) -kernel $(KERNEL)
 
-test: test-gfx test-gui test-audio test-sync test-json test-yaml test-image test-audio-codec test-compress test-archive
+test: test-gfx test-gui test-audio test-sync test-json test-yaml test-image test-audio-codec test-compress test-archive test-h264 test-video
 
 # Host-side tests. Architecture and board crates contain AArch64 assembly or
 # MMIO, so the test set is explicit rather than `--workspace`.
@@ -79,6 +80,12 @@ test-compress:
 
 test-archive:
 	cargo test -p feos-archive --target x86_64-unknown-linux-gnu
+
+test-h264:
+	cargo test -p feos-h264 --target x86_64-unknown-linux-gnu
+
+test-video:
+	cargo test -p feos-video --target x86_64-unknown-linux-gnu
 
 # Host-side audio demo: renders the same library's PCM to a WAV on the host
 # without booting QEMU. The kernel itself plays through the HDA driver with the

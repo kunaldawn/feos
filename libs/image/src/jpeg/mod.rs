@@ -675,5 +675,7 @@ fn sample_index(
 ) -> usize {
     let sx = px * c.h / max_h;
     let sy = py * c.v / max_v;
-    component * 256 + sy * 8 * c.h + sx
+    let block_x = sx / 8;
+    let block_y = sy / 8;
+    component * 256 + (block_y * c.h + block_x) * 64 + (sy % 8) * 8 + (sx % 8)
 }

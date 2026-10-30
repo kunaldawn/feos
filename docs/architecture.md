@@ -40,7 +40,8 @@ Every workspace crate uses the `feos-` prefix. Crates that fill a role use
 - `feos-driver-pl011`, `feos-driver-fw-cfg`, `feos-driver-ramfb`
 - `feos-driver-pci`, `feos-driver-intel-hda`, `feos-driver-gicv2`
 - `feos-hal`, `feos-sync`, `feos-console`, `feos-gfx`, `feos-gui`,
-  `feos-audio`, `feos-app`
+  `feos-audio`, `feos-image`, `feos-audio-codec`, `feos-video`, `feos-h264`,
+  `feos-compress`, `feos-archive`, `feos-app`
 - `feos-apps`, `feos-shell`
 - `feos-kernel` (binary name: `feos`)
 

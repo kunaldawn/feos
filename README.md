@@ -106,6 +106,8 @@ app registry).
 │   ├── yaml/                   # feos-yaml: practical-subset YAML parser/emitter
 │   ├── image/                  # feos-image: PNG, JPEG, BMP, PPM and QOI codecs
 │   ├── audio-codec/            # feos-audio-codec: WAVE, AIFF, AU, MP3, Ogg
+│   ├── h264/                   # feos-h264: vendored H.264/AVC decoder
+│   ├── video/                  # feos-video: containers, GIF, MJPEG, raw video
 │   ├── compress/               # feos-compress: DEFLATE, zlib and gzip
 │   ├── archive/                # feos-archive: ZIP, TAR and gzip archives
 │   └── app/                    # feos-app: App trait, Context, Platform
@@ -184,6 +186,11 @@ change.
   PPM/QOI encoders, all writing into caller-provided RGBA buffers
 - `feos-audio-codec`: WAVE/AIFF/AU and MP3 decoding, PCM16 WAVE/AIFF
   encoding, and Ogg Opus header/page/TOC inspection
+- `feos-h264`: a vendored, `no_std` H.264/AVC decoder (CAVLC/CABAC, P/B
+  pictures, reference frames) with `alloc`-backed picture storage
+- `feos-video`: GIF, AVI, MP4/MOV, Matroska/WebM, FLV, IVF, Annex-B H.264 and
+  Motion JPEG demuxing, with RGBA decoding for GIF, MJPEG, raw/RLE video and
+  H.264; other codecs are recognised and reported as unsupported
 - `feos-compress`: allocation-free raw DEFLATE, zlib and multi-member gzip
   compression/decompression with CRC-32 and Adler-32
 - `feos-archive`: ZIP, TAR (ustar/GNU/PAX) and gzip readers, extraction into
@@ -197,7 +204,7 @@ change.
 - Interactive serial shell with line editing (backspace, Ctrl-C)
 - App registry with per-command crates/modules and aliases
 - Host unit tests for the graphics, GUI, audio, synchronization, JSON, YAML,
-  image, audio-codec, compression, and archive libraries
+  image, audio-codec, video, H.264, compression, and archive libraries
 - Docker image containing Rust, QEMU with GTK (window) and VNC display support
 
 ## Quick start (Docker)
@@ -405,7 +412,7 @@ make test
 # equivalent to:
 cargo test -p feos-gfx -p feos-gui -p feos-audio -p feos-sync \
     -p feos-json -p feos-yaml -p feos-image -p feos-audio-codec \
-    -p feos-compress -p feos-archive \
+    -p feos-h264 -p feos-video -p feos-compress -p feos-archive \
     --target x86_64-unknown-linux-gnu
 ```
 
@@ -568,8 +575,10 @@ API summary:
 
 ## Data and media libraries
 
-These libraries follow the same rules as `feos-gfx`: `no_std`, no dependencies,
-no allocator, no `unsafe`, and caller-provided buffers.
+These libraries follow the same rules as `feos-gfx` where practical: `no_std`,
+dependency-light, and caller-provided buffers. `feos-video` builds on
+`feos-image` and `feos-h264`; `feos-h264` is the one media crate that uses
+`alloc` and contains the vendored unsafe NEON kernels.
 
 | Crate | Formats | Notes |
 |-------|---------|-------|
@@ -577,6 +586,8 @@ no allocator, no `unsafe`, and caller-provided buffers.
 | `feos-yaml` | YAML subset | block/flow mappings and sequences, quoted and block scalars |
 | `feos-image` | PNG, JPEG, BMP, PPM, QOI | decodes to RGBA8888; PNG/BMP/PPM/QOI encoders |
 | `feos-audio-codec` | WAVE, AIFF, AU, MP3, Ogg | decodes to interleaved `i16`; WAVE/AIFF encoders |
+| `feos-h264` | H.264/AVC | Baseline/Main/High 4:2:0 decode; uses `alloc` |
+| `feos-video` | GIF, AVI, MP4/MOV, Matroska/WebM, FLV, IVF, Annex-B, MJPEG | decodes GIF, MJPEG, raw/RLE and H.264 to RGBA8888 |
 | `feos-compress` | DEFLATE, zlib, gzip | inflate plus a small fixed-Huffman deflater; CRC-32/Adler-32 |
 | `feos-archive` | ZIP, TAR, gzip | stored/deflate ZIP, ustar/GNU/PAX TAR, ZIP/TAR writers |
 
@@ -614,6 +625,19 @@ let decoded = decode(wav_bytes, &mut pcm, &mut [])?;
 assert_eq!(decoded.info.sample_rate, 44_100);
 ```
 
+Video decodes into the same RGBA canvas, with scratch space only for animated
+GIF:
+
+```rust
+use feos_video::{decode_frame, info, scratch_len};
+
+let props = info(video_bytes)?;
+let mut rgba = vec![0u8; props.rgba_len()?];
+let mut scratch = vec![0u8; scratch_len(video_bytes)?];
+let frame = decode_frame(video_bytes, 0, &mut rgba, &mut scratch)?;
+assert_eq!((frame.width, frame.height), (props.width, props.height));
+```
+
 Compression and archives use the same caller-buffer model:
 
 ```rust
@@ -644,6 +668,12 @@ Current scope limits:
   `AudioError::UnsupportedFeature`.
 - MP3 is decoded by a vendored, safe-Rust port of minimp3
   (`libs/audio-codec/src/mp3/`, MIT OR Apache-2.0).
+- `feos-video` reconstructs pixels for GIF, MJPEG, uncompressed/RLE AVI and
+  H.264. HEVC, VP8, VP9, AV1, MPEG-1/2/4, Theora, ProRes, VC-1, VP6, H.263 and
+  Cinepak are recognised and their samples are locatable, but `decode_frame`
+  returns `UnsupportedCodec` for them. Fragmented MP4 is not supported.
+- H.264 limits follow `feos-h264`: 8-bit progressive 4:2:0 Baseline, Main and
+  High profiles, with unsupported features reported as errors.
 - `feos-archive` reads ZIP64, multi-disk and encrypted archives only far enough
   to reject them; extraction supports stored (`0`) and deflate (`8`) members.
   The TAR writer emits ustar headers, while the reader also handles GNU long
@@ -657,7 +687,7 @@ Current scope limits:
 Host tests:
 
 ```sh
-make test-json test-yaml test-image test-audio-codec test-compress test-archive
+make test-json test-yaml test-image test-audio-codec test-h264 test-video test-compress test-archive
 ```
 
 ## The audio driver

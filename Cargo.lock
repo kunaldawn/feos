@@ -118,6 +118,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "feos-h264"
+version = "0.1.0"
+
+[[package]]
 name = "feos-hal"
 version = "0.1.0"
 
@@ -158,6 +162,14 @@ dependencies = [
 [[package]]
 name = "feos-sync"
 version = "0.1.0"
+
+[[package]]
+name = "feos-video"
+version = "0.1.0"
+dependencies = [
+ "feos-h264",
+ "feos-image",
+]
 
 [[package]]
 name = "feos-yaml"

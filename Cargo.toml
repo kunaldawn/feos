@@ -35,11 +35,13 @@ feos-driver-pl011 = { path = "drivers/serial/pl011" }
 feos-driver-ramfb = { path = "drivers/display/ramfb" }
 feos-gfx = { path = "libs/gfx" }
 feos-gui = { path = "libs/gui" }
+feos-h264 = { path = "libs/h264" }
 feos-hal = { path = "libs/hal" }
 feos-image = { path = "libs/image" }
 feos-json = { path = "libs/json" }
 feos-shell = { path = "apps/shell" }
 feos-sync = { path = "libs/sync" }
+feos-video = { path = "libs/video" }
 feos-yaml = { path = "libs/yaml" }
 
 # A kernel cannot unwind. These profiles apply to every workspace crate.

@@ -1,0 +1,12 @@
+[package]
+name = "feos-h264"
+description = "A dependency-free, no_std H.264/AVC decoder for the feos kernel"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+
+[features]
+default = []
+upstream-tests = []
