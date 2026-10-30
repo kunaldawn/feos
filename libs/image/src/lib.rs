@@ -34,7 +34,6 @@
 
 pub mod bmp;
 mod error;
-mod inflate;
 pub mod jpeg;
 pub mod png;
 pub mod ppm;

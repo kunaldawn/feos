@@ -8,7 +8,6 @@
 //! keeps the encoder small while still producing standards-compliant PNG files.
 
 use crate::error::{need, ImageError, Result};
-use crate::inflate;
 use crate::{ImageFormat, ImageInfo};
 
 const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
@@ -338,7 +337,10 @@ pub fn decode(input: &[u8], out: &mut [u8], scratch: &mut [u8]) -> Result<ImageI
                 available: scratch.len(),
             });
         }
-        inflate::zlib_decompress(&input[idat.first_data..idat.end], &mut scratch[..raw_len])?;
+        feos_compress::zlib::decompress(
+            &input[idat.first_data..idat.end],
+            &mut scratch[..raw_len],
+        )?;
     } else {
         let required = raw_len
             .checked_add(idat.total)
@@ -351,7 +353,7 @@ pub fn decode(input: &[u8], out: &mut [u8], scratch: &mut [u8]) -> Result<ImageI
         }
         let (raw, compressed) = scratch.split_at_mut(raw_len);
         let written = copy_idat(input, pos, compressed)?;
-        inflate::zlib_decompress(&compressed[..written], raw)?;
+        feos_compress::zlib::decompress(&compressed[..written], raw)?;
     }
 
     unfilter(header, &mut scratch[..raw_len])?;

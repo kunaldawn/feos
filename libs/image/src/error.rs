@@ -55,6 +55,26 @@ impl fmt::Display for ImageError {
 /// Result type used throughout the crate.
 pub type Result<T> = core::result::Result<T, ImageError>;
 
+impl From<feos_compress::CompressError> for ImageError {
+    fn from(error: feos_compress::CompressError) -> Self {
+        use feos_compress::CompressError;
+        match error {
+            CompressError::UnexpectedEnd => Self::UnexpectedEnd,
+            CompressError::InvalidData(what) => Self::InvalidData(what),
+            CompressError::UnsupportedFeature(feature) => Self::UnsupportedFeature(feature),
+            CompressError::Checksum => Self::Checksum,
+            CompressError::BufferTooSmall {
+                required,
+                available,
+            } => Self::BufferTooSmall {
+                required,
+                available,
+            },
+            CompressError::Overflow => Self::Overflow,
+        }
+    }
+}
+
 /// Helper for checking that a slice has at least `n` remaining bytes.
 pub(crate) fn need(len: usize, index: usize, n: usize) -> Result<()> {
     if index.checked_add(n).map_or(true, |end| end > len) {

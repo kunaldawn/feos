@@ -102,6 +102,12 @@ app registry).
 │   ├── gfx/                    # feos-gfx: dependency-free 2D graphics
 │   ├── gui/                    # feos-gui: immediate-mode widgets, layout, charts
 │   ├── audio/                  # feos-audio: PCM buffers, mixing, synthesis
+│   ├── json/                   # feos-json: allocation-free JSON parser/writer
+│   ├── yaml/                   # feos-yaml: practical-subset YAML parser/emitter
+│   ├── image/                  # feos-image: PNG, JPEG, BMP, PPM and QOI codecs
+│   ├── audio-codec/            # feos-audio-codec: WAVE, AIFF, AU, MP3, Ogg
+│   ├── compress/               # feos-compress: DEFLATE, zlib and gzip
+│   ├── archive/                # feos-archive: ZIP, TAR and gzip archives
 │   └── app/                    # feos-app: App trait, Context, Platform
 │
 └── apps/
@@ -178,6 +184,10 @@ change.
   PPM/QOI encoders, all writing into caller-provided RGBA buffers
 - `feos-audio-codec`: WAVE/AIFF/AU and MP3 decoding, PCM16 WAVE/AIFF
   encoding, and Ogg Opus header/page/TOC inspection
+- `feos-compress`: allocation-free raw DEFLATE, zlib and multi-member gzip
+  compression/decompression with CRC-32 and Adler-32
+- `feos-archive`: ZIP, TAR (ustar/GNU/PAX) and gzip readers, extraction into
+  caller buffers, and ZIP/TAR writers
 - `tone` shell command: synthesizes a chord with `feos-audio` and plays it
   through the HDA codec
 - Boot splash and an interactive graphics test card
@@ -187,7 +197,7 @@ change.
 - Interactive serial shell with line editing (backspace, Ctrl-C)
 - App registry with per-command crates/modules and aliases
 - Host unit tests for the graphics, GUI, audio, synchronization, JSON, YAML,
-  image, and audio-codec libraries
+  image, audio-codec, compression, and archive libraries
 - Docker image containing Rust, QEMU with GTK (window) and VNC display support
 
 ## Quick start (Docker)
@@ -395,6 +405,7 @@ make test
 # equivalent to:
 cargo test -p feos-gfx -p feos-gui -p feos-audio -p feos-sync \
     -p feos-json -p feos-yaml -p feos-image -p feos-audio-codec \
+    -p feos-compress -p feos-archive \
     --target x86_64-unknown-linux-gnu
 ```
 
@@ -557,8 +568,8 @@ API summary:
 
 ## Data and media libraries
 
-Four additional libraries follow the same rules as `feos-gfx`: `no_std`, no
-dependencies, no allocator, no `unsafe`, and caller-provided buffers.
+These libraries follow the same rules as `feos-gfx`: `no_std`, no dependencies,
+no allocator, no `unsafe`, and caller-provided buffers.
 
 | Crate | Formats | Notes |
 |-------|---------|-------|
@@ -566,6 +577,8 @@ dependencies, no allocator, no `unsafe`, and caller-provided buffers.
 | `feos-yaml` | YAML subset | block/flow mappings and sequences, quoted and block scalars |
 | `feos-image` | PNG, JPEG, BMP, PPM, QOI | decodes to RGBA8888; PNG/BMP/PPM/QOI encoders |
 | `feos-audio-codec` | WAVE, AIFF, AU, MP3, Ogg | decodes to interleaved `i16`; WAVE/AIFF encoders |
+| `feos-compress` | DEFLATE, zlib, gzip | inflate plus a small fixed-Huffman deflater; CRC-32/Adler-32 |
+| `feos-archive` | ZIP, TAR, gzip | stored/deflate ZIP, ustar/GNU/PAX TAR, ZIP/TAR writers |
 
 JSON and YAML borrow both the source text and a caller-owned node arena:
 
@@ -601,6 +614,25 @@ let decoded = decode(wav_bytes, &mut pcm, &mut [])?;
 assert_eq!(decoded.info.sample_rate, 44_100);
 ```
 
+Compression and archives use the same caller-buffer model:
+
+```rust
+use feos_archive::zip::ZipReader;
+
+let mut gz = vec![0u8; feos_compress::deflate::bound(data.len()) + 64];
+let len = feos_compress::gzip::compress(data, &mut gz)?;
+let mut plain = vec![0u8; data.len()];
+let written = feos_compress::gzip::decompress(&gz[..len], &mut plain)?;
+assert_eq!(&plain[..written], data);
+
+let mut zip = ZipReader::open(zip_bytes)?;
+let mut out = vec![0u8; 4096];
+while let Some(entry) = zip.next()? {
+    let written = entry.extract(&mut out)?;
+    let _ = (entry.name()?, &out[..written]);
+}
+```
+
 Current scope limits:
 
 - JPEG supports baseline and extended-sequential 8-bit files. Progressive
@@ -612,11 +644,20 @@ Current scope limits:
   `AudioError::UnsupportedFeature`.
 - MP3 is decoded by a vendored, safe-Rust port of minimp3
   (`libs/audio-codec/src/mp3/`, MIT OR Apache-2.0).
+- `feos-archive` reads ZIP64, multi-disk and encrypted archives only far enough
+  to reject them; extraction supports stored (`0`) and deflate (`8`) members.
+  The TAR writer emits ustar headers, while the reader also handles GNU long
+  names and PAX `path`/`linkpath`/`size` records.
+- `feos-compress` writes one fixed-Huffman DEFLATE block with greedy LZ77
+  matching. The output is standards-compliant but larger than zlib's optimal
+  encoder. Decompression handles all legal dynamic-Huffman DEFLATE streams.
+- The PNG decoder uses `feos-compress` for zlib, so compressed image support is
+  shared with archives rather than duplicated.
 
 Host tests:
 
 ```sh
-make test-json test-yaml test-image test-audio-codec
+make test-json test-yaml test-image test-audio-codec test-compress test-archive
 ```
 
 ## The audio driver

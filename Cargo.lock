@@ -29,6 +29,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "feos-archive"
+version = "0.1.0"
+dependencies = [
+ "feos-compress",
+]
+
+[[package]]
 name = "feos-audio"
 version = "0.1.0"
 
@@ -50,6 +57,10 @@ dependencies = [
  "feos-gfx",
  "feos-hal",
 ]
+
+[[package]]
+name = "feos-compress"
+version = "0.1.0"
 
 [[package]]
 name = "feos-console"
@@ -113,6 +124,9 @@ version = "0.1.0"
 [[package]]
 name = "feos-image"
 version = "0.1.0"
+dependencies = [
+ "feos-compress",
+]
 
 [[package]]
 name = "feos-json"
