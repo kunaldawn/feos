@@ -22,6 +22,7 @@ feos-app = { path = "libs/app" }
 feos-apps = { path = "apps/commands" }
 feos-arch-aarch64 = { path = "arch/aarch64" }
 feos-audio = { path = "libs/audio" }
+feos-audio-codec = { path = "libs/audio-codec" }
 feos-board-qemu-virt = { path = "boards/qemu-virt" }
 feos-console = { path = "libs/console" }
 feos-driver-fw-cfg = { path = "drivers/firmware/fw-cfg" }
@@ -33,8 +34,11 @@ feos-driver-ramfb = { path = "drivers/display/ramfb" }
 feos-gfx = { path = "libs/gfx" }
 feos-gui = { path = "libs/gui" }
 feos-hal = { path = "libs/hal" }
+feos-image = { path = "libs/image" }
+feos-json = { path = "libs/json" }
 feos-shell = { path = "apps/shell" }
 feos-sync = { path = "libs/sync" }
+feos-yaml = { path = "libs/yaml" }
 
 # A kernel cannot unwind. These profiles apply to every workspace crate.
 [profile.dev]

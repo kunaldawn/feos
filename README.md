@@ -170,6 +170,14 @@ change.
   scrolling, text input, charts, windows and dialogs
 - `feos-audio`: a `no_std` 16-bit PCM library with sample buffers, saturating
   mixing, fades, and sine/square/triangle/sawtooth/noise synthesis
+- `feos-json`: a `no_std`, allocation-free RFC 8259 parser/writer with a
+  caller-provided node arena
+- `feos-yaml`: a practical-subset YAML parser/emitter (block and flow
+  collections, quoted and block scalars, comments, document markers)
+- `feos-image`: PNG, baseline JPEG, BMP, PPM and QOI decoders plus PNG/BMP/
+  PPM/QOI encoders, all writing into caller-provided RGBA buffers
+- `feos-audio-codec`: WAVE/AIFF/AU and MP3 decoding, PCM16 WAVE/AIFF
+  encoding, and Ogg Opus header/page/TOC inspection
 - `tone` shell command: synthesizes a chord with `feos-audio` and plays it
   through the HDA codec
 - Boot splash and an interactive graphics test card
@@ -178,7 +186,8 @@ change.
 - PSCI over `HVC` for clean `poweroff` / `reboot`
 - Interactive serial shell with line editing (backspace, Ctrl-C)
 - App registry with per-command crates/modules and aliases
-- Host unit tests for the graphics, GUI, audio, and synchronization libraries
+- Host unit tests for the graphics, GUI, audio, synchronization, JSON, YAML,
+  image, and audio-codec libraries
 - Docker image containing Rust, QEMU with GTK (window) and VNC display support
 
 ## Quick start (Docker)
@@ -384,7 +393,9 @@ The library is host-testable:
 ```sh
 make test
 # equivalent to:
-cargo test -p feos-gfx -p feos-gui -p feos-audio -p feos-sync --target x86_64-unknown-linux-gnu
+cargo test -p feos-gfx -p feos-gui -p feos-audio -p feos-sync \
+    -p feos-json -p feos-yaml -p feos-image -p feos-audio-codec \
+    --target x86_64-unknown-linux-gnu
 ```
 
 ## The GUI library
@@ -543,6 +554,70 @@ API summary:
 - `AudioFormat`: sample rate plus mono/stereo constructors
 - `Oscillator` + `Waveform`: sine, square, triangle, sawtooth, and noise with
   changeable frequency, amplitude, and phase reset
+
+## Data and media libraries
+
+Four additional libraries follow the same rules as `feos-gfx`: `no_std`, no
+dependencies, no allocator, no `unsafe`, and caller-provided buffers.
+
+| Crate | Formats | Notes |
+|-------|---------|-------|
+| `feos-json` | JSON | RFC 8259 parse into a node arena, compact/pretty emit |
+| `feos-yaml` | YAML subset | block/flow mappings and sequences, quoted and block scalars |
+| `feos-image` | PNG, JPEG, BMP, PPM, QOI | decodes to RGBA8888; PNG/BMP/PPM/QOI encoders |
+| `feos-audio-codec` | WAVE, AIFF, AU, MP3, Ogg | decodes to interleaved `i16`; WAVE/AIFF encoders |
+
+JSON and YAML borrow both the source text and a caller-owned node arena:
+
+```rust
+use feos_json::{JsonDocument, JsonNode};
+
+let mut arena = [JsonNode::EMPTY; 64];
+let doc = JsonDocument::parse(r#"{"name":"feos","cores":4}"#, &mut arena).unwrap();
+let root = doc.root();
+assert_eq!(doc.as_i64(doc.get(root, "cores").unwrap()), Some(4));
+```
+
+Images decode into an RGBA buffer, with optional scratch space for PNG's
+inflated scanlines:
+
+```rust
+use feos_image::{decode, info, scratch_len};
+
+let info = info(png_bytes)?;
+let mut rgba = vec![0u8; info.rgba_len()?];
+let mut scratch = vec![0u8; scratch_len(png_bytes)?];
+decode(png_bytes, &mut rgba, &mut scratch)?;
+```
+
+Audio follows the same pattern with `i16` samples:
+
+```rust
+use feos_audio_codec::{decode, info};
+
+let props = info(wav_bytes)?;
+let mut pcm = vec![0i16; props.sample_count()?];
+let decoded = decode(wav_bytes, &mut pcm, &mut [])?;
+assert_eq!(decoded.info.sample_rate, 44_100);
+```
+
+Current scope limits:
+
+- JPEG supports baseline and extended-sequential 8-bit files. Progressive
+  JPEG, arithmetic coding and CMYK are rejected with `UnsupportedFeature`.
+- The PNG encoder uses uncompressed zlib "stored" blocks, which keeps the
+  encoder tiny but does not reduce file size.
+- Ogg Opus container headers, pages and packet TOC bytes can be inspected, but
+  Opus packet decoding to PCM is **not implemented yet** and returns
+  `AudioError::UnsupportedFeature`.
+- MP3 is decoded by a vendored, safe-Rust port of minimp3
+  (`libs/audio-codec/src/mp3/`, MIT OR Apache-2.0).
+
+Host tests:
+
+```sh
+make test-json test-yaml test-image test-audio-codec
+```
 
 ## The audio driver
 

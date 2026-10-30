@@ -1,0 +1,8 @@
+[package]
+name = "feos-audio-codec"
+description = "Dependency-free audio codecs for the feos kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

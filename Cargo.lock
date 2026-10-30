@@ -33,6 +33,10 @@ name = "feos-audio"
 version = "0.1.0"
 
 [[package]]
+name = "feos-audio-codec"
+version = "0.1.0"
+
+[[package]]
 name = "feos-board-qemu-virt"
 version = "0.1.0"
 dependencies = [
@@ -107,6 +111,14 @@ name = "feos-hal"
 version = "0.1.0"
 
 [[package]]
+name = "feos-image"
+version = "0.1.0"
+
+[[package]]
+name = "feos-json"
+version = "0.1.0"
+
+[[package]]
 name = "feos-kernel"
 version = "0.1.0"
 dependencies = [
@@ -131,4 +143,8 @@ dependencies = [
 
 [[package]]
 name = "feos-sync"
+version = "0.1.0"
+
+[[package]]
+name = "feos-yaml"
 version = "0.1.0"

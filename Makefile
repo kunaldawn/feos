@@ -29,6 +29,7 @@ QEMU_FLAGS   ?= -machine virt -cpu cortex-a53 -smp 1 -m 128M -net none -device r
 FEOS_DISPLAY ?= gtk
 
 .PHONY: all build check run clean test test-gfx test-gui test-audio test-sync \
+        test-json test-yaml test-image test-audio-codec \
         audio-demo docker-build docker-run docker-run-vnc docker-audio docker-shell
 
 all: build
@@ -45,7 +46,7 @@ run: build
 	mkdir -p target/audio
 	$(QEMU) $(QEMU_FLAGS) -display $(QEMU_DISPLAY) -kernel $(KERNEL)
 
-test: test-gfx test-gui test-audio test-sync
+test: test-gfx test-gui test-audio test-sync test-json test-yaml test-image test-audio-codec
 
 # Host-side tests. Architecture and board crates contain AArch64 assembly or
 # MMIO, so the test set is explicit rather than `--workspace`.
@@ -60,6 +61,18 @@ test-audio:
 
 test-sync:
 	cargo test -p feos-sync --target x86_64-unknown-linux-gnu
+
+test-json:
+	cargo test -p feos-json --target x86_64-unknown-linux-gnu
+
+test-yaml:
+	cargo test -p feos-yaml --target x86_64-unknown-linux-gnu
+
+test-image:
+	cargo test -p feos-image --target x86_64-unknown-linux-gnu
+
+test-audio-codec:
+	cargo test -p feos-audio-codec --target x86_64-unknown-linux-gnu
 
 # Host-side audio demo: renders the same library's PCM to a WAV on the host
 # without booting QEMU. The kernel itself plays through the HDA driver with the
