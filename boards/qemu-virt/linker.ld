@@ -36,7 +36,7 @@ SECTIONS
 
     .stack (NOLOAD) : ALIGN(16) {
         __stack_bottom = .;
-        . += 0x10000;          /* 64 KiB kernel stack */
+        . += 0x40000;          /* 256 KiB kernel stack */
         __stack_top = .;
     }
 

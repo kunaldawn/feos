@@ -30,8 +30,8 @@ FEOS_DISPLAY ?= gtk
 
 .PHONY: all build check run clean test test-gfx test-gui test-audio test-sync \
         test-json test-yaml test-image test-audio-codec test-compress test-archive \
-        test-h264 test-video \
-        audio-demo docker-build docker-run docker-run-vnc docker-audio docker-shell
+        test-h264 test-video test-text test-bundle test-init test-desktop test-desktop-app \
+        bundles audio-demo docker-build docker-run docker-run-vnc docker-audio docker-shell
 
 all: build
 
@@ -47,7 +47,7 @@ run: build
 	mkdir -p target/audio
 	$(QEMU) $(QEMU_FLAGS) -display $(QEMU_DISPLAY) -kernel $(KERNEL)
 
-test: test-gfx test-gui test-audio test-sync test-json test-yaml test-image test-audio-codec test-compress test-archive test-h264 test-video
+test: test-gfx test-gui test-audio test-sync test-json test-yaml test-image test-audio-codec test-compress test-archive test-h264 test-video test-text test-bundle test-init test-desktop test-desktop-app
 
 # Host-side tests. Architecture and board crates contain AArch64 assembly or
 # MMIO, so the test set is explicit rather than `--workspace`.
@@ -86,6 +86,32 @@ test-h264:
 
 test-video:
 	cargo test -p feos-video --target x86_64-unknown-linux-gnu
+
+test-text:
+	cargo test -p feos-text --target x86_64-unknown-linux-gnu
+
+test-bundle:
+	cargo test -p feos-bundle --target x86_64-unknown-linux-gnu
+
+test-init:
+	cargo test -p feos-init --target x86_64-unknown-linux-gnu
+
+test-desktop:
+	cargo test -p feos-desktop --target x86_64-unknown-linux-gnu
+
+test-desktop-app:
+	cargo test -p feos-desktop-app --target x86_64-unknown-linux-gnu
+
+# Repacks every bundle source directory into apps/desktop/apps. The desktop's
+# build script picks up whatever is in that folder, so adding an app is:
+#   1. create apps/desktop/bundle-src/<id>/{manifest.yaml,icon.bmp}
+#   2. make bundles
+#   3. rebuild the kernel
+bundles:
+	@for dir in apps/desktop/bundle-src/*/; do \
+		name=$$(basename "$$dir"); \
+		python3 scripts/pack-app.py "$$dir" "apps/desktop/apps/$$name.fapp"; \
+	done
 
 # Host-side audio demo: renders the same library's PCM to a WAV on the host
 # without booting QEMU. The kernel itself plays through the HDA driver with the

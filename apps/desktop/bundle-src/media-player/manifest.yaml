@@ -1,0 +1,10 @@
+id: media-player
+name: Media Player
+version: 1.0.0
+entry: tone
+category: Multimedia
+description: Play a test tone through the HDA codec
+icon: icon.bmp
+window:
+  width: 480
+  height: 320

@@ -6,7 +6,7 @@
 //! separate crate, move the module to `apps/<name>` and register it from the
 //! kernel instead.
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 pub mod clear;
 pub mod echo;
@@ -45,9 +45,49 @@ pub static REGISTRY: &[&dyn App] = &[
     &clear::Clear,
     &power::PowerOff,
     &power::Reboot,
+    &feos_desktop_app::DesktopApp,
 ];
 
 /// Finds an app by primary name or alias.
 pub fn find(name: &str) -> Option<&'static dyn App> {
     REGISTRY.iter().copied().find(|app| app.matches(name))
+}
+
+/// The [`feos_app::AppRegistry`] view of [`REGISTRY`].
+///
+/// The kernel publishes this through `Platform::apps`, so libraries that must
+/// not depend on the app crate (the desktop and init manager) can resolve a
+/// manifest entry point at run time.
+pub struct Registry;
+
+impl feos_app::AppRegistry for Registry {
+    fn find(&self, name: &str) -> Option<&'static dyn App> {
+        find(name)
+    }
+}
+
+/// The shared registry value referenced by [`feos_app::Platform::apps`].
+pub static APP_REGISTRY: Registry = Registry;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_names_and_aliases_are_unique() {
+        for app in REGISTRY {
+            for name in core::iter::once(app.name()).chain(app.aliases().iter().copied()) {
+                let matches = REGISTRY.iter().filter(|other| other.matches(name)).count();
+                assert_eq!(matches, 1, "command '{name}' is claimed more than once");
+            }
+        }
+    }
+
+    #[test]
+    fn desktop_resolves_to_the_session_app() {
+        let app = find("desktop").expect("desktop command");
+        assert_eq!(app.name(), "desktop");
+        assert!(find("wm").is_some());
+        assert_eq!(find("gui").map(|app| app.name()), Some("gui"));
+    }
 }

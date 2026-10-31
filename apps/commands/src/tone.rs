@@ -15,7 +15,7 @@ const CHANNELS: u16 = 2;
 const MAX_SAMPLES: usize = SAMPLE_RATE as usize * CHANNELS as usize * MAX_MS / 1000;
 
 /// Synthesis buffer. Kept in `.bss` because a three-second stereo clip is far
-/// larger than the 64 KiB kernel stack.
+/// larger than the kernel stack.
 #[repr(align(128))]
 struct Buffer([i16; MAX_SAMPLES]);
 

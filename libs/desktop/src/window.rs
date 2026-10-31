@@ -1,0 +1,449 @@
+//! The desktop window manager.
+//!
+//! Windows are stored in a fixed-size table and identified by their slot
+//! index. Every window has a z-order value, a normal rectangle and a saved
+//! rectangle for maximise/restore. The manager owns no pixels and no
+//! allocation; the renderer reads it and draws in z-order.
+
+use feos_gfx::{Point, Rect};
+use feos_gui::RectExt;
+use feos_text::Text;
+
+/// Default maximum number of open windows.
+pub const MAX_WINDOWS: usize = 8;
+
+/// Maximum title length.
+pub const TITLE_MAX: usize = 48;
+
+/// How a window is currently displayed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WindowState {
+    /// Normal floating window.
+    Normal,
+    /// Hidden behind the taskbar button.
+    Minimized,
+    /// Filling the work area.
+    Maximized,
+}
+
+/// One managed window.
+#[derive(Clone, Copy)]
+pub struct DesktopWindow {
+    /// Catalog index of the application this window belongs to.
+    pub app: usize,
+    /// Window title.
+    pub title: Text<TITLE_MAX>,
+    /// Current rectangle.
+    pub rect: Rect,
+    /// Rectangle restored when leaving maximised state.
+    pub restore: Rect,
+    /// Display state.
+    pub state: WindowState,
+    /// Whether the slot is in use.
+    pub open: bool,
+    /// Z-order (larger is closer to the viewer).
+    pub z: u32,
+    /// PID of a background process launched from this window, if any.
+    pub pid: Option<u32>,
+    /// Whether the app has been launched in the background.
+    pub launched: bool,
+}
+
+impl DesktopWindow {
+    /// An unused slot.
+    pub const EMPTY: Self = Self {
+        app: 0,
+        title: Text::EMPTY,
+        rect: Rect::new(0, 0, 0, 0),
+        restore: Rect::new(0, 0, 0, 0),
+        state: WindowState::Normal,
+        open: false,
+        z: 0,
+        pid: None,
+        launched: false,
+    };
+}
+
+/// A fixed-capacity window manager.
+pub struct WindowManager<const N: usize = MAX_WINDOWS> {
+    windows: [DesktopWindow; N],
+    next_z: u32,
+    focused: Option<usize>,
+}
+
+impl<const N: usize> WindowManager<N> {
+    /// Creates an empty manager.
+    pub const fn new() -> Self {
+        Self {
+            windows: [DesktopWindow::EMPTY; N],
+            next_z: 1,
+            focused: None,
+        }
+    }
+
+    /// Opens a window for `app`, or focuses an existing one.
+    ///
+    /// The initial rectangle is cascaded from the top-left of `work_area` and
+    /// clamped so the window is always reachable.
+    pub fn open(
+        &mut self,
+        app: usize,
+        title: &str,
+        work_area: Rect,
+        default_width: u32,
+        default_height: u32,
+        cascade: i32,
+    ) -> Option<usize> {
+        if let Some(index) = self
+            .windows
+            .iter()
+            .position(|window| window.open && window.app == app)
+        {
+            self.focus(index);
+            if self.windows[index].state == WindowState::Minimized {
+                self.windows[index].state = WindowState::Normal;
+            }
+            return Some(index);
+        }
+
+        let index = self.windows.iter().position(|window| !window.open)?;
+        let offset = (self.next_z as i32 % 6) * cascade.max(0);
+        let width = default_width.min(work_area.width.max(1)).max(1);
+        let height = default_height.min(work_area.height.max(1)).max(1);
+        let max_x = (work_area.right_i32() - width as i32).max(work_area.x);
+        let max_y = (work_area.bottom_i32() - height as i32).max(work_area.y);
+        let x = (work_area.x + 32 + offset).min(max_x);
+        let y = (work_area.y + 24 + offset).min(max_y);
+        let rect = Rect::new(x, y, width, height);
+
+        let window = &mut self.windows[index];
+        window.app = app;
+        window.title.set(title);
+        window.rect = rect;
+        window.restore = rect;
+        window.state = WindowState::Normal;
+        window.open = true;
+        window.pid = None;
+        window.launched = false;
+        self.focus(index);
+        Some(index)
+    }
+
+    /// Number of open windows.
+    pub fn count(&self) -> usize {
+        self.windows.iter().filter(|window| window.open).count()
+    }
+
+    /// Returns `true` when no windows are open.
+    pub fn is_empty(&self) -> bool {
+        self.count() == 0
+    }
+
+    /// Returns the window at `index`, even when it is closed.
+    pub fn get(&self, index: usize) -> Option<&DesktopWindow> {
+        self.windows.get(index)
+    }
+
+    /// Returns a mutable window at `index`.
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut DesktopWindow> {
+        self.windows.get_mut(index)
+    }
+
+    /// The focused slot, if any.
+    pub const fn focused(&self) -> Option<usize> {
+        self.focused
+    }
+
+    /// Returns `true` when `index` is the focused window.
+    pub fn is_focused(&self, index: usize) -> bool {
+        self.focused == Some(index)
+    }
+
+    /// The focused window, if any.
+    pub fn focused_window(&self) -> Option<&DesktopWindow> {
+        self.focused
+            .and_then(|index| self.windows.get(index))
+            .filter(|window| window.open)
+    }
+
+    /// Brings a window to the front.
+    pub fn focus(&mut self, index: usize) -> bool {
+        if !self.windows.get(index).is_some_and(|window| window.open) {
+            return false;
+        }
+        let z = self.next_z;
+        self.next_z = self.next_z.wrapping_add(1).max(1);
+        self.windows[index].z = z;
+        self.focused = Some(index);
+        true
+    }
+
+    /// Focuses the next open window in slot order.
+    pub fn focus_next(&mut self) -> Option<usize> {
+        let count = self.count();
+        if count == 0 {
+            self.focused = None;
+            return None;
+        }
+        let start = self.focused.map(|index| index + 1).unwrap_or(0);
+        for step in 0..N {
+            let index = (start + step) % N;
+            if self.windows[index].open {
+                self.focus(index);
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    /// Closes a window.
+    pub fn close(&mut self, index: usize) -> bool {
+        let Some(window) = self.windows.get_mut(index) else {
+            return false;
+        };
+        if !window.open {
+            return false;
+        }
+        window.open = false;
+        window.pid = None;
+        window.launched = false;
+        if self.focused == Some(index) {
+            self.focused = self.topmost_open(None);
+        }
+        true
+    }
+
+    /// Minimises a window.
+    pub fn minimize(&mut self, index: usize) -> bool {
+        let Some(window) = self.windows.get_mut(index) else {
+            return false;
+        };
+        if !window.open || window.state == WindowState::Minimized {
+            return false;
+        }
+        window.state = WindowState::Minimized;
+        if self.focused == Some(index) {
+            self.focused = self.topmost_open(Some(index));
+        }
+        true
+    }
+
+    /// Restores a minimised window and focuses it.
+    pub fn restore(&mut self, index: usize) -> bool {
+        let Some(window) = self.windows.get_mut(index) else {
+            return false;
+        };
+        if !window.open || window.state != WindowState::Minimized {
+            return false;
+        }
+        window.state = WindowState::Normal;
+        self.focus(index);
+        true
+    }
+
+    /// Minimises a normal window or restores a minimised one.
+    pub fn toggle_minimize(&mut self, index: usize) -> bool {
+        let minimized = self
+            .windows
+            .get(index)
+            .is_some_and(|window| window.state == WindowState::Minimized);
+        if minimized {
+            self.restore(index)
+        } else {
+            self.minimize(index)
+        }
+    }
+
+    /// Toggles maximised state, saving or restoring the normal rectangle.
+    pub fn toggle_maximize(&mut self, index: usize, work_area: Rect) -> bool {
+        let Some(window) = self.windows.get_mut(index) else {
+            return false;
+        };
+        if !window.open {
+            return false;
+        }
+        if window.state == WindowState::Maximized {
+            window.rect = window.restore;
+            window.state = WindowState::Normal;
+        } else {
+            window.restore = window.rect;
+            window.rect = work_area;
+            window.state = WindowState::Maximized;
+        }
+        self.focus(index);
+        true
+    }
+
+    /// Moves a normal window, keeping at least part of it visible.
+    pub fn move_by(&mut self, index: usize, dx: i32, dy: i32, work_area: Rect) -> bool {
+        let Some(window) = self.windows.get_mut(index) else {
+            return false;
+        };
+        if !window.open || window.state != WindowState::Normal {
+            return false;
+        }
+        let min_x = work_area.x - window.rect.width as i32 + 48;
+        let max_x = work_area.right_i32() - 48;
+        let min_y = work_area.y;
+        let max_y = work_area.bottom_i32() - 28;
+        window.rect.x = window.rect.x.saturating_add(dx).clamp(min_x, max_x);
+        window.rect.y = window.rect.y.saturating_add(dy).clamp(min_y, max_y);
+        window.restore = window.rect;
+        true
+    }
+
+    /// Resizes a normal window.
+    pub fn resize_by(&mut self, index: usize, dw: i32, dh: i32, work_area: Rect) -> bool {
+        let Some(window) = self.windows.get_mut(index) else {
+            return false;
+        };
+        if !window.open || window.state != WindowState::Normal {
+            return false;
+        }
+        let max_width = (work_area.right_i32() - window.rect.x).max(240) as u32;
+        let max_height = (work_area.bottom_i32() - window.rect.y).max(160) as u32;
+        window.rect.width = (window.rect.width as i32 + dw).clamp(240, max_width as i32) as u32;
+        window.rect.height = (window.rect.height as i32 + dh).clamp(160, max_height as i32) as u32;
+        window.restore = window.rect;
+        true
+    }
+
+    /// Returns the topmost window containing `point`, if any.
+    pub fn topmost_at(&self, point: Point) -> Option<usize> {
+        self.windows
+            .iter()
+            .enumerate()
+            .filter(|(_, window)| window.open && window.state != WindowState::Minimized)
+            .filter(|(_, window)| window.rect.contains(point))
+            .max_by_key(|(_, window)| window.z)
+            .map(|(index, _)| index)
+    }
+
+    /// Fills `out` with open window indices in ascending z-order and returns
+    /// the number written.
+    pub fn z_order(&self, out: &mut [usize; N]) -> usize {
+        let mut count = 0;
+        for (index, window) in self.windows.iter().enumerate() {
+            if !window.open || window.state == WindowState::Minimized {
+                continue;
+            }
+            let mut position = count;
+            while position > 0 && self.windows[out[position - 1]].z > window.z {
+                out[position] = out[position - 1];
+                position -= 1;
+            }
+            out[position] = index;
+            count += 1;
+        }
+        count
+    }
+
+    fn topmost_open(&self, exclude: Option<usize>) -> Option<usize> {
+        self.windows
+            .iter()
+            .enumerate()
+            .filter(|(index, window)| {
+                window.open && window.state != WindowState::Minimized && Some(*index) != exclude
+            })
+            .max_by_key(|(_, window)| window.z)
+            .map(|(index, _)| index)
+    }
+}
+
+impl<const N: usize> Default for WindowManager<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WORK: Rect = Rect::new(0, 0, 800, 600);
+
+    #[test]
+    fn opens_focuses_and_closes() {
+        let mut wm = WindowManager::<4>::new();
+        let first = wm.open(0, "One", WORK, 400, 300, 20).unwrap();
+        let second = wm.open(1, "Two", WORK, 400, 300, 20).unwrap();
+        assert_eq!(wm.count(), 2);
+        assert_eq!(wm.focused(), Some(second));
+        assert!(wm.get(first).unwrap().rect.x >= WORK.x);
+
+        wm.focus(first);
+        assert_eq!(wm.focused(), Some(first));
+        assert_eq!(
+            wm.topmost_at(Point::new(
+                wm.get(first).unwrap().rect.x + 4,
+                wm.get(first).unwrap().rect.y + 4
+            )),
+            Some(first)
+        );
+
+        assert!(wm.close(first));
+        assert_eq!(wm.count(), 1);
+        assert_eq!(wm.focused(), Some(second));
+    }
+
+    #[test]
+    fn opening_the_same_app_focuses_it() {
+        let mut wm = WindowManager::<4>::new();
+        let first = wm.open(7, "Seven", WORK, 300, 200, 10).unwrap();
+        wm.open(1, "Other", WORK, 300, 200, 10).unwrap();
+        let again = wm.open(7, "Seven", WORK, 300, 200, 10).unwrap();
+        assert_eq!(first, again);
+        assert_eq!(wm.count(), 2);
+        assert_eq!(wm.focused(), Some(first));
+    }
+
+    #[test]
+    fn minimizes_and_restores() {
+        let mut wm = WindowManager::<4>::new();
+        let index = wm.open(0, "One", WORK, 300, 200, 10).unwrap();
+        assert!(wm.minimize(index));
+        assert_eq!(wm.get(index).unwrap().state, WindowState::Minimized);
+        assert_eq!(wm.focused(), None);
+        assert!(wm.restore(index));
+        assert_eq!(wm.focused(), Some(index));
+        assert!(wm.toggle_minimize(index));
+        assert_eq!(wm.get(index).unwrap().state, WindowState::Minimized);
+    }
+
+    #[test]
+    fn maximizes_and_restores_the_saved_rect() {
+        let mut wm = WindowManager::<4>::new();
+        let index = wm.open(0, "One", WORK, 300, 200, 10).unwrap();
+        let before = wm.get(index).unwrap().rect;
+        assert!(wm.toggle_maximize(index, WORK));
+        assert_eq!(wm.get(index).unwrap().rect, WORK);
+        assert!(wm.toggle_maximize(index, WORK));
+        assert_eq!(wm.get(index).unwrap().rect, before);
+    }
+
+    #[test]
+    fn cycles_focus_and_orders_z() {
+        let mut wm = WindowManager::<4>::new();
+        let a = wm.open(0, "A", WORK, 300, 200, 10).unwrap();
+        let b = wm.open(1, "B", WORK, 300, 200, 10).unwrap();
+        assert_eq!(wm.focus_next(), Some(a));
+        assert_eq!(wm.focus_next(), Some(b));
+
+        let mut order = [0usize; 4];
+        let count = wm.z_order(&mut order);
+        assert_eq!(count, 2);
+        assert_eq!(order[..count], [a, b]);
+    }
+
+    #[test]
+    fn moving_clamps_to_work_area() {
+        let mut wm = WindowManager::<4>::new();
+        let index = wm.open(0, "One", WORK, 300, 200, 10).unwrap();
+        assert!(wm.move_by(index, 10000, 10000, WORK));
+        let rect = wm.get(index).unwrap().rect;
+        assert!(rect.x < WORK.right_i32());
+        assert!(rect.y < WORK.bottom_i32());
+        assert!(wm.resize_by(index, 10000, 10000, WORK));
+        assert!(wm.get(index).unwrap().rect.width <= WORK.width);
+    }
+}

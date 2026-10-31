@@ -1,0 +1,10 @@
+id: system-info
+name: System Information
+version: 1.0.0
+entry: info
+category: System
+description: Board, CPU, memory and kernel details
+icon: icon.bmp
+window:
+  width: 560
+  height: 380

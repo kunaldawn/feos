@@ -87,6 +87,7 @@ pub extern "C" fn kmain(dtb: usize) -> ! {
         cpu: services,
         audio: audio.as_ref().map(|audio| audio.device),
         processes: &sched::PROCESSES,
+        apps: &feos_apps::APP_REGISTRY,
     };
 
     // Background processes read the platform through this static.

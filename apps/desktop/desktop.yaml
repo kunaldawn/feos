@@ -1,0 +1,53 @@
+# feos desktop session configuration.
+#
+# Every key is optional; missing or invalid values keep their defaults. The
+# file is embedded in the `desktop` app at build time, so a board with a
+# filesystem can use the same schema with a file it reads at run time.
+
+theme: xp-blue
+
+wallpaper:
+  style: gradient
+  top: "#3f8cf3"
+  bottom: "#245edb"
+  accent: "#549cf6"
+
+taskbar:
+  position: bottom
+  height: 40
+  start_label: start
+  show_clock: true
+  clock_24h: true
+  show_quick_launch: true
+  quick_launch_count: 3
+  show_desktop: true
+
+start_menu:
+  width: 448
+  height: 470
+  columns: 2
+  show_descriptions: true
+  initially_open: false
+
+desktop:
+  show_icons: true
+  icon_size: 48
+  show_labels: true
+
+windows:
+  default_width: 560
+  default_height: 380
+  cascade: 24
+
+apps:
+  directories:
+    - apps/desktop/apps
+  extensions:
+    - .fapp
+
+# Services started with the session. Each id may be a bundle id (`terminal`)
+# or a shell command (`ps`). `restart` is never, on-failure or always.
+init:
+  restart: on-failure
+  max_restarts: 3
+  autostart: []

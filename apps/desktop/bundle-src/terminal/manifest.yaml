@@ -1,0 +1,10 @@
+id: terminal
+name: Terminal
+version: 1.0.0
+entry: gui
+category: System
+description: GUI dashboard and component gallery
+icon: icon.bmp
+window:
+  width: 760
+  height: 520

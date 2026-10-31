@@ -1,0 +1,10 @@
+id: console
+name: Console Help
+version: 1.0.0
+entry: help
+category: Utilities
+description: List the built-in shell commands
+icon: icon.bmp
+window:
+  width: 520
+  height: 360

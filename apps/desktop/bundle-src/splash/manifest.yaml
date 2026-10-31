@@ -1,0 +1,10 @@
+id: splash
+name: Splash Screen
+version: 1.0.0
+entry: splash
+category: Utilities
+description: Redraw the feos boot splash
+icon: icon.bmp
+window:
+  width: 640
+  height: 480

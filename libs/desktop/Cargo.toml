@@ -1,0 +1,19 @@
+[package]
+name = "feos-desktop"
+description = "Configurable desktop environment, window manager and XP-style taskbar for feos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+feos-app = { workspace = true }
+feos-bundle = { workspace = true }
+feos-gfx = { workspace = true }
+feos-gui = { workspace = true }
+feos-init = { workspace = true }
+feos-text = { workspace = true }
+feos-yaml = { workspace = true }
+
+[dev-dependencies]
+feos-archive = { workspace = true }
+feos-sync = { workspace = true }

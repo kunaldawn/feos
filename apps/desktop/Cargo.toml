@@ -1,0 +1,13 @@
+[package]
+name = "feos-desktop-app"
+description = "The feos desktop session app: loads YAML config and scans the application folder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+feos-app = { workspace = true }
+feos-console = { workspace = true }
+feos-desktop = { workspace = true }
+feos-gui = { workspace = true }
+feos-sync = { workspace = true }

@@ -131,7 +131,7 @@ impl App for Gui {
     }
 
     fn aliases(&self) -> &'static [&'static str] {
-        &["desktop", "dashboard"]
+        &["dashboard"]
     }
 
     fn usage(&self) -> &'static str {

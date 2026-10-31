@@ -17,6 +17,7 @@ dependencies = [
  "feos-app",
  "feos-audio",
  "feos-console",
+ "feos-desktop-app",
  "feos-gfx",
  "feos-gui",
 ]
@@ -59,6 +60,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "feos-bundle"
+version = "0.1.0"
+dependencies = [
+ "feos-archive",
+ "feos-image",
+ "feos-sync",
+ "feos-text",
+ "feos-yaml",
+]
+
+[[package]]
 name = "feos-compress"
 version = "0.1.0"
 
@@ -66,6 +78,32 @@ version = "0.1.0"
 name = "feos-console"
 version = "0.1.0"
 dependencies = [
+ "feos-sync",
+]
+
+[[package]]
+name = "feos-desktop"
+version = "0.1.0"
+dependencies = [
+ "feos-app",
+ "feos-archive",
+ "feos-bundle",
+ "feos-gfx",
+ "feos-gui",
+ "feos-init",
+ "feos-sync",
+ "feos-text",
+ "feos-yaml",
+]
+
+[[package]]
+name = "feos-desktop-app"
+version = "0.1.0"
+dependencies = [
+ "feos-app",
+ "feos-console",
+ "feos-desktop",
+ "feos-gui",
  "feos-sync",
 ]
 
@@ -133,6 +171,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "feos-init"
+version = "0.1.0"
+dependencies = [
+ "feos-app",
+ "feos-sync",
+ "feos-text",
+ "feos-yaml",
+]
+
+[[package]]
 name = "feos-json"
 version = "0.1.0"
 
@@ -161,6 +209,10 @@ dependencies = [
 
 [[package]]
 name = "feos-sync"
+version = "0.1.0"
+
+[[package]]
+name = "feos-text"
 version = "0.1.0"
 
 [[package]]

@@ -1,0 +1,10 @@
+id: process-monitor
+name: Process Monitor
+version: 1.0.0
+entry: ps
+category: System
+description: Running processes and service status
+icon: icon.bmp
+window:
+  width: 520
+  height: 340

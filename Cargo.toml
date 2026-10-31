@@ -25,8 +25,11 @@ feos-audio = { path = "libs/audio" }
 feos-audio-codec = { path = "libs/audio-codec" }
 feos-archive = { path = "libs/archive" }
 feos-board-qemu-virt = { path = "boards/qemu-virt" }
+feos-bundle = { path = "libs/bundle" }
 feos-compress = { path = "libs/compress" }
 feos-console = { path = "libs/console" }
+feos-desktop = { path = "libs/desktop" }
+feos-desktop-app = { path = "apps/desktop" }
 feos-driver-fw-cfg = { path = "drivers/firmware/fw-cfg" }
 feos-driver-gicv2 = { path = "drivers/interrupt/gicv2" }
 feos-driver-intel-hda = { path = "drivers/audio/intel-hda" }
@@ -38,9 +41,11 @@ feos-gui = { path = "libs/gui" }
 feos-h264 = { path = "libs/h264" }
 feos-hal = { path = "libs/hal" }
 feos-image = { path = "libs/image" }
+feos-init = { path = "libs/init" }
 feos-json = { path = "libs/json" }
 feos-shell = { path = "apps/shell" }
 feos-sync = { path = "libs/sync" }
+feos-text = { path = "libs/text" }
 feos-video = { path = "libs/video" }
 feos-yaml = { path = "libs/yaml" }
 

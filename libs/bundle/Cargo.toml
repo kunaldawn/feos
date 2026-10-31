@@ -1,0 +1,13 @@
+[package]
+name = "feos-bundle"
+description = "Single-file application bundles (.fapp) for the feos desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+feos-archive = { workspace = true }
+feos-image = { workspace = true }
+feos-sync = { workspace = true }
+feos-text = { workspace = true }
+feos-yaml = { workspace = true }

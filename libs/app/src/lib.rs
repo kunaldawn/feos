@@ -132,6 +132,8 @@ pub struct Platform {
     pub audio: Option<&'static dyn Audio>,
     /// Process creation and inspection.
     pub processes: &'static dyn Processes,
+    /// Lookup table the desktop and init manager resolve entries through.
+    pub apps: &'static dyn AppRegistry,
 }
 
 /// Everything an app is allowed to see when it runs.
@@ -145,6 +147,17 @@ pub struct Context<'a> {
     pub display: &'a mut Option<Canvas<'static>>,
     /// Board facts and kernel services.
     pub platform: &'a Platform,
+}
+
+/// A lookup table for applications by command name.
+///
+/// The shell's registry and the desktop's launcher both need to turn a name
+/// from a manifest or configuration into an [`App`]. Keeping that operation
+/// behind a trait lets the desktop and init manager live in libraries that do
+/// not depend on the app registry crate.
+pub trait AppRegistry: Sync {
+    /// Finds an app by primary name or alias.
+    fn find(&self, name: &str) -> Option<&'static dyn App>;
 }
 
 /// A shell application.

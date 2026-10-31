@@ -63,6 +63,7 @@ app registry).
 ├── Makefile                    # build, run, test, Docker targets
 ├── scripts/
 │   ├── qemu.sh                 # shared QEMU launch (ramfb + Intel HDA + display)
+│   ├── pack-app.py             # pack a directory into a single-file .fapp bundle
 │   └── docker-run.sh           # container entry point: build, then boot
 ├── docs/                       # screenshots and architecture notes
 │
@@ -84,7 +85,7 @@ app registry).
 │
 ├── boards/
 │   └── qemu-virt/              # feos-board-qemu-virt
-│       ├── linker.ld           # 0x40080000 load address, BSS, 64 KiB stack
+│       ├── linker.ld           # 0x40080000 load address, BSS, 256 KiB stack
 │       └── src/lib.rs          # MMIO map, UART/framebuffer/audio wiring, symbols
 │
 ├── drivers/
@@ -101,6 +102,10 @@ app registry).
 │   ├── console/                # feos-console: registered console + macros
 │   ├── gfx/                    # feos-gfx: dependency-free 2D graphics
 │   ├── gui/                    # feos-gui: immediate-mode widgets, layout, charts
+│   ├── desktop/                # feos-desktop: YAML desktop, XP taskbar, WM
+│   ├── init/                   # feos-init: service supervisor and restart policy
+│   ├── bundle/                 # feos-bundle: single-file .fapp applications
+│   ├── text/                   # feos-text: fixed-capacity UTF-8 strings
 │   ├── audio/                  # feos-audio: PCM buffers, mixing, synthesis
 │   ├── json/                   # feos-json: allocation-free JSON parser/writer
 │   ├── yaml/                   # feos-yaml: practical-subset YAML parser/emitter
@@ -113,6 +118,10 @@ app registry).
 │   └── app/                    # feos-app: App trait, Context, Platform
 │
 └── apps/
+    ├── desktop/                # feos-desktop-app: `desktop` session + app folder
+    │   ├── desktop.yaml        # embedded desktop configuration
+    │   ├── apps/               # .fapp bundles scanned by build.rs
+    │   └── bundle-src/         # unpacked sources for `make bundles`
     ├── commands/               # feos-apps: built-in apps + registry
     │   └── src/
     │       ├── help.rs  echo.rs  info.rs  uptime.rs  sleep.rs
@@ -139,7 +148,10 @@ and add it to `[workspace.dependencies]` if several crates need it.
 implements `feos_app::App`, then add it to `REGISTRY` in
 `apps/commands/src/lib.rs`. Apps get `args`, the optional `Canvas`, and the
 `Platform` services through `Context`; they do not depend on a board or
-architecture crate.
+architecture crate. To put an app in the desktop Start menu instead, drop a
+single-file `.fapp` bundle into `apps/desktop/apps/` (or a source folder in
+`apps/desktop/bundle-src/` plus `make bundles`); the desktop discovers it
+automatically.
 
 **A board.** Copy `boards/qemu-virt/`, adjust the constants and devices, point
 the kernel at it in `kernel/Cargo.toml`, and select the linker script from
@@ -176,6 +188,12 @@ change.
 - `feos-gui`: a `no_std`, allocation-free immediate-mode GUI toolkit with
   widgets, a Windows/Fluent-inspired component library, linear layout,
   scrolling, text input, charts, windows and dialogs
+- `feos-desktop`: a YAML-configured desktop session with XP-style taskbar and
+  Start menu, wallpaper shortcuts, a window manager and theme support
+- `feos-bundle`: single-file `.fapp` applications (ZIP/TAR with manifest and
+  icon), detected by content and scanned from an application folder
+- `feos-init`: a fixed-capacity service supervisor with `never`/`on-failure`/
+  `always` restart policies and `ps`-style status snapshots
 - `feos-audio`: a `no_std` 16-bit PCM library with sample buffers, saturating
   mixing, fades, and sine/square/triangle/sawtooth/noise synthesis
 - `feos-json`: a `no_std`, allocation-free RFC 8259 parser/writer with a
@@ -318,7 +336,8 @@ default NIC would load.
 | `echo <text>` | Print text back                                      |
 | `info`        | Board, exception level, MIDR, timer, memory, display, audio |
 | `gfx`         | Draw the graphics test card (`demo` is an alias)     |
-| `gui`         | Draw the feos-gui dashboard and component gallery (`desktop`, `dashboard`) |
+| `gui`         | Draw the feos-gui dashboard and component gallery (`dashboard`) |
+| `desktop`     | Run the YAML-configured desktop session (`wm`; `list`, `status`, `run <id>`, `service <action> <id>`) |
 | `splash`      | Redraw the boot splash                               |
 | `tone [ms]`   | Play an A-major chord for `ms` (default 1500, max 3000; `play` alias) |
 | `uptime`      | Milliseconds since the counter started               |
@@ -529,6 +548,67 @@ while widgets simply clip or skip work when there is no room.
 make test-gui
 # equivalent to:
 cargo test -p feos-gui --target x86_64-unknown-linux-gnu
+```
+
+## The desktop environment
+
+![The feos desktop with the XP-style Start menu](docs/desktop.png)
+
+`feos-desktop` (in `libs/desktop/`) is the session layer above `feos-gui`:
+wallpaper and shortcuts, an XP-style taskbar and Start menu, a fixed-capacity
+window manager, and an init/service supervisor. It is `no_std`, allocation-free
+and independent of the board. Full reference:
+[`docs/desktop.md`](docs/desktop.md).
+
+```text
+feos> desktop
+[desktop] 6 application(s) discovered in the application folder (0 skipped)
+[desktop] 1024x768 theme=xp-blue windows=0 start_menu=closed
+feos> desktop list
+  terminal             System         entry=gui    GUI dashboard and component gallery
+  system-info          System         entry=info   Board, CPU, memory and kernel details
+  process-monitor      System         entry=ps     Running processes and service status
+feos> desktop run terminal
+[desktop] 'terminal' started in window 0 as pid 2
+```
+
+The session is configured entirely in YAML
+([`apps/desktop/desktop.yaml`](apps/desktop/desktop.yaml)): theme, wallpaper
+style and colours, taskbar edge/height/clock/quick-launch count, Start-menu
+size and layout, desktop icons, default window sizes, application folders and
+autostart services. Unknown keys and invalid values keep their defaults.
+
+Applications are **single-file bundles** (`.fapp`): one ZIP or TAR archive with
+`manifest.yaml`, an icon and any resources. The scanner detects them by archive
+magic, not by suffix, so renaming a bundle does not hide it. On QEMU the
+application folder is embedded at build time: `apps/desktop/build.rs` turns
+every file in `apps/desktop/apps/` into an embedded `DirEntry`, so dropping a
+bundle in that folder and rebuilding adds it to the Start menu. A
+filesystem-backed board passes the same `&[DirEntry]` list to `Desktop::scan`
+at run time.
+
+```yaml
+# manifest.yaml inside a .fapp
+id: terminal
+name: Terminal
+entry: gui
+category: System
+description: GUI dashboard and component gallery
+icon: icon.bmp
+window:
+  width: 760
+  height: 520
+```
+
+`Desktop::launch` opens the window, resolves the manifest entry through the
+`AppRegistry` published in `Platform::apps`, and spawns it through
+`Processes`. `libs/init` supervises services with `never`, `on-failure` or
+`always` restart policies and a bounded retry budget; the YAML `init.autostart`
+list is registered when the session starts and ticked once per frame.
+
+```sh
+make test-desktop test-desktop-app
+make bundles      # repack apps/desktop/bundle-src/* into apps/desktop/apps/*.fapp
 ```
 
 ## The audio library

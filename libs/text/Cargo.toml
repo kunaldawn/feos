@@ -1,0 +1,8 @@
+[package]
+name = "feos-text"
+description = "Fixed-capacity UTF-8 strings for no_std feos crates"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
