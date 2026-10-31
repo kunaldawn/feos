@@ -9,5 +9,7 @@ license.workspace = true
 feos-app = { workspace = true }
 feos-console = { workspace = true }
 feos-desktop = { workspace = true }
+feos-gfx = { workspace = true }
 feos-gui = { workspace = true }
+feos-keys = { workspace = true }
 feos-sync = { workspace = true }

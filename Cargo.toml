@@ -37,12 +37,14 @@ feos-driver-pci = { path = "drivers/bus/pci" }
 feos-driver-pl011 = { path = "drivers/serial/pl011" }
 feos-driver-ramfb = { path = "drivers/display/ramfb" }
 feos-gfx = { path = "libs/gfx" }
+feos-fs = { path = "libs/fs" }
 feos-gui = { path = "libs/gui" }
 feos-h264 = { path = "libs/h264" }
 feos-hal = { path = "libs/hal" }
 feos-image = { path = "libs/image" }
 feos-init = { path = "libs/init" }
 feos-json = { path = "libs/json" }
+feos-keys = { path = "libs/keys" }
 feos-shell = { path = "apps/shell" }
 feos-sync = { path = "libs/sync" }
 feos-text = { path = "libs/text" }

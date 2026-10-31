@@ -17,6 +17,7 @@
 
 #![no_std]
 
+use feos_fs::FileSystem;
 use feos_gfx::Canvas;
 use feos_hal::{Audio, Clock, Cpu, Power};
 
@@ -134,6 +135,8 @@ pub struct Platform {
     pub processes: &'static dyn Processes,
     /// Lookup table the desktop and init manager resolve entries through.
     pub apps: &'static dyn AppRegistry,
+    /// Read-only filesystem exposed by the board, when it has one.
+    pub filesystem: Option<&'static dyn FileSystem>,
 }
 
 /// Everything an app is allowed to see when it runs.
@@ -178,6 +181,17 @@ pub trait App: Sync {
 
     /// One-line description of what the app does.
     fn description(&self) -> &'static str;
+
+    /// Whether the app needs the whole framebuffer and should run in the
+    /// foreground instead of as a background process.
+    ///
+    /// The desktop opens a window for every launch, but an app that returns
+    /// `true` here is run synchronously by the desktop session so it can draw
+    /// and handle its own input. Pressing the app's exit key returns to the
+    /// desktop.
+    fn foreground(&self) -> bool {
+        false
+    }
 
     /// Executes the app.
     fn run(&self, context: &mut Context<'_>);

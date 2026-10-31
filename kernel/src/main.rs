@@ -43,6 +43,11 @@ pub extern "C" fn kmain(dtb: usize) -> ! {
 
     // Bring up the ramfb framebuffer if QEMU provides one.
     let mut display = board::init_display();
+    let mut back = if display.is_some() {
+        board::back_buffer()
+    } else {
+        None
+    };
     match display.as_mut() {
         Some(canvas) => {
             feos_apps::ui::splash(canvas);
@@ -88,6 +93,7 @@ pub extern "C" fn kmain(dtb: usize) -> ! {
         audio: audio.as_ref().map(|audio| audio.device),
         processes: &sched::PROCESSES,
         apps: &feos_apps::APP_REGISTRY,
+        filesystem: Some(board::filesystem()),
     };
 
     // Background processes read the platform through this static.
@@ -110,6 +116,16 @@ pub extern "C" fn kmain(dtb: usize) -> ! {
     // Timer ticks and IRQ delivery begin here; the shell is PID 1 and the
     // currently running process.
     sched::start(100);
+
+    // Leave the splash on screen for a moment, then hand the framebuffer to
+    // the desktop. Logging off (or Ctrl-\ in the serial terminal) returns to
+    // the shell.
+    if display.is_some() {
+        feos_arch_aarch64::timer::spin_ms(1_500);
+        println!("[boot] starting the desktop session (Ctrl-\\ returns to the shell)");
+        feos_desktop_app::run_session(&mut display, &mut back, sched::platform());
+        println!("[boot] desktop session ended, entering the serial shell");
+    }
 
     feos_shell::run(display, sched::platform())
 }

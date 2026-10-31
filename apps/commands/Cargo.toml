@@ -10,5 +10,8 @@ feos-app = { workspace = true }
 feos-audio = { workspace = true }
 feos-console = { workspace = true }
 feos-desktop-app = { workspace = true }
+feos-fs = { workspace = true }
 feos-gfx = { workspace = true }
 feos-gui = { workspace = true }
+feos-keys = { workspace = true }
+feos-text = { workspace = true }

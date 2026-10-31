@@ -12,6 +12,9 @@ use crate::theme::DesktopTheme;
 /// Number of pinned applications shown before "All Programs".
 pub const PINNED_APPS: usize = 5;
 
+/// Number of columns in the "All Programs" grid.
+pub const GRID_COLUMNS: usize = 4;
+
 /// Commands available from the right-hand column and footer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum StartMenuCommand {
@@ -262,7 +265,7 @@ pub fn render<const N: usize, const A: usize>(
             app_area.width,
             app_area.height.saturating_sub(back_height + 4),
         );
-        let columns = 4u32;
+        let columns = GRID_COLUMNS as u32;
         let cell_width = (grid_area.width / columns).max(1);
         let cell_height = 64u32;
         for index in 0..app_count {

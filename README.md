@@ -4,7 +4,9 @@ A tiny bare-metal **Rust** operating-system skeleton for the **aarch64** QEMU
 `virt` machine, organised as a multi-crate workspace. It boots at EL1, installs
 exception vectors, talks to the PL011 serial port, brings up a **ramfb**
 framebuffer, draws a splash screen, starts a preemptive round-robin scheduler,
-and drops into a small interactive shell.
+and opens an interactive **desktop session** where applications can be launched
+with the keyboard. Logging off (or `Ctrl-\` on the serial console) drops into a
+small interactive shell.
 
 Everything can be built and run inside Docker, so the only host requirement is
 Docker.
@@ -85,6 +87,8 @@ app registry).
 │
 ├── boards/
 │   └── qemu-virt/              # feos-board-qemu-virt
+│       ├── build.rs            # generates the embedded filesystem image
+│       ├── fs/                 # files and directories compiled into the kernel
 │       ├── linker.ld           # 0x40080000 load address, BSS, 256 KiB stack
 │       └── src/lib.rs          # MMIO map, UART/framebuffer/audio wiring, symbols
 │
@@ -105,6 +109,8 @@ app registry).
 │   ├── desktop/                # feos-desktop: YAML desktop, XP taskbar, WM
 │   ├── init/                   # feos-init: service supervisor and restart policy
 │   ├── bundle/                 # feos-bundle: single-file .fapp applications
+│   ├── fs/                     # feos-fs: read-only filesystem abstraction
+│   ├── keys/                   # feos-keys: serial-console keyboard decoder
 │   ├── text/                   # feos-text: fixed-capacity UTF-8 strings
 │   ├── audio/                  # feos-audio: PCM buffers, mixing, synthesis
 │   ├── json/                   # feos-json: allocation-free JSON parser/writer
@@ -127,6 +133,7 @@ app registry).
     │       ├── help.rs  echo.rs  info.rs  uptime.rs  sleep.rs
     │       ├── clear.rs  gfx.rs  splash.rs  tone.rs  power.rs
     │       ├── gui.rs          # feos-gui dashboard demo
+    │       ├── files.rs        # file explorer + ls/cat/tree/stat
     │       ├── spawn.rs  ps.rs  kill.rs  tick.rs
     │       ├── ui.rs           # splash screen and test card renderer
     │       └── lib.rs          # REGISTRY and find()
@@ -190,6 +197,15 @@ change.
   scrolling, text input, charts, windows and dialogs
 - `feos-desktop`: a YAML-configured desktop session with XP-style taskbar and
   Start menu, wallpaper shortcuts, a window manager and theme support
+- `feos-fs`: a read-only, allocation-free filesystem with path lookup, parent
+  links and a compiled-in `StaticFs` image
+- `feos-keys`: serial-console keyboard decoding shared by the desktop and
+  full-screen apps
+- A **File Explorer** app with directory navigation, keyboard control and a
+  text preview pane, plus `files ls`, `files cat`, `files tree` and
+  `files stat` shell forms
+- Foreground app launching: an app can request the full framebuffer from the
+  desktop and return to it with Esc
 - `feos-bundle`: single-file `.fapp` applications (ZIP/TAR with manifest and
   icon), detected by content and scanned from an application folder
 - `feos-init`: a fixed-capacity service supervisor with `never`/`on-failure`/
@@ -215,7 +231,8 @@ change.
   caller buffers, and ZIP/TAR writers
 - `tone` shell command: synthesizes a chord with `feos-audio` and plays it
   through the HDA codec
-- Boot splash and an interactive graphics test card
+- Boot splash followed by the interactive desktop session, with an interactive
+  graphics test card available from the shell
 - Generic timer (`CNTPCT_EL0`) for uptime, busy-wait sleeps, and the scheduler
   tick (`CNTP_TVAL_EL0`)
 - PSCI over `HVC` for clean `poweroff` / `reboot`
@@ -338,6 +355,7 @@ default NIC would load.
 | `gfx`         | Draw the graphics test card (`demo` is an alias)     |
 | `gui`         | Draw the feos-gui dashboard and component gallery (`dashboard`) |
 | `desktop`     | Run the YAML-configured desktop session (`wm`; `list`, `status`, `run <id>`, `service <action> <id>`) |
+| `files`       | Open the file explorer, or use `ls`, `cat`, `tree` and `stat` (`explorer` alias) |
 | `splash`      | Redraw the boot splash                               |
 | `tone [ms]`   | Play an A-major chord for `ms` (default 1500, max 3000; `play` alias) |
 | `uptime`      | Milliseconds since the counter started               |
@@ -560,16 +578,35 @@ window manager, and an init/service supervisor. It is `no_std`, allocation-free
 and independent of the board. Full reference:
 [`docs/desktop.md`](docs/desktop.md).
 
+On boot the kernel draws the splash, waits briefly, and then starts the desktop
+automatically. The QEMU board has no pointer device, so the serial console is
+the keyboard:
+
+| Key | Action |
+|-----|--------|
+| Arrow keys | Move the Start-menu highlight, or the wallpaper selection when the menu is closed |
+| `Enter` | Launch the highlighted application |
+| `Space` | Open the Start menu (or toggle All Programs while it is open) |
+| `Tab` | Toggle All Programs, or focus the next window when the menu is closed |
+| `Esc` | Close the Start menu |
+| `Ctrl-\` | Leave the desktop and return to the serial shell (`Ctrl-D` also works) |
+
+The same controls work in the shell with the `desktop` command:
+
 ```text
 feos> desktop
-[desktop] 6 application(s) discovered in the application folder (0 skipped)
-[desktop] 1024x768 theme=xp-blue windows=0 start_menu=closed
+[desktop] session started
+[desktop] arrows select, Enter launches, Space opens Start, Esc closes, Ctrl-\ returns to the shell
+[desktop] 7 application(s) discovered in the application folder (0 skipped)
 feos> desktop list
+  files                System         entry=files  Browse the filesystem and preview text files
   terminal             System         entry=gui    GUI dashboard and component gallery
   system-info          System         entry=info   Board, CPU, memory and kernel details
   process-monitor      System         entry=ps     Running processes and service status
-feos> desktop run terminal
-[desktop] 'terminal' started in window 0 as pid 2
+feos> desktop run files
+[desktop] launching 'files' in the foreground
+[files] explorer closed
+[desktop] returned from 'files'
 ```
 
 The session is configured entirely in YAML
@@ -610,6 +647,41 @@ list is registered when the session starts and ticked once per frame.
 make test-desktop test-desktop-app
 make bundles      # repack apps/desktop/bundle-src/* into apps/desktop/apps/*.fapp
 ```
+
+## The filesystem and File Explorer
+
+![The feos file explorer showing the docs directory](docs/files.png)
+
+`feos-fs` (in `libs/fs/`) is a small read-only filesystem. The QEMU board has
+no block device driver yet, so its image is compiled into the kernel:
+`boards/qemu-virt/build.rs` walks `boards/qemu-virt/fs/` and generates a flat
+`StaticNode` table. Each node knows its name, kind, parent and children; file
+data is borrowed from the image, so lookup and reads never allocate.
+
+Drop a file into `boards/qemu-virt/fs/` and rebuild to add it to the explorer
+and the shell. The initial image contains `README.txt`, `docs/`, `etc/`,
+`examples/` and an empty directory.
+
+Apps reach the filesystem through `Platform::filesystem`, so the same API works
+for a future disk or RAM backend. The `files` app has a graphical mode and
+text-mode forms:
+
+```text
+feos> files              # full-screen explorer (Esc returns)
+feos> files ls /
+feos> files cat /README.txt
+feos> files tree /docs
+feos> files stat /etc/motd
+```
+
+The explorer shows directories on the left and a preview of the selected file
+on the right. Arrow keys move, `Enter`/`Right` opens a directory,
+`Backspace`/`Left` goes back, and `Esc` or `q` returns to the desktop.
+
+Interactive apps use `App::foreground` to ask the desktop for the whole
+framebuffer. The desktop opens a window, runs the app synchronously, then
+closes the window and redraws itself when the app returns. The File Explorer
+is launched this way from the Start menu.
 
 ## The audio library
 
@@ -885,14 +957,16 @@ its peak level, so a non-zero peak confirms the DSP path ran.
    page-aligned `static` in the board crate's `.bss`.
 5. `ramfb` scans out of guest RAM directly, so drawing is simply writing
    pixels; there is no flush or virtqueue. `feos-gfx` renders the splash into
-   the canvas, then the shell can redraw the test card with `gfx`.
+   the canvas. After a short pause the kernel starts the desktop session, which
+   redraws the same canvas; logging off returns to the shell, where `gfx` can
+   redraw the test card.
 6. The board finds the Intel HDA controller through the PCIe ECAM window,
    assigns BAR0, enables bus mastering, and initialises the driver: reset,
-   CORB/RIRB setup, codec discovery, 48 kHz stereo format. The shell receives
-   the resulting `&dyn Audio` in `Platform`.
+   CORB/RIRB setup, codec discovery, 48 kHz stereo format. The desktop and
+   shell receive the resulting `&dyn Audio` in `Platform`.
 7. `kmain` installs the IRQ handler, asks the board to initialize the GICv2 and
    enable timer PPI 30, creates the shell as PID 1, and starts the 100 Hz tick.
-   Unmasking IRQs is the point where the shell becomes preemptible.
+   Unmasking IRQs is the point where the desktop and shell become preemptible.
 8. Faults land in the vector table, which forwards a `FaultInfo` to the kernel's
    reporter: `ESR_EL1`, `ELR_EL1`, `FAR_EL1`, `SPSR_EL1`, and the stack
    pointer, then halts. IRQs take the separate recoverable path described above.
@@ -904,8 +978,10 @@ its peak level, so a non-zero peak confirms the DSP path ran.
   identity mapping.
 - Resolution is fixed at 1024x768 and the buffer lives in the board's `.bss`
   (3 MiB).
-- No double buffering, alpha blending, or hardware acceleration; the font is
-  ASCII-only (non-ASCII falls back to `?`).
+- The desktop composes each frame in an off-screen `BACK` buffer and copies it
+  to the scanout in one pass; other full-screen apps draw directly. There is
+  no hardware acceleration, and the font is ASCII-only (non-ASCII falls back to
+  `?`).
 - Single core. All processes share one address space and run at EL1, so there
   is no memory protection or privilege boundary between them; a fault in any
   process halts the machine.

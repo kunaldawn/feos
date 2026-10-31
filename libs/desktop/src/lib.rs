@@ -45,7 +45,7 @@ pub mod window;
 use feos_app::{App, AppRegistry, ProcessInfo, ProcessState, Processes, SpawnError, MAX_PROCESSES};
 use feos_bundle::{AppCatalog, InstalledApp, ScanReport};
 use feos_gfx::{Canvas, Color, Rect};
-use feos_gui::{Align, Id, Input, InteractionState, RectExt, Sense, Ui, VerticalAlign};
+use feos_gui::{Align, Id, Input, InteractionState, Key, RectExt, Sense, Ui, VerticalAlign};
 use feos_init::{Init, MAX_SERVICES};
 use feos_text::Text;
 
@@ -87,6 +87,11 @@ pub enum LaunchOutcome {
         window: usize,
         /// Kernel process id.
         pid: u32,
+    },
+    /// The app runs in the foreground and needs the full framebuffer.
+    Foreground {
+        /// Window opened for the application.
+        window: usize,
     },
     /// The window was already running this application.
     AlreadyRunning {
@@ -145,6 +150,8 @@ pub struct Desktop<
     init: Init<S>,
     work_area: Rect,
     session_started: bool,
+    /// Keyboard focus on the wallpaper shortcuts (catalog index).
+    selection: usize,
 }
 
 impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
@@ -166,6 +173,7 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             init: Init::new(config.init.policy, config.init.max_restarts),
             work_area: Rect::new(0, 0, 0, 0),
             session_started: false,
+            selection: 0,
         }
     }
 
@@ -213,6 +221,117 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
         &mut self.start_menu
     }
 
+    /// Catalog index currently selected on the wallpaper.
+    ///
+    /// Keyboard navigation moves this selection; `Enter` launches it when the
+    /// Start menu is closed.
+    pub const fn selection(&self) -> usize {
+        self.selection
+    }
+
+    /// Selects a wallpaper shortcut by catalog index.
+    ///
+    /// The index is clamped to the installed applications.
+    pub fn select(&mut self, index: usize) {
+        self.selection = index.min(self.catalog.len().saturating_sub(1));
+    }
+
+    /// Number of shortcut rows the current work area can hold.
+    fn shortcut_rows(&self, config: &DesktopConfig) -> usize {
+        if self.work_area.is_empty() {
+            return 1;
+        }
+        let icon_size = config.icons.icon_size.clamp(24, 96) as i32;
+        let label_height = if config.icons.show_labels { 34 } else { 8 };
+        let cell_height = (icon_size + label_height).max(1);
+        (self.work_area.height as i32 / cell_height).max(1) as usize
+    }
+
+    /// Moves the wallpaper selection through the column-major shortcut grid.
+    fn move_selection(&mut self, columns: i32, rows_delta: i32, rows: usize) {
+        let count = self.catalog.len();
+        if count == 0 {
+            self.selection = 0;
+            return;
+        }
+        let rows = rows.max(1) as i32;
+        let current = self.selection.min(count - 1) as i32;
+        let next = current + rows_delta + columns * rows;
+        self.selection = next.clamp(0, count as i32 - 1) as usize;
+    }
+
+    /// Applies keyboard navigation before drawing a frame.
+    ///
+    /// With the Start menu open the arrow keys move its highlight and `Tab`
+    /// toggles the "All Programs" grid. With it closed the arrows move the
+    /// wallpaper selection and `Space` opens the menu. `Enter` activation is
+    /// handled by [`render`](Self::render) once the frame is laid out.
+    fn handle_keyboard(&mut self, input: &Input, config: &DesktopConfig) {
+        let up = input.keys().any(|(key, _)| key == Key::Up);
+        let down = input.keys().any(|(key, _)| key == Key::Down);
+        let left = input.keys().any(|(key, _)| key == Key::Left);
+        let right = input.keys().any(|(key, _)| key == Key::Right);
+        let tab = input.keys().any(|(key, _)| key == Key::Tab);
+        let space = input.keys().any(|(key, _)| key == Key::Space);
+
+        if self.start_menu.open {
+            let count = self.catalog.len();
+            if self.start_menu.all_programs {
+                if left {
+                    self.start_menu
+                        .move_grid(-1, 0, count, start_menu::GRID_COLUMNS);
+                }
+                if right {
+                    self.start_menu
+                        .move_grid(1, 0, count, start_menu::GRID_COLUMNS);
+                }
+                if up {
+                    self.start_menu
+                        .move_grid(0, -1, count, start_menu::GRID_COLUMNS);
+                }
+                if down {
+                    self.start_menu
+                        .move_grid(0, 1, count, start_menu::GRID_COLUMNS);
+                }
+            } else {
+                if up {
+                    self.start_menu.move_highlight(-1, count, false);
+                }
+                if down {
+                    self.start_menu.move_highlight(1, count, false);
+                }
+            }
+            if tab || space {
+                self.start_menu.all_programs = !self.start_menu.all_programs;
+                self.start_menu.highlighted = 0;
+            }
+            return;
+        }
+
+        if tab {
+            self.windows.focus_next();
+            return;
+        }
+        if space {
+            self.start_menu.show();
+            return;
+        }
+
+        let rows = self.shortcut_rows(config);
+        if up {
+            self.move_selection(0, -1, rows);
+        }
+        if down {
+            self.move_selection(0, 1, rows);
+        }
+        if left {
+            self.move_selection(-1, 0, rows);
+        }
+        if right {
+            self.move_selection(1, 0, rows);
+        }
+    }
+
     /// The service supervisor.
     pub const fn init(&self) -> &Init<S> {
         &self.init
@@ -238,7 +357,9 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
     /// Call this at session start, and again whenever the backing storage is
     /// known to have changed. Files are detected by content, not by suffix.
     pub fn scan(&mut self, entries: &[DirEntry<'_>]) -> ScanReport {
-        self.catalog.scan(entries)
+        let report = self.catalog.scan(entries);
+        self.selection = self.selection.min(self.catalog.len().saturating_sub(1));
+        report
     }
 
     /// Looks up an installed application by manifest id.
@@ -308,6 +429,11 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
         let Some(runtime) = registry.find(app.manifest.entry.as_str()) else {
             return LaunchOutcome::UnknownEntry;
         };
+        if runtime.foreground() {
+            return LaunchOutcome::Foreground {
+                window: window_index,
+            };
+        }
         match processes.spawn(runtime, app.manifest.args.as_str()) {
             Ok(pid) => {
                 if let Some(window) = self.windows.get_mut(window_index) {
@@ -381,7 +507,7 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
     /// The same pass notices when a background process launched from a window
     /// has exited, so the window can report `Ready` and be launched again.
     pub fn tick_session(&mut self, processes: &dyn Processes) -> usize {
-        let changed = self.init.tick(processes);
+        let mut changed = self.init.tick(processes);
 
         let mut live = [ProcessInfo::EMPTY; MAX_PROCESSES];
         let count = processes.snapshot(&mut live);
@@ -398,6 +524,7 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             if !running {
                 window.pid = None;
                 window.launched = false;
+                changed += 1;
             }
         }
 
@@ -443,12 +570,16 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
         let clock = paint::format_clock(uptime_ms, &config.taskbar);
         let mut response = DesktopResponse::default();
 
-        let mut ui = Ui::new(canvas, &theme.ui, input, &mut self.interaction);
-        let canvas_rect = ui.canvas_rect();
-        paint::draw_wallpaper(&mut ui, &theme, &config.wallpaper);
-
+        let canvas_rect = Rect::new(0, 0, canvas.width() as u32, canvas.height() as u32);
         let layout = taskbar::layout(canvas_rect, &config.taskbar);
         self.work_area = layout.work_area(canvas_rect, config.taskbar.position);
+        self.handle_keyboard(input, &config);
+
+        // The desktop consumes Tab/Space/Enter itself; keep the toolkit from
+        // activating a focused widget for the same key press.
+        let pointer_input = input.without_keyboard();
+        let mut ui = Ui::new(canvas, &theme.ui, &pointer_input, &mut self.interaction);
+        paint::draw_wallpaper(&mut ui, &theme, &config.wallpaper);
 
         let mut shortcut_launch = None;
         if config.icons.show_icons {
@@ -458,6 +589,7 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
                 &config.icons,
                 &self.catalog,
                 self.work_area,
+                self.selection,
             );
         }
 
@@ -497,9 +629,10 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
 
         let pointer = ui.pointer();
         let pointer_pressed = ui.pointer_pressed();
-        let escape = ui.escape_pressed();
-        let enter = ui.enter_pressed();
         drop(ui);
+
+        let escape = input.keys().any(|(key, _)| key == Key::Escape);
+        let enter = input.keys().any(|(key, _)| key == Key::Enter);
 
         if taskbar_response.start_clicked {
             self.start_menu.toggle();
@@ -545,6 +678,9 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
                 .start_menu
                 .selected(self.catalog.len())
                 .or(launch_index);
+        } else if enter && self.selection < self.catalog.len() {
+            // Enter launches the wallpaper shortcut selected with the arrows.
+            launch_index = Some(self.selection).or(launch_index);
         }
 
         if let Some(index) = launch_index {
@@ -594,6 +730,7 @@ fn render_shortcuts<const N: usize, const A: usize>(
     config: &ShortcutConfig,
     catalog: &AppCatalog<A>,
     work_area: Rect,
+    selection: usize,
 ) -> Option<usize> {
     if catalog.is_empty() || work_area.is_empty() {
         return None;
@@ -621,6 +758,13 @@ fn render_shortcuts<const N: usize, const A: usize>(
 
         let id = Id::from_name("desktop.shortcut").child(index as u64 + 1);
         let hit = ui.interact(id, cell, Sense::click());
+        let selected = index == selection;
+        if selected {
+            ui.painter
+                .fill_rounded_rect_alpha(cell, 4, theme.menu_hover_text, 55);
+            ui.painter
+                .stroke_rounded_rect(cell, 4, 1, theme.menu_hover_text);
+        }
         if hit.hovered {
             ui.painter
                 .fill_rounded_rect_alpha(cell, 4, theme.menu_hover, 70);
@@ -1063,6 +1207,7 @@ fn draw_caption_button<const N: usize>(
 mod tests {
     use super::*;
     use feos_app::{Context, ProcessInfo, ProcessState};
+    use feos_gui::{Event, Modifiers};
     use feos_sync::SpinLock;
 
     struct Dummy;
@@ -1204,7 +1349,7 @@ mod tests {
 
         // The fake snapshot never reports pid 2, so the supervisor pass must
         // notice the exit and clear the window's running state.
-        desktop.tick_session(&processes);
+        assert_eq!(desktop.tick_session(&processes), 1);
         let window = desktop.windows().get(0).unwrap();
         assert!(!window.launched);
         assert_eq!(window.pid, None);
@@ -1291,6 +1436,76 @@ mod tests {
         assert!(response.start_open);
         assert!(response.is_empty());
         assert!(pixels.iter().any(|&pixel| pixel != 0));
+    }
+
+    #[test]
+    fn keyboard_moves_start_menu_and_enter_launches() {
+        let config = DesktopConfig::parse("start_menu:\n  initially_open: true\n").unwrap();
+        let names = ["a.fapp", "b.fapp", "c.fapp"];
+        let bundles: std::vec::Vec<_> = ["a", "b", "c"]
+            .iter()
+            .map(|id| catalog_bundle(id, "dummy"))
+            .collect();
+        let entries: std::vec::Vec<_> = names
+            .iter()
+            .zip(bundles.iter())
+            .map(|(name, data)| DirEntry::new(*name, data))
+            .collect();
+        let mut desktop = Desktop::<4, 4, 2>::new(config);
+        desktop.scan(&entries);
+        desktop.work_area = Rect::new(0, 0, 800, 560);
+
+        let mut pixels = std::vec![0u32; 1024 * 768];
+        let mut canvas = Canvas::new(&mut pixels, 1024, 768, 1024).unwrap();
+
+        let mut input = Input::new();
+        input.push(Event::KeyDown(Key::Down, Modifiers::NONE));
+        let response = desktop.render(&mut canvas, &input, 0);
+        assert!(response.start_open);
+        assert_eq!(desktop.start_menu().highlighted, 1);
+
+        let mut input = Input::new();
+        input.push(Event::KeyDown(Key::Enter, Modifiers::NONE));
+        let response = desktop.render(&mut canvas, &input, 16);
+        assert_eq!(response.launch.map(|request| request.app), Some(1));
+        assert!(!response.start_open);
+    }
+
+    #[test]
+    fn space_opens_the_menu_and_enter_launches_the_wallpaper_selection() {
+        let names = ["a.fapp", "b.fapp", "c.fapp"];
+        let bundles: std::vec::Vec<_> = ["a", "b", "c"]
+            .iter()
+            .map(|id| catalog_bundle(id, "dummy"))
+            .collect();
+        let entries: std::vec::Vec<_> = names
+            .iter()
+            .zip(bundles.iter())
+            .map(|(name, data)| DirEntry::new(*name, data))
+            .collect();
+        let mut desktop = Desktop::<4, 4, 2>::default();
+        desktop.scan(&entries);
+        desktop.work_area = Rect::new(0, 0, 800, 560);
+
+        let mut pixels = std::vec![0u32; 1024 * 768];
+        let mut canvas = Canvas::new(&mut pixels, 1024, 768, 1024).unwrap();
+
+        // With the menu closed, Down moves the wallpaper selection.
+        let mut input = Input::new();
+        input.push(Event::KeyDown(Key::Down, Modifiers::NONE));
+        let _ = desktop.render(&mut canvas, &input, 0);
+        assert_eq!(desktop.selection(), 1);
+
+        let mut input = Input::new();
+        input.push(Event::KeyDown(Key::Enter, Modifiers::NONE));
+        let response = desktop.render(&mut canvas, &input, 16);
+        assert_eq!(response.launch.map(|request| request.app), Some(1));
+
+        // Space opens the Start menu.
+        let mut input = Input::new();
+        input.push(Event::KeyDown(Key::Space, Modifiers::NONE));
+        let response = desktop.render(&mut canvas, &input, 32);
+        assert!(response.start_open);
     }
 
     #[test]

@@ -231,6 +231,38 @@ impl Input {
         })
     }
 
+    /// Returns a copy of this input with keyboard events removed.
+    ///
+    /// Pointer, wheel, focus and size events are preserved, as is the
+    /// persistent pointer and modifier state. Surfaces that implement their
+    /// own keyboard navigation can pass the result to a widget toolkit without
+    /// it also activating a focused widget for the same key press.
+    pub fn without_keyboard(&self) -> Self {
+        let mut filtered = Self {
+            events: [Event::None; MAX_EVENTS],
+            count: 0,
+            pointer: self.pointer,
+            pointer_down: self.pointer_down,
+            secondary_down: self.secondary_down,
+            modifiers: self.modifiers,
+            focused: self.focused,
+            size: self.size,
+        };
+
+        for event in &self.events[..self.count] {
+            if matches!(
+                event,
+                Event::KeyDown(..) | Event::KeyUp(..) | Event::Text(_)
+            ) {
+                continue;
+            }
+            filtered.events[filtered.count] = *event;
+            filtered.count += 1;
+        }
+
+        filtered
+    }
+
     /// Current pointer position.
     pub const fn pointer(&self) -> Point {
         self.pointer
@@ -297,6 +329,27 @@ mod tests {
         });
         assert!(!input.pointer_down());
         assert_eq!(input.pointer(), Point::new(7, 8));
+    }
+
+    #[test]
+    fn without_keyboard_keeps_pointer_state() {
+        let mut input = Input::new();
+        input.push(Event::KeyDown(Key::Tab, Modifiers::NONE));
+        input.push(Event::Text('x'));
+        input.push(Event::PointerMoved(Point::new(3, 4)));
+        input.push(Event::PointerDown {
+            pos: Point::new(5, 6),
+            button: MouseButton::Left,
+        });
+
+        let filtered = input.without_keyboard();
+        assert!(filtered.events().all(|event| !matches!(
+            event,
+            Event::KeyDown(..) | Event::KeyUp(..) | Event::Text(_)
+        )));
+        assert_eq!(filtered.events().count(), 2);
+        assert_eq!(filtered.pointer(), Point::new(5, 6));
+        assert!(filtered.pointer_down());
     }
 
     #[test]

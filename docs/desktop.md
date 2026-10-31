@@ -7,19 +7,39 @@ shortcuts, an XP-style taskbar and Start menu, a window manager, and a small
 init/service supervisor. It is configured with YAML and discovers applications
 from an *application folder* of single-file bundles.
 
-Run it from the shell:
+## Booting into the desktop
+
+On a graphical boot the kernel draws the splash, waits 1.5 seconds, and then
+starts the desktop automatically. Because the QEMU board has no pointer or
+keyboard device, the serial console supplies the keyboard events:
+
+| Key | Action |
+|-----|--------|
+| Arrow keys | Move the Start-menu highlight, or the wallpaper selection when the menu is closed |
+| `Enter` | Launch the highlighted application |
+| `Space` | Open the Start menu; toggle All Programs while it is open |
+| `Tab` | Toggle All Programs, or focus the next window when the menu is closed |
+| `Esc` | Close the Start menu |
+| `Ctrl-\` | Leave the desktop and return to the serial shell (`Ctrl-D` also works) |
+
+The Start menu starts open on boot (`start_menu.initially_open`), so pressing
+`Enter` launches the first application, and the arrow keys walk the list. The
+Start menu's "Log Off" button behaves like `Ctrl-\`.
+
+Run the same session from the shell:
 
 ```text
 feos> desktop
-[desktop] 6 application(s) discovered in the application folder (0 skipped)
-[desktop] 1024x768 theme=xp-blue windows=0 start_menu=closed
+[desktop] session started
+[desktop] arrows select, Enter launches, Space opens Start, Esc closes, Ctrl-\ returns to the shell
+[desktop] 7 application(s) discovered in the application folder (0 skipped)
 ```
 
 Other forms are useful on a serial-only boot:
 
 | Command | Description |
 |---------|-------------|
-| `desktop` | Render the desktop session |
+| `desktop` | Run the interactive desktop session (`session` and `boot` are aliases) |
 | `desktop list` | List discovered applications |
 | `desktop status` | Print configuration, windows and service state |
 | `desktop run <id>` | Open and launch an application by bundle id |
@@ -79,7 +99,7 @@ start_menu:
   height: 470
   columns: 2
   show_descriptions: true
-  initially_open: false
+  initially_open: true
 
 desktop:
   show_icons: true
@@ -180,9 +200,18 @@ window count.
 `Desktop::launch(index, registry, processes)` opens the window first, resolves
 the manifest entry point through `AppRegistry`, and spawns it through
 `Processes`. An unknown entry leaves the window open with an explanation
-instead of failing silently. Because the current board has no pointer or
-keyboard driver, `desktop` renders one frame from static input; a driver only
-needs to feed `feos_gui::Input` and forward `DesktopResponse::launch`.
+instead of failing silently. An app that returns `true` from
+`App::foreground` (currently the File Explorer) is run synchronously by the
+desktop session so it can draw full-screen and read the keyboard; the desktop
+closes its window and redraws when the app returns. The serial console feeds
+`feos_gui::Input` events through the desktop app's session loop; a pointer
+driver can use the same path and forward `DesktopResponse::launch`.
+
+The boot session composes frames into the board's off-screen back buffer and
+copies the finished frame to the ramfb scanout in one pass. It also redraws
+only when input arrives, the clock minute changes, a service or window state
+changes, or a launch needs a new frame, so an idle desktop leaves the scanout
+buffer alone.
 
 ## Init process manager
 

@@ -1,0 +1,6 @@
+[package]
+name = "feos-fs"
+description = "A small read-only filesystem abstraction for feos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true

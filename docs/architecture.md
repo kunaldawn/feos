@@ -41,7 +41,7 @@ Every workspace crate uses the `feos-` prefix. Crates that fill a role use
 - `feos-driver-pci`, `feos-driver-intel-hda`, `feos-driver-gicv2`
 - `feos-hal`, `feos-sync`, `feos-console`, `feos-gfx`, `feos-gui`,
   `feos-audio`, `feos-image`, `feos-audio-codec`, `feos-video`, `feos-h264`,
-  `feos-compress`, `feos-archive`, `feos-app`
+  `feos-compress`, `feos-archive`, `feos-fs`, `feos-keys`, `feos-app`
 - `feos-apps`, `feos-shell`
 - `feos-kernel` (binary name: `feos`)
 
@@ -57,9 +57,9 @@ kept out of directory names (`drivers/serial/pl011`, not
    (`Pl011::new(0x0900_0000)`, `FwCfg::new(0x0902_0000)`).
 3. **Libraries never depend on a board, driver, or the kernel.**
 4. **Apps never touch MMIO or architecture registers directly.** They use
-   `feos-console`, `feos-gfx`, `feos-gui`, and the `Platform` services
-   (`Clock`, `Power`, `Cpu`, `Audio`, `Processes`, board facts) passed through
-   `Context`.
+   `feos-console`, `feos-gfx`, `feos-gui`, `feos-fs`, and the `Platform`
+   services (`Clock`, `Power`, `Cpu`, `Audio`, `Processes`, `filesystem`,
+   board facts) passed through `Context`.
 5. **The kernel contains no device logic.** If `kernel/src/main.rs` starts
    growing a driver, it belongs in `drivers/` or `boards/`. The scheduler is
    policy, not a device: it lives in `kernel/src/sched.rs` and reaches the GIC
@@ -223,12 +223,15 @@ late in the frame; the toolkit keeps no hidden z-order. Component state is
 fixed-capacity and caller-owned, matching the rest of the toolkit. Components
 that need more room than their container simply clip.
 
-The current board has no mouse or keyboard driver, so the `gui` app renders a
-static dashboard frame with an overview, charts, a classic component gallery
-and a Fluent gallery showing the newer collection, navigation and overlay
-controls, and a Patterns gallery for advanced composition and chart types.
-Adding an input driver only requires feeding `Event`s into `Input` and clearing
-them per frame; the widget layer is already complete.
+The current board has no mouse or keyboard device, but the desktop session
+translates serial-console keys into `feos_gui::Input` events: arrows navigate
+the Start menu and wallpaper, `Enter` launches, `Space` opens the menu and
+`Ctrl-\` returns to the shell. The `gui` app still renders a static dashboard
+frame with an overview, charts, a classic component gallery and a Fluent gallery
+showing the newer collection, navigation and overlay controls, and a Patterns
+gallery for advanced composition and chart types. Adding a pointer driver only
+requires feeding `Event`s into `Input` and clearing them per frame; the widget
+layer is already complete.
 
 ## The audio path
 
@@ -254,13 +257,34 @@ The MMU is off, so DMA addresses are the static buffers' virtual addresses.
 When paging is added, the driver must translate them before writing the BDL and
 stream registers.
 
+## The filesystem path
+
+The filesystem is a library service, not a device driver:
+
+1. `feos-fs` defines the read-only `FileSystem` trait and `StaticFs`, a backend
+   over a flat `StaticNode` table. Path resolution, parent links, directory
+   iteration and chunked reads are all allocation-free and host-tested.
+2. `boards/qemu-virt/build.rs` walks `boards/qemu-virt/fs/` at build time and
+   emits a `StaticNode` table with `include_bytes!` for file contents. The
+   board exposes it as `&dyn FileSystem`.
+3. The kernel stores that reference in `Platform::filesystem`, so apps never
+   learn how the image is stored. A future virtio-blk or RAM backend implements
+   the same trait.
+4. The `files` app renders the tree as a full-screen foreground app. The
+   desktop's serial-key loop is in `feos-keys`, which both the desktop and the
+   explorer use, so they decode arrow keys and Escape identically.
+
+Because the image is compiled in, adding a file is a rebuild, not a mount. The
+same structure can later be fed from an archive or a filesystem driver without
+changing the explorer.
+
 ## Testing strategy
 
 Bare-metal code cannot be tested on the host when it executes privileged
 instructions or touches MMIO. The split makes most logic host-testable:
 
-- `libs/gfx`, `libs/gui`, `libs/audio`, `libs/sync`, and future pure libraries
-  run `cargo test` on the host.
+- `libs/gfx`, `libs/gui`, `libs/audio`, `libs/sync`, `libs/fs`, `libs/keys`,
+  and future pure libraries run `cargo test` on the host.
 - Drivers are intentionally thin register accessors; they can be exercised in
   QEMU.
 - The kernel is tested by booting `make run` (or `make docker-run`). The

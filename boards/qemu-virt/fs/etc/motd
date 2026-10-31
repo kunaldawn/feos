@@ -1,0 +1,7 @@
+feos 0.1.0 - a tiny aarch64 kernel
+Serial console: PL011 at 0x0900_0000
+Framebuffer: ramfb, 1024x768 XRGB8888
+Filesystem: read-only, embedded in the kernel image
+
+The desktop is a session layer above the GUI toolkit. The file explorer is a
+foreground app: launch it from the Start menu and press Esc to return.

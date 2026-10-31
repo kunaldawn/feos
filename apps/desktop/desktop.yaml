@@ -27,7 +27,7 @@ start_menu:
   height: 470
   columns: 2
   show_descriptions: true
-  initially_open: false
+  initially_open: true
 
 desktop:
   show_icons: true

@@ -1,0 +1,10 @@
+id: files
+name: File Explorer
+version: 1.0.0
+entry: files
+category: System
+description: Browse the filesystem and preview text files
+icon: icon.bmp
+window:
+  width: 760
+  height: 520

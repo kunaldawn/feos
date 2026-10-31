@@ -10,6 +10,7 @@
 
 pub mod clear;
 pub mod echo;
+pub mod files;
 pub mod gfx;
 pub mod gui;
 pub mod help;
@@ -38,6 +39,7 @@ pub static REGISTRY: &[&dyn App] = &[
     &tick::Tick,
     &gfx::Gfx,
     &gui::Gui,
+    &files::Files,
     &splash::Splash,
     &tone::Tone,
     &uptime::Uptime,
@@ -89,5 +91,13 @@ mod tests {
         assert_eq!(app.name(), "desktop");
         assert!(find("wm").is_some());
         assert_eq!(find("gui").map(|app| app.name()), Some("gui"));
+    }
+
+    #[test]
+    fn files_is_a_foreground_app() {
+        let app = find("files").expect("files command");
+        assert_eq!(app.name(), "files");
+        assert!(app.foreground());
+        assert!(find("explorer").is_some());
     }
 }

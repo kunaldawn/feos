@@ -1,0 +1,4 @@
+This directory is intentionally empty.
+
+It proves that empty directories survive the image build and appear in the
+file explorer.

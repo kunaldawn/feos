@@ -60,7 +60,7 @@ pub fn splash(canvas: &mut Canvas) {
     canvas.draw_text(
         32,
         height - 44,
-        "type 'gfx' in the serial shell to draw the test card",
+        "starting the desktop session ...",
         Color::rgb(100, 115, 150),
         1,
     );

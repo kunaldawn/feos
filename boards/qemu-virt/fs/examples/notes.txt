@@ -1,0 +1,7 @@
+Scratch notes
+=============
+
+- The filesystem is read-only for now.
+- The explorer highlights the current entry and previews text files.
+- Directories show how many direct children they contain.
+- Binary files are reported by size instead of being printed.

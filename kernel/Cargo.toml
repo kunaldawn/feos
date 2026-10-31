@@ -18,5 +18,6 @@ feos-apps = { workspace = true }
 feos-arch-aarch64 = { workspace = true }
 feos-board-qemu-virt = { workspace = true }
 feos-console = { workspace = true }
+feos-desktop-app = { workspace = true }
 feos-hal = { workspace = true }
 feos-shell = { workspace = true }

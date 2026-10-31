@@ -26,7 +26,9 @@ exception_vector_table:
 
 .macro irq_ventry index
     .balign 128
-    mov x0, #\index
+    /* Do not touch x0 here: irq_entry saves the interrupted registers, and
+     * overwriting an argument register before the save would corrupt the
+     * interrupted context. */
     b   irq_entry
 .endm
 

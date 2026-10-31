@@ -6,6 +6,7 @@ version = 4
 name = "feos-app"
 version = "0.1.0"
 dependencies = [
+ "feos-fs",
  "feos-gfx",
  "feos-hal",
 ]
@@ -18,8 +19,11 @@ dependencies = [
  "feos-audio",
  "feos-console",
  "feos-desktop-app",
+ "feos-fs",
  "feos-gfx",
  "feos-gui",
+ "feos-keys",
+ "feos-text",
 ]
 
 [[package]]
@@ -55,6 +59,7 @@ dependencies = [
  "feos-driver-pci",
  "feos-driver-pl011",
  "feos-driver-ramfb",
+ "feos-fs",
  "feos-gfx",
  "feos-hal",
 ]
@@ -103,7 +108,9 @@ dependencies = [
  "feos-app",
  "feos-console",
  "feos-desktop",
+ "feos-gfx",
  "feos-gui",
+ "feos-keys",
  "feos-sync",
 ]
 
@@ -143,6 +150,10 @@ version = "0.1.0"
 dependencies = [
  "feos-driver-fw-cfg",
 ]
+
+[[package]]
+name = "feos-fs"
+version = "0.1.0"
 
 [[package]]
 name = "feos-gfx"
@@ -193,8 +204,17 @@ dependencies = [
  "feos-arch-aarch64",
  "feos-board-qemu-virt",
  "feos-console",
+ "feos-desktop-app",
  "feos-hal",
  "feos-shell",
+]
+
+[[package]]
+name = "feos-keys"
+version = "0.1.0"
+dependencies = [
+ "feos-console",
+ "feos-gui",
 ]
 
 [[package]]

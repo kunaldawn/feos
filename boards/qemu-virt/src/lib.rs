@@ -15,6 +15,7 @@ use feos_driver_intel_hda::{CodecInfo, IntelHda};
 use feos_driver_pci::PciEcam;
 use feos_driver_pl011::Pl011;
 use feos_driver_ramfb::Ramfb;
+use feos_fs::{FileSystem, StaticFs};
 use feos_gfx::Canvas;
 use feos_hal::{Audio, Clock, InterruptController, Serial};
 
@@ -91,11 +92,31 @@ struct ScanoutBuffer([u32; DISPLAY_WIDTH * DISPLAY_HEIGHT]);
 
 static mut SCANOUT: ScanoutBuffer = ScanoutBuffer([0; DISPLAY_WIDTH * DISPLAY_HEIGHT]);
 
+/// Off-screen buffer used by the desktop to compose a frame before presenting.
+#[repr(align(4096))]
+struct BackBuffer([u32; DISPLAY_WIDTH * DISPLAY_HEIGHT]);
+
+static mut BACK: BackBuffer = BackBuffer([0; DISPLAY_WIDTH * DISPLAY_HEIGHT]);
+
 /// Physical address of the scanout buffer.
 pub fn framebuffer_addr() -> usize {
     // SAFETY: taking the address of a `static mut` does not create a
     // reference; the buffer is only exposed once through `init_display`.
     unsafe { core::ptr::addr_of_mut!(SCANOUT.0) as *mut u32 as usize }
+}
+
+/// Returns a canvas over the off-screen composition buffer.
+///
+/// The desktop renders into this buffer and then copies it to the scanout
+/// buffer in one pass, which avoids showing a half-drawn frame.
+pub fn back_buffer() -> Option<Canvas<'static>> {
+    // SAFETY: `BACK` is a static, page-aligned buffer that is only handed out
+    // here. The kernel is single-core and the returned canvas owns the only
+    // reference for the rest of the program.
+    let ptr = unsafe { core::ptr::addr_of_mut!(BACK.0).cast::<u32>() };
+    let pixels: &'static mut [u32] =
+        unsafe { core::slice::from_raw_parts_mut(ptr, DISPLAY_WIDTH * DISPLAY_HEIGHT) };
+    Canvas::new(pixels, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_WIDTH)
 }
 
 /// Initializes the UART and registers it as the kernel console.
@@ -138,6 +159,18 @@ pub fn init_display() -> Option<Canvas<'static>> {
         unsafe { core::slice::from_raw_parts_mut(ptr, DISPLAY_WIDTH * DISPLAY_HEIGHT) };
 
     Canvas::new(pixels, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_WIDTH)
+}
+
+mod fs_image {
+    include!(concat!(env!("OUT_DIR"), "/fs_image.rs"));
+}
+
+/// The compiled-in read-only filesystem.
+static FILESYSTEM: StaticFs = StaticFs::new(fs_image::FS_IMAGE);
+
+/// Returns the filesystem apps browse through `Platform::filesystem`.
+pub fn filesystem() -> &'static dyn FileSystem {
+    &FILESYSTEM
 }
 
 /// The board's Intel HDA controller.

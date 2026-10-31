@@ -1,0 +1,10 @@
+[package]
+name = "feos-keys"
+description = "Serial-console keyboard decoding for feos GUI apps"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+feos-console = { workspace = true }
+feos-gui = { workspace = true }
