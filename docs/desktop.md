@@ -10,11 +10,15 @@ from an *application folder* of single-file bundles.
 ## Booting into the desktop
 
 On a graphical boot the kernel draws the splash, waits 1.5 seconds, and then
-starts the desktop automatically. Because the QEMU board has no pointer or
-keyboard device, the serial console supplies the keyboard events:
+starts the desktop automatically. QEMU supplies a virtio tablet, so the desktop
+is driven with a real pointer. The serial console remains the keyboard:
 
-| Key | Action |
-|-----|--------|
+| Input | Action |
+|-------|--------|
+| Mouse | Move the pointer; click Start, menus, taskbar buttons and window controls |
+| Double-click | Open a desktop shortcut, or maximise/restore a window from its title bar |
+| Drag | Move a window by its title bar, or resize it from the lower-right grip |
+| Right-click | Open the desktop menu (Refresh, Show Desktop, Task Manager, Properties) |
 | Arrow keys | Move the Start-menu highlight, or the wallpaper selection when the menu is closed |
 | `Enter` | Launch the highlighted application |
 | `Space` | Open the Start menu; toggle All Programs while it is open |
@@ -22,16 +26,27 @@ keyboard device, the serial console supplies the keyboard events:
 | `Esc` | Close the Start menu |
 | `Ctrl-\` | Leave the desktop and return to the serial shell (`Ctrl-D` also works) |
 
-The Start menu starts open on boot (`start_menu.initially_open`), so pressing
-`Enter` launches the first application, and the arrow keys walk the list. The
-Start menu's "Log Off" button behaves like `Ctrl-\`.
+The Start menu starts closed, like XP: click **start** (or press `Space`) to
+open it. Hovering an item moves the highlight, a single click launches it, and
+clicking outside closes the menu. **All Programs** opens the full application
+list. **Run...** opens a command box that accepts either a bundle id
+(`system-info`) or a shell command (`ps`). **Turn Off Computer** opens the XP
+confirmation dialog with Turn Off, Restart and Cancel. Clicking the tray clock
+opens Date and Time Properties, and the taskbar's Show Desktop button
+minimises every window and restores them on a second click. The Start menu's
+"Log Off" button asks for confirmation and then behaves like `Ctrl-\`.
+
+The pointer is a `virtio-tablet-device` (absolute coordinates) or
+`virtio-mouse-device` (relative coordinates) on QEMU's virtio MMIO bus. Both
+are auto-detected by `feos-driver-virtio-input`; when neither is present the
+desktop still works from the serial keyboard.
 
 Run the same session from the shell:
 
 ```text
 feos> desktop
 [desktop] session started
-[desktop] arrows select, Enter launches, Space opens Start, Esc closes, Ctrl-\ returns to the shell
+[desktop] click Start, double-click desktop icons, drag windows; Ctrl-\ returns to the shell
 [desktop] 7 application(s) discovered in the application folder (0 skipped)
 ```
 
@@ -54,13 +69,15 @@ libs/desktop/src/
 ├── lib.rs          # Desktop session: frames, launching, init integration
 ├── config.rs       # YAML schema and parsing
 ├── theme.rs        # xp-blue, xp-olive, xp-silver, dark, light, high-contrast
-├── paint.rs        # wallpaper, icon scaling, clock formatting, Start flag
+├── paint.rs        # wallpaper, icon scaling, clock, Start flag, pointer
 ├── taskbar.rs      # Start button, quick launch, task buttons, tray
-├── start_menu.rs   # pinned apps, all-programs grid, commands, power footer
+├── start_menu.rs   # pinned apps, All Programs, commands, Run dialog, power footer
 └── window.rs       # z-order, focus, move/resize, minimize/maximize
 
+libs/hal/           # Pointer trait shared by drivers and the desktop app
 libs/init/          # restart policies and service supervision
 libs/bundle/        # .fapp reader: manifest, icon, catalog scan
+drivers/input/virtio/  # virtio MMIO tablet/mouse driver
 apps/desktop/       # the `desktop` app, YAML file and embedded app folder
 ```
 
@@ -99,7 +116,7 @@ start_menu:
   height: 470
   columns: 2
   show_descriptions: true
-  initially_open: true
+  initially_open: false
 
 desktop:
   show_icons: true
@@ -193,9 +210,11 @@ is dynamic in both cases; only the source of the bytes differs.
 
 `WindowManager` is a fixed-capacity table (`MAX_WINDOWS`, default 8). Windows
 cascade from the top-left of the work area, are clamped so they stay reachable,
-and support focus, z-order, drag, resize, minimize, maximize and restore. The
-taskbar reflows to a bottom or top edge and sizes its buttons from the open
-window count.
+and support focus, z-order, drag, resize, minimize, maximize and restore. A
+title-bar click focuses, a drag moves, and a double-click maximises or restores.
+The lower-right grip resizes. The taskbar reflows to a bottom or top edge and
+sizes its buttons from the open window count; clicking the focused task button
+minimises, and clicking a minimised one restores.
 
 `Desktop::launch(index, registry, processes)` opens the window first, resolves
 the manifest entry point through `AppRegistry`, and spawns it through
@@ -203,9 +222,9 @@ the manifest entry point through `AppRegistry`, and spawns it through
 instead of failing silently. An app that returns `true` from
 `App::foreground` (currently the File Explorer) is run synchronously by the
 desktop session so it can draw full-screen and read the keyboard; the desktop
-closes its window and redraws when the app returns. The serial console feeds
-`feos_gui::Input` events through the desktop app's session loop; a pointer
-driver can use the same path and forward `DesktopResponse::launch`.
+closes its window and redraws when the app returns. The desktop app's session
+loop polls the virtio pointer through `feos_hal::Pointer` and feeds
+`feos_gui::Input` events; the same path forwards `DesktopResponse::launch`.
 
 The boot session composes frames into the board's off-screen back buffer and
 copies the finished frame to the ramfb scanout in one pass. It also redraws

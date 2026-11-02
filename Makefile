@@ -22,7 +22,8 @@ AUDIODEV ?= alsa,id=snd0
 endif
 
 AUDIO_FLAGS  ?= -audiodev $(AUDIODEV) -device intel-hda -device hda-output,audiodev=snd0
-QEMU_FLAGS   ?= -machine virt -cpu cortex-a53 -smp 1 -m 128M -net none -device ramfb $(AUDIO_FLAGS) -serial mon:stdio
+POINTER_FLAGS ?= -device virtio-tablet-device
+QEMU_FLAGS   ?= -machine virt -cpu cortex-a53 -smp 1 -m 128M -net none -device ramfb $(POINTER_FLAGS) $(AUDIO_FLAGS) -serial mon:stdio
 
 # Display backend used by `make docker-run`. "gtk" opens a QEMU window on the
 # host through X11/XWayland; "vnc=0.0.0.0:0" serves the display over VNC.
@@ -31,7 +32,7 @@ FEOS_DISPLAY ?= gtk
 .PHONY: all build check run clean test test-gfx test-gui test-audio test-sync \
         test-json test-yaml test-image test-audio-codec test-compress test-archive \
         test-h264 test-video test-text test-bundle test-init test-fs test-keys \
-        test-desktop test-desktop-app \
+        test-desktop test-desktop-app test-virtio-input \
         bundles audio-demo docker-build docker-run docker-run-vnc docker-audio docker-shell
 
 all: build
@@ -48,7 +49,7 @@ run: build
 	mkdir -p target/audio
 	$(QEMU) $(QEMU_FLAGS) -display $(QEMU_DISPLAY) -kernel $(KERNEL)
 
-test: test-gfx test-gui test-audio test-sync test-json test-yaml test-image test-audio-codec test-compress test-archive test-h264 test-video test-text test-bundle test-init test-fs test-keys test-desktop test-desktop-app
+test: test-gfx test-gui test-audio test-sync test-json test-yaml test-image test-audio-codec test-compress test-archive test-h264 test-video test-text test-bundle test-init test-fs test-keys test-desktop test-desktop-app test-virtio-input
 
 # Host-side tests. Architecture and board crates contain AArch64 assembly or
 # MMIO, so the test set is explicit rather than `--workspace`.
@@ -108,6 +109,9 @@ test-desktop:
 
 test-desktop-app:
 	cargo test -p feos-desktop-app --target x86_64-unknown-linux-gnu
+
+test-virtio-input:
+	cargo test -p feos-driver-virtio-input --target x86_64-unknown-linux-gnu
 
 # Repacks every bundle source directory into apps/desktop/apps. The desktop's
 # build script picks up whatever is in that folder, so adding an app is:

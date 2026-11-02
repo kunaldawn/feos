@@ -103,6 +103,47 @@ pub enum AudioError {
     Timeout,
 }
 
+/// One pointer report produced between two input frames.
+///
+/// A report carries the absolute cursor position plus the button transitions
+/// that happened since the previous report. `Some(true)` means the button was
+/// pressed, `Some(false)` means it was released; `None` leaves it unchanged.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct PointerEvent {
+    /// Cursor x coordinate in framebuffer pixels.
+    pub x: u16,
+    /// Cursor y coordinate in framebuffer pixels.
+    pub y: u16,
+    /// Left-button transition.
+    pub left: Option<bool>,
+    /// Right-button transition.
+    pub right: Option<bool>,
+    /// Middle-button transition.
+    pub middle: Option<bool>,
+    /// Wheel movement in notches (positive is away from the user).
+    pub wheel: i32,
+}
+
+impl PointerEvent {
+    /// Returns `true` when the report contains no button or wheel change.
+    pub const fn is_position_only(&self) -> bool {
+        self.left.is_none() && self.right.is_none() && self.middle.is_none() && self.wheel == 0
+    }
+}
+
+/// A relative or absolute pointing device.
+///
+/// The device is polled: [`poll`](Pointer::poll) returns one complete report
+/// at a time, or `None` when no new input has arrived. Implementations keep
+/// the cursor position between calls.
+pub trait Pointer: Sync {
+    /// Returns the next report, if any.
+    fn poll(&self) -> Option<PointerEvent>;
+
+    /// Current cursor position in framebuffer pixels.
+    fn position(&self) -> (u16, u16);
+}
+
 /// A programmable interrupt controller.
 ///
 /// The kernel installs one implementation at boot and enables the interrupts

@@ -84,6 +84,18 @@ impl<const N: usize> Text<N> {
         self.push_str(ch.encode_utf8(&mut buffer))
     }
 
+    /// Removes the last character and returns it.
+    pub fn pop(&mut self) -> Option<char> {
+        if self.len == 0 {
+            return None;
+        }
+        // `Text` only ever stores valid UTF-8, so the prefix is a valid string.
+        let text = core::str::from_utf8(&self.bytes[..self.len]).ok()?;
+        let ch = text.chars().next_back()?;
+        self.len -= ch.len_utf8();
+        Some(ch)
+    }
+
     /// Removes all characters.
     pub fn clear(&mut self) {
         self.len = 0;
@@ -244,6 +256,17 @@ mod tests {
         text.set(" 42 ");
         assert_eq!(text.as_u32(), Some(42));
         assert_eq!(text.trim(), "42");
+    }
+
+    #[test]
+    fn pop_removes_whole_characters() {
+        let mut text = Text::<8>::new();
+        text.set("hé");
+        assert_eq!(text.pop(), Some('é'));
+        assert_eq!(text.as_str(), "h");
+        assert_eq!(text.pop(), Some('h'));
+        assert_eq!(text.pop(), None);
+        assert!(text.is_empty());
     }
 
     #[test]

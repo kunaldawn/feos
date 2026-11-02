@@ -90,7 +90,7 @@ app registry).
 │       ├── build.rs            # generates the embedded filesystem image
 │       ├── fs/                 # files and directories compiled into the kernel
 │       ├── linker.ld           # 0x40080000 load address, BSS, 256 KiB stack
-│       └── src/lib.rs          # MMIO map, UART/framebuffer/audio wiring, symbols
+│       └── src/lib.rs          # MMIO map, UART/framebuffer/audio/pointer wiring, symbols
 │
 ├── drivers/
 │   ├── serial/pl011/           # feos-driver-pl011
@@ -98,6 +98,7 @@ app registry).
 │   ├── display/ramfb/          # feos-driver-ramfb
 │   ├── bus/pci/                # feos-driver-pci: PCIe ECAM + BAR assignment
 │   ├── audio/intel-hda/        # feos-driver-intel-hda: Intel HDA playback
+│   ├── input/virtio/           # feos-driver-virtio-input: tablet/mouse
 │   └── interrupt/gicv2/        # feos-driver-gicv2: GICv2 distributor + CPU interface
 │
 ├── libs/
@@ -197,6 +198,8 @@ change.
   scrolling, text input, charts, windows and dialogs
 - `feos-desktop`: a YAML-configured desktop session with XP-style taskbar and
   Start menu, wallpaper shortcuts, a window manager and theme support
+- `feos-driver-virtio-input`: a virtio MMIO tablet/mouse driver, wired through
+  the `Pointer` HAL trait so the desktop tracks a real pointer
 - `feos-fs`: a read-only, allocation-free filesystem with path lookup, parent
   links and a compiled-in `StaticFs` image
 - `feos-keys`: serial-console keyboard decoding shared by the desktop and
@@ -340,6 +343,10 @@ Useful overrides:
 | `make run AUDIODEV=wav,id=snd0,path=/tmp/qemu.wav` | Capture playback to WAV     |
 | `make audio-demo`                    | Render the audio example WAV natively      |
 | `make docker-audio`                  | Render the audio example WAV in Docker     |
+
+The run targets add `-device virtio-tablet-device` for the pointer. Override
+`POINTER_FLAGS` (for example with `-device virtio-mouse-device`) to use a
+relative mouse, or set it to an empty value for a serial-only boot.
 
 The scripts pass `-net none` because the kernel does not use networking and
 some distributions' QEMU packages omit the `efi-virtio.rom` file that the
@@ -579,11 +586,15 @@ and independent of the board. Full reference:
 [`docs/desktop.md`](docs/desktop.md).
 
 On boot the kernel draws the splash, waits briefly, and then starts the desktop
-automatically. The QEMU board has no pointer device, so the serial console is
-the keyboard:
+automatically. QEMU supplies a virtio tablet, so windows, the Start menu and
+taskbar are driven with the pointer; the serial console remains the keyboard:
 
-| Key | Action |
-|-----|--------|
+| Input | Action |
+|-------|--------|
+| Mouse | Move the pointer; click Start, menus, taskbar buttons and window controls |
+| Double-click | Open a desktop shortcut, or maximise/restore a window from its title bar |
+| Drag | Move a window by its title bar, or resize it from the lower-right grip |
+| Right-click | Open the desktop menu |
 | Arrow keys | Move the Start-menu highlight, or the wallpaper selection when the menu is closed |
 | `Enter` | Launch the highlighted application |
 | `Space` | Open the Start menu (or toggle All Programs while it is open) |
@@ -591,12 +602,17 @@ the keyboard:
 | `Esc` | Close the Start menu |
 | `Ctrl-\` | Leave the desktop and return to the serial shell (`Ctrl-D` also works) |
 
+The Start menu starts closed; click **start** to open it. **Run...** accepts a
+bundle id (`system-info`) or a shell command (`ps`), **Turn Off Computer**
+shows the XP shutdown confirmation, and the tray clock opens Date and Time
+Properties.
+
 The same controls work in the shell with the `desktop` command:
 
 ```text
 feos> desktop
 [desktop] session started
-[desktop] arrows select, Enter launches, Space opens Start, Esc closes, Ctrl-\ returns to the shell
+[desktop] click Start, double-click desktop icons, drag windows; Ctrl-\ returns to the shell
 [desktop] 7 application(s) discovered in the application folder (0 skipped)
 feos> desktop list
   files                System         entry=files  Browse the filesystem and preview text files

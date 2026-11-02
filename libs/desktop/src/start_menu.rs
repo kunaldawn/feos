@@ -12,8 +12,11 @@ use crate::theme::DesktopTheme;
 /// Number of pinned applications shown before "All Programs".
 pub const PINNED_APPS: usize = 5;
 
-/// Number of columns in the "All Programs" grid.
-pub const GRID_COLUMNS: usize = 4;
+/// Number of columns in the "All Programs" list.
+///
+/// XP presents All Programs as a single vertical list; the constant stays
+/// public because the keyboard navigation code only needs the stride.
+pub const GRID_COLUMNS: usize = 1;
 
 /// Commands available from the right-hand column and footer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -23,6 +26,8 @@ pub enum StartMenuCommand {
     None,
     /// Open the "My Computer" view.
     MyComputer,
+    /// Open the "My Documents" view.
+    MyDocuments,
     /// Open the control panel.
     ControlPanel,
     /// Open help.
@@ -37,6 +42,8 @@ pub enum StartMenuCommand {
     LogOff,
     /// Power off the machine.
     ShutDown,
+    /// Restart the machine.
+    Restart,
 }
 
 /// Persistent Start-menu state.
@@ -267,33 +274,41 @@ pub fn render<const N: usize, const A: usize>(
         );
         let columns = GRID_COLUMNS as u32;
         let cell_width = (grid_area.width / columns).max(1);
-        let cell_height = 64u32;
+        let cell_height = 38u32;
         for index in 0..app_count {
             let column = index as u32 % columns;
             let row = index as u32 / columns;
             let cell = Rect::new(
                 grid_area.x + (column * cell_width) as i32 + 2,
-                grid_area.y + (row * cell_height) as i32 + 2,
+                grid_area.y + (row * cell_height) as i32 + 1,
                 cell_width.saturating_sub(4),
-                cell_height.saturating_sub(4),
+                cell_height.saturating_sub(2),
             );
             if cell.y + cell.height as i32 > grid_area.bottom_i32() {
                 break;
             }
             let id = Id::from_name("desktop.start.grid").child(index as u64 + 1);
             let hit = ui.interact(id, cell, Sense::click());
+            if hit.hovered {
+                state.highlighted = index;
+            }
             if hit.hovered || state.highlighted == index {
-                ui.painter.fill_rounded_rect(cell, 4, theme.menu_hover);
+                ui.painter.fill_rounded_rect(cell, 3, theme.menu_hover);
             }
             if let Some(app) = catalog.get(index) {
                 draw_icon(
                     &mut ui.painter,
                     &app.icon,
-                    Rect::new(cell.x + (cell.width as i32 - 32) / 2, cell.y + 6, 32, 32),
+                    Rect::new(cell.x + 6, cell.y + 4, 26, 26),
                     theme.caption_button,
                 );
                 ui.painter.draw_text_ellipsis(
-                    Rect::new(cell.x + 3, cell.y + 40, cell.width.saturating_sub(6), 18),
+                    Rect::new(
+                        cell.x + 38,
+                        cell.y,
+                        cell.width.saturating_sub(44),
+                        cell.height,
+                    ),
                     app.name(),
                     if hit.hovered || state.highlighted == index {
                         theme.menu_hover_text
@@ -301,7 +316,7 @@ pub fn render<const N: usize, const A: usize>(
                         theme.menu_text
                     },
                     1,
-                    Align::Center,
+                    Align::Start,
                     VerticalAlign::Middle,
                 );
             }
@@ -367,6 +382,9 @@ pub fn render<const N: usize, const A: usize>(
             );
             let id = Id::from_name("desktop.start.app").child(index as u64 + 1);
             let hit = ui.interact(id, row, Sense::click());
+            if hit.hovered {
+                state.highlighted = index;
+            }
             if hit.hovered || state.highlighted == index {
                 ui.painter.fill_rounded_rect(row, 3, theme.menu_hover);
             }
@@ -458,7 +476,7 @@ pub fn render<const N: usize, const A: usize>(
             (
                 GuiIcon::Folder,
                 "My Documents",
-                StartMenuCommand::MyComputer,
+                StartMenuCommand::MyDocuments,
             ),
             (
                 GuiIcon::Settings,

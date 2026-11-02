@@ -1,19 +1,21 @@
-//! Interactive desktop session driven by the serial console.
+//! Interactive desktop session driven by the serial console and pointer.
 //!
-//! The QEMU board has no pointer or keyboard device yet, so the serial console
-//! acts as the keyboard. Arrow keys move the Start-menu highlight (or the
-//! wallpaper selection), `Enter` launches the highlighted item, `Space` opens
-//! the Start menu, and `Escape` closes it. `Ctrl-\` (or the Start menu's
-//! "Log Off" button) returns to the shell.
+//! Serial keys are the keyboard: arrow keys move the Start-menu highlight (or
+//! the wallpaper selection), `Enter` launches the highlighted item, `Space`
+//! opens the Start menu, and `Escape` closes it. A virtio tablet supplies the
+//! pointer, so Start-menu items, taskbar buttons, desktop icons and window
+//! controls behave like their Windows XP counterparts. `Ctrl-\` (or the Start
+//! menu's "Log Off" button) returns to the shell.
 //!
-//! The console is polled, so this loop never blocks: the scheduler keeps
-//! running background applications while the desktop redraws.
+//! The console and pointer are polled, so this loop never blocks: the
+//! scheduler keeps running background applications while the desktop redraws.
 
 use feos_app::Platform;
 use feos_console::println;
 use feos_desktop::StartMenuCommand;
-use feos_gfx::Canvas;
-use feos_gui::Input;
+use feos_gfx::{Canvas, Point};
+use feos_gui::{Event, Input, MouseButton};
+use feos_hal::PointerEvent;
 use feos_keys::SerialKeys;
 
 /// Why a desktop session returned to its caller.
@@ -63,13 +65,17 @@ pub fn run_session(
 
     println!("[desktop] session started");
     println!(
-        "[desktop] arrows select, Enter launches, Space opens Start, Esc closes, Ctrl-\\ returns to the shell"
+        "[desktop] click Start, double-click desktop icons, drag windows; Ctrl-\\ returns to the shell"
     );
     super::prepare(&mut session, config, platform, true);
 
     let mut last_tick = platform.clock.uptime_ms();
     let mut last_minute = u64::MAX;
     let mut dirty = true;
+    let mut pointer_position = platform.pointer.map(|pointer| pointer.position());
+    if let Some((x, y)) = pointer_position {
+        input.set_pointer(Point::new(x as i32, y as i32));
+    }
 
     loop {
         let now = platform.clock.uptime_ms();
@@ -77,6 +83,24 @@ pub fn run_session(
             println!();
             println!("[desktop] log off - returning to the serial shell");
             return SessionExit::LogOff;
+        }
+
+        // Drain the pointer device into this frame's GUI event queue. A
+        // report carries a full position, so the session only has to turn
+        // state changes into the events the toolkit understands.
+        if let Some(pointer) = platform.pointer {
+            let mut budget = 16;
+            while budget > 0 {
+                let Some(report) = pointer.poll() else {
+                    break;
+                };
+                if let Some(last) = pointer_position.as_mut() {
+                    if push_pointer(&mut input, report, last) {
+                        dirty = true;
+                    }
+                }
+                budget -= 1;
+            }
         }
 
         let had_input = !input.is_empty();
@@ -129,6 +153,52 @@ pub fn run_session(
         input.clear_events();
         platform.clock.spin_ms(FRAME_MS);
     }
+}
+
+/// Converts one driver report into toolkit events.
+///
+/// The pointer position persists in [`Input`]; a movement event is only
+/// queued when the cursor actually changed, so a button press at the same
+/// position does not produce a redundant move.
+fn push_pointer(input: &mut Input, report: PointerEvent, last: &mut (u16, u16)) -> bool {
+    let mut changed = false;
+    let position = Point::new(report.x as i32, report.y as i32);
+
+    if (report.x, report.y) != *last {
+        *last = (report.x, report.y);
+        input.push(Event::PointerMoved(position));
+        changed = true;
+    }
+
+    for (button, state) in [
+        (MouseButton::Left, report.left),
+        (MouseButton::Right, report.right),
+        (MouseButton::Middle, report.middle),
+    ] {
+        let Some(down) = state else {
+            continue;
+        };
+        let event = if down {
+            Event::PointerDown {
+                pos: position,
+                button,
+            }
+        } else {
+            Event::PointerUp {
+                pos: position,
+                button,
+            }
+        };
+        input.push(event);
+        changed = true;
+    }
+
+    if report.wheel != 0 {
+        input.push(Event::PointerWheel(report.wheel));
+        changed = true;
+    }
+
+    changed
 }
 
 /// Copies the composed frame to the scanout buffer.

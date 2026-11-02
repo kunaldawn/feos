@@ -79,6 +79,12 @@ pub extern "C" fn kmain(dtb: usize) -> ! {
         ),
     }
 
+    let pointer = board::init_pointer();
+    match pointer {
+        Some(kind) => println!("[input] virtio pointer ready ({kind:?})"),
+        None => println!("[input] no pointer (start QEMU with -device virtio-tablet-device)"),
+    }
+
     let platform = Platform {
         board: BoardInfo {
             name: board::NAME,
@@ -91,6 +97,7 @@ pub extern "C" fn kmain(dtb: usize) -> ! {
         power: services,
         cpu: services,
         audio: audio.as_ref().map(|audio| audio.device),
+        pointer: board::pointer(),
         processes: &sched::PROCESSES,
         apps: &feos_apps::APP_REGISTRY,
         filesystem: Some(board::filesystem()),

@@ -19,7 +19,7 @@
 
 use feos_fs::FileSystem;
 use feos_gfx::Canvas;
-use feos_hal::{Audio, Clock, Cpu, Power};
+use feos_hal::{Audio, Clock, Cpu, Pointer, Power};
 
 /// The version shared by every crate in the workspace.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -131,6 +131,8 @@ pub struct Platform {
     pub cpu: &'static dyn Cpu,
     /// Audio output device, when the board found one.
     pub audio: Option<&'static dyn Audio>,
+    /// Pointer device, when the board found one.
+    pub pointer: Option<&'static dyn Pointer>,
     /// Process creation and inspection.
     pub processes: &'static dyn Processes,
     /// Lookup table the desktop and init manager resolve entries through.

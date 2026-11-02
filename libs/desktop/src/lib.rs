@@ -42,9 +42,11 @@ pub mod taskbar;
 pub mod theme;
 pub mod window;
 
+use core::fmt::Write as _;
+
 use feos_app::{App, AppRegistry, ProcessInfo, ProcessState, Processes, SpawnError, MAX_PROCESSES};
 use feos_bundle::{AppCatalog, InstalledApp, ScanReport};
-use feos_gfx::{Canvas, Color, Rect};
+use feos_gfx::{Canvas, Color, Point, Rect};
 use feos_gui::{Align, Id, Input, InteractionState, Key, RectExt, Sense, Ui, VerticalAlign};
 use feos_init::{Init, MAX_SERVICES};
 use feos_text::Text;
@@ -117,6 +119,8 @@ pub struct DesktopResponse {
     pub launch: Option<LaunchRequest>,
     /// A Start-menu command, when one was chosen.
     pub command: StartMenuCommand,
+    /// A command typed into the Run dialog.
+    pub run: Option<Text<96>>,
     /// The notification area was clicked.
     pub tray_clicked: bool,
     /// Start menu visibility after the frame.
@@ -128,7 +132,119 @@ pub struct DesktopResponse {
 impl DesktopResponse {
     /// Returns `true` when the result is empty.
     pub fn is_empty(&self) -> bool {
-        self.launch.is_none() && self.command == StartMenuCommand::None && !self.tray_clicked
+        self.launch.is_none()
+            && self.command == StartMenuCommand::None
+            && self.run.is_none()
+            && !self.tray_clicked
+    }
+}
+
+/// A command chosen from the desktop's right-click menu.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum ContextAction {
+    #[default]
+    None,
+    Refresh,
+    ShowDesktop,
+    TaskManager,
+    Properties,
+}
+
+/// Position of the desktop context menu.
+#[derive(Clone, Copy, Debug, Default)]
+struct ContextMenuState {
+    open: bool,
+    x: i32,
+    y: i32,
+}
+
+/// The XP-style "Run..." dialog.
+#[derive(Clone, Copy, Debug)]
+struct RunDialogState {
+    open: bool,
+    text: Text<96>,
+}
+
+impl RunDialogState {
+    const fn new() -> Self {
+        Self {
+            open: false,
+            text: Text::EMPTY,
+        }
+    }
+
+    fn show(&mut self) {
+        self.open = true;
+        self.text.clear();
+    }
+
+    fn close(&mut self) {
+        self.open = false;
+        self.text.clear();
+    }
+}
+
+/// What the user chose in the "Turn off computer" dialog.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum ShutdownAction {
+    #[default]
+    None,
+    TurnOff,
+    Restart,
+    Cancel,
+}
+
+/// The XP "Turn off computer" dialog.
+#[derive(Clone, Copy, Debug, Default)]
+struct ShutdownDialogState {
+    open: bool,
+}
+
+/// What the user chose in the "Log Off Windows" dialog.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum LogoffAction {
+    #[default]
+    None,
+    LogOff,
+    Cancel,
+}
+
+/// Remembers the previous click so icons and title bars can distinguish a
+/// single click from a double click, as Windows XP does.
+///
+/// A double click is a second click on the same target within half a second
+/// and within a few pixels of the first. After a double click the tracker is
+/// cleared, so a third click starts a new pair instead of opening two windows.
+#[derive(Clone, Copy, Debug, Default)]
+struct ClickMemory {
+    target: u32,
+    at_ms: u64,
+    x: i32,
+    y: i32,
+    valid: bool,
+}
+
+impl ClickMemory {
+    const INTERVAL_MS: u64 = 500;
+    const SLOP: i32 = 4;
+
+    fn hit(&mut self, target: u32, position: Point, now_ms: u64) -> bool {
+        let double = self.valid
+            && self.target == target
+            && now_ms.saturating_sub(self.at_ms) <= Self::INTERVAL_MS
+            && (position.x - self.x).abs() <= Self::SLOP
+            && (position.y - self.y).abs() <= Self::SLOP;
+
+        if double {
+            self.valid = false;
+        } else {
+            self.target = target;
+            self.at_ms = now_ms;
+            self.x = position.x;
+            self.y = position.y;
+            self.valid = true;
+        }
+        double
     }
 }
 
@@ -152,6 +268,20 @@ pub struct Desktop<
     session_started: bool,
     /// Keyboard focus on the wallpaper shortcuts (catalog index).
     selection: usize,
+    /// Double-click state for icons, title bars and desktop menu items.
+    clicks: ClickMemory,
+    /// The wallpaper's right-click menu.
+    context: ContextMenuState,
+    /// The Start menu's Run dialog.
+    run_dialog: RunDialogState,
+    /// The Start menu's "Turn off computer" dialog.
+    shutdown: ShutdownDialogState,
+    /// Whether the tray clock's Date and Time dialog is open.
+    clock_open: bool,
+    /// Whether the "Log Off Windows" confirmation dialog is open.
+    logoff_open: bool,
+    /// Whether "Show Desktop" is active.
+    show_desktop: bool,
 }
 
 impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
@@ -174,6 +304,23 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             work_area: Rect::new(0, 0, 0, 0),
             session_started: false,
             selection: 0,
+            clicks: ClickMemory {
+                target: 0,
+                at_ms: 0,
+                x: 0,
+                y: 0,
+                valid: false,
+            },
+            context: ContextMenuState {
+                open: false,
+                x: 0,
+                y: 0,
+            },
+            run_dialog: RunDialogState::new(),
+            shutdown: ShutdownDialogState { open: false },
+            clock_open: false,
+            logoff_open: false,
+            show_desktop: false,
         }
     }
 
@@ -258,6 +405,47 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
         let current = self.selection.min(count - 1) as i32;
         let next = current + rows_delta + columns * rows;
         self.selection = next.clamp(0, count as i32 - 1) as usize;
+    }
+
+    /// Minimises every window, or restores them when "Show Desktop" is
+    /// clicked a second time.
+    fn toggle_show_desktop(&mut self) {
+        if self.show_desktop {
+            for index in 0..N {
+                if self
+                    .windows
+                    .get(index)
+                    .is_some_and(|window| window.open && window.state == WindowState::Minimized)
+                {
+                    self.windows.restore(index);
+                }
+            }
+            self.show_desktop = false;
+        } else {
+            for index in 0..N {
+                self.windows.minimize(index);
+            }
+            self.show_desktop = true;
+        }
+        self.start_menu.close();
+    }
+
+    /// Feeds typed text and editing keys into the Run dialog.
+    fn handle_run_keys(&mut self, input: &Input, submit: &mut bool) {
+        for ch in input.text() {
+            if !ch.is_control() {
+                self.run_dialog.text.push(ch);
+            }
+        }
+        if input.keys().any(|(key, _)| key == Key::Backspace) {
+            self.run_dialog.text.pop();
+        }
+        if input.keys().any(|(key, _)| key == Key::Escape) {
+            self.run_dialog.close();
+        }
+        if input.keys().any(|(key, _)| key == Key::Enter) {
+            *submit = true;
+        }
     }
 
     /// Applies keyboard navigation before drawing a frame.
@@ -375,6 +563,7 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
     /// defaults, and is clamped to the current work area.
     pub fn open_app(&mut self, index: usize) -> Option<usize> {
         let app = *self.catalog.get(index)?;
+        self.show_desktop = false;
         let work_area = if self.work_area.is_empty() {
             Rect::new(0, 0, 1024, 768)
         } else {
@@ -573,17 +762,40 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
         let canvas_rect = Rect::new(0, 0, canvas.width() as u32, canvas.height() as u32);
         let layout = taskbar::layout(canvas_rect, &config.taskbar);
         self.work_area = layout.work_area(canvas_rect, config.taskbar.position);
-        self.handle_keyboard(input, &config);
+        let run_dialog_open = self.run_dialog.open;
+        let shutdown_open = self.shutdown.open;
+        let clock_open = self.clock_open;
+        let logoff_open = self.logoff_open;
+        let mut run_submit = false;
+        if run_dialog_open {
+            self.handle_run_keys(input, &mut run_submit);
+        } else if shutdown_open {
+            if input.keys().any(|(key, _)| key == Key::Escape) {
+                self.shutdown.open = false;
+            }
+        } else if clock_open {
+            if input.keys().any(|(key, _)| key == Key::Escape) {
+                self.clock_open = false;
+            }
+        } else if logoff_open {
+            if input.keys().any(|(key, _)| key == Key::Escape) {
+                self.logoff_open = false;
+            }
+        } else {
+            self.handle_keyboard(input, &config);
+        }
 
         // The desktop consumes Tab/Space/Enter itself; keep the toolkit from
         // activating a focused widget for the same key press.
         let pointer_input = input.without_keyboard();
         let mut ui = Ui::new(canvas, &theme.ui, &pointer_input, &mut self.interaction);
+        let over_window = self.windows.topmost_at(ui.pointer()).is_some();
         paint::draw_wallpaper(&mut ui, &theme, &config.wallpaper);
 
-        let mut shortcut_launch = None;
+        let mut launch_index = None;
+        let mut shortcut_clicked = None;
         if config.icons.show_icons {
-            shortcut_launch = render_shortcuts(
+            shortcut_clicked = render_shortcuts(
                 &mut ui,
                 &theme,
                 &config.icons,
@@ -591,6 +803,18 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
                 self.work_area,
                 self.selection,
             );
+        }
+
+        if let Some(index) = shortcut_clicked {
+            // A single click selects the icon, exactly as XP does; the second
+            // click within the double-click interval opens it.
+            self.selection = index;
+            if self
+                .clicks
+                .hit(0x1000_0000 | index as u32, ui.pointer(), uptime_ms)
+            {
+                launch_index = Some(index);
+            }
         }
 
         let mut order = [0usize; N];
@@ -604,6 +828,8 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
                 &self.catalog,
                 index,
                 work_area,
+                &mut self.clicks,
+                uptime_ms,
             );
         }
 
@@ -629,16 +855,88 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
 
         let pointer = ui.pointer();
         let pointer_pressed = ui.pointer_pressed();
+        let secondary_released = ui.secondary_released();
+
+        // A right click on the wallpaper opens the XP desktop menu. Right
+        // clicks on a window, the Start menu or the taskbar belong to those
+        // surfaces instead.
+        if secondary_released
+            && !over_window
+            && !layout.bar.contains(pointer)
+            && !menu_response.panel.contains(pointer)
+        {
+            self.start_menu.close();
+            self.context.open = true;
+            self.context.x = pointer.x;
+            self.context.y = pointer.y;
+        }
+
+        let context_action = render_context_menu(
+            &mut ui,
+            &theme,
+            &mut self.context,
+            self.work_area,
+            pointer_pressed,
+        );
+
+        let run_clicked = if self.run_dialog.open {
+            render_run_dialog(&mut ui, &theme, self.work_area, &mut self.run_dialog)
+        } else {
+            false
+        };
+
+        let shutdown_action = if self.shutdown.open {
+            render_shutdown_dialog(&mut ui, &theme, self.work_area)
+        } else {
+            ShutdownAction::None
+        };
+
+        let clock_closed = if self.clock_open {
+            render_clock_dialog(&mut ui, &theme, self.work_area, uptime_ms, clock.as_str())
+        } else {
+            false
+        };
+
+        let logoff_action = if self.logoff_open {
+            render_logoff_dialog(&mut ui, &theme, self.work_area)
+        } else {
+            LogoffAction::None
+        };
+
+        // The pointer is painted last so it stays visible over windows and the
+        // Start menu, exactly like the XP cursor.
+        let cursor = ui.pointer();
+        paint::draw_cursor(&mut ui.painter, cursor.x, cursor.y);
+
+        let pointer = ui.pointer();
         drop(ui);
 
+        if run_dialog_open && (run_submit || run_clicked) {
+            let command = self.run_dialog.text;
+            if !command.trim().is_empty() {
+                response.run = Some(command);
+            }
+            self.run_dialog.close();
+        }
+
+        if clock_closed {
+            self.clock_open = false;
+        }
+
         let escape = input.keys().any(|(key, _)| key == Key::Escape);
-        let enter = input.keys().any(|(key, _)| key == Key::Enter);
+        let enter = !run_dialog_open
+            && !shutdown_open
+            && !clock_open
+            && !logoff_open
+            && input.keys().any(|(key, _)| key == Key::Enter);
 
         if taskbar_response.start_clicked {
             self.start_menu.toggle();
         }
 
         if let Some(index) = taskbar_response.task_clicked {
+            self.start_menu.close();
+            self.show_desktop = false;
             if self.windows.is_focused(index)
                 && self
                     .windows
@@ -658,19 +956,70 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
         }
 
         if taskbar_response.desktop_clicked {
-            for index in 0..N {
-                self.windows.minimize(index);
-            }
-            self.start_menu.close();
+            self.toggle_show_desktop();
         }
 
         if taskbar_response.tray_clicked {
+            self.start_menu.close();
+            self.clock_open = true;
             response.tray_clicked = true;
         }
 
-        let mut launch_index = menu_response.launched.or(shortcut_launch);
+        let mut launch_index = menu_response.launched.or(launch_index);
         if let Some(index) = taskbar_response.quick_clicked {
+            self.start_menu.close();
             launch_index = Some(index);
+        }
+
+        let mut command = menu_response.command;
+        if command == StartMenuCommand::Run {
+            self.run_dialog.show();
+            self.context.open = false;
+            command = StartMenuCommand::None;
+        }
+        if command == StartMenuCommand::ShutDown {
+            self.shutdown.open = true;
+            self.context.open = false;
+            command = StartMenuCommand::None;
+        }
+        if command == StartMenuCommand::LogOff {
+            self.logoff_open = true;
+            self.context.open = false;
+            command = StartMenuCommand::None;
+        }
+        match context_action {
+            ContextAction::None | ContextAction::Refresh => {}
+            ContextAction::ShowDesktop => {
+                self.toggle_show_desktop();
+            }
+            ContextAction::TaskManager => {
+                if let Some(index) = self.catalog.find_id("process-monitor") {
+                    launch_index = Some(index);
+                }
+            }
+            ContextAction::Properties => command = StartMenuCommand::Settings,
+        }
+
+        match shutdown_action {
+            ShutdownAction::None => {}
+            ShutdownAction::Cancel => self.shutdown.open = false,
+            ShutdownAction::TurnOff => {
+                self.shutdown.open = false;
+                command = StartMenuCommand::ShutDown;
+            }
+            ShutdownAction::Restart => {
+                self.shutdown.open = false;
+                command = StartMenuCommand::Restart;
+            }
+        }
+
+        match logoff_action {
+            LogoffAction::None => {}
+            LogoffAction::Cancel => self.logoff_open = false,
+            LogoffAction::LogOff => {
+                self.logoff_open = false;
+                command = StartMenuCommand::LogOff;
+            }
         }
 
         if self.start_menu.open && enter {
@@ -684,6 +1033,7 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
         }
 
         if let Some(index) = launch_index {
+            self.show_desktop = false;
             if let Some(window) = self.open_app(index) {
                 if let Some(app) = self.catalog.get(index) {
                     response.launch = Some(LaunchRequest {
@@ -697,7 +1047,7 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             self.start_menu.close();
         }
 
-        response.command = menu_response.command;
+        response.command = command;
 
         if pointer_pressed
             && !taskbar_response.start_clicked
@@ -722,6 +1072,643 @@ impl<const N: usize, const A: usize, const S: usize> Default for Desktop<N, A, S
     fn default() -> Self {
         Self::new(DesktopConfig::default())
     }
+}
+
+fn render_logoff_dialog<const N: usize>(
+    ui: &mut Ui<'_, '_, '_, N>,
+    theme: &DesktopTheme,
+    work_area: Rect,
+) -> LogoffAction {
+    const WIDTH: u32 = 360;
+    const HEIGHT: u32 = 158;
+    const TITLE: u32 = 28;
+
+    let full = ui.canvas_rect();
+    ui.painter.fill_rect_alpha(full, Color::BLACK, 90);
+    let _blocker = ui.interact(Id::from_name("desktop.logoff.modal"), full, Sense::click());
+
+    let x = work_area.x + (work_area.width as i32 - WIDTH as i32) / 2;
+    let y = work_area.y + (work_area.height as i32 - HEIGHT as i32) / 2;
+    let panel = Rect::new(x.max(work_area.x), y.max(work_area.y), WIDTH, HEIGHT);
+
+    ui.painter.shadow(panel, 8, 10, 120);
+    ui.painter.fill_rounded_rect(panel, 4, theme.menu_bg);
+    ui.painter
+        .stroke_rounded_rect(panel, 4, 1, theme.menu_border);
+
+    let title = Rect::new(panel.x + 1, panel.y + 1, panel.width - 2, TITLE);
+    ui.painter.canvas_mut().fill_vertical_gradient(
+        title,
+        theme.title_active_top,
+        theme.title_active_bottom,
+    );
+    ui.painter.draw_text_ellipsis(
+        Rect::new(
+            title.x + 10,
+            title.y,
+            title.width.saturating_sub(20),
+            title.height,
+        ),
+        "Log Off Windows",
+        theme.title_text,
+        1,
+        Align::Start,
+        VerticalAlign::Middle,
+    );
+
+    ui.painter.draw_text_ellipsis(
+        Rect::new(
+            panel.x + 16,
+            panel.y + 48,
+            panel.width.saturating_sub(32),
+            24,
+        ),
+        "Are you sure you want to log off?",
+        theme.menu_text,
+        1,
+        Align::Center,
+        VerticalAlign::Middle,
+    );
+
+    let logoff = Rect::new(panel.right_i32() - 166, panel.bottom_i32() - 38, 70, 24);
+    let cancel = Rect::new(panel.right_i32() - 88, panel.bottom_i32() - 38, 72, 24);
+    let logoff_hit = ui.interact(
+        Id::from_name("desktop.logoff.confirm"),
+        logoff,
+        Sense::click(),
+    );
+    let cancel_hit = ui.interact(
+        Id::from_name("desktop.logoff.cancel"),
+        cancel,
+        Sense::click(),
+    );
+
+    for (rect, hit, label, color) in [
+        (logoff, logoff_hit, "Log Off", theme.caption_button),
+        (cancel, cancel_hit, "Cancel", theme.task_button),
+    ] {
+        ui.painter.fill_rounded_rect(
+            rect,
+            3,
+            if hit.hovered {
+                color.lerp(Color::WHITE, 40)
+            } else {
+                color
+            },
+        );
+        ui.painter
+            .stroke_rounded_rect(rect, 3, 1, theme.menu_border);
+        ui.painter.draw_text_centered(rect, label, Color::WHITE, 1);
+    }
+
+    if logoff_hit.clicked {
+        LogoffAction::LogOff
+    } else if cancel_hit.clicked {
+        LogoffAction::Cancel
+    } else {
+        LogoffAction::None
+    }
+}
+
+fn render_clock_dialog<const N: usize>(
+    ui: &mut Ui<'_, '_, '_, N>,
+    theme: &DesktopTheme,
+    work_area: Rect,
+    uptime_ms: u64,
+    clock: &str,
+) -> bool {
+    const WIDTH: u32 = 410;
+    const HEIGHT: u32 = 236;
+    const TITLE: u32 = 28;
+    const HOUR_END: [(i32, i32); 12] = [
+        (0, -30),
+        (15, -26),
+        (26, -15),
+        (30, 0),
+        (26, 15),
+        (15, 26),
+        (0, 30),
+        (-15, 26),
+        (-26, 15),
+        (-30, 0),
+        (-26, -15),
+        (-15, -26),
+    ];
+    const MINUTE_END: [(i32, i32); 12] = [
+        (0, -44),
+        (22, -38),
+        (38, -22),
+        (44, 0),
+        (38, 22),
+        (22, 38),
+        (0, 44),
+        (-22, 38),
+        (-38, 22),
+        (-44, 0),
+        (-38, -22),
+        (-22, -38),
+    ];
+
+    let x = work_area.x + (work_area.width as i32 - WIDTH as i32) / 2;
+    let y = work_area.y + (work_area.height as i32 - HEIGHT as i32) / 2;
+    let panel = Rect::new(x.max(work_area.x), y.max(work_area.y), WIDTH, HEIGHT);
+
+    let _blocker = ui.interact(
+        Id::from_name("desktop.clock.modal"),
+        ui.canvas_rect(),
+        Sense::click(),
+    );
+
+    ui.painter.shadow(panel, 8, 10, 120);
+    ui.painter.fill_rounded_rect(panel, 4, theme.menu_bg);
+    ui.painter
+        .stroke_rounded_rect(panel, 4, 1, theme.menu_border);
+
+    let title = Rect::new(panel.x + 1, panel.y + 1, panel.width - 2, TITLE);
+    ui.painter.canvas_mut().fill_vertical_gradient(
+        title,
+        theme.title_active_top,
+        theme.title_active_bottom,
+    );
+    ui.painter.draw_text_ellipsis(
+        Rect::new(
+            title.x + 10,
+            title.y,
+            title.width.saturating_sub(20),
+            title.height,
+        ),
+        "Date and Time Properties",
+        theme.title_text,
+        1,
+        Align::Start,
+        VerticalAlign::Middle,
+    );
+
+    // Analog clock face --------------------------------------------------
+    let cx = panel.x + 92;
+    let cy = panel.y + 128;
+    ui.painter.circle(cx, cy, 58, theme.menu_border);
+    ui.painter.circle(cx, cy, 54, Color::WHITE);
+    for step in 0..12 {
+        let (dx, dy) = MINUTE_END[step];
+        let tick_x = cx + dx * 55 / 44;
+        let tick_y = cy + dy * 55 / 44;
+        ui.painter
+            .fill_rect(Rect::new(tick_x - 1, tick_y - 1, 2, 2), theme.menu_muted);
+    }
+
+    let total_seconds = uptime_ms / 1000;
+    let hours = (total_seconds / 3600) % 24;
+    let minutes = (total_seconds / 60) % 60;
+    let (hx, hy) = HOUR_END[(hours % 12) as usize];
+    let (mx, my) = MINUTE_END[((minutes / 5) % 12) as usize];
+    ui.painter.line(cx, cy, cx + hx, cy + hy, theme.menu_text);
+    ui.painter.line(cx, cy, cx + mx, cy + my, theme.menu_text);
+    ui.painter.circle(cx, cy, 3, theme.menu_border);
+
+    // Current time and uptime -------------------------------------------
+    let text_x = panel.x + 170;
+    let text_width = panel.width.saturating_sub(190);
+    ui.painter.draw_text_ellipsis(
+        Rect::new(text_x, panel.y + 52, text_width, 18),
+        "Current time",
+        theme.menu_muted,
+        1,
+        Align::Start,
+        VerticalAlign::Middle,
+    );
+    ui.painter.draw_text_ellipsis(
+        Rect::new(text_x, panel.y + 72, text_width, 28),
+        clock,
+        theme.menu_text,
+        2,
+        Align::Start,
+        VerticalAlign::Middle,
+    );
+
+    let days = total_seconds / 86_400;
+    let mut uptime = Text::<48>::new();
+    let _ = write!(
+        uptime,
+        "{days} day(s), {:02}:{:02}:{:02}",
+        (total_seconds / 3600) % 24,
+        minutes,
+        total_seconds % 60
+    );
+    ui.painter.draw_text_ellipsis(
+        Rect::new(text_x, panel.y + 116, text_width, 18),
+        "Uptime",
+        theme.menu_muted,
+        1,
+        Align::Start,
+        VerticalAlign::Middle,
+    );
+    ui.painter.draw_text_ellipsis(
+        Rect::new(text_x, panel.y + 136, text_width, 18),
+        uptime.as_str(),
+        theme.menu_text,
+        1,
+        Align::Start,
+        VerticalAlign::Middle,
+    );
+
+    let ok = Rect::new(panel.right_i32() - 166, panel.bottom_i32() - 38, 70, 24);
+    let cancel = Rect::new(panel.right_i32() - 88, panel.bottom_i32() - 38, 72, 24);
+    let ok_hit = ui.interact(Id::from_name("desktop.clock.ok"), ok, Sense::click());
+    let cancel_hit = ui.interact(
+        Id::from_name("desktop.clock.cancel"),
+        cancel,
+        Sense::click(),
+    );
+    for (rect, hit, label) in [(ok, ok_hit, "OK"), (cancel, cancel_hit, "Cancel")] {
+        ui.painter.fill_rounded_rect(
+            rect,
+            3,
+            if hit.hovered {
+                theme.caption_button.lerp(Color::WHITE, 40)
+            } else {
+                theme.caption_button
+            },
+        );
+        ui.painter
+            .stroke_rounded_rect(rect, 3, 1, theme.menu_border);
+        ui.painter.draw_text_centered(rect, label, Color::WHITE, 1);
+    }
+
+    ok_hit.clicked || cancel_hit.clicked
+}
+
+fn render_shutdown_dialog<const N: usize>(
+    ui: &mut Ui<'_, '_, '_, N>,
+    theme: &DesktopTheme,
+    work_area: Rect,
+) -> ShutdownAction {
+    const WIDTH: u32 = 470;
+    const HEIGHT: u32 = 232;
+    const TITLE: u32 = 30;
+
+    let full = ui.canvas_rect();
+    ui.painter.fill_rect_alpha(full, Color::BLACK, 110);
+    let _blocker = ui.interact(
+        Id::from_name("desktop.shutdown.modal"),
+        full,
+        Sense::click(),
+    );
+
+    let x = work_area.x + (work_area.width as i32 - WIDTH as i32) / 2;
+    let y = work_area.y + (work_area.height as i32 - HEIGHT as i32) / 2;
+    let panel = Rect::new(x.max(work_area.x), y.max(work_area.y), WIDTH, HEIGHT);
+
+    ui.painter.shadow(panel, 8, 10, 130);
+    ui.painter.fill_rounded_rect(panel, 4, theme.menu_bg);
+    ui.painter
+        .stroke_rounded_rect(panel, 4, 1, theme.menu_border);
+
+    let title = Rect::new(panel.x + 1, panel.y + 1, panel.width - 2, TITLE);
+    ui.painter.canvas_mut().fill_vertical_gradient(
+        title,
+        theme.title_active_top,
+        theme.title_active_bottom,
+    );
+    ui.painter.draw_text_ellipsis(
+        Rect::new(
+            title.x + 10,
+            title.y,
+            title.width.saturating_sub(20),
+            title.height,
+        ),
+        "Turn off computer",
+        theme.title_text,
+        1,
+        Align::Start,
+        VerticalAlign::Middle,
+    );
+
+    ui.painter.draw_text_ellipsis(
+        Rect::new(
+            panel.x + 16,
+            panel.y + 42,
+            panel.width.saturating_sub(32),
+            24,
+        ),
+        "What do you want the computer to do?",
+        theme.menu_text,
+        1,
+        Align::Center,
+        VerticalAlign::Middle,
+    );
+
+    let button_width = 120u32;
+    let button_height = 78u32;
+    let gap = 16u32;
+    let total = button_width * 3 + gap * 2;
+    let base_x = panel.x + ((panel.width - total) / 2) as i32;
+    let base_y = panel.bottom_i32() - button_height as i32 - 18;
+    let buttons = [
+        (ShutdownAction::TurnOff, "Turn Off", theme.close_button),
+        (ShutdownAction::Restart, "Restart", theme.caption_button),
+        (ShutdownAction::Cancel, "Cancel", theme.task_button),
+    ];
+
+    let mut action = ShutdownAction::None;
+    for (index, (item_action, label, color)) in buttons.iter().enumerate() {
+        let rect = Rect::new(
+            base_x + index as i32 * (button_width + gap) as i32,
+            base_y,
+            button_width,
+            button_height,
+        );
+        let id = Id::from_name("desktop.shutdown.button").child(index as u64 + 1);
+        let hit = ui.interact(id, rect, Sense::click());
+        let fill = if hit.hovered {
+            color.lerp(Color::WHITE, 35)
+        } else {
+            *color
+        };
+        ui.painter.fill_rounded_rect(rect, 4, fill);
+        ui.painter
+            .stroke_rounded_rect(rect, 4, 1, theme.menu_border);
+
+        let cx = rect.x + rect.width as i32 / 2;
+        let cy = rect.y + 22;
+        ui.painter.circle(cx, cy, 13, Color::WHITE);
+        match item_action {
+            ShutdownAction::TurnOff => {
+                ui.painter
+                    .fill_rect(Rect::new(cx - 1, cy - 10, 2, 9), *color);
+                ui.painter.circle(cx, cy + 2, 5, *color);
+            }
+            ShutdownAction::Restart => {
+                ui.painter.circle(cx, cy, 6, *color);
+                let points = [
+                    feos_gfx::Point::new(cx + 7, cy - 10),
+                    feos_gfx::Point::new(cx + 12, cy - 6),
+                    feos_gfx::Point::new(cx + 6, cy - 4),
+                ];
+                ui.painter.fill_polygon(&points, *color);
+            }
+            ShutdownAction::Cancel | ShutdownAction::None => {
+                for offset in -5..=5 {
+                    ui.painter.put_pixel(cx + offset, cy + offset, *color);
+                    ui.painter.put_pixel(cx + offset, cy - offset, *color);
+                }
+            }
+        }
+
+        ui.painter.draw_text_ellipsis(
+            Rect::new(rect.x + 2, rect.y + 42, rect.width - 4, 24),
+            label,
+            Color::WHITE,
+            1,
+            Align::Center,
+            VerticalAlign::Middle,
+        );
+
+        if hit.clicked {
+            action = *item_action;
+        }
+    }
+
+    action
+}
+
+fn render_run_dialog<const N: usize>(
+    ui: &mut Ui<'_, '_, '_, N>,
+    theme: &DesktopTheme,
+    work_area: Rect,
+    state: &mut RunDialogState,
+) -> bool {
+    const WIDTH: u32 = 400;
+    const HEIGHT: u32 = 168;
+    const TITLE: u32 = 26;
+
+    let x = work_area.x + (work_area.width as i32 - WIDTH as i32) / 2;
+    let y = work_area.y + (work_area.height as i32 - HEIGHT as i32) / 2;
+    let panel = Rect::new(x.max(work_area.x), y.max(work_area.y), WIDTH, HEIGHT);
+
+    // Modal blocker: it is created after every other surface, so a press
+    // outside the dialog cannot reach a window or the taskbar behind it.
+    let _blocker = ui.interact(
+        Id::from_name("desktop.run.modal"),
+        ui.canvas_rect(),
+        Sense::click(),
+    );
+
+    ui.painter.shadow(panel, 8, 10, 120);
+    ui.painter.fill_rounded_rect(panel, 4, theme.menu_bg);
+    ui.painter
+        .stroke_rounded_rect(panel, 4, 1, theme.menu_border);
+
+    let title = Rect::new(panel.x + 1, panel.y + 1, panel.width - 2, TITLE);
+    ui.painter.canvas_mut().fill_vertical_gradient(
+        title,
+        theme.title_active_top,
+        theme.title_active_bottom,
+    );
+    ui.painter.draw_text_ellipsis(
+        Rect::new(
+            title.x + 8,
+            title.y,
+            title.width.saturating_sub(16),
+            title.height,
+        ),
+        "Run",
+        theme.title_text,
+        1,
+        Align::Start,
+        VerticalAlign::Middle,
+    );
+
+    let icon = Rect::new(panel.x + 16, panel.y + 38, 32, 32);
+    ui.painter.fill_rounded_rect(icon, 4, theme.caption_button);
+    ui.painter
+        .draw_text_centered(icon, ">", theme.caption_glyph, 2);
+
+    ui.painter.draw_text_ellipsis(
+        Rect::new(
+            panel.x + 58,
+            panel.y + 34,
+            panel.width.saturating_sub(74),
+            17,
+        ),
+        "Type the name of a program, folder, document or command,",
+        theme.menu_text,
+        1,
+        Align::Start,
+        VerticalAlign::Middle,
+    );
+    ui.painter.draw_text_ellipsis(
+        Rect::new(
+            panel.x + 58,
+            panel.y + 51,
+            panel.width.saturating_sub(74),
+            17,
+        ),
+        "and feos will open it for you.",
+        theme.menu_text,
+        1,
+        Align::Start,
+        VerticalAlign::Middle,
+    );
+
+    ui.painter.draw_text_ellipsis(
+        Rect::new(panel.x + 16, panel.y + 78, 42, 24),
+        "Open:",
+        theme.menu_text,
+        1,
+        Align::Start,
+        VerticalAlign::Middle,
+    );
+
+    let field = Rect::new(
+        panel.x + 56,
+        panel.y + 78,
+        panel.width.saturating_sub(72),
+        24,
+    );
+    ui.painter.fill_rect(field, theme.window_content);
+    ui.painter.stroke_rect(field, 1, theme.menu_separator);
+    let text_rect = Rect::new(
+        field.x + 4,
+        field.y + 1,
+        field.width.saturating_sub(8),
+        field.height.saturating_sub(2),
+    );
+    ui.painter.draw_text_ellipsis(
+        text_rect,
+        state.text.as_str(),
+        theme.menu_text,
+        1,
+        Align::Start,
+        VerticalAlign::Middle,
+    );
+    let caret_x =
+        (field.x + 5 + ui.painter.text_width(state.text.as_str(), 1)).min(field.right_i32() - 3);
+    ui.painter
+        .fill_rect(Rect::new(caret_x, field.y + 5, 1, 14), theme.menu_text);
+
+    let ok = Rect::new(panel.right_i32() - 166, panel.bottom_i32() - 38, 70, 24);
+    let cancel = Rect::new(panel.right_i32() - 88, panel.bottom_i32() - 38, 72, 24);
+    let ok_hit = ui.interact(Id::from_name("desktop.run.ok"), ok, Sense::click());
+    let cancel_hit = ui.interact(Id::from_name("desktop.run.cancel"), cancel, Sense::click());
+
+    for (rect, hit, label, fill) in [
+        (ok, ok_hit, "OK", theme.caption_button),
+        (cancel, cancel_hit, "Cancel", theme.task_button),
+    ] {
+        ui.painter.fill_rounded_rect(
+            rect,
+            3,
+            if hit.hovered {
+                fill.lerp(Color::WHITE, 40)
+            } else {
+                fill
+            },
+        );
+        ui.painter
+            .stroke_rounded_rect(rect, 3, 1, theme.menu_border);
+        ui.painter.draw_text_centered(rect, label, Color::WHITE, 1);
+    }
+
+    if cancel_hit.clicked {
+        state.close();
+    }
+    ok_hit.clicked
+}
+
+fn render_context_menu<const N: usize>(
+    ui: &mut Ui<'_, '_, '_, N>,
+    theme: &DesktopTheme,
+    state: &mut ContextMenuState,
+    work_area: Rect,
+    pointer_pressed: bool,
+) -> ContextAction {
+    if !state.open {
+        return ContextAction::None;
+    }
+
+    const WIDTH: u32 = 196;
+    const ROW: u32 = 24;
+    const PAD: u32 = 4;
+    const SEP: u32 = 6;
+    const ITEMS: [(&str, ContextAction); 4] = [
+        ("Refresh", ContextAction::Refresh),
+        ("Show Desktop", ContextAction::ShowDesktop),
+        ("Task Manager", ContextAction::TaskManager),
+        ("Properties", ContextAction::Properties),
+    ];
+
+    let height = PAD * 2 + ROW * ITEMS.len() as u32 + SEP * 2;
+    let x = state
+        .x
+        .min(work_area.right_i32() - WIDTH as i32)
+        .max(work_area.x);
+    let y = state
+        .y
+        .min(work_area.bottom_i32() - height as i32)
+        .max(work_area.y);
+    let panel = Rect::new(x, y, WIDTH, height);
+
+    // Consume a press outside the menu so it only dismisses the menu instead
+    // of also activating the window or icon beneath it.
+    let _blocker = ui.interact(
+        Id::from_name("desktop.context.modal"),
+        ui.canvas_rect(),
+        Sense::click(),
+    );
+
+    if pointer_pressed && !panel.contains(ui.pointer()) {
+        state.open = false;
+        return ContextAction::None;
+    }
+
+    ui.painter.shadow(panel, 6, 8, 120);
+    ui.painter.fill_rounded_rect(panel, 3, theme.menu_bg);
+    ui.painter
+        .stroke_rounded_rect(panel, 3, 1, theme.menu_border);
+
+    let mut action = ContextAction::None;
+    let mut row_y = panel.y + PAD as i32;
+    for (index, (label, item_action)) in ITEMS.iter().enumerate() {
+        if index == 2 || index == 3 {
+            ui.painter.fill_rect(
+                Rect::new(
+                    panel.x + 6,
+                    row_y + (SEP / 2) as i32,
+                    panel.width.saturating_sub(12),
+                    1,
+                ),
+                theme.menu_separator,
+            );
+            row_y += SEP as i32;
+        }
+
+        let row = Rect::new(panel.x + 2, row_y, panel.width.saturating_sub(4), ROW);
+        let id = Id::from_name("desktop.context.item").child(index as u64 + 1);
+        let hit = ui.interact(id, row, Sense::click());
+        if hit.hovered {
+            ui.painter.fill_rounded_rect(row, 2, theme.menu_hover);
+        }
+        ui.painter.draw_text_ellipsis(
+            Rect::new(row.x + 26, row.y, row.width.saturating_sub(30), row.height),
+            label,
+            if hit.hovered {
+                theme.menu_hover_text
+            } else {
+                theme.menu_text
+            },
+            1,
+            Align::Start,
+            VerticalAlign::Middle,
+        );
+        if hit.clicked {
+            action = *item_action;
+            state.open = false;
+        }
+        row_y += ROW as i32;
+    }
+
+    action
 }
 
 fn render_shortcuts<const N: usize, const A: usize>(
@@ -805,6 +1792,8 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
     catalog: &AppCatalog<A>,
     index: usize,
     work_area: Rect,
+    clicks: &mut ClickMemory,
+    now_ms: u64,
 ) {
     let Some(window) = windows.get(index).copied() else {
         return;
@@ -850,7 +1839,7 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
     let title_drag = ui.interact(
         Id::from_name("desktop.window.title").child(index as u64 + 1),
         title,
-        Sense::drag(),
+        Sense::drag().with(Sense::CLICK),
     );
     if title_drag.pressed {
         windows.focus(index);
@@ -862,6 +1851,14 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
             title_drag.drag_delta.y,
             work_area,
         );
+    }
+    // Double-clicking a caption maximises or restores the window, matching the
+    // XP window manager.
+    if title_drag.clicked
+        && !title_drag.dragged
+        && clicks.hit(0x2000_0000 | index as u32, ui.pointer(), now_ms)
+    {
+        windows.toggle_maximize(index, work_area);
     }
 
     if let Some(app) = catalog.get(window.app) {
@@ -1101,6 +2098,35 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
     }
 
     ui.painter.restore_clip(clip);
+
+    // Resize grip ---------------------------------------------------------
+    if window.state == WindowState::Normal && rect.width > 140 && rect.height > 100 {
+        let grip = Rect::new(rect.right_i32() - 14, rect.bottom_i32() - 14, 14, 14);
+        let resize = ui.interact(
+            Id::from_name("desktop.window.resize").child(index as u64 + 1),
+            grip,
+            Sense::drag(),
+        );
+        if resize.dragged {
+            windows.resize_by(index, resize.drag_delta.x, resize.drag_delta.y, work_area);
+        }
+        let grip_color = if resize.hovered {
+            theme.menu_text
+        } else {
+            theme.menu_muted
+        };
+        for step in 0..3 {
+            let offset = step * 4;
+            ui.painter.fill_rect(
+                Rect::new(grip.right_i32() - 4 - offset, grip.bottom_i32() - 3, 3, 1),
+                grip_color,
+            );
+            ui.painter.fill_rect(
+                Rect::new(grip.right_i32() - 3, grip.bottom_i32() - 4 - offset, 1, 3),
+                grip_color,
+            );
+        }
+    }
 }
 
 fn draw_shortcut_label(
@@ -1207,7 +2233,7 @@ fn draw_caption_button<const N: usize>(
 mod tests {
     use super::*;
     use feos_app::{Context, ProcessInfo, ProcessState};
-    use feos_gui::{Event, Modifiers};
+    use feos_gui::{Event, Key, Modifiers, MouseButton};
     use feos_sync::SpinLock;
 
     struct Dummy;
@@ -1515,5 +2541,242 @@ mod tests {
         let config = DesktopConfig::parse("theme: dark\n").unwrap();
         desktop.set_config(config);
         assert_eq!(desktop.theme().name, ThemeName::Dark);
+    }
+
+    fn click_at(x: i32, y: i32) -> Input {
+        let mut input = Input::new();
+        input.push(Event::PointerDown {
+            pos: feos_gfx::Point::new(x, y),
+            button: MouseButton::Left,
+        });
+        input.push(Event::PointerUp {
+            pos: feos_gfx::Point::new(x, y),
+            button: MouseButton::Left,
+        });
+        input
+    }
+
+    #[test]
+    fn clicking_start_opens_and_closes_the_menu() {
+        let config = DesktopConfig::parse("start_menu:\n  initially_open: false\n").unwrap();
+        let mut desktop = Desktop::<4, 4, 2>::new(config);
+        let mut pixels = std::vec![0u32; 1024 * 768];
+        let mut canvas = Canvas::new(&mut pixels, 1024, 768, 1024).unwrap();
+
+        let response = desktop.render(&mut canvas, &click_at(30, 745), 1000);
+        assert!(response.start_open);
+        assert!(desktop.start_menu().open);
+
+        let response = desktop.render(&mut canvas, &click_at(30, 745), 2000);
+        assert!(!response.start_open);
+    }
+
+    #[test]
+    fn clicking_the_desktop_closes_the_start_menu() {
+        let config = DesktopConfig::parse("start_menu:\n  initially_open: true\n").unwrap();
+        let mut desktop = Desktop::<4, 4, 2>::new(config);
+        let mut pixels = std::vec![0u32; 1024 * 768];
+        let mut canvas = Canvas::new(&mut pixels, 1024, 768, 1024).unwrap();
+
+        let response = desktop.render(&mut canvas, &click_at(700, 400), 1000);
+        assert!(!response.start_open);
+        assert!(!desktop.start_menu().open);
+    }
+
+    #[test]
+    fn clicking_all_programs_opens_the_list() {
+        let config = DesktopConfig::parse("start_menu:\n  initially_open: true\n").unwrap();
+        let mut desktop = Desktop::<4, 4, 2>::new(config);
+        let mut pixels = std::vec![0u32; 1024 * 768];
+        let mut canvas = Canvas::new(&mut pixels, 1024, 768, 1024).unwrap();
+
+        desktop.render(&mut canvas, &click_at(120, 656), 1000);
+        assert!(desktop.start_menu().all_programs);
+    }
+
+    #[test]
+    fn turn_off_asks_for_confirmation() {
+        let config = DesktopConfig::parse("start_menu:\n  initially_open: true\n").unwrap();
+        let mut desktop = Desktop::<4, 4, 2>::new(config);
+        let mut pixels = std::vec![0u32; 1024 * 768];
+        let mut canvas = Canvas::new(&mut pixels, 1024, 768, 1024).unwrap();
+
+        let response = desktop.render(&mut canvas, &click_at(389, 705), 1000);
+        assert!(desktop.shutdown.open);
+        assert_eq!(response.command, StartMenuCommand::None);
+
+        let response = desktop.render(&mut canvas, &click_at(376, 423), 1400);
+        assert!(!desktop.shutdown.open);
+        assert_eq!(response.command, StartMenuCommand::ShutDown);
+    }
+
+    #[test]
+    fn log_off_asks_for_confirmation() {
+        let config = DesktopConfig::parse("start_menu:\n  initially_open: true\n").unwrap();
+        let mut desktop = Desktop::<4, 4, 2>::new(config);
+        let mut pixels = std::vec![0u32; 1024 * 768];
+        let mut canvas = Canvas::new(&mut pixels, 1024, 768, 1024).unwrap();
+
+        let response = desktop.render(&mut canvas, &click_at(283, 705), 1000);
+        assert!(desktop.logoff_open);
+        assert_eq!(response.command, StartMenuCommand::None);
+
+        let response = desktop.render(&mut canvas, &click_at(560, 417), 1400);
+        assert!(!desktop.logoff_open);
+        assert_eq!(response.command, StartMenuCommand::LogOff);
+    }
+
+    #[test]
+    fn clicking_the_clock_opens_date_and_time() {
+        let mut desktop =
+            Desktop::<4, 4, 2>::new(DesktopConfig::parse("theme: xp-blue\n").unwrap());
+        let mut pixels = std::vec![0u32; 1024 * 768];
+        let mut canvas = Canvas::new(&mut pixels, 1024, 768, 1024).unwrap();
+
+        desktop.render(&mut canvas, &click_at(980, 746), 1000);
+        assert!(desktop.clock_open);
+
+        let mut input = Input::new();
+        input.push(Event::KeyDown(Key::Escape, Modifiers::NONE));
+        desktop.render(&mut canvas, &input, 1200);
+        assert!(!desktop.clock_open);
+    }
+
+    #[test]
+    fn show_desktop_toggles_windows() {
+        let bytes = catalog_bundle("terminal", "dummy");
+        let entries = [DirEntry::new("terminal.fapp", &bytes)];
+        let mut desktop = Desktop::<4, 4, 2>::new(
+            DesktopConfig::parse("theme: xp-blue\ntaskbar:\n  start_label: start\n").unwrap(),
+        );
+        desktop.scan(&entries);
+        let mut pixels = std::vec![0u32; 1024 * 768];
+        let mut canvas = Canvas::new(&mut pixels, 1024, 768, 1024).unwrap();
+        desktop.render(&mut canvas, &Input::new(), 1000);
+        desktop.open_app(0).expect("window");
+
+        desktop.render(&mut canvas, &click_at(177, 748), 1100);
+        assert_eq!(
+            desktop.windows().get(0).unwrap().state,
+            WindowState::Minimized
+        );
+
+        desktop.render(&mut canvas, &click_at(177, 748), 1400);
+        assert_eq!(desktop.windows().get(0).unwrap().state, WindowState::Normal);
+    }
+
+    fn right_click_at(x: i32, y: i32) -> Input {
+        let mut input = Input::new();
+        input.push(Event::PointerDown {
+            pos: feos_gfx::Point::new(x, y),
+            button: MouseButton::Right,
+        });
+        input.push(Event::PointerUp {
+            pos: feos_gfx::Point::new(x, y),
+            button: MouseButton::Right,
+        });
+        input
+    }
+
+    #[test]
+    fn right_click_opens_and_uses_the_desktop_menu() {
+        let bytes = catalog_bundle("terminal", "dummy");
+        let entries = [DirEntry::new("terminal.fapp", &bytes)];
+        let mut desktop =
+            Desktop::<4, 4, 2>::new(DesktopConfig::parse("theme: xp-blue\n").unwrap());
+        desktop.scan(&entries);
+        desktop.work_area = Rect::new(0, 0, 800, 560);
+        desktop.open_app(0).expect("window");
+
+        let mut pixels = std::vec![0u32; 1024 * 768];
+        let mut canvas = Canvas::new(&mut pixels, 1024, 768, 1024).unwrap();
+        desktop.render(&mut canvas, &right_click_at(700, 500), 1000);
+        assert!(desktop.context.open);
+
+        // The menu opens at the pointer, clamped to the work area; "Show
+        // Desktop" is the second row.
+        desktop.render(&mut canvas, &click_at(750, 540), 1400);
+        assert!(!desktop.context.open);
+        assert_eq!(
+            desktop.windows().get(0).unwrap().state,
+            WindowState::Minimized
+        );
+    }
+
+    #[test]
+    fn double_clicking_a_desktop_icon_launches_it() {
+        let bytes = catalog_bundle("terminal", "dummy");
+        let entries = [DirEntry::new("terminal.fapp", &bytes)];
+        let mut desktop =
+            Desktop::<4, 4, 2>::new(DesktopConfig::parse("theme: xp-blue\n").unwrap());
+        desktop.scan(&entries);
+        let mut pixels = std::vec![0u32; 1024 * 768];
+        let mut canvas = Canvas::new(&mut pixels, 1024, 768, 1024).unwrap();
+
+        // The first click only selects the icon.
+        let response = desktop.render(&mut canvas, &click_at(30, 30), 1000);
+        assert_eq!(desktop.selection(), 0);
+        assert!(response.launch.is_none());
+
+        let response = desktop.render(&mut canvas, &click_at(30, 30), 1200);
+        assert_eq!(response.launch.map(|request| request.app), Some(0));
+    }
+
+    #[test]
+    fn hovering_a_start_menu_item_moves_the_highlight() {
+        let config = DesktopConfig::parse("start_menu:\n  initially_open: true\n").unwrap();
+        let names = ["a.fapp", "b.fapp", "c.fapp"];
+        let bundles: std::vec::Vec<_> = ["a", "b", "c"]
+            .iter()
+            .map(|id| catalog_bundle(id, "dummy"))
+            .collect();
+        let entries: std::vec::Vec<_> = names
+            .iter()
+            .zip(bundles.iter())
+            .map(|(name, data)| DirEntry::new(*name, data))
+            .collect();
+        let mut desktop = Desktop::<4, 4, 2>::new(config);
+        desktop.scan(&entries);
+        let mut pixels = std::vec![0u32; 1024 * 768];
+        let mut canvas = Canvas::new(&mut pixels, 1024, 768, 1024).unwrap();
+
+        let mut input = Input::new();
+        input.push(Event::PointerMoved(feos_gfx::Point::new(100, 380)));
+        desktop.render(&mut canvas, &input, 1000);
+        assert_eq!(desktop.start_menu().highlighted, 1);
+    }
+
+    #[test]
+    fn double_click_interval_expires() {
+        let mut clicks = ClickMemory::default();
+        let position = feos_gfx::Point::new(10, 12);
+        assert!(!clicks.hit(7, position, 1000));
+        assert!(clicks.hit(7, position, 1300));
+        assert!(!clicks.hit(7, position, 1900));
+        assert!(!clicks.hit(8, position, 2000));
+    }
+
+    #[test]
+    fn run_dialog_collects_text_and_submits_on_enter() {
+        let mut desktop =
+            Desktop::<4, 4, 2>::new(DesktopConfig::parse("theme: xp-blue\n").unwrap());
+        desktop.run_dialog.show();
+        let mut pixels = std::vec![0u32; 1024 * 768];
+        let mut canvas = Canvas::new(&mut pixels, 1024, 768, 1024).unwrap();
+
+        let mut input = Input::new();
+        input.push(Event::Text('p'));
+        input.push(Event::Text('s'));
+        let response = desktop.render(&mut canvas, &input, 1000);
+        assert!(response.run.is_none());
+        assert!(desktop.run_dialog.open);
+        assert_eq!(desktop.run_dialog.text.as_str(), "ps");
+
+        let mut input = Input::new();
+        input.push(Event::KeyDown(Key::Enter, Modifiers::NONE));
+        let response = desktop.render(&mut canvas, &input, 1100);
+        let command = response.run.expect("submitted command");
+        assert_eq!(command.as_str(), "ps");
+        assert!(!desktop.run_dialog.open);
     }
 }

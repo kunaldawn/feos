@@ -59,9 +59,11 @@ dependencies = [
  "feos-driver-pci",
  "feos-driver-pl011",
  "feos-driver-ramfb",
+ "feos-driver-virtio-input",
  "feos-fs",
  "feos-gfx",
  "feos-hal",
+ "feos-sync",
 ]
 
 [[package]]
@@ -110,6 +112,7 @@ dependencies = [
  "feos-desktop",
  "feos-gfx",
  "feos-gui",
+ "feos-hal",
  "feos-keys",
  "feos-sync",
 ]
@@ -149,6 +152,13 @@ name = "feos-driver-ramfb"
 version = "0.1.0"
 dependencies = [
  "feos-driver-fw-cfg",
+]
+
+[[package]]
+name = "feos-driver-virtio-input"
+version = "0.1.0"
+dependencies = [
+ "feos-hal",
 ]
 
 [[package]]

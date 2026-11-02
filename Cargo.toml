@@ -36,6 +36,7 @@ feos-driver-intel-hda = { path = "drivers/audio/intel-hda" }
 feos-driver-pci = { path = "drivers/bus/pci" }
 feos-driver-pl011 = { path = "drivers/serial/pl011" }
 feos-driver-ramfb = { path = "drivers/display/ramfb" }
+feos-driver-virtio-input = { path = "drivers/input/virtio" }
 feos-gfx = { path = "libs/gfx" }
 feos-fs = { path = "libs/fs" }
 feos-gui = { path = "libs/gui" }

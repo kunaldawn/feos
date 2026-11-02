@@ -1,6 +1,6 @@
 #!/bin/sh
-# Boot the kernel in QEMU's aarch64 `virt` machine with ramfb display and an
-# Intel HDA audio device.
+# Boot the kernel in QEMU's aarch64 `virt` machine with ramfb display, a
+# virtio tablet pointer and an Intel HDA audio device.
 #
 #   ./scripts/qemu.sh [path/to/kernel.elf]
 #
@@ -34,6 +34,7 @@ exec qemu-system-aarch64 \
     -m 128M \
     -net none \
     -device ramfb \
+    -device virtio-tablet-device \
     -audiodev "$AUDIODEV" \
     -device intel-hda \
     -device hda-output,audiodev=snd0 \

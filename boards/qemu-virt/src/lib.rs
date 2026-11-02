@@ -15,9 +15,11 @@ use feos_driver_intel_hda::{CodecInfo, IntelHda};
 use feos_driver_pci::PciEcam;
 use feos_driver_pl011::Pl011;
 use feos_driver_ramfb::Ramfb;
+use feos_driver_virtio_input::{PointerKind, VirtioInput};
 use feos_fs::{FileSystem, StaticFs};
 use feos_gfx::Canvas;
-use feos_hal::{Audio, Clock, InterruptController, Serial};
+use feos_hal::{Audio, Clock, InterruptController, Pointer, PointerEvent, Serial};
+use feos_sync::SpinLock;
 
 /// Human-readable board name, shown by the `info` app.
 pub const NAME: &str = "QEMU aarch64 virt";
@@ -44,6 +46,15 @@ pub const FW_CFG_BASE: usize = 0x0902_0000;
 ///
 /// QEMU places the high ECAM region at 256 GiB + 16 MiB.
 pub const PCIE_ECAM_BASE: usize = 0x40_1000_0000;
+
+/// First virtio MMIO slot on the `virt` machine.
+pub const VIRTIO_MMIO_BASE: usize = 0x0a00_0000;
+
+/// Distance between virtio MMIO slots.
+pub const VIRTIO_MMIO_STRIDE: usize = 0x200;
+
+/// Number of virtio MMIO slots exposed by QEMU's `virt` machine.
+pub const VIRTIO_MMIO_SLOTS: usize = 32;
 
 /// Address assigned to BAR0 of the Intel HDA controller.
 ///
@@ -84,6 +95,48 @@ pub fn init_interrupts() {
 /// Returns the interrupt controller shared with the kernel IRQ handler.
 pub fn interrupts() -> &'static dyn InterruptController {
     &INTERRUPT_CONTROLLER
+}
+
+/// The virtio-input pointer discovered at boot.
+///
+/// QEMU exposes the tablet as a virtio MMIO device. The driver keeps its
+/// virtqueue in this static so the session loop can poll it without
+/// allocation.
+pub static POINTER: SpinLock<VirtioInput> = SpinLock::new(VirtioInput::new());
+
+struct BoardPointer;
+
+impl Pointer for BoardPointer {
+    fn poll(&self) -> Option<PointerEvent> {
+        POINTER.lock().poll()
+    }
+
+    fn position(&self) -> (u16, u16) {
+        POINTER.lock().position()
+    }
+}
+
+static BOARD_POINTER: BoardPointer = BoardPointer;
+
+/// Finds and initialises the virtio pointer, if QEMU provided one.
+pub fn init_pointer() -> Option<PointerKind> {
+    let (base, kind) =
+        feos_driver_virtio_input::find(VIRTIO_MMIO_BASE, VIRTIO_MMIO_STRIDE, VIRTIO_MMIO_SLOTS)?;
+    let mut pointer = POINTER.lock();
+    if pointer.init(base, DISPLAY_WIDTH as u16, DISPLAY_HEIGHT as u16) {
+        Some(kind)
+    } else {
+        None
+    }
+}
+
+/// Returns the pointer shared with apps, when one was initialised.
+pub fn pointer() -> Option<&'static dyn Pointer> {
+    if POINTER.lock().is_ready() {
+        Some(&BOARD_POINTER)
+    } else {
+        None
+    }
 }
 
 /// The ramfb scanout buffer. Page aligned as required by the device.

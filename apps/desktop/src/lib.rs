@@ -16,7 +16,8 @@
 use feos_app::{App, Context, Platform};
 use feos_console::println;
 use feos_desktop::{
-    Desktop, DesktopConfig, DesktopResponse, LaunchOutcome, ServiceStatus, StartMenuCommand,
+    Desktop, DesktopConfig, DesktopResponse, DesktopTheme, LaunchOutcome, ServiceStatus,
+    StartMenuCommand, ThemeName,
 };
 use feos_gfx::Canvas;
 use feos_gui::Input;
@@ -230,22 +231,172 @@ fn apply_response(
         }
     }
 
+    if let Some(command) = response.run {
+        ran_foreground |= run_command(desktop, command.as_str(), platform, display);
+    }
+
     match response.command {
         StartMenuCommand::None => {}
         StartMenuCommand::ShutDown => {
             println!("[desktop] turning the machine off");
             platform.power.system_off();
         }
+        StartMenuCommand::Restart => {
+            println!("[desktop] restarting the machine");
+            platform.power.system_reset();
+        }
         StartMenuCommand::LogOff => println!("[desktop] log off requested"),
-        StartMenuCommand::Settings => println!("[desktop] desktop settings requested"),
-        StartMenuCommand::MyComputer => println!("[desktop] my computer requested"),
-        StartMenuCommand::ControlPanel => println!("[desktop] control panel requested"),
-        StartMenuCommand::Help => println!("[desktop] help requested"),
-        StartMenuCommand::Run => println!("[desktop] run dialog requested"),
-        StartMenuCommand::Search => println!("[desktop] search requested"),
+        StartMenuCommand::Settings => cycle_theme(desktop),
+        StartMenuCommand::MyComputer => {
+            ran_foreground |= launch_id(desktop, "files", platform, display);
+        }
+        StartMenuCommand::MyDocuments => {
+            ran_foreground |= launch_id(desktop, "files", platform, display);
+        }
+        StartMenuCommand::ControlPanel => {
+            ran_foreground |= launch_id(desktop, "system-info", platform, display);
+        }
+        StartMenuCommand::Help => {
+            ran_foreground |= launch_id(desktop, "terminal", platform, display);
+        }
+        StartMenuCommand::Run => {}
+        StartMenuCommand::Search => {
+            ran_foreground |= launch_id(desktop, "files", platform, display);
+        }
     }
 
     ran_foreground
+}
+
+/// Cycles through the three Luna colour schemes, giving the Start menu's
+/// "Desktop Settings" entry a visible effect.
+fn cycle_theme(desktop: &mut Session) {
+    let mut config = *desktop.config();
+    config.theme = match config.theme {
+        ThemeName::XpBlue => ThemeName::XpOlive,
+        ThemeName::XpOlive => ThemeName::XpSilver,
+        _ => ThemeName::XpBlue,
+    };
+    let palette = match config.theme {
+        ThemeName::XpOlive => DesktopTheme::xp_olive(),
+        ThemeName::XpSilver => DesktopTheme::xp_silver(),
+        _ => DesktopTheme::xp_blue(),
+    };
+    config.wallpaper.top = palette.wallpaper_top;
+    config.wallpaper.bottom = palette.wallpaper_bottom;
+    config.wallpaper.grid = palette.wallpaper_grid;
+    desktop.set_config(config);
+    println!(
+        "[desktop] theme changed to {}",
+        desktop.config().theme.name()
+    );
+}
+
+/// Handles a command entered in the Run dialog.
+///
+/// A catalog id opens the matching bundle; otherwise the name is resolved
+/// through the shell registry, so commands such as `ps`, `tone` and `files`
+/// work exactly as they do at the serial prompt.
+fn run_command(
+    desktop: &mut Session,
+    command: &str,
+    platform: &Platform,
+    display: &mut Option<Canvas<'static>>,
+) -> bool {
+    let command = command.trim();
+    if command.is_empty() {
+        return false;
+    }
+    if desktop.catalog().find_id(command).is_some() {
+        return launch_id(desktop, command, platform, display);
+    }
+
+    let mut parts = command.splitn(2, char::is_whitespace);
+    let name = parts.next().unwrap_or("");
+    let args = parts.next().unwrap_or("").trim();
+    let Some(runtime) = platform.apps.find(name) else {
+        println!("[desktop] run: '{command}' was not found");
+        return false;
+    };
+
+    if runtime.foreground() {
+        let mut context = Context {
+            args,
+            display,
+            platform,
+        };
+        runtime.run(&mut context);
+        true
+    } else {
+        match platform.processes.spawn(runtime, args) {
+            Ok(pid) => {
+                println!("[desktop] run: '{command}' started as pid {pid}");
+                false
+            }
+            Err(error) => {
+                println!("[desktop] run: could not start '{command}': {error:?}");
+                false
+            }
+        }
+    }
+}
+
+/// Launches an installed application by bundle id.
+///
+/// Returns `true` when the app ran in the foreground, so the caller knows the
+/// framebuffer was used directly.
+fn launch_id(
+    desktop: &mut Session,
+    id: &str,
+    platform: &Platform,
+    display: &mut Option<Canvas<'static>>,
+) -> bool {
+    let Some(index) = desktop.catalog().find_id(id) else {
+        println!("desktop: no installed application with id '{id}'");
+        return false;
+    };
+    let (entry, args) = {
+        let app = desktop.catalog().get(index).expect("index from find_id");
+        (app.manifest.entry, app.manifest.args)
+    };
+    match desktop.launch(index, platform.apps, platform.processes) {
+        LaunchOutcome::Spawned { window, pid } => {
+            println!("[desktop] '{id}' opened in window {window} as pid {pid}");
+            false
+        }
+        LaunchOutcome::Foreground { window } => {
+            if let Some(app) = platform.apps.find(entry.as_str()) {
+                let mut context = Context {
+                    args: args.as_str(),
+                    display,
+                    platform,
+                };
+                app.run(&mut context);
+            }
+            desktop.windows_mut().close(window);
+            true
+        }
+        LaunchOutcome::AlreadyRunning { window, .. } => {
+            println!("[desktop] '{id}' is already open in window {window}");
+            false
+        }
+        LaunchOutcome::UnknownEntry => {
+            println!("[desktop] '{id}' has no registered entry point");
+            false
+        }
+        LaunchOutcome::UnknownApp => {
+            println!("[desktop] catalog entry vanished");
+            false
+        }
+        LaunchOutcome::NoWindowSlot => {
+            println!("[desktop] no free window slot");
+            false
+        }
+        LaunchOutcome::SpawnFailed(error) => {
+            println!("[desktop] could not spawn '{id}': {error:?}");
+            false
+        }
+    }
 }
 
 fn run_app(
@@ -427,7 +578,7 @@ mod tests {
         let mut canvas = feos_gfx::Canvas::new(&mut pixels, 1024, 768, 1024).unwrap();
         let input = feos_gui::Input::new();
         let response = desktop.render(&mut canvas, &input, 0);
-        assert!(response.start_open);
+        assert!(!response.start_open);
         assert!(pixels.iter().any(|&pixel| pixel != 0));
     }
 }

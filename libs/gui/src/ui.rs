@@ -210,6 +210,16 @@ impl<'a, 'b, 's, const N: usize> Ui<'a, 'b, 's, N> {
         self.pointer_released
     }
 
+    /// Returns `true` when the right or middle button went down this frame.
+    pub const fn secondary_pressed(&self) -> bool {
+        self.secondary_pressed
+    }
+
+    /// Returns `true` when the right or middle button went up this frame.
+    pub const fn secondary_released(&self) -> bool {
+        self.secondary_released
+    }
+
     /// Mouse-wheel delta for this frame.
     pub const fn wheel(&self) -> i32 {
         self.wheel
