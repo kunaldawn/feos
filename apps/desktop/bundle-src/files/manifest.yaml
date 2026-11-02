@@ -1,9 +1,9 @@
 id: files
 name: File Explorer
-version: 1.0.0
+version: 1.1.0
 entry: files
 category: System
-description: Browse the filesystem and preview text files
+description: Browse, search and preview files with an XP-style explorer
 icon: icon.bmp
 window:
   width: 760

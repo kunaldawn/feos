@@ -270,9 +270,12 @@ The filesystem is a library service, not a device driver:
 3. The kernel stores that reference in `Platform::filesystem`, so apps never
    learn how the image is stored. A future virtio-blk or RAM backend implements
    the same trait.
-4. The `files` app renders the tree as a full-screen foreground app. The
-   desktop's serial-key loop is in `feos-keys`, which both the desktop and the
-   explorer use, so they decode arrow keys and Escape identically.
+4. The `files` app renders an XP-style explorer as a full-screen foreground
+   app. `apps/commands/src/files/explorer.rs` owns the menu bar, toolbar,
+   address history, folder tree, search, four view modes, preview pane,
+   dialogs and pointer/keyboard input. The desktop's serial-key loop is in
+   `feos-keys`, which both the desktop and the explorer use, so they decode
+   arrows, modified arrows, function keys, Page Up/Down and Escape identically.
 
 Because the image is compiled in, adding a file is a rebuild, not a mount. The
 same structure can later be fed from an archive or a filesystem driver without

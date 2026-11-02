@@ -132,6 +132,17 @@ pub fn run_session(
             };
             let ran_foreground = super::apply_response(&mut session, &response, platform, display);
 
+            // The foreground app may have consumed pointer reports while it
+            // owned the screen. Resynchronise the cursor before composing the
+            // desktop again so it does not jump back to its pre-launch spot.
+            if ran_foreground {
+                if let Some(pointer) = platform.pointer {
+                    let (x, y) = pointer.position();
+                    pointer_position = Some((x, y));
+                    input.set_pointer(Point::new(x as i32, y as i32));
+                }
+            }
+
             // A foreground app drew directly to the scanout buffer. Leave it
             // alone and compose a fresh desktop frame on the next pass. A
             // background launch also needs one more frame so its new window

@@ -22,6 +22,7 @@ dependencies = [
  "feos-fs",
  "feos-gfx",
  "feos-gui",
+ "feos-hal",
  "feos-keys",
  "feos-text",
 ]

@@ -134,7 +134,9 @@ app registry).
     │       ├── help.rs  echo.rs  info.rs  uptime.rs  sleep.rs
     │       ├── clear.rs  gfx.rs  splash.rs  tone.rs  power.rs
     │       ├── gui.rs          # feos-gui dashboard demo
-    │       ├── files.rs        # file explorer + ls/cat/tree/stat
+    │       ├── files.rs        # file explorer app + ls/cat/tree/stat
+    │       ├── files/
+    │       │   └── explorer.rs # XP-style explorer UI, input and rendering
     │       ├── spawn.rs  ps.rs  kill.rs  tick.rs
     │       ├── ui.rs           # splash screen and test card renderer
     │       └── lib.rs          # REGISTRY and find()
@@ -204,9 +206,12 @@ change.
   links and a compiled-in `StaticFs` image
 - `feos-keys`: serial-console keyboard decoding shared by the desktop and
   full-screen apps
-- A **File Explorer** app with directory navigation, keyboard control and a
-  text preview pane, plus `files ls`, `files cat`, `files tree` and
-  `files stat` shell forms
+- A **File Explorer** app with XP Luna window chrome, a menu bar, standard
+  buttons, an editable address bar with history, a folder tree, recursive
+  search, Details/Icons/List/Tiles views, sortable columns, multi-selection,
+  a preview pane, text/binary viewer, properties, context menus, mouse and
+  wheel input, and keyboard shortcuts, plus `files ls`, `files cat`,
+  `files tree` and `files stat` shell forms
 - Foreground app launching: an app can request the full framebuffer from the
   desktop and return to it with Esc
 - `feos-bundle`: single-file `.fapp` applications (ZIP/TAR with manifest and
@@ -615,7 +620,7 @@ feos> desktop
 [desktop] click Start, double-click desktop icons, drag windows; Ctrl-\ returns to the shell
 [desktop] 7 application(s) discovered in the application folder (0 skipped)
 feos> desktop list
-  files                System         entry=files  Browse the filesystem and preview text files
+  files                System         entry=files  Browse, search and preview files with an XP-style explorer
   terminal             System         entry=gui    GUI dashboard and component gallery
   system-info          System         entry=info   Board, CPU, memory and kernel details
   process-monitor      System         entry=ps     Running processes and service status
@@ -690,9 +695,40 @@ feos> files tree /docs
 feos> files stat /etc/motd
 ```
 
-The explorer shows directories on the left and a preview of the selected file
-on the right. Arrow keys move, `Enter`/`Right` opens a directory,
-`Backspace`/`Left` goes back, and `Esc` or `q` returns to the desktop.
+The explorer is a complete Windows XP-style browser rather than a directory
+dump. It has the Luna title bar, File/Edit/View/Favorites/Tools/Help menus,
+Back/Forward/Up/Search/Folders/Views standard buttons, an editable Address bar
+with a history drop-down, a synchronised folder tree, File and Folder Tasks,
+and a Details pane. The main view supports Details, Icons, List and Tiles
+layouts, sortable columns, multi-selection and right-click context menus.
+Folders can be searched recursively (with an optional subfolder toggle), and
+text or binary files open in a scrollable viewer with a hex dump for binary
+data. Properties, Folder Options and About are modal XP-style dialogs.
+
+The filesystem is read-only, so file-changing commands are deliberately
+disabled and explain that the image is compiled into the kernel. Everything
+else works with either the mouse or the serial keyboard:
+
+| Input | Action |
+|-------|--------|
+| Click / double-click | Select, open folders, or open a file viewer |
+| Right-click | Context menu for an item or the current folder |
+| Mouse wheel | Scroll the list, tree, preview or viewer |
+| Title bar | Drag a restored window; the square button maximises/restores |
+| Arrow keys | Move the list or tree selection |
+| `Shift` + arrows | Extend the selection |
+| `Ctrl` + arrow keys | Move the focus without changing the selection |
+| `Enter` / `Right` | Open a folder or file |
+| `Backspace` / `Left` | Go to the parent folder |
+| `Alt+Left` / `Alt+Right` | Back / Forward |
+| `F3` / `Ctrl+F` | Open the Search pane |
+| `F5` / `Ctrl+R` | Refresh |
+| `F10` | Open the File menu |
+| `F1` | About File Explorer |
+| `Ctrl+L` | Focus and edit the Address bar |
+| `Ctrl+A` | Select all (Edit menu can invert the selection) |
+| `Tab` / `Shift+Tab` | Move focus between list, tree and address bar |
+| `Esc` | Close a menu/dialog, or return to the desktop |
 
 Interactive apps use `App::foreground` to ask the desktop for the whole
 framebuffer. The desktop opens a window, runs the app synchronously, then
