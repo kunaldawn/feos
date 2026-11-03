@@ -220,9 +220,10 @@ minimises, and clicking a minimised one restores.
 the manifest entry point through `AppRegistry`, and spawns it through
 `Processes`. An unknown entry leaves the window open with an explanation
 instead of failing silently. An app that returns `true` from
-`App::foreground` (currently the File Explorer) is run synchronously by the
-desktop session so it can draw full-screen and read the keyboard; the desktop
-closes its window and redraws when the app returns. The desktop app's session
+`App::foreground` (currently the File Explorer and Media Player) is run
+synchronously by the desktop session so it can draw full-screen and read the
+keyboard and pointer; the desktop closes its window and redraws when the app
+returns. The desktop app's session
 loop polls the virtio pointer through `feos_hal::Pointer` and feeds
 `feos_gui::Input` events; the same path forwards `DesktopResponse::launch`.
 

@@ -8,6 +8,8 @@
 
 #![cfg_attr(not(test), no_std)]
 
+extern crate alloc;
+
 pub mod clear;
 pub mod echo;
 pub mod files;
@@ -16,6 +18,7 @@ pub mod gui;
 pub mod help;
 pub mod info;
 pub mod kill;
+pub mod player;
 pub mod power;
 pub mod ps;
 pub mod sleep;
@@ -40,6 +43,7 @@ pub static REGISTRY: &[&dyn App] = &[
     &gfx::Gfx,
     &gui::Gui,
     &files::Files,
+    &player::Player,
     &splash::Splash,
     &tone::Tone,
     &uptime::Uptime,
@@ -91,6 +95,15 @@ mod tests {
         assert_eq!(app.name(), "desktop");
         assert!(find("wm").is_some());
         assert_eq!(find("gui").map(|app| app.name()), Some("gui"));
+    }
+
+    #[test]
+    fn player_is_a_foreground_app() {
+        let app = find("player").expect("player command");
+        assert_eq!(app.name(), "player");
+        assert!(app.foreground());
+        assert!(find("vlc").is_some());
+        assert!(find("media-player").is_some());
     }
 
     #[test]

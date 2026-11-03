@@ -21,3 +21,4 @@ feos-console = { workspace = true }
 feos-desktop-app = { workspace = true }
 feos-hal = { workspace = true }
 feos-shell = { workspace = true }
+feos-sync = { workspace = true }

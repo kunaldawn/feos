@@ -25,6 +25,7 @@ dependencies = [
  "feos-hal",
  "feos-keys",
  "feos-text",
+ "feos-video",
 ]
 
 [[package]]
@@ -218,6 +219,7 @@ dependencies = [
  "feos-desktop-app",
  "feos-hal",
  "feos-shell",
+ "feos-sync",
 ]
 
 [[package]]

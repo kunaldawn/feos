@@ -233,6 +233,29 @@ gallery for advanced composition and chart types. Adding a pointer driver only
 requires feeding `Event`s into `Input` and clearing them per frame; the widget
 layer is already complete.
 
+## The kernel heap and video path
+
+Most of feos is allocation-free, but the vendored H.264 decoder keeps reference
+pictures in `alloc` collections. `kernel/src/allocator.rs` provides one 16 MiB
+static arena with a sorted free list, boundary tags and a spin lock for the
+preemptive scheduler. `Allocator` implements `GlobalAlloc`; the player reads a
+media file into a `Vec`, allocates the RGBA frame and decoder scratch, and
+releases them when the clip changes. GIF, MJPEG and raw/RLE decoders do not
+allocate themselves.
+
+The video path is:
+
+1. The `player` app scans `Platform::filesystem` for video extensions and reads
+   the selected node into a bounded buffer.
+2. `feos-video` detects the container and reports dimensions, codec, frame
+   count and frame rate. `decode_frame` writes one RGBA8888 frame into the
+   caller buffer.
+3. H.264 containers call into `feos-h264`; its reference pictures use the
+   kernel heap.
+4. The app scales the RGBA frame directly into the ramfb scanout with
+   nearest-neighbour sampling, letterboxing according to the selected aspect
+   mode, and paints the VLC-style chrome around it.
+
 ## The audio path
 
 Audio crosses the same layers as graphics:

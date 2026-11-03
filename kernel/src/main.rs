@@ -8,6 +8,7 @@
 #![no_std]
 #![no_main]
 
+mod allocator;
 mod sched;
 
 use core::panic::PanicInfo;

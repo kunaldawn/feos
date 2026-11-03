@@ -72,6 +72,7 @@ app registry).
 ├── kernel/                     # feos-kernel: the bootable binary (bin: feos)
 │   └── src/
 │       ├── main.rs             # kmain, IRQ handler, panic handler, wiring
+│       ├── allocator.rs        # 16 MiB static first-fit heap for H.264
 │       └── sched.rs            # process table and round-robin scheduler
 │
 ├── arch/
@@ -89,6 +90,7 @@ app registry).
 │   └── qemu-virt/              # feos-board-qemu-virt
 │       ├── build.rs            # generates the embedded filesystem image
 │       ├── fs/                 # files and directories compiled into the kernel
+│       │   └── media/          # sample GIF, MJPEG, AVI, MP4, MKV, FLV clips
 │       ├── linker.ld           # 0x40080000 load address, BSS, 256 KiB stack
 │       └── src/lib.rs          # MMIO map, UART/framebuffer/audio/pointer wiring, symbols
 │
@@ -137,6 +139,7 @@ app registry).
     │       ├── files.rs        # file explorer app + ls/cat/tree/stat
     │       ├── files/
     │       │   └── explorer.rs # XP-style explorer UI, input and rendering
+    │       ├── player.rs       # VLC-style video player, playlist and dialogs
     │       ├── spawn.rs  ps.rs  kill.rs  tick.rs
     │       ├── ui.rs           # splash screen and test card renderer
     │       └── lib.rs          # REGISTRY and find()
@@ -212,6 +215,10 @@ change.
   a preview pane, text/binary viewer, properties, context menus, mouse and
   wheel input, and keyboard shortcuts, plus `files ls`, `files cat`,
   `files tree` and `files stat` shell forms
+- A VLC-style **Media Player** with menus, transport controls, seek bar,
+  playlist, fullscreen mode, aspect modes, speed/frame controls, media
+  information, mouse context menus and a static kernel heap for H.264
+  playback
 - Foreground app launching: an app can request the full framebuffer from the
   desktop and return to it with Esc
 - `feos-bundle`: single-file `.fapp` applications (ZIP/TAR with manifest and
@@ -368,6 +375,7 @@ default NIC would load.
 | `gui`         | Draw the feos-gui dashboard and component gallery (`dashboard`) |
 | `desktop`     | Run the YAML-configured desktop session (`wm`; `list`, `status`, `run <id>`, `service <action> <id>`) |
 | `files`       | Open the file explorer, or use `ls`, `cat`, `tree` and `stat` (`explorer` alias) |
+| `player`      | Open the VLC-style video player (`vlc`, `video`, `media`, `media-player` aliases) |
 | `splash`      | Redraw the boot splash                               |
 | `tone [ms]`   | Play an A-major chord for `ms` (default 1500, max 3000; `play` alias) |
 | `uptime`      | Milliseconds since the counter started               |
@@ -735,6 +743,60 @@ framebuffer. The desktop opens a window, runs the app synchronously, then
 closes the window and redraws itself when the app returns. The File Explorer
 is launched this way from the Start menu.
 
+## The video player
+
+![The feos video player showing an H.264 MP4](docs/player.png)
+
+`player` is a VLC-inspired foreground application built on `feos-video`,
+`feos-fs` and the GUI toolkit. It scans `/media` recursively, opens the first
+movie automatically, and keeps a session playlist with the other supported
+files. The initial filesystem ships with tiny GIF, MJPEG, raw AVI, H.264 MP4,
+MKV, FLV and Annex-B samples; VP9 files are listed as recognised but not
+decodable so the media-information path can be inspected too.
+
+The interface has VLC-style Media/Playback/Audio/Video/Subtitle/Tools/View/Help
+menus, standard transport buttons, a seek bar with elapsed/duration labels,
+playback speed, loop and shuffle modes, a playlist strip, fullscreen mode with
+auto-hiding controls, and Fit/Fill/Stretch/Original aspect modes. Media
+Information reports the container, codec, dimensions, frame count/rate,
+duration, file size and decode support. A modal Open Media dialog lists every
+video on the filesystem. Right-clicking the video or playlist opens a context
+menu.
+
+```text
+feos> player                    # scan /media and start playing
+feos> player /media/h264-sample.mp4
+feos> player /media/animation.gif
+```
+
+| Input | Action |
+|-------|--------|
+| `Space` | Play or pause |
+| `S` / `B` / `N` | Stop / previous / next |
+| `Left`, `Right` | Seek 5 seconds (`Shift` seeks 1 second) |
+| `Page Up`, `Page Down` | Seek 30 seconds |
+| `Home`, `End` | Start / end |
+| `,`, `.` | Previous / next frame while paused |
+| `+`, `-`, `0` | Faster, slower, normal speed |
+| `F` / `F11` | Toggle fullscreen |
+| `P` | Toggle the playlist |
+| `O` | Open the media browser |
+| `I` | Media information |
+| `L` / `R` | Cycle repeat mode / toggle shuffle |
+| `A` | Cycle aspect mode |
+| `Tab` | Switch between video and playlist focus |
+| Mouse | Click video to play/pause, double-click for fullscreen |
+| Wheel | Seek, or scroll the playlist |
+| `Esc` | Close a dialog, leave fullscreen, or quit |
+
+`feos-video` demuxes the container and decodes GIF, MJPEG, uncompressed/RLE AVI
+and H.264 into caller-provided RGBA buffers. H.264 needs `alloc` for reference
+pictures, so the kernel now has a small static first-fit heap
+(`kernel/src/allocator.rs`). Everything else remains allocation-free outside
+the player's file and frame buffers. The player has no audio track support yet
+because the current video demuxers expose the video track only; the Audio menu
+is present but explains that limitation.
+
 ## The audio library
 
 `feos-audio` (in `libs/audio/`) is the audio counterpart of `feos-gfx`: a
@@ -782,7 +844,8 @@ API summary:
 These libraries follow the same rules as `feos-gfx` where practical: `no_std`,
 dependency-light, and caller-provided buffers. `feos-video` builds on
 `feos-image` and `feos-h264`; `feos-h264` is the one media crate that uses
-`alloc` and contains the vendored unsafe NEON kernels.
+`alloc` and contains the vendored unsafe NEON kernels. The kernel's 16 MiB
+static heap exists to serve it.
 
 | Crate | Formats | Notes |
 |-------|---------|-------|
@@ -1057,12 +1120,12 @@ its peak level, so a non-zero peak confirms the DSP path ran.
 
 Natural extensions: identity-map the kernel with caches enabled, add an EL0
 user mode with per-process page tables and a syscall boundary, add blocking
-sleep/wait queues and priorities to the scheduler, support GICv3/ITS, implement
-a bump allocator, add a `virtio-gpu` driver for larger modes, add
+sleep/wait queues and priorities to the scheduler, support GICv3/ITS, add
+a `virtio-gpu` driver for larger modes, add
 interrupt-driven HDA playback with a mixer and hardware volume control, or
 parse the device tree. Each of these fits into an existing layer: `libs/` for
-the allocator and scheduler policy, `drivers/` for GICv3, virtio-gpu and audio,
-and `apps/` for an animation or audio app.
+media and scheduler policy, `kernel/` for the heap, `drivers/` for GICv3,
+virtio-gpu and audio, and `apps/` for an animation or audio app.
 
 ## License
 
