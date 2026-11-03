@@ -39,6 +39,7 @@ window as well.
 | Compound commands | `if`/`elif`/`else`/`fi`, `for`/`in`/`do`/`done`, `while`, `until`, `{ ...; }`, `( ... )` |
 | Builtins | `cd`, `pwd`, `export`, `unset`, `set`, `exit`, `return`, `source`/`.`, `eval`, `alias`, `unalias`, `history`, `help`, `type`, `command`, `read`, `break`, `continue`, `clear`, `sh`/`bash` |
 | Interactive editing | Arrows, Home/End, Delete, history, Ctrl-A/E/U/K/W, Ctrl-L, Ctrl-C, Ctrl-D, Ctrl-R, Tab |
+| Zoom (desktop window) | Ctrl-`=`/Ctrl-`+` zooms in, Ctrl-`-` zooms out, Ctrl-`0` resets (1x–4x) |
 | Scripts | `sh script`, `source script`, `bash -c '...'` |
 
 Pipelines are executed by running each stage, buffering its output and feeding

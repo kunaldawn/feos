@@ -122,6 +122,9 @@ impl SerialKeys {
         let key = match byte {
             0x00 => Key::Space,
             0x01..=0x1a => Key::Character((b'a' + byte - 1) as char),
+            0x1d => Key::Character('='),
+            0x1e => Key::Character('^'),
+            0x1f => Key::Character('-'),
             _ => return,
         };
         Self::key(input, key, Modifiers::CTRL);
@@ -165,7 +168,7 @@ impl SerialKeys {
                     Self::key(input, Key::Space, Modifiers::NONE);
                     Self::text(input, ' ');
                 }
-                0x00..=0x1a => Self::push_control_char(input, byte),
+                0x00..=0x1f => Self::push_control_char(input, byte),
                 byte if byte.is_ascii_graphic() => {
                     let ch = byte as char;
                     Self::key(input, Key::Character(ch), Modifiers::NONE);
@@ -466,6 +469,21 @@ fn character(code: u16) -> Option<(char, char)> {
         51 => (',', '<'),
         52 => ('.', '>'),
         53 => ('/', '?'),
+        55 => ('*', '*'),
+        71 => ('7', '7'),
+        72 => ('8', '8'),
+        73 => ('9', '9'),
+        74 => ('-', '-'),
+        75 => ('4', '4'),
+        76 => ('5', '5'),
+        77 => ('6', '6'),
+        78 => ('+', '+'),
+        79 => ('1', '1'),
+        80 => ('2', '2'),
+        81 => ('3', '3'),
+        82 => ('0', '0'),
+        83 => ('.', '.'),
+        98 => ('/', '/'),
         _ => return None,
     };
     Some(pair)
@@ -553,6 +571,20 @@ mod tests {
             .any(|(key, modifiers)| key == Key::Character('a')
                 && modifiers.contains(Modifiers::CTRL)));
         assert_eq!(input.text().count(), 0);
+    }
+
+    #[test]
+    fn serial_control_equals_and_minus_are_zoom_keys() {
+        let mut keys = SerialKeys::new();
+        let input = feed_all(&mut keys, b"\x1d\x1f");
+        assert!(input
+            .keys()
+            .any(|(key, modifiers)| key == Key::Character('=')
+                && modifiers.contains(Modifiers::CTRL)));
+        assert!(input
+            .keys()
+            .any(|(key, modifiers)| key == Key::Character('-')
+                && modifiers.contains(Modifiers::CTRL)));
     }
 
     #[test]

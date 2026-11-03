@@ -116,6 +116,7 @@ struct TerminalState {
     history_index: usize,
     saved_line: String,
     close_requested: bool,
+    scale: u32,
 }
 
 impl TerminalState {
@@ -131,12 +132,13 @@ impl TerminalState {
             history_index: 0,
             saved_line: String::new(),
             close_requested: false,
+            scale: 1,
         };
         state
             .lines
             .push(String::from("FEOS terminal - Bash-compatible shell"));
         state.lines.push(String::from(
-            "Type 'help' for commands. Ctrl-D closes this window.",
+            "Type 'help' for commands. Ctrl+/- zooms, Ctrl-D closes.",
         ));
         state.lines.push(String::new());
         state.history_index = state.shell.history.len();
@@ -217,6 +219,20 @@ impl TerminalState {
         if self.lines.len() > 1000 {
             let excess = self.lines.len() - 1000;
             self.lines.drain(0..excess);
+        }
+    }
+
+    fn zoom_in(&mut self) {
+        if self.scale < MAX_SCALE {
+            self.scale += 1;
+            self.scroll = 0;
+        }
+    }
+
+    fn zoom_out(&mut self) {
+        if self.scale > MIN_SCALE {
+            self.scale -= 1;
+            self.scroll = 0;
         }
     }
 
@@ -407,6 +423,9 @@ fn handle_event(
                     }
                     Key::Character('a') | Key::Character('A') => state.cursor = 0,
                     Key::Character('e') | Key::Character('E') => state.cursor = state.input.len(),
+                    Key::Character('=') | Key::Character('+') => state.zoom_in(),
+                    Key::Character('-') | Key::Character('_') => state.zoom_out(),
+                    Key::Character('0') => state.scale = MIN_SCALE,
                     Key::Character('w') | Key::Character('W') => {
                         let mut start = state.cursor;
                         while start > 0 && state.input[start - 1].is_whitespace() {
@@ -463,11 +482,11 @@ fn handle_event(
                 }
                 Key::Tab => state.complete(),
                 Key::PageUp => {
-                    let rows = visible_rows(context.canvas);
+                    let rows = visible_rows(context.canvas, state.scale);
                     state.scroll = state.scroll.saturating_add(rows / 2).min(state.lines.len());
                 }
                 Key::PageDown => {
-                    let rows = visible_rows(context.canvas);
+                    let rows = visible_rows(context.canvas, state.scale);
                     state.scroll = state.scroll.saturating_sub(rows / 2);
                 }
                 Key::Escape => state.close_requested = true,
@@ -478,16 +497,22 @@ fn handle_event(
     }
 }
 
-fn visible_rows(canvas: &Canvas<'_>) -> usize {
-    (canvas.height().saturating_sub(8) / LINE_HEIGHT as usize).max(1)
+fn visible_rows(canvas: &Canvas<'_>, scale: u32) -> usize {
+    let line_height = BASE_LINE_HEIGHT as usize * scale as usize;
+    (canvas.height().saturating_sub(8) / line_height).max(1)
 }
 
-const CELL_WIDTH: i32 = 8;
-const LINE_HEIGHT: i32 = 10;
+const BASE_CELL_WIDTH: i32 = 8;
+const BASE_LINE_HEIGHT: i32 = 10;
+const MIN_SCALE: u32 = 1;
+const MAX_SCALE: u32 = 4;
 
 fn render(state: &TerminalState, canvas: &mut Canvas<'_>) {
     let width = canvas.width() as i32;
     let height = canvas.height() as i32;
+    let scale = state.scale;
+    let cell_width = BASE_CELL_WIDTH * scale as i32;
+    let line_height = BASE_LINE_HEIGHT * scale as i32;
     let background = Color::rgb(8, 12, 16);
     let text_color = Color::rgb(196, 220, 206);
     let prompt_color = Color::rgb(92, 222, 148);
@@ -497,8 +522,8 @@ fn render(state: &TerminalState, canvas: &mut Canvas<'_>) {
         background,
     );
 
-    let cols = ((width - 8).max(CELL_WIDTH) / CELL_WIDTH) as usize;
-    let rows = visible_rows(canvas);
+    let cols = ((width - 8).max(cell_width) / cell_width) as usize;
+    let rows = visible_rows(canvas, scale);
     if rows == 0 || cols == 0 {
         return;
     }
@@ -515,17 +540,17 @@ fn render(state: &TerminalState, canvas: &mut Canvas<'_>) {
 
     let mut y = 4;
     for line in state.lines.iter().skip(start).take(history_rows) {
-        draw_clipped(canvas, 4, y, line, cols, text_color);
-        y += LINE_HEIGHT;
+        draw_clipped(canvas, 4, y, line, cols, text_color, scale);
+        y += line_height;
     }
 
     let prompt = state.shell.prompt();
-    let prompt_row = 4 + history_rows as i32 * LINE_HEIGHT;
-    draw_clipped(canvas, 4, prompt_row, &prompt, cols, prompt_color);
+    let prompt_row = 4 + history_rows as i32 * line_height;
+    draw_clipped(canvas, 4, prompt_row, &prompt, cols, prompt_color, scale);
 
     let prompt_width = prompt.chars().count();
     let input = state.line();
-    let input_x = 4 + prompt_width as i32 * CELL_WIDTH;
+    let input_x = 4 + prompt_width as i32 * cell_width;
     draw_clipped(
         canvas,
         input_x,
@@ -533,23 +558,38 @@ fn render(state: &TerminalState, canvas: &mut Canvas<'_>) {
         &input,
         cols.saturating_sub(prompt_width),
         text_color,
+        scale,
     );
 
-    let cursor_x = input_x + state.cursor as i32 * CELL_WIDTH;
+    let cursor_x = input_x + state.cursor as i32 * cell_width;
     if cursor_x < width - 2 {
+        let underline = (scale * 2).max(2);
         canvas.fill_rect(
-            Rect::new(cursor_x, prompt_row + LINE_HEIGHT - 2, CELL_WIDTH as u32, 2),
+            Rect::new(
+                cursor_x,
+                prompt_row + line_height - underline as i32,
+                cell_width as u32,
+                underline,
+            ),
             prompt_color,
         );
     }
 }
 
-fn draw_clipped(canvas: &mut Canvas<'_>, x: i32, y: i32, text: &str, columns: usize, color: Color) {
+fn draw_clipped(
+    canvas: &mut Canvas<'_>,
+    x: i32,
+    y: i32,
+    text: &str,
+    columns: usize,
+    color: Color,
+    scale: u32,
+) {
     if columns == 0 {
         return;
     }
     let clipped: String = text.chars().take(columns).collect();
-    canvas.draw_text(x, y, &clipped, color, 1);
+    canvas.draw_text(x, y, &clipped, color, scale);
 }
 
 #[cfg(test)]
@@ -659,7 +699,21 @@ mod tests {
             "terminal output was {:?}",
             state.lines
         );
+        assert_eq!(state.scale, 1);
         drop(guard);
+
+        let mut input = Input::new();
+        let mut keys = feos_keys::SerialKeys::new();
+        keys.feed(0x1d, 20, &mut input);
+        desktop.render_with_platform(&mut canvas, &input, 300, Some(&platform));
+        assert_eq!(TERMINAL.lock().as_ref().unwrap().scale, 2);
+
+        let mut input = Input::new();
+        let mut keys = feos_keys::SerialKeys::new();
+        keys.feed(0x1f, 40, &mut input);
+        desktop.render_with_platform(&mut canvas, &input, 400, Some(&platform));
+        assert_eq!(TERMINAL.lock().as_ref().unwrap().scale, 1);
+
         Terminal.close_window();
     }
 
@@ -683,6 +737,20 @@ mod tests {
             apps: &REGISTRY,
             filesystem: None,
         }
+    }
+
+    #[test]
+    fn terminal_zoom_is_bounded() {
+        let mut state = TerminalState::new(None);
+        assert_eq!(state.scale, MIN_SCALE);
+        for _ in 0..10 {
+            state.zoom_in();
+        }
+        assert_eq!(state.scale, MAX_SCALE);
+        for _ in 0..10 {
+            state.zoom_out();
+        }
+        assert_eq!(state.scale, MIN_SCALE);
     }
 
     #[test]

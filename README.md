@@ -209,6 +209,8 @@ change.
 - Interactive line editor: cursor movement, Home/End, history, Ctrl-A/E/U/K/W,
   Ctrl-L, Ctrl-C, Ctrl-D, reverse history search (Ctrl-R), multi-line
   continuation for open quotes and substitutions
+- Terminal zoom: Ctrl-`=`/Ctrl-`+` and Ctrl-`-` scale the desktop Terminal
+  window from 1x to 4x, with Ctrl-`0` resetting it
 - **POSIX coreutils** (`feos-coreutils`): `ls`, `cat`, `echo`, `printf`, `pwd`,
   `mkdir`, `rmdir`, `rm`, `cp`, `mv`, `touch`, `head`, `tail`, `wc`, `grep`,
   `sort`, `uniq`, `cut`, `tr`, `seq`, `basename`, `dirname`, `nl`, `rev`,
