@@ -109,6 +109,12 @@ pub extern "C" fn kmain(dtb: usize) -> ! {
         None => println!("[input] no pointer (start QEMU with -device virtio-tablet-device)"),
     }
 
+    if board::init_keyboard() {
+        println!("[input] virtio keyboard ready");
+    } else {
+        println!("[input] no virtio keyboard (serial console is the keyboard)");
+    }
+
     let platform = Platform {
         board: BoardInfo {
             name: board::NAME,
@@ -122,6 +128,7 @@ pub extern "C" fn kmain(dtb: usize) -> ! {
         cpu: services,
         audio: audio.as_ref().map(|audio| audio.device),
         pointer: board::pointer(),
+        keyboard: board::keyboard(),
         processes: &sched::PROCESSES,
         memory: Some(&KERNEL_MEMORY),
         apps: &feos_apps::APP_REGISTRY,

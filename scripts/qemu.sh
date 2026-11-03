@@ -1,10 +1,11 @@
 #!/bin/sh
 # Boot the kernel in QEMU's aarch64 `virt` machine with ramfb display, a
-# virtio tablet pointer and an Intel HDA audio device.
+# virtio tablet pointer, a virtio keyboard and an Intel HDA audio device.
 #
 #   ./scripts/qemu.sh [path/to/kernel.elf]
 #
-# The serial console is on stdio. The display backend comes from FEOS_DISPLAY:
+# The serial console is on stdio and the graphical window has its own virtio
+# keyboard. The display backend comes from FEOS_DISPLAY:
 # `vnc=127.0.0.1:0` (the default), `gtk` for a native window, or `none` for
 # serial only. With VNC, connect a viewer to localhost:5900 to see the
 # graphics. Use the `tone` shell command to play audio and `poweroff` (or
@@ -35,6 +36,7 @@ exec qemu-system-aarch64 \
     -net none \
     -device ramfb \
     -device virtio-tablet-device \
+    -device virtio-keyboard-device \
     -audiodev "$AUDIODEV" \
     -device intel-hda \
     -device hda-output,audiodev=snd0 \

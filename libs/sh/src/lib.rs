@@ -589,6 +589,55 @@ mod tests {
         }
     }
 
+    static CONSOLE_INPUT: std::sync::Mutex<std::collections::VecDeque<u8>> =
+        std::sync::Mutex::new(std::collections::VecDeque::new());
+
+    fn test_console_reader() -> Option<u8> {
+        CONSOLE_INPUT.lock().unwrap().pop_front()
+    }
+
+    #[test]
+    fn the_interactive_loop_reads_the_registered_console() {
+        {
+            let mut input = CONSOLE_INPUT.lock().unwrap();
+            input.clear();
+            input.extend(b"echo hi\r\x04");
+        }
+        feos_console::set_reader(test_console_reader);
+
+        let mut shell = Shell::new(None, &NoSystem);
+        let mut host = NoHost;
+        let mut stdin = crate::ConsoleInput;
+        let mut stdout = crate::ConsoleOutput;
+        let mut stderr = crate::ConsoleOutput;
+        let mut io = Io {
+            stdin: &mut stdin,
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+
+        assert_eq!(crate::interactive(&mut shell, &mut host, &mut io), 0);
+        assert_eq!(shell.history, ["echo hi"]);
+    }
+
+    #[test]
+    fn the_line_editor_consumes_console_bytes() {
+        let mut shell = Shell::new(None, &NoSystem);
+        let mut host = NoHost;
+        let mut stdin = BytesInput::new(b"echo hi\r".to_vec());
+        let mut stdout = BytesOutput::new();
+        let mut stderr = BytesOutput::new();
+        let mut io = Io {
+            stdin: &mut stdin,
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        match editor::read_line(&mut shell, &mut host, &mut io) {
+            editor::ReadResult::Line(line) => assert_eq!(line, "echo hi"),
+            _ => panic!("expected a line"),
+        }
+    }
+
     fn run(shell: &mut Shell<'_>, line: &str) -> (i32, String, String) {
         let mut stdin = BytesInput::empty();
         let mut stdout = BytesOutput::new();

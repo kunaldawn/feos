@@ -18,7 +18,9 @@ feos-coreutils    commands, writable overlay VFS, text/system services
 Nothing in the shell knows about QEMU, the PL011 or a particular board. The
 adapter supplies console streams, platform facts (`uname`, `uptime`, `free`)
 and an external-command host that resolves names through the normal app
-registry.
+registry. Keyboard input reaches the desktop from the serial console and, when
+QEMU is started with `-device virtio-keyboard-device`, from the graphical
+window as well.
 
 ## Supported language
 

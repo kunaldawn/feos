@@ -26,6 +26,25 @@ pub trait Serial {
     fn read_byte(&self) -> Option<u8>;
 }
 
+/// One key transition reported by a keyboard device.
+///
+/// `code` uses the Linux evdev key-code numbering (`KEY_A` is 30, `KEY_ENTER`
+/// is 28, and so on). Decoding it into characters and modifiers is the job of
+/// `feos-keys`, so the HAL stays independent of a keyboard layout.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct KeyboardEvent {
+    /// Linux evdev key code.
+    pub code: u16,
+    /// True for a press, false for a release.
+    pub pressed: bool,
+}
+
+/// A polled keyboard device.
+pub trait Keyboard: Sync {
+    /// Returns the next key transition, or `None` when the queue is empty.
+    fn poll(&self) -> Option<KeyboardEvent>;
+}
+
 /// A monotonic hardware counter.
 pub trait Clock: Sync {
     /// Counter frequency in Hz.

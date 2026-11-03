@@ -2640,9 +2640,58 @@ fn draw_caption_button<const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use feos_app::{Context, ProcessInfo, ProcessState};
+    use feos_app::{BoardInfo, Context, ProcessInfo, ProcessState};
     use feos_gui::{Event, Key, Modifiers, MouseButton};
+    use feos_hal::{Clock, Cpu, Power};
     use feos_sync::SpinLock;
+
+    struct FakeClock;
+
+    impl Clock for FakeClock {
+        fn frequency(&self) -> u64 {
+            1_000_000
+        }
+
+        fn ticks(&self) -> u64 {
+            0
+        }
+
+        fn spin_ms(&self, _ms: u64) {}
+    }
+
+    static CLOCK: FakeClock = FakeClock;
+
+    struct FakePower;
+
+    impl Power for FakePower {
+        fn system_off(&self) -> ! {
+            loop {}
+        }
+
+        fn system_reset(&self) -> ! {
+            loop {}
+        }
+    }
+
+    static POWER: FakePower = FakePower;
+
+    struct FakeCpu;
+
+    impl Cpu for FakeCpu {
+        fn current_el(&self) -> u64 {
+            1
+        }
+
+        fn midr(&self) -> u64 {
+            0
+        }
+
+        fn halt(&self) -> ! {
+            loop {}
+        }
+    }
+
+    static CPU: FakeCpu = FakeCpu;
 
     struct Dummy;
 
@@ -2692,6 +2741,41 @@ mod tests {
 
     static WINDOWED: WindowedDummy = WindowedDummy;
 
+    struct Recorder;
+
+    static RECORDED: SpinLock<(bool, usize)> = SpinLock::new((false, 0));
+
+    impl App for Recorder {
+        fn name(&self) -> &'static str {
+            "recorder"
+        }
+
+        fn usage(&self) -> &'static str {
+            "recorder"
+        }
+
+        fn description(&self) -> &'static str {
+            "records keyboard input"
+        }
+
+        fn windowed(&self) -> bool {
+            true
+        }
+
+        fn open_window(&self, _context: &WindowContext<'_, '_>) -> bool {
+            true
+        }
+
+        fn frame_window(&self, context: &mut WindowContext<'_, '_>) -> WindowFrame {
+            *RECORDED.lock() = (context.keyboard_active, context.input.text().count());
+            WindowFrame::Continue
+        }
+
+        fn run(&self, _context: &mut Context<'_>) {}
+    }
+
+    static RECORDER: Recorder = Recorder;
+
     struct Registry;
 
     impl AppRegistry for Registry {
@@ -2699,6 +2783,7 @@ mod tests {
             match name {
                 "dummy" => Some(&DUMMY),
                 "windowed" => Some(&WINDOWED),
+                "recorder" => Some(&RECORDER),
                 _ => None,
             }
         }
@@ -2724,6 +2809,13 @@ mod tests {
             }
         }
     }
+
+    static TEST_PROCESSES: FakeProcesses = FakeProcesses {
+        state: SpinLock::new(FakeState {
+            next_pid: 2,
+            spawned: 0,
+        }),
+    };
 
     impl Processes for FakeProcesses {
         fn spawn(&self, _app: &'static dyn App, _args: &str) -> Result<u32, SpawnError> {
@@ -2839,6 +2931,54 @@ mod tests {
         desktop.windows_mut().minimize(0);
         let response = desktop.render(&mut canvas, &Input::new(), 200);
         assert!(!response.redraw);
+    }
+
+    #[test]
+    fn windowed_apps_receive_keyboard_events() {
+        let bytes = catalog_bundle("rec", "recorder");
+        let entries = [DirEntry::new("rec.fapp", &bytes)];
+        let mut desktop = Desktop::<4, 4, 2>::default();
+        desktop.scan(&entries);
+        desktop.work_area = Rect::new(0, 0, 800, 560);
+
+        let outcome = desktop.launch(0, &Registry, &TEST_PROCESSES);
+        assert!(matches!(outcome, LaunchOutcome::Windowed { window: 0 }));
+
+        let platform = Platform {
+            board: BoardInfo {
+                name: "test",
+                console_base: 0,
+                framebuffer_addr: 0,
+                kernel_range: (0, 0),
+                bss_range: (0, 0),
+            },
+            clock: &CLOCK,
+            power: &POWER,
+            cpu: &CPU,
+            audio: None,
+            pointer: None,
+            keyboard: None,
+            processes: &TEST_PROCESSES,
+            memory: None,
+            apps: &Registry,
+            filesystem: None,
+        };
+
+        let mut pixels = std::vec![0u32; 1024 * 768];
+        let mut canvas = Canvas::new(&mut pixels, 1024, 768, 1024).unwrap();
+        desktop.render_with_platform(&mut canvas, &Input::new(), 100, Some(&platform));
+
+        let mut input = Input::new();
+        input.push(Event::Text('a'));
+        input.push(Event::Text('b'));
+        desktop.render_with_platform(&mut canvas, &input, 200, Some(&platform));
+
+        let (keyboard_active, text_count) = *RECORDED.lock();
+        assert!(
+            keyboard_active,
+            "focused windowed app should own the keyboard"
+        );
+        assert_eq!(text_count, 2);
     }
 
     #[test]

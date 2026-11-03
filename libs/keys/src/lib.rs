@@ -1,11 +1,15 @@
-//! Turns serial-console bytes into [`feos_gui::Input`] events.
+//! Turns keyboard input into [`feos_gui::Input`] events.
 //!
-//! The QEMU board has no keyboard device, so the serial terminal is the
-//! keyboard for the desktop and full-screen GUI apps. Terminals send arrow
-//! keys as `ESC [ A` (or `ESC O A`), which means a lone `Escape` can only be
-//! recognised after a short timeout. Function keys, Page Up/Down, Insert,
-//! Delete and Ctrl/Alt/Shift modified arrows are decoded from the standard
-//! xterm control sequences as well.
+//! Two sources are supported:
+//!
+//! - [`SerialKeys`] decodes bytes from the serial console, which remains a
+//!   keyboard even on boards without an input device. Terminals send arrow
+//!   keys as `ESC [ A` (or `ESC O A`), which means a lone `Escape` can only be
+//!   recognised after a short timeout. Function keys, Page Up/Down, Insert,
+//!   Delete and Ctrl/Alt/Shift modified arrows are decoded from the standard
+//!   xterm control sequences as well.
+//! - [`EvdevKeys`] decodes Linux evdev key transitions from a virtio keyboard,
+//!   so QEMU's graphical window can type into the desktop and terminal.
 //!
 //! [`SerialKeys`] owns that decoder: a caller polls it once per frame, passes
 //! the resulting [`Input`] to its UI, and clears the input's events when the
@@ -25,6 +29,7 @@
 
 use feos_console::read_byte;
 use feos_gui::{Event, Input, Key, Modifiers};
+use feos_hal::KeyboardEvent;
 
 /// Maximum time spent waiting for the rest of an escape sequence, in ms.
 pub const ESCAPE_TIMEOUT_MS: u64 = 30;
@@ -276,6 +281,196 @@ impl Default for SerialKeys {
     }
 }
 
+/// Decodes Linux evdev key transitions from a virtio keyboard into GUI events.
+///
+/// The layout is US/QWERTY. Modifier state is tracked across presses and
+/// releases, Caps Lock toggles on press, and Ctrl+letter produces a key event
+/// without a matching text event so the terminal can implement Ctrl-C, Ctrl-D
+/// and friends.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EvdevKeys {
+    shift: bool,
+    ctrl: bool,
+    alt: bool,
+    caps: bool,
+}
+
+impl EvdevKeys {
+    /// Creates a decoder with no modifiers held.
+    pub const fn new() -> Self {
+        Self {
+            shift: false,
+            ctrl: false,
+            alt: false,
+            caps: false,
+        }
+    }
+
+    fn key(input: &mut Input, key: Key, modifiers: Modifiers) {
+        input.push(Event::KeyDown(key, modifiers));
+    }
+
+    fn text(input: &mut Input, ch: char) {
+        input.push(Event::Text(ch));
+    }
+
+    fn modifiers(&self) -> Modifiers {
+        let mut modifiers = Modifiers::NONE;
+        if self.shift {
+            modifiers |= Modifiers::SHIFT;
+        }
+        if self.ctrl {
+            modifiers |= Modifiers::CTRL;
+        }
+        if self.alt {
+            modifiers |= Modifiers::ALT;
+        }
+        modifiers
+    }
+
+    /// Feeds one key transition.
+    pub fn feed(&mut self, event: KeyboardEvent, input: &mut Input) {
+        match event.code {
+            42 | 54 => {
+                self.shift = event.pressed;
+                return;
+            }
+            29 | 97 => {
+                self.ctrl = event.pressed;
+                return;
+            }
+            56 | 100 => {
+                self.alt = event.pressed;
+                return;
+            }
+            58 => {
+                if event.pressed {
+                    self.caps = !self.caps;
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        if !event.pressed {
+            return;
+        }
+
+        let modifiers = self.modifiers();
+
+        if let Some(key) = special_key(event.code) {
+            if key == Key::Space && !self.ctrl && !self.alt {
+                Self::text(input, ' ');
+            }
+            Self::key(input, key, modifiers);
+            return;
+        }
+
+        if let Some((plain, shifted)) = character(event.code) {
+            if self.ctrl {
+                Self::key(input, Key::Character(plain), modifiers);
+                return;
+            }
+
+            let upper = if plain.is_ascii_alphabetic() {
+                self.caps ^ self.shift
+            } else {
+                self.shift
+            };
+            let ch = if upper { shifted } else { plain };
+            Self::key(input, Key::Character(ch), modifiers);
+            Self::text(input, ch);
+        }
+    }
+}
+
+fn special_key(code: u16) -> Option<Key> {
+    match code {
+        1 => Some(Key::Escape),
+        14 => Some(Key::Backspace),
+        15 => Some(Key::Tab),
+        28 | 96 => Some(Key::Enter),
+        57 => Some(Key::Space),
+        59 => Some(Key::F1),
+        60 => Some(Key::F2),
+        61 => Some(Key::F3),
+        62 => Some(Key::F4),
+        63 => Some(Key::F5),
+        64 => Some(Key::F6),
+        65 => Some(Key::F7),
+        66 => Some(Key::F8),
+        67 => Some(Key::F9),
+        68 => Some(Key::F10),
+        87 => Some(Key::F11),
+        88 => Some(Key::F12),
+        102 => Some(Key::Home),
+        103 => Some(Key::Up),
+        104 => Some(Key::PageUp),
+        105 => Some(Key::Left),
+        106 => Some(Key::Right),
+        107 => Some(Key::End),
+        108 => Some(Key::Down),
+        109 => Some(Key::PageDown),
+        110 => Some(Key::Insert),
+        111 => Some(Key::Delete),
+        _ => None,
+    }
+}
+
+fn character(code: u16) -> Option<(char, char)> {
+    let pair = match code {
+        2 => ('1', '!'),
+        3 => ('2', '@'),
+        4 => ('3', '#'),
+        5 => ('4', '$'),
+        6 => ('5', '%'),
+        7 => ('6', '^'),
+        8 => ('7', '&'),
+        9 => ('8', '*'),
+        10 => ('9', '('),
+        11 => ('0', ')'),
+        12 => ('-', '_'),
+        13 => ('=', '+'),
+        16 => ('q', 'Q'),
+        17 => ('w', 'W'),
+        18 => ('e', 'E'),
+        19 => ('r', 'R'),
+        20 => ('t', 'T'),
+        21 => ('y', 'Y'),
+        22 => ('u', 'U'),
+        23 => ('i', 'I'),
+        24 => ('o', 'O'),
+        25 => ('p', 'P'),
+        26 => ('[', '{'),
+        27 => (']', '}'),
+        30 => ('a', 'A'),
+        31 => ('s', 'S'),
+        32 => ('d', 'D'),
+        33 => ('f', 'F'),
+        34 => ('g', 'G'),
+        35 => ('h', 'H'),
+        36 => ('j', 'J'),
+        37 => ('k', 'K'),
+        38 => ('l', 'L'),
+        39 => (';', ':'),
+        40 => ('\'', '"'),
+        41 => ('`', '~'),
+        43 => ('\\', '|'),
+        44 => ('z', 'Z'),
+        45 => ('x', 'X'),
+        46 => ('c', 'C'),
+        47 => ('v', 'V'),
+        48 => ('b', 'B'),
+        49 => ('n', 'N'),
+        50 => ('m', 'M'),
+        51 => (',', '<'),
+        52 => ('.', '>'),
+        53 => ('/', '?'),
+        _ => return None,
+    };
+    Some(pair)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,6 +551,86 @@ mod tests {
         assert!(input
             .keys()
             .any(|(key, modifiers)| key == Key::Character('a')
+                && modifiers.contains(Modifiers::CTRL)));
+        assert_eq!(input.text().count(), 0);
+    }
+
+    #[test]
+    fn evdev_decodes_letters_shift_and_caps() {
+        let mut keys = EvdevKeys::new();
+        let mut input = Input::new();
+        keys.feed(
+            KeyboardEvent {
+                code: 30,
+                pressed: true,
+            },
+            &mut input,
+        );
+        assert!(input.text().any(|ch| ch == 'a'));
+
+        input.clear_events();
+        keys.feed(
+            KeyboardEvent {
+                code: 42,
+                pressed: true,
+            },
+            &mut input,
+        );
+        keys.feed(
+            KeyboardEvent {
+                code: 30,
+                pressed: true,
+            },
+            &mut input,
+        );
+        assert!(input.text().any(|ch| ch == 'A'));
+
+        input.clear_events();
+        keys.feed(
+            KeyboardEvent {
+                code: 42,
+                pressed: false,
+            },
+            &mut input,
+        );
+        keys.feed(
+            KeyboardEvent {
+                code: 58,
+                pressed: true,
+            },
+            &mut input,
+        );
+        keys.feed(
+            KeyboardEvent {
+                code: 30,
+                pressed: true,
+            },
+            &mut input,
+        );
+        assert!(input.text().any(|ch| ch == 'A'));
+    }
+
+    #[test]
+    fn evdev_ctrl_letters_have_no_text() {
+        let mut keys = EvdevKeys::new();
+        let mut input = Input::new();
+        keys.feed(
+            KeyboardEvent {
+                code: 29,
+                pressed: true,
+            },
+            &mut input,
+        );
+        keys.feed(
+            KeyboardEvent {
+                code: 46,
+                pressed: true,
+            },
+            &mut input,
+        );
+        assert!(input
+            .keys()
+            .any(|(key, modifiers)| key == Key::Character('c')
                 && modifiers.contains(Modifiers::CTRL)));
         assert_eq!(input.text().count(), 0);
     }

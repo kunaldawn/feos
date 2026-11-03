@@ -4803,6 +4803,7 @@ mod render_tests {
             cpu: &CPU,
             audio: None,
             pointer: None,
+            keyboard: None,
             processes: &PROCESSES,
             memory: Some(&MEMORY),
             apps: &APPS,

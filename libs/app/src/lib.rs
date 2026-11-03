@@ -22,7 +22,7 @@ use core::cell::Cell;
 use feos_fs::FileSystem;
 use feos_gfx::{Canvas, Point, Rect};
 use feos_gui::{Event, Input};
-use feos_hal::{Audio, Clock, Cpu, Memory, Pointer, PointerEvent, Power};
+use feos_hal::{Audio, Clock, Cpu, Keyboard, Memory, Pointer, PointerEvent, Power};
 
 /// The version shared by every crate in the workspace.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -197,6 +197,8 @@ pub struct Platform {
     pub audio: Option<&'static dyn Audio>,
     /// Pointer device, when the board found one.
     pub pointer: Option<&'static dyn Pointer>,
+    /// Keyboard device, when the board found one.
+    pub keyboard: Option<&'static dyn Keyboard>,
     /// Process creation and inspection.
     pub processes: &'static dyn Processes,
     /// Kernel memory accounting, when the board provides it.

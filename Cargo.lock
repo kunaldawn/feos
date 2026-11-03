@@ -18,8 +18,10 @@ version = "0.1.0"
 dependencies = [
  "feos-app",
  "feos-audio",
+ "feos-bundle",
  "feos-console",
  "feos-coreutils",
+ "feos-desktop",
  "feos-desktop-app",
  "feos-fs",
  "feos-gfx",
@@ -110,6 +112,7 @@ dependencies = [
  "feos-bundle",
  "feos-gfx",
  "feos-gui",
+ "feos-hal",
  "feos-init",
  "feos-sync",
  "feos-text",
@@ -239,6 +242,7 @@ version = "0.1.0"
 dependencies = [
  "feos-console",
  "feos-gui",
+ "feos-hal",
 ]
 
 [[package]]

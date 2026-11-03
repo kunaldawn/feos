@@ -16,4 +16,5 @@ feos-yaml = { workspace = true }
 
 [dev-dependencies]
 feos-archive = { workspace = true }
+feos-hal = { workspace = true }
 feos-sync = { workspace = true }

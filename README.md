@@ -102,7 +102,7 @@ app registry).
 │   ├── display/ramfb/          # feos-driver-ramfb
 │   ├── bus/pci/                # feos-driver-pci: PCIe ECAM + BAR assignment
 │   ├── audio/intel-hda/        # feos-driver-intel-hda: Intel HDA playback
-│   ├── input/virtio/           # feos-driver-virtio-input: tablet/mouse
+│   ├── input/virtio/           # feos-driver-virtio-input: tablet/mouse/keyboard
 │   └── interrupt/gicv2/        # feos-driver-gicv2: GICv2 distributor + CPU interface
 │
 ├── libs/
@@ -117,7 +117,7 @@ app registry).
 │   ├── init/                   # feos-init: service supervisor and restart policy
 │   ├── bundle/                 # feos-bundle: single-file .fapp applications
 │   ├── fs/                     # feos-fs: read-only filesystem abstraction
-│   ├── keys/                   # feos-keys: serial-console keyboard decoder
+│   ├── keys/                   # feos-keys: serial + evdev keyboard decoding
 │   ├── text/                   # feos-text: fixed-capacity UTF-8 strings
 │   ├── audio/                  # feos-audio: PCM buffers, mixing, synthesis
 │   ├── json/                   # feos-json: allocation-free JSON parser/writer
@@ -230,12 +230,13 @@ change.
   scrolling, text input, charts, windows and dialogs
 - `feos-desktop`: a YAML-configured desktop session with XP-style taskbar and
   Start menu, wallpaper shortcuts, a window manager and theme support
-- `feos-driver-virtio-input`: a virtio MMIO tablet/mouse driver, wired through
-  the `Pointer` HAL trait so the desktop tracks a real pointer
+- `feos-driver-virtio-input`: a virtio MMIO tablet/mouse/keyboard driver, wired
+  through the `Pointer` and `Keyboard` HAL traits so the desktop tracks a real
+  pointer and accepts typing from the QEMU display as well as the serial port
 - `feos-fs`: a read-only, allocation-free filesystem with path lookup, parent
   links and a compiled-in `StaticFs` image
-- `feos-keys`: serial-console keyboard decoding shared by the desktop and
-  full-screen apps
+- `feos-keys`: serial-console and Linux-evdev keyboard decoding shared by the
+  desktop and full-screen apps
 - A **File Explorer** app with XP Luna window chrome, a menu bar, standard
   buttons, an editable address bar with history, a folder tree, recursive
   search, Details/Icons/List/Tiles views, sortable columns, multi-selection,
@@ -391,9 +392,12 @@ Useful overrides:
 | `make audio-demo`                    | Render the audio example WAV natively      |
 | `make docker-audio`                  | Render the audio example WAV in Docker     |
 
-The run targets add `-device virtio-tablet-device` for the pointer. Override
+The run targets add `-device virtio-tablet-device` for the pointer and
+`-device virtio-keyboard-device` for typing in the QEMU window. Override
 `POINTER_FLAGS` (for example with `-device virtio-mouse-device`) to use a
-relative mouse, or set it to an empty value for a serial-only boot.
+relative mouse, or set it to an empty value for a serial-only boot. Set
+`KEYBOARD_FLAGS=` to disable the virtio keyboard and use only the serial
+console.
 
 The scripts pass `-net none` because the kernel does not use networking and
 some distributions' QEMU packages omit the `efi-virtio.rom` file that the
@@ -593,9 +597,8 @@ Key pieces:
   layout. No constraint solver and no allocations.
 - `Painter` — clipping, rounded rectangles, alpha blending, shadows, and
   text drawing/wrapping/ellipsis over `feos_gfx::Canvas`.
-- `Input` / `Event` — pointer, wheel and keyboard events for a future board
-  driver. The current QEMU board has no mouse or keyboard device, so the `gui`
-  demo renders one frame from static state.
+- `Input` / `Event` — pointer, wheel and keyboard events. The QEMU board feeds
+  them from virtio tablet/keyboard devices and the serial console decoder.
 - Widgets — labels, headings, paragraphs, buttons, checkboxes, radios, toggles,
   sliders, progress bars, badges, separators, text fields with selection and
   UTF-8 editing, panels, cards, scroll areas, tabs, windows, dialogs, lists,
@@ -674,12 +677,15 @@ and independent of the board. Full reference:
 [`docs/desktop.md`](docs/desktop.md).
 
 On boot the kernel draws the splash, waits briefly, and then starts the desktop
-automatically. QEMU supplies a virtio tablet, so windows, the Start menu and
-taskbar are driven with the pointer; the serial console remains the keyboard:
+automatically. QEMU supplies a virtio tablet and, with the default run flags, a
+virtio keyboard, so windows, the Start menu and terminal work with the pointer
+and keyboard in the QEMU window. The serial console is still a keyboard and can
+be used alongside it:
 
 | Input | Action |
 |-------|--------|
 | Mouse | Move the pointer; click Start, menus, taskbar buttons and window controls |
+| Keyboard | Type in the focused window (terminal, dialogs) or use arrows/Enter on the desktop |
 | Double-click | Open a desktop shortcut, or maximise/restore a window from its title bar |
 | Drag | Move a window by its title bar, or resize it from any edge or corner |
 | Cursor | Arrow on the desktop, horizontal/vertical arrows on window edges, diagonal arrows on corners |
@@ -834,7 +840,7 @@ data. Properties, Folder Options and About are modal XP-style dialogs.
 
 The filesystem is read-only, so file-changing commands are deliberately
 disabled and explain that the image is compiled into the kernel. Everything
-else works with either the mouse or the serial keyboard:
+else works with the mouse, the virtio keyboard or the serial keyboard:
 
 | Input | Action |
 |-------|--------|

@@ -10,12 +10,15 @@ from an *application folder* of single-file bundles.
 ## Booting into the desktop
 
 On a graphical boot the kernel draws the splash, waits 1.5 seconds, and then
-starts the desktop automatically. QEMU supplies a virtio tablet, so the desktop
-is driven with a real pointer. The serial console remains the keyboard:
+starts the desktop automatically. QEMU supplies a virtio tablet and (with the
+default run flags) a virtio keyboard, so the desktop is driven with a real
+pointer and the graphical window accepts typing. The serial console remains a
+keyboard and works alongside it:
 
 | Input | Action |
 |-------|--------|
 | Mouse | Move the pointer; click Start, menus, taskbar buttons and window controls |
+| Keyboard | Type into the focused window, terminal or dialog |
 | Double-click | Open a desktop shortcut, or maximise/restore a window from its title bar |
 | Drag | Move a window by its title bar, or resize it from any edge or corner |
 | Cursor | Follows XP: arrow over the desktop, horizontal/vertical arrows on edges, diagonal arrows on corners |
@@ -39,9 +42,11 @@ minimises every window and restores them on a second click. The Start menu's
 "Log Off" button asks for confirmation and then behaves like `Ctrl-\`.
 
 The pointer is a `virtio-tablet-device` (absolute coordinates) or
-`virtio-mouse-device` (relative coordinates) on QEMU's virtio MMIO bus. Both
-are auto-detected by `feos-driver-virtio-input`; when neither is present the
-desktop still works from the serial keyboard.
+`virtio-mouse-device` (relative coordinates) on QEMU's virtio MMIO bus. The
+keyboard is a `virtio-keyboard-device`; its Linux-evdev transitions are decoded
+by `feos-keys::EvdevKeys`. Both devices are auto-detected by
+`feos-driver-virtio-input`. When neither is present the desktop still works
+from the serial keyboard.
 
 Run the same session from the shell:
 

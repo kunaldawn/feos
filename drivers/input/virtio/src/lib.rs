@@ -16,10 +16,13 @@
 
 use core::sync::atomic::{fence, Ordering};
 
-use feos_hal::PointerEvent;
+use feos_hal::{KeyboardEvent, PointerEvent};
 
 /// Number of descriptors in the event queue. Must be a power of two.
 pub const QUEUE_SIZE: usize = 16;
+
+/// Number of decoded key transitions buffered for the caller.
+pub const KEY_QUEUE_SIZE: usize = 32;
 
 /// First virtio MMIO slot on QEMU's `virt` machine.
 pub const VIRTIO_MMIO_BASE: usize = 0x0a00_0000;
@@ -92,6 +95,8 @@ mod input {
     pub const BTN_RIGHT: u16 = 0x111;
     pub const BTN_MIDDLE: u16 = 0x112;
 
+    pub const KEY_A: u16 = 30;
+
     pub const CFG_EV_BITS: u8 = 0x11;
     pub const CFG_ABS_INFO: u8 = 0x12;
 }
@@ -105,6 +110,15 @@ pub enum PointerKind {
     Absolute,
     /// Relative motion (QEMU `virtio-mouse`).
     Relative,
+}
+
+/// What kind of virtio input device a slot contains.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DeviceKind {
+    /// A tablet or mouse.
+    Pointer(PointerKind),
+    /// A keyboard.
+    Keyboard,
 }
 
 /// One virtqueue descriptor.
@@ -250,8 +264,8 @@ fn config_bit(base: usize, select: u8, subsel: u8, bit: u16) -> bool {
     read8_at(base, reg::CONFIG + config::UNION + byte) & (1 << (bit % 8)) != 0
 }
 
-/// Probes one MMIO slot and reports whether it is a pointer.
-pub fn probe(base: usize) -> Option<PointerKind> {
+/// Probes one MMIO slot and reports which kind of input device it contains.
+pub fn probe(base: usize) -> Option<DeviceKind> {
     if read32_at(base, reg::MAGIC) != MAGIC {
         return None;
     }
@@ -264,9 +278,11 @@ pub fn probe(base: usize) -> Option<PointerKind> {
     }
 
     if config_bit(base, input::CFG_EV_BITS, input::EV_ABS as u8, input::ABS_X) {
-        Some(PointerKind::Absolute)
+        Some(DeviceKind::Pointer(PointerKind::Absolute))
     } else if config_bit(base, input::CFG_EV_BITS, input::EV_REL as u8, input::REL_X) {
-        Some(PointerKind::Relative)
+        Some(DeviceKind::Pointer(PointerKind::Relative))
+    } else if config_bit(base, input::CFG_EV_BITS, input::EV_KEY as u8, input::KEY_A) {
+        Some(DeviceKind::Keyboard)
     } else {
         None
     }
@@ -276,8 +292,19 @@ pub fn probe(base: usize) -> Option<PointerKind> {
 pub fn find(base: usize, stride: usize, slots: usize) -> Option<(usize, PointerKind)> {
     for slot in 0..slots {
         let address = base + slot * stride;
-        if let Some(kind) = probe(address) {
+        if let Some(DeviceKind::Pointer(kind)) = probe(address) {
             return Some((address, kind));
+        }
+    }
+    None
+}
+
+/// Finds the first keyboard in the QEMU virtio MMIO range.
+pub fn find_keyboard(base: usize, stride: usize, slots: usize) -> Option<usize> {
+    for slot in 0..slots {
+        let address = base + slot * stride;
+        if probe(address) == Some(DeviceKind::Keyboard) {
+            return Some(address);
         }
     }
     None
@@ -287,7 +314,7 @@ pub fn find(base: usize, stride: usize, slots: usize) -> Option<(usize, PointerK
 pub struct VirtioInput {
     base: usize,
     version: u32,
-    kind: PointerKind,
+    kind: DeviceKind,
     width: u16,
     height: u16,
     abs_min_x: u32,
@@ -311,6 +338,9 @@ pub struct VirtioInput {
     pending_right: Option<bool>,
     pending_middle: Option<bool>,
     pending_wheel: i32,
+    keys: [Option<KeyboardEvent>; KEY_QUEUE_SIZE],
+    key_head: usize,
+    key_tail: usize,
 }
 
 impl VirtioInput {
@@ -319,7 +349,7 @@ impl VirtioInput {
         Self {
             base: 0,
             version: 0,
-            kind: PointerKind::Absolute,
+            kind: DeviceKind::Pointer(PointerKind::Absolute),
             width: 0,
             height: 0,
             abs_min_x: 0,
@@ -343,6 +373,9 @@ impl VirtioInput {
             pending_right: None,
             pending_middle: None,
             pending_wheel: 0,
+            keys: [None; KEY_QUEUE_SIZE],
+            key_head: 0,
+            key_tail: 0,
         }
     }
 
@@ -351,8 +384,8 @@ impl VirtioInput {
         self.version
     }
 
-    /// Kind of pointer this device represents.
-    pub const fn kind(&self) -> PointerKind {
+    /// Kind of input device this instance represents.
+    pub const fn kind(&self) -> DeviceKind {
         self.kind
     }
 
@@ -406,6 +439,9 @@ impl VirtioInput {
         };
         self.kind = kind;
         self.version = self.read32(reg::VERSION);
+        self.key_head = 0;
+        self.key_tail = 0;
+        self.keys = [None; KEY_QUEUE_SIZE];
 
         // Reset, then announce the driver.
         self.write32(reg::STATUS, 0);
@@ -437,7 +473,7 @@ impl VirtioInput {
             self.write32(reg::DRIVER_FEATURES, 0);
         }
 
-        if self.kind == PointerKind::Absolute {
+        if self.kind == DeviceKind::Pointer(PointerKind::Absolute) {
             let (min, max) = self.read_abs_info(input::ABS_X as u8);
             self.abs_min_x = min;
             self.abs_max_x = max;
@@ -575,7 +611,7 @@ impl VirtioInput {
 
     fn handle_event(&mut self, event: RawEvent) -> Option<PointerEvent> {
         match event.kind {
-            input::EV_ABS if self.kind == PointerKind::Absolute => {
+            input::EV_ABS if self.kind == DeviceKind::Pointer(PointerKind::Absolute) => {
                 match event.code {
                     input::ABS_X => {
                         self.pending_x = Some(Self::scale(
@@ -597,7 +633,7 @@ impl VirtioInput {
                 }
                 None
             }
-            input::EV_REL if self.kind == PointerKind::Relative => {
+            input::EV_REL if self.kind == DeviceKind::Pointer(PointerKind::Relative) => {
                 match event.code {
                     input::REL_X => {
                         let current = self.pending_x.unwrap_or(self.x) as i32;
@@ -619,6 +655,13 @@ impl VirtioInput {
                     }
                     _ => None,
                 }
+            }
+            input::EV_KEY if self.kind == DeviceKind::Keyboard => {
+                self.push_key(KeyboardEvent {
+                    code: event.code,
+                    pressed: event.value != 0,
+                });
+                None
             }
             input::EV_KEY => {
                 let before = (self.left, self.right, self.middle);
@@ -670,11 +713,31 @@ impl VirtioInput {
         })
     }
 
-    /// Returns the next complete pointer report.
+    fn push_key(&mut self, event: KeyboardEvent) {
+        let next = (self.key_tail + 1) % KEY_QUEUE_SIZE;
+        if next == self.key_head {
+            // Queue full: drop the newest transition rather than overwrite
+            // older ones that the desktop has not seen yet.
+            return;
+        }
+        self.keys[self.key_tail] = Some(event);
+        self.key_tail = next;
+    }
+
+    fn take_key(&mut self) -> Option<KeyboardEvent> {
+        if self.key_head == self.key_tail {
+            return None;
+        }
+        let event = self.keys[self.key_head].take();
+        self.key_head = (self.key_head + 1) % KEY_QUEUE_SIZE;
+        event
+    }
+
+    /// Processes one descriptor from the used ring.
     ///
-    /// Call this repeatedly until it returns `None`; each call processes at
-    /// least one descriptor when input is pending.
-    pub fn poll(&mut self) -> Option<PointerEvent> {
+    /// `Some(report)` means a descriptor was consumed, with an optional pointer
+    /// report; `None` means the queue is empty.
+    fn process_next(&mut self) -> Option<Option<PointerEvent>> {
         if !self.ready {
             return None;
         }
@@ -684,34 +747,57 @@ impl VirtioInput {
         // this driver; the index is volatile because it changes asynchronously.
         let used_idx =
             unsafe { core::ptr::read_volatile(core::ptr::addr_of!(self.queue.used.idx)) };
-
-        while self.used_seen != used_idx {
-            let slot = (self.used_seen as usize) % QUEUE_SIZE;
-            // SAFETY: `slot` is inside the used ring.
-            let (id, len) = unsafe {
-                let element = core::ptr::addr_of!(self.queue.used.ring[slot]);
-                (
-                    core::ptr::read_volatile(core::ptr::addr_of!((*element).id)),
-                    core::ptr::read_volatile(core::ptr::addr_of!((*element).len)),
-                )
-            };
-            self.used_seen = self.used_seen.wrapping_add(1);
-
-            if (id as usize) < QUEUE_SIZE && len >= 8 {
-                let raw = RawEvent::from_bytes(&self.buffers[id as usize].bytes);
-                let report = self.handle_event(raw);
-                self.release_descriptor(id as u16);
-                self.publish();
-                if let Some(report) = report {
-                    return Some(report);
-                }
-            } else {
-                self.release_descriptor(id as u16);
-                self.publish();
-            }
+        if self.used_seen == used_idx {
+            return None;
         }
 
-        None
+        let slot = (self.used_seen as usize) % QUEUE_SIZE;
+        // SAFETY: `slot` is inside the used ring.
+        let (id, len) = unsafe {
+            let element = core::ptr::addr_of!(self.queue.used.ring[slot]);
+            (
+                core::ptr::read_volatile(core::ptr::addr_of!((*element).id)),
+                core::ptr::read_volatile(core::ptr::addr_of!((*element).len)),
+            )
+        };
+        self.used_seen = self.used_seen.wrapping_add(1);
+
+        if (id as usize) < QUEUE_SIZE && len >= 8 {
+            let raw = RawEvent::from_bytes(&self.buffers[id as usize].bytes);
+            let report = self.handle_event(raw);
+            self.release_descriptor(id as u16);
+            self.publish();
+            Some(report)
+        } else {
+            self.release_descriptor(id as u16);
+            self.publish();
+            Some(None)
+        }
+    }
+
+    /// Returns the next complete pointer report.
+    ///
+    /// Call this repeatedly until it returns `None`; each call processes at
+    /// least one descriptor when input is pending.
+    pub fn poll(&mut self) -> Option<PointerEvent> {
+        loop {
+            match self.process_next()? {
+                Some(report) => return Some(report),
+                None => {}
+            }
+        }
+    }
+
+    /// Returns the next key transition from a keyboard device.
+    ///
+    /// Call this repeatedly until it returns `None`.
+    pub fn poll_key(&mut self) -> Option<KeyboardEvent> {
+        loop {
+            if let Some(event) = self.take_key() {
+                return Some(event);
+            }
+            self.process_next()?;
+        }
     }
 }
 
@@ -771,6 +857,42 @@ mod tests {
 
         assert!(device.take_report().is_none());
         assert_eq!(device.position(), (40, 60));
+    }
+
+    #[test]
+    fn keyboard_events_are_queued_in_order() {
+        let mut device = VirtioInput::new();
+        device.kind = DeviceKind::Keyboard;
+        assert!(device
+            .handle_event(RawEvent {
+                kind: input::EV_KEY,
+                code: input::KEY_A,
+                value: 1,
+            })
+            .is_none());
+        assert!(device
+            .handle_event(RawEvent {
+                kind: input::EV_KEY,
+                code: input::KEY_A,
+                value: 0,
+            })
+            .is_none());
+
+        assert_eq!(
+            device.take_key(),
+            Some(KeyboardEvent {
+                code: input::KEY_A,
+                pressed: true
+            })
+        );
+        assert_eq!(
+            device.take_key(),
+            Some(KeyboardEvent {
+                code: input::KEY_A,
+                pressed: false
+            })
+        );
+        assert_eq!(device.take_key(), None);
     }
 
     #[test]

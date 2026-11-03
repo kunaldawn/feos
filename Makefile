@@ -23,7 +23,8 @@ endif
 
 AUDIO_FLAGS  ?= -audiodev $(AUDIODEV) -device intel-hda -device hda-output,audiodev=snd0
 POINTER_FLAGS ?= -device virtio-tablet-device
-QEMU_FLAGS   ?= -machine virt -cpu cortex-a53 -smp 1 -m 128M -net none -device ramfb $(POINTER_FLAGS) $(AUDIO_FLAGS) -serial mon:stdio
+KEYBOARD_FLAGS ?= -device virtio-keyboard-device
+QEMU_FLAGS   ?= -machine virt -cpu cortex-a53 -smp 1 -m 128M -net none -device ramfb $(POINTER_FLAGS) $(KEYBOARD_FLAGS) $(AUDIO_FLAGS) -serial mon:stdio
 
 # Display backend used by `make docker-run`. "gtk" opens a QEMU window on the
 # host through X11/XWayland; "vnc=0.0.0.0:0" serves the display over VNC.

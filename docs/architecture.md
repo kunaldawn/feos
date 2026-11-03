@@ -223,10 +223,10 @@ late in the frame; the toolkit keeps no hidden z-order. Component state is
 fixed-capacity and caller-owned, matching the rest of the toolkit. Components
 that need more room than their container simply clip.
 
-The current board has no mouse or keyboard device, but the desktop session
-translates serial-console keys into `feos_gui::Input` events: arrows navigate
-the Start menu and wallpaper, `Enter` launches, `Space` opens the menu and
-`Ctrl-\` returns to the shell. The `gui` app still renders a static dashboard
+The QEMU board exposes a virtio tablet and virtio keyboard, and the desktop
+session also translates serial-console keys into `feos_gui::Input` events:
+arrows navigate the Start menu and wallpaper, `Enter` launches, `Space` opens
+the menu and `Ctrl-\` returns to the shell. The `gui` app still renders a static dashboard
 frame with an overview, charts, a classic component gallery and a Fluent gallery
 showing the newer collection, navigation and overlay controls, and a Patterns
 gallery for advanced composition and chart types. Adding a pointer driver only

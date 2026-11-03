@@ -16,7 +16,7 @@ use feos_desktop::StartMenuCommand;
 use feos_gfx::{Canvas, Point};
 use feos_gui::{Event, Input, MouseButton};
 use feos_hal::PointerEvent;
-use feos_keys::SerialKeys;
+use feos_keys::{EvdevKeys, SerialKeys};
 
 /// Why a desktop session returned to its caller.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -58,6 +58,7 @@ pub fn run_session(
 
     let mut input = Input::new();
     let mut keys = SerialKeys::new();
+    let mut evdev = EvdevKeys::new();
     let Some(mut session) = super::SESSION.try_lock() else {
         println!("[desktop] a desktop session is already running");
         return SessionExit::Busy;
@@ -84,6 +85,14 @@ pub fn run_session(
             println!();
             println!("[desktop] log off - returning to the serial shell");
             return SessionExit::LogOff;
+        }
+
+        // A virtio keyboard (when QEMU exposes one) feeds the same GUI event
+        // queue as the serial console, so windows work with either input.
+        if let Some(keyboard) = platform.keyboard {
+            while let Some(event) = keyboard.poll() {
+                evdev.feed(event, &mut input);
+            }
         }
 
         // Drain the pointer device into this frame's GUI event queue. A

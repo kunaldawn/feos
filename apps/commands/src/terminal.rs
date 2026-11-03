@@ -323,8 +323,13 @@ impl App for Terminal {
 
         if context.keyboard_active {
             let events: Vec<Event> = context.input.events().collect();
+            // The serial decoder emits KeyDown + Text; some keyboard drivers
+            // emit only KeyDown(Character). Insert from Text when present and
+            // fall back to the key event otherwise, so neither source doubles
+            // characters.
+            let has_text = events.iter().any(|event| matches!(event, Event::Text(_)));
             for event in events {
-                handle_event(state, event, context);
+                handle_event(state, event, context, has_text);
             }
         }
         if context.pointer_active {
@@ -369,7 +374,12 @@ fn update_system(context: &WindowContext<'_, '_>) {
     }
 }
 
-fn handle_event(state: &mut TerminalState, event: Event, context: &WindowContext<'_, '_>) {
+fn handle_event(
+    state: &mut TerminalState,
+    event: Event,
+    context: &WindowContext<'_, '_>,
+    has_text: bool,
+) {
     match event {
         Event::Text(ch) if !ch.is_control() => state.insert(ch),
         Event::KeyDown(key, modifiers) => {
@@ -414,6 +424,7 @@ fn handle_event(state: &mut TerminalState, event: Event, context: &WindowContext
             }
 
             match key {
+                Key::Character(ch) if !has_text && !ch.is_control() => state.insert(ch),
                 Key::Enter => state.execute(),
                 Key::Backspace => state.backspace(),
                 Key::Delete => state.delete(),
@@ -539,4 +550,204 @@ fn draw_clipped(canvas: &mut Canvas<'_>, x: i32, y: i32, text: &str, columns: us
     }
     let clipped: String = text.chars().take(columns).collect();
     canvas.draw_text(x, y, &clipped, color, 1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use feos_app::{AppRegistry, BoardInfo, Platform};
+    use feos_app::{ProcessInfo, Processes, SpawnError};
+    use feos_gfx::Point;
+    use feos_gui::Input;
+    use feos_hal::{Clock, Cpu, Power};
+
+    struct FakeClock;
+    impl Clock for FakeClock {
+        fn frequency(&self) -> u64 {
+            1_000_000
+        }
+        fn ticks(&self) -> u64 {
+            0
+        }
+        fn spin_ms(&self, _ms: u64) {}
+    }
+    static CLOCK: FakeClock = FakeClock;
+
+    struct FakePower;
+    impl Power for FakePower {
+        fn system_off(&self) -> ! {
+            loop {}
+        }
+        fn system_reset(&self) -> ! {
+            loop {}
+        }
+    }
+    static POWER: FakePower = FakePower;
+
+    struct FakeCpu;
+    impl Cpu for FakeCpu {
+        fn current_el(&self) -> u64 {
+            1
+        }
+        fn midr(&self) -> u64 {
+            0
+        }
+        fn halt(&self) -> ! {
+            loop {}
+        }
+    }
+    static CPU: FakeCpu = FakeCpu;
+
+    struct FakeProcesses;
+    impl Processes for FakeProcesses {
+        fn spawn(&self, _app: &'static dyn App, _args: &str) -> Result<u32, SpawnError> {
+            Ok(2)
+        }
+        fn kill(&self, _pid: u32) -> bool {
+            false
+        }
+        fn current(&self) -> u32 {
+            1
+        }
+        fn snapshot(&self, out: &mut [ProcessInfo]) -> usize {
+            if out.is_empty() {
+                0
+            } else {
+                let _ = &mut out[0];
+                0
+            }
+        }
+    }
+    static PROCESSES: FakeProcesses = FakeProcesses;
+
+    struct Registry;
+    impl AppRegistry for Registry {
+        fn find(&self, _name: &str) -> Option<&'static dyn App> {
+            None
+        }
+    }
+    static REGISTRY: Registry = Registry;
+
+    #[test]
+    fn desktop_terminal_receives_keyboard_events() {
+        let bundle = include_bytes!("../../desktop/apps/terminal.fapp");
+        let entries = [feos_bundle::DirEntry::new("terminal.fapp", bundle)];
+        let mut desktop = std::boxed::Box::new(feos_desktop::Desktop::<4, 4, 2>::default());
+        desktop.scan(&entries);
+
+        assert!(matches!(
+            desktop.launch(0, &crate::APP_REGISTRY, &PROCESSES),
+            feos_desktop::LaunchOutcome::Windowed { window: 0 }
+        ));
+
+        let platform = test_platform();
+        let mut pixels = std::vec![0u32; 1024 * 768];
+        let mut canvas = Canvas::new(&mut pixels, 1024, 768, 1024).unwrap();
+        desktop.render_with_platform(&mut canvas, &Input::new(), 100, Some(&platform));
+
+        let mut input = Input::new();
+        let mut keys = feos_keys::SerialKeys::new();
+        for byte in b"echo hi\r" {
+            keys.feed(*byte, 10, &mut input);
+        }
+        desktop.render_with_platform(&mut canvas, &input, 200, Some(&platform));
+
+        let guard = TERMINAL.lock();
+        let state = guard.as_ref().expect("terminal state");
+        assert!(
+            state.lines.iter().any(|line| line == "hi"),
+            "terminal output was {:?}",
+            state.lines
+        );
+        drop(guard);
+        Terminal.close_window();
+    }
+
+    fn test_platform() -> Platform {
+        Platform {
+            board: BoardInfo {
+                name: "test",
+                console_base: 0,
+                framebuffer_addr: 0,
+                kernel_range: (0, 0),
+                bss_range: (0, 0),
+            },
+            clock: &CLOCK,
+            power: &POWER,
+            cpu: &CPU,
+            audio: None,
+            pointer: None,
+            keyboard: None,
+            processes: &PROCESSES,
+            memory: None,
+            apps: &REGISTRY,
+            filesystem: None,
+        }
+    }
+
+    #[test]
+    fn terminal_accepts_text_and_executes_it() {
+        let mut pixels = [0u32; 400 * 200];
+        let platform = Platform {
+            board: BoardInfo {
+                name: "test",
+                console_base: 0,
+                framebuffer_addr: 0,
+                kernel_range: (0, 0),
+                bss_range: (0, 0),
+            },
+            clock: &CLOCK,
+            power: &POWER,
+            cpu: &CPU,
+            audio: None,
+            pointer: None,
+            keyboard: None,
+            processes: &PROCESSES,
+            memory: None,
+            apps: &REGISTRY,
+            filesystem: None,
+        };
+        let mut canvas = Canvas::new(&mut pixels, 400, 200, 400).unwrap();
+        let input = Input::new();
+        let context = WindowContext {
+            args: "",
+            canvas: &mut canvas,
+            input: &input,
+            platform: &platform,
+            now_ms: 0,
+            origin: Point::new(0, 0),
+            pointer_active: false,
+            keyboard_active: true,
+        };
+        assert!(Terminal.open_window(&context));
+
+        let mut input = Input::new();
+        input.push(Event::Text('e'));
+        input.push(Event::Text('c'));
+        input.push(Event::Text('h'));
+        input.push(Event::Text('o'));
+        input.push(Event::Text(' '));
+        input.push(Event::Text('h'));
+        input.push(Event::Text('i'));
+        input.push(Event::KeyDown(Key::Enter, Modifiers::NONE));
+        let mut context = WindowContext {
+            args: "",
+            canvas: &mut canvas,
+            input: &input,
+            platform: &platform,
+            now_ms: 10,
+            origin: Point::new(0, 0),
+            pointer_active: false,
+            keyboard_active: true,
+        };
+        let _ = Terminal.frame_window(&mut context);
+
+        let guard = TERMINAL.lock();
+        let state = guard.as_ref().expect("terminal state");
+        assert!(
+            state.lines.iter().any(|line| line == "hi"),
+            "terminal output was {:?}",
+            state.lines
+        );
+    }
 }

@@ -18,7 +18,9 @@ use feos_driver_ramfb::Ramfb;
 use feos_driver_virtio_input::{PointerKind, VirtioInput};
 use feos_fs::{FileSystem, StaticFs};
 use feos_gfx::Canvas;
-use feos_hal::{Audio, Clock, InterruptController, Pointer, PointerEvent, Serial};
+use feos_hal::{
+    Audio, Clock, InterruptController, Keyboard, KeyboardEvent, Pointer, PointerEvent, Serial,
+};
 use feos_sync::SpinLock;
 
 /// Human-readable board name, shown by the `info` app.
@@ -134,6 +136,40 @@ pub fn init_pointer() -> Option<PointerKind> {
 pub fn pointer() -> Option<&'static dyn Pointer> {
     if POINTER.lock().is_ready() {
         Some(&BOARD_POINTER)
+    } else {
+        None
+    }
+}
+
+/// The virtio keyboard discovered at boot.
+pub static KEYBOARD: SpinLock<VirtioInput> = SpinLock::new(VirtioInput::new());
+
+struct BoardKeyboard;
+
+impl Keyboard for BoardKeyboard {
+    fn poll(&self) -> Option<KeyboardEvent> {
+        KEYBOARD.lock().poll_key()
+    }
+}
+
+static BOARD_KEYBOARD: BoardKeyboard = BoardKeyboard;
+
+/// Finds and initialises the virtio keyboard, if QEMU provided one.
+pub fn init_keyboard() -> bool {
+    let Some(base) = feos_driver_virtio_input::find_keyboard(
+        VIRTIO_MMIO_BASE,
+        VIRTIO_MMIO_STRIDE,
+        VIRTIO_MMIO_SLOTS,
+    ) else {
+        return false;
+    };
+    KEYBOARD.lock().init(base, 1, 1)
+}
+
+/// Returns the keyboard shared with apps, when one was initialised.
+pub fn keyboard() -> Option<&'static dyn Keyboard> {
+    if KEYBOARD.lock().is_ready() {
+        Some(&BOARD_KEYBOARD)
     } else {
         None
     }

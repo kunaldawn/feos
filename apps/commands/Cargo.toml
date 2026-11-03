@@ -20,3 +20,7 @@ feos-sh = { workspace = true }
 feos-sync = { workspace = true }
 feos-text = { workspace = true }
 feos-video = { workspace = true }
+
+[dev-dependencies]
+feos-bundle = { workspace = true }
+feos-desktop = { workspace = true }
