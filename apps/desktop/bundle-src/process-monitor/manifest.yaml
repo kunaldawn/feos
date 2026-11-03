@@ -1,10 +1,10 @@
 id: process-monitor
-name: Process Monitor
-version: 1.0.0
-entry: ps
+name: Task Manager
+version: 1.1.0
+entry: taskmgr
 category: System
-description: Running processes and service status
+description: Applications, processes, CPU and memory graphs with Windows XP styling
 icon: icon.bmp
 window:
-  width: 520
-  height: 340
+  width: 900
+  height: 620

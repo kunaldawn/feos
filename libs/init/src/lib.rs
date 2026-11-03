@@ -598,8 +598,7 @@ mod tests {
                 out[index] = ProcessInfo {
                     pid,
                     state: ProcessState::Running,
-                    name: [0; feos_app::PROCESS_NAME_MAX],
-                    name_len: 0,
+                    ..ProcessInfo::EMPTY
                 };
             }
             count

@@ -1,7 +1,7 @@
 //! Generic timer access and the scheduler's periodic tick.
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Frequency of the system counter in Hz (from CNTFRQ_EL0).
 pub fn frequency() -> u64 {
@@ -38,6 +38,36 @@ pub fn spin_ms(ms: u64) {
     while ticks().wrapping_sub(start) < delta {
         core::hint::spin_loop();
     }
+}
+
+/// Set before `WFI` so the scheduler can classify the tick as idle.
+static IDLE_HINT: AtomicBool = AtomicBool::new(false);
+
+/// Waits for roughly `ms` milliseconds in a low-power state.
+///
+/// The scheduler's periodic tick wakes the CPU, so this never sleeps longer
+/// than one tick. Each wait marks the current tick as idle, which lets the
+/// task manager distinguish spinning from genuinely waiting work.
+pub fn idle_ms(ms: u64) {
+    let freq = frequency();
+    if freq == 0 {
+        return;
+    }
+
+    let start = ticks();
+    let delta = freq.saturating_mul(ms) / 1000;
+
+    while ticks().wrapping_sub(start) < delta {
+        IDLE_HINT.store(true, Ordering::Relaxed);
+        // SAFETY: `WFI` only suspends execution until an interrupt. The
+        // scheduler's 100 Hz timer guarantees that one arrives promptly.
+        unsafe { asm!("wfi", options(nomem, nostack)) };
+    }
+}
+
+/// Returns and clears the idle hint recorded by [`idle_ms`].
+pub fn take_idle_hint() -> bool {
+    IDLE_HINT.swap(false, Ordering::Relaxed)
 }
 
 /// Period between scheduler ticks, in counter ticks (0 when stopped).

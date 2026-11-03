@@ -17,6 +17,29 @@ use feos_app::{BoardInfo, Platform};
 use feos_arch_aarch64::{cpu, exceptions, irq, timer};
 use feos_board_qemu_virt as board;
 use feos_console::println;
+use feos_hal::{Memory, MemoryInfo};
+
+/// Kernel memory accounting for the task manager.
+struct KernelMemory;
+
+impl Memory for KernelMemory {
+    fn info(&self) -> MemoryInfo {
+        let heap = allocator::stats();
+        let (kernel_start, _) = board::kernel_range();
+        let (_, bss_end) = board::bss_range();
+        let total_bytes = bss_end.saturating_sub(kernel_start);
+        MemoryInfo {
+            total_bytes,
+            used_bytes: total_bytes.saturating_sub(heap.free_bytes),
+            free_bytes: heap.free_bytes,
+            heap_total_bytes: heap.total_bytes,
+            heap_used_bytes: heap.used_bytes,
+            heap_free_bytes: heap.free_bytes,
+        }
+    }
+}
+
+static KERNEL_MEMORY: KernelMemory = KernelMemory;
 
 /// Kernel entry point.
 ///
@@ -100,6 +123,7 @@ pub extern "C" fn kmain(dtb: usize) -> ! {
         audio: audio.as_ref().map(|audio| audio.device),
         pointer: board::pointer(),
         processes: &sched::PROCESSES,
+        memory: Some(&KERNEL_MEMORY),
         apps: &feos_apps::APP_REGISTRY,
         filesystem: Some(board::filesystem()),
     };

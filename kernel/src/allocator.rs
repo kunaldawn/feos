@@ -78,6 +78,27 @@ impl Heap {
         }
     }
 
+    /// Walks the free list and returns `(free_bytes, free_blocks)`.
+    fn free_space(&self) -> (usize, usize) {
+        let mut free = 0usize;
+        let mut blocks = 0usize;
+        let mut current = self.head;
+        let mut guard = 0usize;
+        while current != NONE && guard < HEAP_SIZE / HEADER {
+            guard += 1;
+            // SAFETY: `current` comes from the free list and lies inside the
+            // arena. Links are only written by this allocator.
+            let header = unsafe { read_header(current) };
+            if header.size < HEADER || current.saturating_add(header.size) > HEAP_SIZE {
+                break;
+            }
+            free = free.saturating_add(header.size);
+            blocks += 1;
+            current = header.next;
+        }
+        (free, blocks)
+    }
+
     /// Allocates one aligned block from the free list.
     ///
     /// # Safety
@@ -299,6 +320,32 @@ unsafe fn read_header(offset: usize) -> Header {
 unsafe fn write_header(offset: usize, header: Header) {
     unsafe {
         ptr::write((base() + offset) as *mut Header, header);
+    }
+}
+
+/// A snapshot of the static heap.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Stats {
+    /// Total arena size in bytes.
+    pub total_bytes: usize,
+    /// Bytes owned by live allocations, including headers and padding.
+    pub used_bytes: usize,
+    /// Bytes still on the free list.
+    pub free_bytes: usize,
+    /// Number of free-list entries.
+    pub free_blocks: usize,
+}
+
+/// Returns the current heap usage, initialising the arena if needed.
+pub fn stats() -> Stats {
+    let mut heap = HEAP_LOCK.lock();
+    heap.initialize();
+    let (free, free_blocks) = heap.free_space();
+    Stats {
+        total_bytes: HEAP_SIZE,
+        used_bytes: HEAP_SIZE.saturating_sub(free),
+        free_bytes: free,
+        free_blocks,
     }
 }
 

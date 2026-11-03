@@ -44,6 +44,44 @@ pub trait Clock: Sync {
 
     /// Busy-waits for roughly `ms` milliseconds.
     fn spin_ms(&self, ms: u64);
+
+    /// Waits for roughly `ms` milliseconds without burning CPU time.
+    ///
+    /// Architectures with a `WFI`-style instruction override this; the default
+    /// falls back to the busy-wait so a port still works without idle support.
+    /// The kernel uses the distinction to report real CPU utilisation in the
+    /// task manager: time spent here is accounted as idle.
+    fn idle_ms(&self, ms: u64) {
+        self.spin_ms(ms);
+    }
+}
+
+/// A snapshot of the kernel's memory accounting.
+///
+/// `total_bytes`, `used_bytes` and `free_bytes` describe the whole loaded
+/// system (kernel image, `.bss`, stacks and the heap). The heap-specific
+/// figures let the task manager show commit charge separately from physical
+/// memory.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct MemoryInfo {
+    /// Total memory owned by the loaded system image.
+    pub total_bytes: usize,
+    /// Memory in use by the image, stacks and live heap allocations.
+    pub used_bytes: usize,
+    /// Memory currently available for new work.
+    pub free_bytes: usize,
+    /// Size of the kernel heap arena.
+    pub heap_total_bytes: usize,
+    /// Heap bytes handed out to live allocations.
+    pub heap_used_bytes: usize,
+    /// Heap bytes still on the free list.
+    pub heap_free_bytes: usize,
+}
+
+/// Kernel memory accounting exposed to apps.
+pub trait Memory: Sync {
+    /// Returns a consistent snapshot of the system's memory usage.
+    fn info(&self) -> MemoryInfo;
 }
 
 /// System power control.

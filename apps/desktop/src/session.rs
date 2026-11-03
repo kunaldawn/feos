@@ -162,7 +162,7 @@ pub fn run_session(
         }
 
         input.clear_events();
-        platform.clock.spin_ms(FRAME_MS);
+        platform.clock.idle_ms(FRAME_MS);
     }
 }
 

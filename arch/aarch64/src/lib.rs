@@ -42,6 +42,10 @@ impl Clock for Aarch64 {
     fn spin_ms(&self, ms: u64) {
         timer::spin_ms(ms);
     }
+
+    fn idle_ms(&self, ms: u64) {
+        timer::idle_ms(ms);
+    }
 }
 
 impl Power for Aarch64 {

@@ -138,7 +138,7 @@ init:
   restart: on-failure     # never, on-failure, always
   max_restarts: 3
   autostart:
-    - process-monitor
+    - terminal
 ```
 
 Unknown keys and invalid values keep their defaults, so a newer configuration

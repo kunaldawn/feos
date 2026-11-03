@@ -2460,7 +2460,7 @@ pub fn run(fs: &dyn FileSystem, context: &mut Context<'_>) {
         }
 
         input.clear_events();
-        platform.clock.spin_ms(10);
+        platform.clock.idle_ms(10);
     }
     println!("[player] closed");
 }

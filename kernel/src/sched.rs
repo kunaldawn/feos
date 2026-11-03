@@ -15,8 +15,8 @@ use core::ptr::addr_of;
 use core::ptr::addr_of_mut;
 
 use feos_app::{
-    App, Context, Platform, ProcessInfo, ProcessState, Processes, SpawnError, MAX_PROCESSES,
-    PROCESS_ARGS_MAX, PROCESS_NAME_MAX,
+    App, Context, Platform, ProcessInfo, ProcessState, Processes, SpawnError, SystemInfo,
+    MAX_PROCESSES, PROCESS_ARGS_MAX, PROCESS_NAME_MAX,
 };
 use feos_arch_aarch64::{irq, timer};
 
@@ -31,6 +31,9 @@ const STACK_SIZE: usize = 16 * 1024;
 
 /// Maximum argument string length copied into the process table.
 const ARG_MAX: usize = PROCESS_ARGS_MAX;
+
+/// The single scheduler priority used by the round-robin policy.
+const NORMAL_PRIORITY: u8 = 8;
 
 /// Scheduler-visible lifecycle state.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -59,6 +62,10 @@ struct Task {
     app: Option<&'static dyn App>,
     context: irq::TrapFrame,
     stack: Stack,
+    /// Scheduler ticks consumed by this task.
+    cpu_ticks: u64,
+    /// Uptime when the task was created.
+    started_ms: u64,
 }
 
 impl Task {
@@ -72,6 +79,8 @@ impl Task {
         app: None,
         context: irq::TrapFrame::ZERO,
         stack: Stack([0; STACK_SIZE]),
+        cpu_ticks: 0,
+        started_ms: 0,
     };
 
     fn set_name(&mut self, name: &str) {
@@ -86,6 +95,12 @@ struct Scheduler {
     tasks: [Task; MAX_TASKS],
     current: usize,
     next_pid: u32,
+    /// Timer ticks accounted since boot, including idle ticks.
+    total_ticks: u64,
+    /// Ticks spent in an architecture idle wait.
+    idle_ticks: u64,
+    /// Scheduler frequency in Hz.
+    ticks_per_second: u64,
 }
 
 impl Scheduler {
@@ -96,6 +111,9 @@ impl Scheduler {
             tasks: [Task::EMPTY; MAX_TASKS],
             current: 0,
             next_pid: 0,
+            total_ticks: 0,
+            idle_ticks: 0,
+            ticks_per_second: 100,
         }
     }
 
@@ -148,6 +166,8 @@ pub fn init() {
     shell.state = State::Running;
     shell.pid = 1;
     shell.set_name("shell");
+    shell.cpu_ticks = 0;
+    shell.started_ms = 0;
     scheduler.current = 0;
     scheduler.next_pid = 2;
 }
@@ -160,6 +180,14 @@ pub fn preempt(frame: &mut irq::TrapFrame) {
     // SAFETY: interrupts are masked, so this is the only writer.
     let scheduler = unsafe { &mut *addr_of_mut!(SCHEDULER) };
     let current = scheduler.current;
+
+    // A tick spent inside `WFI` is idle, not CPU time for the current task.
+    scheduler.total_ticks = scheduler.total_ticks.wrapping_add(1);
+    if timer::take_idle_hint() {
+        scheduler.idle_ticks = scheduler.idle_ticks.wrapping_add(1);
+    } else {
+        scheduler.tasks[current].cpu_ticks = scheduler.tasks[current].cpu_ticks.wrapping_add(1);
+    }
 
     scheduler.tasks[current].context = *frame;
     match scheduler.tasks[current].state {
@@ -258,6 +286,8 @@ fn spawn_app(app: &'static dyn App, args: &str) -> Result<u32, SpawnError> {
                 task.args[..args.len()].copy_from_slice(args.as_bytes());
                 task.args_len = args.len();
                 task.app = Some(app);
+                task.cpu_ticks = 0;
+                task.started_ms = platform().clock.uptime_ms();
                 task.context = irq::TrapFrame::new_task(
                     app_entry as *const () as usize,
                     slot,
@@ -330,12 +360,43 @@ fn snapshot(out: &mut [ProcessInfo]) -> usize {
                 },
                 name: task.name,
                 name_len: task.name_len as u8,
+                cpu_ticks: task.cpu_ticks,
+                started_ms: task.started_ms,
+                memory_bytes: STACK_SIZE,
+                threads: 1,
+                priority: NORMAL_PRIORITY,
             };
             count += 1;
         }
     }
     irq::restore(flags);
     count
+}
+
+fn system_info() -> SystemInfo {
+    let flags = irq::save_and_disable();
+    // SAFETY: interrupts are masked for the duration of the read.
+    let info = unsafe {
+        let scheduler = &*addr_of!(SCHEDULER);
+        let mut processes = 0;
+        let mut threads = 0;
+        for task in &scheduler.tasks {
+            if matches!(task.state, State::Ready | State::Running) {
+                processes += 1;
+                threads += 1;
+            }
+        }
+        SystemInfo {
+            uptime_ms: platform().clock.uptime_ms(),
+            total_ticks: scheduler.total_ticks,
+            idle_ticks: scheduler.idle_ticks,
+            ticks_per_second: scheduler.ticks_per_second,
+            processes,
+            threads,
+        }
+    };
+    irq::restore(flags);
+    info
 }
 
 /// Kernel implementation of the process-management platform service.
@@ -357,6 +418,10 @@ impl Processes for ProcessManager {
     fn snapshot(&self, out: &mut [ProcessInfo]) -> usize {
         snapshot(out)
     }
+
+    fn system(&self) -> SystemInfo {
+        system_info()
+    }
 }
 
 /// The process manager installed in [`Platform`].
@@ -366,6 +431,11 @@ pub static PROCESSES: ProcessManager = ProcessManager;
 ///
 /// The interrupt controller and IRQ handler must already be installed.
 pub fn start(tick_hz: u64) {
+    // SAFETY: called once during boot before interrupts are enabled.
+    unsafe {
+        let scheduler = &mut *addr_of_mut!(SCHEDULER);
+        scheduler.ticks_per_second = tick_hz;
+    }
     timer::start_periodic(tick_hz);
     irq::enable();
 }

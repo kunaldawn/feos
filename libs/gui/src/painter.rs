@@ -236,17 +236,63 @@ impl<'a, 'buf> Painter<'a, 'buf> {
     }
 
     /// Draws a soft drop shadow beneath `rect`.
-    pub fn shadow(&mut self, rect: Rect, radius: u32, spread: i32, alpha: u8) {
+    ///
+    /// Only the visible ring outside `rect` is blended: filling the whole
+    /// grown rectangle would touch every pixel under the panel even though
+    /// the caller immediately covers it again. On a 1024x768 window that
+    /// difference is millions of alpha blends per frame.
+    pub fn shadow(&mut self, rect: Rect, _radius: u32, spread: i32, alpha: u8) {
         let spread = spread.max(0);
+        if spread == 0 || alpha == 0 || rect.is_empty() {
+            return;
+        }
         for layer in (1..=3).rev() {
             let grow = spread * layer / 3;
+            if grow == 0 {
+                continue;
+            }
             let shifted = rect.inset(-grow).translate(0, 2 + layer);
-            self.fill_rounded_rect_alpha(
-                shifted,
-                radius.saturating_add(grow as u32),
-                Color::BLACK,
-                alpha / (layer as u8 + 1),
-            );
+            let alpha = alpha / (layer as u8 + 1);
+            if alpha == 0 {
+                continue;
+            }
+
+            let left = (rect.x - shifted.x).max(0) as u32;
+            let right = (shifted.right_i32() - rect.right_i32()).max(0) as u32;
+            let top = (rect.y - shifted.y).max(0) as u32;
+            let bottom = (shifted.bottom_i32() - rect.bottom_i32()).max(0) as u32;
+
+            // Bottom band spans the full shadow width.
+            if bottom > 0 {
+                self.fill_rect_alpha(
+                    Rect::new(shifted.x, rect.bottom_i32(), shifted.width, bottom),
+                    Color::BLACK,
+                    alpha,
+                );
+            }
+            // Top band only exists when the shadow is not fully shifted down.
+            if top > 0 {
+                self.fill_rect_alpha(
+                    Rect::new(shifted.x, shifted.y, shifted.width, top),
+                    Color::BLACK,
+                    alpha,
+                );
+            }
+            // Left and right bands cover the remaining vertical edges.
+            if left > 0 {
+                self.fill_rect_alpha(
+                    Rect::new(shifted.x, rect.y, left, rect.height),
+                    Color::BLACK,
+                    alpha,
+                );
+            }
+            if right > 0 {
+                self.fill_rect_alpha(
+                    Rect::new(rect.right_i32(), rect.y, right, rect.height),
+                    Color::BLACK,
+                    alpha,
+                );
+            }
         }
     }
 
@@ -799,7 +845,9 @@ mod tests {
         let mut painter = Painter::new(&mut canvas);
         painter.shadow(Rect::new(6, 6, 18, 18), 4, 4, 160);
         assert_ne!(canvas.pixel(15, 27), Some(Color::WHITE));
-        assert_ne!(canvas.pixel(15, 15), Some(Color::WHITE));
+        // The shadow only paints the visible ring; the panel covers the
+        // interior, so blending it would be wasted work.
+        assert_eq!(canvas.pixel(15, 15), Some(Color::WHITE));
     }
 
     #[test]

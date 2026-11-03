@@ -24,6 +24,7 @@ pub mod ps;
 pub mod sleep;
 pub mod spawn;
 pub mod splash;
+pub mod taskmgr;
 pub mod tick;
 pub mod tone;
 pub mod ui;
@@ -37,6 +38,7 @@ pub static REGISTRY: &[&dyn App] = &[
     &echo::Echo,
     &info::Info,
     &ps::Ps,
+    &taskmgr::TaskManager,
     &spawn::Spawn,
     &kill::Kill,
     &tick::Tick,
@@ -112,5 +114,14 @@ mod tests {
         assert_eq!(app.name(), "files");
         assert!(app.foreground());
         assert!(find("explorer").is_some());
+    }
+
+    #[test]
+    fn task_manager_is_a_foreground_app() {
+        let app = find("taskmgr").expect("task manager command");
+        assert_eq!(app.name(), "taskmgr");
+        assert!(app.foreground());
+        assert!(find("task-manager").is_some());
+        assert!(find("taskmgr.exe").is_some());
     }
 }

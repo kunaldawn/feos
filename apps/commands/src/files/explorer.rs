@@ -3148,7 +3148,7 @@ pub fn run(fs: &dyn FileSystem, context: &mut Context<'_>) {
         }
 
         input.clear_events();
-        platform.clock.spin_ms(12);
+        platform.clock.idle_ms(12);
     }
     feos_console::println!("[files] explorer closed");
 }

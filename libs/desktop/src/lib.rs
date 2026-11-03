@@ -2313,8 +2313,7 @@ mod tests {
                 out[0] = ProcessInfo {
                     pid: 1,
                     state: ProcessState::Running,
-                    name: [0; feos_app::PROCESS_NAME_MAX],
-                    name_len: 0,
+                    ..ProcessInfo::EMPTY
                 };
                 1
             }

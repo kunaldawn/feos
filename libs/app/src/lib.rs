@@ -19,7 +19,7 @@
 
 use feos_fs::FileSystem;
 use feos_gfx::Canvas;
-use feos_hal::{Audio, Clock, Cpu, Pointer, Power};
+use feos_hal::{Audio, Clock, Cpu, Memory, Pointer, Power};
 
 /// The version shared by every crate in the workspace.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -39,7 +39,7 @@ pub struct BoardInfo {
 }
 
 /// Maximum number of processes the kernel can track at once.
-pub const MAX_PROCESSES: usize = 8;
+pub const MAX_PROCESSES: usize = 16;
 
 /// Maximum length of a process name, in bytes.
 pub const PROCESS_NAME_MAX: usize = 24;
@@ -69,6 +69,20 @@ pub struct ProcessInfo {
     pub name: [u8; PROCESS_NAME_MAX],
     /// Number of valid bytes in `name`.
     pub name_len: u8,
+    /// Scheduler ticks consumed by this process since it was created.
+    ///
+    /// The kernel tick rate is reported by [`SystemInfo::ticks_per_second`],
+    /// so a task manager can turn differences between two snapshots into a
+    /// CPU percentage without knowing the timer frequency.
+    pub cpu_ticks: u64,
+    /// Milliseconds between system start and process creation.
+    pub started_ms: u64,
+    /// Resident stack/process memory charged to this process, in bytes.
+    pub memory_bytes: usize,
+    /// Number of threads in the process (currently always one).
+    pub threads: u16,
+    /// Scheduler priority (currently a single normal priority).
+    pub priority: u8,
 }
 
 impl ProcessInfo {
@@ -78,11 +92,50 @@ impl ProcessInfo {
         state: ProcessState::Exited,
         name: [0; PROCESS_NAME_MAX],
         name_len: 0,
+        cpu_ticks: 0,
+        started_ms: 0,
+        memory_bytes: 0,
+        threads: 0,
+        priority: 0,
     };
 
     /// Returns the process name as a string.
     pub fn name(&self) -> &str {
         core::str::from_utf8(&self.name[..self.name_len as usize]).unwrap_or("?")
+    }
+}
+
+/// System-wide scheduler and process accounting.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct SystemInfo {
+    /// Milliseconds since boot.
+    pub uptime_ms: u64,
+    /// Timer ticks elapsed since boot.
+    pub total_ticks: u64,
+    /// Ticks the CPU spent waiting in an idle instruction.
+    pub idle_ticks: u64,
+    /// Scheduler tick rate in Hz.
+    pub ticks_per_second: u64,
+    /// Number of live processes.
+    pub processes: usize,
+    /// Number of live threads.
+    pub threads: usize,
+}
+
+impl SystemInfo {
+    /// An all-zero snapshot.
+    pub const EMPTY: Self = Self {
+        uptime_ms: 0,
+        total_ticks: 0,
+        idle_ticks: 0,
+        ticks_per_second: 0,
+        processes: 0,
+        threads: 0,
+    };
+
+    /// Returns the busy (non-idle) tick count.
+    pub const fn busy_ticks(&self) -> u64 {
+        self.total_ticks.saturating_sub(self.idle_ticks)
     }
 }
 
@@ -117,6 +170,14 @@ pub trait Processes: Sync {
 
     /// Copies a snapshot of live processes into `out` and returns its length.
     fn snapshot(&self, out: &mut [ProcessInfo]) -> usize;
+
+    /// Returns system-wide scheduler accounting.
+    ///
+    /// The default keeps simple test doubles working; the kernel implements
+    /// real values.
+    fn system(&self) -> SystemInfo {
+        SystemInfo::EMPTY
+    }
 }
 
 /// Services the kernel makes available to every app.
@@ -135,6 +196,8 @@ pub struct Platform {
     pub pointer: Option<&'static dyn Pointer>,
     /// Process creation and inspection.
     pub processes: &'static dyn Processes,
+    /// Kernel memory accounting, when the board provides it.
+    pub memory: Option<&'static dyn Memory>,
     /// Lookup table the desktop and init manager resolve entries through.
     pub apps: &'static dyn AppRegistry,
     /// Read-only filesystem exposed by the board, when it has one.

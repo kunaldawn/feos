@@ -140,6 +140,7 @@ app registry).
     │       ├── files/
     │       │   └── explorer.rs # XP-style explorer UI, input and rendering
     │       ├── player.rs       # VLC-style video player, playlist and dialogs
+    │       ├── taskmgr.rs      # XP-style task manager, graphs and process control
     │       ├── spawn.rs  ps.rs  kill.rs  tick.rs
     │       ├── ui.rs           # splash screen and test card renderer
     │       └── lib.rs          # REGISTRY and find()
@@ -191,7 +192,7 @@ change.
   recoverable IRQ entry that saves and restores a full 800-byte `TrapFrame`
 - GICv2 driver behind an `InterruptController` HAL trait, with Group 0 and the
   timer PPI wired up by the board
-- Preemptive round-robin scheduler: eight process slots, 16 KiB stacks, and a
+- Preemptive round-robin scheduler: sixteen process slots, 16 KiB stacks, and a
   100 Hz generic-timer tick; the shell is PID 1
 - `spawn`, `ps`, `kill`, and `tick` commands for running and inspecting
   background processes
@@ -219,6 +220,14 @@ change.
   playlist, fullscreen mode, aspect modes, speed/frame controls, media
   information, mouse context menus and a static kernel heap for H.264
   playback
+- A Windows XP-style **Task Manager** (`taskmgr`) with Applications,
+  Processes, Performance, Networking and Users tabs; live CPU/memory history
+  graphs; sortable process columns; per-process CPU time, memory, threads and
+  priority; Run, Select Columns, Properties, About, Help and confirmation
+  dialogs; context menus; configurable update speed; and mouse/keyboard control
+- Real scheduler and memory accounting: per-process CPU ticks, idle-tick
+  detection through `WFI`, and a HAL `Memory` service backed by the kernel heap
+  for commit charge, physical memory and kernel-memory panels
 - Foreground app launching: an app can request the full framebuffer from the
   desktop and return to it with Esc
 - `feos-bundle`: single-file `.fapp` applications (ZIP/TAR with manifest and
@@ -376,6 +385,7 @@ default NIC would load.
 | `desktop`     | Run the YAML-configured desktop session (`wm`; `list`, `status`, `run <id>`, `service <action> <id>`) |
 | `files`       | Open the file explorer, or use `ls`, `cat`, `tree` and `stat` (`explorer` alias) |
 | `player`      | Open the VLC-style video player (`vlc`, `video`, `media`, `media-player` aliases) |
+| `taskmgr`     | Open the XP-style Task Manager (`task-manager`, `taskmanager`, `tm` aliases) |
 | `splash`      | Redraw the boot splash                               |
 | `tone [ms]`   | Play an A-major chord for `ms` (default 1500, max 3000; `play` alias) |
 | `uptime`      | Milliseconds since the counter started               |
@@ -392,7 +402,7 @@ default NIC would load.
 
 Processes in feos are **kernel threads**, not isolated user processes: they
 share the kernel address space, all run at EL1, and each has its own 16 KiB
-stack and saved register frame. The process table has eight slots in `.bss`;
+stack and saved register frame. The process table has sixteen slots in `.bss`;
 slot 0 is the shell, which is always PID 1 and is never reused.
 
 The board initializes a GICv2 and enables the EL1 physical timer PPI (IRQ 30).
@@ -631,7 +641,7 @@ feos> desktop list
   files                System         entry=files  Browse, search and preview files with an XP-style explorer
   terminal             System         entry=gui    GUI dashboard and component gallery
   system-info          System         entry=info   Board, CPU, memory and kernel details
-  process-monitor      System         entry=ps     Running processes and service status
+  process-monitor      System         entry=taskmgr Applications, processes, graphs and process control
 feos> desktop run files
 [desktop] launching 'files' in the foreground
 [files] explorer closed
@@ -676,6 +686,47 @@ list is registered when the session starts and ticked once per frame.
 make test-desktop test-desktop-app
 make bundles      # repack apps/desktop/bundle-src/* into apps/desktop/apps/*.fapp
 ```
+
+## The Task Manager
+
+![The feos Task Manager showing the Processes tab](docs/taskmgr.png)
+
+`taskmgr` is a Windows XP-style task manager with five tabs and live data from
+the kernel scheduler and heap:
+
+- **Applications** lists running tasks with End Task, Switch To and New Task.
+- **Processes** shows PID, CPU percentage, CPU time, memory, threads, start
+  time, status and priority. Click a heading to sort; double-click for
+  properties; right-click for the context menu; End Process or Delete ends the
+  selected task.
+- **Performance** draws CPU and memory history graphs on the classic black
+  grid, alongside Totals, Commit Charge, Physical Memory and Kernel Memory
+  panels.
+- **Networking** presents the adapter view; on a board without a network driver
+  it reports a disconnected adapter and a flat graph rather than pretending.
+- **Users** shows the console session.
+
+The File, Options, View and Help menus expose Run, Select Columns, update
+speed (High/Normal/Low/Paused), status-bar and graph toggles, Help and About.
+Dialogs use the Luna title bar and include Run, Select Columns, Process
+Properties, About, Help, End Process and Log Off. The window can be dragged,
+resized, maximised or closed with the mouse.
+
+```text
+feos> taskmgr
+feos> spawn tick 100 200
+feos> taskmgr
+```
+
+The `ps` command remains the serial-console view. The task manager is a
+foreground app, so the desktop opens it from the Start menu or the desktop
+context menu's **Task Manager** item, and `Esc` returns to the desktop.
+
+CPU accounting is real: the scheduler records one tick per process and marks
+ticks spent in the architecture's `WFI` idle wait separately, so an idle
+desktop is quiet while a busy app actually raises the graph. Memory figures
+come from a HAL `Memory` service backed by the kernel's static heap and the
+loaded image ranges.
 
 ## The filesystem and File Explorer
 
