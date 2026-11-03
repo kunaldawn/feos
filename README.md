@@ -6,7 +6,9 @@ exception vectors, talks to the PL011 serial port, brings up a **ramfb**
 framebuffer, draws a splash screen, starts a preemptive round-robin scheduler,
 and opens an interactive **desktop session** where applications can be launched
 with the keyboard. Logging off (or `Ctrl-\` on the serial console) drops into a
-small interactive shell.
+**Bash-compatible terminal** with a writable overlay filesystem, pipelines,
+redirection, job-style background launches and a built-in POSIX coreutils
+library.
 
 Everything can be built and run inside Docker, so the only host requirement is
 Docker.
@@ -107,6 +109,8 @@ app registry).
 │   ├── hal/                    # feos-hal: device + system-service traits
 │   ├── sync/                   # feos-sync: SpinLock and friends
 │   ├── console/                # feos-console: registered console + macros
+│   ├── coreutils/              # feos-coreutils: POSIX utilities + overlay VFS
+│   ├── sh/                     # feos-sh: Bash-compatible shell engine
 │   ├── gfx/                    # feos-gfx: dependency-free 2D graphics
 │   ├── gui/                    # feos-gui: immediate-mode widgets, layout, charts
 │   ├── desktop/                # feos-desktop: YAML desktop, XP taskbar, WM
@@ -134,6 +138,7 @@ app registry).
     ├── commands/               # feos-apps: built-in apps + registry
     │   └── src/
     │       ├── help.rs  echo.rs  info.rs  uptime.rs  sleep.rs
+    │       ├── coreutils.rs    # `coreutils` command/help for the terminal
     │       ├── clear.rs  gfx.rs  splash.rs  tone.rs  power.rs
     │       ├── gui.rs          # feos-gui dashboard demo
     │       ├── files.rs        # file explorer app + ls/cat/tree/stat
@@ -144,7 +149,7 @@ app registry).
     │       ├── spawn.rs  ps.rs  kill.rs  tick.rs
     │       ├── ui.rs           # splash screen and test card renderer
     │       └── lib.rs          # REGISTRY and find()
-    └── shell/                  # feos-shell: line editor + dispatcher
+    └── shell/                  # feos-shell: terminal adapter + app host
         └── src/lib.rs
 ```
 
@@ -196,6 +201,27 @@ change.
   100 Hz generic-timer tick; the shell is PID 1
 - `spawn`, `ps`, `kill`, and `tick` commands for running and inspecting
   background processes
+- **Bash-compatible terminal** (`feos-sh`): quoting and escapes, parameter and
+  command substitution, integer arithmetic, globbing, `&&`/`||`/`;`/`&`
+  lists, multi-stage pipelines, `<`/`>`/`>>`/`2>`/`2>&1` redirection, variables,
+  aliases, `if`/`elif`/`else`, `for`, `while`, `until`, `break`, `continue`,
+  `source`, `eval`, `read`, `history`, and tab completion
+- Interactive line editor: cursor movement, Home/End, history, Ctrl-A/E/U/K/W,
+  Ctrl-L, Ctrl-C, Ctrl-D, reverse history search (Ctrl-R), multi-line
+  continuation for open quotes and substitutions
+- **POSIX coreutils** (`feos-coreutils`): `ls`, `cat`, `echo`, `printf`, `pwd`,
+  `mkdir`, `rmdir`, `rm`, `cp`, `mv`, `touch`, `head`, `tail`, `wc`, `grep`,
+  `sort`, `uniq`, `cut`, `tr`, `seq`, `basename`, `dirname`, `nl`, `rev`,
+  `tac`, `paste`, `tee`, `cmp`, `find`, `stat`, `tree`, `du`, `df`, `env`,
+  `printenv`, `uname`, `whoami`, `id`, `hostname`, `nproc`, `arch`, `uptime`,
+  `free`, `hexdump`/`xxd`, `base64`, `sha256sum`, `test`, `expr`, `true`,
+  `false`, `yes`
+- **Writable overlay VFS**: the compiled-in read-only image is extended with
+  an in-RAM copy-on-write layer, so `mkdir`, `cp`, `mv`, `rm`, `touch` and
+  shell redirection work without a block device; writes never touch the base
+  image
+- `feos-console::write_bytes` for raw binary terminal output (`cat` of a
+  binary file, `hexdump`, and friends)
 - QEMU `ramfb` framebuffer: 1024x768 linear **XRGB8888** in guest RAM
 - `feos-gfx`: a `no_std` 2D library with pixels, rectangles, Bresenham lines,
   circles, gradients, blitting, and an 8x8 bitmap font
@@ -375,10 +401,49 @@ default NIC would load.
 
 ## Shell commands
 
+The serial console is a Bash-compatible terminal, not just a line dispatcher.
+It understands quoting, variables, globs, pipelines, redirection, `&&`/`||`,
+`if`/`for`/`while`, aliases and command substitution. The complete reference is
+in [`docs/terminal.md`](docs/terminal.md).
+
+```text
+feos:/$ ls -l /docs
+-rw-r--r-- 1 feos feos      569 Jan  1 00:00 getting-started.md
+-rw-r--r-- 1 feos feos      546 Jan  1 00:00 filesystem.md
+
+feos:/$ cat /docs/getting-started.md | grep -i build
+feos:/$ mkdir -p /tmp/demo && cp /README.txt /tmp/demo/
+feos:/$ for f in /tmp/demo/*; do echo "$f"; done
+feos:/$ echo "the answer is $((6 * 7))" > /tmp/answer
+feos:/$ cat /tmp/answer
+the answer is 42
+feos:/$ ps | grep shell
+feos:/$ help grep
+```
+
+The utilities live in `feos-coreutils`; the language engine lives in
+`feos-sh`. `apps/shell` only adapts them to the console and the kernel's app
+registry.
+
 | Command       | Description                                          |
 |---------------|------------------------------------------------------|
-| `help`        | List registered apps and their aliases                |
+| `help`        | List apps, shell builtins and coreutils               |
+| `help <cmd>`  | Usage and description for one command                 |
 | `echo <text>` | Print text back                                      |
+| `printf FORMAT [args]` | Formatted output (`%s`, `%d`, `%x`, `%b`, width) |
+| `ls [-la1hRFr] [path]` | List directory contents                    |
+| `cat [-nbsA] [file]` | Concatenate files                            |
+| `pwd`, `cd [dir]` | Print or change the working directory            |
+| `mkdir`, `rmdir`, `rm`, `cp`, `mv`, `touch` | File management   |
+| `head`, `tail`, `wc`, `nl`, `rev`, `tac`, `paste` | Text slicing   |
+| `grep`, `sort`, `uniq`, `cut`, `tr`, `seq` | Text filtering          |
+| `find`, `stat`, `tree`, `du`, `df` | Filesystem inspection            |
+| `tee`, `cmp`, `sha256sum`, `base64`, `hexdump` | Data utilities     |
+| `test`, `expr`, `true`, `false` | Conditionals and arithmetic      |
+| `env`, `printenv`, `uname`, `whoami`, `id`, `hostname`, `nproc`, `arch`, `uptime`, `free` | System facts |
+| `coreutils [cmd]` | List or describe the POSIX utilities             |
+| `terminal`    | Open the Bash-compatible terminal window (`term`, `xterm`) |
+| `sh [script]`, `bash` | Start a nested shell or run a script        |
 | `info`        | Board, exception level, MIDR, timer, memory, display, audio |
 | `gfx`         | Draw the graphics test card (`demo` is an alias)     |
 | `gui`         | Draw the feos-gui dashboard and component gallery (`dashboard`) |

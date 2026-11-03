@@ -1,0 +1,9 @@
+[package]
+name = "feos-coreutils"
+description = "POSIX-style core utilities for the feos shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+feos-fs = { workspace = true }

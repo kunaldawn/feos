@@ -1,0 +1,11 @@
+[package]
+name = "feos-sh"
+description = "Bash-compatible shell language for feos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+feos-console = { workspace = true }
+feos-coreutils = { workspace = true }
+feos-fs = { workspace = true }

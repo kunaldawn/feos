@@ -11,6 +11,7 @@
 extern crate alloc;
 
 pub mod clear;
+pub mod coreutils;
 pub mod echo;
 pub mod files;
 pub mod gfx;
@@ -25,6 +26,7 @@ pub mod sleep;
 pub mod spawn;
 pub mod splash;
 pub mod taskmgr;
+pub mod terminal;
 pub mod tick;
 pub mod tone;
 pub mod ui;
@@ -35,6 +37,8 @@ use feos_app::App;
 /// Every app the shell knows about, in `help` order.
 pub static REGISTRY: &[&dyn App] = &[
     &help::Help,
+    &coreutils::CoreUtils,
+    &terminal::Terminal,
     &echo::Echo,
     &info::Info,
     &ps::Ps,

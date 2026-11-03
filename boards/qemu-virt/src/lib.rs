@@ -176,11 +176,21 @@ pub fn back_buffer() -> Option<Canvas<'static>> {
 pub fn init_console() {
     UART0.init();
     feos_console::set_writer(console_writer);
+    feos_console::set_byte_writer(console_byte_writer);
     feos_console::set_reader(console_reader);
 }
 
 fn console_writer(text: &str) {
     UART0.write_terminal(text);
+}
+
+fn console_byte_writer(bytes: &[u8]) {
+    for &byte in bytes {
+        if byte == b'\n' {
+            UART0.write_byte(b'\r');
+        }
+        UART0.write_byte(byte);
+    }
 }
 
 fn console_reader() -> Option<u8> {

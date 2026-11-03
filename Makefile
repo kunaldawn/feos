@@ -32,6 +32,7 @@ FEOS_DISPLAY ?= gtk
 .PHONY: all build check run clean test test-gfx test-gui test-audio test-sync \
         test-json test-yaml test-image test-audio-codec test-compress test-archive \
         test-h264 test-video test-text test-bundle test-init test-fs test-keys \
+        test-coreutils test-sh \
         test-desktop test-desktop-app test-virtio-input \
         bundles audio-demo docker-build docker-run docker-run-vnc docker-audio docker-shell
 
@@ -49,7 +50,7 @@ run: build
 	mkdir -p target/audio
 	$(QEMU) $(QEMU_FLAGS) -display $(QEMU_DISPLAY) -kernel $(KERNEL)
 
-test: test-gfx test-gui test-audio test-sync test-json test-yaml test-image test-audio-codec test-compress test-archive test-h264 test-video test-text test-bundle test-init test-fs test-keys test-desktop test-desktop-app test-virtio-input
+test: test-gfx test-gui test-audio test-sync test-json test-yaml test-image test-audio-codec test-compress test-archive test-h264 test-video test-text test-bundle test-init test-fs test-keys test-coreutils test-sh test-desktop test-desktop-app test-virtio-input
 
 # Host-side tests. Architecture and board crates contain AArch64 assembly or
 # MMIO, so the test set is explicit rather than `--workspace`.
@@ -103,6 +104,12 @@ test-fs:
 
 test-keys:
 	cargo test -p feos-keys --target x86_64-unknown-linux-gnu
+
+test-coreutils:
+	cargo test -p feos-coreutils --target x86_64-unknown-linux-gnu
+
+test-sh:
+	cargo test -p feos-sh --target x86_64-unknown-linux-gnu
 
 test-desktop:
 	cargo test -p feos-desktop --target x86_64-unknown-linux-gnu

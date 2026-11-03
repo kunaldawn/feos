@@ -1,9 +1,9 @@
 id: terminal
 name: Terminal
 version: 1.0.0
-entry: gui
+entry: terminal
 category: System
-description: GUI dashboard and component gallery
+description: Bash-compatible shell with POSIX core utilities
 icon: icon.bmp
 window:
   width: 760

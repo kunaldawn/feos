@@ -24,5 +24,15 @@ impl App for Help {
         for app in crate::REGISTRY {
             println!("  {:<20} {}", app.usage(), app.description());
         }
+
+        println!();
+        println!("terminal commands:");
+        for spec in feos_coreutils::COMMANDS {
+            println!("  {:<20} {}", spec.usage, spec.description);
+        }
+        println!(
+            "  {:<20} {}",
+            "cd, export, unset", "shell builtins (see 'help <name>')"
+        );
     }
 }

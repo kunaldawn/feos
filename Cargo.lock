@@ -19,12 +19,14 @@ dependencies = [
  "feos-app",
  "feos-audio",
  "feos-console",
+ "feos-coreutils",
  "feos-desktop-app",
  "feos-fs",
  "feos-gfx",
  "feos-gui",
  "feos-hal",
  "feos-keys",
+ "feos-sh",
  "feos-sync",
  "feos-text",
  "feos-video",
@@ -90,6 +92,13 @@ name = "feos-console"
 version = "0.1.0"
 dependencies = [
  "feos-sync",
+]
+
+[[package]]
+name = "feos-coreutils"
+version = "0.1.0"
+dependencies = [
+ "feos-fs",
 ]
 
 [[package]]
@@ -233,13 +242,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "feos-sh"
+version = "0.1.0"
+dependencies = [
+ "feos-console",
+ "feos-coreutils",
+ "feos-fs",
+]
+
+[[package]]
 name = "feos-shell"
 version = "0.1.0"
 dependencies = [
  "feos-app",
  "feos-apps",
  "feos-console",
+ "feos-coreutils",
  "feos-gfx",
+ "feos-sh",
 ]
 
 [[package]]

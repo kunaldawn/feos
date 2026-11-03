@@ -1,84 +1,168 @@
-//! A minimal line-oriented serial shell.
+//! The FEOS terminal.
 //!
-//! The shell owns line editing and dispatch, not the commands themselves. It
-//! reads from the registered console and looks commands up in the app registry
-//! (`feos-apps`), so adding a command never touches this crate.
+//! This crate is a thin adapter between the Bash-compatible `feos-sh` engine
+//! and the kernel's app registry. The engine owns parsing, expansion, builtins
+//! and line editing; this file supplies console streams, the external-command
+//! host, and the platform facts used by the system utilities.
 
 #![no_std]
 
+extern crate alloc;
+
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use feos_app::{Context, Platform};
-use feos_console::{print, println, read_byte};
+use feos_coreutils::{MemoryInfo as CoreMemoryInfo, System as CoreSystem};
 use feos_gfx::Canvas;
+use feos_sh::{ConsoleInput, ConsoleOutput, Host, Io, Shell};
 
-const MAX_LINE: usize = 128;
-const PROMPT: &str = "feos> ";
+struct PlatformSystem<'a> {
+    platform: &'a Platform,
+}
 
-/// Reads and executes commands forever.
-pub fn run(mut display: Option<Canvas<'static>>, platform: &Platform) -> ! {
-    let mut line = [0u8; MAX_LINE];
-    let mut len = 0usize;
+impl CoreSystem for PlatformSystem<'_> {
+    fn sysname(&self) -> &'static str {
+        "FEOS"
+    }
 
-    print!("{PROMPT}");
+    fn nodename(&self) -> &'static str {
+        "feos"
+    }
 
-    loop {
-        let Some(byte) = read_byte() else {
-            core::hint::spin_loop();
-            continue;
-        };
+    fn release(&self) -> &'static str {
+        feos_app::VERSION
+    }
 
-        match byte {
-            b'\r' | b'\n' => {
-                println!();
-                if len > 0 {
-                    let text = core::str::from_utf8(&line[..len]).unwrap_or("");
-                    execute(text.trim(), &mut display, platform);
-                }
-                len = 0;
-                print!("{PROMPT}");
+    fn version(&self) -> &'static str {
+        "feos"
+    }
+
+    fn machine(&self) -> &'static str {
+        "aarch64"
+    }
+
+    fn username(&self) -> &'static str {
+        "feos"
+    }
+
+    fn uid(&self) -> u32 {
+        1000
+    }
+
+    fn gid(&self) -> u32 {
+        1000
+    }
+
+    fn uptime_ms(&self) -> u64 {
+        self.platform.clock.uptime_ms()
+    }
+
+    fn clock_hz(&self) -> u64 {
+        self.platform.clock.frequency()
+    }
+
+    fn cpu_count(&self) -> usize {
+        1
+    }
+
+    fn pid(&self) -> u32 {
+        self.platform.processes.current()
+    }
+
+    fn memory(&self) -> Option<CoreMemoryInfo> {
+        self.platform.memory.map(|memory| {
+            let info = memory.info();
+            CoreMemoryInfo {
+                total: info.total_bytes,
+                used: info.used_bytes,
+                free: info.free_bytes,
             }
-            0x7f | 0x08 => {
-                if len > 0 {
-                    len -= 1;
-                    print!("\x08 \x08");
-                }
-            }
-            0x03 => {
-                // Ctrl-C: discard the current line.
-                println!("^C");
-                len = 0;
-                print!("{PROMPT}");
-            }
-            b if (b.is_ascii_graphic() || b == b' ') && len < MAX_LINE => {
-                line[len] = b;
-                len += 1;
-                print!("{}", b as char);
-            }
-            _ => {}
-        }
+        })
     }
 }
 
-fn execute(line: &str, display: &mut Option<Canvas<'static>>, platform: &Platform) {
-    let mut parts = line.splitn(2, ' ');
-    let command = parts.next().unwrap_or("");
-    let args = parts.next().unwrap_or("").trim();
+struct AppHost<'a> {
+    platform: &'a Platform,
+    display: &'a mut Option<Canvas<'static>>,
+}
 
-    if command.is_empty() {
-        return;
+impl Host for AppHost<'_> {
+    fn run_external(
+        &mut self,
+        name: &str,
+        args: &[String],
+        _stdin: &mut dyn feos_coreutils::Input,
+        _stdout: &mut dyn feos_coreutils::Output,
+        _stderr: &mut dyn feos_coreutils::Output,
+        background: bool,
+    ) -> Option<i32> {
+        let app = feos_apps::find(name)?;
+        let args_text = args.join(" ");
+
+        if background {
+            return Some(match self.platform.processes.spawn(app, &args_text) {
+                Ok(pid) => {
+                    feos_console::println!("[shell] {name} started as PID {pid}");
+                    0
+                }
+                Err(feos_app::SpawnError::NoFreeSlot) => {
+                    feos_console::println!("[shell] {name}: no free process slot");
+                    1
+                }
+                Err(feos_app::SpawnError::ArgsTooLong) => {
+                    feos_console::println!("[shell] {name}: arguments too long");
+                    1
+                }
+            });
+        }
+
+        let mut context = Context {
+            args: &args_text,
+            display: self.display,
+            viewport: None,
+            suspend: None,
+            suspend_area: None,
+            platform: self.platform,
+        };
+        app.run(&mut context);
+        Some(0)
     }
 
-    match feos_apps::find(command) {
-        Some(app) => {
-            let mut context = Context {
-                args,
-                display,
-                viewport: None,
-                suspend: None,
-                suspend_area: None,
-                platform,
-            };
-            app.run(&mut context);
+    fn command_names(&self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        for app in feos_apps::REGISTRY {
+            names.push(app.name());
+            names.extend(app.aliases().iter().copied());
         }
-        None => println!("unknown command: {command} (type 'help')"),
+        names
+    }
+}
+
+/// Runs the terminal forever.
+///
+/// The shell is PID 1, so reaching end-of-file (Ctrl-D) or typing `exit` does
+/// not return control to a kernel: it simply starts a fresh prompt.
+pub fn run(display: Option<Canvas<'static>>, platform: &Platform) -> ! {
+    let mut display = display;
+    let system = PlatformSystem { platform };
+    let mut shell = Shell::new(platform.filesystem, &system);
+    let mut host = AppHost {
+        platform,
+        display: &mut display,
+    };
+
+    let mut stdin = ConsoleInput;
+    let mut stdout = ConsoleOutput;
+    let mut stderr = ConsoleOutput;
+
+    loop {
+        let mut io = Io {
+            stdin: &mut stdin,
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        feos_sh::interactive(&mut shell, &mut host, &mut io);
+        feos_console::println!("[shell] starting a fresh prompt (the serial shell is PID 1)");
     }
 }

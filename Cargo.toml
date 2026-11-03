@@ -28,6 +28,7 @@ feos-board-qemu-virt = { path = "boards/qemu-virt" }
 feos-bundle = { path = "libs/bundle" }
 feos-compress = { path = "libs/compress" }
 feos-console = { path = "libs/console" }
+feos-coreutils = { path = "libs/coreutils" }
 feos-desktop = { path = "libs/desktop" }
 feos-desktop-app = { path = "apps/desktop" }
 feos-driver-fw-cfg = { path = "drivers/firmware/fw-cfg" }
@@ -46,6 +47,7 @@ feos-image = { path = "libs/image" }
 feos-init = { path = "libs/init" }
 feos-json = { path = "libs/json" }
 feos-keys = { path = "libs/keys" }
+feos-sh = { path = "libs/sh" }
 feos-shell = { path = "apps/shell" }
 feos-sync = { path = "libs/sync" }
 feos-text = { path = "libs/text" }
