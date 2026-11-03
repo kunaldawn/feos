@@ -224,6 +224,11 @@ change.
   image
 - `feos-console::write_bytes` for raw binary terminal output (`cat` of a
   binary file, `hexdump`, and friends)
+- **FEOS-DOS** (`feos-dosbox`): an original 8086/80186 virtual machine with
+  1 MiB of memory, VGA 80x25 text mode, the CP437 character set, BIOS
+  `INT 10h`/`16h`/`1Ah` services, a DOS `INT 21h` kernel, a writable RAM drive
+  and a `COMMAND.COM`-style prompt that runs real `.COM` and `.EXE` programs
+  from the desktop or the serial shell
 - QEMU `ramfb` framebuffer: 1024x768 linear **XRGB8888** in guest RAM
 - `feos-gfx`: a `no_std` 2D library with pixels, rectangles, Bresenham lines,
   circles, gradients, blitting, and an 8x8 bitmap font
@@ -762,6 +767,63 @@ list is registered when the session starts and ticked once per frame.
 make test-desktop test-desktop-app
 make bundles      # repack apps/desktop/bundle-src/* into apps/desktop/apps/*.fapp
 ```
+
+## FEOS-DOS
+
+![FEOS-DOS in the desktop](docs/dosbox-window.png)
+
+`feos-dosbox` (in `libs/dosbox/`) is FEOS's own DOS box: an original,
+dependency-free `no_std` implementation of the PC that a DOS program expects.
+Open **FEOS-DOS** from the Start menu, or run `dosbox` from the serial shell.
+
+It provides:
+
+- an 8086/80186 CPU interpreter with the full integer instruction set,
+  segmentation, flags, interrupts and `REP` string operations, plus an x87
+  FPU with the common arithmetic, load/store, comparison, BCD and control
+  instructions;
+- 1 MiB of conventional memory, the interrupt vector table and the BIOS data
+  area;
+- an 80x25 VGA text adapter with the CP437 box-drawing and block characters,
+  plus VGA mode 13h (320x200, 256 colours), CGA modes 4/5/6 and EGA/VGA planar
+  modes with the graphics-controller registers and DAC palette;
+- BIOS `INT 10h` video, `INT 16h` keyboard, `INT 1Ah` clock, `INT 33h` mouse,
+  equipment/memory calls and honest "not present" answers for disks, serial
+  and printer;
+- a DOS kernel with a writable `C:` RAM drive, handles, a DTA, file search,
+  memory allocation and the `INT 21h` calls a text-mode program needs;
+- OPL2/OPL3 FM synthesis on the AdLib/Sound Blaster ports, a PC speaker BEL
+  beep, and stereo mixing through `feos_hal::Audio`;
+- `MOUNT` of per-game ZIPs, `SCREEN` BMP screenshots, and `SAVESTATE` /
+  `LOADSTATE` machine snapshots;
+- a `COMMAND.COM`-style prompt with `DIR`, `CD`, `TYPE`, `COPY`, `DEL`, `REN`,
+  `MD`, `RD`, `CLS`, `ECHO`, `PROMPT`, `VER`, `MEM`, `VOL`, `DATE`, `TIME`,
+  `MOUNT`, `GAMES`, `SCREEN`, `HELP`, `ABOUT`, `DEMO`, `RUN` and `EXIT`, plus
+  batch files;
+- real `.COM` and `.EXE` loading: `HELLO.COM` and `BOX.COM` are assembled by
+  hand and exercise the CPU, DOS and VGA paths end to end.
+
+`C:` is a RAM drive, so DOS programs can create and change files without
+touching the read-only host image. `MOUNT WOLF3D` imports a directory from the
+board's filesystem on demand; `GAMES` lists the shipped game image and `SCREEN`
+writes a BMP screenshot to `C:\SCREEN.BMP`. Full reference:
+[`docs/dosbox.md`](docs/dosbox.md), with the full rust-dos comparison in
+[`docs/dosbox-gap.md`](docs/dosbox-gap.md).
+
+The repository includes a 64 MiB exFAT image at `data/games/dos.img` with 13
+shareware, demo and freeware DOS games from DOSGames.com, one ZIP per title.
+`make games-image` links it as the QEMU board's optional disk, and `MOUNT`
+extracts one ZIP at a time so it fits the kernel heap.
+
+Graphics hardware and the CPU paths are in place, but **none of the 13 titles
+has been validated as playable end to end yet**. The image mounts, `GAMES`
+lists it, `MOUNT` imports a title and `DIR` shows its files; Wolfenstein 3D
+decompresses and reaches its self-relocation stub, which still needs loader
+work. The DOS/4GW, DOS/4G, DJGPP and CWSDPMI games additionally need 386
+protected mode and DOS extenders. Transcendental x87 instructions, Sound
+Blaster DSP/DMA, GUS/MT-32/MIDI, networking and video/GIF recording are not
+implemented; OPL2/OPL3 FM, the PC speaker BEL beep, mouse, screenshots and save
+states are. `ABOUT` in the guest says the same thing.
 
 ## The Task Manager
 

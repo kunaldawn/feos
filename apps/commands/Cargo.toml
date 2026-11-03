@@ -11,6 +11,7 @@ feos-audio = { workspace = true }
 feos-console = { workspace = true }
 feos-coreutils = { workspace = true }
 feos-desktop-app = { workspace = true }
+feos-dosbox-app = { workspace = true }
 feos-fs = { workspace = true }
 feos-gfx = { workspace = true }
 feos-gui = { workspace = true }

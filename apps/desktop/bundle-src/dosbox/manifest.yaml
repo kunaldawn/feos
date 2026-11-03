@@ -1,0 +1,10 @@
+id: dosbox
+name: FEOS-DOS
+version: 1.0.0
+entry: dosbox
+category: System
+description: Run the FEOS-DOS 8086 virtual machine and DOS prompt
+icon: icon.bmp
+window:
+  width: 720
+  height: 500

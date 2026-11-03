@@ -58,6 +58,7 @@ pub static REGISTRY: &[&dyn App] = &[
     &power::PowerOff,
     &power::Reboot,
     &feos_desktop_app::DesktopApp,
+    &feos_dosbox_app::DosBoxApp,
 ];
 
 /// Finds an app by primary name or alias.

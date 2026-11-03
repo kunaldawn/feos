@@ -23,6 +23,7 @@ dependencies = [
  "feos-coreutils",
  "feos-desktop",
  "feos-desktop-app",
+ "feos-dosbox-app",
  "feos-fs",
  "feos-gfx",
  "feos-gui",
@@ -126,6 +127,29 @@ dependencies = [
  "feos-app",
  "feos-console",
  "feos-desktop",
+ "feos-gfx",
+ "feos-gui",
+ "feos-hal",
+ "feos-keys",
+ "feos-sync",
+]
+
+[[package]]
+name = "feos-dosbox"
+version = "0.1.0"
+dependencies = [
+ "feos-archive",
+ "feos-fs",
+ "feos-gfx",
+]
+
+[[package]]
+name = "feos-dosbox-app"
+version = "0.1.0"
+dependencies = [
+ "feos-app",
+ "feos-console",
+ "feos-dosbox",
  "feos-gfx",
  "feos-gui",
  "feos-hal",

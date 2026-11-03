@@ -4,6 +4,7 @@ PROFILE      ?= release
 KERNEL       := target/$(TARGET)/$(PROFILE)/feos
 QEMU         ?= qemu-system-aarch64
 QEMU_DISPLAY ?= vnc=127.0.0.1:0
+QEMU_MEM     ?= 128M
 
 # PulseAudio/PipeWire socket, used for live sound when it exists.
 PULSE_SOCKET ?= /run/user/$(shell id -u)/pulse/native
@@ -24,7 +25,7 @@ endif
 AUDIO_FLAGS  ?= -audiodev $(AUDIODEV) -device intel-hda -device hda-output,audiodev=snd0
 POINTER_FLAGS ?= -device virtio-tablet-device
 KEYBOARD_FLAGS ?= -device virtio-keyboard-device
-QEMU_FLAGS   ?= -machine virt -cpu cortex-a53 -smp 1 -m 128M -net none -device ramfb $(POINTER_FLAGS) $(KEYBOARD_FLAGS) $(AUDIO_FLAGS) -serial mon:stdio
+QEMU_FLAGS   ?= -machine virt -cpu cortex-a53 -smp 1 -m $(QEMU_MEM) -net none -device ramfb $(POINTER_FLAGS) $(KEYBOARD_FLAGS) $(AUDIO_FLAGS) -serial mon:stdio
 
 # Display backend used by `make docker-run`. "gtk" opens a QEMU window on the
 # host through X11/XWayland; "vnc=0.0.0.0:0" serves the display over VNC.
@@ -34,8 +35,8 @@ FEOS_DISPLAY ?= gtk
         test-json test-yaml test-image test-audio-codec test-compress test-archive \
         test-h264 test-video test-text test-bundle test-init test-fs test-keys \
         test-coreutils test-sh \
-        test-desktop test-desktop-app test-virtio-input \
-        bundles audio-demo docker-build docker-run docker-run-vnc docker-audio docker-shell
+        test-desktop test-desktop-app test-virtio-input test-dosbox \
+        bundles games-image games-check run-games audio-demo docker-build docker-run docker-run-vnc docker-audio docker-shell
 
 all: build
 
@@ -51,7 +52,7 @@ run: build
 	mkdir -p target/audio
 	$(QEMU) $(QEMU_FLAGS) -display $(QEMU_DISPLAY) -kernel $(KERNEL)
 
-test: test-gfx test-gui test-audio test-sync test-json test-yaml test-image test-audio-codec test-compress test-archive test-h264 test-video test-text test-bundle test-init test-fs test-keys test-coreutils test-sh test-desktop test-desktop-app test-virtio-input
+test: test-gfx test-gui test-audio test-sync test-json test-yaml test-image test-audio-codec test-compress test-archive test-h264 test-video test-text test-bundle test-init test-fs test-keys test-coreutils test-sh test-desktop test-desktop-app test-virtio-input test-dosbox
 
 # Host-side tests. Architecture and board crates contain AArch64 assembly or
 # MMIO, so the test set is explicit rather than `--workspace`.
@@ -120,6 +121,27 @@ test-desktop-app:
 
 test-virtio-input:
 	cargo test -p feos-driver-virtio-input --target x86_64-unknown-linux-gnu
+
+test-dosbox:
+	cargo test -p feos-dosbox --target x86_64-unknown-linux-gnu
+
+# Links the 256 MiB exFAT game image as the QEMU board's optional disk. The
+# board's build script embeds it, so run `make build` afterwards. Importing a
+# game into C: at run time is `MOUNT <dir>` inside FEOS-DOS.
+GAMES_IMAGE ?= data/games/dos.img
+games-image:
+	ln -sfn ../../$(GAMES_IMAGE) boards/qemu-virt/disk-exfat.img
+	@echo "linked boards/qemu-virt/disk-exfat.img -> $(GAMES_IMAGE); run make build"
+
+games-check:
+	fsck.exfat -n $(GAMES_IMAGE)
+
+# The 256 MiB image is linked into the kernel, so the guest needs more than
+# the default 128 MiB of RAM. This target builds and boots with 512 MiB.
+run-games: QEMU_MEM = 512M
+run-games: games-image build
+	mkdir -p target/audio
+	$(QEMU) $(QEMU_FLAGS) -display $(QEMU_DISPLAY) -kernel $(KERNEL)
 
 # Repacks every bundle source directory into apps/desktop/apps. The desktop's
 # build script picks up whatever is in that folder, so adding an app is:

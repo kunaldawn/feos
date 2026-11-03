@@ -1,0 +1,14 @@
+[package]
+name = "feos-dosbox"
+description = "FEOS-DOS: a no_std x86 virtual machine and DOS prompt for feos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+stereo-ext = []
+
+[dependencies]
+feos-archive = { workspace = true }
+feos-fs = { workspace = true }
+feos-gfx = { workspace = true }
