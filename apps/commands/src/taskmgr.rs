@@ -366,11 +366,53 @@ enum Dialog {
     LogOff,
 }
 
+/// The edge or corner used to resize the task manager window.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResizeEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl ResizeEdge {
+    const fn moves_left(self) -> bool {
+        matches!(self, Self::Left | Self::TopLeft | Self::BottomLeft)
+    }
+
+    const fn moves_right(self) -> bool {
+        matches!(self, Self::Right | Self::TopRight | Self::BottomRight)
+    }
+
+    const fn moves_top(self) -> bool {
+        matches!(self, Self::Top | Self::TopLeft | Self::TopRight)
+    }
+
+    const fn moves_bottom(self) -> bool {
+        matches!(self, Self::Bottom | Self::BottomLeft | Self::BottomRight)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DragMode {
     None,
-    Move { dx: i32, dy: i32 },
-    Resize { width: i32, height: i32 },
+    Move {
+        dx: i32,
+        dy: i32,
+    },
+    Resize {
+        edge: ResizeEdge,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        pointer_x: i32,
+        pointer_y: i32,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -1276,31 +1318,10 @@ fn dialog_button_rect(panel: Rect, index: usize, total: usize) -> Rect {
 // Run loop
 // ---------------------------------------------------------------------------
 
-const CURSOR_WIDTH: i32 = 12;
-const CURSOR_HEIGHT: i32 = 19;
-const CURSOR_PIXELS: usize = (CURSOR_WIDTH * CURSOR_HEIGHT) as usize;
-
-const CURSOR_PATTERN: [&str; CURSOR_HEIGHT as usize] = [
-    "X           ",
-    "XX          ",
-    "X.X         ",
-    "X..X        ",
-    "X...X       ",
-    "X....X      ",
-    "X.....X     ",
-    "X......X    ",
-    "X.......X   ",
-    "X........X  ",
-    "X.....XXXXX ",
-    "X..X..X     ",
-    "X.X X..X    ",
-    "XX  X..X    ",
-    "X    X..X   ",
-    "     X..X   ",
-    "      X..X  ",
-    "      X..X  ",
-    "       XX   ",
-];
+/// Pixels saved around the pointer so the cursor can be restored. The box is
+/// large enough for both the arrow and the wider resize cursors.
+const CURSOR_BOX: i32 = 21;
+const CURSOR_PIXELS: usize = 24 * 24;
 
 /// A hardware cursor composited directly onto the front buffer.
 ///
@@ -1344,16 +1365,16 @@ impl Cursor {
         self.saved = false;
     }
 
-    fn move_to(&mut self, canvas: &mut Canvas<'_>, pointer: Point) {
+    fn move_to(&mut self, canvas: &mut Canvas<'_>, pointer: Point, shape: feos_gui::CursorShape) {
         self.restore(canvas);
         let bounds = Rect::new(0, 0, canvas.width() as u32, canvas.height() as u32);
-        let rect = Rect::new(
-            pointer.x,
-            pointer.y,
-            CURSOR_WIDTH as u32,
-            CURSOR_HEIGHT as u32,
-        )
-        .clipped_to(bounds);
+        // The arrow grows right/down from its tip; resize cursors are centred.
+        let origin = match shape {
+            feos_gui::CursorShape::Arrow => pointer,
+            _ => Point::new(pointer.x - 10, pointer.y - 10),
+        };
+        let rect =
+            Rect::new(origin.x, origin.y, CURSOR_BOX as u32, CURSOR_BOX as u32).clipped_to(bounds);
         if rect.is_empty() {
             return;
         }
@@ -1370,40 +1391,54 @@ impl Cursor {
         self.rect = rect;
         self.saved = true;
 
-        for (row, line) in CURSOR_PATTERN.iter().enumerate() {
-            for (column, pixel) in line.bytes().enumerate() {
-                let color = match pixel {
-                    b'X' => Color::BLACK,
-                    b'.' => Color::WHITE,
-                    _ => continue,
-                };
-                let x = pointer.x + column as i32;
-                let y = pointer.y + row as i32;
-                if rect.contains(Point::new(x, y)) {
-                    canvas.put_pixel(x, y, color);
-                }
-            }
-        }
+        let mut painter = Painter::new(canvas);
+        feos_gui::draw_cursor_shape(&mut painter, pointer.x, pointer.y, shape);
     }
+}
+
+fn state_cursor_shape(state: &State) -> feos_gui::CursorShape {
+    if state.menu.is_some()
+        || state.context.is_some()
+        || state.dialog != Dialog::None
+        || state.maximized
+    {
+        return feos_gui::CursorShape::Arrow;
+    }
+    let window = Rect::new(
+        state.window_x,
+        state.window_y,
+        state.window_w.max(1) as u32,
+        state.window_h.max(1) as u32,
+    );
+    resize_edge_at(window, state.pointer)
+        .map(resize_cursor)
+        .unwrap_or(feos_gui::CursorShape::Arrow)
 }
 
 fn run(context: &mut Context<'_>) {
     let platform = context.platform;
+    let suspend = context.suspend;
+    let suspend_area = context.suspend_area;
     let Some(display) = context.display.as_mut() else {
         println!("taskmgr: no framebuffer; run 'ps' from the serial shell instead");
         return;
     };
 
-    let screen = Rect::new(0, 0, display.width() as u32, display.height() as u32);
+    let full = Rect::new(0, 0, display.width() as u32, display.height() as u32);
+    let view = context.viewport.unwrap_or(full).clipped_to(full);
+    if view.is_empty() {
+        return;
+    }
+    let screen = Rect::new(0, 0, view.width, view.height);
     let mut state = State::new(screen);
     state.has_pointer = platform.pointer.is_some();
     if let Some(pointer) = platform.pointer {
         let (x, y) = pointer.position();
-        state.pointer = Point::new(x as i32, y as i32);
+        state.pointer = Point::new(x as i32 - view.x, y as i32 - view.y);
     }
 
-    let width = display.width();
-    let height = display.height();
+    let width = view.width as usize;
+    let height = view.height as usize;
     let mut back_pixels = vec![0u32; width * height];
     let mut back = Canvas::new(&mut back_pixels, width, height, width);
 
@@ -1420,6 +1455,7 @@ fn run(context: &mut Context<'_>) {
         &mut state,
         platform.clock.uptime_ms(),
         &mut cursor,
+        view,
     );
 
     loop {
@@ -1430,12 +1466,22 @@ fn run(context: &mut Context<'_>) {
 
         let mut pointer_full = false;
         let mut cursor_only = false;
+        let mut suspend_requested = false;
         if let Some(pointer) = platform.pointer {
             let mut budget = 32;
             while budget > 0 {
-                let Some(report) = pointer.poll() else {
+                let Some(mut report) = pointer.poll() else {
                     break;
                 };
+                if let (Some(cell), Some(area), Some(true)) = (suspend, suspend_area, report.left) {
+                    if area.contains(Point::new(report.x as i32, report.y as i32)) {
+                        cell.set(true);
+                        suspend_requested = true;
+                        break;
+                    }
+                }
+                report.x = report.x.saturating_sub(view.x as u16);
+                report.y = report.y.saturating_sub(view.y as u16);
                 let interactive = report.left.is_some()
                     || report.right.is_some()
                     || report.middle.is_some()
@@ -1454,6 +1500,9 @@ fn run(context: &mut Context<'_>) {
                 }
                 budget -= 1;
             }
+        }
+        if suspend_requested {
+            break;
         }
 
         let input_changed = !input.is_empty();
@@ -1497,10 +1546,21 @@ fn run(context: &mut Context<'_>) {
                 &mut state,
                 now,
                 &mut cursor,
+                view,
             );
             dirty = false;
         } else if cursor_only && state.has_pointer {
-            cursor.move_to(display, state.pointer);
+            if Rect::new(0, 0, view.width, view.height).contains(state.pointer) {
+                cursor.move_to(
+                    display,
+                    Point::new(state.pointer.x + view.x, state.pointer.y + view.y),
+                    state_cursor_shape(&state),
+                );
+            } else {
+                // The pointer is over the taskbar. Restore the last cursor
+                // pixels and leave the taskbar untouched.
+                cursor.restore(display);
+            }
         }
 
         input.clear_events();
@@ -1520,15 +1580,28 @@ fn draw_frame(
     state: &mut State,
     now: u64,
     cursor: &mut Cursor,
+    view: Rect,
 ) {
     cursor.invalidate();
     if let Some(back) = back {
         render(back, platform, state, now);
-        front.copy_from(back);
+        front.blit(
+            view.x,
+            view.y,
+            back.width() as u32,
+            back.height() as u32,
+            back.pixels(),
+        );
     } else {
         render(front, platform, state, now);
     }
-    cursor.move_to(front, state.pointer);
+    if Rect::new(0, 0, view.width, view.height).contains(state.pointer) {
+        cursor.move_to(
+            front,
+            Point::new(state.pointer.x + view.x, state.pointer.y + view.y),
+            state_cursor_shape(state),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1549,10 +1622,42 @@ impl State {
                         self.clamp_window();
                     }
                 }
-                DragMode::Resize { width, height } => {
+                DragMode::Resize {
+                    edge,
+                    x,
+                    y,
+                    width,
+                    height,
+                    pointer_x,
+                    pointer_y,
+                } => {
                     if !self.maximized {
-                        self.window_w = (self.pointer.x - self.window_x + width).max(720);
-                        self.window_h = (self.pointer.y - self.window_y + height).max(480);
+                        const MIN_WIDTH: i32 = 720;
+                        const MIN_HEIGHT: i32 = 480;
+                        let dx = self.pointer.x - pointer_x;
+                        let dy = self.pointer.y - pointer_y;
+                        let max_right = self.screen.width as i32;
+                        let max_bottom = self.screen.height as i32;
+                        let mut left = x;
+                        let mut top = y;
+                        let mut right = (x + width).min(max_right);
+                        let mut bottom = (y + height).min(max_bottom);
+
+                        if edge.moves_left() {
+                            left = (x + dx).clamp(0, right - MIN_WIDTH);
+                        } else if edge.moves_right() {
+                            right = (x + width + dx).clamp(left + MIN_WIDTH, max_right);
+                        }
+                        if edge.moves_top() {
+                            top = (y + dy).clamp(0, bottom - MIN_HEIGHT);
+                        } else if edge.moves_bottom() {
+                            bottom = (y + height + dy).clamp(top + MIN_HEIGHT, max_bottom);
+                        }
+
+                        self.window_x = left;
+                        self.window_y = top;
+                        self.window_w = (right - left).max(1);
+                        self.window_h = (bottom - top).max(1);
                         self.clamp_window();
                     }
                 }
@@ -1653,6 +1758,22 @@ impl State {
             }
         }
 
+        // Resize edges and corners.
+        if !self.maximized {
+            if let Some(edge) = resize_edge_at(layout.window, self.pointer) {
+                self.drag = DragMode::Resize {
+                    edge,
+                    x: self.window_x,
+                    y: self.window_y,
+                    width: self.window_w,
+                    height: self.window_h,
+                    pointer_x: self.pointer.x,
+                    pointer_y: self.pointer.y,
+                };
+                return;
+            }
+        }
+
         // Title bar drag.
         if layout.title.contains(self.pointer) {
             let double = self.title_click_ms != 0 && now.wrapping_sub(self.title_click_ms) <= 500;
@@ -1668,15 +1789,6 @@ impl State {
                     dy: self.pointer.y - self.window_y,
                 };
             }
-            return;
-        }
-
-        // Resize grip.
-        if !self.maximized && resize_grip_rect(layout).contains(self.pointer) {
-            self.drag = DragMode::Resize {
-                width: self.window_w,
-                height: self.window_h,
-            };
             return;
         }
 
@@ -2449,13 +2561,52 @@ fn title_button_rect(layout: Layout, index: usize) -> Rect {
     Rect::new(x, layout.title.y + 4, WIDTH as u32, HEIGHT as u32)
 }
 
-fn resize_grip_rect(layout: Layout) -> Rect {
-    Rect::new(
-        layout.window.right_i32() - 16,
-        layout.window.bottom_i32() - 16,
-        16,
-        16,
-    )
+/// Thickness of the invisible resize border around the task manager window.
+const RESIZE_BORDER: i32 = 5;
+/// Size of the invisible resize corners around the task manager window.
+const RESIZE_CORNER: i32 = 14;
+
+fn resize_edge_at(window: Rect, point: Point) -> Option<ResizeEdge> {
+    if !window.contains(point) {
+        return None;
+    }
+    if window.width <= (RESIZE_CORNER * 2) as u32 || window.height <= (RESIZE_CORNER * 2) as u32 {
+        return None;
+    }
+
+    let left = point.x < window.x + RESIZE_CORNER;
+    let right = point.x >= window.right_i32() - RESIZE_CORNER;
+    let top = point.y < window.y + RESIZE_CORNER;
+    let bottom = point.y >= window.bottom_i32() - RESIZE_CORNER;
+
+    if left && top {
+        Some(ResizeEdge::TopLeft)
+    } else if right && top {
+        Some(ResizeEdge::TopRight)
+    } else if left && bottom {
+        Some(ResizeEdge::BottomLeft)
+    } else if right && bottom {
+        Some(ResizeEdge::BottomRight)
+    } else if point.x < window.x + RESIZE_BORDER {
+        Some(ResizeEdge::Left)
+    } else if point.x >= window.right_i32() - RESIZE_BORDER {
+        Some(ResizeEdge::Right)
+    } else if point.y < window.y + RESIZE_BORDER {
+        Some(ResizeEdge::Top)
+    } else if point.y >= window.bottom_i32() - RESIZE_BORDER {
+        Some(ResizeEdge::Bottom)
+    } else {
+        None
+    }
+}
+
+fn resize_cursor(edge: ResizeEdge) -> feos_gui::CursorShape {
+    match edge {
+        ResizeEdge::Left | ResizeEdge::Right => feos_gui::CursorShape::SizeHorizontal,
+        ResizeEdge::Top | ResizeEdge::Bottom => feos_gui::CursorShape::SizeVertical,
+        ResizeEdge::TopLeft | ResizeEdge::BottomRight => feos_gui::CursorShape::SizeNwse,
+        ResizeEdge::TopRight | ResizeEdge::BottomLeft => feos_gui::CursorShape::SizeNesw,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4976,15 +5127,18 @@ mod cursor_tests {
         let mut canvas = Canvas::new(&mut pixels, 64, 64, 64).unwrap();
         let mut cursor = Cursor::new();
 
-        cursor.move_to(&mut canvas, Point::new(10, 10));
+        cursor.move_to(
+            &mut canvas,
+            Point::new(10, 10),
+            feos_gui::CursorShape::Arrow,
+        );
         assert_ne!(canvas.pixel(10, 10), Some(background));
 
-        cursor.move_to(&mut canvas, Point::new(32, 24));
-        for y in 10..(10 + CURSOR_HEIGHT) {
-            for x in 10..(10 + CURSOR_WIDTH) {
-                assert_eq!(canvas.pixel(x, y), Some(background), "pixel {x},{y}");
-            }
-        }
+        cursor.move_to(
+            &mut canvas,
+            Point::new(32, 24),
+            feos_gui::CursorShape::SizeHorizontal,
+        );
         cursor.restore(&mut canvas);
         assert_eq!(canvas.pixels(), before.as_slice());
     }

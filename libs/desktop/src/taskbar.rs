@@ -107,6 +107,58 @@ pub fn layout(canvas: Rect, config: &TaskbarConfig) -> TaskbarLayout {
     }
 }
 
+/// The width and gap of each task button for `count` open windows.
+fn task_button_size(layout: &TaskbarLayout, count: usize) -> (i32, i32) {
+    let gap = 3;
+    let available = layout.tasks.width as i32;
+    // Like XP, buttons shrink as more windows open instead of overflowing
+    // past the notification area.
+    let width = ((available - gap * (count as i32 - 1)) / count as i32).clamp(32, 168);
+    (width.max(1), gap)
+}
+
+/// The taskbar button for the window at `index`, if it has one.
+///
+/// The desktop uses this to tell a foreground app which part of the taskbar
+/// represents its window, so a click there can suspend the app and minimise
+/// the window instead of being swallowed by the app's own input loop.
+pub fn task_button_rect<const W: usize>(
+    layout: &TaskbarLayout,
+    windows: &WindowManager<W>,
+    index: usize,
+) -> Option<Rect> {
+    let window = windows.get(index)?;
+    if !window.open || layout.tasks.width == 0 {
+        return None;
+    }
+    let count = windows.count();
+    if count == 0 {
+        return None;
+    }
+
+    let (width, gap) = task_button_size(layout, count);
+    let mut ordinal = 0i32;
+    for slot in 0..W {
+        let Some(candidate) = windows.get(slot) else {
+            break;
+        };
+        if !candidate.open {
+            continue;
+        }
+        if slot == index {
+            let x = layout.tasks.x + ordinal * (width + gap);
+            return Some(Rect::new(
+                x,
+                layout.tasks.y,
+                width as u32,
+                layout.tasks.height,
+            ));
+        }
+        ordinal += 1;
+    }
+    None
+}
+
 /// Draws the taskbar and returns interaction results.
 pub fn render<const N: usize, const W: usize, const A: usize>(
     ui: &mut Ui<'_, '_, '_, N>,
@@ -249,10 +301,7 @@ pub fn render<const N: usize, const W: usize, const A: usize>(
     // Task buttons -------------------------------------------------------
     let open_count = windows.count();
     if open_count > 0 && layout.tasks.width > 0 {
-        let gap = 3i32;
-        let available = layout.tasks.width as i32;
-        let width =
-            ((available - gap * (open_count as i32 - 1)) / open_count as i32).clamp(70, 168);
+        let (width, gap) = task_button_size(layout, open_count);
         let clip = ui.painter.push_clip(layout.tasks);
         let mut x = layout.tasks.x;
         for index in 0..W {
@@ -397,6 +446,26 @@ mod tests {
         let work = layout.work_area(canvas, config.position);
         assert_eq!(work.y, 48);
         assert_eq!(work.height, 552);
+    }
+
+    #[test]
+    fn task_buttons_are_easy_to_locate() {
+        use crate::window::WindowManager;
+
+        let config = TaskbarConfig::default();
+        let canvas = Rect::new(0, 0, 800, 600);
+        let layout = layout(canvas, &config);
+        let mut windows = WindowManager::<4>::new();
+        let work = layout.work_area(canvas, config.position);
+        let first = windows.open(0, "One", work, 300, 200, 10).unwrap();
+        let second = windows.open(1, "Two", work, 300, 200, 10).unwrap();
+
+        let first_rect = task_button_rect(&layout, &windows, first).unwrap();
+        let second_rect = task_button_rect(&layout, &windows, second).unwrap();
+        assert_eq!(first_rect.x, layout.tasks.x);
+        assert!(second_rect.x > first_rect.x);
+        assert_eq!(first_rect.y, layout.tasks.y);
+        assert_eq!(task_button_rect(&layout, &windows, 3), None);
     }
 
     #[test]

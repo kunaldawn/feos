@@ -61,6 +61,7 @@
 
 pub mod chart;
 pub mod components;
+pub mod cursor;
 pub mod geometry;
 pub mod id;
 pub mod input;
@@ -77,6 +78,7 @@ mod math;
 
 pub use chart::{Chart, ChartPoint, Series, SeriesKind};
 pub use components::*;
+pub use cursor::{draw_cursor, draw_cursor_shape, CursorShape};
 pub use geometry::{Align, Padding, RectExt, VerticalAlign};
 pub use id::Id;
 pub use input::{Event, Input, Key, Modifiers, MouseButton};

@@ -59,13 +59,21 @@ pub use feos_bundle::{BundleFormat, DirEntry};
 pub use feos_init::{InitError, RestartPolicy, ServiceState, ServiceStatus};
 pub use start_menu::{StartMenuCommand, StartMenuState};
 pub use theme::{DesktopTheme, ThemeName};
-pub use window::{DesktopWindow, WindowManager, WindowState, MAX_WINDOWS};
+pub use window::{
+    DesktopWindow, ResizeEdge, WindowManager, WindowState, MAX_WINDOWS, MIN_WINDOW_HEIGHT,
+    MIN_WINDOW_WIDTH,
+};
 
 /// Default maximum number of applications in the catalog.
 pub const MAX_APPS: usize = 12;
 
 /// Maximum number of shortcut cells drawn on the wallpaper.
 pub const MAX_DESKTOP_ICONS: usize = 24;
+
+/// Thickness of the resize border along each window edge.
+const RESIZE_EDGE: i32 = 5;
+/// Size of a resize corner.
+const RESIZE_CORNER: i32 = 14;
 
 /// A request to launch a catalog application.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -904,9 +912,22 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
         };
 
         // The pointer is painted last so it stays visible over windows and the
-        // Start menu, exactly like the XP cursor.
+        // Start menu, exactly like the XP cursor. Its shape follows the window
+        // edge underneath it.
         let cursor = ui.pointer();
-        paint::draw_cursor(&mut ui.painter, cursor.x, cursor.y);
+        let over_desktop_menu = self.start_menu.open
+            || self.context.open
+            || self.run_dialog.open
+            || self.shutdown.open
+            || self.clock_open
+            || self.logoff_open
+            || layout.bar.contains(cursor);
+        let cursor_shape = if over_desktop_menu {
+            paint::CursorShape::Arrow
+        } else {
+            window_cursor_shape(&self.windows, cursor)
+        };
+        paint::draw_cursor_shape(&mut ui.painter, cursor.x, cursor.y, cursor_shape);
 
         let pointer = ui.pointer();
         drop(ui);
@@ -937,19 +958,31 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
         if let Some(index) = taskbar_response.task_clicked {
             self.start_menu.close();
             self.show_desktop = false;
-            if self.windows.is_focused(index)
-                && self
-                    .windows
-                    .get(index)
-                    .is_some_and(|window| window.state == WindowState::Normal)
-            {
-                self.windows.minimize(index);
-            } else if self
+            let minimized = self
                 .windows
                 .get(index)
-                .is_some_and(|window| window.state == WindowState::Minimized)
-            {
+                .is_some_and(|window| window.state == WindowState::Minimized);
+            let suspended = self
+                .windows
+                .get(index)
+                .is_some_and(|window| window.suspended);
+            if minimized {
+                // A taskbar button for a minimised window brings it back,
+                // including returning it maximised when that is how it was
+                // before it was minimised.
                 self.windows.restore(index);
+                if suspended {
+                    // A foreground app owned the screen before it was
+                    // suspended; run it again now that its window is shown.
+                    if let Some(window) = self.windows.get_mut(index) {
+                        window.suspended = false;
+                        launch_index = Some(window.app);
+                    }
+                }
+            } else if self.windows.is_focused(index) {
+                // Clicking the focused window's button minimises it, whether
+                // the window is normal or maximised.
+                self.windows.minimize(index);
             } else {
                 self.windows.focus(index);
             }
@@ -1845,6 +1878,14 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
         windows.focus(index);
     }
     if title_drag.dragged {
+        // Dragging a maximised caption restores the window first, exactly as
+        // XP does, then continues moving the restored rectangle.
+        if windows
+            .get(index)
+            .is_some_and(|window| window.state == WindowState::Maximized)
+        {
+            windows.toggle_maximize(index, work_area);
+        }
         windows.move_by(
             index,
             title_drag.drag_delta.x,
@@ -1928,7 +1969,11 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
         maximize_hit.hovered,
         theme.caption_button,
         theme.caption_glyph,
-        CaptionGlyph::Maximize,
+        if window.state == WindowState::Maximized {
+            CaptionGlyph::Restore
+        } else {
+            CaptionGlyph::Maximize
+        },
     );
     draw_caption_button(
         ui,
@@ -2099,18 +2144,15 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
 
     ui.painter.restore_clip(clip);
 
+    // Resize handles ------------------------------------------------------
+    // These are registered last so they take priority over the title bar and
+    // content interactions underneath them.
+    resize_edges(ui, windows, index, rect, work_area);
+
     // Resize grip ---------------------------------------------------------
     if window.state == WindowState::Normal && rect.width > 140 && rect.height > 100 {
         let grip = Rect::new(rect.right_i32() - 14, rect.bottom_i32() - 14, 14, 14);
-        let resize = ui.interact(
-            Id::from_name("desktop.window.resize").child(index as u64 + 1),
-            grip,
-            Sense::drag(),
-        );
-        if resize.dragged {
-            windows.resize_by(index, resize.drag_delta.x, resize.drag_delta.y, work_area);
-        }
-        let grip_color = if resize.hovered {
+        let grip_color = if ui.pointer_over(grip) {
             theme.menu_text
         } else {
             theme.menu_muted
@@ -2126,6 +2168,171 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
                 grip_color,
             );
         }
+    }
+}
+
+/// Registers the eight invisible resize grips around a normal window.
+///
+/// XP lets a window be resized from any side or corner, not just the lower
+/// right grip. The grips are thin so they do not steal normal title-bar or
+/// content clicks; the corners are larger, which makes diagonal resizing easy.
+fn resize_edges<const UI: usize, const N: usize>(
+    ui: &mut Ui<'_, '_, '_, UI>,
+    windows: &mut WindowManager<N>,
+    index: usize,
+    rect: Rect,
+    work_area: Rect,
+) {
+    let resizable = windows
+        .get(index)
+        .is_some_and(|window| window.open && window.state == WindowState::Normal);
+    if !resizable {
+        return;
+    }
+
+    let corner = RESIZE_CORNER as u32;
+    let edge = RESIZE_EDGE as u32;
+    if rect.width <= corner * 2 || rect.height <= corner * 2 {
+        return;
+    }
+
+    let right = rect.right_i32();
+    let bottom = rect.bottom_i32();
+    let handles = [
+        (
+            ResizeEdge::TopLeft,
+            Rect::new(rect.x, rect.y, corner, corner),
+        ),
+        (
+            ResizeEdge::TopRight,
+            Rect::new(right - RESIZE_CORNER, rect.y, corner, corner),
+        ),
+        (
+            ResizeEdge::BottomLeft,
+            Rect::new(rect.x, bottom - RESIZE_CORNER, corner, corner),
+        ),
+        (
+            ResizeEdge::BottomRight,
+            Rect::new(
+                right - RESIZE_CORNER,
+                bottom - RESIZE_CORNER,
+                corner,
+                corner,
+            ),
+        ),
+        (
+            ResizeEdge::Left,
+            Rect::new(
+                rect.x,
+                rect.y + RESIZE_CORNER,
+                edge,
+                rect.height - corner * 2,
+            ),
+        ),
+        (
+            ResizeEdge::Right,
+            Rect::new(
+                right - RESIZE_EDGE,
+                rect.y + RESIZE_CORNER,
+                edge,
+                rect.height - corner * 2,
+            ),
+        ),
+        (
+            ResizeEdge::Top,
+            Rect::new(
+                rect.x + RESIZE_CORNER,
+                rect.y,
+                rect.width - corner * 2,
+                edge,
+            ),
+        ),
+        (
+            ResizeEdge::Bottom,
+            Rect::new(
+                rect.x + RESIZE_CORNER,
+                bottom - RESIZE_EDGE,
+                rect.width - corner * 2,
+                edge,
+            ),
+        ),
+    ];
+
+    for (edge, area) in handles {
+        let id = Id::from_name("desktop.window.resize")
+            .child(index as u64 + 1)
+            .child(edge as u64 + 1);
+        let response = ui.interact(id, area, Sense::drag());
+        if response.dragged {
+            windows.resize_from(
+                index,
+                edge,
+                response.drag_delta.x,
+                response.drag_delta.y,
+                work_area,
+            );
+        }
+    }
+}
+
+/// The resize handle under `point`, matching the regions registered by
+/// [`resize_edges`].
+fn resize_edge_at(rect: Rect, point: Point) -> Option<ResizeEdge> {
+    if !rect.contains(point) {
+        return None;
+    }
+    let corner = RESIZE_CORNER;
+    if rect.width <= (corner * 2) as u32 || rect.height <= (corner * 2) as u32 {
+        return None;
+    }
+
+    let left = point.x < rect.x + corner;
+    let right = point.x >= rect.right_i32() - corner;
+    let top = point.y < rect.y + corner;
+    let bottom = point.y >= rect.bottom_i32() - corner;
+
+    if left && top {
+        Some(ResizeEdge::TopLeft)
+    } else if right && top {
+        Some(ResizeEdge::TopRight)
+    } else if left && bottom {
+        Some(ResizeEdge::BottomLeft)
+    } else if right && bottom {
+        Some(ResizeEdge::BottomRight)
+    } else if point.x < rect.x + RESIZE_EDGE {
+        Some(ResizeEdge::Left)
+    } else if point.x >= rect.right_i32() - RESIZE_EDGE {
+        Some(ResizeEdge::Right)
+    } else if point.y < rect.y + RESIZE_EDGE {
+        Some(ResizeEdge::Top)
+    } else if point.y >= rect.bottom_i32() - RESIZE_EDGE {
+        Some(ResizeEdge::Bottom)
+    } else {
+        None
+    }
+}
+
+/// Picks the cursor for the window edge under `pointer`.
+fn window_cursor_shape<const N: usize>(
+    windows: &WindowManager<N>,
+    pointer: Point,
+) -> paint::CursorShape {
+    let Some(index) = windows.topmost_at(pointer) else {
+        return paint::CursorShape::Arrow;
+    };
+    let Some(window) = windows.get(index) else {
+        return paint::CursorShape::Arrow;
+    };
+    if !window.open || window.state != WindowState::Normal {
+        return paint::CursorShape::Arrow;
+    }
+
+    match resize_edge_at(window.rect, pointer) {
+        Some(ResizeEdge::Left | ResizeEdge::Right) => paint::CursorShape::SizeHorizontal,
+        Some(ResizeEdge::Top | ResizeEdge::Bottom) => paint::CursorShape::SizeVertical,
+        Some(ResizeEdge::TopLeft | ResizeEdge::BottomRight) => paint::CursorShape::SizeNwse,
+        Some(ResizeEdge::TopRight | ResizeEdge::BottomLeft) => paint::CursorShape::SizeNesw,
+        None => paint::CursorShape::Arrow,
     }
 }
 
@@ -2191,6 +2398,7 @@ fn draw_shortcut_label(
 enum CaptionGlyph {
     Minimize,
     Maximize,
+    Restore,
     Close,
 }
 
@@ -2219,6 +2427,13 @@ fn draw_caption_button<const N: usize>(
         CaptionGlyph::Maximize => {
             ui.painter
                 .stroke_rect(Rect::new(cx - 4, cy - 4, 9, 8), 1, glyph);
+        }
+        CaptionGlyph::Restore => {
+            // Two overlapping frames, like the XP "restore down" button.
+            ui.painter
+                .stroke_rect(Rect::new(cx - 4, cy - 2, 8, 7), 1, glyph);
+            ui.painter
+                .stroke_rect(Rect::new(cx - 1, cy - 5, 6, 6), 1, glyph);
         }
         CaptionGlyph::Close => {
             for offset in -4..=4 {
@@ -2662,6 +2877,114 @@ mod tests {
 
         desktop.render(&mut canvas, &click_at(177, 748), 1400);
         assert_eq!(desktop.windows().get(0).unwrap().state, WindowState::Normal);
+    }
+
+    #[test]
+    fn window_edges_choose_the_xp_resize_cursor() {
+        let mut windows = WindowManager::<4>::new();
+        let index = windows
+            .open(0, "One", Rect::new(0, 0, 800, 600), 400, 300, 0)
+            .unwrap();
+        let rect = Rect::new(100, 100, 400, 300);
+        windows.get_mut(index).unwrap().rect = rect;
+
+        let middle_y = rect.y + rect.height as i32 / 2;
+        let middle_x = rect.x + rect.width as i32 / 2;
+        assert_eq!(
+            window_cursor_shape(&windows, Point::new(rect.x + 1, middle_y)),
+            paint::CursorShape::SizeHorizontal
+        );
+        assert_eq!(
+            window_cursor_shape(&windows, Point::new(rect.right_i32() - 1, middle_y)),
+            paint::CursorShape::SizeHorizontal
+        );
+        assert_eq!(
+            window_cursor_shape(&windows, Point::new(middle_x, rect.y + 1)),
+            paint::CursorShape::SizeVertical
+        );
+        assert_eq!(
+            window_cursor_shape(&windows, Point::new(rect.x + 1, rect.y + 1)),
+            paint::CursorShape::SizeNwse
+        );
+        assert_eq!(
+            window_cursor_shape(&windows, Point::new(rect.right_i32() - 1, rect.y + 1)),
+            paint::CursorShape::SizeNesw
+        );
+        assert_eq!(
+            window_cursor_shape(&windows, rect.center()),
+            paint::CursorShape::Arrow
+        );
+    }
+
+    #[test]
+    fn dragging_a_window_edge_resizes_it() {
+        let bytes = catalog_bundle("terminal", "dummy");
+        let entries = [DirEntry::new("terminal.fapp", &bytes)];
+        let mut desktop =
+            Desktop::<4, 4, 2>::new(DesktopConfig::parse("theme: xp-blue\n").unwrap());
+        desktop.scan(&entries);
+        let mut pixels = std::vec![0u32; 1024 * 768];
+        let mut canvas = Canvas::new(&mut pixels, 1024, 768, 1024).unwrap();
+        desktop.render(&mut canvas, &Input::new(), 1000);
+
+        let index = desktop.open_app(0).expect("window");
+        desktop.render(&mut canvas, &Input::new(), 1100);
+        let before = desktop.windows().get(index).unwrap().rect;
+        let x = before.right_i32() - 2;
+        let y = before.y + before.height as i32 / 2;
+
+        // Press on the right border, then drag it 40 pixels to the right.
+        let mut input = Input::new();
+        input.push(Event::PointerMoved(feos_gfx::Point::new(x, y)));
+        input.push(Event::PointerDown {
+            pos: feos_gfx::Point::new(x, y),
+            button: MouseButton::Left,
+        });
+        desktop.render(&mut canvas, &input, 1200);
+        input.clear_events();
+
+        input.push(Event::PointerMoved(feos_gfx::Point::new(x + 40, y)));
+        desktop.render(&mut canvas, &input, 1300);
+
+        let after = desktop.windows().get(index).unwrap().rect;
+        assert_eq!(after.width, before.width + 40);
+        assert_eq!(after.x, before.x);
+    }
+
+    #[test]
+    fn a_suspended_foreground_window_relaunches_from_the_taskbar() {
+        let bytes = catalog_bundle("terminal", "dummy");
+        let entries = [DirEntry::new("terminal.fapp", &bytes)];
+        let mut desktop =
+            Desktop::<4, 4, 2>::new(DesktopConfig::parse("theme: xp-blue\n").unwrap());
+        desktop.scan(&entries);
+        let mut pixels = std::vec![0u32; 1024 * 768];
+        let mut canvas = Canvas::new(&mut pixels, 1024, 768, 1024).unwrap();
+        desktop.render(&mut canvas, &Input::new(), 1000);
+
+        let index = desktop.open_app(0).expect("window");
+        let layout = taskbar::layout(Rect::new(0, 0, 1024, 768), &desktop.config().taskbar);
+        let button = taskbar::task_button_rect(&layout, desktop.windows(), index).expect("button");
+
+        // Simulate the foreground app returning because its taskbar button
+        // was clicked.
+        desktop.windows_mut().minimize(index);
+        desktop.windows_mut().get_mut(index).unwrap().suspended = true;
+
+        let response = desktop.render(
+            &mut canvas,
+            &click_at(
+                button.x + button.width as i32 / 2,
+                button.y + button.height as i32 / 2,
+            ),
+            1400,
+        );
+        assert_eq!(response.launch.map(|request| request.app), Some(0));
+        assert_eq!(
+            desktop.windows().get(index).unwrap().state,
+            WindowState::Normal
+        );
+        assert!(!desktop.windows().get(index).unwrap().suspended);
     }
 
     fn right_click_at(x: i32, y: i32) -> Input {

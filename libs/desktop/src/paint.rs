@@ -136,54 +136,7 @@ pub fn draw_start_flag(painter: &mut Painter<'_, '_>, rect: Rect) {
     }
 }
 
-/// Draws the classic XP arrow pointer at `x`/`y`.
-///
-/// The bitmap is small enough that the desktop can paint it after every other
-/// layer, which keeps the cursor above windows and menus without a compositor.
-pub fn draw_cursor(painter: &mut Painter<'_, '_>, x: i32, y: i32) {
-    const CURSOR: [&str; 19] = [
-        "X           ",
-        "XX          ",
-        "X.X         ",
-        "X..X        ",
-        "X...X       ",
-        "X....X      ",
-        "X.....X     ",
-        "X......X    ",
-        "X.......X   ",
-        "X........X  ",
-        "X.....XXXXX ",
-        "X..X..X     ",
-        "X.X X..X    ",
-        "XX  X..X    ",
-        "X    X..X   ",
-        "     X..X   ",
-        "      X..X  ",
-        "      X..X  ",
-        "       XX   ",
-    ];
-
-    let outline = Color::BLACK;
-    let fill = Color::WHITE;
-    for (row, line) in CURSOR.iter().enumerate() {
-        for (column, pixel) in line.bytes().enumerate() {
-            let color = match pixel {
-                b'X' => outline,
-                b'.' => fill,
-                _ => continue,
-            };
-            painter.put_pixel(x + column as i32, y + row as i32, color);
-        }
-    }
-
-    // A one-pixel soft shadow along the lower-right edge gives the pointer the
-    // same slightly raised look as the Luna cursor.
-    let shadow = Color::rgb(96, 96, 96);
-    for offset in 1..=2 {
-        painter.blend_pixel(x + 10 + offset, y + 17 + offset, shadow, 90);
-        painter.blend_pixel(x + 9 + offset, y + 18, shadow, 70);
-    }
-}
+pub use feos_gui::{draw_cursor, draw_cursor_shape, CursorShape};
 
 #[cfg(test)]
 mod tests {
@@ -198,6 +151,28 @@ mod tests {
         config.clock_24h = false;
         assert_eq!(format_clock(3_723_000, &config).as_str(), "1:02 AM");
         assert_eq!(format_clock(45_723_000, &config).as_str(), "12:42 PM");
+    }
+
+    #[test]
+    fn every_resize_cursor_draws_visible_pixels() {
+        let shapes = [
+            CursorShape::SizeHorizontal,
+            CursorShape::SizeVertical,
+            CursorShape::SizeNwse,
+            CursorShape::SizeNesw,
+        ];
+        for shape in shapes {
+            let mut pixels = [0u32; 64 * 64];
+            let background = Color::rgb(10, 20, 30);
+            let mut canvas = Canvas::new(&mut pixels, 64, 64, 64).unwrap();
+            canvas.fill_rect(Rect::new(0, 0, 64, 64), background);
+            let mut painter = Painter::new(&mut canvas);
+            draw_cursor_shape(&mut painter, 32, 32, shape);
+            assert!(
+                pixels.iter().any(|&pixel| pixel != background.raw()),
+                "{shape:?} painted nothing"
+            );
+        }
     }
 
     #[test]

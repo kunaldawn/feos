@@ -13,13 +13,15 @@
 
 #![cfg_attr(not(test), no_std)]
 
+use core::cell::Cell;
+
 use feos_app::{App, Context, Platform};
 use feos_console::println;
 use feos_desktop::{
     Desktop, DesktopConfig, DesktopResponse, DesktopTheme, LaunchOutcome, ServiceStatus,
     StartMenuCommand, ThemeName,
 };
-use feos_gfx::Canvas;
+use feos_gfx::{Canvas, Rect};
 use feos_gui::Input;
 use feos_sync::SpinLock;
 
@@ -188,6 +190,46 @@ fn render(desktop: &mut Session, context: &mut Context<'_>) {
     );
 }
 
+/// The area a foreground app may draw into.
+///
+/// When the desktop has already laid out its taskbar this is the work area;
+/// otherwise (for example before the first frame) the whole display is used.
+fn foreground_viewport(desktop: &Session, display: &Option<Canvas<'static>>) -> Option<Rect> {
+    let area = desktop.work_area();
+    if !area.is_empty() {
+        Some(area)
+    } else {
+        display
+            .as_ref()
+            .map(|canvas| Rect::new(0, 0, canvas.width() as u32, canvas.height() as u32))
+    }
+}
+
+/// The taskbar button for `window`, when it belongs to a foreground app.
+fn foreground_suspend_area(
+    desktop: &Session,
+    display: &Option<Canvas<'static>>,
+    window: usize,
+) -> Option<Rect> {
+    let canvas = display.as_ref()?;
+    let canvas_rect = Rect::new(0, 0, canvas.width() as u32, canvas.height() as u32);
+    let layout = feos_desktop::taskbar::layout(canvas_rect, &desktop.config().taskbar);
+    feos_desktop::taskbar::task_button_rect(&layout, desktop.windows(), window)
+}
+
+/// Closes a finished foreground window, or minimises it when the app exited
+/// because its taskbar button was clicked.
+fn finish_foreground(desktop: &mut Session, window: usize, suspended: bool) {
+    if suspended {
+        desktop.windows_mut().minimize(window);
+        if let Some(window) = desktop.windows_mut().get_mut(window) {
+            window.suspended = true;
+        }
+    } else {
+        desktop.windows_mut().close(window);
+    }
+}
+
 fn apply_response(
     desktop: &mut Session,
     response: &DesktopResponse,
@@ -203,15 +245,21 @@ fn apply_response(
             LaunchOutcome::Foreground { window } => {
                 ran_foreground = true;
                 println!("[desktop] launching '{}' in the foreground", request.entry);
+                let viewport = foreground_viewport(desktop, display);
+                let suspend_area = foreground_suspend_area(desktop, display, window);
+                let suspend = Cell::new(false);
                 if let Some(app) = platform.apps.find(request.entry.as_str()) {
                     let mut context = Context {
                         args: request.args.as_str(),
                         display,
+                        viewport,
+                        suspend: Some(&suspend),
+                        suspend_area,
                         platform,
                     };
                     app.run(&mut context);
                 }
-                desktop.windows_mut().close(window);
+                finish_foreground(desktop, window, suspend.get());
                 println!("[desktop] returned from '{}'", request.entry);
             }
             LaunchOutcome::AlreadyRunning { pid, .. } => {
@@ -320,9 +368,13 @@ fn run_command(
     };
 
     if runtime.foreground() {
+        let viewport = foreground_viewport(desktop, display);
         let mut context = Context {
             args,
             display,
+            viewport,
+            suspend: None,
+            suspend_area: None,
             platform,
         };
         runtime.run(&mut context);
@@ -365,15 +417,21 @@ fn launch_id(
             false
         }
         LaunchOutcome::Foreground { window } => {
+            let viewport = foreground_viewport(desktop, display);
+            let suspend_area = foreground_suspend_area(desktop, display, window);
+            let suspend = Cell::new(false);
             if let Some(app) = platform.apps.find(entry.as_str()) {
                 let mut context = Context {
                     args: args.as_str(),
                     display,
+                    viewport,
+                    suspend: Some(&suspend),
+                    suspend_area,
                     platform,
                 };
                 app.run(&mut context);
             }
-            desktop.windows_mut().close(window);
+            finish_foreground(desktop, window, suspend.get());
             true
         }
         LaunchOutcome::AlreadyRunning { window, .. } => {
@@ -419,15 +477,21 @@ fn run_app(
         }
         LaunchOutcome::Foreground { window } => {
             println!("[desktop] '{id}' is running in the foreground");
+            let viewport = foreground_viewport(desktop, display);
+            let suspend_area = foreground_suspend_area(desktop, display, window);
+            let suspend = Cell::new(false);
             if let Some(app) = platform.apps.find(entry.as_str()) {
                 let mut context = Context {
                     args: args.as_str(),
                     display,
+                    viewport,
+                    suspend: Some(&suspend),
+                    suspend_area,
                     platform,
                 };
                 app.run(&mut context);
             }
-            desktop.windows_mut().close(window);
+            finish_foreground(desktop, window, suspend.get());
             println!("[desktop] returned from '{id}'");
         }
         LaunchOutcome::AlreadyRunning { window, .. } => {
@@ -565,6 +629,18 @@ mod tests {
         assert!(desktop.catalog().find_id("terminal").is_some());
         assert!(desktop.catalog().find_id("process-monitor").is_some());
         assert!(desktop.catalog().find_id("files").is_some());
+    }
+
+    #[test]
+    fn foreground_apps_get_the_work_area_above_the_taskbar() {
+        let mut desktop = session();
+        let mut pixels = std::vec![0u32; 1024 * 768];
+        let mut canvas = feos_gfx::Canvas::new(&mut pixels, 1024, 768, 1024).unwrap();
+        desktop.render(&mut canvas, &feos_gui::Input::new(), 0);
+
+        let viewport = foreground_viewport(&desktop, &None).expect("work area");
+        assert_eq!(viewport, Rect::new(0, 0, 1024, 728));
+        assert_eq!(viewport.height, desktop.work_area().height);
     }
 
     #[test]

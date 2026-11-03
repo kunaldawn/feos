@@ -336,12 +336,56 @@ fn menu_items(kind: MenuKind) -> &'static [MenuItem] {
     }
 }
 
+/// The edge or corner used to resize the explorer window.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResizeEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl ResizeEdge {
+    const fn moves_left(self) -> bool {
+        matches!(self, Self::Left | Self::TopLeft | Self::BottomLeft)
+    }
+
+    const fn moves_right(self) -> bool {
+        matches!(self, Self::Right | Self::TopRight | Self::BottomRight)
+    }
+
+    const fn moves_top(self) -> bool {
+        matches!(self, Self::Top | Self::TopLeft | Self::TopRight)
+    }
+
+    const fn moves_bottom(self) -> bool {
+        matches!(self, Self::Bottom | Self::BottomLeft | Self::BottomRight)
+    }
+}
+
 #[derive(Clone, Copy)]
 enum DragMode {
     None,
-    Move { dx: i32, dy: i32 },
-    Resize { width: i32, height: i32 },
-    Marquee { start: Point },
+    Move {
+        dx: i32,
+        dy: i32,
+    },
+    Resize {
+        edge: ResizeEdge,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        pointer_x: i32,
+        pointer_y: i32,
+    },
+    Marquee {
+        start: Point,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -1398,12 +1442,42 @@ impl ExplorerState {
                         .clamp(0, (self.screen.height as i32 - self.window_h).max(0));
                 }
             }
-            DragMode::Resize { width, height } => {
+            DragMode::Resize {
+                edge,
+                x,
+                y,
+                width,
+                height,
+                pointer_x,
+                pointer_y,
+            } => {
                 if !self.maximized {
-                    self.window_w = (self.pointer.x - self.window_x + width).max(720);
-                    self.window_h = (self.pointer.y - self.window_y + height).max(480);
-                    self.window_w = self.window_w.min(self.screen.width as i32);
-                    self.window_h = self.window_h.min(self.screen.height as i32);
+                    const MIN_WIDTH: i32 = 720;
+                    const MIN_HEIGHT: i32 = 480;
+                    let dx = self.pointer.x - pointer_x;
+                    let dy = self.pointer.y - pointer_y;
+                    let max_right = self.screen.width as i32;
+                    let max_bottom = self.screen.height as i32;
+                    let mut left = x;
+                    let mut top = y;
+                    let mut right = (x + width).min(max_right);
+                    let mut bottom = (y + height).min(max_bottom);
+
+                    if edge.moves_left() {
+                        left = (x + dx).clamp(0, right - MIN_WIDTH);
+                    } else if edge.moves_right() {
+                        right = (x + width + dx).clamp(left + MIN_WIDTH, max_right);
+                    }
+                    if edge.moves_top() {
+                        top = (y + dy).clamp(0, bottom - MIN_HEIGHT);
+                    } else if edge.moves_bottom() {
+                        bottom = (y + height + dy).clamp(top + MIN_HEIGHT, max_bottom);
+                    }
+
+                    self.window_x = left;
+                    self.window_y = top;
+                    self.window_w = (right - left).max(1);
+                    self.window_h = (bottom - top).max(1);
                 }
             }
             DragMode::Marquee { .. } => {}
@@ -1535,17 +1609,24 @@ impl ExplorerState {
             }
             return false;
         }
+        if !self.maximized {
+            if let Some(edge) = resize_edge_at(layout.window, point) {
+                self.drag = DragMode::Resize {
+                    edge,
+                    x: self.window_x,
+                    y: self.window_y,
+                    width: self.window_w,
+                    height: self.window_h,
+                    pointer_x: point.x,
+                    pointer_y: point.y,
+                };
+                return false;
+            }
+        }
         if layout.title.contains(point) && !self.maximized {
             self.drag = DragMode::Move {
                 dx: point.x - self.window_x,
                 dy: point.y - self.window_y,
-            };
-            return false;
-        }
-        if !self.maximized && resize_grip(layout.window).contains(point) {
-            self.drag = DragMode::Resize {
-                width: self.window_w,
-                height: self.window_h,
             };
             return false;
         }
@@ -2867,8 +2948,52 @@ fn title_button_at(layout: Layout, point: Point) -> Option<usize> {
     None
 }
 
-fn resize_grip(window: Rect) -> Rect {
-    Rect::new(window.right_i32() - 16, window.bottom_i32() - 16, 14, 14)
+/// Thickness of the invisible resize border around the explorer window.
+const RESIZE_BORDER: i32 = 5;
+/// Size of the invisible resize corners around the explorer window.
+const RESIZE_CORNER: i32 = 14;
+
+fn resize_edge_at(window: Rect, point: Point) -> Option<ResizeEdge> {
+    if !window.contains(point) {
+        return None;
+    }
+    if window.width <= (RESIZE_CORNER * 2) as u32 || window.height <= (RESIZE_CORNER * 2) as u32 {
+        return None;
+    }
+
+    let left = point.x < window.x + RESIZE_CORNER;
+    let right = point.x >= window.right_i32() - RESIZE_CORNER;
+    let top = point.y < window.y + RESIZE_CORNER;
+    let bottom = point.y >= window.bottom_i32() - RESIZE_CORNER;
+
+    if left && top {
+        Some(ResizeEdge::TopLeft)
+    } else if right && top {
+        Some(ResizeEdge::TopRight)
+    } else if left && bottom {
+        Some(ResizeEdge::BottomLeft)
+    } else if right && bottom {
+        Some(ResizeEdge::BottomRight)
+    } else if point.x < window.x + RESIZE_BORDER {
+        Some(ResizeEdge::Left)
+    } else if point.x >= window.right_i32() - RESIZE_BORDER {
+        Some(ResizeEdge::Right)
+    } else if point.y < window.y + RESIZE_BORDER {
+        Some(ResizeEdge::Top)
+    } else if point.y >= window.bottom_i32() - RESIZE_BORDER {
+        Some(ResizeEdge::Bottom)
+    } else {
+        None
+    }
+}
+
+fn resize_cursor(edge: ResizeEdge) -> feos_gui::CursorShape {
+    match edge {
+        ResizeEdge::Left | ResizeEdge::Right => feos_gui::CursorShape::SizeHorizontal,
+        ResizeEdge::Top | ResizeEdge::Bottom => feos_gui::CursorShape::SizeVertical,
+        ResizeEdge::TopLeft | ResizeEdge::BottomRight => feos_gui::CursorShape::SizeNwse,
+        ResizeEdge::TopRight | ResizeEdge::BottomLeft => feos_gui::CursorShape::SizeNesw,
+    }
 }
 
 fn toolbar_button_rect(layout: Layout, index: usize) -> Rect {
@@ -3063,19 +3188,26 @@ fn entry_at(state: &ExplorerState, layout: Layout, point: Point) -> Option<usize
 /// Runs the interactive XP-style explorer.
 pub fn run(fs: &dyn FileSystem, context: &mut Context<'_>) {
     let platform = context.platform;
+    let suspend = context.suspend;
+    let suspend_area = context.suspend_area;
     let Some(display) = context.display.as_mut() else {
         feos_console::println!("files: no framebuffer; try 'files ls /' instead");
         return;
     };
-    let screen = Rect::new(0, 0, display.width() as u32, display.height() as u32);
+    let full = Rect::new(0, 0, display.width() as u32, display.height() as u32);
+    let view = context.viewport.unwrap_or(full).clipped_to(full);
+    if view.is_empty() {
+        return;
+    }
+    let screen = Rect::new(0, 0, view.width, view.height);
     let mut state = ExplorerState::new(fs, screen);
     state.has_pointer = platform.pointer.is_some();
     if let Some(pointer) = platform.pointer {
         let (x, y) = pointer.position();
-        state.pointer = Point::new(x as i32, y as i32);
+        state.pointer = Point::new(x as i32 - view.x, y as i32 - view.y);
     }
-    let width = display.width();
-    let height = display.height();
+    let width = view.width as usize;
+    let height = view.height as usize;
     let mut back_pixels = vec![0u32; width * height];
     let mut back = Canvas::new(&mut back_pixels, width, height, width);
 
@@ -3090,6 +3222,7 @@ pub fn run(fs: &dyn FileSystem, context: &mut Context<'_>) {
         fs,
         &mut state,
         platform.clock.uptime_ms(),
+        view,
     );
 
     loop {
@@ -3099,16 +3232,29 @@ pub fn run(fs: &dyn FileSystem, context: &mut Context<'_>) {
         }
 
         let mut pointer_changed = false;
+        let mut suspend_requested = false;
         if let Some(pointer) = platform.pointer {
             let mut budget = 32;
             while budget > 0 {
-                let Some(report) = pointer.poll() else {
+                let Some(mut report) = pointer.poll() else {
                     break;
                 };
+                if let (Some(cell), Some(area), Some(true)) = (suspend, suspend_area, report.left) {
+                    if area.contains(Point::new(report.x as i32, report.y as i32)) {
+                        cell.set(true);
+                        suspend_requested = true;
+                        break;
+                    }
+                }
+                report.x = report.x.saturating_sub(view.x as u16);
+                report.y = report.y.saturating_sub(view.y as u16);
                 pointer_changed = true;
                 state.handle_pointer(fs, report, now);
                 budget -= 1;
             }
+        }
+        if suspend_requested {
+            break;
         }
 
         let input_changed = !input.is_empty();
@@ -3142,7 +3288,7 @@ pub fn run(fs: &dyn FileSystem, context: &mut Context<'_>) {
             break;
         }
         if dirty || input_changed || pointer_changed || notice_active != last_notice {
-            draw_frame(display, back.as_mut(), fs, &mut state, now);
+            draw_frame(display, back.as_mut(), fs, &mut state, now, view);
             dirty = false;
             last_notice = notice_active;
         }
@@ -3159,10 +3305,17 @@ fn draw_frame(
     fs: &dyn FileSystem,
     state: &mut ExplorerState,
     now: u64,
+    view: Rect,
 ) {
     if let Some(back) = back {
         render(back, fs, state, now);
-        front.copy_from(back);
+        front.blit(
+            view.x,
+            view.y,
+            back.width() as u32,
+            back.height() as u32,
+            back.pixels(),
+        );
     } else {
         render(front, fs, state, now);
     }
@@ -3192,7 +3345,18 @@ fn render(canvas: &mut Canvas<'_>, fs: &dyn FileSystem, state: &mut ExplorerStat
         draw_dialog(&mut painter, fs, state, now);
     }
     if state.has_pointer {
-        draw_cursor(&mut painter, state.pointer.x, state.pointer.y);
+        let shape = if state.menu_open.is_none()
+            && state.context.is_none()
+            && state.dialog == Dialog::None
+            && !state.maximized
+        {
+            resize_edge_at(layout.window, state.pointer)
+                .map(resize_cursor)
+                .unwrap_or(feos_gui::CursorShape::Arrow)
+        } else {
+            feos_gui::CursorShape::Arrow
+        };
+        feos_gui::draw_cursor_shape(&mut painter, state.pointer.x, state.pointer.y, shape);
     }
 }
 
@@ -5346,40 +5510,6 @@ fn draw_file_icon(painter: &mut Painter<'_, '_>, rect: Rect, accent: Color) {
         Rect::new(page.x + 3, line_y + 3, page.width.saturating_sub(8), 1),
         Color::rgb(170, 170, 170),
     );
-}
-
-fn draw_cursor(painter: &mut Painter<'_, '_>, x: i32, y: i32) {
-    const CURSOR: [&str; 19] = [
-        "X           ",
-        "XX          ",
-        "X.X         ",
-        "X..X        ",
-        "X...X       ",
-        "X....X      ",
-        "X.....X     ",
-        "X......X    ",
-        "X.......X   ",
-        "X........X  ",
-        "X.....XXXXX ",
-        "X..X..X     ",
-        "X.X X..X    ",
-        "XX  X..X    ",
-        "X    X..X   ",
-        "     X..X   ",
-        "      X..X  ",
-        "      X..X  ",
-        "       XX   ",
-    ];
-    for (row, line) in CURSOR.iter().enumerate() {
-        for (column, pixel) in line.bytes().enumerate() {
-            let color = match pixel {
-                b'X' => Color::BLACK,
-                b'.' => Color::WHITE,
-                _ => continue,
-            };
-            painter.put_pixel(x + column as i32, y + row as i32, color);
-        }
-    }
 }
 
 #[cfg(test)]

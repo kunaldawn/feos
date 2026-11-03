@@ -130,6 +130,18 @@ pub fn run_session(
                 let front = display.as_mut().expect("display checked at session start");
                 session.render(front, &input, now)
             };
+
+            // A foreground app paints directly into the scanout and only the
+            // work area. Present the freshly composed desktop first so the
+            // taskbar (including the new task button) is already visible
+            // underneath the app while it runs.
+            let may_run_foreground = response.launch.is_some()
+                || response.run.is_some()
+                || response.command != StartMenuCommand::None;
+            if may_run_foreground {
+                present(display, back);
+            }
+
             let ran_foreground = super::apply_response(&mut session, &response, platform, display);
 
             // The foreground app may have consumed pointer reports while it

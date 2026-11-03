@@ -17,7 +17,8 @@ is driven with a real pointer. The serial console remains the keyboard:
 |-------|--------|
 | Mouse | Move the pointer; click Start, menus, taskbar buttons and window controls |
 | Double-click | Open a desktop shortcut, or maximise/restore a window from its title bar |
-| Drag | Move a window by its title bar, or resize it from the lower-right grip |
+| Drag | Move a window by its title bar, or resize it from any edge or corner |
+| Cursor | Follows XP: arrow over the desktop, horizontal/vertical arrows on edges, diagonal arrows on corners |
 | Right-click | Open the desktop menu (Refresh, Show Desktop, Task Manager, Properties) |
 | Arrow keys | Move the Start-menu highlight, or the wallpaper selection when the menu is closed |
 | `Enter` | Launch the highlighted application |
@@ -212,18 +213,27 @@ is dynamic in both cases; only the source of the bytes differs.
 cascade from the top-left of the work area, are clamped so they stay reachable,
 and support focus, z-order, drag, resize, minimize, maximize and restore. A
 title-bar click focuses, a drag moves, and a double-click maximises or restores.
-The lower-right grip resizes. The taskbar reflows to a bottom or top edge and
-sizes its buttons from the open window count; clicking the focused task button
-minimises, and clicking a minimised one restores.
+Every side and corner resizes (the lower-right grip is just the visible one),
+and resized windows are kept inside the work area so they never cover the
+taskbar. The taskbar reflows to a bottom or top edge and sizes its buttons from
+the open window count; clicking the focused task button minimises it (normal or
+maximised), clicking a minimised one restores it to its previous normal or
+maximised state, and clicking another window raises it.
 
 `Desktop::launch(index, registry, processes)` opens the window first, resolves
 the manifest entry point through `AppRegistry`, and spawns it through
 `Processes`. An unknown entry leaves the window open with an explanation
 instead of failing silently. An app that returns `true` from
-`App::foreground` (currently the File Explorer and Media Player) is run
-synchronously by the desktop session so it can draw full-screen and read the
-keyboard and pointer; the desktop closes its window and redraws when the app
-returns. The desktop app's session
+`App::foreground` (currently the File Explorer, Task Manager and Media Player)
+is run synchronously by the desktop session so it can draw and read the keyboard
+and pointer. The desktop passes its work area as `Context::viewport`, so the app
+draws above the taskbar instead of covering it. It also passes the app's
+taskbar button as `Context::suspend_area`: clicking that button makes the app
+return, the desktop minimises its window, and clicking the button again restores
+the window and runs the app. A normal close still closes the window. The
+File Explorer and Task Manager windows resize from every edge and corner as
+well, and use the same resize cursors as the desktop window manager. The
+desktop app's session
 loop polls the virtio pointer through `feos_hal::Pointer` and feeds
 `feos_gui::Input` events; the same path forwards `DesktopResponse::launch`.
 

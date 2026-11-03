@@ -2376,20 +2376,27 @@ fn open_row_at(state: &PlayerState, layout: DialogLayout, point: Point) -> Optio
 /// Runs the VLC-style player.
 pub fn run(fs: &dyn FileSystem, context: &mut Context<'_>) {
     let platform = context.platform;
+    let suspend = context.suspend;
+    let suspend_area = context.suspend_area;
     let Some(display) = context.display.as_mut() else {
         println!("player: no framebuffer; video playback needs ramfb");
         return;
     };
-    let screen = Rect::new(0, 0, display.width() as u32, display.height() as u32);
+    let full = Rect::new(0, 0, display.width() as u32, display.height() as u32);
+    let view = context.viewport.unwrap_or(full).clipped_to(full);
+    if view.is_empty() {
+        return;
+    }
+    let screen = Rect::new(0, 0, view.width, view.height);
     let now = platform.clock.uptime_ms();
     let mut state = PlayerState::new(fs, screen, context.args, now);
     state.has_pointer = platform.pointer.is_some();
     if let Some(pointer) = platform.pointer {
         let (x, y) = pointer.position();
-        state.pointer = Point::new(x as i32, y as i32);
+        state.pointer = Point::new(x as i32 - view.x, y as i32 - view.y);
     }
-    let width = display.width();
-    let height = display.height();
+    let width = view.width as usize;
+    let height = view.height as usize;
     let mut back_pixels = vec![0u32; width * height];
     let mut back = Canvas::new(&mut back_pixels, width, height, width);
 
@@ -2398,7 +2405,7 @@ pub fn run(fs: &dyn FileSystem, context: &mut Context<'_>) {
     let mut dirty = true;
     let mut last_render = now;
 
-    draw_frame(display, back.as_mut(), fs, &mut state, now);
+    draw_frame(display, back.as_mut(), fs, &mut state, now, view);
 
     loop {
         let now = platform.clock.uptime_ms();
@@ -2407,16 +2414,29 @@ pub fn run(fs: &dyn FileSystem, context: &mut Context<'_>) {
         }
 
         let mut pointer_changed = false;
+        let mut suspend_requested = false;
         if let Some(pointer) = platform.pointer {
             let mut budget = 32;
             while budget > 0 {
-                let Some(report) = pointer.poll() else {
+                let Some(mut report) = pointer.poll() else {
                     break;
                 };
+                if let (Some(cell), Some(area), Some(true)) = (suspend, suspend_area, report.left) {
+                    if area.contains(Point::new(report.x as i32, report.y as i32)) {
+                        cell.set(true);
+                        suspend_requested = true;
+                        break;
+                    }
+                }
+                report.x = report.x.saturating_sub(view.x as u16);
+                report.y = report.y.saturating_sub(view.y as u16);
                 pointer_changed = true;
                 state.handle_pointer(fs, report, now);
                 budget -= 1;
             }
+        }
+        if suspend_requested {
+            break;
         }
 
         let input_changed = !input.is_empty();
@@ -2451,7 +2471,7 @@ pub fn run(fs: &dyn FileSystem, context: &mut Context<'_>) {
             || fullscreen_controls
             || osd_active
         {
-            draw_frame(display, back.as_mut(), fs, &mut state, now);
+            draw_frame(display, back.as_mut(), fs, &mut state, now, view);
             dirty = false;
             last_render = now;
         }
@@ -2471,10 +2491,17 @@ fn draw_frame(
     fs: &dyn FileSystem,
     state: &mut PlayerState,
     now: u64,
+    view: Rect,
 ) {
     if let Some(back) = back {
         render(back, fs, state, now);
-        front.copy_from(back);
+        front.blit(
+            view.x,
+            view.y,
+            back.width() as u32,
+            back.height() as u32,
+            back.pixels(),
+        );
     } else {
         render(front, fs, state, now);
     }

@@ -616,7 +616,8 @@ taskbar are driven with the pointer; the serial console remains the keyboard:
 |-------|--------|
 | Mouse | Move the pointer; click Start, menus, taskbar buttons and window controls |
 | Double-click | Open a desktop shortcut, or maximise/restore a window from its title bar |
-| Drag | Move a window by its title bar, or resize it from the lower-right grip |
+| Drag | Move a window by its title bar, or resize it from any edge or corner |
+| Cursor | Arrow on the desktop, horizontal/vertical arrows on window edges, diagonal arrows on corners |
 | Right-click | Open the desktop menu |
 | Arrow keys | Move the Start-menu highlight, or the wallpaper selection when the menu is closed |
 | `Enter` | Launch the highlighted application |
@@ -774,6 +775,7 @@ else works with either the mouse or the serial keyboard:
 | Right-click | Context menu for an item or the current folder |
 | Mouse wheel | Scroll the list, tree, preview or viewer |
 | Title bar | Drag a restored window; the square button maximises/restores |
+| Window edges | Drag any edge or corner to resize; the cursor changes to the matching XP resize arrow |
 | Arrow keys | Move the list or tree selection |
 | `Shift` + arrows | Extend the selection |
 | `Ctrl` + arrow keys | Move the focus without changing the selection |
@@ -789,9 +791,11 @@ else works with either the mouse or the serial keyboard:
 | `Tab` / `Shift+Tab` | Move focus between list, tree and address bar |
 | `Esc` | Close a menu/dialog, or return to the desktop |
 
-Interactive apps use `App::foreground` to ask the desktop for the whole
-framebuffer. The desktop opens a window, runs the app synchronously, then
-closes the window and redraws itself when the app returns. The File Explorer
+Interactive apps use `App::foreground` to ask the desktop to run them
+synchronously. The desktop opens a window, passes its work area through
+`Context::viewport`, then closes the window and redraws itself when the app
+returns. Because the app draws above the taskbar rather than over the whole
+framebuffer, the XP taskbar stays visible the whole time. The File Explorer
 is launched this way from the Start menu.
 
 ## The video player
@@ -1145,10 +1149,11 @@ its peak level, so a non-zero peak confirms the DSP path ran.
 - Resolution is fixed at 1024x768 and the buffer lives in the board's `.bss`
   (3 MiB).
 - The desktop composes each frame in an off-screen `BACK` buffer and copies it
-  to the scanout in one pass. Full-screen foreground apps use their own
-  off-screen canvas and present it with one copy as well, so pointer movement
-  does not expose a half-drawn frame. There is no hardware acceleration, and
-  the font is ASCII-only (non-ASCII falls back to `?`).
+  to the scanout in one pass. Foreground apps use their own off-screen canvas,
+  sized to the desktop work area so the taskbar stays visible, and present it
+  with one copy as well, so pointer movement does not expose a half-drawn
+  frame. There is no hardware acceleration, and the font is ASCII-only
+  (non-ASCII falls back to `?`).
 - Single core. All processes share one address space and run at EL1, so there
   is no memory protection or privilege boundary between them; a fault in any
   process halts the machine.

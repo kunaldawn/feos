@@ -252,6 +252,9 @@ extern "C" fn app_entry(slot: usize) -> ! {
     let mut context = Context {
         args,
         display: &mut display,
+        viewport: None,
+        suspend: None,
+        suspend_area: None,
         platform: platform(),
     };
 

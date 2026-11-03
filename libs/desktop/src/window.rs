@@ -15,6 +15,12 @@ pub const MAX_WINDOWS: usize = 8;
 /// Maximum title length.
 pub const TITLE_MAX: usize = 48;
 
+/// Smallest width a resized window may have.
+pub const MIN_WINDOW_WIDTH: u32 = 240;
+
+/// Smallest height a resized window may have.
+pub const MIN_WINDOW_HEIGHT: u32 = 160;
+
 /// How a window is currently displayed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WindowState {
@@ -24,6 +30,49 @@ pub enum WindowState {
     Minimized,
     /// Filling the work area.
     Maximized,
+}
+
+/// The edge or corner being dragged to resize a window.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ResizeEdge {
+    /// Top edge.
+    Top,
+    /// Bottom edge.
+    Bottom,
+    /// Left edge.
+    Left,
+    /// Right edge.
+    Right,
+    /// Top-left corner.
+    TopLeft,
+    /// Top-right corner.
+    TopRight,
+    /// Bottom-left corner.
+    BottomLeft,
+    /// Bottom-right corner.
+    BottomRight,
+}
+
+impl ResizeEdge {
+    /// Returns `true` when the edge moves the left side of the window.
+    pub const fn moves_left(self) -> bool {
+        matches!(self, Self::Left | Self::TopLeft | Self::BottomLeft)
+    }
+
+    /// Returns `true` when the edge moves the right side of the window.
+    pub const fn moves_right(self) -> bool {
+        matches!(self, Self::Right | Self::TopRight | Self::BottomRight)
+    }
+
+    /// Returns `true` when the edge moves the top side of the window.
+    pub const fn moves_top(self) -> bool {
+        matches!(self, Self::Top | Self::TopLeft | Self::TopRight)
+    }
+
+    /// Returns `true` when the edge moves the bottom side of the window.
+    pub const fn moves_bottom(self) -> bool {
+        matches!(self, Self::Bottom | Self::BottomLeft | Self::BottomRight)
+    }
 }
 
 /// One managed window.
@@ -39,6 +88,10 @@ pub struct DesktopWindow {
     pub restore: Rect,
     /// Display state.
     pub state: WindowState,
+    /// State restored when the window leaves the minimized state.
+    pub restore_state: WindowState,
+    /// Whether a foreground app was suspended by clicking its taskbar button.
+    pub suspended: bool,
     /// Whether the slot is in use.
     pub open: bool,
     /// Z-order (larger is closer to the viewer).
@@ -57,6 +110,8 @@ impl DesktopWindow {
         rect: Rect::new(0, 0, 0, 0),
         restore: Rect::new(0, 0, 0, 0),
         state: WindowState::Normal,
+        restore_state: WindowState::Normal,
+        suspended: false,
         open: false,
         z: 0,
         pid: None,
@@ -99,10 +154,11 @@ impl<const N: usize> WindowManager<N> {
             .iter()
             .position(|window| window.open && window.app == app)
         {
-            self.focus(index);
             if self.windows[index].state == WindowState::Minimized {
-                self.windows[index].state = WindowState::Normal;
+                self.windows[index].state = self.windows[index].restore_state;
             }
+            self.windows[index].suspended = false;
+            self.focus(index);
             return Some(index);
         }
 
@@ -122,6 +178,8 @@ impl<const N: usize> WindowManager<N> {
         window.rect = rect;
         window.restore = rect;
         window.state = WindowState::Normal;
+        window.restore_state = WindowState::Normal;
+        window.suspended = false;
         window.open = true;
         window.pid = None;
         window.launched = false;
@@ -207,6 +265,7 @@ impl<const N: usize> WindowManager<N> {
         window.open = false;
         window.pid = None;
         window.launched = false;
+        window.suspended = false;
         if self.focused == Some(index) {
             self.focused = self.topmost_open(None);
         }
@@ -221,6 +280,9 @@ impl<const N: usize> WindowManager<N> {
         if !window.open || window.state == WindowState::Minimized {
             return false;
         }
+        // Remember whether the window was maximised so restoring it from the
+        // taskbar returns it to the same size, exactly like XP.
+        window.restore_state = window.state;
         window.state = WindowState::Minimized;
         if self.focused == Some(index) {
             self.focused = self.topmost_open(Some(index));
@@ -236,7 +298,7 @@ impl<const N: usize> WindowManager<N> {
         if !window.open || window.state != WindowState::Minimized {
             return false;
         }
-        window.state = WindowState::Normal;
+        window.state = window.restore_state;
         self.focus(index);
         true
     }
@@ -262,13 +324,18 @@ impl<const N: usize> WindowManager<N> {
         if !window.open {
             return false;
         }
+        if window.state == WindowState::Minimized {
+            window.state = window.restore_state;
+        }
         if window.state == WindowState::Maximized {
             window.rect = window.restore;
             window.state = WindowState::Normal;
+            window.restore_state = WindowState::Normal;
         } else {
             window.restore = window.rect;
             window.rect = work_area;
             window.state = WindowState::Maximized;
+            window.restore_state = WindowState::Maximized;
         }
         self.focus(index);
         true
@@ -292,18 +359,61 @@ impl<const N: usize> WindowManager<N> {
         true
     }
 
-    /// Resizes a normal window.
+    /// Resizes a normal window from its lower-right corner.
     pub fn resize_by(&mut self, index: usize, dw: i32, dh: i32, work_area: Rect) -> bool {
+        self.resize_from(index, ResizeEdge::BottomRight, dw, dh, work_area)
+    }
+
+    /// Resizes a normal window by dragging one edge or corner.
+    ///
+    /// The window is kept inside `work_area` (so it never covers the taskbar)
+    /// and never shrinks below [`MIN_WINDOW_WIDTH`] by [`MIN_WINDOW_HEIGHT`].
+    pub fn resize_from(
+        &mut self,
+        index: usize,
+        edge: ResizeEdge,
+        dx: i32,
+        dy: i32,
+        work_area: Rect,
+    ) -> bool {
         let Some(window) = self.windows.get_mut(index) else {
             return false;
         };
         if !window.open || window.state != WindowState::Normal {
             return false;
         }
-        let max_width = (work_area.right_i32() - window.rect.x).max(240) as u32;
-        let max_height = (work_area.bottom_i32() - window.rect.y).max(160) as u32;
-        window.rect.width = (window.rect.width as i32 + dw).clamp(240, max_width as i32) as u32;
-        window.rect.height = (window.rect.height as i32 + dh).clamp(160, max_height as i32) as u32;
+
+        let min_width = MIN_WINDOW_WIDTH as i32;
+        let min_height = MIN_WINDOW_HEIGHT as i32;
+        let mut left = window.rect.x;
+        let mut top = window.rect.y;
+        let mut right = window.rect.right_i32();
+        let mut bottom = window.rect.bottom_i32();
+
+        if edge.moves_left() {
+            let min_left = work_area.x.min(right - min_width);
+            left = left.saturating_add(dx).clamp(min_left, right - min_width);
+        } else if edge.moves_right() {
+            let max_right = work_area.right_i32().max(left + min_width);
+            right = right.saturating_add(dx).clamp(left + min_width, max_right);
+        }
+
+        if edge.moves_top() {
+            let min_top = work_area.y.min(bottom - min_height);
+            top = top.saturating_add(dy).clamp(min_top, bottom - min_height);
+        } else if edge.moves_bottom() {
+            let max_bottom = work_area.bottom_i32().max(top + min_height);
+            bottom = bottom
+                .saturating_add(dy)
+                .clamp(top + min_height, max_bottom);
+        }
+
+        window.rect = Rect::new(
+            left,
+            top,
+            (right - left).max(1) as u32,
+            (bottom - top).max(1) as u32,
+        );
         window.restore = window.rect;
         true
     }
@@ -445,5 +555,57 @@ mod tests {
         assert!(rect.y < WORK.bottom_i32());
         assert!(wm.resize_by(index, 10000, 10000, WORK));
         assert!(wm.get(index).unwrap().rect.width <= WORK.width);
+    }
+
+    #[test]
+    fn resizes_from_every_edge_and_corner() {
+        let mut wm = WindowManager::<4>::new();
+        let index = wm.open(0, "One", WORK, 400, 300, 10).unwrap();
+        wm.get_mut(index).unwrap().rect = Rect::new(100, 100, 400, 300);
+        let before = wm.get(index).unwrap().rect;
+
+        assert!(wm.resize_from(index, ResizeEdge::Right, 40, 0, WORK));
+        assert_eq!(wm.get(index).unwrap().rect.width, before.width + 40);
+        assert_eq!(wm.get(index).unwrap().rect.x, before.x);
+
+        assert!(wm.resize_from(index, ResizeEdge::Bottom, 0, 30, WORK));
+        assert_eq!(wm.get(index).unwrap().rect.height, before.height + 30);
+
+        assert!(wm.resize_from(index, ResizeEdge::Left, 20, 0, WORK));
+        let rect = wm.get(index).unwrap().rect;
+        assert_eq!(rect.x, before.x + 20);
+        assert_eq!(rect.width, before.width + 20);
+
+        assert!(wm.resize_from(index, ResizeEdge::Top, 0, 10, WORK));
+        let rect = wm.get(index).unwrap().rect;
+        assert_eq!(rect.y, before.y + 10);
+        assert_eq!(rect.height, before.height + 20);
+
+        // Dragging too far in either direction clamps to the minimum size.
+        assert!(wm.resize_from(index, ResizeEdge::Left, 10000, 0, WORK));
+        assert_eq!(wm.get(index).unwrap().rect.width, MIN_WINDOW_WIDTH);
+        assert!(wm.resize_from(index, ResizeEdge::Top, 0, 10000, WORK));
+        assert_eq!(wm.get(index).unwrap().rect.height, MIN_WINDOW_HEIGHT);
+
+        // And to the work area.
+        assert!(wm.resize_from(index, ResizeEdge::Right, 10000, 0, WORK));
+        assert!(wm.resize_from(index, ResizeEdge::Bottom, 0, 10000, WORK));
+        let rect = wm.get(index).unwrap().rect;
+        assert_eq!(rect.right_i32(), WORK.right_i32());
+        assert_eq!(rect.bottom_i32(), WORK.bottom_i32());
+    }
+
+    #[test]
+    fn a_minimized_maximized_window_restores_maximized() {
+        let mut wm = WindowManager::<4>::new();
+        let index = wm.open(0, "One", WORK, 300, 200, 10).unwrap();
+        assert!(wm.toggle_maximize(index, WORK));
+        assert_eq!(wm.get(index).unwrap().state, WindowState::Maximized);
+
+        assert!(wm.minimize(index));
+        assert_eq!(wm.get(index).unwrap().state, WindowState::Minimized);
+        assert!(wm.restore(index));
+        assert_eq!(wm.get(index).unwrap().state, WindowState::Maximized);
+        assert_eq!(wm.get(index).unwrap().rect, WORK);
     }
 }

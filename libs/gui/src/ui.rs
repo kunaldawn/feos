@@ -471,8 +471,13 @@ impl<'a, 'b, 's, const N: usize> Ui<'a, 'b, 's, N> {
         }
 
         if is_active && sense.contains(Sense::DRAG) {
-            response.dragged =
-                self.pointer_down && (self.pointer_delta.x != 0 || self.pointer_delta.y != 0);
+            // The pointer delta on the press frame includes the movement that
+            // brought the pointer onto the widget. Reporting it as a drag would
+            // make windows jump when a drag starts, so only frames after the
+            // press count as drag movement.
+            response.dragged = self.pointer_down
+                && !self.pointer_pressed
+                && (self.pointer_delta.x != 0 || self.pointer_delta.y != 0);
             response.drag_delta = self.pointer_delta;
         }
 

@@ -17,8 +17,10 @@
 
 #![no_std]
 
+use core::cell::Cell;
+
 use feos_fs::FileSystem;
-use feos_gfx::Canvas;
+use feos_gfx::{Canvas, Rect};
 use feos_hal::{Audio, Clock, Cpu, Memory, Pointer, Power};
 
 /// The version shared by every crate in the workspace.
@@ -213,6 +215,23 @@ pub struct Context<'a> {
     /// The canvas is stable for the lifetime of the kernel; apps draw
     /// directly into it.
     pub display: &'a mut Option<Canvas<'static>>,
+    /// The part of the framebuffer the app may use, when it was launched from
+    /// the desktop.
+    ///
+    /// `None` means the whole framebuffer. The desktop passes its work area
+    /// (the screen minus the taskbar) so a foreground app such as the file
+    /// explorer can draw full-screen without hiding the taskbar.
+    pub viewport: Option<Rect>,
+    /// Set to `true` when the user clicks this app's taskbar button.
+    ///
+    /// An app that owns the framebuffer should watch
+    /// [`suspend_area`](Self::suspend_area) and return from `App::run` when it
+    /// is clicked; the desktop then minimises the window and can restore and
+    /// run the app again from the taskbar.
+    pub suspend: Option<&'a Cell<bool>>,
+    /// The taskbar button that belongs to this app, in framebuffer
+    /// coordinates. `None` when the app was not launched from the desktop.
+    pub suspend_area: Option<Rect>,
     /// Board facts and kernel services.
     pub platform: &'a Platform,
 }

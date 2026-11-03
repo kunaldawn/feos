@@ -72,6 +72,9 @@ fn execute(line: &str, display: &mut Option<Canvas<'static>>, platform: &Platfor
             let mut context = Context {
                 args,
                 display,
+                viewport: None,
+                suspend: None,
+                suspend_area: None,
                 platform,
             };
             app.run(&mut context);
