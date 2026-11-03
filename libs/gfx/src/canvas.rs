@@ -65,6 +65,22 @@ impl<'a> Canvas<'a> {
         self.pixels
     }
 
+    /// Copies the overlapping part of `source` into this canvas.
+    ///
+    /// A fast whole-buffer copy is used when the layouts match; otherwise the
+    /// rows are copied with clipping. This is the present step for an
+    /// off-screen composition buffer.
+    pub fn copy_from(&mut self, source: &Canvas<'_>) {
+        let width = (self.width as u32).min(source.width as u32) as usize;
+        let height = (self.height as u32).min(source.height as u32) as usize;
+        for row in 0..height {
+            let source_start = row * source.stride;
+            let destination_start = row * self.stride;
+            self.pixels[destination_start..destination_start + width]
+                .copy_from_slice(&source.pixels[source_start..source_start + width]);
+        }
+    }
+
     /// Fills the whole canvas with `color`.
     pub fn clear(&mut self, color: Color) {
         let raw = color.raw();
@@ -404,6 +420,24 @@ mod tests {
         assert!(Canvas::new(&mut pixels, 3, 2, 2).is_none());
         assert!(Canvas::new(&mut pixels, 3, 2, 3).is_none());
         assert!(Canvas::new(&mut pixels, 2, 2, 2).is_some());
+    }
+
+    #[test]
+    fn offscreen_copy_matches_source() {
+        let mut source_pixels = [0u32; 4 * 3];
+        let mut destination_pixels = [0u32; 4 * 3];
+        {
+            let mut source = canvas(&mut source_pixels, 4, 3);
+            source.clear(Color::BLUE);
+            source.put_pixel(1, 1, Color::RED);
+        }
+        {
+            let source = canvas(&mut source_pixels, 4, 3);
+            let mut destination = canvas(&mut destination_pixels, 4, 3);
+            destination.copy_from(&source);
+        }
+        assert_eq!(destination_pixels[0], Color::BLUE.raw());
+        assert_eq!(destination_pixels[5], Color::RED.raw());
     }
 
     #[test]

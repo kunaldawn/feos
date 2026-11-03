@@ -34,8 +34,8 @@ use crate::files::format_size;
 const MAX_PLAYLIST: usize = 64;
 const MAX_OPEN: usize = 128;
 const MAX_PATH: usize = 256;
-const MAX_MEDIA_BYTES: usize = 8 * 1024 * 1024;
-const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+const MAX_MEDIA_BYTES: usize = 4 * 1024 * 1024;
+const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 const PLAYLIST_WIDTH: i32 = 300;
 const TITLE_HEIGHT: i32 = 30;
 const MENU_HEIGHT: i32 = 22;
@@ -2388,12 +2388,17 @@ pub fn run(fs: &dyn FileSystem, context: &mut Context<'_>) {
         let (x, y) = pointer.position();
         state.pointer = Point::new(x as i32, y as i32);
     }
+    let width = display.width();
+    let height = display.height();
+    let mut back_pixels = vec![0u32; width * height];
+    let mut back = Canvas::new(&mut back_pixels, width, height, width);
+
     let mut input = Input::new();
     let mut keys = SerialKeys::new();
     let mut dirty = true;
     let mut last_render = now;
 
-    render(display, fs, &mut state, now);
+    draw_frame(display, back.as_mut(), fs, &mut state, now);
 
     loop {
         let now = platform.clock.uptime_ms();
@@ -2446,7 +2451,7 @@ pub fn run(fs: &dyn FileSystem, context: &mut Context<'_>) {
             || fullscreen_controls
             || osd_active
         {
-            render(display, fs, &mut state, now);
+            draw_frame(display, back.as_mut(), fs, &mut state, now);
             dirty = false;
             last_render = now;
         }
@@ -2460,7 +2465,22 @@ pub fn run(fs: &dyn FileSystem, context: &mut Context<'_>) {
     println!("[player] closed");
 }
 
-fn render(canvas: &mut Canvas<'static>, fs: &dyn FileSystem, state: &mut PlayerState, now: u64) {
+fn draw_frame(
+    front: &mut Canvas<'static>,
+    back: Option<&mut Canvas<'_>>,
+    fs: &dyn FileSystem,
+    state: &mut PlayerState,
+    now: u64,
+) {
+    if let Some(back) = back {
+        render(back, fs, state, now);
+        front.copy_from(back);
+    } else {
+        render(front, fs, state, now);
+    }
+}
+
+fn render(canvas: &mut Canvas<'_>, fs: &dyn FileSystem, state: &mut PlayerState, now: u64) {
     state.set_screen(Rect::new(
         0,
         0,

@@ -9,6 +9,8 @@
 use core::cmp::Ordering;
 use core::fmt::Write;
 
+use alloc::vec;
+
 use feos_app::Context;
 use feos_fs::{FileSystem, NodeId};
 use feos_gfx::{Canvas, Color, Point, Rect};
@@ -3072,12 +3074,23 @@ pub fn run(fs: &dyn FileSystem, context: &mut Context<'_>) {
         let (x, y) = pointer.position();
         state.pointer = Point::new(x as i32, y as i32);
     }
+    let width = display.width();
+    let height = display.height();
+    let mut back_pixels = vec![0u32; width * height];
+    let mut back = Canvas::new(&mut back_pixels, width, height, width);
+
     let mut input = Input::new();
     let mut keys = SerialKeys::new();
     let mut dirty = true;
     let mut last_notice = false;
 
-    render(display, fs, &mut state, platform.clock.uptime_ms());
+    draw_frame(
+        display,
+        back.as_mut(),
+        fs,
+        &mut state,
+        platform.clock.uptime_ms(),
+    );
 
     loop {
         let now = platform.clock.uptime_ms();
@@ -3129,7 +3142,7 @@ pub fn run(fs: &dyn FileSystem, context: &mut Context<'_>) {
             break;
         }
         if dirty || input_changed || pointer_changed || notice_active != last_notice {
-            render(display, fs, &mut state, now);
+            draw_frame(display, back.as_mut(), fs, &mut state, now);
             dirty = false;
             last_notice = notice_active;
         }
@@ -3140,7 +3153,22 @@ pub fn run(fs: &dyn FileSystem, context: &mut Context<'_>) {
     feos_console::println!("[files] explorer closed");
 }
 
-fn render(canvas: &mut Canvas<'static>, fs: &dyn FileSystem, state: &mut ExplorerState, now: u64) {
+fn draw_frame(
+    front: &mut Canvas<'static>,
+    back: Option<&mut Canvas<'_>>,
+    fs: &dyn FileSystem,
+    state: &mut ExplorerState,
+    now: u64,
+) {
+    if let Some(back) = back {
+        render(back, fs, state, now);
+        front.copy_from(back);
+    } else {
+        render(front, fs, state, now);
+    }
+}
+
+fn render(canvas: &mut Canvas<'_>, fs: &dyn FileSystem, state: &mut ExplorerState, now: u64) {
     state.set_screen(Rect::new(
         0,
         0,

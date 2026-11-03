@@ -1094,9 +1094,10 @@ its peak level, so a non-zero peak confirms the DSP path ran.
 - Resolution is fixed at 1024x768 and the buffer lives in the board's `.bss`
   (3 MiB).
 - The desktop composes each frame in an off-screen `BACK` buffer and copies it
-  to the scanout in one pass; other full-screen apps draw directly. There is
-  no hardware acceleration, and the font is ASCII-only (non-ASCII falls back to
-  `?`).
+  to the scanout in one pass. Full-screen foreground apps use their own
+  off-screen canvas and present it with one copy as well, so pointer movement
+  does not expose a half-drawn frame. There is no hardware acceleration, and
+  the font is ASCII-only (non-ASCII falls back to `?`).
 - Single core. All processes share one address space and run at EL1, so there
   is no memory protection or privilege boundary between them; a fault in any
   process halts the machine.

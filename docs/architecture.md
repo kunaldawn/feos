@@ -252,9 +252,10 @@ The video path is:
    caller buffer.
 3. H.264 containers call into `feos-h264`; its reference pictures use the
    kernel heap.
-4. The app scales the RGBA frame directly into the ramfb scanout with
-   nearest-neighbour sampling, letterboxing according to the selected aspect
-   mode, and paints the VLC-style chrome around it.
+4. The app scales the RGBA frame with nearest-neighbour sampling into an
+   off-screen canvas, letterboxes according to the selected aspect mode, paints
+   the VLC-style chrome around it, and copies the completed frame to the ramfb
+   scanout in one pass.
 
 ## The audio path
 
@@ -296,9 +297,12 @@ The filesystem is a library service, not a device driver:
 4. The `files` app renders an XP-style explorer as a full-screen foreground
    app. `apps/commands/src/files/explorer.rs` owns the menu bar, toolbar,
    address history, folder tree, search, four view modes, preview pane,
-   dialogs and pointer/keyboard input. The desktop's serial-key loop is in
-   `feos-keys`, which both the desktop and the explorer use, so they decode
-   arrows, modified arrows, function keys, Page Up/Down and Escape identically.
+   dialogs and pointer/keyboard input. It composes each frame into an
+   off-screen canvas and presents it with one `Canvas::copy_from`, which avoids
+   exposing a half-drawn frame while the pointer moves. The desktop's
+   serial-key loop is in `feos-keys`, which both the desktop and the explorer
+   use, so they decode arrows, modified arrows, function keys, Page Up/Down
+   and Escape identically.
 
 Because the image is compiled in, adding a file is a rebuild, not a mount. The
 same structure can later be fed from an archive or a filesystem driver without
