@@ -167,7 +167,7 @@ fn render(desktop: &mut Session, context: &mut Context<'_>) {
     let uptime = platform.clock.uptime_ms();
     let response = {
         let canvas = context.display.as_mut().expect("display checked above");
-        desktop.render(canvas, &input, uptime)
+        desktop.render_with_platform(canvas, &input, uptime, Some(platform))
     };
     apply_response(desktop, &response, platform, context.display);
     desktop.tick_session(platform.processes);
@@ -241,6 +241,9 @@ fn apply_response(
         match desktop.launch(request.app, platform.apps, platform.processes) {
             LaunchOutcome::Spawned { pid, .. } => {
                 println!("[desktop] launched '{}' as pid {pid}", request.entry)
+            }
+            LaunchOutcome::Windowed { window } => {
+                println!("[desktop] '{}' opened in window {window}", request.entry);
             }
             LaunchOutcome::Foreground { window } => {
                 ran_foreground = true;
@@ -416,6 +419,10 @@ fn launch_id(
             println!("[desktop] '{id}' opened in window {window} as pid {pid}");
             false
         }
+        LaunchOutcome::Windowed { window } => {
+            println!("[desktop] '{id}' opened in window {window}");
+            false
+        }
         LaunchOutcome::Foreground { window } => {
             let viewport = foreground_viewport(desktop, display);
             let suspend_area = foreground_suspend_area(desktop, display, window);
@@ -474,6 +481,9 @@ fn run_app(
     match desktop.launch(index, platform.apps, platform.processes) {
         LaunchOutcome::Spawned { window, pid } => {
             println!("[desktop] '{id}' started in window {window} as pid {pid}")
+        }
+        LaunchOutcome::Windowed { window } => {
+            println!("[desktop] '{id}' opened in window {window}")
         }
         LaunchOutcome::Foreground { window } => {
             println!("[desktop] '{id}' is running in the foreground");

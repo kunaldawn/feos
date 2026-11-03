@@ -621,7 +621,8 @@ taskbar are driven with the pointer; the serial console remains the keyboard:
 | Right-click | Open the desktop menu |
 | Arrow keys | Move the Start-menu highlight, or the wallpaper selection when the menu is closed |
 | `Enter` | Launch the highlighted application |
-| `Space` | Open the Start menu (or toggle All Programs while it is open) |
+| `Space` | Open the Start menu from the desktop (or toggle All Programs while it is open) |
+| `Ctrl+Esc` | Open the Start menu while an application has focus |
 | `Tab` | Toggle All Programs, or focus the next window when the menu is closed |
 | `Esc` | Close the Start menu |
 | `Ctrl-\` | Leave the desktop and return to the serial shell (`Ctrl-D` also works) |
@@ -720,8 +721,9 @@ feos> taskmgr
 ```
 
 The `ps` command remains the serial-console view. The task manager is a
-foreground app, so the desktop opens it from the Start menu or the desktop
-context menu's **Task Manager** item, and `Esc` returns to the desktop.
+windowed app, so the desktop opens it from the Start menu or the desktop
+context menu's **Task Manager** item; it can be moved, resized, minimized and
+restored while the taskbar and other windows stay live.
 
 CPU accounting is real: the scheduler records one tick per process and marks
 ticks spent in the architecture's `WFI` idle wait separately, so an idle
@@ -791,18 +793,19 @@ else works with either the mouse or the serial keyboard:
 | `Tab` / `Shift+Tab` | Move focus between list, tree and address bar |
 | `Esc` | Close a menu/dialog, or return to the desktop |
 
-Interactive apps use `App::foreground` to ask the desktop to run them
-synchronously. The desktop opens a window, passes its work area through
-`Context::viewport`, then closes the window and redraws itself when the app
-returns. Because the app draws above the taskbar rather than over the whole
-framebuffer, the XP taskbar stays visible the whole time. The File Explorer
-is launched this way from the Start menu.
+Interactive apps implement `App::windowed`. The desktop opens a managed
+window, then calls `App::frame_window` once per frame with a content canvas and
+the desktop's input. The app keeps its state while the desktop stays in its
+normal loop, so wallpaper icons remain visible beside the window and the
+taskbar, Start menu and other windows keep working. Minimizing a window
+preserves the app; restoring it from the taskbar resumes the same session.
+File Explorer, Task Manager and Media Player all run this way.
 
 ## The video player
 
 ![The feos video player showing an H.264 MP4](docs/player.png)
 
-`player` is a VLC-inspired foreground application built on `feos-video`,
+`player` is a VLC-inspired windowed application built on `feos-video`,
 `feos-fs` and the GUI toolkit. It scans `/media` recursively, opens the first
 movie automatically, and keeps a session playlist with the other supported
 files. The initial filesystem ships with tiny GIF, MJPEG, raw AVI, H.264 MP4,

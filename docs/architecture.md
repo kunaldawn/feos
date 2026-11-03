@@ -294,16 +294,17 @@ The filesystem is a library service, not a device driver:
 3. The kernel stores that reference in `Platform::filesystem`, so apps never
    learn how the image is stored. A future virtio-blk or RAM backend implements
    the same trait.
-4. The `files` app renders an XP-style explorer as a foreground app.
+4. The `files` app renders an XP-style explorer inside a desktop window.
    `apps/commands/src/files/explorer.rs` owns the menu bar, toolbar, address
    history, folder tree, search, four view modes, preview pane, dialogs and
-   pointer/keyboard input. It composes each frame into an off-screen canvas
-   sized to `Context::viewport` (the desktop work area, so the taskbar stays
-   visible) and presents it with one `Canvas::blit`, which avoids exposing a
-   half-drawn frame while the pointer moves. The desktop's
-   serial-key loop is in `feos-keys`, which both the desktop and the explorer
-   use, so they decode arrows, modified arrows, function keys, Page Up/Down
-   and Escape identically.
+   pointer/keyboard input. `App::windowed` lets the desktop drive it through
+   `App::open_window`/`App::frame_window` with a `WindowContext`: the desktop
+   supplies a content-sized `Canvas` sub-view, frame input and its platform
+   services. Because the app no longer owns the screen, wallpaper icons, the
+   taskbar, the Start menu and other windows stay interactive. The desktop's
+   serial-key loop is in `feos-keys`; routed `Event`s give the explorer and
+   the desktop identical arrow, modified-arrow, function-key, Page Up/Down and
+   Escape decoding.
 
 Because the image is compiled in, adding a file is a rebuild, not a mount. The
 same structure can later be fed from an archive or a filesystem driver without

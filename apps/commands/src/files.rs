@@ -15,7 +15,7 @@
 
 use core::fmt::Write;
 
-use feos_app::{App, Context};
+use feos_app::{App, Context, WindowContext, WindowFrame};
 use feos_console::{print, println};
 use feos_fs::{EntryKind, FileSystem, NodeId};
 use feos_text::Text;
@@ -47,6 +47,28 @@ impl App for Files {
 
     fn foreground(&self) -> bool {
         true
+    }
+
+    fn windowed(&self) -> bool {
+        true
+    }
+
+    fn open_window(&self, context: &WindowContext<'_, '_>) -> bool {
+        let Some(fs) = context.platform.filesystem else {
+            return false;
+        };
+        explorer::open_window(fs, context)
+    }
+
+    fn frame_window(&self, context: &mut WindowContext<'_, '_>) -> WindowFrame {
+        let Some(fs) = context.platform.filesystem else {
+            return WindowFrame::Close;
+        };
+        explorer::frame_window(fs, context)
+    }
+
+    fn close_window(&self) {
+        explorer::close_window();
     }
 
     fn run(&self, context: &mut Context<'_>) {

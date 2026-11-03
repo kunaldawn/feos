@@ -14,7 +14,7 @@ use core::fmt::Write;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use feos_app::{App, Context};
+use feos_app::{App, Context, WindowContext, WindowFrame};
 use feos_console::println;
 use feos_fs::{FileSystem, NodeId};
 use feos_gfx::{Canvas, Color, Point, Rect};
@@ -23,6 +23,7 @@ use feos_gui::{
 };
 use feos_hal::PointerEvent;
 use feos_keys::SerialKeys;
+use feos_sync::SpinLock;
 use feos_text::Text;
 use feos_video::{
     decode_frame as decode_video_frame, info as video_info, scratch_len, ContainerFormat,
@@ -81,6 +82,32 @@ impl App for Player {
 
     fn foreground(&self) -> bool {
         true
+    }
+
+    fn windowed(&self) -> bool {
+        true
+    }
+
+    fn animates(&self) -> bool {
+        true
+    }
+
+    fn open_window(&self, context: &WindowContext<'_, '_>) -> bool {
+        let Some(fs) = context.platform.filesystem else {
+            return false;
+        };
+        open_player(fs, context)
+    }
+
+    fn frame_window(&self, context: &mut WindowContext<'_, '_>) -> WindowFrame {
+        let Some(fs) = context.platform.filesystem else {
+            return WindowFrame::Close;
+        };
+        frame_player(fs, context)
+    }
+
+    fn close_window(&self) {
+        close_player();
     }
 
     fn run(&self, context: &mut Context<'_>) {
@@ -453,8 +480,11 @@ struct PlayerState {
     menu_open: Option<MenuKind>,
     menu_hover: usize,
     context: Option<ContextMenu>,
+    /// True when the player is hosted by the desktop window manager.
+    embedded: bool,
     pointer: Point,
     has_pointer: bool,
+    show_cursor: bool,
     mouse_down: bool,
     drag: DragMode,
     resume_after_seek: bool,
@@ -516,8 +546,10 @@ impl PlayerState {
             menu_open: None,
             menu_hover: 0,
             context: None,
+            embedded: false,
             pointer: Point::new(-100, -100),
             has_pointer: false,
+            show_cursor: true,
             mouse_down: false,
             drag: DragMode::None,
             resume_after_seek: false,
@@ -1463,16 +1495,18 @@ impl PlayerState {
             }
         }
 
-        if let Some(button) = title_button_at(layout, point) {
-            match button {
-                0 => self.show_osd("Minimize is handled by the desktop", now),
-                1 => self.toggle_fullscreen(now),
-                _ => {
-                    self.exit = true;
-                    return true;
+        if !self.embedded {
+            if let Some(button) = title_button_at(layout, point) {
+                match button {
+                    0 => self.show_osd("Minimize is handled by the desktop", now),
+                    1 => self.toggle_fullscreen(now),
+                    _ => {
+                        self.exit = true;
+                        return true;
+                    }
                 }
+                return false;
             }
-            return false;
         }
 
         if !layout.toolbar.is_empty() {
@@ -2071,7 +2105,8 @@ impl Layout {
                 status: empty_rect(),
             };
         }
-        let (title, rest) = screen.split_top(TITLE_HEIGHT);
+        let title_height = if state.embedded { 0 } else { TITLE_HEIGHT };
+        let (title, rest) = screen.split_top(title_height);
         let (menu_bar, rest) = rest.split_top(MENU_HEIGHT);
         let (toolbar, rest) = rest.split_top(TOOLBAR_HEIGHT);
         let (status, rest) = rest.split_bottom(STATUS_HEIGHT);
@@ -2374,6 +2409,60 @@ fn open_row_at(state: &PlayerState, layout: DialogLayout, point: Point) -> Optio
 }
 
 /// Runs the VLC-style player.
+/// State of a media player hosted inside a desktop window.
+static WINDOW: SpinLock<Option<PlayerState>> = SpinLock::new(None);
+
+pub(super) fn open_player(fs: &dyn FileSystem, context: &WindowContext<'_, '_>) -> bool {
+    let screen = Rect::new(
+        0,
+        0,
+        context.canvas.width() as u32,
+        context.canvas.height() as u32,
+    );
+    let mut state = PlayerState::new(fs, screen, context.args, context.now_ms);
+    state.has_pointer = true;
+    state.pointer = context.pointer();
+    state.show_cursor = false;
+    state.embedded = true;
+    *WINDOW.lock() = Some(state);
+    true
+}
+
+pub(super) fn frame_player(
+    fs: &dyn FileSystem,
+    context: &mut WindowContext<'_, '_>,
+) -> WindowFrame {
+    let mut guard = WINDOW.lock();
+    let Some(state) = guard.as_mut() else {
+        return WindowFrame::Close;
+    };
+    let now = context.now_ms;
+
+    context.dispatch_pointer(|report| {
+        if state.handle_pointer(fs, report, now) {
+            state.exit = true;
+        }
+    });
+    context.dispatch_keys(|event| {
+        if let Event::KeyDown(key, modifiers) = event {
+            if state.handle_key(fs, key, modifiers, now) {
+                state.exit = true;
+            }
+        }
+    });
+    state.tick(fs, now);
+
+    if state.exit {
+        return WindowFrame::Close;
+    }
+    render(context.canvas, fs, state, now);
+    WindowFrame::Continue
+}
+
+pub(super) fn close_player() {
+    *WINDOW.lock() = None;
+}
+
 pub fn run(fs: &dyn FileSystem, context: &mut Context<'_>) {
     let platform = context.platform;
     let suspend = context.suspend;
@@ -2519,7 +2608,9 @@ fn render(canvas: &mut Canvas<'_>, fs: &dyn FileSystem, state: &mut PlayerState,
     painter.fill_rect(layout.screen, BG);
     draw_video(&mut painter, state, layout, now);
     if !state.fullscreen {
-        draw_title_bar(&mut painter, state, layout);
+        if !state.embedded {
+            draw_title_bar(&mut painter, state, layout);
+        }
         draw_menu_bar(&mut painter, state, layout);
         draw_toolbar(&mut painter, state, layout);
         draw_controls(&mut painter, state, layout, now);
@@ -2546,7 +2637,7 @@ fn render(canvas: &mut Canvas<'_>, fs: &dyn FileSystem, state: &mut PlayerState,
     if state.dialog != Dialog::None {
         draw_dialog(&mut painter, fs, state, now);
     }
-    if state.has_pointer {
+    if state.has_pointer && state.show_cursor {
         draw_cursor(&mut painter, state.pointer.x, state.pointer.y);
     }
 }

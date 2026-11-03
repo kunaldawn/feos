@@ -24,7 +24,10 @@ use core::fmt::Write;
 
 use alloc::vec;
 
-use feos_app::{App, Context, Platform, ProcessInfo, ProcessState, SystemInfo, MAX_PROCESSES};
+use feos_app::{
+    App, Context, Platform, ProcessInfo, ProcessState, SystemInfo, WindowContext, WindowFrame,
+    MAX_PROCESSES,
+};
 use feos_console::println;
 use feos_gfx::{Canvas, Color, Point, Rect};
 use feos_gui::{
@@ -33,6 +36,7 @@ use feos_gui::{
 };
 use feos_hal::{MemoryInfo, PointerEvent};
 use feos_keys::SerialKeys;
+use feos_sync::SpinLock;
 use feos_text::Text;
 
 /// Number of history samples kept for the performance graphs.
@@ -101,6 +105,26 @@ impl App for TaskManager {
 
     fn foreground(&self) -> bool {
         true
+    }
+
+    fn windowed(&self) -> bool {
+        true
+    }
+
+    fn animates(&self) -> bool {
+        true
+    }
+
+    fn open_window(&self, context: &WindowContext<'_, '_>) -> bool {
+        open_task_manager(context)
+    }
+
+    fn frame_window(&self, context: &mut WindowContext<'_, '_>) -> WindowFrame {
+        frame_task_manager(context)
+    }
+
+    fn close_window(&self) {
+        close_task_manager();
     }
 
     fn run(&self, context: &mut Context<'_>) {
@@ -496,6 +520,8 @@ struct State {
     window_y: i32,
     window_w: i32,
     window_h: i32,
+    /// True when the task manager is hosted by the desktop window manager.
+    embedded: bool,
 
     tab: Tab,
     pointer: Point,
@@ -573,6 +599,7 @@ impl State {
             window_y: (screen.height as i32 - height).max(0) / 2,
             window_w: width,
             window_h: height,
+            embedded: false,
             tab: Tab::Applications,
             pointer: Point::new(-100, -100),
             has_pointer: false,
@@ -1192,7 +1219,8 @@ impl Layout {
         } else {
             window.inset(3)
         };
-        let (title, rest) = inner.split_top(TITLE_HEIGHT);
+        let title_height = if state.embedded { 0 } else { TITLE_HEIGHT };
+        let (title, rest) = inner.split_top(title_height);
         let (menu_bar, rest) = rest.split_top(MENU_HEIGHT);
         let (tabs, rest) = rest.split_top(TABS_HEIGHT);
         let (status, content) = if state.show_status {
@@ -1413,6 +1441,63 @@ fn state_cursor_shape(state: &State) -> feos_gui::CursorShape {
     resize_edge_at(window, state.pointer)
         .map(resize_cursor)
         .unwrap_or(feos_gui::CursorShape::Arrow)
+}
+
+/// State of a task manager hosted inside a desktop window.
+static WINDOW: SpinLock<Option<State>> = SpinLock::new(None);
+
+pub(super) fn open_task_manager(context: &WindowContext<'_, '_>) -> bool {
+    let screen = Rect::new(
+        0,
+        0,
+        context.canvas.width() as u32,
+        context.canvas.height() as u32,
+    );
+    let mut state = State::new(screen);
+    state.has_pointer = true;
+    state.pointer = context.pointer();
+    state.embedded = true;
+    state.maximized = true;
+    state.sample(context.platform, context.now_ms);
+    *WINDOW.lock() = Some(state);
+    true
+}
+
+pub(super) fn frame_task_manager(context: &mut WindowContext<'_, '_>) -> WindowFrame {
+    let mut guard = WINDOW.lock();
+    let Some(state) = guard.as_mut() else {
+        return WindowFrame::Close;
+    };
+    let platform = context.platform;
+    let now = context.now_ms;
+
+    context.dispatch_pointer(|report| state.handle_pointer(platform, report, now));
+    context.dispatch_keys(|event| match event {
+        Event::KeyDown(key, modifiers) => state.handle_key(platform, key, modifiers, now),
+        Event::Text(ch) => state.handle_text(platform, ch, now),
+        _ => {}
+    });
+
+    if state.exit {
+        return WindowFrame::Close;
+    }
+
+    let due = state.update != UpdateSpeed::Paused
+        && now.wrapping_sub(state.last_sample_ms) >= state.update.interval_ms();
+    if due {
+        state.sample(platform, now);
+    }
+    if state.notice_until != 0 && now >= state.notice_until {
+        state.notice.clear();
+        state.notice_until = 0;
+    }
+
+    render(context.canvas, platform, state, now);
+    WindowFrame::Continue
+}
+
+pub(super) fn close_task_manager() {
+    *WINDOW.lock() = None;
 }
 
 fn run(context: &mut Context<'_>) {
@@ -1741,20 +1826,22 @@ impl State {
         }
 
         // Title bar buttons.
-        for index in 0..3 {
-            if title_button_rect(layout, index).contains(self.pointer) {
-                match index {
-                    0 => {
-                        self.exit = true;
-                        self.exit_message = "minimized";
+        if !self.embedded {
+            for index in 0..3 {
+                if title_button_rect(layout, index).contains(self.pointer) {
+                    match index {
+                        0 => {
+                            self.exit = true;
+                            self.exit_message = "minimized";
+                        }
+                        1 => self.maximized = !self.maximized,
+                        _ => {
+                            self.exit = true;
+                            self.exit_message = "";
+                        }
                     }
-                    1 => self.maximized = !self.maximized,
-                    _ => {
-                        self.exit = true;
-                        self.exit_message = "";
-                    }
+                    return;
                 }
-                return;
             }
         }
 
@@ -2721,38 +2808,40 @@ fn draw_window(painter: &mut Painter<'_, '_>, state: &State, layout: Layout, now
         );
         painter.fill_rect(layout.inner, FACE);
     }
-    painter
-        .canvas_mut()
-        .fill_vertical_gradient(layout.title, TITLE_TOP, TITLE_BOTTOM);
+    if !state.embedded {
+        painter
+            .canvas_mut()
+            .fill_vertical_gradient(layout.title, TITLE_TOP, TITLE_BOTTOM);
 
-    draw_taskmgr_icon(
-        painter,
-        Rect::new(layout.title.x + 7, layout.title.y + 5, 18, 18),
-    );
-
-    let buttons_left = title_button_rect(layout, 0).x - 6;
-    painter.draw_text_ellipsis(
-        Rect::new(
-            layout.title.x + 31,
-            layout.title.y,
-            (buttons_left - layout.title.x - 35).max(10) as u32,
-            layout.title.height,
-        ),
-        "Windows Task Manager",
-        Color::WHITE,
-        2,
-        Align::Start,
-        VerticalAlign::Middle,
-    );
-
-    for index in 0..3 {
-        draw_title_button(
+        draw_taskmgr_icon(
             painter,
-            title_button_rect(layout, index),
-            index,
-            state.pointer,
-            state.maximized,
+            Rect::new(layout.title.x + 7, layout.title.y + 5, 18, 18),
         );
+
+        let buttons_left = title_button_rect(layout, 0).x - 6;
+        painter.draw_text_ellipsis(
+            Rect::new(
+                layout.title.x + 31,
+                layout.title.y,
+                (buttons_left - layout.title.x - 35).max(10) as u32,
+                layout.title.height,
+            ),
+            "Windows Task Manager",
+            Color::WHITE,
+            2,
+            Align::Start,
+            VerticalAlign::Middle,
+        );
+
+        for index in 0..3 {
+            draw_title_button(
+                painter,
+                title_button_rect(layout, index),
+                index,
+                state.pointer,
+                state.maximized,
+            );
+        }
     }
 
     draw_menu_bar(painter, state, layout);

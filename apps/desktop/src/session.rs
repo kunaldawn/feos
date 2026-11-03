@@ -71,6 +71,7 @@ pub fn run_session(
 
     let mut last_tick = platform.clock.uptime_ms();
     let mut last_minute = u64::MAX;
+    let mut last_animated_frame = 0u64;
     let mut dirty = true;
     let mut pointer_position = platform.pointer.map(|pointer| pointer.position());
     if let Some((x, y)) = pointer_position {
@@ -125,10 +126,10 @@ pub fn run_session(
 
         if dirty {
             let response = if let Some(back) = back.as_mut() {
-                session.render(back, &input, now)
+                session.render_with_platform(back, &input, now, Some(platform))
             } else {
                 let front = display.as_mut().expect("display checked at session start");
-                session.render(front, &input, now)
+                session.render_with_platform(front, &input, now, Some(platform))
             };
 
             // A foreground app paints directly into the scanout and only the
@@ -166,6 +167,13 @@ pub fn run_session(
             // painted (closing or minimising a window, for example). Compose
             // one more frame so that result becomes visible.
             dirty = ran_foreground || response.launch.is_some() || had_input;
+            // Windowed apps can animate (the media player, live task-manager
+            // graphs). Repaint at a modest rate while one is open without
+            // spinning the compositor at the full poll rate.
+            if response.redraw && now.wrapping_sub(last_animated_frame) >= 33 {
+                last_animated_frame = now;
+                dirty = true;
+            }
 
             if response.command == StartMenuCommand::LogOff {
                 println!("[desktop] log off - returning to the serial shell");

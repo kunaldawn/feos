@@ -22,7 +22,8 @@ is driven with a real pointer. The serial console remains the keyboard:
 | Right-click | Open the desktop menu (Refresh, Show Desktop, Task Manager, Properties) |
 | Arrow keys | Move the Start-menu highlight, or the wallpaper selection when the menu is closed |
 | `Enter` | Launch the highlighted application |
-| `Space` | Open the Start menu; toggle All Programs while it is open |
+| `Space` | Open the Start menu from the desktop; toggle All Programs while it is open |
+| `Ctrl+Esc` | Open the Start menu even while an application has focus |
 | `Tab` | Toggle All Programs, or focus the next window when the menu is closed |
 | `Esc` | Close the Start menu |
 | `Ctrl-\` | Leave the desktop and return to the serial shell (`Ctrl-D` also works) |
@@ -221,27 +222,33 @@ maximised), clicking a minimised one restores it to its previous normal or
 maximised state, and clicking another window raises it.
 
 `Desktop::launch(index, registry, processes)` opens the window first, resolves
-the manifest entry point through `AppRegistry`, and spawns it through
-`Processes`. An unknown entry leaves the window open with an explanation
-instead of failing silently. An app that returns `true` from
-`App::foreground` (currently the File Explorer, Task Manager and Media Player)
-is run synchronously by the desktop session so it can draw and read the keyboard
-and pointer. The desktop passes its work area as `Context::viewport`, so the app
-draws above the taskbar instead of covering it. It also passes the app's
-taskbar button as `Context::suspend_area`: clicking that button makes the app
-return, the desktop minimises its window, and clicking the button again restores
-the window and runs the app. A normal close still closes the window. The
-File Explorer and Task Manager windows resize from every edge and corner as
-well, and use the same resize cursors as the desktop window manager. The
-desktop app's session
-loop polls the virtio pointer through `feos_hal::Pointer` and feeds
-`feos_gui::Input` events; the same path forwards `DesktopResponse::launch`.
+the manifest entry point through `AppRegistry`, and either hosts it in the
+window or spawns it through `Processes`. An unknown entry leaves the window open
+with an explanation instead of failing silently.
+
+File Explorer, Task Manager and Media Player implement `App::windowed`, so the
+desktop drives them one frame at a time through `App::open_window` and
+`App::frame_window`. Their state persists in each app across frames, which
+means the desktop keeps running normally while they are open: wallpaper icons
+stay visible around the window, the taskbar and Start menu remain clickable,
+and several windows can be open at once. `WindowContext` supplies the content
+canvas, frame input, the content origin and platform services; pointer events
+are routed only to the topmost content area, and keyboard events go to the
+focused hosted app. Minimizing preserves the app state, so restoring from the
+taskbar resumes the same window instead of restarting the application.
+
+Apps that return `true` from `App::foreground` but not `App::windowed` still use
+the older synchronous path with `Context::viewport` and `Context::suspend_area`
+for compatibility. The desktop app's session loop polls the virtio pointer
+through `feos_hal::Pointer` and feeds `feos_gui::Input` events; the same path
+forwards `DesktopResponse::launch`.
 
 The boot session composes frames into the board's off-screen back buffer and
 copies the finished frame to the ramfb scanout in one pass. It also redraws
 only when input arrives, the clock minute changes, a service or window state
-changes, or a launch needs a new frame, so an idle desktop leaves the scanout
-buffer alone.
+changes, a launch needs a new frame, or an animating windowed app (media
+playback, live task-manager graphs) asks for another frame. An idle desktop
+leaves the scanout buffer alone.
 
 ## Init process manager
 

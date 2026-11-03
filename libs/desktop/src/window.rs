@@ -5,6 +5,7 @@
 //! rectangle for maximise/restore. The manager owns no pixels and no
 //! allocation; the renderer reads it and draws in z-order.
 
+use feos_app::App;
 use feos_gfx::{Point, Rect};
 use feos_gui::RectExt;
 use feos_text::Text;
@@ -20,6 +21,19 @@ pub const MIN_WINDOW_WIDTH: u32 = 240;
 
 /// Smallest height a resized window may have.
 pub const MIN_WINDOW_HEIGHT: u32 = 160;
+
+/// Height of the managed title bar.
+pub const TITLE_HEIGHT: u32 = 28;
+
+/// The content rectangle of a managed window.
+pub fn content_rect(rect: Rect) -> Rect {
+    Rect::new(
+        rect.x + 1,
+        rect.y + TITLE_HEIGHT as i32 + 1,
+        rect.width.saturating_sub(2),
+        rect.height.saturating_sub(TITLE_HEIGHT + 2),
+    )
+}
 
 /// How a window is currently displayed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -92,6 +106,10 @@ pub struct DesktopWindow {
     pub restore_state: WindowState,
     /// Whether a foreground app was suspended by clicking its taskbar button.
     pub suspended: bool,
+    /// The windowed application hosted by this window, if any.
+    pub runtime: Option<&'static dyn App>,
+    /// Whether [`App::open_window`] has been called for this window.
+    pub app_started: bool,
     /// Whether the slot is in use.
     pub open: bool,
     /// Z-order (larger is closer to the viewer).
@@ -112,6 +130,8 @@ impl DesktopWindow {
         state: WindowState::Normal,
         restore_state: WindowState::Normal,
         suspended: false,
+        runtime: None,
+        app_started: false,
         open: false,
         z: 0,
         pid: None,
@@ -164,11 +184,18 @@ impl<const N: usize> WindowManager<N> {
 
         let index = self.windows.iter().position(|window| !window.open)?;
         let offset = (self.next_z as i32 % 6) * cascade.max(0);
-        let width = default_width.min(work_area.width.max(1)).max(1);
+        // Keep the wallpaper's icon column visible for normal windows. The
+        // user can still maximise or resize over it afterwards.
+        let icon_margin = if work_area.width >= 900 { 160 } else { 48 };
+        let width = default_width
+            .min(work_area.width.saturating_sub(icon_margin).max(1))
+            .max(1);
         let height = default_height.min(work_area.height.max(1)).max(1);
         let max_x = (work_area.right_i32() - width as i32).max(work_area.x);
         let max_y = (work_area.bottom_i32() - height as i32).max(work_area.y);
-        let x = (work_area.x + 32 + offset).min(max_x);
+        // Leave the wallpaper's icon column visible, the way XP keeps the
+        // left edge of the desktop usable when a window opens.
+        let x = (work_area.x + icon_margin as i32 + offset).min(max_x);
         let y = (work_area.y + 24 + offset).min(max_y);
         let rect = Rect::new(x, y, width, height);
 
@@ -180,6 +207,8 @@ impl<const N: usize> WindowManager<N> {
         window.state = WindowState::Normal;
         window.restore_state = WindowState::Normal;
         window.suspended = false;
+        window.runtime = None;
+        window.app_started = false;
         window.open = true;
         window.pid = None;
         window.launched = false;
@@ -236,6 +265,11 @@ impl<const N: usize> WindowManager<N> {
         true
     }
 
+    /// Clears keyboard focus, as clicking the wallpaper does in XP.
+    pub fn clear_focus(&mut self) {
+        self.focused = None;
+    }
+
     /// Focuses the next open window in slot order.
     pub fn focus_next(&mut self) -> Option<usize> {
         let count = self.count();
@@ -266,6 +300,8 @@ impl<const N: usize> WindowManager<N> {
         window.pid = None;
         window.launched = false;
         window.suspended = false;
+        window.runtime = None;
+        window.app_started = false;
         if self.focused == Some(index) {
             self.focused = self.topmost_open(None);
         }
@@ -383,8 +419,13 @@ impl<const N: usize> WindowManager<N> {
             return false;
         }
 
-        let min_width = MIN_WINDOW_WIDTH as i32;
-        let min_height = MIN_WINDOW_HEIGHT as i32;
+        // Hosted apps lay themselves out against a minimum content size, so
+        // keep their desktop frames large enough to avoid clipping their UI.
+        let (min_width, min_height) = if window.runtime.is_some() {
+            ((720 + 2) as i32, (480 + TITLE_HEIGHT as i32 + 2) as i32)
+        } else {
+            (MIN_WINDOW_WIDTH as i32, MIN_WINDOW_HEIGHT as i32)
+        };
         let mut left = window.rect.x;
         let mut top = window.rect.y;
         let mut right = window.rect.right_i32();
@@ -425,6 +466,26 @@ impl<const N: usize> WindowManager<N> {
             .enumerate()
             .filter(|(_, window)| window.open && window.state != WindowState::Minimized)
             .filter(|(_, window)| window.rect.contains(point))
+            .max_by_key(|(_, window)| window.z)
+            .map(|(index, _)| index)
+    }
+
+    /// Returns the topmost window whose content area contains `point`.
+    ///
+    /// Title bars and the resize border belong to the desktop window manager,
+    /// so app pointer events are routed through this narrower test. The inset
+    /// matches the transparent resize border drawn by the desktop.
+    pub fn topmost_content_at(&self, point: Point) -> Option<usize> {
+        const BORDER: i32 = 4;
+        self.windows
+            .iter()
+            .enumerate()
+            .filter(|(_, window)| window.open && window.state != WindowState::Minimized)
+            .filter(|(_, window)| {
+                content_rect(window.rect)
+                    .inset_each(BORDER, 0, BORDER, BORDER)
+                    .contains(point)
+            })
             .max_by_key(|(_, window)| window.z)
             .map(|(index, _)| index)
     }
@@ -555,6 +616,18 @@ mod tests {
         assert!(rect.y < WORK.bottom_i32());
         assert!(wm.resize_by(index, 10000, 10000, WORK));
         assert!(wm.get(index).unwrap().rect.width <= WORK.width);
+    }
+
+    #[test]
+    fn content_hit_test_excludes_the_title_bar() {
+        let mut wm = WindowManager::<4>::new();
+        let index = wm.open(0, "One", WORK, 400, 300, 10).unwrap();
+        let rect = Rect::new(10, 10, 400, 300);
+        wm.get_mut(index).unwrap().rect = rect;
+
+        assert_eq!(wm.topmost_content_at(Point::new(60, 60)), Some(index));
+        assert_eq!(wm.topmost_content_at(Point::new(60, rect.y + 2)), None);
+        assert_eq!(wm.topmost_at(Point::new(60, rect.y + 2)), Some(index));
     }
 
     #[test]

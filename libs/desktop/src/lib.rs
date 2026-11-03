@@ -44,10 +44,15 @@ pub mod window;
 
 use core::fmt::Write as _;
 
-use feos_app::{App, AppRegistry, ProcessInfo, ProcessState, Processes, SpawnError, MAX_PROCESSES};
+use feos_app::{
+    App, AppRegistry, Platform, ProcessInfo, ProcessState, Processes, SpawnError, WindowContext,
+    WindowFrame, MAX_PROCESSES,
+};
 use feos_bundle::{AppCatalog, InstalledApp, ScanReport};
 use feos_gfx::{Canvas, Color, Point, Rect};
-use feos_gui::{Align, Id, Input, InteractionState, Key, RectExt, Sense, Ui, VerticalAlign};
+use feos_gui::{
+    Align, Id, Input, InteractionState, Key, Modifiers, RectExt, Sense, Ui, VerticalAlign,
+};
 use feos_init::{Init, MAX_SERVICES};
 use feos_text::Text;
 
@@ -103,6 +108,11 @@ pub enum LaunchOutcome {
         /// Window opened for the application.
         window: usize,
     },
+    /// The app runs inside its desktop window and is driven by the desktop.
+    Windowed {
+        /// Window hosting the application.
+        window: usize,
+    },
     /// The window was already running this application.
     AlreadyRunning {
         /// Window that displays the application.
@@ -135,6 +145,8 @@ pub struct DesktopResponse {
     pub start_open: bool,
     /// Number of open windows after the frame.
     pub window_count: usize,
+    /// A windowed app is animating and the caller should render another frame.
+    pub redraw: bool,
 }
 
 impl DesktopResponse {
@@ -290,6 +302,8 @@ pub struct Desktop<
     logoff_open: bool,
     /// Whether "Show Desktop" is active.
     show_desktop: bool,
+    /// Window that captured the current pointer drag, if any.
+    pointer_window: Option<usize>,
 }
 
 impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
@@ -329,6 +343,7 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             clock_open: false,
             logoff_open: false,
             show_desktop: false,
+            pointer_window: None,
         }
     }
 
@@ -463,6 +478,16 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
     /// wallpaper selection and `Space` opens the menu. `Enter` activation is
     /// handled by [`render`](Self::render) once the frame is laid out.
     fn handle_keyboard(&mut self, input: &Input, config: &DesktopConfig) {
+        // XP's Ctrl+Esc opens the Start menu even when an application has
+        // keyboard focus. Space only opens it from the desktop.
+        if input
+            .keys()
+            .any(|(key, modifiers)| key == Key::Escape && modifiers.contains(Modifiers::CTRL))
+        {
+            self.start_menu.show();
+            return;
+        }
+
         let up = input.keys().any(|(key, _)| key == Key::Up);
         let down = input.keys().any(|(key, _)| key == Key::Down);
         let left = input.keys().any(|(key, _)| key == Key::Left);
@@ -626,6 +651,17 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
         let Some(runtime) = registry.find(app.manifest.entry.as_str()) else {
             return LaunchOutcome::UnknownEntry;
         };
+        if runtime.windowed() {
+            if let Some(window) = self.windows.get_mut(window_index) {
+                if window.runtime.is_none() {
+                    window.runtime = Some(runtime);
+                    window.app_started = false;
+                }
+            }
+            return LaunchOutcome::Windowed {
+                window: window_index,
+            };
+        }
         if runtime.foreground() {
             return LaunchOutcome::Foreground {
                 window: window_index,
@@ -762,6 +798,17 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
         input: &Input,
         uptime_ms: u64,
     ) -> DesktopResponse {
+        self.render_with_platform(canvas, input, uptime_ms, None)
+    }
+
+    /// Renders one frame with platform services available to windowed apps.
+    pub fn render_with_platform(
+        &mut self,
+        canvas: &mut Canvas<'_>,
+        input: &Input,
+        uptime_ms: u64,
+        platform: Option<&Platform>,
+    ) -> DesktopResponse {
         let theme = self.theme;
         let config = self.config;
         let clock = paint::format_clock(uptime_ms, &config.taskbar);
@@ -790,14 +837,64 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
                 self.logoff_open = false;
             }
         } else {
-            self.handle_keyboard(input, &config);
+            // With a hosted app focused, Tab/Space/arrow keys belong to the
+            // app. Ctrl+Esc is the XP shortcut that always opens Start, and an
+            // already open menu always owns the keyboard.
+            let ctrl_escape = input
+                .keys()
+                .any(|(key, modifiers)| key == Key::Escape && modifiers.contains(Modifiers::CTRL));
+            let window_owns_keyboard = self
+                .windows
+                .focused_window()
+                .is_some_and(|window| window.runtime.is_some());
+            if self.start_menu.open || !window_owns_keyboard || ctrl_escape {
+                self.handle_keyboard(input, &config);
+            }
         }
 
         // The desktop consumes Tab/Space/Enter itself; keep the toolkit from
         // activating a focused widget for the same key press.
         let pointer_input = input.without_keyboard();
         let mut ui = Ui::new(canvas, &theme.ui, &pointer_input, &mut self.interaction);
-        let over_window = self.windows.topmost_at(ui.pointer()).is_some();
+
+        // Follow the pointer into the window that owns the current drag. This
+        // keeps a resize or text selection alive even when the pointer crosses
+        // the window border.
+        let desktop_overlay = self.start_menu.open
+            || self.context.open
+            || run_dialog_open
+            || shutdown_open
+            || clock_open
+            || logoff_open;
+        let pointer_in_work_area = self.work_area.contains(ui.pointer());
+        if (ui.pointer_pressed() || ui.secondary_pressed())
+            && !desktop_overlay
+            && pointer_in_work_area
+        {
+            self.pointer_window = self.windows.topmost_content_at(ui.pointer());
+        }
+        let pointer_window = if desktop_overlay {
+            None
+        } else if self.pointer_window.is_some() {
+            // Keep delivering pointer events to the window that owns the drag,
+            // even when the pointer crosses the taskbar or another window.
+            self.pointer_window
+        } else if pointer_in_work_area {
+            self.windows.topmost_content_at(ui.pointer())
+        } else {
+            None
+        };
+        let keyboard_window = if desktop_overlay {
+            None
+        } else {
+            self.windows.focused().filter(|index| {
+                self.windows
+                    .get(*index)
+                    .is_some_and(|window| window.runtime.is_some())
+            })
+        };
+
+        let over_window = pointer_in_work_area && self.windows.topmost_at(ui.pointer()).is_some();
         paint::draw_wallpaper(&mut ui, &theme, &config.wallpaper);
 
         let mut launch_index = None;
@@ -828,8 +925,9 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
         let mut order = [0usize; N];
         let count = self.windows.z_order(&mut order);
         let work_area = self.work_area;
+        let mut close_after = [false; N];
         for &index in &order[..count] {
-            render_window(
+            close_after[index] = render_window(
                 &mut ui,
                 &theme,
                 &mut self.windows,
@@ -838,7 +936,22 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
                 work_area,
                 &mut self.clicks,
                 uptime_ms,
+                input,
+                platform,
+                pointer_window == Some(index),
+                keyboard_window == Some(index),
             );
+        }
+        for index in 0..N {
+            if !close_after[index] {
+                continue;
+            }
+            if let Some(window) = self.windows.get(index) {
+                if let Some(runtime) = window.runtime {
+                    runtime.close_window();
+                }
+            }
+            self.windows.close(index);
         }
 
         let taskbar_response = taskbar::render(
@@ -863,6 +976,7 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
 
         let pointer = ui.pointer();
         let pointer_pressed = ui.pointer_pressed();
+        let pointer_released = ui.pointer_released();
         let secondary_released = ui.secondary_released();
 
         // A right click on the wallpaper opens the XP desktop menu. Right
@@ -932,6 +1046,10 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
         let pointer = ui.pointer();
         drop(ui);
 
+        if pointer_released || secondary_released {
+            self.pointer_window = None;
+        }
+
         if run_dialog_open && (run_submit || run_clicked) {
             let command = self.run_dialog.text;
             if !command.trim().is_empty() {
@@ -958,33 +1076,43 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
         if let Some(index) = taskbar_response.task_clicked {
             self.start_menu.close();
             self.show_desktop = false;
-            let minimized = self
-                .windows
-                .get(index)
-                .is_some_and(|window| window.state == WindowState::Minimized);
-            let suspended = self
-                .windows
-                .get(index)
-                .is_some_and(|window| window.suspended);
-            if minimized {
-                // A taskbar button for a minimised window brings it back,
-                // including returning it maximised when that is how it was
-                // before it was minimised.
-                self.windows.restore(index);
-                if suspended {
-                    // A foreground app owned the screen before it was
-                    // suspended; run it again now that its window is shown.
-                    if let Some(window) = self.windows.get_mut(index) {
-                        window.suspended = false;
-                        launch_index = Some(window.app);
-                    }
-                }
-            } else if self.windows.is_focused(index) {
-                // Clicking the focused window's button minimises it, whether
-                // the window is normal or maximised.
-                self.windows.minimize(index);
+            // XP uses a double-click on a taskbar button to toggle between
+            // normal and maximized. The click memory already used by title
+            // bars and desktop icons gives us the same interval here.
+            let double = self
+                .clicks
+                .hit(0x5000_0000 | index as u32, pointer, uptime_ms);
+            if double {
+                self.windows.toggle_maximize(index, self.work_area);
             } else {
-                self.windows.focus(index);
+                let minimized = self
+                    .windows
+                    .get(index)
+                    .is_some_and(|window| window.state == WindowState::Minimized);
+                let suspended = self
+                    .windows
+                    .get(index)
+                    .is_some_and(|window| window.suspended);
+                if minimized {
+                    // A taskbar button for a minimised window brings it back,
+                    // including returning it maximised when that is how it was
+                    // before it was minimised.
+                    self.windows.restore(index);
+                    if suspended {
+                        // A foreground app owned the screen before it was
+                        // suspended; run it again now that its window is shown.
+                        if let Some(window) = self.windows.get_mut(index) {
+                            window.suspended = false;
+                            launch_index = Some(window.app);
+                        }
+                    }
+                } else if self.windows.is_focused(index) {
+                    // Clicking the focused window's button minimises it,
+                    // whether the window is normal or maximised.
+                    self.windows.minimize(index);
+                } else {
+                    self.windows.focus(index);
+                }
             }
         }
 
@@ -1091,12 +1219,34 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             self.start_menu.close();
         }
 
+        // Clicking the wallpaper moves keyboard focus off the active window,
+        // exactly like XP.
+        if pointer_pressed
+            && !over_window
+            && !self.start_menu.open
+            && !layout.bar.contains(pointer)
+            && !menu_response.panel.contains(pointer)
+        {
+            self.windows.clear_focus();
+        }
+
         if escape {
             self.start_menu.close();
         }
 
         response.start_open = self.start_menu.open;
         response.window_count = self.windows.count();
+        for index in 0..N {
+            if let Some(window) = self.windows.get(index) {
+                if window.open
+                    && window.state != WindowState::Minimized
+                    && window.runtime.is_some_and(|app| app.animates())
+                {
+                    response.redraw = true;
+                    break;
+                }
+            }
+        }
         response
     }
 }
@@ -1818,6 +1968,7 @@ fn render_shortcuts<const N: usize, const A: usize>(
     launched
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_window<const UI: usize, const N: usize, const A: usize>(
     ui: &mut Ui<'_, '_, '_, UI>,
     theme: &DesktopTheme,
@@ -1827,12 +1978,16 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
     work_area: Rect,
     clicks: &mut ClickMemory,
     now_ms: u64,
-) {
+    input: &Input,
+    platform: Option<&Platform>,
+    pointer_active: bool,
+    keyboard_active: bool,
+) -> bool {
     let Some(window) = windows.get(index).copied() else {
-        return;
+        return false;
     };
     if !window.open || window.state == WindowState::Minimized {
-        return;
+        return false;
     }
 
     let focused = windows.is_focused(index);
@@ -1843,7 +1998,7 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
     };
     let rect = window.rect;
     if rect.width < 80 || rect.height < 40 {
-        return;
+        return false;
     }
 
     // Frame ---------------------------------------------------------------
@@ -1854,7 +2009,7 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
     );
 
     // Title bar -----------------------------------------------------------
-    let title_height = 28u32;
+    let title_height = window::TITLE_HEIGHT;
     let title = Rect::new(rect.x + 1, rect.y + 1, rect.width - 2, title_height);
     let (title_top, title_bottom) = if focused {
         (theme.title_active_top, theme.title_active_bottom)
@@ -1985,24 +2140,22 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
     );
 
     if close_hit.clicked {
+        if let Some(runtime) = window.runtime {
+            runtime.close_window();
+        }
         windows.close(index);
-        return;
+        return false;
     }
     if minimize_hit.clicked {
         windows.minimize(index);
-        return;
+        return false;
     }
     if maximize_hit.clicked {
         windows.toggle_maximize(index, work_area);
     }
 
     // Content -------------------------------------------------------------
-    let content = Rect::new(
-        rect.x + 1,
-        rect.y + title_height as i32 + 1,
-        rect.width - 2,
-        rect.height - title_height - 2,
-    );
+    let content = window::content_rect(rect);
     let clip = ui.painter.push_clip(content);
     ui.painter.fill_rect(content, theme.window_bg);
 
@@ -2012,7 +2165,38 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
         windows.focus(index);
     }
 
-    if let Some(app) = catalog.get(window.app) {
+    let mut close_requested = false;
+    let windowed_runtime = window.runtime.filter(|runtime| runtime.windowed());
+    if let (Some(runtime), Some(platform)) = (windowed_runtime, platform) {
+        let args = catalog
+            .get(window.app)
+            .map(|app| app.manifest.args.as_str())
+            .unwrap_or("");
+        let mut started = window.app_started;
+        if let Some(mut app_canvas) = ui.painter.canvas_mut().sub_canvas(content) {
+            let mut context = WindowContext {
+                args,
+                canvas: &mut app_canvas,
+                input,
+                platform,
+                now_ms,
+                origin: Point::new(content.x, content.y),
+                pointer_active,
+                keyboard_active,
+            };
+            if !started {
+                started = runtime.open_window(&context);
+                if started {
+                    if let Some(window) = windows.get_mut(index) {
+                        window.app_started = true;
+                    }
+                }
+            }
+            if started && runtime.frame_window(&mut context) == WindowFrame::Close {
+                close_requested = true;
+            }
+        }
+    } else if let Some(app) = catalog.get(window.app) {
         if content.width > 40 && content.height > 40 {
             let panel = Rect::new(
                 content.x + 12,
@@ -2169,6 +2353,8 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
             );
         }
     }
+
+    close_requested
 }
 
 /// Registers the eight invisible resize grips around a normal window.
@@ -2263,6 +2449,9 @@ fn resize_edges<const UI: usize, const N: usize>(
             .child(index as u64 + 1)
             .child(edge as u64 + 1);
         let response = ui.interact(id, area, Sense::drag());
+        if response.pressed {
+            windows.focus(index);
+        }
         if response.dragged {
             windows.resize_from(
                 index,
@@ -2471,14 +2660,42 @@ mod tests {
 
     static DUMMY: Dummy = Dummy;
 
+    struct WindowedDummy;
+
+    impl App for WindowedDummy {
+        fn name(&self) -> &'static str {
+            "windowed"
+        }
+
+        fn usage(&self) -> &'static str {
+            "windowed"
+        }
+
+        fn description(&self) -> &'static str {
+            "windowed test app"
+        }
+
+        fn windowed(&self) -> bool {
+            true
+        }
+
+        fn animates(&self) -> bool {
+            true
+        }
+
+        fn run(&self, _context: &mut Context<'_>) {}
+    }
+
+    static WINDOWED: WindowedDummy = WindowedDummy;
+
     struct Registry;
 
     impl AppRegistry for Registry {
         fn find(&self, name: &str) -> Option<&'static dyn App> {
-            if name == "dummy" {
-                Some(&DUMMY)
-            } else {
-                None
+            match name {
+                "dummy" => Some(&DUMMY),
+                "windowed" => Some(&WINDOWED),
+                _ => None,
             }
         }
     }
@@ -2593,6 +2810,31 @@ mod tests {
         let window = desktop.windows().get(0).unwrap();
         assert!(!window.launched);
         assert_eq!(window.pid, None);
+    }
+
+    #[test]
+    fn windowed_apps_open_in_managed_windows() {
+        let bytes = catalog_bundle("win", "windowed");
+        let entries = [DirEntry::new("win.fapp", &bytes)];
+        let mut desktop = Desktop::<4, 4, 2>::default();
+        desktop.scan(&entries);
+        desktop.work_area = Rect::new(0, 0, 800, 560);
+        let processes = FakeProcesses::new();
+
+        let outcome = desktop.launch(0, &Registry, &processes);
+        assert!(matches!(outcome, LaunchOutcome::Windowed { window: 0 }));
+        assert!(desktop.windows().get(0).unwrap().runtime.is_some());
+        assert_eq!(processes.state.lock().spawned, 0);
+
+        let mut pixels = std::vec![0u32; 1024 * 768];
+        let mut canvas = Canvas::new(&mut pixels, 1024, 768, 1024).unwrap();
+        let response = desktop.render(&mut canvas, &Input::new(), 100);
+        assert!(response.redraw);
+        assert_eq!(response.window_count, 1);
+
+        desktop.windows_mut().minimize(0);
+        let response = desktop.render(&mut canvas, &Input::new(), 200);
+        assert!(!response.redraw);
     }
 
     #[test]

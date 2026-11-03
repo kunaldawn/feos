@@ -65,6 +65,36 @@ impl<'a> Canvas<'a> {
         self.pixels
     }
 
+    /// Creates a drawing surface for `rect` inside this canvas.
+    ///
+    /// The returned canvas has its own origin at `(0, 0)` and shares the
+    /// parent's stride, so it can be used to host a window client without
+    /// copying pixels. Drawing is clipped to the requested rectangle.
+    pub fn sub_canvas(&mut self, rect: Rect) -> Option<Canvas<'_>> {
+        let x = rect.x.max(0) as usize;
+        let y = rect.y.max(0) as usize;
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        let width = (rect.width as usize).min(self.width - x);
+        let height = (rect.height as usize).min(self.height - y);
+        if width == 0 || height == 0 {
+            return None;
+        }
+
+        let start = y * self.stride + x;
+        let len = self.stride * height;
+        if start + len > self.pixels.len() {
+            return None;
+        }
+        Canvas::new(
+            &mut self.pixels[start..start + len],
+            width,
+            height,
+            self.stride,
+        )
+    }
+
     /// Copies the overlapping part of `source` into this canvas.
     ///
     /// A fast whole-buffer copy is used when the layouts match; otherwise the
@@ -420,6 +450,21 @@ mod tests {
         assert!(Canvas::new(&mut pixels, 3, 2, 2).is_none());
         assert!(Canvas::new(&mut pixels, 3, 2, 3).is_none());
         assert!(Canvas::new(&mut pixels, 2, 2, 2).is_some());
+    }
+
+    #[test]
+    fn sub_canvas_draws_inside_the_parent() {
+        let mut pixels = [0u32; 8 * 6];
+        let mut parent = canvas(&mut pixels, 8, 6);
+        parent.fill_rect(Rect::new(0, 0, 8, 6), Color::BLACK);
+        {
+            let mut child = parent.sub_canvas(Rect::new(2, 1, 3, 2)).unwrap();
+            child.fill_rect(Rect::new(0, 0, 3, 2), Color::WHITE);
+        }
+        assert_eq!(parent.pixel(2, 1), Some(Color::WHITE));
+        assert_eq!(parent.pixel(4, 2), Some(Color::WHITE));
+        assert_eq!(parent.pixel(1, 1), Some(Color::BLACK));
+        assert_eq!(parent.pixel(5, 2), Some(Color::BLACK));
     }
 
     #[test]

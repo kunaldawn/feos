@@ -11,7 +11,7 @@ use core::fmt::Write;
 
 use alloc::vec;
 
-use feos_app::Context;
+use feos_app::{Context, WindowContext, WindowFrame};
 use feos_fs::{FileSystem, NodeId};
 use feos_gfx::{Canvas, Color, Point, Rect};
 use feos_gui::{
@@ -20,6 +20,7 @@ use feos_gui::{
 };
 use feos_hal::PointerEvent;
 use feos_keys::SerialKeys;
+use feos_sync::SpinLock;
 use feos_text::Text;
 
 use super::{format_size, PATH_MAX};
@@ -449,8 +450,11 @@ struct ExplorerState {
     notice_body: Text<192>,
     message: Text<160>,
     message_until: u64,
+    /// True when the explorer is hosted by the desktop window manager.
+    embedded: bool,
     pointer: Point,
     has_pointer: bool,
+    show_cursor: bool,
     mouse_down: bool,
     drag: DragMode,
     last_click_ms: u64,
@@ -517,8 +521,10 @@ impl ExplorerState {
             notice_body: Text::new(),
             message: Text::new(),
             message_until: 0,
+            embedded: false,
             pointer: Point::new(-100, -100),
             has_pointer: false,
+            show_cursor: true,
             mouse_down: false,
             drag: DragMode::None,
             last_click_ms: 0,
@@ -1585,29 +1591,31 @@ impl ExplorerState {
             }
         }
 
-        if let Some(button) = title_button_at(layout, point) {
-            match button {
-                0 => self.set_message("The desktop controls minimize from the taskbar.", now),
-                1 => {
-                    self.maximized = !self.maximized;
-                    if !self.maximized {
-                        self.window_w = (self.screen.width as i32 - 120)
-                            .max(720)
-                            .min(self.screen.width as i32);
-                        self.window_h = (self.screen.height as i32 - 100)
-                            .max(480)
-                            .min(self.screen.height as i32);
-                        self.window_x = (self.screen.width as i32 - self.window_w) / 2;
-                        self.window_y = (self.screen.height as i32 - self.window_h) / 2;
+        if !self.embedded {
+            if let Some(button) = title_button_at(layout, point) {
+                match button {
+                    0 => self.set_message("The desktop controls minimize from the taskbar.", now),
+                    1 => {
+                        self.maximized = !self.maximized;
+                        if !self.maximized {
+                            self.window_w = (self.screen.width as i32 - 120)
+                                .max(720)
+                                .min(self.screen.width as i32);
+                            self.window_h = (self.screen.height as i32 - 100)
+                                .max(480)
+                                .min(self.screen.height as i32);
+                            self.window_x = (self.screen.width as i32 - self.window_w) / 2;
+                            self.window_y = (self.screen.height as i32 - self.window_h) / 2;
+                        }
                     }
+                    2 => {
+                        self.exit = true;
+                        return true;
+                    }
+                    _ => {}
                 }
-                2 => {
-                    self.exit = true;
-                    return true;
-                }
-                _ => {}
+                return false;
             }
-            return false;
         }
         if !self.maximized {
             if let Some(edge) = resize_edge_at(layout.window, point) {
@@ -2718,7 +2726,8 @@ impl Layout {
         } else {
             window.inset(3)
         };
-        let (title, rest) = inner.split_top(TITLE_HEIGHT);
+        let title_height = if state.embedded { 0 } else { TITLE_HEIGHT };
+        let (title, rest) = inner.split_top(title_height);
         let (menu_bar, rest) = rest.split_top(MENU_BAR_HEIGHT);
         let (toolbar, rest) = if state.toolbar_open {
             rest.split_top(TOOLBAR_HEIGHT)
@@ -3186,6 +3195,68 @@ fn entry_at(state: &ExplorerState, layout: Layout, point: Point) -> Option<usize
 }
 
 /// Runs the interactive XP-style explorer.
+/// State of an explorer hosted inside a desktop window.
+static WINDOW: SpinLock<Option<ExplorerState>> = SpinLock::new(None);
+
+pub(super) fn open_window(fs: &dyn FileSystem, context: &WindowContext<'_, '_>) -> bool {
+    let screen = Rect::new(
+        0,
+        0,
+        context.canvas.width() as u32,
+        context.canvas.height() as u32,
+    );
+    let mut state = ExplorerState::new(fs, screen);
+    state.pointer = context.pointer();
+    state.has_pointer = true;
+    state.show_cursor = false;
+    state.embedded = true;
+    state.maximized = true;
+    *WINDOW.lock() = Some(state);
+    true
+}
+
+pub(super) fn frame_window(
+    fs: &dyn FileSystem,
+    context: &mut WindowContext<'_, '_>,
+) -> WindowFrame {
+    let mut guard = WINDOW.lock();
+    let Some(state) = guard.as_mut() else {
+        return WindowFrame::Close;
+    };
+    let now = context.now_ms;
+
+    context.dispatch_pointer(|report| {
+        if state.handle_pointer(fs, report, now) {
+            state.exit = true;
+        }
+    });
+    context.dispatch_keys(|event| match event {
+        Event::KeyDown(key, modifiers) => {
+            if state.handle_key(fs, key, modifiers, now) {
+                state.exit = true;
+            }
+        }
+        Event::Text(ch) => state.handle_text(ch),
+        _ => {}
+    });
+    state.after_input(fs, now);
+
+    if state.message_until != 0 && now >= state.message_until {
+        state.message.clear();
+        state.message_until = 0;
+    }
+    if state.exit {
+        return WindowFrame::Close;
+    }
+
+    render(context.canvas, fs, state, now);
+    WindowFrame::Continue
+}
+
+pub(super) fn close_window() {
+    *WINDOW.lock() = None;
+}
+
 pub fn run(fs: &dyn FileSystem, context: &mut Context<'_>) {
     let platform = context.platform;
     let suspend = context.suspend;
@@ -3344,7 +3415,7 @@ fn render(canvas: &mut Canvas<'_>, fs: &dyn FileSystem, state: &mut ExplorerStat
     if state.dialog != Dialog::None {
         draw_dialog(&mut painter, fs, state, now);
     }
-    if state.has_pointer {
+    if state.has_pointer && state.show_cursor {
         let shape = if state.menu_open.is_none()
             && state.context.is_none()
             && state.dialog == Dialog::None
@@ -3403,45 +3474,47 @@ fn draw_window(
     }
     painter.fill_rect(layout.window, TITLE_BOTTOM);
     painter.fill_rect(layout.inner, FACE);
-    painter
-        .canvas_mut()
-        .fill_vertical_gradient(layout.title, TITLE_TOP, TITLE_BOTTOM);
+    if !state.embedded {
+        painter
+            .canvas_mut()
+            .fill_vertical_gradient(layout.title, TITLE_TOP, TITLE_BOTTOM);
 
-    draw_folder_icon(
-        painter,
-        Rect::new(layout.title.x + 7, layout.title.y + 6, 16, 16),
-    );
-    let mut title = Text::<96>::new();
-    if state.current == fs.root() {
-        let _ = write!(title, "File Explorer - My Computer");
-    } else {
-        let _ = write!(
-            title,
-            "{} - File Explorer",
-            fs.name(state.current).unwrap_or("/")
-        );
-    }
-    let buttons_left = title_button_rect(layout, 0).x - 6;
-    painter.draw_text_ellipsis(
-        Rect::new(
-            layout.title.x + 30,
-            layout.title.y,
-            (buttons_left - layout.title.x - 34).max(10) as u32,
-            layout.title.height,
-        ),
-        title.as_str(),
-        Color::WHITE,
-        2,
-        Align::Start,
-        VerticalAlign::Middle,
-    );
-    for index in 0..3 {
-        draw_title_button(
+        draw_folder_icon(
             painter,
-            title_button_rect(layout, index),
-            index,
-            state.pointer,
+            Rect::new(layout.title.x + 7, layout.title.y + 6, 16, 16),
         );
+        let mut title = Text::<96>::new();
+        if state.current == fs.root() {
+            let _ = write!(title, "File Explorer - My Computer");
+        } else {
+            let _ = write!(
+                title,
+                "{} - File Explorer",
+                fs.name(state.current).unwrap_or("/")
+            );
+        }
+        let buttons_left = title_button_rect(layout, 0).x - 6;
+        painter.draw_text_ellipsis(
+            Rect::new(
+                layout.title.x + 30,
+                layout.title.y,
+                (buttons_left - layout.title.x - 34).max(10) as u32,
+                layout.title.height,
+            ),
+            title.as_str(),
+            Color::WHITE,
+            2,
+            Align::Start,
+            VerticalAlign::Middle,
+        );
+        for index in 0..3 {
+            draw_title_button(
+                painter,
+                title_button_rect(layout, index),
+                index,
+                state.pointer,
+            );
+        }
     }
 
     draw_menu_bar(painter, fs, state, layout);

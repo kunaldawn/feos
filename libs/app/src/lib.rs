@@ -20,8 +20,9 @@
 use core::cell::Cell;
 
 use feos_fs::FileSystem;
-use feos_gfx::{Canvas, Rect};
-use feos_hal::{Audio, Clock, Cpu, Memory, Pointer, Power};
+use feos_gfx::{Canvas, Point, Rect};
+use feos_gui::{Event, Input};
+use feos_hal::{Audio, Clock, Cpu, Memory, Pointer, PointerEvent, Power};
 
 /// The version shared by every crate in the workspace.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -236,6 +237,119 @@ pub struct Context<'a> {
     pub platform: &'a Platform,
 }
 
+/// Result of one windowed application frame.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WindowFrame {
+    /// Keep the window open.
+    Continue,
+    /// The application asked to close its window.
+    Close,
+}
+
+/// Everything a windowed application sees for one frame.
+pub struct WindowContext<'a, 'b> {
+    /// Arguments the application was opened with.
+    pub args: &'a str,
+    /// Drawing surface for the window content.
+    pub canvas: &'a mut Canvas<'b>,
+    /// Input events for this frame.
+    pub input: &'a Input,
+    /// Board facts and kernel services.
+    pub platform: &'a Platform,
+    /// Milliseconds since boot.
+    pub now_ms: u64,
+    /// Content origin in framebuffer coordinates.
+    pub origin: Point,
+    /// Whether pointer events belong to this window this frame.
+    pub pointer_active: bool,
+    /// Whether keyboard events belong to this window this frame.
+    pub keyboard_active: bool,
+}
+
+impl WindowContext<'_, '_> {
+    /// The pointer position in window-content coordinates.
+    pub fn pointer(&self) -> Point {
+        let pointer = self.input.pointer();
+        Point::new(pointer.x - self.origin.x, pointer.y - self.origin.y)
+    }
+
+    /// Dispatches this frame's pointer events in content coordinates.
+    pub fn dispatch_pointer(&self, mut handler: impl FnMut(PointerEvent)) {
+        if !self.pointer_active {
+            return;
+        }
+        let origin = self.origin;
+        let pointer = self.pointer();
+        let position = |x: i32, y: i32| {
+            (
+                (x - origin.x).clamp(0, u16::MAX as i32) as u16,
+                (y - origin.y).clamp(0, u16::MAX as i32) as u16,
+            )
+        };
+
+        for event in self.input.events() {
+            match event {
+                Event::PointerMoved(pos) => {
+                    let (x, y) = position(pos.x, pos.y);
+                    handler(PointerEvent {
+                        x,
+                        y,
+                        ..PointerEvent::default()
+                    });
+                }
+                Event::PointerDown { pos, button } => {
+                    let (x, y) = position(pos.x, pos.y);
+                    let mut report = PointerEvent {
+                        x,
+                        y,
+                        ..PointerEvent::default()
+                    };
+                    match button {
+                        feos_gui::MouseButton::Left => report.left = Some(true),
+                        feos_gui::MouseButton::Right => report.right = Some(true),
+                        feos_gui::MouseButton::Middle => report.middle = Some(true),
+                    }
+                    handler(report);
+                }
+                Event::PointerUp { pos, button } => {
+                    let (x, y) = position(pos.x, pos.y);
+                    let mut report = PointerEvent {
+                        x,
+                        y,
+                        ..PointerEvent::default()
+                    };
+                    match button {
+                        feos_gui::MouseButton::Left => report.left = Some(false),
+                        feos_gui::MouseButton::Right => report.right = Some(false),
+                        feos_gui::MouseButton::Middle => report.middle = Some(false),
+                    }
+                    handler(report);
+                }
+                Event::PointerWheel(delta) => handler(PointerEvent {
+                    x: pointer.x.clamp(0, u16::MAX as i32) as u16,
+                    y: pointer.y.clamp(0, u16::MAX as i32) as u16,
+                    wheel: delta,
+                    ..PointerEvent::default()
+                }),
+                _ => {}
+            }
+        }
+    }
+
+    /// Dispatches keyboard and text events.
+    pub fn dispatch_keys(&self, mut handler: impl FnMut(Event)) {
+        if !self.keyboard_active {
+            return;
+        }
+        for event in self.input.events() {
+            match event {
+                Event::KeyDown(_, _) | Event::Text(_) => handler(event),
+                _ => {}
+            }
+        }
+    }
+}
+
 /// A lookup table for applications by command name.
 ///
 /// The shell's registry and the desktop's launcher both need to turn a name
@@ -276,6 +390,36 @@ pub trait App: Sync {
     fn foreground(&self) -> bool {
         false
     }
+
+    /// Whether the desktop should host this app in a managed window.
+    ///
+    /// Windowed apps are driven one frame at a time by the desktop instead of
+    /// taking over the screen from a blocking `run` loop. That keeps desktop
+    /// icons, the taskbar and the Start menu responsive while the app runs.
+    fn windowed(&self) -> bool {
+        false
+    }
+
+    /// Whether an open window needs periodic frames even without input.
+    ///
+    /// The media player and task manager return `true` so playback and live
+    /// graphs keep advancing; ordinary document-style apps leave it `false`.
+    fn animates(&self) -> bool {
+        false
+    }
+
+    /// Opens a windowed session. Returns `false` when the app cannot start.
+    fn open_window(&self, _context: &WindowContext<'_, '_>) -> bool {
+        false
+    }
+
+    /// Draws and advances one windowed frame.
+    fn frame_window(&self, _context: &mut WindowContext<'_, '_>) -> WindowFrame {
+        WindowFrame::Close
+    }
+
+    /// Releases any state owned by a windowed session.
+    fn close_window(&self) {}
 
     /// Executes the app.
     fn run(&self, context: &mut Context<'_>);

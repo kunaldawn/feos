@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "feos-fs",
  "feos-gfx",
+ "feos-gui",
  "feos-hal",
 ]
 
@@ -24,6 +25,7 @@ dependencies = [
  "feos-gui",
  "feos-hal",
  "feos-keys",
+ "feos-sync",
  "feos-text",
  "feos-video",
 ]
