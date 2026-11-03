@@ -27,7 +27,11 @@ impl<'a> Canvas<'a> {
         if width == 0 || height == 0 || stride < width {
             return None;
         }
-        if pixels.len() < stride.checked_mul(height)? {
+        // The last row only needs `width` pixels, not a full stride. This lets
+        // sub-canvases start at a non-zero x without requiring padding past
+        // the end of their own rows.
+        let required = stride.checked_mul(height - 1)?.checked_add(width)?;
+        if pixels.len() < required {
             return None;
         }
 
@@ -71,19 +75,20 @@ impl<'a> Canvas<'a> {
     /// parent's stride, so it can be used to host a window client without
     /// copying pixels. Drawing is clipped to the requested rectangle.
     pub fn sub_canvas(&mut self, rect: Rect) -> Option<Canvas<'_>> {
-        let x = rect.x.max(0) as usize;
-        let y = rect.y.max(0) as usize;
-        if x >= self.width || y >= self.height {
-            return None;
-        }
-        let width = (rect.width as usize).min(self.width - x);
-        let height = (rect.height as usize).min(self.height - y);
-        if width == 0 || height == 0 {
+        let x0 = rect.x.max(0) as i64;
+        let y0 = rect.y.max(0) as i64;
+        let x1 = rect.right().min(self.width as i64);
+        let y1 = rect.bottom().min(self.height as i64);
+        if x1 <= x0 || y1 <= y0 {
             return None;
         }
 
+        let x = x0 as usize;
+        let y = y0 as usize;
+        let width = (x1 - x0) as usize;
+        let height = (y1 - y0) as usize;
         let start = y * self.stride + x;
-        let len = self.stride * height;
+        let len = self.stride * (height - 1) + width;
         if start + len > self.pixels.len() {
             return None;
         }
@@ -465,6 +470,19 @@ mod tests {
         assert_eq!(parent.pixel(4, 2), Some(Color::WHITE));
         assert_eq!(parent.pixel(1, 1), Some(Color::BLACK));
         assert_eq!(parent.pixel(5, 2), Some(Color::BLACK));
+    }
+
+    #[test]
+    fn sub_canvas_works_at_the_bottom_right_edge() {
+        let mut pixels = [0u32; 8 * 6];
+        let mut parent = canvas(&mut pixels, 8, 6);
+        parent.fill_rect(Rect::new(0, 0, 8, 6), Color::BLACK);
+        // The requested rectangle extends past both edges; the visible part
+        // must still be usable.
+        let mut child = parent.sub_canvas(Rect::new(5, 4, 10, 10)).unwrap();
+        child.fill_rect(Rect::new(0, 0, 3, 2), Color::WHITE);
+        assert_eq!(parent.pixel(5, 4), Some(Color::WHITE));
+        assert_eq!(parent.pixel(7, 5), Some(Color::WHITE));
     }
 
     #[test]

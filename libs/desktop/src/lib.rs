@@ -2173,14 +2173,18 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
             .map(|app| app.manifest.args.as_str())
             .unwrap_or("");
         let mut started = window.app_started;
-        if let Some(mut app_canvas) = ui.painter.canvas_mut().sub_canvas(content) {
+        // A window dragged past the framebuffer edge still gets the visible
+        // part of its content. Passing the unclipped rectangle would make
+        // `sub_canvas` fail and leave the frame with only its background.
+        let app_area = content.clipped_to(ui.painter.canvas_rect());
+        if let Some(mut app_canvas) = ui.painter.canvas_mut().sub_canvas(app_area) {
             let mut context = WindowContext {
                 args,
                 canvas: &mut app_canvas,
                 input,
                 platform,
                 now_ms,
-                origin: Point::new(content.x, content.y),
+                origin: Point::new(app_area.x, app_area.y),
                 pointer_active,
                 keyboard_active,
             };
