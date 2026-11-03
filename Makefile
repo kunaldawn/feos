@@ -190,6 +190,7 @@ docker-run: docker-build
 		-e NO_AT_BRIDGE=1 \
 		-e FEOS_DISPLAY="$(FEOS_DISPLAY)" \
 		-e FEOS_AUDIODEV="$$audiod" \
+		-e FEOS_TEST_DISKS=1 \
 		$$audio_args \
 		-v /tmp/.X11-unix:/tmp/.X11-unix \
 		-p 5900:5900 \
@@ -211,6 +212,7 @@ docker-run-vnc: docker-build
 	docker run --rm -it -p 5900:5900 \
 		-e FEOS_DISPLAY=vnc=0.0.0.0:0 \
 		-e FEOS_AUDIODEV="$$audiod" \
+		-e FEOS_TEST_DISKS=1 \
 		$$audio_args \
 		$(IMAGE)
 

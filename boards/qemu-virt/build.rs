@@ -19,6 +19,9 @@ struct EntryInfo {
 
 fn main() {
     println!("cargo:rerun-if-changed=fs");
+    println!("cargo:rerun-if-changed=disk.img");
+    println!("cargo:rerun-if-changed=disk-fat32.img");
+    println!("cargo:rerun-if-changed=disk-exfat.img");
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
     let root = manifest_dir.join("fs");
@@ -92,6 +95,38 @@ fn main() {
         }
     }
     generated.push_str("];\n");
+
+    // An optional FAT32 or exFAT disk image can be dropped next to the board's
+    // embedded tree. It is mounted read-only at boot and takes precedence over
+    // the compiled-in StaticFs image.
+    let disk = manifest_dir.join("disk.img");
+    if disk.is_file() {
+        generated.push_str(&format!(
+            "pub static DISK_IMAGE: Option<&'static [u8]> = Some(include_bytes!({:?}));\n",
+            disk.to_string_lossy().as_ref()
+        ));
+    } else {
+        generated.push_str("pub static DISK_IMAGE: Option<&'static [u8]> = None;\n");
+    }
+
+    // Test volumes used by `make docker-run`. Each is exposed under its own
+    // top-level directory when present.
+    for (name, file) in [
+        ("DISK_FAT32_IMAGE", "disk-fat32.img"),
+        ("DISK_EXFAT_IMAGE", "disk-exfat.img"),
+    ] {
+        let path = manifest_dir.join(file);
+        if path.is_file() {
+            generated.push_str(&format!(
+                "pub static {name}: Option<&'static [u8]> = Some(include_bytes!({:?}));\n",
+                path.to_string_lossy().as_ref()
+            ));
+        } else {
+            generated.push_str(&format!(
+                "pub static {name}: Option<&'static [u8]> = None;\n"
+            ));
+        }
+    }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("out dir"));
     write_if_changed(&out_dir.join("fs_image.rs"), &generated);

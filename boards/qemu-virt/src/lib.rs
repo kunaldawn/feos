@@ -9,6 +9,9 @@
 
 #![no_std]
 
+extern crate alloc;
+
+use feos_console::println;
 use feos_driver_fw_cfg::FwCfg;
 use feos_driver_gicv2::GicV2;
 use feos_driver_intel_hda::{CodecInfo, IntelHda};
@@ -16,7 +19,7 @@ use feos_driver_pci::PciEcam;
 use feos_driver_pl011::Pl011;
 use feos_driver_ramfb::Ramfb;
 use feos_driver_virtio_input::{PointerKind, VirtioInput};
-use feos_fs::{FileSystem, StaticFs};
+use feos_fs::{FileSystem, MemoryBlockDevice, MountTable, StaticFs};
 use feos_gfx::Canvas;
 use feos_hal::{
     Audio, Clock, InterruptController, Keyboard, KeyboardEvent, Pointer, PointerEvent, Serial,
@@ -267,9 +270,61 @@ mod fs_image {
 /// The compiled-in read-only filesystem.
 static FILESYSTEM: StaticFs = StaticFs::new(fs_image::FS_IMAGE);
 
+/// Cached result of the optional disk-image probe.
+static MOUNTED_DISK: feos_sync::SpinLock<Option<&'static dyn FileSystem>> =
+    feos_sync::SpinLock::new(None);
+
 /// Returns the filesystem apps browse through `Platform::filesystem`.
+///
+/// If `boards/qemu-virt/disk.img` exists at build time it is probed as FAT32 or
+/// exFAT and takes precedence over the compiled-in tree. The optional disk
+/// mount is read-only because the board has no block-device driver; a board
+/// with one can mount the writable backends through `feos_fs`.
 pub fn filesystem() -> &'static dyn FileSystem {
-    &FILESYSTEM
+    if let Some(filesystem) = *MOUNTED_DISK.lock() {
+        return filesystem;
+    }
+
+    let mut table = MountTable::new();
+    if let Some(image) = fs_image::DISK_FAT32_IMAGE {
+        match feos_fs::mount(MemoryBlockDevice::new(image)) {
+            Ok(fs) => {
+                if table.mount("fat32", fs).is_ok() {
+                    println!("[fs] FAT32 volume mounted at /fat32");
+                }
+            }
+            Err(error) => println!("[fs] FAT32 image rejected: {error}"),
+        }
+    }
+    if let Some(image) = fs_image::DISK_EXFAT_IMAGE {
+        match feos_fs::mount(MemoryBlockDevice::new(image)) {
+            Ok(fs) => {
+                if table.mount("exfat", fs).is_ok() {
+                    println!("[fs] exFAT volume mounted at /exfat");
+                }
+            }
+            Err(error) => println!("[fs] exFAT image rejected: {error}"),
+        }
+    }
+
+    let filesystem: &'static dyn FileSystem = if !table.is_empty() {
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(table))
+    } else if let Some(image) = fs_image::DISK_IMAGE {
+        match feos_fs::mount(MemoryBlockDevice::new(image)) {
+            Ok(filesystem) => {
+                println!("[fs] disk image mounted at /");
+                alloc::boxed::Box::leak(filesystem)
+            }
+            Err(error) => {
+                println!("[fs] disk image rejected: {error}");
+                &FILESYSTEM
+            }
+        }
+    } else {
+        &FILESYSTEM
+    };
+    *MOUNTED_DISK.lock() = Some(filesystem);
+    filesystem
 }
 
 /// The board's Intel HDA controller.

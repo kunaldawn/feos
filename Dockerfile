@@ -8,6 +8,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
+        dosfstools \
+        exfatprogs \
         make \
         qemu-system-arm \
         qemu-system-gui \

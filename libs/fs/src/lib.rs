@@ -1,13 +1,35 @@
-//! A small, allocation-free read-only filesystem.
+//! Read-only and writable filesystems for feos.
 //!
-//! The QEMU board has no block device driver yet, so its filesystem image is
-//! compiled into the kernel. The abstraction is deliberately storage-agnostic:
-//! an app walks nodes through [`FileSystem`] and never sees whether the bytes
-//! came from an embedded image, a disk, or RAM.
+//! The abstraction is deliberately storage-agnostic: an app walks nodes
+//! through [`FileSystem`] and never sees whether the bytes came from an
+//! embedded image, a disk, or RAM. Three backends are provided:
 //!
-//! [`StaticFs`] is the read-only backend used by the board. A node is a file
-//! or directory with a name, an optional parent and a list of children; file
-//! contents are borrowed from the image, so lookup and reads never allocate.
+//! * [`StaticFs`] — a compiled-in `StaticNode` table. It is allocation-free
+//!   and is what the QEMU board uses by default.
+//! * [`Fat32`] — FAT32 long-file-name volumes on any [`BlockDevice`].
+//! * [`Exfat`] — exFAT volumes, including UTF-16 names, contiguous streams,
+//!   allocation bitmaps and both main and backup boot regions.
+//!
+//! [`WritableFileSystem`] adds `create_file`, `create_dir`, `write`, `set_len`,
+//! `rename`, `remove` and `flush` for devices implementing
+//! [`WritableBlockDevice`]. The read-only [`FileSystem`] view stays available
+//! through a shared borrow.
+//!
+//! Disk backends walk the directory tree once at mount time into a small
+//! in-memory index (one allocation per entry) and read file data on demand
+//! through the [`BlockDevice`]. A RAM-backed device is included for embedding
+//! and for tests:
+//!
+//! ```no_run
+//! use feos_fs::{mount_image, EntryKind, FileSystem};
+//!
+//! static DISK: &[u8] = &[];
+//! let fs = mount_image(DISK).unwrap();
+//! let node = fs.resolve("/hello.txt").unwrap();
+//! assert_eq!(fs.kind(node), Some(EntryKind::File));
+//! ```
+//!
+//! [`StaticFs`] example:
 //!
 //! ```no_run
 //! use feos_fs::{EntryKind, FileSystem, StaticFs};
@@ -23,6 +45,63 @@
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
+
+extern crate alloc;
+
+mod block;
+mod error;
+mod exfat;
+mod fat32;
+mod mount;
+mod tree;
+mod volume;
+
+pub use block::{
+    BlockDevice, MemoryBlockDevice, MemoryBlockDeviceMut, RamDisk, WritableBlockDevice,
+    MAX_BLOCK_SIZE,
+};
+pub use error::FsError;
+pub use exfat::Exfat;
+pub use fat32::Fat32;
+pub use mount::MountTable;
+pub use volume::{detect, VolumeKind};
+
+use alloc::boxed::Box;
+
+#[cfg(test)]
+mod tests;
+
+/// Probes `device` and mounts the first supported filesystem.
+///
+/// The returned trait object borrows from `device` only when the device itself
+/// does: `mount_image` can therefore return a box tied to the image slice's
+/// lifetime.
+pub fn mount<'a, D: BlockDevice + 'a>(device: D) -> Result<Box<dyn FileSystem + 'a>, FsError> {
+    match detect(&device)? {
+        VolumeKind::Fat32 => Ok(Box::new(Fat32::mount(device)?)),
+        VolumeKind::Exfat => Ok(Box::new(Exfat::mount(device)?)),
+    }
+}
+
+/// Mounts a filesystem from an in-memory disk image.
+pub fn mount_image(image: &[u8]) -> Result<Box<dyn FileSystem + '_>, FsError> {
+    mount(MemoryBlockDevice::new(image))
+}
+
+/// Probes `device` and mounts the first supported writable filesystem.
+pub fn mount_writable<'a, D: WritableBlockDevice + 'a>(
+    device: D,
+) -> Result<Box<dyn WritableFileSystem + 'a>, FsError> {
+    match detect(&device)? {
+        VolumeKind::Fat32 => Ok(Box::new(Fat32::mount(device)?)),
+        VolumeKind::Exfat => Ok(Box::new(Exfat::mount(device)?)),
+    }
+}
+
+/// Mounts a writable filesystem from a mutable in-memory disk image.
+pub fn mount_image_mut(image: &mut [u8]) -> Result<Box<dyn WritableFileSystem + '_>, FsError> {
+    mount_writable(MemoryBlockDeviceMut::new(image))
+}
 
 /// Stable identifier of a node inside one filesystem.
 ///
@@ -66,11 +145,11 @@ impl EntryKind {
 /// Maximum number of path components [`FileSystem::path`] can walk.
 pub const MAX_PATH_DEPTH: usize = 32;
 
-/// A read-only filesystem.
+/// A read-only filesystem view.
 ///
 /// All methods are cheap lookups; file data is copied by
 /// [`read`](FileSystem::read), so callers control the buffer size and no
-/// allocation is required.
+/// allocation is required after mounting.
 pub trait FileSystem: Sync {
     /// Number of nodes in the filesystem.
     fn node_count(&self) -> usize;
@@ -187,6 +266,41 @@ pub trait FileSystem: Sync {
     }
 }
 
+/// A filesystem that can be modified.
+///
+/// The read-only [`FileSystem`] view is still available through a mutable
+/// borrow. Mutations take `&mut self` so a backend can update its block device
+/// without interior locking; callers that need to share a mounted volume should
+/// protect it with a lock.
+pub trait WritableFileSystem: FileSystem {
+    /// Creates an empty file in `parent` and returns its node.
+    fn create_file(&mut self, parent: NodeId, name: &str) -> Result<NodeId, FsError>;
+
+    /// Creates an empty directory in `parent` and returns its node.
+    fn create_dir(&mut self, parent: NodeId, name: &str) -> Result<NodeId, FsError>;
+
+    /// Removes a file or an empty directory.
+    fn remove(&mut self, node: NodeId) -> Result<(), FsError>;
+
+    /// Moves `node` into `new_parent` and gives it `new_name`.
+    fn rename(&mut self, node: NodeId, new_parent: NodeId, new_name: &str) -> Result<(), FsError>;
+
+    /// Writes `data` at `offset`, extending the file when necessary.
+    ///
+    /// Returns the number of bytes written. A gap between the old end of file
+    /// and `offset` is zero-filled.
+    fn write(&mut self, node: NodeId, offset: usize, data: &[u8]) -> Result<usize, FsError>;
+
+    /// Grows or shrinks a file to exactly `size` bytes.
+    ///
+    /// Growing zero-fills the new range. Shrinking releases clusters that are
+    /// no longer needed.
+    fn set_len(&mut self, node: NodeId, size: usize) -> Result<(), FsError>;
+
+    /// Flushes filesystem metadata and device caches.
+    fn flush(&mut self) -> Result<(), FsError>;
+}
+
 /// One node in a compiled-in filesystem image.
 ///
 /// `parent` and `children` are indices into the enclosing node table.
@@ -289,7 +403,7 @@ impl FileSystem for StaticFs {
 }
 
 #[cfg(test)]
-mod tests {
+mod static_tests {
     use super::*;
 
     static NODES: &[StaticNode] = &[

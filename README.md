@@ -116,7 +116,7 @@ app registry).
 │   ├── desktop/                # feos-desktop: YAML desktop, XP taskbar, WM
 │   ├── init/                   # feos-init: service supervisor and restart policy
 │   ├── bundle/                 # feos-bundle: single-file .fapp applications
-│   ├── fs/                     # feos-fs: read-only filesystem abstraction
+│   ├── fs/                     # feos-fs: StaticFs + read/write FAT32/exFAT
 │   ├── keys/                   # feos-keys: serial + evdev keyboard decoding
 │   ├── text/                   # feos-text: fixed-capacity UTF-8 strings
 │   ├── audio/                  # feos-audio: PCM buffers, mixing, synthesis
@@ -235,8 +235,9 @@ change.
 - `feos-driver-virtio-input`: a virtio MMIO tablet/mouse/keyboard driver, wired
   through the `Pointer` and `Keyboard` HAL traits so the desktop tracks a real
   pointer and accepts typing from the QEMU display as well as the serial port
-- `feos-fs`: a read-only, allocation-free filesystem with path lookup, parent
-  links and a compiled-in `StaticFs` image
+- `feos-fs`: a FAT32 and exFAT driver with read/write support (long names,
+  UTF-16 names, allocation bitmaps, cluster chains, create/write/rename/remove)
+  plus a compiled-in, allocation-free `StaticFs` image
 - `feos-keys`: serial-console and Linux-evdev keyboard decoding shared by the
   desktop and full-screen apps
 - A **File Explorer** app with XP Luna window chrome, a menu bar, standard
@@ -808,11 +809,64 @@ loaded image ranges.
 
 ![The feos file explorer showing the docs directory](docs/files.png)
 
-`feos-fs` (in `libs/fs/`) is a small read-only filesystem. The QEMU board has
-no block device driver yet, so its image is compiled into the kernel:
+`feos-fs` (in `libs/fs/`) provides three backends. The QEMU board has no block
+device driver yet, so its default image is compiled into the kernel:
 `boards/qemu-virt/build.rs` walks `boards/qemu-virt/fs/` and generates a flat
 `StaticNode` table. Each node knows its name, kind, parent and children; file
 data is borrowed from the image, so lookup and reads never allocate.
+
+The same crate now provides real FAT32 and exFAT readers/writers over the
+`BlockDevice`/`WritableBlockDevice` traits. The drivers understand long FAT
+file names, exFAT UTF-16 names and up-case tables, allocation bitmaps, FAT and
+contiguous cluster streams, and support creating, writing, extending,
+truncating, renaming and deleting files and directories. On-disk structures were
+validated with `fsck.fat` and `fsck.exfat`. Mutations use the
+`WritableFileSystem` trait; the read-only `FileSystem` view remains available
+through a shared borrow.
+
+To boot QEMU with a real filesystem image, drop a FAT32 or exFAT image at
+`boards/qemu-virt/disk.img` and rebuild. The board probes it at boot and prefers
+it over the compiled-in tree (the optional mount is read-only until a block
+device driver is wired up). A board with a virtio-blk, SD or USB driver can use
+`MemoryBlockDeviceMut` or `RamDisk` today:
+
+```rust
+use feos_fs::{Fat32, MemoryBlockDeviceMut, NodeId, WritableFileSystem};
+
+let mut fs = Fat32::mount(MemoryBlockDeviceMut::new(&mut image))?;
+let file = fs.create_file(NodeId::ROOT, "hello.txt")?;
+fs.write(file, 0, b"hello\n")?;
+fs.flush()?;
+```
+
+`make docker-run` goes one step further: the container creates a 36 MiB FAT32
+image and a 16 MiB exFAT image, seeds both with sample files, embeds them in the
+kernel and mounts them as `/fat32` and `/exfat`:
+
+```text
+feos> files tree /
+/
+  fat32
+    hello.txt
+    docs
+      notes.md
+    big.bin
+    Long File Name.txt
+  exfat
+    hello.txt
+    docs
+      notes.md
+    big.bin
+    café.txt
+feos> files cat /fat32/hello.txt
+feos> files cat /exfat/café.txt
+```
+
+That path exercises the read/write drivers twice: the `seed` example writes the
+files, the kernel mounts both volumes, and the explorer/shell read them back.
+Use `make docker-run-vnc` when there is no X11 display. The test images are
+created inside the container, not in your working tree; set
+`FEOS_TEST_DISKS=0` when running `docker run` directly to skip them.
 
 Drop a file into `boards/qemu-virt/fs/` and rebuild to add it to the explorer
 and the shell. The initial image contains `README.txt`, `docs/`, `etc/`,

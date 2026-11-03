@@ -1,8 +1,9 @@
 //! A small first-fit heap for the kernel.
 //!
-//! The GUI and filesystem code are allocation-free, but the H.264 decoder used
-//! by the video player stores reference pictures in `alloc` collections. A
-//! real allocator is therefore needed before video playback can work.
+//! The `StaticFs` image and the GUI are allocation-free, but the H.264 decoder
+//! used by the video player and the writable FAT32/exFAT mounts use `alloc`
+//! collections. A real allocator is therefore needed before video playback or a
+//! writable disk mount can work.
 //!
 //! This allocator is intentionally simple: one 4 MiB static arena, a sorted
 //! free list with boundary tags in front of each block, and a spin lock for the
