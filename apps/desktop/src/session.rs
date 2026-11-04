@@ -73,6 +73,7 @@ pub fn run_session(
     let mut last_tick = platform.clock.uptime_ms();
     let mut last_minute = u64::MAX;
     let mut last_animated_frame = 0u64;
+    let mut animation_period = 0u32;
     let mut dirty = true;
     let mut pointer_position = platform.pointer.map(|pointer| pointer.position());
     if let Some((x, y)) = pointer_position {
@@ -176,21 +177,22 @@ pub fn run_session(
             // painted (closing or minimising a window, for example). Compose
             // one more frame so that result becomes visible.
             dirty = ran_foreground || response.launch.is_some() || had_input;
-            // Windowed apps can animate (the media player, live task-manager
-            // graphs). Repaint at a modest rate while one is open without
-            // spinning the compositor at the full poll rate.
-            if response.redraw
-                && now.wrapping_sub(last_animated_frame)
-                    >= response.animation_period_ms.max(1) as u64
-            {
-                last_animated_frame = now;
-                dirty = true;
-            }
+            animation_period = response.animation_period_ms;
 
             if response.command == StartMenuCommand::LogOff {
                 println!("[desktop] log off - returning to the serial shell");
                 return SessionExit::LogOff;
             }
+        }
+
+        // Windowed apps can animate (the media player, live task-manager
+        // graphs). This check must run even when the desktop is otherwise
+        // idle: otherwise no frame is rendered, no `DesktopResponse` is
+        // produced, and an open task manager's graph never advances.
+        if animation_period > 0 && now.wrapping_sub(last_animated_frame) >= animation_period as u64
+        {
+            last_animated_frame = now;
+            dirty = true;
         }
 
         input.clear_events();

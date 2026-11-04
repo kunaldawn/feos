@@ -904,7 +904,10 @@ impl State {
             .sum();
         self.commit_total = memory.heap_used_bytes.saturating_add(process_memory);
         self.commit_limit = memory.heap_total_bytes.saturating_add(process_memory);
-        self.memory_percent = percentage(self.commit_total as u64, self.commit_limit as u64);
+        // "Memory Usage" is physical memory in use, not just the kernel heap:
+        // the heap alone is usually a few hundred KiB against a 16 MiB arena,
+        // which rounded to 0% and left the graph flat.
+        self.memory_percent = percentage(memory.used_bytes as u64, memory.total_bytes as u64);
         if self.commit_total > self.commit_peak {
             self.commit_peak = self.commit_total;
         }
@@ -4871,6 +4874,19 @@ mod render_tests {
         state.cpu_history = [55; HISTORY];
         state.mem_history = [19; HISTORY];
         state
+    }
+
+    #[test]
+    fn memory_percent_tracks_physical_memory() {
+        let screen = Rect::new(0, 0, 1024, 768);
+        let mut state = test_state(screen);
+        state.sample(&platform(), 1_000);
+        // TestMemory reports 24 MiB used of 32 MiB total.
+        assert_eq!(state.memory_percent, 75);
+        assert_eq!(
+            state.mem_history[state.mem_head.saturating_sub(1) % HISTORY],
+            75
+        );
     }
 
     #[test]

@@ -2936,6 +2936,7 @@ mod tests {
         let mut canvas = Canvas::new(&mut pixels, 1024, 768, 1024).unwrap();
         let response = desktop.render(&mut canvas, &Input::new(), 100);
         assert!(response.redraw);
+        assert_eq!(response.animation_period_ms, 33);
         assert_eq!(response.window_count, 1);
 
         desktop.windows_mut().minimize(0);
