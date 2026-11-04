@@ -20,10 +20,23 @@ pub enum CursorShape {
     SizeNesw,
 }
 
+/// The screen area `shape` can touch with its hot spot at `(x, y)`.
+///
+/// A caller that keeps the cursor out of its composed frame restores this
+/// rectangle before drawing the cursor somewhere else.
+pub fn cursor_bounds(x: i32, y: i32, shape: CursorShape) -> Rect {
+    match shape {
+        CursorShape::Arrow => Rect::new(x, y, 16, 24),
+        // The resize cursors are centred on the hot spot and reach 11 pixels
+        // along each diagonal or axis, plus their outline.
+        _ => Rect::new(x - 14, y - 14, 29, 29),
+    }
+}
+
 /// Draws `shape` with its hotspot at `(x, y)`.
 ///
-/// The arrow uses the classic XP bitmap; resize shapes are centred on the
-/// pointer, like the Windows resize cursors.
+/// The arrow uses the classic bitmap; resize shapes are centred on the
+/// pointer.
 pub fn draw_cursor_shape(painter: &mut Painter<'_, '_>, x: i32, y: i32, shape: CursorShape) {
     match shape {
         CursorShape::Arrow => draw_cursor(painter, x, y),

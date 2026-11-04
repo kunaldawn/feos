@@ -177,6 +177,8 @@ impl Frame {
 pub struct LayoutStack {
     frames: [Frame; MAX_LAYOUT_DEPTH],
     depth: usize,
+    /// Pushes ignored because the stack was already full.
+    overflow: usize,
 }
 
 impl LayoutStack {
@@ -185,6 +187,7 @@ impl LayoutStack {
         let mut stack = Self {
             frames: [Frame::column(Rect::new(0, 0, 0, 0), gap); MAX_LAYOUT_DEPTH],
             depth: 1,
+            overflow: 0,
         };
         stack.frames[0] = Frame::column(rect, gap);
         stack
@@ -193,6 +196,7 @@ impl LayoutStack {
     /// Resets the stack to a default column filling `rect`.
     pub fn reset(&mut self, rect: Rect, gap: i32) {
         self.depth = 1;
+        self.overflow = 0;
         self.frames[0] = Frame::column(rect, gap);
     }
 
@@ -201,6 +205,8 @@ impl LayoutStack {
         if self.depth < MAX_LAYOUT_DEPTH {
             self.frames[self.depth] = Frame::column(rect, gap);
             self.depth += 1;
+        } else {
+            self.overflow += 1;
         }
     }
 
@@ -209,6 +215,8 @@ impl LayoutStack {
         if self.depth < MAX_LAYOUT_DEPTH {
             self.frames[self.depth] = Frame::row(rect, gap);
             self.depth += 1;
+        } else {
+            self.overflow += 1;
         }
     }
 
@@ -217,11 +225,19 @@ impl LayoutStack {
         if self.depth < MAX_LAYOUT_DEPTH {
             self.frames[self.depth] = Frame::grid(rect, columns, cell_height, gap);
             self.depth += 1;
+        } else {
+            self.overflow += 1;
         }
     }
 
     /// Pops the current frame and returns the area it consumed.
     pub fn pop(&mut self) -> Rect {
+        // A push past the depth limit was ignored, so its pop must be too.
+        // Otherwise it would remove the frame the overflowing scope sits in.
+        if self.overflow > 0 {
+            self.overflow -= 1;
+            return self.frames[self.depth - 1].used();
+        }
         if self.depth <= 1 {
             return self.frames[0].used();
         }
@@ -325,5 +341,32 @@ mod tests {
         stack.next(0, 10);
         stack.next(0, 20);
         assert_eq!(stack.pop(), Rect::new(0, 0, 100, 34));
+    }
+
+    #[test]
+    fn pushes_past_the_depth_limit_pop_in_balance() {
+        let base = Rect::new(0, 0, 100, 100);
+        let mut stack = LayoutStack::new(base, 0);
+        for _ in 0..MAX_LAYOUT_DEPTH * 2 {
+            stack.push_column(base, 0);
+        }
+        for _ in 0..MAX_LAYOUT_DEPTH * 2 {
+            stack.pop();
+        }
+        // Every push was matched, so the original frame is on top again and
+        // has consumed nothing.
+        assert_eq!(stack.next(10, 10), Rect::new(0, 0, 100, 10));
+    }
+
+    #[test]
+    fn an_ignored_push_does_not_pop_the_frame_it_sits_in() {
+        let inner = Rect::new(50, 50, 20, 20);
+        let mut stack = LayoutStack::new(Rect::new(0, 0, 100, 100), 0);
+        for _ in 1..MAX_LAYOUT_DEPTH {
+            stack.push_column(inner, 0);
+        }
+        stack.push_column(Rect::new(0, 0, 1, 1), 0);
+        stack.pop();
+        assert_eq!(stack.next(5, 5).x, inner.x);
     }
 }

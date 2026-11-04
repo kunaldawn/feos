@@ -2,10 +2,12 @@
 //! feos kernel.
 //!
 //! The crate follows the same rules as `feos-image` and `feos-audio-codec`:
-//! containers are parsed in place, decoded frames are written into a
-//! caller-provided RGBA8888 buffer, and no allocator is used. H.264 decoding is
-//! delegated to the vendored `feos-h264` crate, which uses `alloc` for its
-//! reference-picture buffer.
+//! containers are parsed in place and decoded frames are written into a
+//! caller-provided RGBA8888 buffer. H.264 decoding is delegated to the vendored
+//! `feos-h264` crate. [`info`] reads a file's properties without building
+//! anything. [`VideoDecoder`] keeps a sample table and codec state, so decoding
+//! the next frame costs one frame; all its allocation is fallible and limited
+//! by [`DecoderLimits`]. [`decode_frame`] is a stateless wrapper around it.
 //!
 //! | Container | Demux | Decode |
 //! |-----------|-------|--------|
@@ -50,13 +52,17 @@
 // tests or by future decoders.
 #![allow(dead_code)]
 
+extern crate alloc;
+
 mod avi;
 mod bitstream;
 pub mod codec;
+mod decoder;
 mod error;
 mod flv;
 mod gif;
 mod h264;
+mod index;
 mod ivf;
 mod matroska;
 mod mjpeg;
@@ -66,8 +72,10 @@ mod raw;
 mod rle;
 
 pub use codec::Codec;
+pub use decoder::VideoDecoder;
 pub use error::{Result, VideoError};
-pub use pixel::PixelFormat;
+pub use index::DecoderLimits;
+pub use pixel::{ColourMatrix, PixelFormat};
 
 /// A video container or elementary stream.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -106,12 +114,72 @@ impl ContainerFormat {
     }
 }
 
+/// How a decoded frame should be shown. Decoded frames are never scaled or
+/// rotated by this crate; that's up to whoever draws them.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct DisplayMetadata {
+    /// Sample aspect ratio as width:height, or `(0, 0)` for unspecified.
+    pub sar: (u32, u32),
+    /// Clockwise rotation to apply, one of 0, 90, 180 or 270.
+    pub rotation: u16,
+}
+
+/// A stream's colour signalling, using H.273 code points as shared by H.264
+/// VUI, Matroska and MP4 `colr`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StreamColour {
+    /// `matrix_coefficients`; 2 means unspecified.
+    pub matrix: u8,
+    /// `colour_primaries`; 2 means unspecified.
+    pub primaries: u8,
+    /// `transfer_characteristics`; 2 means unspecified.
+    pub transfer: u8,
+    /// Whether samples use the full 0-255 range.
+    pub full_range: bool,
+}
+
+impl Default for StreamColour {
+    fn default() -> Self {
+        Self {
+            matrix: 2,
+            primaries: 2,
+            transfer: 2,
+            full_range: false,
+        }
+    }
+}
+
+/// Merges what an H.264 SPS says into container metadata. The container's
+/// display settings win, as they're what a muxer chose to show. The codec knows
+/// best how its own samples were encoded.
+pub(crate) fn merge_sps_metadata(
+    display: &mut DisplayMetadata,
+    colour: &mut StreamColour,
+    sps: &feos_h264::SpsInfo,
+) {
+    if display.sar == (0, 0) {
+        let (w, h) = sps.vui.sample_aspect_ratio;
+        display.sar = (w as u32, h as u32);
+    }
+    if sps.vui.matrix_coefficients != 2 {
+        colour.matrix = sps.vui.matrix_coefficients;
+    }
+    if sps.vui.colour_primaries != 2 {
+        colour.primaries = sps.vui.colour_primaries;
+    }
+    if sps.vui.transfer_characteristics != 2 {
+        colour.transfer = sps.vui.transfer_characteristics;
+    }
+    colour.full_range |= sps.vui.full_range;
+}
+
 /// Basic properties of an encoded video.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct VideoInfo {
-    /// Display width in pixels.
+    /// Width of decoded frames in pixels. Use
+    /// [`display_size`](Self::display_size) for the shape to show them at.
     pub width: u32,
-    /// Display height in pixels.
+    /// Height of decoded frames in pixels.
     pub height: u32,
     /// Container or elementary-stream format.
     pub format: ContainerFormat,
@@ -119,11 +187,36 @@ pub struct VideoInfo {
     pub codec: Codec,
     /// Number of coded frames, or 0 when the container does not say.
     pub frame_count: u32,
-    /// Frame rate as numerator/denominator, when known.
+    /// Frame rate as numerator/denominator, when known. The average, for a
+    /// variable-rate MP4. [`VideoDecoder`] has each frame's own time.
     pub frame_rate: Option<(u32, u32)>,
+    /// Aspect ratio and rotation to show frames with.
+    pub display: DisplayMetadata,
+    /// Colour signalling.
+    pub colour: StreamColour,
 }
 
 impl VideoInfo {
+    /// Size to show a frame at, after the sample aspect ratio and rotation.
+    pub fn display_size(&self) -> (u32, u32) {
+        let (mut width, mut height) = (self.width, self.height);
+        let (sar_w, sar_h) = self.display.sar;
+        if sar_w != 0 && sar_h != 0 {
+            if sar_w >= sar_h {
+                let scaled = width as u64 * sar_w as u64 / sar_h as u64;
+                width = scaled.min(u32::MAX as u64) as u32;
+            } else {
+                let scaled = height as u64 * sar_h as u64 / sar_w as u64;
+                height = scaled.min(u32::MAX as u64) as u32;
+            }
+        }
+        if self.display.rotation % 180 == 90 {
+            (height, width)
+        } else {
+            (width, height)
+        }
+    }
+
     /// Number of bytes needed for one RGBA8888 frame.
     pub fn rgba_len(&self) -> Result<usize> {
         pixel::rgba_len(self.width, self.height)
@@ -158,6 +251,11 @@ pub struct DecodedFrame {
     pub height: u32,
     /// Display delay in milliseconds (0 when unknown).
     pub delay_ms: u32,
+    /// Presentation time in milliseconds. Zero from [`decode_frame`] on GIF.
+    pub pts_ms: u64,
+    /// The frame's display-order index. Past the requested index if that frame
+    /// was lost to a damaged sample.
+    pub index: u32,
 }
 
 /// Detects a video format from its signature.
@@ -170,7 +268,13 @@ pub fn detect(input: &[u8]) -> Option<ContainerFormat> {
         && (&input[4..8] == b"ftyp"
             || &input[4..8] == b"moov"
             || &input[4..8] == b"mdat"
-            || &input[4..8] == b"free")
+            || &input[4..8] == b"free"
+            || &input[4..8] == b"wide"
+            || &input[4..8] == b"skip"
+            || &input[4..8] == b"pnot"
+            || &input[4..8] == b"styp"
+            || &input[4..8] == b"sidx"
+            || &input[4..8] == b"moof")
     {
         Some(ContainerFormat::Mp4)
     } else if input.len() >= 4 && input[..4] == [0x1a, 0x45, 0xdf, 0xa3] {
@@ -217,96 +321,81 @@ fn is_annex_b(input: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
-/// Reads the properties of an encoded video.
+/// Reads the properties of an encoded video. This allocates nothing beyond an
+/// H.264 parameter set, and doesn't decode any frames.
 pub fn info(input: &[u8]) -> Result<VideoInfo> {
-    match detect(input).ok_or(VideoError::UnknownFormat)? {
+    let format = detect(input).ok_or(VideoError::UnknownFormat)?;
+    let plain = |width, height, codec, frame_count, frame_rate| VideoInfo {
+        width,
+        height,
+        format,
+        codec,
+        frame_count,
+        frame_rate,
+        display: DisplayMetadata::default(),
+        colour: StreamColour::default(),
+    };
+    match format {
         ContainerFormat::Gif => {
             let gif = gif::info(input)?;
-            Ok(VideoInfo {
-                width: gif.width,
-                height: gif.height,
-                format: ContainerFormat::Gif,
-                codec: Codec::Gif,
-                frame_count: gif.frame_count,
-                frame_rate: None,
-            })
+            Ok(plain(gif.width, gif.height, Codec::Gif, gif.frame_count, None))
         }
         ContainerFormat::Avi => {
             let avi = avi::info(input)?;
             Ok(VideoInfo {
-                width: avi.width,
-                height: avi.height,
-                format: ContainerFormat::Avi,
-                codec: avi.codec,
-                frame_count: avi.frame_count,
-                frame_rate: avi.frame_rate,
+                display: avi.display,
+                colour: avi.colour,
+                ..plain(avi.width, avi.height, avi.codec, avi.frame_count, avi.frame_rate)
             })
         }
         ContainerFormat::Mp4 => {
             let mp4 = mp4::info(input)?;
             Ok(VideoInfo {
-                width: mp4.width,
-                height: mp4.height,
-                format: ContainerFormat::Mp4,
-                codec: mp4.codec,
-                frame_count: mp4.frame_count,
-                frame_rate: mp4.frame_rate,
+                display: mp4.display,
+                colour: mp4.colour,
+                ..plain(mp4.width, mp4.height, mp4.codec, mp4.frame_count, mp4.frame_rate)
             })
         }
         ContainerFormat::Matroska => {
             let mkv = matroska::info(input)?;
             Ok(VideoInfo {
-                width: mkv.width,
-                height: mkv.height,
-                format: ContainerFormat::Matroska,
-                codec: mkv.codec,
-                frame_count: mkv.frame_count,
-                frame_rate: mkv.frame_rate,
+                display: mkv.display,
+                colour: mkv.colour,
+                ..plain(mkv.width, mkv.height, mkv.codec, mkv.frame_count, mkv.frame_rate)
             })
         }
         ContainerFormat::Flv => {
             let flv = flv::info(input)?;
             Ok(VideoInfo {
-                width: flv.width,
-                height: flv.height,
-                format: ContainerFormat::Flv,
-                codec: flv.codec,
-                frame_count: flv.frame_count,
-                frame_rate: flv.frame_rate,
+                display: flv.display,
+                colour: flv.colour,
+                ..plain(flv.width, flv.height, flv.codec, flv.frame_count, flv.frame_rate)
             })
         }
         ContainerFormat::Ivf => {
             let ivf = ivf::info(input)?;
-            Ok(VideoInfo {
-                width: ivf.width,
-                height: ivf.height,
-                format: ContainerFormat::Ivf,
-                codec: ivf.codec,
-                frame_count: ivf.frame_count,
-                frame_rate: ivf.frame_rate,
-            })
+            Ok(plain(ivf.width, ivf.height, ivf.codec, ivf.frame_count, ivf.frame_rate))
         }
         ContainerFormat::H264 => {
-            let h264 = h264::info_from_annex_b(input)?;
+            let sps = h264::info_from_annex_b(input)?;
+            let mut display = DisplayMetadata::default();
+            let mut colour = StreamColour::default();
+            merge_sps_metadata(&mut display, &mut colour, &sps);
             Ok(VideoInfo {
-                width: h264.width,
-                height: h264.height,
-                format: ContainerFormat::H264,
-                codec: Codec::H264,
-                frame_count: h264::annex_b_frame_count(input),
-                frame_rate: None,
+                display,
+                colour,
+                ..plain(
+                    sps.width,
+                    sps.height,
+                    Codec::H264,
+                    h264::annex_b_frame_count(input),
+                    sps.frame_rate.and_then(|(n, d)| reduce_fraction(n, d)),
+                )
             })
         }
         ContainerFormat::MotionJpeg => {
             let mjpeg = mjpeg::info(input)?;
-            Ok(VideoInfo {
-                width: mjpeg.width,
-                height: mjpeg.height,
-                format: ContainerFormat::MotionJpeg,
-                codec: Codec::Mjpeg,
-                frame_count: mjpeg.frame_count,
-                frame_rate: None,
-            })
+            Ok(plain(mjpeg.width, mjpeg.height, Codec::Mjpeg, mjpeg.frame_count, None))
         }
     }
 }
@@ -326,39 +415,31 @@ pub fn scratch_len(input: &[u8]) -> Result<usize> {
 ///
 /// `out` must be at least [`VideoInfo::rgba_len`] bytes. `scratch` must be at
 /// least [`scratch_len`] bytes.
+///
+/// This opens the video each time, which for inter-coded video restarts from the
+/// closest key frame. To decode more than one frame, use [`VideoDecoder`].
 pub fn decode_frame(
     input: &[u8],
     index: u32,
     out: &mut [u8],
     scratch: &mut [u8],
 ) -> Result<DecodedFrame> {
-    let info = info(input)?;
-    if info.frame_count != 0 && index >= info.frame_count {
-        return Err(VideoError::FrameOutOfRange {
+    if detect(input) == Some(ContainerFormat::Gif) {
+        let gif = gif::info(input)?;
+        if index >= gif.frame_count {
+            return Err(VideoError::FrameOutOfRange {
+                index,
+                count: gif.frame_count,
+            });
+        }
+        let delay_ms = gif::decode_frame(input, index, out, scratch)?;
+        return Ok(DecodedFrame {
+            width: gif.width,
+            height: gif.height,
+            delay_ms,
+            pts_ms: 0,
             index,
-            count: info.frame_count,
         });
     }
-    let delay_ms = match info.format {
-        ContainerFormat::Gif => gif::decode_frame(input, index, out, scratch)?,
-        ContainerFormat::Avi => avi::decode_frame(input, index, out)?,
-        ContainerFormat::Mp4 => mp4::decode_frame(input, index, out)?,
-        ContainerFormat::Matroska => matroska::decode_frame(input, index, out)?,
-        ContainerFormat::Flv => flv::decode_frame(input, index, out)?,
-        ContainerFormat::Ivf => {
-            let _sample = ivf::frame(input, index)?;
-            return Err(VideoError::UnsupportedCodec(info.codec.name()));
-        }
-        ContainerFormat::H264 => h264::decode_annex_b(input, index, out)?,
-        ContainerFormat::MotionJpeg => {
-            let frame = mjpeg::find_frame(input, index)?;
-            mjpeg::decode_sample(frame, out)?;
-            0
-        }
-    };
-    Ok(DecodedFrame {
-        width: info.width,
-        height: info.height,
-        delay_ms,
-    })
+    VideoDecoder::open(input)?.decode(index, out)
 }

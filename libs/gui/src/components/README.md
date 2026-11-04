@@ -15,6 +15,11 @@ on top of the base widgets in [`../widgets`](../widgets/) and the painter in
 - **Floating surfaces paint inline** — menus, flyouts, popovers, drawers,
   tooltips, toasts, sheets and the command palette must be drawn late in the
   frame. There is no separate z-order stack.
+- **Surfaces stop the pointer** — `ui.overlay(rect, ...)` and `ui.float(rect)`
+  stop widgets beneath a floating surface from reacting, from the next frame
+  on, and `ui.set_pointer_occluded(true)` does it at once for a caller that
+  already knows the stacking order. `dialog` and the menu and select popups do
+  this themselves.
 
 The component directory currently exposes **112 component methods** across
 twelve modules, plus the base widgets and charts covered in the appendix.
@@ -221,7 +226,7 @@ Source: [`overlays.rs`](overlays.rs)
 
 Supporting types: `FlyoutPlacement`, `FlyoutState`, `TeachingTipState`.
 
-## Windows/Fluent patterns
+## Desktop patterns
 
 Source: [`patterns.rs`](patterns.rs)
 

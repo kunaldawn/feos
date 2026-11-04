@@ -3,22 +3,66 @@
 use alloc::format;
 use alloc::string::{String, ToString};
 
-use super::{error, format_size, is_option, parse_i64, usage, write_line, Ctx};
+use super::opts::{bad_option, Opt, Opts};
+use super::{error, format_size, parse_i64, usage, write_line, Ctx};
 use crate::fs::Kind;
+use crate::regex::{Regex, Syntax};
+
+/// Deepest `( ( ... ) )` and `! ! ...` nesting `test` and `expr` will parse.
+const MAX_EXPR_DEPTH: usize = 32;
+
+pub(super) fn run_true(_args: &[String], _ctx: &mut Ctx<'_>) -> i32 {
+    0
+}
+
+pub(super) fn run_false(_args: &[String], _ctx: &mut Ctx<'_>) -> i32 {
+    1
+}
+
+pub(super) fn pwd(_args: &[String], ctx: &mut Ctx<'_>) -> i32 {
+    write_line(ctx.stdout, format_args!("{}", ctx.fs.cwd()));
+    0
+}
 
 pub(super) fn env(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
-    if !args.is_empty() {
-        error(
-            ctx.stderr,
-            "env",
-            "running a command with a modified environment is a shell feature",
-        );
-        return 2;
+    // `env NAME=value command` runs the command with changed variables and
+    // restores them, since a command here shares the shell's environment.
+    let mut opts = Opts::new(args, "i").stop_at_operand();
+    let mut clear = false;
+    while let Some(opt) = opts.next() {
+        match opt {
+            Opt::Flag('i') => clear = true,
+            other => return bad_option(ctx, "env", other),
+        }
     }
-    for entry in ctx.env.entries() {
-        write_line(ctx.stdout, format_args!("{entry}"));
+    let mut rest = opts.rest();
+    let saved = ctx.env.clone();
+    if clear {
+        *ctx.env = crate::env::Env::new();
     }
-    0
+    while let Some((name, value)) = rest.first().and_then(|arg| arg.split_once('=')) {
+        ctx.env.set(name, value);
+        ctx.env.export(name);
+        rest = &rest[1..];
+    }
+    let status = match rest.split_first() {
+        Some((command, command_args)) => {
+            if super::is_command(command) {
+                super::run_nested(command, command_args, ctx)
+            } else {
+                error(ctx.stderr, command, "command not found");
+                127
+            }
+        }
+        None => {
+            for entry in ctx.env.entries() {
+                write_line(ctx.stdout, format_args!("{entry}"));
+            }
+            0
+        }
+    };
+    *ctx.env = saved;
+    status
 }
 
 pub(super) fn printenv(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
@@ -30,7 +74,7 @@ pub(super) fn printenv(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
     }
     let mut status = 0;
     for name in args {
-        match ctx.env.get(name) {
+        match ctx.env.get(name).filter(|_| ctx.env.is_exported(name)) {
             Some(value) => write_line(ctx.stdout, format_args!("{value}")),
             None => status = 1,
         }
@@ -43,28 +87,24 @@ pub(super) fn uname(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
     if args.is_empty() {
         show[0] = true;
     }
-    for arg in args {
-        if !is_option(arg) {
-            error(ctx.stderr, "uname", &format!("extra operand '{arg}'"));
-            return 2;
+    let mut opts = Opts::new(args, "asnrvmpio");
+    while let Some(opt) = opts.next() {
+        match opt {
+            Opt::Flag('a') => show = [true; 8],
+            Opt::Flag('s') => show[0] = true,
+            Opt::Flag('n') => show[1] = true,
+            Opt::Flag('r') => show[2] = true,
+            Opt::Flag('v') => show[3] = true,
+            Opt::Flag('m') => show[4] = true,
+            Opt::Flag('p') => show[5] = true,
+            Opt::Flag('i') => show[6] = true,
+            Opt::Flag('o') => show[7] = true,
+            other => return bad_option(ctx, "uname", other),
         }
-        for flag in arg[1..].chars() {
-            match flag {
-                'a' => show = [true; 8],
-                's' => show[0] = true,
-                'n' => show[1] = true,
-                'r' => show[2] = true,
-                'v' => show[3] = true,
-                'm' => show[4] = true,
-                'p' => show[5] = true,
-                'i' => show[6] = true,
-                'o' => show[7] = true,
-                other => {
-                    error(ctx.stderr, "uname", &format!("invalid option -- '{other}'"));
-                    return 2;
-                }
-            }
-        }
+    }
+    if let Some(extra) = opts.operands.first() {
+        error(ctx.stderr, "uname", &format!("extra operand '{extra}'"));
+        return 2;
     }
 
     let fields = [
@@ -184,23 +224,56 @@ pub(super) fn free(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
 }
 
 pub(super) fn test(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
-    let mut args = args;
-    if args.last().map(String::as_str) == Some("]") {
-        args = &args[..args.len() - 1];
+    test_command("test", args, ctx)
+}
+
+/// `[` requires its closing bracket; `test` treats `]` as an ordinary word.
+pub(super) fn bracket(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
+    match args.split_last() {
+        Some((last, inner)) if last == "]" => test_command("[", inner, ctx),
+        _ => {
+            error(ctx.stderr, "[", "missing ']'");
+            2
+        }
     }
+}
+
+fn test_command(name: &str, args: &[String], ctx: &mut Ctx<'_>) -> i32 {
     if args.is_empty() {
         return 1;
+    }
+
+    // POSIX fixes the meaning of short argument lists, so an operand that looks
+    // like an operator (`test -n`, `[ = ]`) cannot derail the expression parser.
+    let simple = match args {
+        [only] => Some(Ok(!only.is_empty())),
+        [not, only] if not == "!" => Some(Ok(only.is_empty())),
+        [left, operator, right] if is_binary_test(operator) => {
+            Some(compare(left, operator, right))
+        }
+        _ => None,
+    };
+    if let Some(result) = simple {
+        return match result {
+            Ok(true) => 0,
+            Ok(false) => 1,
+            Err(message) => {
+                error(ctx.stderr, name, &message);
+                2
+            }
+        };
     }
 
     let mut parser = TestParser {
         args,
         index: 0,
+        depth: 0,
         ctx,
     };
     match parser.parse_or() {
         Ok(value) => {
             if parser.index != args.len() {
-                error(parser.ctx.stderr, "test", "extra arguments");
+                error(parser.ctx.stderr, name, "too many arguments");
                 2
             } else if value {
                 0
@@ -209,7 +282,7 @@ pub(super) fn test(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
             }
         }
         Err(message) => {
-            error(parser.ctx.stderr, "test", message);
+            error(parser.ctx.stderr, name, &message);
             2
         }
     }
@@ -218,6 +291,7 @@ pub(super) fn test(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
 struct TestParser<'a, 'b, 'c> {
     args: &'a [String],
     index: usize,
+    depth: usize,
     ctx: &'b mut Ctx<'c>,
 }
 
@@ -234,7 +308,15 @@ impl TestParser<'_, '_, '_> {
         value
     }
 
-    fn parse_or(&mut self) -> Result<bool, &'static str> {
+    fn enter(&mut self) -> Result<(), String> {
+        self.depth += 1;
+        if self.depth > MAX_EXPR_DEPTH {
+            return Err(String::from("expression too deeply nested"));
+        }
+        Ok(())
+    }
+
+    fn parse_or(&mut self) -> Result<bool, String> {
         let mut value = self.parse_and()?;
         while self.peek() == Some("-o") {
             self.index += 1;
@@ -244,7 +326,7 @@ impl TestParser<'_, '_, '_> {
         Ok(value)
     }
 
-    fn parse_and(&mut self) -> Result<bool, &'static str> {
+    fn parse_and(&mut self) -> Result<bool, String> {
         let mut value = self.parse_not()?;
         while self.peek() == Some("-a") {
             self.index += 1;
@@ -254,82 +336,90 @@ impl TestParser<'_, '_, '_> {
         Ok(value)
     }
 
-    fn parse_not(&mut self) -> Result<bool, &'static str> {
+    fn parse_not(&mut self) -> Result<bool, String> {
         if self.peek() == Some("!") {
             self.index += 1;
-            return Ok(!self.parse_not()?);
+            self.enter()?;
+            let value = !self.parse_not()?;
+            self.depth -= 1;
+            return Ok(value);
         }
         self.parse_primary()
     }
 
-    fn parse_primary(&mut self) -> Result<bool, &'static str> {
+    fn parse_primary(&mut self) -> Result<bool, String> {
         if self.peek() == Some("(") {
             self.index += 1;
+            self.enter()?;
             let value = self.parse_or()?;
+            self.depth -= 1;
             if self.take().as_deref() != Some(")") {
-                return Err("missing ')'");
+                return Err(String::from("missing ')'"));
             }
             return Ok(value);
         }
 
         let Some(first) = self.take() else {
-            return Err("expected an expression");
+            return Err(String::from("argument expected"));
         };
 
-        match first.as_str() {
-            "-e" => self.exists(),
-            "-f" => self.kind(Kind::File),
-            "-d" => self.kind(Kind::Dir),
-            "-s" => {
-                let path = self.take().ok_or("missing operand")?;
-                let meta = self.ctx.fs.meta(&path).map_err(|_| "missing file")?;
-                Ok(meta.size > 0)
-            }
-            "-r" | "-w" => self.exists(),
-            "-z" => Ok(self.take().unwrap_or_default().is_empty()),
-            "-n" => Ok(!self.take().unwrap_or_default().is_empty()),
-            _ => {
-                // Binary operators have a left operand that we just consumed.
-                let operator = self.peek().map(str::to_string);
-                if let Some(operator) = operator {
-                    if matches!(
-                        operator.as_str(),
-                        "=" | "==" | "!=" | "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge"
-                    ) {
-                        self.index += 1;
-                        let right = self.take().ok_or("missing right operand")?;
-                        return Ok(compare(&first, &operator, &right));
-                    }
-                }
-                Ok(!first.is_empty())
-            }
+        // A binary operator wins over reading the first word as a unary one,
+        // so `[ -f = -f ]` compares strings.
+        if let Some(operator) = self.peek().filter(|word| is_binary_test(word)) {
+            let operator = operator.to_string();
+            self.index += 1;
+            let right = self.take().ok_or("argument expected")?;
+            return compare(&first, &operator, &right);
         }
-    }
 
-    fn exists(&mut self) -> Result<bool, &'static str> {
-        let path = self.take().ok_or("missing operand")?;
-        Ok(self.ctx.fs.exists(&path))
-    }
-
-    fn kind(&mut self, expected: Kind) -> Result<bool, &'static str> {
-        let path = self.take().ok_or("missing operand")?;
-        Ok(self
-            .ctx
-            .fs
-            .meta(&path)
-            .map(|meta| meta.kind == expected)
-            .unwrap_or(false))
+        match first.as_str() {
+            "-e" | "-r" | "-w" | "-x" | "-f" | "-d" | "-s" | "-L" | "-h" => {
+                let path = self.take().ok_or("argument expected")?;
+                Ok(file_test(self.ctx, &first, &path))
+            }
+            "-z" => Ok(self.take().ok_or("argument expected")?.is_empty()),
+            "-n" => Ok(!self.take().ok_or("argument expected")?.is_empty()),
+            _ => Ok(!first.is_empty()),
+        }
     }
 }
 
-fn compare(left: &str, operator: &str, right: &str) -> bool {
+fn is_binary_test(word: &str) -> bool {
+    matches!(
+        word,
+        "=" | "==" | "!=" | "<" | ">" | "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge"
+    )
+}
+
+fn file_test(ctx: &mut Ctx<'_>, operator: &str, path: &str) -> bool {
+    let Ok(meta) = ctx.fs.meta(path) else {
+        return false;
+    };
     match operator {
-        "=" | "==" => left == right,
-        "!=" => left != right,
+        "-f" => meta.kind == Kind::File,
+        "-d" => meta.kind == Kind::Dir,
+        "-s" => meta.size > 0 || meta.kind == Kind::Dir,
+        // There are no symbolic links.
+        "-L" | "-h" => false,
+        // There are no permissions, so anything that exists is accessible, and
+        // directories and scripts count as executable.
+        _ => true,
+    }
+}
+
+fn compare(left: &str, operator: &str, right: &str) -> Result<bool, String> {
+    match operator {
+        "=" | "==" => Ok(left == right),
+        "!=" => Ok(left != right),
+        "<" => Ok(left < right),
+        ">" => Ok(left > right),
         _ => {
-            let left = parse_i64(left).unwrap_or(0);
-            let right = parse_i64(right).unwrap_or(0);
-            match operator {
+            let number = |text: &str| -> Result<i64, String> {
+                parse_i64(text.trim()).ok_or_else(|| format!("{text}: integer expression expected"))
+            };
+            let left = number(left)?;
+            let right = number(right)?;
+            Ok(match operator {
                 "-eq" => left == right,
                 "-ne" => left != right,
                 "-lt" => left < right,
@@ -337,7 +427,7 @@ fn compare(left: &str, operator: &str, right: &str) -> bool {
                 "-gt" => left > right,
                 "-ge" => left >= right,
                 _ => false,
-            }
+            })
         }
     }
 }
@@ -347,106 +437,255 @@ pub(super) fn expr(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
         return usage(ctx.stderr, "expr", "expr ARG...");
     }
 
-    if args[0] == "length" {
-        let value = args.get(1).map(String::as_str).unwrap_or("");
-        let length = value.chars().count();
+    if args[0] == "length" && args.len() == 2 {
+        let length = args[1].chars().count();
         write_line(ctx.stdout, format_args!("{length}"));
-        return if length == 0 { 1 } else { 0 };
+        return i32::from(length == 0);
     }
-    if args[0] == "index" {
-        let value = args.get(1).map(String::as_str).unwrap_or("");
-        let chars = args.get(2).map(String::as_str).unwrap_or("");
-        let found = value
+    if args[0] == "index" && args.len() == 3 {
+        let found = args[1]
             .chars()
-            .position(|ch| chars.contains(ch))
-            .map(|index| index + 1)
-            .unwrap_or(0);
+            .position(|ch| args[2].contains(ch))
+            .map_or(0, |index| index + 1);
         write_line(ctx.stdout, format_args!("{found}"));
-        return if found == 0 { 1 } else { 0 };
+        return i32::from(found == 0);
     }
-    if args[0] == "substr" {
-        let value = args.get(1).map(String::as_str).unwrap_or("");
-        let position = args
-            .get(2)
-            .and_then(|value| parse_i64(value))
-            .unwrap_or(1)
-            .max(1) as usize;
-        let length = args
-            .get(3)
-            .and_then(|value| parse_i64(value))
-            .unwrap_or(0)
-            .max(0) as usize;
-        let result: String = value.chars().skip(position - 1).take(length).collect();
+    if args[0] == "substr" && args.len() == 4 {
+        let position = parse_i64(&args[2]).unwrap_or(0);
+        let length = parse_i64(&args[3]).unwrap_or(0).max(0) as usize;
+        let result: String = if position < 1 {
+            String::new()
+        } else {
+            args[1]
+                .chars()
+                .skip(position as usize - 1)
+                .take(length)
+                .collect()
+        };
         write_line(ctx.stdout, format_args!("{result}"));
-        return if result.is_empty() { 1 } else { 0 };
+        return i32::from(result.is_empty());
+    }
+    if args[0] == "match" && args.len() == 3 {
+        let value = regex_match(&args[1], &args[2]);
+        return finish_expr(ctx, value);
     }
 
-    let mut value = match parse_i64(&args[0]) {
-        Some(value) => value,
-        None => {
-            // A bare string is echoed, as POSIX expr does.
-            if args.len() == 1 {
-                write_line(ctx.stdout, format_args!("{}", args[0]));
-                return if args[0].is_empty() { 1 } else { 0 };
-            }
-            error(
-                ctx.stderr,
-                "expr",
-                &format!("non-numeric argument '{}'", args[0]),
-            );
-            return 2;
-        }
+    let mut parser = ExprParser {
+        args,
+        index: 0,
+        depth: 0,
     };
+    let result = parser.or().and_then(|value| {
+        if parser.index == args.len() {
+            Ok(value)
+        } else {
+            Err(String::from("syntax error"))
+        }
+    });
+    finish_expr(ctx, result)
+}
 
-    let mut index = 1usize;
-    while index < args.len() {
-        let operator = args[index].as_str();
-        let Some(right) = args.get(index + 1).and_then(|value| parse_i64(value)) else {
-            error(ctx.stderr, "expr", "syntax error");
-            return 2;
-        };
-        value = match operator {
-            "+" => value.wrapping_add(right),
-            "-" => value.wrapping_sub(right),
-            "*" => value.wrapping_mul(right),
-            "/" => {
-                if right == 0 {
-                    error(ctx.stderr, "expr", "division by zero");
-                    return 2;
-                }
-                value / right
-            }
-            "%" => {
-                if right == 0 {
-                    error(ctx.stderr, "expr", "division by zero");
-                    return 2;
-                }
-                value % right
-            }
-            "<" => i64::from(value < right),
-            "<=" => i64::from(value <= right),
-            "=" | "==" => i64::from(value == right),
-            "!=" => i64::from(value != right),
-            ">=" => i64::from(value >= right),
-            ">" => i64::from(value > right),
-            "&" => value & right,
-            "|" => value | right,
-            _ => {
-                error(
-                    ctx.stderr,
-                    "expr",
-                    &format!("unknown operator '{operator}'"),
-                );
-                return 2;
-            }
-        };
-        index += 2;
+fn finish_expr(ctx: &mut Ctx<'_>, result: Result<ExprValue, String>) -> i32 {
+    match result {
+        Ok(value) => {
+            let text = value.text();
+            write_line(ctx.stdout, format_args!("{text}"));
+            i32::from(value.is_null())
+        }
+        Err(message) => {
+            error(ctx.stderr, "expr", &message);
+            2
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum ExprValue {
+    Int(i64),
+    Text(String),
+}
+
+impl ExprValue {
+    fn from_word(word: &str) -> Self {
+        match parse_i64(word) {
+            Some(number) if !word.starts_with('+') => Self::Int(number),
+            _ => Self::Text(word.to_string()),
+        }
     }
 
-    write_line(ctx.stdout, format_args!("{value}"));
-    if value == 0 {
-        1
-    } else {
-        0
+    fn text(&self) -> String {
+        match self {
+            Self::Int(number) => number.to_string(),
+            Self::Text(text) => text.clone(),
+        }
     }
+
+    fn is_null(&self) -> bool {
+        match self {
+            Self::Int(number) => *number == 0,
+            Self::Text(text) => text.is_empty(),
+        }
+    }
+
+    fn int(&self) -> Result<i64, String> {
+        match self {
+            Self::Int(number) => Ok(*number),
+            Self::Text(_) => Err(String::from("non-integer argument")),
+        }
+    }
+}
+
+/// The POSIX `expr` grammar, loosest operators first: `|`, `&`, comparisons,
+/// `+ -`, `* / %`, then `:`.
+struct ExprParser<'a> {
+    args: &'a [String],
+    index: usize,
+    depth: usize,
+}
+
+impl ExprParser<'_> {
+    fn peek(&self) -> Option<&str> {
+        self.args.get(self.index).map(String::as_str)
+    }
+
+    fn or(&mut self) -> Result<ExprValue, String> {
+        let mut left = self.and()?;
+        while self.peek() == Some("|") {
+            self.index += 1;
+            let right = self.and()?;
+            if left.is_null() {
+                left = if right.is_null() {
+                    ExprValue::Int(0)
+                } else {
+                    right
+                };
+            }
+        }
+        Ok(left)
+    }
+
+    fn and(&mut self) -> Result<ExprValue, String> {
+        let mut left = self.comparison()?;
+        while self.peek() == Some("&") {
+            self.index += 1;
+            let right = self.comparison()?;
+            if left.is_null() || right.is_null() {
+                left = ExprValue::Int(0);
+            }
+        }
+        Ok(left)
+    }
+
+    fn comparison(&mut self) -> Result<ExprValue, String> {
+        let mut left = self.sum()?;
+        while let Some(operator) = self
+            .peek()
+            .filter(|word| matches!(*word, "<" | "<=" | "=" | "==" | "!=" | ">=" | ">"))
+            .map(str::to_string)
+        {
+            self.index += 1;
+            let right = self.sum()?;
+            let ordering = match (&left, &right) {
+                (ExprValue::Int(a), ExprValue::Int(b)) => a.cmp(b),
+                _ => left.text().cmp(&right.text()),
+            };
+            let result = match operator.as_str() {
+                "<" => ordering.is_lt(),
+                "<=" => ordering.is_le(),
+                "=" | "==" => ordering.is_eq(),
+                "!=" => ordering.is_ne(),
+                ">=" => ordering.is_ge(),
+                _ => ordering.is_gt(),
+            };
+            left = ExprValue::Int(i64::from(result));
+        }
+        Ok(left)
+    }
+
+    fn sum(&mut self) -> Result<ExprValue, String> {
+        let mut left = self.product()?;
+        while let Some(operator) = self.peek().filter(|word| matches!(*word, "+" | "-")) {
+            let add = operator == "+";
+            self.index += 1;
+            let right = self.product()?.int()?;
+            let value = left.int()?;
+            left = ExprValue::Int(if add {
+                value.wrapping_add(right)
+            } else {
+                value.wrapping_sub(right)
+            });
+        }
+        Ok(left)
+    }
+
+    fn product(&mut self) -> Result<ExprValue, String> {
+        let mut left = self.matching()?;
+        while let Some(operator) = self
+            .peek()
+            .filter(|word| matches!(*word, "*" | "/" | "%"))
+            .map(str::to_string)
+        {
+            self.index += 1;
+            let right = self.matching()?.int()?;
+            let value = left.int()?;
+            left = ExprValue::Int(match operator.as_str() {
+                "*" => value.wrapping_mul(right),
+                _ if right == 0 => return Err(String::from("division by zero")),
+                "/" => value.wrapping_div(right),
+                _ => value.wrapping_rem(right),
+            });
+        }
+        Ok(left)
+    }
+
+    fn matching(&mut self) -> Result<ExprValue, String> {
+        let mut left = self.primary()?;
+        while self.peek() == Some(":") {
+            self.index += 1;
+            let pattern = self.primary()?;
+            left = regex_match(&left.text(), &pattern.text())?;
+        }
+        Ok(left)
+    }
+
+    fn primary(&mut self) -> Result<ExprValue, String> {
+        let Some(word) = self.peek().map(str::to_string) else {
+            return Err(String::from("syntax error"));
+        };
+        self.index += 1;
+        if word == "(" {
+            self.depth += 1;
+            if self.depth > MAX_EXPR_DEPTH {
+                return Err(String::from("expression too deeply nested"));
+            }
+            let value = self.or()?;
+            self.depth -= 1;
+            if self.peek() != Some(")") {
+                return Err(String::from("syntax error: expecting ')'"));
+            }
+            self.index += 1;
+            return Ok(value);
+        }
+        Ok(ExprValue::from_word(&word))
+    }
+}
+
+/// `STRING : REGEX`: an anchored basic regular expression. The result is the
+/// first group when there is one, otherwise the number of bytes matched.
+fn regex_match(text: &str, pattern: &str) -> Result<ExprValue, String> {
+    let mut anchored = String::from("^");
+    anchored.push_str(pattern.strip_prefix('^').unwrap_or(pattern));
+    let regex = Regex::new(&anchored, Syntax::Basic).map_err(String::from)?;
+    let found = regex.find_at(text.as_bytes(), 0);
+    if regex.groups() > 0 {
+        let group = found
+            .and_then(|caps| caps.group(1))
+            .and_then(|(start, end)| text.get(start..end))
+            .unwrap_or("");
+        return Ok(ExprValue::Text(group.to_string()));
+    }
+    Ok(ExprValue::Int(found.map_or(0, |caps| {
+        let (start, end) = caps.span();
+        text.get(start..end).map_or(0, |part| part.chars().count()) as i64
+    })))
 }

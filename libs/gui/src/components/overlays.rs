@@ -138,6 +138,7 @@ impl<'a, 'b, 's, const N: usize> Ui<'a, 'b, 's, N> {
             popup_width.max(0) as u32,
             popup_height.max(0) as u32,
         );
+        self.float(popup);
 
         let mut dismissed = false;
         if self.pointer_pressed() && !self.pointer_over(anchor) && !self.pointer_over(popup) {

@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup show
+      - name: Type-check both ports
+        run: make check-arm check-x64
+      - name: Host tests
+        run: make test
+
+  boot:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm, x64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-arm qemu-system-x86 binutils
+      - name: Install toolchain
+        run: rustup show
+      - name: Boot test
+        run: make boot-test-${{ matrix.arch }}

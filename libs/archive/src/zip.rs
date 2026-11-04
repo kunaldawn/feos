@@ -27,6 +27,11 @@ const FLAG_ENCRYPTED: u16 = 0x0001;
 const FLAG_STRONG_ENCRYPTION: u16 = 0x0040;
 const FLAG_UTF8: u16 = 0x0800;
 
+/// DEFLATE's best case: a two-bit match of 258 bytes gives 1032:1. The slack
+/// covers very small streams, whose block framing rounds the ratio.
+const DEFLATE_MAX_RATIO: u64 = 1032;
+const DEFLATE_RATIO_SLACK: u64 = 1024;
+
 fn u16_at(data: &[u8], offset: usize) -> Result<u16> {
     need(data.len(), offset, 2)?;
     Ok(u16::from_le_bytes([data[offset], data[offset + 1]]))
@@ -226,6 +231,25 @@ impl<'a> ZipReader<'a> {
             || local_offset == 0xffff_ffff
         {
             return Err(ArchiveError::UnsupportedFeature("zip64 entry"));
+        }
+
+        // Callers size allocations from these fields, so an entry whose sizes
+        // can't be true is rejected here rather than on extraction.
+        let implausible = match method {
+            METHOD_STORED => compressed_size != uncompressed_size,
+            // A method this reader can't extract gets the same bound, since a
+            // caller may allocate before it finds that out.
+            _ => {
+                uncompressed_size as u64
+                    > (compressed_size as u64)
+                        .saturating_mul(DEFLATE_MAX_RATIO)
+                        .saturating_add(DEFLATE_RATIO_SLACK)
+            }
+        };
+        if implausible {
+            return Err(ArchiveError::InvalidData(
+                "zip entry sizes are not plausible",
+            ));
         }
 
         let name_start = self.central + CENTRAL_HEADER_LEN;

@@ -6,3 +6,6 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+feos-port-io = { workspace = true }

@@ -3,7 +3,7 @@
 use feos_app::{App, Context};
 use feos_audio::{AudioBuffer, AudioFormat, Oscillator, Sample, Waveform};
 use feos_console::println;
-use feos_sync::SpinLock;
+use feos_sync::Mutex;
 
 /// Longest playable clip, matching the driver's DMA buffer.
 const MAX_MS: usize = 3_000;
@@ -18,7 +18,10 @@ const MAX_SAMPLES: usize = SAMPLE_RATE as usize * CHANNELS as usize * MAX_MS / 1
 #[repr(align(128))]
 struct Buffer([i16; MAX_SAMPLES]);
 
-static BUFFER: SpinLock<Buffer> = SpinLock::new(Buffer([0; MAX_SAMPLES]));
+static BUFFER: Mutex<Buffer> = Mutex::new(Buffer([0; MAX_SAMPLES]));
+
+/// How long to wait for room in the device's queue.
+const WRITE_RETRY_MS: u64 = 20;
 
 /// Plays a short A-major chord.
 pub struct Tone;
@@ -62,7 +65,8 @@ impl App for Tone {
 
         // The host audio device is a single stream. Serialize synthesis and
         // playback so two `tone` processes cannot overwrite each other's
-        // samples or interleave DMA blocks.
+        // samples or interleave them in the stream. The second one sleeps on
+        // this mutex rather than spinning.
         let mut buffer = BUFFER.lock();
         let format = AudioFormat::new(SAMPLE_RATE, CHANNELS).expect("valid format");
         let mut audio = AudioBuffer::new(&mut buffer.0[..samples], format).expect("whole frames");
@@ -84,9 +88,28 @@ impl App for Tone {
             audio.peak()
         );
 
-        match device.play(audio.samples()) {
-            Ok(()) => println!("done"),
-            Err(error) => println!("playback failed: {error:?}"),
+        // Streamed in pieces, so a kill can stop this between two of them. That
+        // releases the mutex at once; a kill can't reap a task holding it.
+        let processes = context.platform.processes;
+        let mut remaining = audio.samples();
+        while !remaining.is_empty() {
+            if processes.kill_requested() {
+                device.stop();
+                return;
+            }
+            let accepted = device.write(remaining);
+            remaining = &remaining[accepted..];
+            if accepted == 0 {
+                context.platform.clock.idle_ms(WRITE_RETRY_MS);
+            }
         }
+        while device.queued() > 0 {
+            if processes.kill_requested() {
+                device.stop();
+                return;
+            }
+            context.platform.clock.idle_ms(WRITE_RETRY_MS);
+        }
+        println!("done");
     }
 }

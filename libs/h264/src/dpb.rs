@@ -5,8 +5,8 @@
 
 use alloc::vec::Vec;
 
-use alloc::rc::Rc;
-use core::cell::Cell;
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::nal::NalUnitType;
 use crate::slice::SliceHeader;
@@ -23,19 +23,44 @@ pub enum ReferenceStatus {
     LongTerm(u32),
 }
 
-/// Immutable decoded picture data shared via Rc.
+/// A picture's long-term index, set by MMCO while the picture is shared
+/// between the DPB and reference lists.
+#[derive(Debug)]
+pub struct LongTermIdx(AtomicU32);
+
+impl LongTermIdx {
+    const NONE: u32 = u32::MAX;
+
+    pub fn new(index: Option<u32>) -> Self {
+        Self(AtomicU32::new(index.unwrap_or(Self::NONE)))
+    }
+
+    pub fn get(&self) -> Option<u32> {
+        match self.0.load(Ordering::Relaxed) {
+            Self::NONE => None,
+            index => Some(index),
+        }
+    }
+
+    pub fn set(&self, index: Option<u32>) {
+        self.0
+            .store(index.unwrap_or(Self::NONE), Ordering::Relaxed);
+    }
+}
+
+/// Immutable decoded picture data shared via Arc.
 #[derive(Debug)]
 pub struct DecodedPicture {
-    pub y: Rc<Vec<u8>>,
-    pub u: Rc<Vec<u8>>,
-    pub v: Rc<Vec<u8>>,
+    pub y: Arc<Vec<u8>>,
+    pub u: Arc<Vec<u8>>,
+    pub v: Arc<Vec<u8>>,
     pub width: u32,
     pub height: u32,
     pub frame_num: u32,
     pub pic_order_cnt: i32,
     /// Long-term index assigned by MMCO. Interior mutability is used because
-    /// pictures are shared through `Rc` between the DPB and reference lists.
-    pub long_term_frame_idx: Cell<Option<u32>>,
+    /// pictures are shared through `Arc` between the DPB and reference lists.
+    pub long_term_frame_idx: LongTermIdx,
     /// Per-4x4-block L0 motion vectors (for temporal direct mode co-located access).
     pub mv_l0: Vec<[i16; 2]>,
     /// Per-4x4-block L0 reference indices.
@@ -52,9 +77,9 @@ pub struct DecodedPicture {
     pub is_intra: bool,
 }
 
-/// A DPB entry wrapping an Rc<DecodedPicture> with mutable status.
+/// A DPB entry wrapping an Arc<DecodedPicture> with mutable status.
 struct DpbEntry {
-    pic: Rc<DecodedPicture>,
+    pic: Arc<DecodedPicture>,
     reference: ReferenceStatus,
 }
 
@@ -65,6 +90,11 @@ pub struct Dpb {
     // POC type 0 state
     prev_poc_msb: i32,
     prev_poc_lsb: u32,
+    // POC types 1 and 2 state
+    prev_frame_num: u32,
+    prev_frame_num_offset: i32,
+    /// MaxFrameNum of the SPS used by the last compute_poc.
+    max_frame_num: u32,
 }
 
 impl Dpb {
@@ -74,7 +104,15 @@ impl Dpb {
             entries: Vec::new(),
             prev_poc_msb: 0,
             prev_poc_lsb: 0,
+            prev_frame_num: 0,
+            prev_frame_num_offset: 0,
+            max_frame_num: 16,
         }
+    }
+
+    /// MaxFrameNum of the active SPS.
+    pub fn max_frame_num(&self) -> u32 {
+        self.max_frame_num
     }
 
     /// Update capacity when a new SPS is parsed.
@@ -82,16 +120,34 @@ impl Dpb {
         self.max_ref_frames = max_ref_frames.min(16) as usize;
     }
 
-    /// Clear the entire DPB. Called on IDR.
+    /// Clear the entire DPB. Called when an IDR picture finishes; its slices
+    /// already reset the POC state in compute_poc.
     pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Clear the DPB and all POC state, to restart decoding at an IDR.
+    pub fn reset(&mut self) {
         self.entries.clear();
         self.prev_poc_msb = 0;
         self.prev_poc_lsb = 0;
+        self.prev_frame_num = 0;
+        self.prev_frame_num_offset = 0;
+    }
+
+    /// Update POC state after a picture with MMCO 5, which is treated as
+    /// having had frame_num 0 and a POC rebased to zero (spec 8.2.1).
+    pub fn reset_after_mmco5(&mut self, delta_poc_bottom: i32) {
+        self.prev_poc_msb = 0;
+        // TopFieldOrderCnt - min(TopFieldOrderCnt, BottomFieldOrderCnt)
+        self.prev_poc_lsb = delta_poc_bottom.min(0).unsigned_abs();
+        self.prev_frame_num = 0;
+        self.prev_frame_num_offset = 0;
     }
 
     /// Insert a decoded picture into the DPB.
     /// Applies sliding window marking if needed (spec 8.2.5.3).
-    pub fn insert(&mut self, pic: Rc<DecodedPicture>, reference: ReferenceStatus) {
+    pub fn insert(&mut self, pic: Arc<DecodedPicture>, reference: ReferenceStatus) {
         let mut reference = reference;
         // Sliding window only applies to short-term references (spec 8.2.5.3)
         if reference == ReferenceStatus::ShortTerm {
@@ -117,18 +173,28 @@ impl Dpb {
     }
 
     /// Get the list of short-term reference pictures, sorted by descending PicNum.
-    /// Used to build ref_pic_list_0 for P slices (spec 8.2.4.2.1).
-    /// PicNum = FrameNumWrap = frame_num when frame_num hasn't wrapped, but after
-    /// wraparound we sort by POC (descending) which correctly orders by recency.
-    pub fn short_term_ref_list(&self) -> Vec<Rc<DecodedPicture>> {
+    /// Used to build ref_pic_list_0 for P slices (spec 8.2.4.2.1). For frames,
+    /// PicNum = FrameNumWrap: frame_num, less MaxFrameNum if it's above the
+    /// current picture's frame_num.
+    pub fn short_term_ref_list(
+        &self,
+        frame_num: u32,
+        max_frame_num: u32,
+    ) -> Vec<Arc<DecodedPicture>> {
         let mut refs: Vec<_> = self
             .entries
             .iter()
             .filter(|e| e.reference == ReferenceStatus::ShortTerm)
             .map(|e| e.pic.clone())
             .collect();
-        // Sort by descending POC as a proxy for recency (handles frame_num wraparound).
-        refs.sort_by_key(|b| core::cmp::Reverse(b.pic_order_cnt));
+        refs.sort_by_key(|pic| {
+            let wrap = if pic.frame_num > frame_num {
+                pic.frame_num as i64 - max_frame_num as i64
+            } else {
+                pic.frame_num as i64
+            };
+            core::cmp::Reverse(wrap)
+        });
         // Append long-term refs sorted by ascending long_term_frame_idx (spec 8.2.4.2.1)
         refs.extend(self.long_term_ref_list());
         refs
@@ -137,7 +203,7 @@ impl Dpb {
     /// Build ref_pic_list_0 for B slices (spec 8.2.4.2.3).
     /// Short-term refs with POC < current sorted by descending POC,
     /// then refs with POC > current sorted by ascending POC.
-    pub fn ref_list_l0_b(&self, current_poc: i32) -> Vec<Rc<DecodedPicture>> {
+    pub fn ref_list_l0_b(&self, current_poc: i32) -> Vec<Arc<DecodedPicture>> {
         let short_term: Vec<_> = self
             .entries
             .iter()
@@ -169,7 +235,7 @@ impl Dpb {
     /// Short-term refs with POC > current sorted by ascending POC,
     /// then refs with POC <= current sorted by descending POC.
     /// If L1 == L0 and has more than one entry, swap the first two.
-    pub fn ref_list_l1_b(&self, current_poc: i32) -> Vec<Rc<DecodedPicture>> {
+    pub fn ref_list_l1_b(&self, current_poc: i32) -> Vec<Arc<DecodedPicture>> {
         let short_term: Vec<_> = self
             .entries
             .iter()
@@ -215,7 +281,7 @@ impl Dpb {
     /// `frame_num`: current picture's frame_num
     /// `max_pic_num`: 1 << (log2_max_frame_num_minus4 + 4)
     pub fn apply_ref_list_modification(
-        ref_list: &mut Vec<Rc<DecodedPicture>>,
+        ref_list: &mut Vec<Arc<DecodedPicture>>,
         ops: &[(u32, u32)],
         frame_num: u32,
         max_pic_num: u32,
@@ -242,7 +308,7 @@ impl Dpb {
                     .position(|p| p.long_term_frame_idx.get() == Some(long_term_pic_num))
                 {
                     reorder_ref_list(ref_list, num_active, ref_idx_lx, found_pos, |p, pic| {
-                        !Rc::ptr_eq(p, pic)
+                        !Arc::ptr_eq(p, pic)
                     });
                 }
                 ref_idx_lx += 1;
@@ -275,9 +341,11 @@ impl Dpb {
 
             // Spec 8.2.4.3.1: find the picture, shift entries right to make room,
             // insert at ref_idx_lx, then remove duplicates after ref_idx_lx.
-            if let Some(found_pos) = ref_list.iter().position(|p| p.frame_num == pic_num) {
+            if let Some(found_pos) = ref_list
+                .iter()
+                .position(|p| p.frame_num == pic_num && p.long_term_frame_idx.get().is_none()) {
                 reorder_ref_list(ref_list, num_active, ref_idx_lx, found_pos, |p, pic| {
-                    !Rc::ptr_eq(p, pic)
+                    !Arc::ptr_eq(p, pic)
                 });
             }
 
@@ -293,12 +361,36 @@ impl Dpb {
         nal_unit_type: NalUnitType,
         nal_ref_idc: u8,
     ) -> i32 {
+        self.max_frame_num = 1u32 << (sps.log2_max_frame_num_minus4 + 4).min(31);
         match sps.pic_order_cnt_type {
             0 => self.compute_poc_type0(sps, header, nal_unit_type, nal_ref_idc),
-            1 => self.compute_poc_type1(sps, header, nal_unit_type, nal_ref_idc),
-            2 => Self::compute_poc_type2(header.frame_num, nal_unit_type, nal_ref_idc),
+            1 => {
+                let offset = self.frame_num_offset(header.frame_num, nal_unit_type);
+                Self::compute_poc_type1(sps, header, offset, nal_unit_type, nal_ref_idc)
+            }
+            2 => {
+                let offset = self.frame_num_offset(header.frame_num, nal_unit_type);
+                Self::compute_poc_type2(header.frame_num, offset, nal_unit_type, nal_ref_idc)
+            }
             _ => 0,
         }
+    }
+
+    /// FrameNumOffset for POC types 1 and 2 (spec 8.2.1.2, 8.2.1.3): grows by
+    /// MaxFrameNum each time frame_num wraps. Every slice of a picture calls
+    /// this, and repeats with the same frame_num leave the state unchanged.
+    fn frame_num_offset(&mut self, frame_num: u32, nal_unit_type: NalUnitType) -> i32 {
+        let offset = if nal_unit_type == NalUnitType::SliceIdr {
+            0
+        } else if self.prev_frame_num > frame_num {
+            self.prev_frame_num_offset
+                .wrapping_add(self.max_frame_num as i32)
+        } else {
+            self.prev_frame_num_offset
+        };
+        self.prev_frame_num = frame_num;
+        self.prev_frame_num_offset = offset;
+        offset
     }
 
     /// POC type 0 (spec 8.2.1.1) — uses pic_order_cnt_lsb with MSB wrapping.
@@ -312,7 +404,6 @@ impl Dpb {
         if nal_unit_type == NalUnitType::SliceIdr {
             self.prev_poc_msb = 0;
             self.prev_poc_lsb = 0;
-            return 0;
         }
 
         let shift = (sps.log2_max_pic_order_cnt_lsb_minus4 + 4).min(31);
@@ -346,21 +437,20 @@ impl Dpb {
 
     /// POC type 1 (spec 8.2.1.2) — uses delta_pic_order_cnt with cycle offsets.
     fn compute_poc_type1(
-        &self,
         sps: &Sps,
         header: &SliceHeader,
+        frame_num_offset: i32,
         nal_unit_type: NalUnitType,
         nal_ref_idc: u8,
     ) -> i32 {
-        if nal_unit_type == NalUnitType::SliceIdr {
-            return 0;
-        }
-
         let num_ref_frames_in_cycle = sps.num_ref_frames_in_pic_order_cnt_cycle as usize;
-        let expected_delta_per_cycle: i32 = sps.offset_for_ref_frame.iter().sum();
+        let expected_delta_per_cycle = sps
+            .offset_for_ref_frame
+            .iter()
+            .fold(0i32, |a, &b| a.wrapping_add(b));
 
         let mut abs_frame_num = if num_ref_frames_in_cycle > 0 {
-            header.frame_num as i32
+            frame_num_offset.wrapping_add(header.frame_num as i32)
         } else {
             0
         };
@@ -368,42 +458,51 @@ impl Dpb {
             abs_frame_num -= 1;
         }
 
-        let expected_poc = if abs_frame_num > 0 {
+        let mut expected_poc = if abs_frame_num > 0 {
             let cycle = (abs_frame_num - 1) / num_ref_frames_in_cycle.max(1) as i32;
             let idx = ((abs_frame_num - 1) % num_ref_frames_in_cycle.max(1) as i32) as usize;
-            let partial: i32 = sps.offset_for_ref_frame[..=idx]
+            let partial: i32 = sps
+                .offset_for_ref_frame
                 .iter()
+                .take(idx + 1)
                 .copied()
                 .fold(0i32, |a, b| a.wrapping_add(b));
             cycle
                 .wrapping_mul(expected_delta_per_cycle)
                 .wrapping_add(partial)
-                .wrapping_add(if nal_ref_idc == 0 {
-                    sps.offset_for_non_ref_pic
-                } else {
-                    0
-                })
         } else {
             0
         };
+        if nal_ref_idc == 0 {
+            expected_poc = expected_poc.wrapping_add(sps.offset_for_non_ref_pic);
+        }
 
-        let top_field_order_cnt = expected_poc + header.delta_pic_order_cnt[0];
+        let top_field_order_cnt = expected_poc.wrapping_add(header.delta_pic_order_cnt[0]);
         // For frames: PicOrderCnt = min(TopFieldOrderCnt, BottomFieldOrderCnt)
         // BottomFieldOrderCnt = TopFieldOrderCnt + offset_for_top_to_bottom_field + delta[1]
         let bottom_field_order_cnt = top_field_order_cnt
             .wrapping_add(sps.offset_for_top_to_bottom_field)
             .wrapping_add(header.delta_pic_order_cnt[1]);
+        let _ = nal_unit_type;
         top_field_order_cnt.min(bottom_field_order_cnt)
     }
 
     /// POC type 2 (spec 8.2.1.3) — derived directly from frame_num.
-    fn compute_poc_type2(frame_num: u32, nal_unit_type: NalUnitType, nal_ref_idc: u8) -> i32 {
+    fn compute_poc_type2(
+        frame_num: u32,
+        frame_num_offset: i32,
+        nal_unit_type: NalUnitType,
+        nal_ref_idc: u8,
+    ) -> i32 {
+        let doubled = frame_num_offset
+            .wrapping_add(frame_num as i32)
+            .wrapping_mul(2);
         if nal_unit_type == NalUnitType::SliceIdr {
             0
         } else if nal_ref_idc > 0 {
-            (2i32).wrapping_mul(frame_num as i32)
+            doubled
         } else {
-            (2i32).wrapping_mul(frame_num as i32).wrapping_sub(1)
+            doubled.wrapping_sub(1)
         }
     }
 
@@ -541,7 +640,7 @@ impl Dpb {
 
     /// Get list of long-term reference pictures, sorted by ascending long_term_frame_idx.
     /// Used to append to reference lists after short-term refs (spec 8.2.4.2.1, 8.2.4.2.3).
-    pub fn long_term_ref_list(&self) -> Vec<Rc<DecodedPicture>> {
+    pub fn long_term_ref_list(&self) -> Vec<Arc<DecodedPicture>> {
         let mut refs: Vec<_> = self
             .entries
             .iter()
@@ -562,11 +661,11 @@ impl Dpb {
 }
 
 fn reorder_ref_list(
-    ref_list: &mut Vec<Rc<DecodedPicture>>,
+    ref_list: &mut Vec<Arc<DecodedPicture>>,
     num_active: usize,
     insert_at: usize,
     found_pos: usize,
-    keep: impl Fn(&Rc<DecodedPicture>, &Rc<DecodedPicture>) -> bool,
+    keep: impl Fn(&Arc<DecodedPicture>, &Arc<DecodedPicture>) -> bool,
 ) {
     let pic = ref_list[found_pos].clone();
     ref_list.push(ref_list.last().unwrap().clone());
@@ -590,8 +689,8 @@ fn reorder_ref_list(
 mod tests {
     use super::*;
 
-    fn make_pic(frame_num: u32, poc: i32) -> Rc<DecodedPicture> {
-        Rc::new(DecodedPicture {
+    fn make_pic(frame_num: u32, poc: i32) -> Arc<DecodedPicture> {
+        Arc::new(DecodedPicture {
             y: vec![].into(),
             u: vec![].into(),
             v: vec![].into(),
@@ -599,7 +698,7 @@ mod tests {
             height: 16,
             frame_num,
             pic_order_cnt: poc,
-            long_term_frame_idx: Cell::new(None),
+            long_term_frame_idx: LongTermIdx::new(None),
             mv_l0: vec![],
             ref_idx_l0: vec![],
             ref_poc_l0: vec![],
@@ -723,5 +822,140 @@ mod tests {
         let ops: Vec<(u32, u32)> = (0..10).map(|_| (0u32, 0u32)).collect();
         // This must not panic
         Dpb::apply_ref_list_modification(&mut ref_list, &ops, 5, 16);
+    }
+}
+
+#[cfg(test)]
+mod poc_tests {
+    use super::*;
+    use crate::nal::{NalUnitType, annex_b_units};
+    use crate::pps::parse_pps;
+    use crate::slice::parse_slice_header;
+    use crate::sps::parse_sps;
+
+    /// A real SPS and P slice header, ready for their fields to be edited.
+    fn parameters() -> (Sps, SliceHeader) {
+        let stream = include_bytes!("../testdata/baseline_cavlc.h264");
+        let mut sps = None;
+        let mut pps = None;
+        let mut header = None;
+        for nal in annex_b_units(stream) {
+            match nal.nal_unit_type {
+                NalUnitType::Sps => sps = Some(parse_sps(&nal.rbsp).unwrap()),
+                NalUnitType::Pps => pps = Some(parse_pps(&nal.rbsp, sps.as_ref()).unwrap()),
+                NalUnitType::Slice if header.is_none() => {
+                    let (parsed, _) = parse_slice_header(
+                        &nal.rbsp,
+                        sps.as_ref().unwrap(),
+                        pps.as_ref().unwrap(),
+                        nal.nal_unit_type,
+                        nal.nal_ref_idc,
+                    )
+                    .unwrap();
+                    header = Some(parsed);
+                }
+                _ => {}
+            }
+        }
+        let mut sps = sps.unwrap();
+        // MaxFrameNum 16, so frame_num wraps quickly.
+        sps.log2_max_frame_num_minus4 = 0;
+        (sps, header.unwrap())
+    }
+
+    /// POC of each picture in a run of reference P frames across frame_num wraps.
+    fn run(sps: &Sps, header: &mut SliceHeader, frames: u32) -> Vec<i32> {
+        let mut dpb = Dpb::new(1);
+        (1..=frames)
+            .map(|count| {
+                header.frame_num = count % 16;
+                // Every slice of a picture computes POC, which mustn't change it.
+                dpb.compute_poc(sps, header, NalUnitType::Slice, 1);
+                dpb.compute_poc(sps, header, NalUnitType::Slice, 1)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn poc_type_2_keeps_rising_when_frame_num_wraps() {
+        // MED-15.
+        let (mut sps, mut header) = parameters();
+        sps.pic_order_cnt_type = 2;
+        let pocs = run(&sps, &mut header, 40);
+        let expected: Vec<i32> = (1..=40).map(|count| count * 2).collect();
+        assert_eq!(pocs, expected);
+    }
+
+    #[test]
+    fn poc_type_1_keeps_rising_when_frame_num_wraps() {
+        // MED-15.
+        let (mut sps, mut header) = parameters();
+        sps.pic_order_cnt_type = 1;
+        sps.num_ref_frames_in_pic_order_cnt_cycle = 1;
+        sps.offset_for_ref_frame = vec![2];
+        sps.offset_for_top_to_bottom_field = 0;
+        header.delta_pic_order_cnt = [0; 2];
+        let pocs = run(&sps, &mut header, 40);
+        let expected: Vec<i32> = (1..=40).map(|count| count * 2).collect();
+        assert_eq!(pocs, expected);
+    }
+
+    #[test]
+    fn mmco5_restarts_the_frame_num_offset() {
+        let (mut sps, mut header) = parameters();
+        sps.pic_order_cnt_type = 2;
+        let mut dpb = Dpb::new(1);
+        header.frame_num = 15;
+        dpb.compute_poc(&sps, &header, NalUnitType::Slice, 1);
+        dpb.reset_after_mmco5(0);
+        header.frame_num = 1;
+        assert_eq!(dpb.compute_poc(&sps, &header, NalUnitType::Slice, 1), 2);
+    }
+
+    fn picture(frame_num: u32, poc: i32) -> Arc<DecodedPicture> {
+        Arc::new(DecodedPicture {
+            y: Arc::new(Vec::new()),
+            u: Arc::new(Vec::new()),
+            v: Arc::new(Vec::new()),
+            width: 16,
+            height: 16,
+            frame_num,
+            pic_order_cnt: poc,
+            long_term_frame_idx: LongTermIdx::new(None),
+            mv_l0: Vec::new(),
+            ref_idx_l0: Vec::new(),
+            ref_poc_l0: Vec::new(),
+            mv_l1: Vec::new(),
+            ref_idx_l1: Vec::new(),
+            mb_width: 1,
+            is_intra: false,
+        })
+    }
+
+    #[test]
+    fn default_p_list_sorts_by_pic_num_across_a_wrap() {
+        // MED-23. Decode order 14, 15, 0, where POC order differs: a reference
+        // B-frame has the highest frame_num but a middling POC.
+        let mut dpb = Dpb::new(4);
+        for (frame_num, poc) in [(14, 100), (15, 200), (0, 150)] {
+            dpb.insert(picture(frame_num, poc), ReferenceStatus::ShortTerm);
+        }
+        let list = dpb.short_term_ref_list(1, 16);
+        let order: Vec<u32> = list.iter().map(|pic| pic.frame_num).collect();
+        assert_eq!(order, [0, 15, 14]);
+    }
+
+    #[test]
+    fn reference_marking_finds_a_picture_across_a_wrap() {
+        // MED-23: picNumX below zero maps through MaxFrameNum. See
+        // Decoder::finalize_pending.
+        let mut dpb = Dpb::new(4);
+        dpb.insert(picture(15, 0), ReferenceStatus::ShortTerm);
+        dpb.insert(picture(0, 2), ReferenceStatus::ShortTerm);
+        let pic_num_x = (1i64 - 1 - 1).rem_euclid(16) as u32;
+        dpb.mark_short_term_unused(pic_num_x);
+        let list = dpb.short_term_ref_list(1, 16);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].frame_num, 0);
     }
 }

@@ -16,11 +16,12 @@
 //! The board chooses the transport and passes the base address (or nothing,
 //! for the legacy port pair).
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
+
+use core::ptr::{read_volatile, write_volatile};
 
 #[cfg(target_arch = "x86_64")]
-use core::arch::asm;
-use core::ptr::{read_volatile, write_volatile};
+use feos_port_io::{inl, outl};
 
 /// Number of buses scanned by `find`.
 const SCAN_BUSES: u8 = 8;
@@ -29,9 +30,14 @@ const SCAN_BUSES: u8 = 8;
 mod reg {
     pub const VENDOR_ID: usize = 0x00;
     pub const COMMAND: usize = 0x04;
-    pub const HEADER_TYPE: usize = 0x0c;
+    pub const HEADER_TYPE: usize = 0x0e;
     pub const BAR0: usize = 0x10;
 }
+
+/// BAR type field: bits 2:1 of a memory BAR.
+const BAR_TYPE_MASK: u32 = 0b110;
+/// BAR type field value for a 64-bit BAR.
+const BAR_TYPE_64: u32 = 0b100;
 
 /// PCI command-register bits.
 mod command {
@@ -281,44 +287,104 @@ impl<C: ConfigSpace> PciDevice<C> {
             .read32(self.bus, self.slot, self.function, reg::BAR0 + index * 4)
     }
 
+    fn read_bar(&self, offset: usize) -> u32 {
+        self.config
+            .read32(self.bus, self.slot, self.function, offset)
+    }
+
+    fn write_bar(&self, offset: usize, value: u32) {
+        self.config
+            .write32(self.bus, self.slot, self.function, offset, value);
+    }
+
+    /// Returns `true` when a memory BAR's type field says it is 64 bits wide.
+    fn is_64_bit(low: u32) -> bool {
+        low & BAR_TYPE_MASK == BAR_TYPE_64
+    }
+
+    /// Runs `body` with memory decoding off.
+    ///
+    /// While a BAR is being sized or moved it can hold any address, and the
+    /// device would answer accesses meant for something else.
+    fn with_decode_disabled<T>(&self, body: impl FnOnce() -> T) -> T {
+        let current = self
+            .config
+            .read16(self.bus, self.slot, self.function, reg::COMMAND);
+        self.config.write16(
+            self.bus,
+            self.slot,
+            self.function,
+            reg::COMMAND,
+            current & !command::MEMORY_SPACE,
+        );
+        let result = body();
+        self.config
+            .write16(self.bus, self.slot, self.function, reg::COMMAND, current);
+        result
+    }
+
+    /// Returns the address programmed into a memory BAR.
+    ///
+    /// Returns `None` for an I/O BAR. An address of zero means firmware left the
+    /// BAR unassigned.
+    pub fn memory_bar_address(&self, index: usize) -> Option<u64> {
+        let offset = reg::BAR0 + index * 4;
+        let low = self.read_bar(offset);
+        if low & 1 != 0 {
+            return None;
+        }
+        let high = if Self::is_64_bit(low) {
+            self.read_bar(offset + 4)
+        } else {
+            0
+        };
+        Some(((high as u64) << 32) | (low & !0xf) as u64)
+    }
+
     /// Sizes a BAR and returns its length in bytes.
     ///
     /// Returns `None` for I/O BARs or if the size cannot be probed.
     pub fn bar_size(&self, index: usize) -> Option<u64> {
         let offset = reg::BAR0 + index * 4;
-        let original = self
-            .config
-            .read32(self.bus, self.slot, self.function, offset);
+        let original = self.read_bar(offset);
 
         if original & 1 != 0 {
             return None; // I/O space BAR
         }
 
-        self.config
-            .write32(self.bus, self.slot, self.function, offset, 0xffff_ffff);
-        let mask = self
-            .config
-            .read32(self.bus, self.slot, self.function, offset);
-        self.config
-            .write32(self.bus, self.slot, self.function, offset, original);
+        let wide = Self::is_64_bit(original);
+        let mask = self.with_decode_disabled(|| {
+            self.write_bar(offset, 0xffff_ffff);
+            let low = self.read_bar(offset);
+            self.write_bar(offset, original);
+            let high = if wide {
+                let high_original = self.read_bar(offset + 4);
+                self.write_bar(offset + 4, 0xffff_ffff);
+                let high = self.read_bar(offset + 4);
+                self.write_bar(offset + 4, high_original);
+                high
+            } else {
+                // A 32-bit BAR decodes nothing above bit 31.
+                0xffff_ffff
+            };
+            ((high as u64) << 32) | (low & !0xf) as u64
+        });
 
-        let mask = mask & !0xf;
-        if mask == 0 {
+        if mask as u32 == 0 && mask >> 32 == if wide { 0 } else { 0xffff_ffff } {
             return None;
         }
 
-        Some((!mask as u64) + 1)
+        Some((!mask).wrapping_add(1))
     }
 
-    /// Assigns `address` to a memory BAR and enables decoding.
+    /// Assigns `address` to a memory BAR.
     ///
     /// Handles both 32-bit and 64-bit memory BARs. Returns `false` if the BAR
-    /// is not memory-mapped, has an unknown size, or `address` is misaligned.
+    /// is not memory-mapped, has an unknown size, `address` is misaligned, or
+    /// `address` doesn't fit a 32-bit BAR.
     pub fn assign_memory_bar(&self, index: usize, address: u64) -> bool {
         let offset = reg::BAR0 + index * 4;
-        let original = self
-            .config
-            .read32(self.bus, self.slot, self.function, offset);
+        let original = self.read_bar(offset);
 
         if original & 1 != 0 {
             return false;
@@ -328,25 +394,20 @@ impl<C: ConfigSpace> PciDevice<C> {
             return false;
         };
 
-        if !address.is_multiple_of(size) || address > u32::MAX as u64 {
+        let wide = Self::is_64_bit(original);
+        if !address.is_multiple_of(size) || (!wide && address > u32::MAX as u64) {
             return false;
         }
 
-        // Preserve the read-only type bits (bit 0 is 0 for memory, bits 2:1
-        // encode 32/64-bit addressing and prefetchability).
-        self.config.write32(
-            self.bus,
-            self.slot,
-            self.function,
-            offset,
-            (address as u32) | (original & 0xf),
-        );
-
-        if original & 0x4 != 0 {
-            // 64-bit BAR: the upper half lives in the next register.
-            self.config
-                .write32(self.bus, self.slot, self.function, offset + 4, 0);
-        }
+        self.with_decode_disabled(|| {
+            // Preserve the read-only type bits (bit 0 is 0 for memory, bits 2:1
+            // encode 32/64-bit addressing and bit 3 prefetchability).
+            self.write_bar(offset, (address as u32) | (original & 0xf));
+            if wide {
+                // 64-bit BAR: the upper half lives in the next register.
+                self.write_bar(offset + 4, (address >> 32) as u32);
+            }
+        });
 
         true
     }
@@ -369,18 +430,185 @@ impl<C: ConfigSpace> PciDevice<C> {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-#[inline]
-unsafe fn outl(port: u16, value: u32) {
-    // SAFETY: callers pass the standard PCI configuration ports.
-    unsafe { asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack)) };
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[cfg(target_arch = "x86_64")]
-#[inline]
-unsafe fn inl(port: u16) -> u32 {
-    let value: u32;
-    // SAFETY: callers pass the standard PCI configuration ports.
-    unsafe { asm!("in eax, dx", out("eax") value, in("dx") port, options(nomem, nostack)) };
-    value
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    /// A config space backed by a map, with a sizable BAR per function.
+    struct Bus {
+        registers: RefCell<HashMap<(u8, u8, u8, usize), u32>>,
+        /// `(bus, slot, function, bar offset) -> writable address mask`.
+        masks: RefCell<HashMap<(u8, u8, u8, usize), u32>>,
+        /// Each write to a BAR while memory decoding is on.
+        writes_while_decoding: RefCell<usize>,
+    }
+
+    impl Bus {
+        fn new() -> &'static Self {
+            Box::leak(Box::new(Self {
+                registers: RefCell::new(HashMap::new()),
+                masks: RefCell::new(HashMap::new()),
+                writes_while_decoding: RefCell::new(0),
+            }))
+        }
+
+        fn add(&self, slot: u8, function: u8, id: u32, multi_function: bool) {
+            let mut registers = self.registers.borrow_mut();
+            registers.insert((0, slot, function, reg::VENDOR_ID), id);
+            let header = if multi_function { 0x80u32 << 16 } else { 0 };
+            registers.insert((0, slot, function, 0x0c), header);
+            // Cache line size in the byte the wrong offset used to read.
+            registers.entry((0, slot, function, 0x0c)).and_modify(|value| *value |= 0x10);
+        }
+
+        fn bar(&self, slot: u8, function: u8, offset: usize, value: u32, mask: u32) {
+            self.registers
+                .borrow_mut()
+                .insert((0, slot, function, offset), value);
+            self.masks
+                .borrow_mut()
+                .insert((0, slot, function, offset), mask);
+        }
+    }
+
+    impl ConfigSpace for &'static Bus {
+        fn read32(&self, bus: u8, device: u8, function: u8, offset: usize) -> u32 {
+            *self
+                .registers
+                .borrow()
+                .get(&(bus, device, function, offset))
+                .unwrap_or(&if offset == reg::VENDOR_ID {
+                    0xffff_ffff
+                } else {
+                    0
+                })
+        }
+
+        fn write32(&self, bus: u8, device: u8, function: u8, offset: usize, value: u32) {
+            let key = (bus, device, function, offset);
+            let value = match self.masks.borrow().get(&key) {
+                Some(mask) => {
+                    let command = self.read32(bus, device, function, reg::COMMAND);
+                    if command as u16 & command::MEMORY_SPACE != 0 {
+                        *self.writes_while_decoding.borrow_mut() += 1;
+                    }
+                    let current = self.read32(bus, device, function, offset);
+                    (value & mask) | (current & !mask)
+                }
+                None => value,
+            };
+            self.registers.borrow_mut().insert(key, value);
+        }
+    }
+
+    const ID: u32 = 0x2668_8086;
+
+    fn found(bus: &'static Bus) -> Option<PciDevice<&'static Bus>> {
+        find_device(bus, 0x8086, 0x2668)
+    }
+
+    #[test]
+    fn scan_finds_a_device_at_function_zero() {
+        let bus = Bus::new();
+        bus.add(3, 0, ID, false);
+        let device = found(bus).expect("device");
+        assert_eq!((device.slot(), device.function()), (3, 0));
+    }
+
+    #[test]
+    fn scan_reaches_higher_functions_of_a_multi_function_device() {
+        // DRV-6: the header type was read from 0x0c, the cache line size, so
+        // the multi-function bit was never seen. q35's AHCI is at 00:1f.2.
+        let bus = Bus::new();
+        bus.add(0x1f, 0, 0x2918_8086, true);
+        bus.add(0x1f, 2, ID, false);
+        let device = found(bus).expect("device");
+        assert_eq!((device.slot(), device.function()), (0x1f, 2));
+    }
+
+    #[test]
+    fn scan_skips_functions_of_a_single_function_device() {
+        let bus = Bus::new();
+        bus.add(1, 0, 0x1234_5678, false);
+        bus.add(1, 2, ID, false);
+        assert!(found(bus).is_none());
+    }
+
+    #[test]
+    fn read8_and_read16_select_the_right_lane() {
+        let bus = Bus::new();
+        bus.registers.borrow_mut().insert((0, 0, 0, 0x0c), 0x0080_0010);
+        assert_eq!(bus.read8(0, 0, 0, 0x0c), 0x10);
+        assert_eq!(bus.read8(0, 0, 0, 0x0e), 0x80);
+        assert_eq!(bus.read16(0, 0, 0, 0x0e), 0x0080);
+    }
+
+    #[test]
+    fn a_32_bit_bar_sizes_and_assigns() {
+        let bus = Bus::new();
+        bus.add(1, 0, ID, false);
+        bus.bar(1, 0, reg::BAR0, 0, 0xffff_c000);
+        let device = found(bus).unwrap();
+        assert_eq!(device.bar_size(0), Some(0x4000));
+        assert!(device.assign_memory_bar(0, 0xc000_0000));
+        assert_eq!(device.memory_bar_address(0), Some(0xc000_0000));
+
+        // A 32-bit BAR can't hold a 64-bit address, and alignment is enforced.
+        assert!(!device.assign_memory_bar(0, 0x1_0000_0000));
+        assert!(!device.assign_memory_bar(0, 0xc000_1000));
+    }
+
+    #[test]
+    fn a_64_bit_bar_takes_an_address_above_4_gib() {
+        // DRV-17: the docs claimed 64-bit BARs while the code refused them.
+        let bus = Bus::new();
+        bus.add(1, 0, ID, false);
+        bus.bar(1, 0, reg::BAR0, BAR_TYPE_64, 0xffff_c000);
+        bus.bar(1, 0, reg::BAR0 + 4, 0, 0xffff_ffff);
+        let device = found(bus).unwrap();
+        assert_eq!(device.bar_size(0), Some(0x4000));
+        assert!(device.assign_memory_bar(0, 0x2_c000_0000));
+        assert_eq!(device.memory_bar_address(0), Some(0x2_c000_0000));
+    }
+
+    #[test]
+    fn sizing_restores_the_bar_and_decode_is_off_meanwhile() {
+        let bus = Bus::new();
+        bus.add(1, 0, ID, false);
+        bus.bar(1, 0, reg::BAR0, 0xc000_0000, 0xffff_c000);
+        let device = found(bus).unwrap();
+        device.enable();
+
+        assert_eq!(device.bar_size(0), Some(0x4000));
+        assert_eq!(device.memory_bar_address(0), Some(0xc000_0000));
+        assert!(device.assign_memory_bar(0, 0xd000_0000));
+        assert_eq!(*bus.writes_while_decoding.borrow(), 0);
+
+        // Decoding is back on afterwards.
+        let command = bus.read16(0, 1, 0, reg::COMMAND);
+        assert_ne!(command & command::MEMORY_SPACE, 0);
+    }
+
+    #[test]
+    fn an_io_bar_is_refused() {
+        let bus = Bus::new();
+        bus.add(1, 0, ID, false);
+        bus.bar(1, 0, reg::BAR0, 0xc001, 0xffff_fff0);
+        let device = found(bus).unwrap();
+        assert_eq!(device.bar_size(0), None);
+        assert_eq!(device.memory_bar_address(0), None);
+        assert!(!device.assign_memory_bar(0, 0xc000_0000));
+    }
+
+    #[test]
+    fn an_unimplemented_bar_has_no_size() {
+        let bus = Bus::new();
+        bus.add(1, 0, ID, false);
+        bus.bar(1, 0, reg::BAR0, 0, 0);
+        let device = found(bus).unwrap();
+        assert_eq!(device.bar_size(0), None);
+    }
 }

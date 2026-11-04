@@ -12,6 +12,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::format;
+use core::ops::Bound;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
@@ -63,6 +64,10 @@ pub enum FsError {
     InvalidPath,
     /// The operation is not supported by this filesystem.
     NotSupported,
+    /// The file does not fit the overlay quota or the heap.
+    NoSpace,
+    /// The path is nested too deeply.
+    TooDeep,
 }
 
 impl FsError {
@@ -76,6 +81,8 @@ impl FsError {
             Self::NotEmpty => "Directory not empty",
             Self::InvalidPath => "Invalid path",
             Self::NotSupported => "Operation not supported",
+            Self::NoSpace => "No space left on device",
+            Self::TooDeep => "Path is nested too deeply",
         }
     }
 }
@@ -111,6 +118,16 @@ pub trait Vfs {
 
     /// Lists a directory, sorted by name.
     fn read_dir(&mut self, path: &str) -> Result<Vec<DirEntry>, FsError>;
+
+    /// Reads up to `out.len()` bytes at `offset`, returning the count. Reading
+    /// at or past the end of the file returns zero.
+    fn read_at(&mut self, path: &str, offset: usize, out: &mut [u8]) -> Result<usize, FsError> {
+        let data = self.read_file(path)?;
+        let tail = data.get(offset..).unwrap_or(&[]);
+        let count = tail.len().min(out.len());
+        out[..count].copy_from_slice(&tail[..count]);
+        Ok(count)
+    }
 
     /// Resolves `path` against the current working directory.
     fn resolve(&self, path: &str) -> String {
@@ -202,7 +219,36 @@ pub fn join(dir: &str, name: &str) -> String {
 enum Node {
     File(Vec<u8>),
     Dir,
+    /// A character device that reads as empty and discards writes.
+    Null,
     Tombstone,
+}
+
+/// Bytes the overlay may hold in RAM by default. The kernel heap is a 64 MiB
+/// arena, and pipeline buffers and variables need their share of it.
+pub const DEFAULT_QUOTA: usize = 24 * 1024 * 1024;
+
+/// Largest file [`Vfs::read_file`] brings into memory in one piece.
+pub const MAX_READ_BYTES: usize = 32 * 1024 * 1024;
+
+/// Deepest path the overlay will create, which bounds every recursive walker.
+pub const MAX_PATH_DEPTH: usize = 48;
+
+/// True when `path` insists on a directory, as in `file/` or `file/.`.
+fn wants_dir(path: &str) -> bool {
+    path.len() > 1 && (path.ends_with('/') || path.ends_with("/."))
+}
+
+fn path_depth(path: &str) -> usize {
+    path.split('/').filter(|part| !part.is_empty()).count()
+}
+
+fn copy_bytes(data: &[u8]) -> Result<Vec<u8>, FsError> {
+    let mut copy = Vec::new();
+    copy.try_reserve_exact(data.len())
+        .map_err(|_| FsError::NoSpace)?;
+    copy.extend_from_slice(data);
+    Ok(copy)
 }
 
 /// An overlay filesystem with an optional read-only base image.
@@ -210,6 +256,8 @@ pub struct OverlayFs {
     base: Option<&'static dyn FileSystem>,
     nodes: BTreeMap<String, Node>,
     cwd: String,
+    used: usize,
+    quota: usize,
 }
 
 impl OverlayFs {
@@ -219,6 +267,51 @@ impl OverlayFs {
             base,
             nodes: BTreeMap::new(),
             cwd: String::from("/"),
+            used: 0,
+            quota: DEFAULT_QUOTA,
+        }
+    }
+
+    /// Sets how many bytes of file data the overlay may keep in RAM.
+    pub fn set_quota(&mut self, bytes: usize) {
+        self.quota = bytes;
+    }
+
+    /// Bytes of file data currently held in RAM.
+    pub fn used_bytes(&self) -> usize {
+        self.used
+    }
+
+    /// Creates a device node that reads as empty and discards writes, which is
+    /// how `/dev/null` exists on a filesystem with no device layer.
+    pub fn add_null_device(&mut self, path: &str) -> Result<(), FsError> {
+        let path = normalize(&self.cwd, path);
+        if self.effective_meta(parent(&path))?.kind != Kind::Dir {
+            return Err(FsError::NotDir);
+        }
+        self.drop_file_bytes(&path);
+        self.nodes.insert(path, Node::Null);
+        Ok(())
+    }
+
+    fn drop_file_bytes(&mut self, path: &str) {
+        if let Some(Node::File(data)) = self.nodes.get(path) {
+            self.used = self.used.saturating_sub(data.len());
+        }
+    }
+
+    fn check_quota(&self, extra: usize) -> Result<(), FsError> {
+        match self.used.checked_add(extra) {
+            Some(total) if total <= self.quota => Ok(()),
+            _ => Err(FsError::NoSpace),
+        }
+    }
+
+    /// Moves the working directory off a directory that was just removed.
+    fn leave_removed(&mut self, removed: &str) {
+        let inside = join(removed, "");
+        if self.cwd == removed || self.cwd.starts_with(&inside) {
+            self.cwd = parent(removed).to_string();
         }
     }
 
@@ -301,6 +394,10 @@ impl OverlayFs {
                     kind: Kind::Dir,
                     size: 0,
                 }),
+                Node::Null => Ok(Meta {
+                    kind: Kind::File,
+                    size: 0,
+                }),
                 Node::Tombstone => Err(FsError::NotFound),
             };
         }
@@ -317,6 +414,9 @@ impl OverlayFs {
             Kind::Dir => {
                 if path == "/" {
                     return Err(FsError::InvalidPath);
+                }
+                if path_depth(path) > MAX_PATH_DEPTH * 2 {
+                    return Err(FsError::TooDeep);
                 }
                 let entries = self.read_dir(path)?;
                 for entry in entries {
@@ -336,6 +436,9 @@ impl OverlayFs {
                 self.write_file(to, &data, false)
             }
             Kind::Dir => {
+                if path_depth(from) > MAX_PATH_DEPTH * 2 {
+                    return Err(FsError::TooDeep);
+                }
                 self.create_dir(to)?;
                 let entries = self.read_dir(from)?;
                 for entry in entries {
@@ -345,6 +448,25 @@ impl OverlayFs {
                 }
                 Ok(())
             }
+        }
+    }
+}
+
+/// A node's listing facts, copied out so a directory walk borrows nothing.
+#[derive(Clone, Copy)]
+enum NodeKind {
+    File(usize),
+    Dir,
+    Tombstone,
+}
+
+impl Node {
+    fn clone_kind(&self) -> NodeKind {
+        match self {
+            Node::File(data) => NodeKind::File(data.len()),
+            Node::Null => NodeKind::File(0),
+            Node::Dir => NodeKind::Dir,
+            Node::Tombstone => NodeKind::Tombstone,
         }
     }
 }
@@ -365,25 +487,42 @@ impl Vfs for OverlayFs {
     }
 
     fn meta(&self, path: &str) -> Result<Meta, FsError> {
+        let insists_on_dir = wants_dir(path);
         let path = normalize(&self.cwd, path);
-        self.effective_meta(&path)
+        let meta = self.effective_meta(&path)?;
+        if insists_on_dir && meta.kind != Kind::Dir {
+            return Err(FsError::NotDir);
+        }
+        Ok(meta)
     }
 
     fn read_file(&mut self, path: &str) -> Result<Vec<u8>, FsError> {
+        let insists_on_dir = wants_dir(path);
         let path = normalize(&self.cwd, path);
         let meta = self.effective_meta(&path)?;
         if meta.kind != Kind::File {
             return Err(FsError::IsDir);
         }
-
-        if let Some(Node::File(data)) = self.nodes.get(&path) {
-            return Ok(data.clone());
+        if insists_on_dir {
+            return Err(FsError::NotDir);
+        }
+        if meta.size > MAX_READ_BYTES {
+            return Err(FsError::NoSpace);
         }
 
+        match self.nodes.get(&path) {
+            Some(Node::File(data)) => return copy_bytes(data),
+            Some(Node::Null) => return Ok(Vec::new()),
+            _ => {}
+        }
+
+        // The size comes from the medium, so it is only a hint: allocate
+        // fallibly and never read more than the budget.
         let base = self.base.ok_or(FsError::NotFound)?;
         let node = base.resolve(&path).ok_or(FsError::NotFound)?;
         let size = base.size(node);
-        let mut data = Vec::with_capacity(size);
+        let mut data = Vec::new();
+        data.try_reserve_exact(size).map_err(|_| FsError::NoSpace)?;
         let mut chunk = [0u8; 4096];
         let mut offset = 0usize;
         loop {
@@ -391,13 +530,42 @@ impl Vfs for OverlayFs {
             if read == 0 {
                 break;
             }
+            if data.len() + read > MAX_READ_BYTES || data.try_reserve(read).is_err() {
+                return Err(FsError::NoSpace);
+            }
             data.extend_from_slice(&chunk[..read]);
             offset += read;
         }
         Ok(data)
     }
 
+    fn read_at(&mut self, path: &str, offset: usize, out: &mut [u8]) -> Result<usize, FsError> {
+        let insists_on_dir = wants_dir(path);
+        let path = normalize(&self.cwd, path);
+        let meta = self.effective_meta(&path)?;
+        if meta.kind != Kind::File {
+            return Err(FsError::IsDir);
+        }
+        if insists_on_dir {
+            return Err(FsError::NotDir);
+        }
+        match self.nodes.get(&path) {
+            Some(Node::File(data)) => {
+                let tail = data.get(offset..).unwrap_or(&[]);
+                let count = tail.len().min(out.len());
+                out[..count].copy_from_slice(&tail[..count]);
+                return Ok(count);
+            }
+            Some(Node::Null) => return Ok(0),
+            _ => {}
+        }
+        let base = self.base.ok_or(FsError::NotFound)?;
+        let node = base.resolve(&path).ok_or(FsError::NotFound)?;
+        Ok(base.read(node, offset, out))
+    }
+
     fn write_file(&mut self, path: &str, data: &[u8], append: bool) -> Result<(), FsError> {
+        let insists_on_dir = wants_dir(path);
         let path = normalize(&self.cwd, path);
         if path == "/" {
             return Err(FsError::IsDir);
@@ -406,24 +574,53 @@ impl Vfs for OverlayFs {
         if self.effective_meta(parent)?.kind != Kind::Dir {
             return Err(FsError::NotDir);
         }
-        if let Ok(meta) = self.effective_meta(&path) {
+        let existing = self.effective_meta(&path).ok();
+        if let Some(meta) = existing {
             if meta.kind == Kind::Dir {
                 return Err(FsError::IsDir);
             }
+            if insists_on_dir {
+                return Err(FsError::NotDir);
+            }
+        } else if insists_on_dir {
+            return Err(FsError::IsDir);
+        } else if path_depth(&path) > MAX_PATH_DEPTH {
+            return Err(FsError::TooDeep);
         }
 
-        let contents = if append {
-            match self.read_file(&path) {
-                Ok(mut existing) => {
-                    existing.extend_from_slice(data);
-                    existing
+        match self.nodes.get_mut(&path) {
+            Some(Node::Null) => return Ok(()),
+            // Appending grows the file in place, so a loop of `>>` is linear.
+            Some(Node::File(contents)) if append => {
+                match self.used.checked_add(data.len()) {
+                    Some(total) if total <= self.quota => {}
+                    _ => return Err(FsError::NoSpace),
                 }
-                Err(FsError::NotFound) => data.to_vec(),
-                Err(error) => return Err(error),
+                contents
+                    .try_reserve(data.len())
+                    .map_err(|_| FsError::NoSpace)?;
+                contents.extend_from_slice(data);
+                self.used += data.len();
+                return Ok(());
             }
-        } else {
-            data.to_vec()
+            _ => {}
+        }
+
+        let previous = match self.nodes.get(&path) {
+            Some(Node::File(contents)) => contents.len(),
+            _ => 0,
         };
+        let prefix = if append && existing.is_some() {
+            self.read_file(&path)?
+        } else {
+            Vec::new()
+        };
+        let total = prefix.len().saturating_add(data.len());
+        self.check_quota(total.saturating_sub(previous))?;
+        let mut contents = prefix;
+        contents.try_reserve_exact(data.len()).map_err(|_| FsError::NoSpace)?;
+        contents.extend_from_slice(data);
+        self.used = self.used.saturating_sub(previous) + contents.len();
         self.nodes.insert(path, Node::File(contents));
         Ok(())
     }
@@ -440,16 +637,24 @@ impl Vfs for OverlayFs {
         if self.effective_meta(&path).is_ok() {
             return Err(FsError::Exists);
         }
+        if path_depth(&path) > MAX_PATH_DEPTH {
+            return Err(FsError::TooDeep);
+        }
         self.nodes.insert(path, Node::Dir);
         Ok(())
     }
 
     fn remove_file(&mut self, path: &str) -> Result<(), FsError> {
+        let insists_on_dir = wants_dir(path);
         let path = normalize(&self.cwd, path);
         let meta = self.effective_meta(&path)?;
         if meta.kind == Kind::Dir {
             return Err(FsError::IsDir);
         }
+        if insists_on_dir {
+            return Err(FsError::NotDir);
+        }
+        self.drop_file_bytes(&path);
         if self.base_meta(&path).is_some() {
             self.nodes.insert(path, Node::Tombstone);
         } else {
@@ -474,14 +679,15 @@ impl Vfs for OverlayFs {
         let prefix = join(&path, "");
         let nested: Vec<String> = self
             .nodes
-            .keys()
-            .filter(|key| key.starts_with(&prefix))
-            .cloned()
+            .range::<str, _>((Bound::Included(prefix.as_str()), Bound::Unbounded))
+            .take_while(|(key, _)| key.starts_with(&prefix))
+            .map(|(key, _)| key.clone())
             .collect();
         for key in nested {
             self.nodes.remove(&key);
         }
 
+        self.leave_removed(&path);
         if self.base_meta(&path).is_some() {
             self.nodes.insert(path, Node::Tombstone);
         } else {
@@ -564,20 +770,50 @@ impl Vfs for OverlayFs {
             }
         }
 
-        for (key, node) in &self.nodes {
-            if matches!(node, Node::Tombstone) || parent(key) != path {
-                continue;
-            }
-            if self.hidden(key) {
-                continue;
-            }
-            let (kind, size) = match node {
-                Node::File(data) => (Kind::File, data.len()),
-                Node::Dir => (Kind::Dir, 0),
-                Node::Tombstone => continue,
+        // Keys sort by path, so this directory's children are one contiguous
+        // run, and a child's own subtree can be skipped by jumping past it.
+        let prefix = join(&path, "");
+        let mut start = prefix.clone();
+        let mut bound = Bound::Included(start.as_str());
+        let mut skip_to: Option<String> = None;
+        loop {
+            let found = self
+                .nodes
+                .range::<str, _>((bound, Bound::Unbounded))
+                .next()
+                .map(|(key, node)| (key.clone(), node.clone_kind()));
+            let Some((key, node)) = found else {
+                break;
             };
-            let name = base_name(key).to_string();
-            entries.insert(name.clone(), DirEntry { name, kind, size });
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let rest = &key[prefix.len()..];
+            match rest.find('/') {
+                Some(slash) => {
+                    // `/` + 1 is `0`, the first key after this child's subtree.
+                    let mut next = String::from(&key[..prefix.len() + slash]);
+                    next.push('0');
+                    skip_to = Some(next);
+                }
+                None => {
+                    if !matches!(node, NodeKind::Tombstone) && !self.hidden(&key) {
+                        let name = rest.to_string();
+                        let (kind, size) = match node {
+                            NodeKind::File(size) => (Kind::File, size),
+                            NodeKind::Dir => (Kind::Dir, 0),
+                            NodeKind::Tombstone => (Kind::File, 0),
+                        };
+                        entries.insert(name.clone(), DirEntry { name, kind, size });
+                    }
+                    skip_to = None;
+                    start = key;
+                }
+            }
+            bound = match &skip_to {
+                Some(next) => Bound::Included(next.as_str()),
+                None => Bound::Excluded(start.as_str()),
+            };
         }
 
         Ok(entries.into_iter().map(|(_, entry)| entry).collect())
@@ -647,6 +883,100 @@ mod tests {
         assert_eq!(fs.read_file("/b/file").unwrap(), b"payload");
         fs.rename("/b/file", "/b/renamed").unwrap();
         assert_eq!(fs.read_file("/b/renamed").unwrap(), b"payload");
+    }
+
+    #[test]
+    fn a_trailing_slash_requires_a_directory() {
+        let mut fs = OverlayFs::memory();
+        fs.write_file("/f", b"x", false).unwrap();
+        assert_eq!(fs.meta("/f/"), Err(FsError::NotDir));
+        assert_eq!(fs.read_file("/f/"), Err(FsError::NotDir));
+        assert_eq!(fs.write_file("/f/", b"y", false), Err(FsError::NotDir));
+        assert_eq!(fs.write_file("/new/", b"y", false), Err(FsError::IsDir));
+        fs.create_dir("/d").unwrap();
+        assert!(fs.is_dir("/d/"));
+    }
+
+    #[test]
+    fn removing_the_working_directory_moves_up() {
+        let mut fs = OverlayFs::memory();
+        fs.create_dir("/a").unwrap();
+        fs.create_dir("/a/b").unwrap();
+        fs.chdir("/a/b").unwrap();
+        fs.remove_dir("/a/b").unwrap();
+        assert_eq!(fs.cwd(), "/a");
+    }
+
+    #[test]
+    fn the_quota_turns_writes_into_no_space_errors() {
+        let mut fs = OverlayFs::memory();
+        fs.set_quota(4);
+        fs.write_file("/a", b"abc", false).unwrap();
+        assert_eq!(fs.write_file("/b", b"de", false), Err(FsError::NoSpace));
+        assert_eq!(fs.write_file("/a", b"de", true), Err(FsError::NoSpace));
+        fs.write_file("/a", b"abcd", false).unwrap();
+        assert_eq!(fs.used_bytes(), 4);
+        fs.remove_file("/a").unwrap();
+        assert_eq!(fs.used_bytes(), 0);
+    }
+
+    #[test]
+    fn appending_to_a_base_file_keeps_its_contents() {
+        let mut fs = OverlayFs::new(Some(&BASE));
+        fs.write_file("/readme.txt", b"more\n", true).unwrap();
+        assert_eq!(fs.read_file("/readme.txt").unwrap(), b"hello\nmore\n");
+    }
+
+    #[test]
+    fn null_devices_read_empty_and_discard_writes() {
+        let mut fs = OverlayFs::memory();
+        fs.create_dir("/dev").unwrap();
+        fs.add_null_device("/dev/null").unwrap();
+        fs.write_file("/dev/null", b"x", false).unwrap();
+        fs.write_file("/dev/null", b"x", true).unwrap();
+        assert_eq!(fs.read_file("/dev/null").unwrap(), b"");
+        assert_eq!(fs.meta("/dev/null").unwrap().kind, Kind::File);
+    }
+
+    #[test]
+    fn read_at_returns_slices_of_overlay_and_base_files() {
+        let mut fs = OverlayFs::new(Some(&BASE));
+        let mut out = [0u8; 3];
+        assert_eq!(fs.read_at("/readme.txt", 1, &mut out), Ok(3));
+        assert_eq!(&out, b"ell");
+        fs.write_file("/o", b"abcd", false).unwrap();
+        assert_eq!(fs.read_at("/o", 3, &mut out), Ok(1));
+        assert_eq!(fs.read_at("/o", 9, &mut out), Ok(0));
+    }
+
+    #[test]
+    fn listing_skips_nested_subtrees_and_sibling_prefixes() {
+        let mut fs = OverlayFs::memory();
+        for dir in ["/p", "/p/child", "/p/child/deep", "/p/child-x", "/p/child0", "/q"] {
+            fs.create_dir(dir).unwrap();
+        }
+        fs.write_file("/p/child/deep/f", b"x", false).unwrap();
+        fs.write_file("/p/file", b"yy", false).unwrap();
+        let names: Vec<String> = fs
+            .read_dir("/p")
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(names, ["child", "child-x", "child0", "file"]);
+        assert_eq!(fs.read_dir("/p").unwrap()[3].size, 2);
+    }
+
+    #[test]
+    fn deep_paths_are_refused_so_walkers_stay_bounded() {
+        let mut fs = OverlayFs::memory();
+        let mut path = String::new();
+        let mut result = Ok(());
+        for _ in 0..=MAX_PATH_DEPTH {
+            path.push_str("/a");
+            result = fs.create_dir(&path);
+        }
+        assert_eq!(result, Err(FsError::TooDeep));
     }
 
     #[test]

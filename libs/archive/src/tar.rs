@@ -331,9 +331,17 @@ impl<'a> TarReader<'a> {
             let expected = parse_number(&header[148..156])?;
             verify_checksum(header, expected)?;
 
+            let flag = header[156];
             let header_size = parse_number(&header[124..136])?;
             let data_start = self.pos + BLOCK;
-            let size = self.pax_size.unwrap_or(header_size);
+            // Links, devices, directories and FIFOs carry no data blocks whatever
+            // their size field says, and a PAX size only describes the file it
+            // precedes: applying it to a metadata header would desync the walk.
+            let size = match flag {
+                b'L' | b'K' | b'x' | b'g' => header_size,
+                b'1'..=b'6' => 0,
+                _ => self.pax_size.unwrap_or(header_size),
+            };
             let data_end = data_start
                 .checked_add(usize::try_from(size).map_err(|_| ArchiveError::Overflow)?)
                 .ok_or(ArchiveError::Overflow)?;
@@ -345,7 +353,6 @@ impl<'a> TarReader<'a> {
             need(self.data.len(), data_end, padded - data_end)?;
             self.pos = padded;
 
-            let flag = header[156];
             match flag {
                 b'L' => {
                     self.long_name = Some(trim_nul(data));

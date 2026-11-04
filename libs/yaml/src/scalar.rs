@@ -164,87 +164,73 @@ impl<'b> Writer<'b> {
                 continue;
             }
             i += 1;
-            let escape = *bytes.get(i)?;
-            i += 1;
-            match escape {
-                b'0' => self.byte(0)?,
-                b'a' => self.byte(0x07)?,
-                b'b' => self.byte(0x08)?,
-                b't' => self.byte(b'\t')?,
-                b'n' => self.byte(b'\n')?,
-                b'v' => self.byte(0x0b)?,
-                b'f' => self.byte(0x0c)?,
-                b'r' => self.byte(b'\r')?,
-                b'e' => self.byte(0x1b)?,
-                b' ' => self.byte(b' ')?,
-                b'"' => self.byte(b'"')?,
-                b'/' => self.byte(b'/')?,
-                b'\\' => self.byte(b'\\')?,
-                b'N' => self.char('\u{85}')?,
-                b'_' => self.char('\u{a0}')?,
-                b'L' => self.char('\u{2028}')?,
-                b'P' => self.char('\u{2029}')?,
-                b'x' => {
-                    let value = read_hex(bytes, &mut i, 2)?;
-                    self.char(char::from_u32(value)?)?;
-                }
-                b'u' => {
-                    let value = read_hex16(bytes, &mut i)?;
-                    self.char(char::from_u32(value)?)?;
-                }
-                b'U' => {
-                    let value = read_hex32(bytes, &mut i)?;
-                    self.char(char::from_u32(value)?)?;
-                }
-                b'\n' => {
-                    // Escaped line break: skip following indentation.
-                    while matches!(bytes.get(i), Some(b' ' | b'\t')) {
-                        i += 1;
-                    }
-                }
-                _ => return None,
+            match decode_escape(bytes, &mut i)? {
+                Escape::Byte(value) => self.byte(value)?,
+                Escape::Char(value) => self.char(value)?,
+                Escape::LineBreak => {}
             }
         }
         Some(())
     }
 
+    /// Writes a block scalar's body, before chomping.
+    ///
+    /// Only leading spaces are removed, so a short line can't cut into text or
+    /// split a character. Folding follows YAML: runs of ordinary lines join
+    /// with a space, blank lines become line breaks, and lines indented beyond
+    /// the content keep their breaks.
     fn block(&mut self, raw: &str, indent: u8, folded: bool) -> Option<()> {
-        let ends_newline = raw.ends_with('\n');
-        let body = if ends_newline {
-            &raw[..raw.len() - 1]
-        } else {
-            raw
-        };
-        let indent = indent as usize;
-        let mut previous_blank = true;
-        let mut first = true;
-
-        for line in body.split('\n') {
-            let content = if line.len() >= indent {
-                &line[indent..]
-            } else {
-                ""
-            };
-            let blank = content.trim().is_empty();
-            if !first {
-                if folded {
-                    if blank {
-                        self.byte(b'\n')?;
-                    } else if !previous_blank {
-                        self.byte(b' ')?;
-                    }
-                } else {
-                    self.byte(b'\n')?;
-                }
-            }
-            self.bytes(content.as_bytes())?;
-            previous_blank = blank;
-            first = false;
+        #[derive(PartialEq)]
+        enum Previous {
+            Nothing,
+            Ordinary,
+            MoreIndented,
         }
 
-        match self_finish_block(self, ends_newline, folded) {
-            Some(()) => {}
-            None => return None,
+        let indent = indent as usize;
+        let mut previous = Previous::Nothing;
+        let mut blanks = 0usize;
+
+        for line in raw.split_inclusive('\n') {
+            let line = line.strip_suffix('\n').unwrap_or(line);
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let spaces = line.bytes().take(indent).take_while(|&b| b == b' ').count();
+            let content = &line[spaces..];
+            if content.is_empty() {
+                blanks += 1;
+                continue;
+            }
+
+            let more_indented = folded && content.starts_with([' ', '\t']);
+            match previous {
+                Previous::Nothing => self.newlines(blanks)?,
+                Previous::Ordinary if folded && !more_indented => {
+                    if blanks == 0 {
+                        self.byte(b' ')?;
+                    } else {
+                        self.newlines(blanks)?;
+                    }
+                }
+                _ => self.newlines(blanks + 1)?,
+            }
+            self.bytes(content.as_bytes())?;
+            previous = if more_indented {
+                Previous::MoreIndented
+            } else {
+                Previous::Ordinary
+            };
+            blanks = 0;
+        }
+
+        // Every line after the last text ends in a break, and so does the text
+        // itself when the source does.
+        let final_break = previous != Previous::Nothing && raw.ends_with('\n');
+        self.newlines(blanks + final_break as usize)
+    }
+
+    fn newlines(&mut self, count: usize) -> Option<()> {
+        for _ in 0..count {
+            self.byte(b'\n')?;
         }
         Some(())
     }
@@ -256,10 +242,11 @@ impl<'b> Writer<'b> {
             match scalar.chomp {
                 Chomp::Strip => written -= trailing,
                 Chomp::Clip => {
-                    written -= trailing;
-                    if written > 0 {
-                        *out.get_mut(written)? = b'\n';
-                        written += 1;
+                    // Keeps the final break only if the source had one.
+                    if trailing > 0 && trailing < written {
+                        written -= trailing - 1;
+                    } else if trailing == written {
+                        written = 0;
                     }
                 }
                 Chomp::Keep => {}
@@ -270,12 +257,51 @@ impl<'b> Writer<'b> {
     }
 }
 
-// Kept separate to make the block writer's chomp rules explicit.
-fn self_finish_block(writer: &mut Writer<'_>, ends_newline: bool, _folded: bool) -> Option<()> {
-    if ends_newline {
-        writer.byte(b'\n')?;
-    }
-    Some(())
+/// One decoded double-quoted escape.
+pub(crate) enum Escape {
+    Byte(u8),
+    Char(char),
+    /// An escaped line break, which produces nothing.
+    LineBreak,
+}
+
+/// Decodes the escape whose character (after the backslash) is at `*i`.
+///
+/// Returns `None` for an escape YAML does not define, which is what the parser
+/// reports as `InvalidEscape`.
+pub(crate) fn decode_escape(bytes: &[u8], i: &mut usize) -> Option<Escape> {
+    let escape = *bytes.get(*i)?;
+    *i += 1;
+    Some(match escape {
+        b'0' => Escape::Byte(0),
+        b'a' => Escape::Byte(0x07),
+        b'b' => Escape::Byte(0x08),
+        b't' | b'\t' => Escape::Byte(b'\t'),
+        b'n' => Escape::Byte(b'\n'),
+        b'v' => Escape::Byte(0x0b),
+        b'f' => Escape::Byte(0x0c),
+        b'r' => Escape::Byte(b'\r'),
+        b'e' => Escape::Byte(0x1b),
+        b' ' => Escape::Byte(b' '),
+        b'"' => Escape::Byte(b'"'),
+        b'/' => Escape::Byte(b'/'),
+        b'\\' => Escape::Byte(b'\\'),
+        b'N' => Escape::Char('\u{85}'),
+        b'_' => Escape::Char('\u{a0}'),
+        b'L' => Escape::Char('\u{2028}'),
+        b'P' => Escape::Char('\u{2029}'),
+        b'x' => Escape::Char(char::from_u32(read_hex(bytes, i, 2)?)?),
+        b'u' => Escape::Char(char::from_u32(read_hex16(bytes, i)?)?),
+        b'U' => Escape::Char(char::from_u32(read_hex32(bytes, i)?)?),
+        b'\n' => {
+            // Escaped line break: skip following indentation.
+            while matches!(bytes.get(*i), Some(b' ' | b'\t')) {
+                *i += 1;
+            }
+            Escape::LineBreak
+        }
+        _ => return None,
+    })
 }
 
 fn trailing_newlines(bytes: &[u8]) -> usize {
@@ -367,5 +393,35 @@ mod tests {
             Chomp::Clip,
         );
         assert_eq!(decode(scalar), "one two\nthree\n");
+    }
+
+    #[test]
+    fn folded_block_keeps_breaks_around_more_indented_lines() {
+        let scalar = YamlScalar::block(
+            "  one\n  two\n    code\n  three\n",
+            ScalarStyle::Folded,
+            2,
+            Chomp::Clip,
+        );
+        assert_eq!(decode(scalar), "one two\n  code\nthree\n");
+    }
+
+    #[test]
+    fn short_lines_never_lose_text_or_split_characters() {
+        // Hand-built spans can hold lines shorter than the indent.
+        let scalar =
+            YamlScalar::block("    four\n  \u{e9}\n", ScalarStyle::Literal, 4, Chomp::Clip);
+        assert_eq!(decode(scalar), "four\n\u{e9}\n");
+    }
+
+    #[test]
+    fn chomping_rules() {
+        let block = |raw, chomp| YamlScalar::block(raw, ScalarStyle::Literal, 2, chomp);
+        assert_eq!(decode(block("  a\n\n\n", Chomp::Clip)), "a\n");
+        assert_eq!(decode(block("  a\n\n\n", Chomp::Strip)), "a");
+        assert_eq!(decode(block("  a\n\n\n", Chomp::Keep)), "a\n\n\n");
+        assert_eq!(decode(block("  a", Chomp::Clip)), "a");
+        assert_eq!(decode(block("\n", Chomp::Clip)), "");
+        assert_eq!(decode(block("  a\r\n  b\r\n", Chomp::Clip)), "a\nb\n");
     }
 }

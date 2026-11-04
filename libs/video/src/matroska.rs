@@ -2,16 +2,24 @@
 //!
 //! Supports the elements needed to find a video track, read its dimensions and
 //! codec id, count frames, and walk SimpleBlock/BlockGroup samples. Lacing is
-//! expanded so one block may yield several video frames.
+//! expanded so one block may yield several video frames. Live-muxed files with
+//! unknown-size clusters and files cut off inside a cluster are both handled.
 
 use crate::codec::Codec;
-use crate::error::{require_rgba, Result, VideoError};
-use crate::h264::{AnnexBDecoder, AvccDecoder};
-use crate::{mjpeg, raw};
+use crate::error::{Result, VideoError};
+use crate::index::{DecoderLimits, Index, FLAG_KEY};
+use crate::{DisplayMetadata, StreamColour};
 
+const ID_EBML: u32 = 0x1a45_dfa3;
 const ID_SEGMENT: u32 = 0x1853_8067;
+const ID_INFO: u32 = 0x1549_a966;
 const ID_TRACKS: u32 = 0x1654_ae6b;
 const ID_CLUSTER: u32 = 0x1f43_b675;
+const ID_CUES: u32 = 0x1c53_bb6b;
+const ID_SEEK_HEAD: u32 = 0x114d_9b74;
+const ID_TAGS: u32 = 0x1254_c367;
+const ID_CHAPTERS: u32 = 0x1043_a770;
+const ID_ATTACHMENTS: u32 = 0x1941_a469;
 const ID_TRACK_ENTRY: u32 = 0xae;
 const ID_TRACK_NUMBER: u32 = 0xd7;
 const ID_TRACK_TYPE: u32 = 0x83;
@@ -21,10 +29,30 @@ const ID_DEFAULT_DURATION: u32 = 0x23e3_83;
 const ID_VIDEO: u32 = 0xe0;
 const ID_PIXEL_WIDTH: u32 = 0xb0;
 const ID_PIXEL_HEIGHT: u32 = 0xba;
+const ID_DISPLAY_WIDTH: u32 = 0x54b0;
+const ID_DISPLAY_HEIGHT: u32 = 0x54ba;
+const ID_DISPLAY_UNIT: u32 = 0x54b2;
+const ID_COLOUR_SPACE: u32 = 0x2eb5_24;
+const ID_COLOUR: u32 = 0x55b0;
+const ID_MATRIX_COEFFICIENTS: u32 = 0x55b1;
+const ID_RANGE: u32 = 0x55b9;
+const ID_TRANSFER: u32 = 0x55ba;
+const ID_PRIMARIES: u32 = 0x55bb;
+const ID_PROJECTION: u32 = 0x7670;
+const ID_POSE_ROLL: u32 = 0x7675;
+const ID_CONTENT_ENCODINGS: u32 = 0x6d80;
+const ID_CONTENT_ENCODING: u32 = 0x6240;
+const ID_CONTENT_COMPRESSION: u32 = 0x5034;
+const ID_COMPRESSION_ALGO: u32 = 0x4254;
+const ID_COMPRESSION_SETTINGS: u32 = 0x4255;
 const ID_TIMESTAMP_SCALE: u32 = 0x2ad7_b1;
+const ID_CLUSTER_TIMESTAMP: u32 = 0xe7;
 const ID_SIMPLE_BLOCK: u32 = 0xa3;
 const ID_BLOCK_GROUP: u32 = 0xa0;
 const ID_BLOCK: u32 = 0xa1;
+const ID_REFERENCE_BLOCK: u32 = 0xfb;
+const ID_CUE_POINT: u32 = 0xbb;
+const ID_CUE_TIME: u32 = 0xb3;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MatroskaInfo {
@@ -33,6 +61,17 @@ pub(crate) struct MatroskaInfo {
     pub codec: Codec,
     pub frame_count: u32,
     pub frame_rate: Option<(u32, u32)>,
+    pub display: DisplayMetadata,
+    pub colour: StreamColour,
+}
+
+/// How a track's samples are stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Compression {
+    None,
+    /// These leading bytes were stripped from every frame.
+    HeaderStrip(core::ops::Range<usize>),
+    Zlib,
 }
 
 #[derive(Clone, Copy)]
@@ -41,6 +80,7 @@ struct Elem {
     payload: usize,
     end: usize,
     next: usize,
+    unknown_size: bool,
 }
 
 fn id_len(first: u8) -> Option<usize> {
@@ -53,6 +93,9 @@ fn id_len(first: u8) -> Option<usize> {
 fn read_id(data: &[u8], pos: usize, end: usize) -> Result<(u32, usize)> {
     let first = *data.get(pos).ok_or(VideoError::UnexpectedEnd)?;
     let len = id_len(first).ok_or(VideoError::InvalidData("EBML id"))?;
+    if len > 4 {
+        return Err(VideoError::InvalidData("EBML id"));
+    }
     if pos + len > end {
         return Err(VideoError::UnexpectedEnd);
     }
@@ -81,6 +124,24 @@ fn read_size(data: &[u8], pos: usize, end: usize) -> Result<(u64, usize, bool)> 
     Ok((value, len, unknown))
 }
 
+/// IDs that can only appear directly inside the segment or at the top level.
+/// Any of them ends an open element of unknown size.
+fn ends_unknown_size(id: u32) -> bool {
+    matches!(
+        id,
+        ID_CLUSTER
+            | ID_INFO
+            | ID_TRACKS
+            | ID_CUES
+            | ID_SEEK_HEAD
+            | ID_TAGS
+            | ID_CHAPTERS
+            | ID_ATTACHMENTS
+            | ID_SEGMENT
+            | ID_EBML
+    )
+}
+
 fn next_elem(data: &[u8], pos: usize, end: usize) -> Result<Option<Elem>> {
     if pos >= end {
         return Ok(None);
@@ -91,9 +152,8 @@ fn next_elem(data: &[u8], pos: usize, end: usize) -> Result<Option<Elem>> {
     let elem_end = if unknown {
         end
     } else {
-        payload
-            .checked_add(size as usize)
-            .ok_or(VideoError::Overflow)?
+        let size = usize::try_from(size).map_err(|_| VideoError::Overflow)?;
+        payload.checked_add(size).ok_or(VideoError::Overflow)?
     };
     if elem_end > end || payload > elem_end {
         return Err(VideoError::UnexpectedEnd);
@@ -103,7 +163,32 @@ fn next_elem(data: &[u8], pos: usize, end: usize) -> Result<Option<Elem>> {
         payload,
         end: elem_end,
         next: elem_end,
+        unknown_size: unknown,
     }))
+}
+
+/// Like [`next_elem`], for walking a segment or cluster. A cluster running past
+/// the data keeps its complete blocks, and damage inside ends the walk instead
+/// of refusing the file.
+fn next_lenient(data: &[u8], pos: usize, end: usize) -> Option<Elem> {
+    match next_elem(data, pos, end) {
+        Ok(elem) => elem,
+        Err(_) => {
+            let (id, id_len) = read_id(data, pos, end).ok()?;
+            let (_, size_len, _) = read_size(data, pos + id_len, end).ok()?;
+            if id == ID_CLUSTER || id == ID_SEGMENT {
+                Some(Elem {
+                    id,
+                    payload: pos + id_len + size_len,
+                    end,
+                    next: end,
+                    unknown_size: false,
+                })
+            } else {
+                None
+            }
+        }
+    }
 }
 
 fn find_elem(data: &[u8], start: usize, end: usize, id: u32) -> Result<Option<Elem>> {
@@ -115,6 +200,22 @@ fn find_elem(data: &[u8], start: usize, end: usize, id: u32) -> Result<Option<El
         pos = elem.next;
     }
     Ok(None)
+}
+
+/// Finds a direct child of the segment, stepping over unknown-size clusters.
+fn find_in_segment(data: &[u8], seg: Elem, id: u32) -> Option<Elem> {
+    let mut pos = seg.payload;
+    while let Some(elem) = next_lenient(data, pos, seg.end) {
+        if elem.id == id {
+            return Some(elem);
+        }
+        pos = if elem.id == ID_CLUSTER && elem.unknown_size {
+            unknown_cluster_end(data, elem)
+        } else {
+            elem.next
+        };
+    }
+    None
 }
 
 fn read_uint(data: &[u8], elem: Elem) -> Result<u64> {
@@ -129,7 +230,7 @@ fn read_uint(data: &[u8], elem: Elem) -> Result<u64> {
     Ok(value)
 }
 
-fn read_str<'a>(data: &'a [u8], elem: Elem) -> &'a [u8] {
+fn read_str(data: &[u8], elem: Elem) -> &[u8] {
     let mut slice = &data[elem.payload..elem.end];
     while let [rest @ .., 0] = slice {
         slice = rest;
@@ -139,7 +240,7 @@ fn read_str<'a>(data: &'a [u8], elem: Elem) -> &'a [u8] {
 
 fn segment(input: &[u8]) -> Result<Elem> {
     let mut pos = 0usize;
-    while let Some(elem) = next_elem(input, pos, input.len())? {
+    while let Some(elem) = next_lenient(input, pos, input.len()) {
         if elem.id == ID_SEGMENT {
             return Ok(elem);
         }
@@ -155,11 +256,16 @@ struct Track<'a> {
     codec: Codec,
     config: &'a [u8],
     default_duration: u64,
+    display: DisplayMetadata,
+    colour: StreamColour,
+    compression: Compression,
+    /// A DIB-style sample (`V_MS/VFW/FOURCC`), with this bottom-up flag.
+    dib: Option<bool>,
 }
 
 fn video_track<'a>(input: &'a [u8], seg: Elem) -> Result<Track<'a>> {
-    let tracks = find_elem(input, seg.payload, seg.end, ID_TRACKS)?
-        .ok_or(VideoError::InvalidData("Matroska tracks"))?;
+    let tracks =
+        find_in_segment(input, seg, ID_TRACKS).ok_or(VideoError::InvalidData("Matroska tracks"))?;
     let mut pos = tracks.payload;
     while let Some(entry) = next_elem(input, pos, tracks.end)? {
         pos = entry.next;
@@ -188,23 +294,95 @@ fn video_track<'a>(input: &'a [u8], seg: Elem) -> Result<Track<'a>> {
             .transpose()?
             .unwrap_or(0);
         let mut codec = Codec::from_matroska(codec_id);
-        if matches!(codec, Codec::Unknown(_))
-            && codec_id == b"V_MS/VFW/FOURCC"
-            && config.len() >= 20
-        {
-            let compression = [config[16], config[17], config[18], config[19]];
-            codec = Codec::from_avi(compression);
+        let mut dib = None;
+        if codec_id == b"V_MS/VFW/FOURCC" {
+            if let Ok(bih) = crate::avi::parse_bitmap_info(config) {
+                codec = bih.codec;
+                dib = bih.dib.then_some(bih.bottom_up);
+            }
         }
         let mut width = 0u32;
         let mut height = 0u32;
+        let mut display = DisplayMetadata::default();
+        let mut colour = StreamColour::default();
         if let Some(video) = find_elem(input, entry.payload, entry.end, ID_VIDEO)? {
-            if let Some(w) = find_elem(input, video.payload, video.end, ID_PIXEL_WIDTH)? {
-                width = read_uint(input, w)? as u32;
+            let uint = |id: u32| -> Result<Option<u64>> {
+                find_elem(input, video.payload, video.end, id)?
+                    .map(|e| read_uint(input, e))
+                    .transpose()
+            };
+            let clamp = |value: u64| value.min(u32::MAX as u64) as u32;
+            width = uint(ID_PIXEL_WIDTH)?.map_or(0, clamp);
+            height = uint(ID_PIXEL_HEIGHT)?.map_or(0, clamp);
+            let display_unit = uint(ID_DISPLAY_UNIT)?.unwrap_or(0);
+            if let (Some(w), Some(h), 0 | 3) = (
+                uint(ID_DISPLAY_WIDTH)?,
+                uint(ID_DISPLAY_HEIGHT)?,
+                display_unit,
+            ) {
+                // DisplayWidth/Height give the shape; turn that into a sample
+                // aspect ratio relative to the coded size.
+                if w != 0 && h != 0 && width != 0 && height != 0 {
+                    let (sar_w, sar_h) = (w * height as u64, h * width as u64);
+                    if sar_w != sar_h {
+                        display.sar = (clamp(sar_w), clamp(sar_h));
+                    }
+                }
             }
-            if let Some(h) = find_elem(input, video.payload, video.end, ID_PIXEL_HEIGHT)? {
-                height = read_uint(input, h)? as u32;
+            if codec_id == b"V_UNCOMPRESSED" {
+                if let Some(space) = find_elem(input, video.payload, video.end, ID_COLOUR_SPACE)? {
+                    if let [a, b, c, d] = input[space.payload..space.end] {
+                        codec = Codec::from_colour_space([a, b, c, d]);
+                    }
+                }
+            }
+            if let Some(element) = find_elem(input, video.payload, video.end, ID_COLOUR)? {
+                let value = |id: u32| -> Option<u64> {
+                    find_elem(input, element.payload, element.end, id)
+                        .ok()?
+                        .and_then(|e| read_uint(input, e).ok())
+                };
+                if let Some(matrix) = value(ID_MATRIX_COEFFICIENTS) {
+                    colour.matrix = matrix.min(255) as u8;
+                }
+                if let Some(primaries) = value(ID_PRIMARIES) {
+                    colour.primaries = primaries.min(255) as u8;
+                }
+                if let Some(transfer) = value(ID_TRANSFER) {
+                    colour.transfer = transfer.min(255) as u8;
+                }
+                colour.full_range = value(ID_RANGE) == Some(2);
+            }
+            if let Some(projection) = find_elem(input, video.payload, video.end, ID_PROJECTION)? {
+                if let Some(roll) =
+                    find_elem(input, projection.payload, projection.end, ID_POSE_ROLL)?
+                {
+                    // A float of 4 or 8 bytes. Compare exact bit patterns: only
+                    // quarter turns are meaningful, and this avoids soft-float.
+                    let roll = &input[roll.payload..roll.end];
+                    let degrees = match *roll {
+                        [a, b, c, d] => match u32::from_be_bytes([a, b, c, d]) {
+                            0x42b4_0000 => 90,
+                            0xc2b4_0000 | 0x4387_0000 => 270,
+                            0x4334_0000 | 0xc334_0000 => 180,
+                            _ => 0,
+                        },
+                        [a, b, c, d, e, f, g, h] => {
+                            match u64::from_be_bytes([a, b, c, d, e, f, g, h]) {
+                                0x4056_8000_0000_0000 => 90,
+                                0xc056_8000_0000_0000 | 0x4070_e000_0000_0000 => 270,
+                                0x4066_8000_0000_0000 | 0xc066_8000_0000_0000 => 180,
+                                _ => 0,
+                            }
+                        }
+                        _ => 0,
+                    };
+                    // The roll counts counter-clockwise.
+                    display.rotation = (360 - degrees) % 360;
+                }
             }
         }
+        let compression = parse_compression(input, entry)?;
         return Ok(Track {
             number,
             width,
@@ -212,9 +390,46 @@ fn video_track<'a>(input: &'a [u8], seg: Elem) -> Result<Track<'a>> {
             codec,
             config,
             default_duration,
+            display,
+            colour,
+            compression,
+            dib,
         });
     }
     Err(VideoError::InvalidData("Matroska has no video track"))
+}
+
+fn parse_compression(input: &[u8], entry: Elem) -> Result<Compression> {
+    let Some(encodings) = find_elem(input, entry.payload, entry.end, ID_CONTENT_ENCODINGS)? else {
+        return Ok(Compression::None);
+    };
+    let Some(encoding) = find_elem(input, encodings.payload, encodings.end, ID_CONTENT_ENCODING)?
+    else {
+        return Ok(Compression::None);
+    };
+    let Some(compression) =
+        find_elem(input, encoding.payload, encoding.end, ID_CONTENT_COMPRESSION)?
+    else {
+        return Err(VideoError::UnsupportedFeature("Matroska content encryption"));
+    };
+    let algo = find_elem(input, compression.payload, compression.end, ID_COMPRESSION_ALGO)?
+        .map(|e| read_uint(input, e))
+        .transpose()?
+        .unwrap_or(0);
+    match algo {
+        0 => Ok(Compression::Zlib),
+        3 => {
+            let settings = find_elem(
+                input,
+                compression.payload,
+                compression.end,
+                ID_COMPRESSION_SETTINGS,
+            )?
+            .map_or(0..0, |e| e.payload..e.end);
+            Ok(Compression::HeaderStrip(settings))
+        }
+        _ => Err(VideoError::UnsupportedFeature("Matroska compression")),
+    }
 }
 
 fn lacing_signed(data: &[u8], pos: usize, end: usize) -> Result<(i64, usize)> {
@@ -232,36 +447,62 @@ fn lacing_signed(data: &[u8], pos: usize, end: usize) -> Result<(i64, usize)> {
     Ok((value as i64 - bias, len))
 }
 
-fn visit_block<'a, F>(data: &'a [u8], block: Elem, track: u64, mut f: F) -> Result<()>
+/// A block's relevant fields, passed to the visitor.
+#[derive(Clone, Copy)]
+struct BlockFrame {
+    offset: usize,
+    size: usize,
+    /// Timecode relative to the cluster, and this frame's place in its lace.
+    relative_time: i16,
+    lace_index: u32,
+    key: bool,
+}
+
+/// Calls `f` for each frame of the block. Returns `false` if `f` asked to stop.
+fn visit_block<F>(
+    data: &[u8],
+    block: Elem,
+    track: u64,
+    block_group_key: Option<bool>,
+    f: &mut F,
+) -> Result<bool>
 where
-    F: FnMut(&'a [u8]) -> Result<bool>,
+    F: FnMut(BlockFrame) -> Result<bool>,
 {
     let mut pos = block.payload;
     let (block_track, track_len, _) = read_size(data, pos, block.end)?;
     pos += track_len;
     if block_track != track {
-        return Ok(());
+        return Ok(true);
     }
     if pos + 3 > block.end {
         return Err(VideoError::UnexpectedEnd);
     }
-    pos += 2; // timecode
+    let relative_time = i16::from_be_bytes([data[pos], data[pos + 1]]);
+    pos += 2;
     let flags = data[pos];
     pos += 1;
+    // SimpleBlock has a key flag. BlockGroup is a key frame unless it refers to
+    // another block.
+    let key = block_group_key.unwrap_or(flags & 0x80 != 0);
     let lacing = (flags >> 1) & 0x03;
     if lacing == 0 {
         if pos < block.end {
-            f(&data[pos..block.end])?;
+            return f(BlockFrame {
+                offset: pos,
+                size: block.end - pos,
+                relative_time,
+                lace_index: 0,
+                key,
+            });
         }
-        return Ok(());
+        return Ok(true);
     }
 
     let frames = data.get(pos).copied().ok_or(VideoError::UnexpectedEnd)? as usize + 1;
     pos += 1;
-    if frames > 256 {
-        return Err(VideoError::InvalidData("Matroska lacing count"));
-    }
     let mut sizes = [0usize; 256];
+    let total_fixed;
     match lacing {
         1 => {
             // Xiph lacing: each size is a sequence of 255-continuation bytes.
@@ -281,14 +522,7 @@ where
                 *size = value;
                 total = total.checked_add(value).ok_or(VideoError::Overflow)?;
             }
-            let remaining = block
-                .end
-                .checked_sub(pos)
-                .ok_or(VideoError::UnexpectedEnd)?;
-            if total > remaining {
-                return Err(VideoError::InvalidData("Matroska lacing size"));
-            }
-            sizes[frames - 1] = remaining - total;
+            total_fixed = total;
         }
         2 => {
             let remaining = block
@@ -298,189 +532,301 @@ where
             if remaining % frames != 0 {
                 return Err(VideoError::InvalidData("Matroska fixed lacing"));
             }
-            for size in sizes.iter_mut().take(frames) {
+            for size in sizes.iter_mut().take(frames - 1) {
                 *size = remaining / frames;
             }
+            total_fixed = remaining / frames * (frames - 1);
         }
-        3 => {
-            let (first, len, _) = read_size(data, pos, block.end)?;
-            pos += len;
-            let mut previous = first as usize;
-            sizes[0] = previous;
-            for size in sizes.iter_mut().take(frames).skip(1) {
-                let (diff, len) = lacing_signed(data, pos, block.end)?;
+        _ => {
+            // EBML lacing: the first size, then signed differences. The last
+            // frame's size is whatever remains, and isn't coded.
+            let mut total = 0usize;
+            if frames > 1 {
+                let (first, len, _) = read_size(data, pos, block.end)?;
                 pos += len;
-                let next = previous as i64 + diff;
-                if next < 0 {
-                    return Err(VideoError::InvalidData("Matroska EBML lacing"));
+                let first = usize::try_from(first).map_err(|_| VideoError::Overflow)?;
+                let mut previous = first;
+                sizes[0] = previous;
+                total = previous;
+                for size in sizes.iter_mut().take(frames - 1).skip(1) {
+                    let (diff, len) = lacing_signed(data, pos, block.end)?;
+                    pos += len;
+                    let next = (previous as i64)
+                        .checked_add(diff)
+                        .filter(|&next| next >= 0)
+                        .ok_or(VideoError::InvalidData("Matroska EBML lacing"))?;
+                    previous = next as usize;
+                    *size = previous;
+                    total = total.checked_add(previous).ok_or(VideoError::Overflow)?;
                 }
-                previous = next as usize;
-                *size = previous;
             }
+            total_fixed = total;
         }
-        _ => unreachable!(),
     }
+    let remaining = block
+        .end
+        .checked_sub(pos)
+        .ok_or(VideoError::UnexpectedEnd)?;
+    sizes[frames - 1] = remaining
+        .checked_sub(total_fixed)
+        .ok_or(VideoError::InvalidData("Matroska lacing size"))?;
 
-    for &size in sizes.iter().take(frames) {
+    for (lace_index, &size) in sizes.iter().take(frames).enumerate() {
         let end = pos.checked_add(size).ok_or(VideoError::Overflow)?;
         if end > block.end {
             return Err(VideoError::UnexpectedEnd);
         }
-        if f(&data[pos..end])? {
-            return Ok(());
+        let more = f(BlockFrame {
+            offset: pos,
+            size,
+            relative_time,
+            lace_index: lace_index as u32,
+            key: key && lace_index == 0,
+        })?;
+        if !more {
+            return Ok(false);
         }
         pos = end;
     }
-    Ok(())
+    Ok(true)
 }
 
-fn visit_cluster_blocks<'a, F>(input: &'a [u8], seg: Elem, track: u64, mut f: F) -> Result<()>
+/// Where an unknown-size cluster ends: at the next segment-level element.
+fn unknown_cluster_end(data: &[u8], cluster: Elem) -> usize {
+    let mut pos = cluster.payload;
+    while pos < cluster.end {
+        let Ok((id, _)) = read_id(data, pos, cluster.end) else {
+            return cluster.end;
+        };
+        if ends_unknown_size(id) {
+            return pos;
+        }
+        match next_elem(data, pos, cluster.end) {
+            Ok(Some(elem)) => pos = elem.next,
+            _ => return cluster.end,
+        }
+    }
+    cluster.end
+}
+
+/// Walks clusters, calling `f(cluster_timestamp, frame)` for each frame of
+/// `track` until it returns `false`. Damage or truncation ends the walk with
+/// what was read so far.
+fn visit_clusters<F>(input: &[u8], seg: Elem, track: u64, mut f: F) -> Result<()>
 where
-    F: FnMut(&'a [u8]) -> Result<bool>,
+    F: FnMut(u64, BlockFrame) -> Result<bool>,
 {
     let mut pos = seg.payload;
-    while let Some(elem) = next_elem(input, pos, seg.end)? {
-        pos = elem.next;
-        if elem.id != ID_CLUSTER {
+    while let Some(elem) = next_lenient(input, pos, seg.end) {
+        let is_unknown = elem.unknown_size;
+        let id = elem.id;
+        if id != ID_CLUSTER {
+            // An unknown-size element other than a cluster can't be skipped.
+            if is_unknown {
+                return Ok(());
+            }
+            pos = elem.next;
             continue;
         }
+        let cluster_end = if is_unknown {
+            unknown_cluster_end(input, elem)
+        } else {
+            elem.end
+        };
+        let mut cluster_time = 0u64;
         let mut cpos = elem.payload;
-        while let Some(child) = next_elem(input, cpos, elem.end)? {
+        while let Some(child) = next_lenient(input, cpos, cluster_end) {
             cpos = child.next;
-            match child.id {
+            let more = match child.id {
+                ID_CLUSTER_TIMESTAMP => {
+                    cluster_time = read_uint(input, child).unwrap_or(cluster_time);
+                    true
+                }
                 ID_SIMPLE_BLOCK => {
-                    let mut hit = false;
-                    visit_block(input, child, track, |sample| {
-                        if f(sample)? {
-                            hit = true;
-                            Ok(true)
-                        } else {
-                            Ok(false)
-                        }
-                    })?;
-                    if hit {
-                        return Ok(());
+                    let mut visit = |frame| f(cluster_time, frame);
+                    match visit_block(input, child, track, None, &mut visit) {
+                        Ok(more) => more,
+                        Err(error) if error.is_fatal() => return Err(error),
+                        Err(_) => true,
                     }
                 }
                 ID_BLOCK_GROUP => {
-                    if let Some(block) = find_elem(input, child.payload, child.end, ID_BLOCK)? {
-                        let mut hit = false;
-                        visit_block(input, block, track, |sample| {
-                            if f(sample)? {
-                                hit = true;
-                                Ok(true)
-                            } else {
-                                Ok(false)
+                    let key = !matches!(
+                        find_elem(input, child.payload, child.end, ID_REFERENCE_BLOCK),
+                        Ok(Some(_))
+                    );
+                    match find_elem(input, child.payload, child.end, ID_BLOCK) {
+                        Ok(Some(block)) => {
+                            let mut visit = |frame| f(cluster_time, frame);
+                            match visit_block(input, block, track, Some(key), &mut visit) {
+                                Ok(more) => more,
+                                Err(error) if error.is_fatal() => return Err(error),
+                                Err(_) => true,
                             }
-                        })?;
-                        if hit {
-                            return Ok(());
                         }
+                        _ => true,
                     }
                 }
-                _ => {}
+                _ => true,
+            };
+            if !more {
+                return Ok(());
             }
         }
+        pos = cluster_end;
     }
     Ok(())
 }
 
-fn count_frames(input: &[u8], seg: Elem, track: u64) -> Result<u32> {
-    let mut count = 0u32;
-    visit_cluster_blocks(input, seg, track, |_| {
-        count = count.saturating_add(1);
+fn first_frame<'a>(input: &'a [u8], seg: Elem, track: &Track<'_>) -> Option<&'a [u8]> {
+    let mut found = None;
+    let _ = visit_clusters(input, seg, track.number, |_, frame| {
+        found = Some(frame);
         Ok(false)
-    })?;
-    Ok(count)
+    });
+    let frame = found?;
+    input.get(frame.offset..frame.offset + frame.size)
 }
 
 pub(crate) fn info(input: &[u8]) -> Result<MatroskaInfo> {
     let seg = segment(input)?;
-    let track = video_track(input, seg)?;
-    let frame_count = count_frames(input, seg, track.number)?;
+    let mut track = video_track(input, seg)?;
+    let mut frame_count = 0u32;
+    visit_clusters(input, seg, track.number, |_, _| {
+        frame_count = frame_count.saturating_add(1);
+        Ok(true)
+    })?;
     let frame_rate = if track.default_duration != 0 && track.default_duration <= u32::MAX as u64 {
         crate::reduce_fraction(1_000_000_000, track.default_duration as u32)
     } else {
         None
     };
+    let mut width = track.width;
+    let mut height = track.height;
+    let mut colour = track.colour;
+    if track.compression == Compression::None {
+        match track.codec {
+            Codec::H264 => {
+                let sps = if track.config.first() == Some(&1) {
+                    crate::h264::info_from_avcc(track.config).ok()
+                } else {
+                    first_frame(input, seg, &track)
+                        .and_then(|sample| crate::h264::info_from_sample(sample, None))
+                };
+                if let Some(sps) = sps {
+                    width = sps.width;
+                    height = sps.height;
+                    crate::merge_sps_metadata(&mut track.display, &mut colour, &sps);
+                }
+            }
+            Codec::Mjpeg => {
+                if let Some(image) = first_frame(input, seg, &track)
+                    .and_then(|sample| feos_image::jpeg::info(sample).ok())
+                {
+                    width = image.width;
+                    height = image.height;
+                }
+            }
+            _ => {}
+        }
+    }
     Ok(MatroskaInfo {
-        width: track.width,
-        height: track.height,
+        width,
+        height,
         codec: track.codec,
         frame_count,
         frame_rate,
+        display: track.display,
+        colour,
     })
 }
 
-pub(crate) fn decode_frame(input: &[u8], index: u32, out: &mut [u8]) -> Result<u32> {
+/// A sample table and what's needed to read the samples.
+pub(crate) struct MatroskaIndex {
+    pub index: Index,
+    pub config: core::ops::Range<usize>,
+    pub compression: Compression,
+    pub dib: Option<bool>,
+    pub palette: core::ops::Range<usize>,
+}
+
+/// Marks samples at the times listed in the Cues element as seek points.
+fn apply_cues(input: &[u8], seg: Elem, scale_ns: u64, index: &mut Index) {
+    let Some(cues) = find_in_segment(input, seg, ID_CUES) else {
+        return;
+    };
+    let mut pos = cues.payload;
+    while let Ok(Some(point)) = next_elem(input, pos, cues.end) {
+        pos = point.next;
+        if point.id != ID_CUE_POINT {
+            continue;
+        }
+        let Ok(Some(time)) = find_elem(input, point.payload, point.end, ID_CUE_TIME) else {
+            continue;
+        };
+        let Ok(ticks) = read_uint(input, time) else {
+            continue;
+        };
+        let ms = (ticks as u128 * scale_ns as u128 / 1_000_000).min(i32::MAX as u128) as i32;
+        // Decode order is nearly sorted by time, so look around the insertion
+        // point instead of scanning. Cue times are in the file's own units.
+        let at = index.samples.partition_point(|s| s.pts_ms < ms);
+        let window = at.saturating_sub(8)..(at + 8).min(index.samples.len());
+        for sample in &mut index.samples[window] {
+            if sample.pts_ms == ms {
+                sample.flags |= FLAG_KEY;
+            }
+        }
+    }
+}
+
+/// Builds the sample table of the first video track.
+pub(crate) fn build_index(input: &[u8], limits: &DecoderLimits) -> Result<MatroskaIndex> {
     let seg = segment(input)?;
     let track = video_track(input, seg)?;
-    let count = count_frames(input, seg, track.number)?;
-    if index >= count {
-        return Err(VideoError::FrameOutOfRange { index, count });
-    }
-    require_rgba(out, track.width, track.height)?;
-
-    match track.codec {
-        Codec::H264 => {
-            let mut avcc = if track.config.len() > 7 && track.config[0] == 1 {
-                Some(AvccDecoder::new(track.config, index)?)
-            } else {
-                None
-            };
-            let mut annex_b = AnnexBDecoder::new(index);
-            let mut done = false;
-            visit_cluster_blocks(input, seg, track.number, |sample| {
-                let hit = if let Some(decoder) = avcc.as_mut() {
-                    decoder.push(sample, out)?
-                } else {
-                    annex_b.push(sample, out)?
-                };
-                if hit {
-                    done = true;
-                }
-                Ok(hit)
-            })?;
-            if !done {
-                done = if let Some(decoder) = avcc.as_mut() {
-                    decoder.finish(out)?
-                } else {
-                    annex_b.finish(out)?
-                };
+    let scale_ns = find_in_segment(input, seg, ID_INFO)
+        .and_then(|element| {
+            find_elem(input, element.payload, element.end, ID_TIMESTAMP_SCALE)
+                .ok()
+                .flatten()
+                .and_then(|e| read_uint(input, e).ok())
+        })
+        .filter(|&scale| scale != 0)
+        .unwrap_or(1_000_000);
+    let frame_step_ns = track.default_duration;
+    let mut index = Index::default();
+    visit_clusters(input, seg, track.number, |cluster_time, frame| {
+        let ticks = cluster_time as i128 + frame.relative_time as i128;
+        let ns = ticks * scale_ns as i128 + (frame.lace_index as i128 * frame_step_ns as i128);
+        let ms = (ns / 1_000_000).clamp(i32::MIN as i128, i32::MAX as i128) as i64;
+        let flags = if frame.key { FLAG_KEY } else { 0 };
+        index.push(limits, input.len(), frame.offset, frame.size, ms, flags)?;
+        Ok(true)
+    })?;
+    apply_cues(input, seg, scale_ns, &mut index);
+    let offset_of = |slice: &[u8]| slice.as_ptr() as usize - input.as_ptr() as usize;
+    let config = if track.config.is_empty() {
+        0..0
+    } else {
+        let start = offset_of(track.config);
+        start..start + track.config.len()
+    };
+    let palette = if track.dib.is_some() {
+        match crate::avi::parse_bitmap_info(track.config) {
+            Ok(bih) => {
+                let start = config.start + bih.palette.start;
+                start..config.start + bih.palette.end
             }
-            if !done {
-                return Err(VideoError::FrameOutOfRange { index, count });
-            }
-            Ok(0)
+            Err(_) => 0..0,
         }
-        Codec::Mjpeg
-        | Codec::RawRgb
-        | Codec::RawBgr
-        | Codec::RawBgra
-        | Codec::RawRgba
-        | Codec::RawGray
-        | Codec::RawYuv420
-        | Codec::RawYuv422
-        | Codec::RawYuv444
-        | Codec::RawYuy2
-        | Codec::RawUyvy => {
-            let mut sample = None;
-            let mut seen = 0u32;
-            visit_cluster_blocks(input, seg, track.number, |data| {
-                if seen == index {
-                    sample = Some(data);
-                    return Ok(true);
-                }
-                seen = seen.saturating_add(1);
-                Ok(false)
-            })?;
-            let sample = sample.ok_or(VideoError::UnexpectedEnd)?;
-            match track.codec {
-                Codec::Mjpeg => mjpeg::decode_sample(sample, out)?,
-                codec => raw::decode(sample, codec, track.width, track.height, false, out)?,
-            }
-            Ok(0)
-        }
-        codec => Err(VideoError::UnsupportedCodec(codec.name())),
-    }
+    } else {
+        0..0
+    };
+    Ok(MatroskaIndex {
+        index,
+        config,
+        compression: track.compression,
+        dib: track.dib,
+        palette,
+    })
 }

@@ -1,31 +1,25 @@
-//! FEOS-DOS: an x86 virtual machine and DOS prompt for feos.
+//! FEOS-DOS: an x86 virtual machine and DOS for feos.
 //!
-//! FEOS-DOS is an original, dependency-free `no_std` implementation of the
-//! parts of a PC that a DOS program expects:
+//! The crate implements the parts of a PC that DOS programs expect:
 //!
-//! * an 8086/80186 interpreter ([`cpu`]) with the full integer instruction
-//!   set, flags, segmentation, interrupts and `REP` string operations;
-//! * 1 MiB of conventional memory, the interrupt vector table and the BIOS
-//!   data area ([`memory`]);
-//! * an 80x25 VGA text adapter with the CP437 character set ([`vga`],
-//!   [`font`]);
-//! * the BIOS services a DOS program uses: `INT 10h` video, `INT 16h`
-//!   keyboard, `INT 1Ah` time and the usual equipment/memory calls ([`bios`]);
-//! * a DOS kernel with a writable RAM drive, handles, a DTA, file search and
-//!   the `INT 21h` calls a text-mode program needs ([`dos`]);
-//! * a `COMMAND.COM`-style prompt ([`shell`]) with the familiar built-ins.
+//! * an 80386 interpreter ([`cpu`]) with real and protected mode, paging, task
+//!   switches and an x87 ([`fpu`]);
+//! * RAM with a real A20 gate ([`memory`]), 8259 PICs, an 8254 PIT, the keyboard
+//!   controller and 8237 DMA ([`hw`], [`keyboard`]);
+//! * a VGA adapter with its register core, and text, CGA, EGA and VGA modes
+//!   ([`vga`], [`int10`], [`font`]);
+//! * a ROM whose interrupt vectors enter the Rust BIOS through callbacks, so
+//!   programs can hook and chain them ([`bios`]);
+//! * a DOS kernel with an MCB arena, PSPs, handles, FCBs, `EXEC` and a writable
+//!   RAM drive ([`dos`], [`ramdisk`]), plus XMS and EMS ([`xms`]);
+//! * a `COMMAND.COM`-style prompt with batch files ([`shell`]);
+//! * OPL3 FM, a PC speaker and a Sound Blaster 2.0 DSP ([`opl`], [`sb`]), and a
+//!   mouse driver ([`mouse`]).
 //!
-//! The machine is driven by [`DosBox::frame`], which executes a cycle budget
-//! and then draws the text screen into a [`feos_gfx::Canvas`]. Keyboard input
-//! is queued with [`keyboard::Keyboard`], so the same core runs under the
-//! desktop, the serial shell and host tests.
-//!
-//! # Scope
-//!
-//! This is a DOS *text-mode* machine. Graphics adapters (CGA/EGA/VGA modes),
-//! the x87 FPU, protected mode, DOS extenders, sound cards and networking are
-//! deliberately outside this crate's first version; [`cpu`] reports the
-//! machine as an 8086 so programs can choose a compatible code path.
+//! The machine is driven by [`DosBox::frame_paced`] or [`DosBox::frame`], which
+//! execute a budget of guest work and return, so the same core runs under the
+//! desktop, the serial shell and host tests. See `docs/dosbox.md` for what works
+//! and how far each game in the library gets.
 //!
 //! ```no_run
 //! use feos_dosbox::DosBox;
@@ -50,6 +44,8 @@ pub mod dos;
 pub mod f80;
 pub mod font;
 pub mod fpu;
+pub mod hw;
+pub mod int10;
 pub mod keyboard;
 pub mod machine;
 pub mod memory;
@@ -57,8 +53,10 @@ pub mod mouse;
 pub mod opl;
 pub mod opl3;
 pub mod ramdisk;
+pub mod sb;
 pub mod shell;
 pub mod vga;
+pub mod xms;
 
 pub use cpu::Cpu;
 pub use dos::Dos;

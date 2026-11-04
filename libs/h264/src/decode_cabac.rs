@@ -308,7 +308,7 @@ impl SliceContext<'_> {
                     let qp_y = if cbp_luma != 0 || cbp_chroma != 0 {
                         let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero);
                         self.last_qp_delta_nonzero = delta != 0;
-                        ((self.prev_mb_qp + delta + 52) % 52 + 52) % 52
+                        (self.prev_mb_qp + (delta % 52) + 52) % 52
                     } else {
                         self.last_qp_delta_nonzero = false;
                         self.prev_mb_qp
@@ -593,7 +593,7 @@ impl SliceContext<'_> {
                             &pred_v,
                             false,
                             cbp_chroma,
-                            _qp_c,
+                            chroma_qp(qp_y, sp.second_chroma_qp_index_offset),
                             &sp.scaling_list_4x4[2],
                             mb_x,
                         );
@@ -625,7 +625,7 @@ impl SliceContext<'_> {
 
                     let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero);
                     self.last_qp_delta_nonzero = delta != 0;
-                    let qp_y = ((self.prev_mb_qp + delta + 52) % 52 + 52) % 52;
+                    let qp_y = (self.prev_mb_qp + (delta % 52) + 52) % 52;
                     self.prev_mb_qp = qp_y;
                     let qp_c = chroma_qp(qp_y, sp.chroma_qp_index_offset);
 
@@ -901,7 +901,7 @@ impl SliceContext<'_> {
                             &pred_v,
                             false,
                             cbp_chroma,
-                            qp_c,
+                            chroma_qp(qp_y, sp.second_chroma_qp_index_offset),
                             &sp.scaling_list_4x4[2],
                             mb_x,
                         );
@@ -1397,7 +1397,7 @@ impl SliceContext<'_> {
                 let qp_y = if cbp_luma != 0 || cbp_chroma != 0 {
                     let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero);
                     self.last_qp_delta_nonzero = delta != 0;
-                    ((self.prev_mb_qp + delta + 52) % 52 + 52) % 52
+                    (self.prev_mb_qp + (delta % 52) + 52) % 52
                 } else {
                     self.last_qp_delta_nonzero = false;
                     self.prev_mb_qp
@@ -1562,6 +1562,11 @@ impl SliceContext<'_> {
                         (&mut chroma_dc_cr, &mut self.frame.v, 5usize),
                     ] {
                         let chroma_scale = &sp.scaling_list_4x4[scale_idx];
+                        let qp_c = if scale_idx % 3 == 2 {
+                            chroma_qp(qp_y, sp.second_chroma_qp_index_offset)
+                        } else {
+                            qp_c
+                        };
                         inverse_hadamard_2x2(plane_dc);
                         dequant_chroma_dc(plane_dc, qp_c, chroma_scale[0]);
                         let mut chroma_residual = [0i32; 64];
@@ -2984,7 +2989,7 @@ impl SliceContext<'_> {
                 let qp_y = if cbp_luma != 0 || cbp_chroma != 0 {
                     let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero);
                     self.last_qp_delta_nonzero = delta != 0;
-                    ((self.prev_mb_qp + delta + 52) % 52 + 52) % 52
+                    (self.prev_mb_qp + (delta % 52) + 52) % 52
                 } else {
                     self.last_qp_delta_nonzero = false;
                     self.prev_mb_qp
@@ -3145,6 +3150,11 @@ impl SliceContext<'_> {
                         (&mut chroma_dc_cr, &mut self.frame.v, 5usize),
                     ] {
                         let chroma_scale = &sp.scaling_list_4x4[scale_idx];
+                        let qp_c = if scale_idx % 3 == 2 {
+                            chroma_qp(qp_y, sp.second_chroma_qp_index_offset)
+                        } else {
+                            qp_c
+                        };
                         inverse_hadamard_2x2(plane_dc);
                         dequant_chroma_dc(plane_dc, qp_c, chroma_scale[0]);
                         let mut chroma_residual = [0i32; 64];
@@ -3374,7 +3384,7 @@ impl SliceContext<'_> {
             let qp_y = if cbp_luma != 0 || cbp_chroma != 0 {
                 let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero);
                 self.last_qp_delta_nonzero = delta != 0;
-                ((self.prev_mb_qp + delta + 52) % 52 + 52) % 52
+                (self.prev_mb_qp + (delta % 52) + 52) % 52
             } else {
                 self.last_qp_delta_nonzero = false;
                 self.prev_mb_qp
@@ -3673,7 +3683,7 @@ impl SliceContext<'_> {
                     &pred_v,
                     false,
                     cbp_chroma,
-                    _qp_c,
+                    chroma_qp(qp_y, sp.second_chroma_qp_index_offset),
                     &sp.scaling_list_4x4[2],
                     mb_x,
                 );
@@ -3707,7 +3717,7 @@ impl SliceContext<'_> {
             self.mb_chroma_pred[mb_idx] = intra_chroma_pred_mode;
             let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero);
             self.last_qp_delta_nonzero = delta != 0;
-            let qp_y = ((self.prev_mb_qp + delta + 52) % 52 + 52) % 52;
+            let qp_y = (self.prev_mb_qp + (delta % 52) + 52) % 52;
             self.prev_mb_qp = qp_y;
             let qp_c = chroma_qp(qp_y, sp.chroma_qp_index_offset);
             // Luma DC: cat=0, 16 coefficients
@@ -3960,7 +3970,7 @@ impl SliceContext<'_> {
                     &pred_v,
                     false,
                     cbp_chroma,
-                    qp_c,
+                    chroma_qp(qp_y, sp.second_chroma_qp_index_offset),
                     &sp.scaling_list_4x4[2],
                     mb_x,
                 );

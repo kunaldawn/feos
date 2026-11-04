@@ -24,7 +24,7 @@ impl App for PowerOff {
     }
 
     fn run(&self, context: &mut Context<'_>) {
-        println!("powering off via PSCI...");
+        println!("powering off...");
         context.platform.power.system_off()
     }
 }
@@ -50,7 +50,7 @@ impl App for Reboot {
     }
 
     fn run(&self, context: &mut Context<'_>) {
-        println!("resetting via PSCI...");
+        println!("resetting...");
         context.platform.power.system_reset()
     }
 }

@@ -45,8 +45,14 @@ apps:
   extensions:
     - .fapp
 
-# Services started with the session. Each id may be a bundle id (`terminal`)
-# or a shell command (`ps`). `restart` is never, on-failure or always.
+# Layout of the virtio keyboard: us, uk, de, fr or dvorak. A serial terminal
+# uses its own layout. The Display Properties dialog can change this at run time.
+keyboard:
+  layout: us
+
+# Services started with the session. Each id may be a bundle id or a shell
+# command. A windowed bundle (`terminal`) opens its window instead of being
+# supervised. `restart` is never, on-failure or always.
 init:
   restart: on-failure
   max_restarts: 3

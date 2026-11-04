@@ -135,11 +135,29 @@ impl SerialKeys {
     /// Returns `true` when the user asked to leave the session with Ctrl-\ or
     /// Ctrl-D. The flag is sticky once set.
     pub fn poll(&mut self, now: u64, input: &mut Input) -> bool {
-        while let Some(byte) = read_byte() {
+        self.poll_limited(now, input, usize::MAX)
+    }
+
+    /// [`poll`](Self::poll), reading at most `limit` bytes.
+    ///
+    /// It also stops when the frame's queue has no room for another key and
+    /// its text, and leaves the rest in the console for the next frame.
+    /// Nothing is lost in a burst, such as a paste into the serial terminal.
+    pub fn poll_limited(&mut self, now: u64, input: &mut Input, limit: usize) -> bool {
+        let mut read = 0;
+        let mut drained = false;
+        while read < limit && input.keyboard_capacity() >= 2 {
+            let Some(byte) = read_byte() else {
+                drained = true;
+                break;
+            };
             self.feed(byte, now, input);
+            read += 1;
         }
 
-        if self.state != DecodeState::Ground
+        // A sequence is only finished by the clock once nothing more is waiting.
+        if drained
+            && self.state != DecodeState::Ground
             && now.wrapping_sub(self.escape_at) >= ESCAPE_TIMEOUT_MS
         {
             if self.state == DecodeState::Escape {
@@ -244,6 +262,10 @@ impl SerialKeys {
             b'D' => Some(Key::Left),
             b'H' => Some(Key::Home),
             b'F' => Some(Key::End),
+            b'P' => Some(Key::F1),
+            b'Q' => Some(Key::F2),
+            b'R' => Some(Key::F3),
+            b'S' => Some(Key::F4),
             b'Z' => {
                 Self::key(input, Key::Tab, Modifiers::SHIFT);
                 return;
@@ -665,5 +687,15 @@ mod tests {
             .any(|(key, modifiers)| key == Key::Character('c')
                 && modifiers.contains(Modifiers::CTRL)));
         assert_eq!(input.text().count(), 0);
+    }
+
+    #[test]
+    fn f1_to_f4_arrive_in_their_short_forms_with_modifiers() {
+        let mut keys = SerialKeys::new();
+        let mut input = Input::new();
+        for byte in *b"\x1b[1;3S" {
+            keys.feed(byte, 0, &mut input);
+        }
+        assert_eq!(input.keys().next(), Some((Key::F4, Modifiers::ALT)));
     }
 }

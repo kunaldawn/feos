@@ -1,0 +1,9 @@
+[package]
+name = "feos-port-io"
+description = "x86 port I/O instructions shared by the x86 drivers and architecture crate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false

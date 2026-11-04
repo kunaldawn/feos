@@ -3,10 +3,12 @@ name = "feos-dosbox"
 description = "FEOS-DOS: a no_std x86 virtual machine and DOS prompt for feos"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license = "GPL-2.0-or-later"
 
 [features]
 stereo-ext = []
+# Keeps a ring of recently executed instructions in `Cpu::trace`.
+trace = []
 
 [dependencies]
 feos-archive = { workspace = true }

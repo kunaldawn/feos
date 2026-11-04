@@ -334,15 +334,17 @@ impl<'a> Parser<'a> {
             self.pos = end;
             Ok(())
         } else {
-            let offset = self
-                .bytes
+            let rest = self.bytes.get(self.pos..).unwrap_or(&[]);
+            let matched = rest
                 .iter()
                 .zip(literal)
-                .position(|(actual, expected)| actual != expected)
-                .map(|index| self.pos + index)
-                .unwrap_or(self.pos);
-            let byte = self.bytes.get(offset).copied().unwrap_or(0);
-            Err(JsonError::UnexpectedByte { offset, byte })
+                .take_while(|(actual, expected)| actual == expected)
+                .count();
+            let offset = self.pos + matched;
+            match self.bytes.get(offset) {
+                Some(&byte) => Err(JsonError::UnexpectedByte { offset, byte }),
+                None => Err(JsonError::UnexpectedEnd),
+            }
         }
     }
 

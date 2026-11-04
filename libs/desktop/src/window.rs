@@ -22,6 +22,9 @@ pub const MIN_WINDOW_WIDTH: u32 = 240;
 /// Smallest height a resized window may have.
 pub const MIN_WINDOW_HEIGHT: u32 = 160;
 
+/// [`DesktopWindow::app`] for a window whose bundle is no longer installed.
+pub const NO_APP: usize = usize::MAX;
+
 /// Height of the managed title bar.
 pub const TITLE_HEIGHT: u32 = 28;
 
@@ -89,11 +92,42 @@ impl ResizeEdge {
     }
 }
 
+/// Why a window has no running application to show.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum WindowStatus {
+    /// Nothing went wrong.
+    #[default]
+    Ready,
+    /// The manifest's entry point is not in the shell registry.
+    UnknownEntry,
+    /// The kernel refused to create a process.
+    SpawnFailed,
+    /// The app could not open its window.
+    OpenFailed,
+}
+
 /// One managed window.
 #[derive(Clone, Copy)]
 pub struct DesktopWindow {
     /// Catalog index of the application this window belongs to.
+    ///
+    /// [`bundle`](Self::bundle) is the stable identity: a catalog rescan
+    /// recomputes this index from it, and sets it to [`NO_APP`] when the
+    /// bundle has gone away.
     pub app: usize,
+    /// Manifest id of the application this window belongs to.
+    pub bundle: Text<32>,
+    /// Arguments the application was opened with.
+    pub args: Text<96>,
+    /// Why the window has nothing to show, if so.
+    pub status: WindowStatus,
+    /// The title bar has moved since the current press began, so its release
+    /// is the end of a drag and not half of a double click.
+    pub title_moved: bool,
+    /// Minimized by "Show Desktop", which may restore it again.
+    pub hidden_by_show_desktop: bool,
+    /// Uptime of the app's last frame, for per-window animation periods.
+    pub last_frame_ms: u64,
     /// Window title.
     pub title: Text<TITLE_MAX>,
     /// Current rectangle.
@@ -124,6 +158,12 @@ impl DesktopWindow {
     /// An unused slot.
     pub const EMPTY: Self = Self {
         app: 0,
+        bundle: Text::EMPTY,
+        args: Text::EMPTY,
+        status: WindowStatus::Ready,
+        title_moved: false,
+        hidden_by_show_desktop: false,
+        last_frame_ms: 0,
         title: Text::EMPTY,
         rect: Rect::new(0, 0, 0, 0),
         restore: Rect::new(0, 0, 0, 0),
@@ -201,6 +241,12 @@ impl<const N: usize> WindowManager<N> {
 
         let window = &mut self.windows[index];
         window.app = app;
+        window.bundle.clear();
+        window.args.clear();
+        window.status = WindowStatus::Ready;
+        window.title_moved = false;
+        window.hidden_by_show_desktop = false;
+        window.last_frame_ms = 0;
         window.title.set(title);
         window.rect = rect;
         window.restore = rect;
@@ -214,6 +260,13 @@ impl<const N: usize> WindowManager<N> {
         window.launched = false;
         self.focus(index);
         Some(index)
+    }
+
+    /// The open window showing catalog entry `app`, if any.
+    pub fn get_open_for(&self, app: usize) -> Option<usize> {
+        self.windows
+            .iter()
+            .position(|window| window.open && window.app == app)
     }
 
     /// Number of open windows.
@@ -270,22 +323,90 @@ impl<const N: usize> WindowManager<N> {
         self.focused = None;
     }
 
-    /// Focuses the next open window in slot order.
+    /// Focuses the next visible window in slot order.
+    ///
+    /// Minimized windows are skipped: they cannot take keyboard input, and
+    /// focusing one would leave every key going nowhere.
     pub fn focus_next(&mut self) -> Option<usize> {
-        let count = self.count();
-        if count == 0 {
-            self.focused = None;
-            return None;
-        }
         let start = self.focused.map(|index| index + 1).unwrap_or(0);
         for step in 0..N {
-            let index = (start + step) % N;
-            if self.windows[index].open {
+            let index = (start + step) % N.max(1);
+            let window = &self.windows[index];
+            if window.open && window.state != WindowState::Minimized {
                 self.focus(index);
                 return Some(index);
             }
         }
+        self.focused = None;
         None
+    }
+
+    /// Switches to the window that has gone longest without focus, restoring
+    /// it if it is minimized. Repeating this visits every open window.
+    pub fn cycle_forward(&mut self) -> Option<usize> {
+        let index = self
+            .windows
+            .iter()
+            .enumerate()
+            .filter(|(index, window)| window.open && self.focused != Some(*index))
+            .min_by_key(|(_, window)| window.z)
+            .map(|(index, _)| index)?;
+        if self.windows[index].state == WindowState::Minimized {
+            self.windows[index].state = self.windows[index].restore_state;
+        }
+        self.focus(index);
+        Some(index)
+    }
+
+    /// Undoes [`cycle_forward`](Self::cycle_forward): sends the focused window
+    /// to the back and focuses whichever window is now on top.
+    pub fn cycle_backward(&mut self) -> Option<usize> {
+        if let Some(index) = self.focused {
+            let lowest = self
+                .windows
+                .iter()
+                .filter(|window| window.open)
+                .map(|window| window.z)
+                .min()
+                .unwrap_or(1);
+            if lowest <= 1 {
+                self.renumber();
+            }
+            let lowest = self
+                .windows
+                .iter()
+                .filter(|window| window.open)
+                .map(|window| window.z)
+                .min()
+                .unwrap_or(2);
+            self.windows[index].z = lowest.saturating_sub(1);
+            self.focused = None;
+        }
+        let index = self.topmost_open(None)?;
+        self.focus(index);
+        Some(index)
+    }
+
+    /// Spreads z values out so a window can be placed below the lowest one.
+    fn renumber(&mut self) {
+        let mut order = [0usize; N];
+        let mut count = 0;
+        for (index, window) in self.windows.iter().enumerate() {
+            if !window.open {
+                continue;
+            }
+            let mut position = count;
+            while position > 0 && self.windows[order[position - 1]].z > window.z {
+                order[position] = order[position - 1];
+                position -= 1;
+            }
+            order[position] = index;
+            count += 1;
+        }
+        for (rank, index) in order[..count].iter().enumerate() {
+            self.windows[*index].z = rank as u32 + 2;
+        }
+        self.next_z = count as u32 + 2;
     }
 
     /// Closes a window.
@@ -385,10 +506,12 @@ impl<const N: usize> WindowManager<N> {
         if !window.open || window.state != WindowState::Normal {
             return false;
         }
+        // On a very small work area these bounds can cross; keeping the title
+        // bar reachable matters more than the other edge then.
         let min_x = work_area.x - window.rect.width as i32 + 48;
-        let max_x = work_area.right_i32() - 48;
+        let max_x = (work_area.right_i32() - 48).max(min_x);
         let min_y = work_area.y;
-        let max_y = work_area.bottom_i32() - 28;
+        let max_y = (work_area.bottom_i32() - 28).max(min_y);
         window.rect.x = window.rect.x.saturating_add(dx).clamp(min_x, max_x);
         window.rect.y = window.rect.y.saturating_add(dy).clamp(min_y, max_y);
         window.restore = window.rect;
@@ -457,6 +580,16 @@ impl<const N: usize> WindowManager<N> {
         );
         window.restore = window.rect;
         true
+    }
+
+    /// Recomputes every window's catalog index after a rescan, using `find` to
+    /// turn its bundle id into the new index.
+    pub fn remap_apps(&mut self, mut find: impl FnMut(&str) -> Option<usize>) {
+        for window in &mut self.windows {
+            if window.open {
+                window.app = find(window.bundle.as_str()).unwrap_or(NO_APP);
+            }
+        }
     }
 
     /// Returns the topmost window containing `point`, if any.
@@ -680,5 +813,67 @@ mod tests {
         assert!(wm.restore(index));
         assert_eq!(wm.get(index).unwrap().state, WindowState::Maximized);
         assert_eq!(wm.get(index).unwrap().rect, WORK);
+    }
+
+    #[test]
+    fn tab_focus_skips_minimized_windows() {
+        let mut wm = WindowManager::<4>::new();
+        let a = wm.open(0, "A", WORK, 300, 200, 10).unwrap();
+        let b = wm.open(1, "B", WORK, 300, 200, 10).unwrap();
+        wm.minimize(a);
+        assert_eq!(wm.focus_next(), Some(b));
+        assert_eq!(wm.focus_next(), Some(b));
+        wm.minimize(b);
+        assert_eq!(wm.focus_next(), None);
+        assert_eq!(wm.focused(), None);
+    }
+
+    #[test]
+    fn cycling_forward_visits_every_window_and_restores_minimized_ones() {
+        let mut wm = WindowManager::<4>::new();
+        let a = wm.open(0, "A", WORK, 300, 200, 10).unwrap();
+        let b = wm.open(1, "B", WORK, 300, 200, 10).unwrap();
+        let c = wm.open(2, "C", WORK, 300, 200, 10).unwrap();
+        wm.minimize(b);
+        wm.focus(c);
+        assert_eq!(wm.cycle_forward(), Some(a));
+        assert_eq!(wm.cycle_forward(), Some(b));
+        assert_eq!(wm.get(b).unwrap().state, WindowState::Normal);
+        assert_eq!(wm.cycle_forward(), Some(c));
+        assert_eq!(wm.cycle_forward(), Some(a));
+    }
+
+    #[test]
+    fn cycling_backward_sends_the_focused_window_to_the_back() {
+        let mut wm = WindowManager::<4>::new();
+        let a = wm.open(0, "A", WORK, 300, 200, 10).unwrap();
+        let b = wm.open(1, "B", WORK, 300, 200, 10).unwrap();
+        let c = wm.open(2, "C", WORK, 300, 200, 10).unwrap();
+        assert_eq!(wm.cycle_backward(), Some(b));
+        assert_eq!(wm.cycle_backward(), Some(a));
+        let mut order = [0usize; 4];
+        let count = wm.z_order(&mut order);
+        assert_eq!(&order[..count], &[b, c, a]);
+    }
+
+    #[test]
+    fn a_rescan_moves_windows_with_their_bundle() {
+        let mut wm = WindowManager::<4>::new();
+        let index = wm.open(3, "Keep", WORK, 300, 200, 10).unwrap();
+        wm.get_mut(index).unwrap().bundle.set("keep");
+        let gone = wm.open(4, "Gone", WORK, 300, 200, 10).unwrap();
+        wm.get_mut(gone).unwrap().bundle.set("gone");
+        wm.remap_apps(|id| (id == "keep").then_some(1));
+        assert_eq!(wm.get(index).unwrap().app, 1);
+        assert_eq!(wm.get(gone).unwrap().app, NO_APP);
+    }
+
+    #[test]
+    fn moving_on_a_tiny_work_area_does_not_panic() {
+        let tiny = Rect::new(0, 0, 20, 10);
+        let mut wm = WindowManager::<4>::new();
+        let index = wm.open(0, "One", tiny, 300, 200, 10).unwrap();
+        assert!(wm.move_by(index, 5, 5, tiny));
+        assert!(wm.move_by(index, -500, -500, tiny));
     }
 }

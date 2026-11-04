@@ -1,15 +1,18 @@
 //! EL1 exception vectors and fault reporting.
 //!
 //! The assembly table in `vectors.S` routes every entry through
-//! `exception_handler`, which builds a [`FaultInfo`] and forwards it to the
-//! handler registered with [`set_handler`]. The handler reports the fault; it
-//! cannot return, because there is no recovery path yet.
+//! `irq::trap_dispatch`, which sends anything that isn't an IRQ or a software
+//! switch here. [`fatal`] builds a [`FaultInfo`] and forwards it to the handler
+//! registered with [`set_handler`]. The handler reports the fault and stops the
+//! machine; there is no recovery path.
 
 use core::arch::{asm, global_asm};
+use core::fmt;
 use core::mem::transmute;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::cpu;
+use crate::irq::TrapFrame;
 
 global_asm!(include_str!("vectors.S"));
 
@@ -32,9 +35,24 @@ pub struct FaultInfo {
     pub spsr: u64,
     /// Stack pointer at the time of the fault.
     pub sp: u64,
+    /// `x0`..`x30` at the time of the fault.
+    pub regs: [u64; 31],
 }
 
 impl FaultInfo {
+    /// Writes the general-purpose registers, four to a line.
+    pub fn write_registers(&self, out: &mut dyn fmt::Write) -> fmt::Result {
+        for (index, value) in self.regs.iter().enumerate() {
+            let separator = if index % 4 == 3 || index == self.regs.len() - 1 {
+                "\n"
+            } else {
+                " "
+            };
+            write!(out, "x{index:<2}={value:016x}{separator}")?;
+        }
+        Ok(())
+    }
+
     /// Exception class extracted from `ESR_EL1`.
     pub const fn exception_class(&self) -> u64 {
         (self.esr >> 26) & 0x3f
@@ -106,7 +124,7 @@ pub fn init() {
 
 /// Installs the function called when an exception is taken.
 ///
-/// The handler must not return; the architecture crate halts after it runs.
+/// The architecture crate halts if the handler returns.
 pub fn set_handler(handler: FaultHandler) {
     HANDLER.store(handler as usize, Ordering::Release);
 }
@@ -122,26 +140,23 @@ fn handler() -> Option<FaultHandler> {
     }
 }
 
-/// Called from `exception_common` in `vectors.S`.
-///
-/// # Safety
-/// Only called from the assembly exception entry stub.
-#[no_mangle]
-pub unsafe extern "C" fn exception_handler(
-    index: u64,
-    esr: u64,
-    elr: u64,
-    far: u64,
-    spsr: u64,
-    sp: u64,
-) -> ! {
+/// Reports a trap that can't be recovered from. Called from `irq::trap_dispatch`.
+pub(crate) fn fatal(index: u64, esr: u64, frame: &TrapFrame) -> ! {
+    let elr: u64;
+    let far: u64;
+    // SAFETY: reading system registers has no side effects.
+    unsafe {
+        asm!("mrs {}, elr_el1", out(reg) elr, options(nomem, nostack));
+        asm!("mrs {}, far_el1", out(reg) far, options(nomem, nostack));
+    }
     let info = FaultInfo {
         index,
         esr,
         elr,
         far,
-        spsr,
-        sp,
+        spsr: frame.spsr,
+        sp: frame.sp,
+        regs: frame.x,
     };
 
     if let Some(handler) = handler() {

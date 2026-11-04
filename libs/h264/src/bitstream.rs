@@ -1,47 +1,50 @@
-use alloc::vec::Vec;
-
 /// Bitstream reader for parsing H.264 NAL unit RBSP data.
 /// Reads bits left-to-right (MSB first).
 ///
-/// The internal buffer is padded with zero bytes so that `read_bit` can skip
-/// per-bit bounds checks in the hot path. Only `bits_remaining` and
-/// `more_rbsp_data` use the true data length.
-pub struct BitstreamReader {
-    data: Vec<u8>,
-    data_len: usize, // actual RBSP length (excluding padding)
+/// The reader borrows the RBSP, so creating one costs nothing. Reads past the
+/// end return zero bits for up to `PADDING` bytes, which keeps multi-slice
+/// end-of-slice detection simple, and fail after that. Only `bits_remaining`
+/// and `more_rbsp_data` use the true data length.
+pub struct BitstreamReader<'a> {
+    data: &'a [u8],
+    /// One past the last non-zero byte of `data`, computed once so
+    /// `more_rbsp_data` stays O(1) per macroblock however long the trailing
+    /// zeros are.
+    last_nz: usize,
     byte_offset: usize,
     bit_offset: u8, // 0-7, bits already consumed in current byte
 }
 
-/// Number of zero bytes appended after RBSP data.
+/// Number of virtual zero bytes readable after the RBSP data.
 /// Must be large enough that reading past the end during multi-slice
-/// end-of-slice detection doesn't cause index-out-of-bounds panics.
+/// end-of-slice detection is not reported as an error.
 /// 128 bytes = 1024 bits covers the worst case for any single MB decode.
 const PADDING: usize = 128;
 
-impl BitstreamReader {
-    pub fn new(rbsp: &[u8]) -> Self {
-        let data_len = rbsp.len();
-        let mut data = Vec::with_capacity(data_len + PADDING);
-        data.extend_from_slice(rbsp);
-        data.resize(data_len + PADDING, 0);
+impl<'a> BitstreamReader<'a> {
+    pub fn new(rbsp: &'a [u8]) -> Self {
+        let mut last_nz = rbsp.len();
+        while last_nz > 0 && rbsp[last_nz - 1] == 0 {
+            last_nz -= 1;
+        }
         Self {
-            data,
-            data_len,
+            data: rbsp,
+            last_nz,
             byte_offset: 0,
             bit_offset: 0,
         }
     }
 
     /// Read a single bit, returning 0 or 1.
-    /// Does not bounds-check on every call; relies on padding to avoid
-    /// out-of-bounds reads. Call `bits_remaining` to check before bulk reads.
+    /// Reads inside the padding return zero bits; `bits_remaining` tells a
+    /// caller whether real data is left before a bulk read.
     #[inline(always)]
     pub fn read_bit(&mut self) -> Result<u8, &'static str> {
-        if self.byte_offset >= self.data.len() {
-            return Err("end of bitstream");
-        }
-        let bit = (self.data[self.byte_offset] >> (7 - self.bit_offset)) & 1;
+        let bit = match self.data.get(self.byte_offset) {
+            Some(byte) => (byte >> (7 - self.bit_offset)) & 1,
+            None if self.byte_offset < self.data.len() + PADDING => 0,
+            None => return Err("end of bitstream"),
+        };
         self.bit_offset += 1;
         if self.bit_offset == 8 {
             self.bit_offset = 0;
@@ -55,32 +58,30 @@ impl BitstreamReader {
         if n > 32 {
             return Err("cannot read more than 32 bits");
         }
-        let mut val: u32 = 0;
-        for _ in 0..n {
-            val = (val << 1) | self.read_bit()? as u32;
+        let total = self.bit_offset as usize + n as usize;
+        if self.byte_offset + total.div_ceil(8) > self.data.len() + PADDING {
+            return Err("end of bitstream");
         }
+        let val = self.peek_bits(n);
+        self.byte_offset += total / 8;
+        self.bit_offset = (total % 8) as u8;
         Ok(val)
     }
 
-    /// Peek at the next `n` bits without consuming them. Zero-pads if fewer bits remain.
+    /// Peek at the next `n` bits (up to 32) without consuming them. Zero-pads
+    /// if fewer bits remain.
     pub fn peek_bits(&self, n: u8) -> u32 {
-        let mut val: u32 = 0;
-        let mut byte_offset = self.byte_offset;
-        let mut bit_offset = self.bit_offset;
-        for _ in 0..n {
-            // Padding guarantees in-bounds for reasonable peek sizes
-            if byte_offset < self.data.len() {
-                val = (val << 1) | ((self.data[byte_offset] >> (7 - bit_offset)) & 1) as u32;
-            } else {
-                val <<= 1;
-            }
-            bit_offset += 1;
-            if bit_offset == 8 {
-                bit_offset = 0;
-                byte_offset += 1;
-            }
+        if n == 0 {
+            return 0;
         }
-        val
+        // Five bytes hold any 32-bit field at any bit offset.
+        let mut window = 0u64;
+        for i in 0..5 {
+            let byte = self.data.get(self.byte_offset + i).copied().unwrap_or(0);
+            window = (window << 8) | byte as u64;
+        }
+        let shift = 40 - self.bit_offset as u32 - n as u32;
+        ((window >> shift) & ((1u64 << n) - 1)) as u32
     }
 
     /// Advance position by `n` bits without reading them.
@@ -103,7 +104,7 @@ impl BitstreamReader {
             return Ok(0);
         }
         let suffix = self.read_bits(leading_zeros as u8)?;
-        Ok((1 << leading_zeros) - 1 + suffix)
+        Ok(((1u32 << leading_zeros) - 1).wrapping_add(suffix))
     }
 
     /// Read a truncated Exp-Golomb coded value (te(v)).
@@ -128,15 +129,11 @@ impl BitstreamReader {
     /// Returns true if there is more RBSP data before the trailing bits.
     /// The RBSP trailing bits are: a stop bit (1) followed by zero bits to byte-align.
     pub fn more_rbsp_data(&self) -> bool {
-        if self.byte_offset >= self.data_len {
+        if self.byte_offset >= self.data.len() {
             return false;
         }
 
-        // Find the position of the last non-zero byte in the actual data
-        let mut last_nz = self.data_len;
-        while last_nz > self.byte_offset && self.data[last_nz - 1] == 0 {
-            last_nz -= 1;
-        }
+        let last_nz = self.last_nz;
         if last_nz <= self.byte_offset {
             return false;
         }
@@ -169,13 +166,14 @@ impl BitstreamReader {
 
     /// Peek at the byte at the current byte_offset (for debugging).
     pub fn peek_byte(&self) -> u8 {
-        self.data[self.byte_offset]
+        self.data.get(self.byte_offset).copied().unwrap_or(0)
     }
 
     /// Peek at a slice of bytes starting at byte_offset (for debugging).
     pub fn peek_bytes(&self, n: usize) -> &[u8] {
-        let end = (self.byte_offset + n).min(self.data.len());
-        &self.data[self.byte_offset..end]
+        let start = self.byte_offset.min(self.data.len());
+        let end = start.saturating_add(n).min(self.data.len());
+        &self.data[start..end]
     }
 
     /// Get the byte-aligned position for CABAC initialization.
@@ -187,14 +185,14 @@ impl BitstreamReader {
             self.bit_offset = 0;
             self.byte_offset += 1;
         }
-        (self.byte_offset, &self.data[..self.data_len])
+        (self.byte_offset, self.data)
     }
 
     pub fn bits_remaining(&self) -> usize {
-        if self.byte_offset >= self.data_len {
+        if self.byte_offset >= self.data.len() {
             return 0;
         }
-        (self.data_len - self.byte_offset) * 8 - self.bit_offset as usize
+        (self.data.len() - self.byte_offset) * 8 - self.bit_offset as usize
     }
 }
 

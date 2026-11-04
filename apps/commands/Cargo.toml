@@ -16,6 +16,7 @@ feos-fs = { workspace = true }
 feos-gfx = { workspace = true }
 feos-gui = { workspace = true }
 feos-hal = { workspace = true }
+feos-image = { workspace = true }
 feos-keys = { workspace = true }
 feos-sh = { workspace = true }
 feos-sync = { workspace = true }

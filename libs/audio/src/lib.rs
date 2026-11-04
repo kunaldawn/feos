@@ -1,6 +1,6 @@
 //! `feos-audio` is a small, dependency-free audio library for the feos
-//! kernel. It provides integer PCM sample buffers, mixing, fades, and simple
-//! waveform synthesis. Like `feos-gfx`, it is `no_std`, never allocates, and
+//! kernel. It provides integer PCM sample buffers, mixing, fades, simple
+//! waveform synthesis, and rate and channel conversion. Like `feos-gfx`, it is `no_std`, never allocates, and
 //! works on caller-provided memory.
 //!
 //! Samples are signed 16-bit mono values. An [`AudioBuffer`] stores
@@ -37,10 +37,12 @@
 
 pub mod buffer;
 pub mod format;
+pub mod resample;
 pub mod sample;
 pub mod wave;
 
 pub use buffer::AudioBuffer;
 pub use format::AudioFormat;
+pub use resample::{Progress, Resampler, DRIVER_FORMAT};
 pub use sample::Sample;
 pub use wave::{Oscillator, Waveform};

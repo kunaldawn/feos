@@ -10,11 +10,10 @@
 //! Linux evdev numbers, so `feos-keys` decodes them exactly as it does the
 //! virtio keyboard.
 
-#![no_std]
-
-use core::arch::asm;
+#![cfg_attr(not(test), no_std)]
 
 use feos_hal::{Keyboard, KeyboardEvent, Pointer, PointerEvent};
+use feos_port_io::{inb, outb};
 use feos_sync::SpinLock;
 
 const DATA_PORT: u16 = 0x60;
@@ -35,15 +34,34 @@ const CMD_WRITE_AUX: u8 = 0xd4;
 
 const MOUSE_SET_DEFAULTS: u8 = 0xf6;
 const MOUSE_ENABLE_REPORTING: u8 = 0xf4;
+const MOUSE_SET_SAMPLE_RATE: u8 = 0xf3;
+const MOUSE_GET_ID: u8 = 0xf2;
 const ACK: u8 = 0xfa;
+/// Device ID of a mouse in IntelliMouse (wheel) mode.
+const MOUSE_ID_WHEEL: u8 = 3;
+/// The sample-rate sequence that asks a mouse to enter IntelliMouse mode.
+const WHEEL_KNOCK: [u8; 3] = [200, 100, 80];
+
+/// Mouse packet flag bits.
+const PACKET_ALWAYS_SET: u8 = 1 << 3;
+const PACKET_X_OVERFLOW: u8 = 1 << 6;
+const PACKET_Y_OVERFLOW: u8 = 1 << 7;
 
 const KEY_QUEUE: usize = 32;
+/// Pointer reports buffered between polls.
+const POINTER_QUEUE: usize = 16;
+/// Scancode prefix of the Pause key.
+const PAUSE_PREFIX: u8 = 0xe1;
+/// Linux evdev code for the Pause key.
+const KEY_PAUSE: u16 = 119;
 
 /// Which kind of pointer a board initialised.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PointerKind {
     /// PS/2 auxiliary device (relative movement).
     Ps2,
+    /// PS/2 auxiliary device with a wheel (IntelliMouse protocol).
+    Ps2Wheel,
 }
 
 struct State {
@@ -57,13 +75,19 @@ struct State {
     key_head: usize,
     key_count: usize,
     extended: bool,
+    /// Bytes left to swallow from a Pause key sequence.
+    pause_bytes: u8,
 
-    mouse_packet: [u8; 3],
+    mouse_packet: [u8; 4],
     mouse_len: usize,
+    /// Bytes in a mouse packet: 3, or 4 with a wheel.
+    packet_size: usize,
     left: bool,
     right: bool,
     middle: bool,
-    pending: Option<PointerEvent>,
+    pointer: [PointerEvent; POINTER_QUEUE],
+    pointer_head: usize,
+    pointer_count: usize,
 }
 
 impl State {
@@ -80,12 +104,23 @@ impl State {
         key_head: 0,
         key_count: 0,
         extended: false,
-        mouse_packet: [0; 3],
+        pause_bytes: 0,
+        mouse_packet: [0; 4],
         mouse_len: 0,
+        packet_size: 3,
         left: false,
         right: false,
         middle: false,
-        pending: None,
+        pointer: [PointerEvent {
+            x: 0,
+            y: 0,
+            left: None,
+            right: None,
+            middle: None,
+            wheel: 0,
+        }; POINTER_QUEUE],
+        pointer_head: 0,
+        pointer_count: 0,
     };
 
     fn push_key(&mut self, event: KeyboardEvent) {
@@ -108,15 +143,48 @@ impl State {
         Some(event)
     }
 
+    /// Queues a pointer report.
+    ///
+    /// Button and wheel reports must all reach the desktop, or a click is lost
+    /// or a drag sticks. Only position matters from a position-only report, so
+    /// a new position replaces a queued one. If the queue still fills up, the
+    /// oldest report goes.
+    fn push_pointer(&mut self, event: PointerEvent) {
+        if self.pointer_count > 0 && event.is_position_only() {
+            let last = (self.pointer_head + self.pointer_count - 1) % POINTER_QUEUE;
+            if self.pointer[last].is_position_only() {
+                self.pointer[last] = event;
+                return;
+            }
+        }
+        if self.pointer_count == POINTER_QUEUE {
+            self.pointer_head = (self.pointer_head + 1) % POINTER_QUEUE;
+            self.pointer_count -= 1;
+        }
+        let index = (self.pointer_head + self.pointer_count) % POINTER_QUEUE;
+        self.pointer[index] = event;
+        self.pointer_count += 1;
+    }
+
+    fn pop_pointer(&mut self) -> Option<PointerEvent> {
+        if self.pointer_count == 0 {
+            return None;
+        }
+        let event = self.pointer[self.pointer_head];
+        self.pointer_head = (self.pointer_head + 1) % POINTER_QUEUE;
+        self.pointer_count -= 1;
+        Some(event)
+    }
+
     fn push_mouse(&mut self, byte: u8) {
-        if self.mouse_len == 0 && byte & 0x08 == 0 {
+        if self.mouse_len == 0 && byte & PACKET_ALWAYS_SET == 0 {
             // Not a valid first packet byte; resynchronise.
             return;
         }
 
         self.mouse_packet[self.mouse_len] = byte;
         self.mouse_len += 1;
-        if self.mouse_len < 3 {
+        if self.mouse_len < self.packet_size {
             return;
         }
         self.mouse_len = 0;
@@ -130,6 +198,21 @@ impl State {
         if flags & 0x20 != 0 {
             dy -= 256;
         }
+        // An overflowed axis has no usable delta, and overflow on a packet that
+        // lost a byte is how misalignment usually shows. Buttons still count.
+        if flags & PACKET_X_OVERFLOW != 0 {
+            dx = 0;
+        }
+        if flags & PACKET_Y_OVERFLOW != 0 {
+            dy = 0;
+        }
+        // The fourth byte is a signed count where negative is away from the
+        // user, the opposite of `PointerEvent::wheel`.
+        let wheel = if self.packet_size == 4 {
+            -(self.mouse_packet[3] as i8 as i32)
+        } else {
+            0
+        };
 
         let max_x = self.width.saturating_sub(1) as i32;
         let max_y = self.height.saturating_sub(1) as i32;
@@ -147,7 +230,7 @@ impl State {
             left: None,
             right: None,
             middle: None,
-            wheel: 0,
+            wheel,
         };
         if left != self.left {
             event.left = Some(left);
@@ -164,7 +247,7 @@ impl State {
 
         self.x = x;
         self.y = y;
-        self.pending = Some(event);
+        self.push_pointer(event);
     }
 }
 
@@ -189,9 +272,10 @@ impl I8042 {
         state.width = width.max(1);
         state.height = height.max(1);
         if !state.initialized {
-            if !self.configure() {
+            let Some(packet_size) = self.configure() else {
                 return false;
-            }
+            };
+            state.packet_size = packet_size;
             state.x = width / 2;
             state.y = height / 2;
             state.initialized = true;
@@ -215,7 +299,16 @@ impl I8042 {
     pub fn poll_pointer(&self) -> Option<PointerEvent> {
         let mut state = self.state.lock();
         self.drain(&mut state);
-        state.pending.take()
+        state.pop_pointer()
+    }
+
+    /// Which kind of pointer the controller found.
+    pub fn pointer_kind(&self) -> PointerKind {
+        if self.state.lock().packet_size == 4 {
+            PointerKind::Ps2Wheel
+        } else {
+            PointerKind::Ps2
+        }
     }
 
     /// Current absolute cursor position.
@@ -224,7 +317,8 @@ impl I8042 {
         (state.x, state.y)
     }
 
-    fn configure(&self) -> bool {
+    /// Configures the controller and returns the mouse's packet size.
+    fn configure(&self) -> Option<usize> {
         // Disable both devices while reconfiguring.
         wait_input_clear();
         write_command(CMD_DISABLE_KEYBOARD);
@@ -236,9 +330,7 @@ impl I8042 {
         // polls the controller from the desktop/shell loops.
         wait_input_clear();
         write_command(CMD_READ_CONFIG);
-        let Some(mut config) = read_output() else {
-            return false;
-        };
+        let mut config = read_output()?;
         config &= !0x03;
         // Enable set-2 -> set-1 translation so the scancode table below works
         // regardless of the keyboard's power-on default.
@@ -257,10 +349,20 @@ impl I8042 {
         // Put the mouse in a known state and start reporting. ACK bytes are
         // allowed to be missing on some emulated controllers.
         let _ = self.mouse_command(MOUSE_SET_DEFAULTS);
+        let packet_size = if self.enable_wheel() { 4 } else { 3 };
         let _ = self.mouse_command(MOUSE_ENABLE_REPORTING);
 
         flush_output();
-        true
+        Some(packet_size)
+    }
+
+    /// Asks the mouse to enter IntelliMouse mode and reports if it agreed.
+    fn enable_wheel(&self) -> bool {
+        for rate in WHEEL_KNOCK {
+            let _ = self.mouse_command(MOUSE_SET_SAMPLE_RATE);
+            let _ = self.mouse_command(rate);
+        }
+        self.mouse_command(MOUSE_GET_ID) && read_output() == Some(MOUSE_ID_WHEEL)
     }
 
     fn mouse_command(&self, command: u8) -> bool {
@@ -318,6 +420,27 @@ impl Pointer for I8042 {
 }
 
 fn decode_keyboard(state: &mut State, byte: u8) {
+    // Pause sends E1 1D 45 E1 9D C5, all at once on press and nothing on release.
+    // The bytes would otherwise decode as LCtrl and NumLock.
+    if state.pause_bytes > 0 {
+        state.pause_bytes -= 1;
+        if state.pause_bytes == 0 {
+            state.push_key(KeyboardEvent {
+                code: KEY_PAUSE,
+                pressed: true,
+            });
+            state.push_key(KeyboardEvent {
+                code: KEY_PAUSE,
+                pressed: false,
+            });
+        }
+        return;
+    }
+    if byte == PAUSE_PREFIX {
+        state.pause_bytes = 5;
+        return;
+    }
+
     if byte == 0xe0 {
         state.extended = true;
         return;
@@ -331,12 +454,7 @@ fn decode_keyboard(state: &mut State, byte: u8) {
     let key = if extended {
         extended_key(code)
     } else {
-        let key = SCANCODE_TO_KEY[code as usize];
-        if key == 0 {
-            0
-        } else {
-            key
-        }
+        SCANCODE_TO_KEY[code as usize]
     };
 
     if key != 0 {
@@ -381,20 +499,6 @@ const SCANCODE_TO_KEY: [u16; 128] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x60-0x6f
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x70-0x7f
 ];
-
-#[inline]
-unsafe fn outb(port: u16, value: u8) {
-    // SAFETY: callers pass a valid x86 I/O port.
-    unsafe { asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack)) };
-}
-
-#[inline]
-unsafe fn inb(port: u16) -> u8 {
-    let value: u8;
-    // SAFETY: callers pass a valid x86 I/O port.
-    unsafe { asm!("in al, dx", out("al") value, in("dx") port, options(nomem, nostack)) };
-    value
-}
 
 fn status() -> u8 {
     // SAFETY: STATUS_PORT is the i8042 status register.
@@ -441,5 +545,163 @@ fn flush_output() {
             return;
         }
         let _ = read_data();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> State {
+        let mut state = State::EMPTY;
+        state.width = 1024;
+        state.height = 768;
+        state.x = 100;
+        state.y = 100;
+        state
+    }
+
+    fn packet(state: &mut State, bytes: &[u8]) {
+        for &byte in bytes {
+            state.push_mouse(byte);
+        }
+    }
+
+    #[test]
+    fn a_press_followed_by_motion_in_one_drain_is_not_lost() {
+        // DRV-4: one pending slot was overwritten by the next packet.
+        let mut state = state();
+        packet(&mut state, &[0x09, 0, 0]); // press
+        packet(&mut state, &[0x09, 5, 0]); // move with the button held
+        packet(&mut state, &[0x08, 0, 0]); // release
+
+        let press = state.pop_pointer().unwrap();
+        assert_eq!(press.left, Some(true));
+        let motion = state.pop_pointer().unwrap();
+        assert_eq!(motion.left, None);
+        assert_eq!(motion.x, 105);
+        let release = state.pop_pointer().unwrap();
+        assert_eq!(release.left, Some(false));
+        assert_eq!(state.pop_pointer(), None);
+    }
+
+    #[test]
+    fn position_reports_coalesce_but_never_across_a_button() {
+        let mut state = state();
+        packet(&mut state, &[0x08, 1, 0]);
+        packet(&mut state, &[0x08, 1, 0]);
+        packet(&mut state, &[0x09, 0, 0]);
+        packet(&mut state, &[0x09, 1, 0]);
+        packet(&mut state, &[0x09, 1, 0]);
+
+        let first = state.pop_pointer().unwrap();
+        assert_eq!((first.x, first.left), (102, None));
+        assert_eq!(state.pop_pointer().unwrap().left, Some(true));
+        let last = state.pop_pointer().unwrap();
+        assert_eq!((last.x, last.left), (104, None));
+        assert_eq!(state.pop_pointer(), None);
+    }
+
+    #[test]
+    fn a_full_queue_drops_the_oldest_report() {
+        let mut state = state();
+        for index in 0..POINTER_QUEUE * 2 {
+            let flags = if index % 2 == 0 { 0x09 } else { 0x08 };
+            packet(&mut state, &[flags, 0, 0]);
+        }
+        let mut seen = 0;
+        let mut last = None;
+        while let Some(report) = state.pop_pointer() {
+            seen += 1;
+            last = Some(report);
+        }
+        assert_eq!(seen, POINTER_QUEUE);
+        assert_eq!(last.unwrap().left, Some(false));
+    }
+
+    #[test]
+    fn deltas_are_signed_and_y_points_down() {
+        let mut state = state();
+        packet(&mut state, &[0x08 | 0x10 | 0x20, 0xf6, 0xf6]); // -10, -10
+        let report = state.pop_pointer().unwrap();
+        assert_eq!((report.x, report.y), (90, 110));
+    }
+
+    #[test]
+    fn overflowed_deltas_are_ignored_but_buttons_still_count() {
+        // DRV-16.
+        let mut state = state();
+        packet(&mut state, &[0x09 | PACKET_X_OVERFLOW | PACKET_Y_OVERFLOW, 0xff, 0xff]);
+        let report = state.pop_pointer().unwrap();
+        assert_eq!((report.x, report.y), (100, 100));
+        assert_eq!(report.left, Some(true));
+    }
+
+    #[test]
+    fn a_byte_without_the_marker_bit_resynchronises() {
+        let mut state = state();
+        packet(&mut state, &[0x00, 0x00, 0x09, 0, 0]);
+        assert_eq!(state.pop_pointer().unwrap().left, Some(true));
+    }
+
+    #[test]
+    fn a_wheel_mouse_sends_four_byte_packets() {
+        // DRV-5: QEMU sends -1 for wheel-up, which is away from the user.
+        let mut state = state();
+        state.packet_size = 4;
+        packet(&mut state, &[0x08, 0, 0, 0xff]);
+        assert_eq!(state.pop_pointer().unwrap().wheel, 1);
+        packet(&mut state, &[0x08, 0, 0, 0x01]);
+        assert_eq!(state.pop_pointer().unwrap().wheel, -1);
+    }
+
+    #[test]
+    fn pause_is_one_key_not_lctrl_and_numlock() {
+        // DRV-16.
+        let mut state = state();
+        for byte in [0xe1, 0x1d, 0x45, 0xe1, 0x9d, 0xc5] {
+            decode_keyboard(&mut state, byte);
+        }
+        assert_eq!(
+            state.pop_key(),
+            Some(KeyboardEvent {
+                code: KEY_PAUSE,
+                pressed: true
+            })
+        );
+        assert_eq!(
+            state.pop_key(),
+            Some(KeyboardEvent {
+                code: KEY_PAUSE,
+                pressed: false
+            })
+        );
+        assert_eq!(state.pop_key(), None);
+
+        // The next key decodes normally.
+        decode_keyboard(&mut state, 0x1e);
+        assert_eq!(state.pop_key().unwrap().code, 30);
+    }
+
+    #[test]
+    fn extended_and_plain_keys_decode() {
+        let mut state = state();
+        decode_keyboard(&mut state, 0xe0);
+        decode_keyboard(&mut state, 0x48);
+        assert_eq!(
+            state.pop_key(),
+            Some(KeyboardEvent {
+                code: 103,
+                pressed: true
+            })
+        );
+        decode_keyboard(&mut state, 0x9e);
+        assert_eq!(
+            state.pop_key(),
+            Some(KeyboardEvent {
+                code: 30,
+                pressed: false
+            })
+        );
     }
 }

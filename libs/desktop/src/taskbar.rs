@@ -1,4 +1,4 @@
-//! The XP-style taskbar: Start button, quick launch, task buttons and tray.
+//! The classic-style taskbar: Start button, quick launch, task buttons and tray.
 
 use feos_bundle::AppCatalog;
 use feos_gfx::{Color, Rect};
@@ -52,8 +52,12 @@ pub struct TaskbarResponse {
     pub task_clicked: Option<usize>,
     /// The "show desktop" button was clicked.
     pub desktop_clicked: bool,
-    /// The notification area was clicked.
+    /// The clock was clicked.
     pub tray_clicked: bool,
+    /// The bell in the notification area was clicked.
+    pub bell_clicked: bool,
+    /// A task button was right-clicked.
+    pub task_menu: Option<usize>,
 }
 
 /// Computes the taskbar layout for `canvas`.
@@ -159,6 +163,41 @@ pub fn task_button_rect<const W: usize>(
     None
 }
 
+/// The notification bell inside the tray.
+pub fn bell_rect(layout: &TaskbarLayout) -> Rect {
+    let size = layout.tray.height.saturating_sub(8).min(24);
+    Rect::new(
+        layout.tray.x + 6,
+        layout.tray.y + (layout.tray.height as i32 - size as i32) / 2,
+        size,
+        size,
+    )
+}
+
+fn draw_bell<const N: usize>(
+    ui: &mut Ui<'_, '_, '_, N>,
+    rect: Rect,
+    theme: &DesktopTheme,
+    unread: usize,
+) {
+    let cx = rect.x + rect.width as i32 / 2;
+    let top = rect.y + 4;
+    let body = [
+        feos_gfx::Point::new(cx - 3, top + 2),
+        feos_gfx::Point::new(cx + 3, top + 2),
+        feos_gfx::Point::new(cx + 6, top + 11),
+        feos_gfx::Point::new(cx - 6, top + 11),
+    ];
+    ui.painter.fill_polygon(&body, theme.tray_text);
+    ui.painter
+        .fill_rect(Rect::new(cx - 1, top, 2, 2), theme.tray_text);
+    ui.painter
+        .fill_rect(Rect::new(cx - 2, top + 13, 4, 2), theme.tray_text);
+    if unread > 0 {
+        ui.painter.fill_circle(cx + 6, top + 2, 4, theme.close_button);
+    }
+}
+
 /// Draws the taskbar and returns interaction results.
 pub fn render<const N: usize, const W: usize, const A: usize>(
     ui: &mut Ui<'_, '_, '_, N>,
@@ -168,6 +207,7 @@ pub fn render<const N: usize, const W: usize, const A: usize>(
     windows: &WindowManager<W>,
     catalog: &AppCatalog<A>,
     clock: &str,
+    unread: usize,
 ) -> TaskbarResponse {
     let mut response = TaskbarResponse::default();
     let bar = layout.bar;
@@ -176,7 +216,6 @@ pub fn render<const N: usize, const W: usize, const A: usize>(
     }
 
     ui.painter
-        .canvas_mut()
         .fill_vertical_gradient(bar, theme.taskbar_top, theme.taskbar_bottom);
     let highlight_y = match config.position {
         TaskbarPosition::Bottom => bar.y,
@@ -361,42 +400,35 @@ pub fn render<const N: usize, const W: usize, const A: usize>(
             if task.clicked {
                 response.task_clicked = Some(index);
             }
+            if task.secondary_clicked {
+                response.task_menu = Some(index);
+            }
             x += width + gap;
         }
         ui.painter.restore_clip(clip);
     }
 
     // Notification area --------------------------------------------------
+    // The whole area opens the clock, except the bell, which is registered
+    // after it and so takes the press.
     let tray_id = Id::from_name("desktop.taskbar.tray");
     let tray = ui.interact(tray_id, layout.tray, Sense::click());
+    let bell = bell_rect(layout);
+    let bell_hit = ui.interact(Id::from_name("desktop.taskbar.bell"), bell, Sense::click());
     ui.painter.fill_rect(layout.tray, theme.tray_bg);
     ui.painter.fill_rect(
         Rect::new(layout.tray.x, layout.tray.y, 1, layout.tray.height),
         theme.taskbar_highlight,
     );
 
-    let mut icon_x = layout.tray.x + 7;
-    let icon_y = layout.tray.y + (layout.tray.height as i32 - 14) / 2;
-    // Speaker.
-    ui.painter
-        .fill_rect(Rect::new(icon_x, icon_y + 4, 4, 6), theme.tray_text);
-    let speaker = [
-        feos_gfx::Point::new(icon_x + 4, icon_y + 4),
-        feos_gfx::Point::new(icon_x + 9, icon_y),
-        feos_gfx::Point::new(icon_x + 9, icon_y + 14),
-        feos_gfx::Point::new(icon_x + 4, icon_y + 10),
-    ];
-    ui.painter.fill_polygon(&speaker, theme.tray_text);
-    ui.painter
-        .circle(icon_x + 11, icon_y + 7, 4, theme.tray_text);
-    icon_x += 22;
-    // Network.
-    ui.painter
-        .fill_rect(Rect::new(icon_x, icon_y + 8, 4, 6), theme.tray_text);
-    ui.painter
-        .fill_rect(Rect::new(icon_x + 5, icon_y + 5, 4, 9), theme.tray_text);
-    ui.painter
-        .fill_rect(Rect::new(icon_x + 10, icon_y + 2, 4, 12), theme.tray_text);
+    if bell_hit.hovered {
+        ui.painter
+            .fill_rounded_rect(bell, 3, theme.task_button_hover);
+    }
+    draw_bell(ui, bell, theme, unread);
+    if bell_hit.clicked {
+        response.bell_clicked = true;
+    }
 
     if config.show_clock {
         ui.painter.draw_text_ellipsis(
@@ -413,7 +445,7 @@ pub fn render<const N: usize, const W: usize, const A: usize>(
             VerticalAlign::Middle,
         );
     }
-    if tray.clicked {
+    if tray.clicked && !bell_hit.clicked {
         response.tray_clicked = true;
     }
 

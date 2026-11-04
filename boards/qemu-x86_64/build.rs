@@ -23,10 +23,12 @@ fn main() {
     let virt_dir = manifest_dir.join("../qemu-virt");
     let root = virt_dir.join("fs");
 
-    println!("cargo:rerun-if-changed={}", root.display());
-    for name in ["disk.img", "disk-fat32.img", "disk-exfat.img"] {
-        println!("cargo:rerun-if-changed={}", virt_dir.join(name).display());
-    }
+    // Naming a file that doesn't exist makes Cargo treat this build as stale on
+    // every run, which relinks the kernel. Watching the directory notices the
+    // optional disk images appearing, whichever of them do exist. It also covers
+    // the sample tree under `fs/`.
+    println!("cargo:rerun-if-changed={}", virt_dir.display());
+    println!("cargo:rerun-if-changed=.");
 
     let mut found = Vec::new();
     collect(&root, "", &mut found);

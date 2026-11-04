@@ -1,6 +1,6 @@
 //! Collection views: list views, card grids, flip views and pips pagers.
 //!
-//! These are the Windows/Fluent-style collection controls: a scrollable
+//! These are the desktop-style collection controls: a scrollable
 //! `ListView`, a wrapping `GridView`, a `FlipView` with arrows and page dots,
 //! and the small `PipsPager` often paired with a carousel.
 

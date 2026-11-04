@@ -2,7 +2,7 @@
 //!
 //! The app owns one [`DosBox`] machine while its window is open. The desktop
 //! drives [`frame_window`](App::frame_window) once per frame, so the prompt
-//! stays responsive while the emulated 8086 runs a `.COM`/`.EXE` program.
+//! stays responsive while the emulated PC runs a `.COM`/`.EXE` program.
 //! Launching `dosbox` from the serial shell runs the same machine full-screen.
 
 #![cfg_attr(not(test), no_std)]
@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use feos_app::{App, Context, WindowContext, WindowFrame};
 use feos_console::println;
-use feos_dosbox::keyboard::Key as DosKey;
+use feos_dosbox::keyboard::{scan_for_char, Key as DosKey};
 use feos_dosbox::DosBox;
 use feos_gui::{Event, Input, Key as GuiKey, Modifiers};
 use feos_keys::SerialKeys;
@@ -19,9 +19,6 @@ use feos_sync::SpinLock;
 
 /// The machine hosted by the desktop window.
 static MACHINE: SpinLock<Option<DosBox>> = SpinLock::new(None);
-/// Set when the audio device rejects or times out a block. A blocking HAL
-/// must not be allowed to stall the desktop every frame.
-static AUDIO_FAILED: AtomicBool = AtomicBool::new(false);
 /// Whether a guest program is running. The prompt does not need 30 fps
 /// compositing; only a running program does.
 static RUNNING: AtomicBool = AtomicBool::new(false);
@@ -43,7 +40,7 @@ impl App for DosBoxApp {
     }
 
     fn description(&self) -> &'static str {
-        "run the FEOS-DOS 8086 virtual machine and DOS prompt"
+        "run the FEOS-DOS x86 virtual machine and DOS prompt"
     }
 
     fn foreground(&self) -> bool {
@@ -94,9 +91,9 @@ impl App for DosBoxApp {
                 );
             });
         }
-        machine.frame(context.now_ms, 50_000);
+        machine.frame_paced(context.now_ms);
         RUNNING.store(
-            machine.is_running() || !machine.shell.batch.is_empty(),
+            machine.is_running() || machine.shell.in_batch(),
             Ordering::Relaxed,
         );
         play_audio(machine, context.platform.audio);
@@ -134,7 +131,7 @@ impl App for DosBoxApp {
                 break;
             }
             feed_events(&mut machine, &input);
-            machine.frame(now, 50_000);
+            machine.frame_paced(now);
             play_audio(&mut machine, platform.audio);
             machine.render(display);
             if machine.exit {
@@ -145,6 +142,9 @@ impl App for DosBoxApp {
     }
 }
 
+/// Hands the device whatever it can take right now. This never blocks: what
+/// doesn't fit waits in the machine for the next frame, and the machine drops the
+/// oldest audio if the device falls far behind.
 fn play_audio(machine: &mut DosBox, audio: Option<&dyn feos_hal::Audio>) {
     let Some(audio) = audio else {
         return;
@@ -152,18 +152,12 @@ fn play_audio(machine: &mut DosBox, audio: Option<&dyn feos_hal::Audio>) {
     if !audio.is_ready() {
         return;
     }
-    if AUDIO_FAILED.load(Ordering::Relaxed) {
+    let samples = machine.pending_audio();
+    if samples.is_empty() {
         return;
     }
-    let samples = machine.take_audio();
-    if samples.is_empty() || samples.iter().all(|sample| *sample == 0) {
-        return;
-    }
-    let max = audio.max_samples().max(2);
-    let len = samples.len().min(max) & !1;
-    if audio.play(&samples[..len]).is_err() {
-        AUDIO_FAILED.store(true, Ordering::Relaxed);
-    }
+    let taken = audio.write(samples);
+    machine.consume_audio(taken);
 }
 
 fn feed_events(machine: &mut DosBox, input: &Input) {
@@ -171,29 +165,21 @@ fn feed_events(machine: &mut DosBox, input: &Input) {
     for event in input.events() {
         match event {
             Event::Text(ch) if !ch.is_control() => machine.keyboard().push_char(ch),
+            Event::ModifiersChanged(modifiers) => set_modifiers(machine, modifiers),
             Event::KeyDown(key, modifiers) => {
+                set_modifiers(machine, modifiers);
                 if modifiers.contains(Modifiers::CTRL) {
                     if let GuiKey::Character(ch) = key {
-                        match ch.to_ascii_lowercase() {
-                            'c' => {
-                                machine.push_key(0x03, 0x2E);
-                                continue;
-                            }
-                            'd' => {
-                                machine.push_key(0x04, 0x20);
-                                continue;
-                            }
-                            'l' => {
-                                machine.push_key(0x0C, 0x26);
-                                continue;
-                            }
-                            'z' => {
-                                machine.push_key(0x1A, 0x2C);
-                                continue;
-                            }
-                            _ => {}
+                        if ch.is_ascii_alphabetic() {
+                            let upper = ch.to_ascii_uppercase();
+                            machine.push_key(upper as u8 & 0x1F, scan_for_char(upper));
+                            continue;
                         }
                     }
+                }
+                // A space arrives both as a key and as text: the text is enough.
+                if key == GuiKey::Space && has_text {
+                    continue;
                 }
                 if let Some(key) = map_key(key) {
                     machine.keyboard().push_key(key);
@@ -206,6 +192,19 @@ fn feed_events(machine: &mut DosBox, input: &Input) {
             _ => {}
         }
     }
+}
+
+/// Passes the host's modifier state on, which also sends their scan codes.
+fn set_modifiers(machine: &mut DosBox, modifiers: Modifiers) {
+    machine.keyboard().set_modifiers(
+        modifiers.contains(Modifiers::SHIFT),
+        modifiers.contains(Modifiers::CTRL),
+        modifiers.contains(Modifiers::ALT),
+        false,
+        false,
+        false,
+        false,
+    );
 }
 
 fn map_key(key: GuiKey) -> Option<DosKey> {

@@ -1,10 +1,10 @@
-//! AVI (RIFF) demuxing and uncompressed/RLE/MJPEG/H.264 frame decoding.
+//! AVI (RIFF) demuxing, including OpenDML files and `rec ` lists.
 
 use crate::bitstream::{fourcc_at, u16_le_at, u32_le_at};
 use crate::codec::Codec;
-use crate::error::{require_rgba, Result, VideoError};
-use crate::h264::{AnnexBDecoder, AvccDecoder};
-use crate::{mjpeg, raw, rle};
+use crate::error::{Result, VideoError};
+use crate::index::{DecoderLimits, Index, FLAG_KEY};
+use crate::{DisplayMetadata, StreamColour};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AviInfo {
@@ -13,29 +13,90 @@ pub(crate) struct AviInfo {
     pub codec: Codec,
     pub frame_count: u32,
     pub frame_rate: Option<(u32, u32)>,
-    pub bottom_up: bool,
+    pub display: DisplayMetadata,
+    pub colour: StreamColour,
 }
 
-struct Strf<'a> {
-    codec: Codec,
-    bottom_up: bool,
-    palette: &'a [u8],
-    extra: &'a [u8],
+/// A BITMAPINFOHEADER: the part of an AVI `strf` that describes video, also
+/// used by Matroska's `V_MS/VFW/FOURCC`.
+#[derive(Clone, Debug)]
+pub(crate) struct BitmapInfo {
+    pub width: u32,
+    pub height: u32,
+    pub codec: Codec,
+    /// Stored as a true DIB: packed rows padded to 4 bytes. Fourcc raw formats
+    /// such as Y800 and YV12 are tightly packed, top-down.
+    pub dib: bool,
+    pub bottom_up: bool,
+    /// Palette or codec data, relative to the start of the header.
+    pub palette: core::ops::Range<usize>,
+}
+
+/// Parses a BITMAPINFOHEADER and what follows it.
+pub(crate) fn parse_bitmap_info(data: &[u8]) -> Result<BitmapInfo> {
+    if data.len() < 40 {
+        return Err(VideoError::InvalidData("AVI BITMAPINFOHEADER"));
+    }
+    let bi_size = u32_le_at(data, 0)? as usize;
+    let width = u32_le_at(data, 4)? as i32;
+    let height = u32_le_at(data, 8)? as i32;
+    let bit_count = u16_le_at(data, 14)?;
+    let compression = fourcc_at(data, 16)?;
+    let extra_start = bi_size.max(40).min(data.len());
+    let codec = match compression {
+        [0, 0, 0, 0] => match bit_count {
+            32 => Codec::RawBgra,
+            24 => Codec::RawBgr,
+            16 => Codec::RawBgr555,
+            8 => Codec::RawPal8,
+            _ => Codec::Unknown(u32::from_be_bytes(compression)),
+        },
+        [3, 0, 0, 0] => match bit_count {
+            32 => Codec::RawBgra,
+            16 => {
+                // BI_BITFIELDS: the green mask decides 5:5:5 or 5:6:5.
+                let green = u32_le_at(data, extra_start + 4).unwrap_or(0);
+                if green == 0x07e0 {
+                    Codec::RawBgr565
+                } else {
+                    Codec::RawBgr555
+                }
+            }
+            _ => Codec::Unknown(u32::from_be_bytes(compression)),
+        },
+        [1, 0, 0, 0] => Codec::Rle8,
+        [2, 0, 0, 0] => Codec::Rle4,
+        // `\0\0\0\0`-style fourccs aside, Y800 and friends are also gray.
+        _ => Codec::from_avi(compression),
+    };
+    // A negative height marks a top-down DIB, and only DIBs have a direction:
+    // YUV and compressed frames are always stored top-down.
+    let bottom_up = height > 0;
+    let dib = matches!(compression, [0, 0, 0, 0] | [3, 0, 0, 0]);
+    Ok(BitmapInfo {
+        dib,
+        width: width.unsigned_abs(),
+        height: height.unsigned_abs(),
+        codec,
+        bottom_up,
+        palette: extra_start..data.len(),
+    })
 }
 
 fn scan(data: &[u8], pos: usize, end: usize) -> Option<([u8; 4], usize, usize, usize)> {
     // Returns (id, payload_start, payload_len, next_chunk_start).
-    if pos + 8 > end {
+    if pos.checked_add(8)? > end {
         return None;
     }
     let id = fourcc_at(data, pos).ok()?;
     let size = u32_le_at(data, pos + 4).ok()? as usize;
     let payload = pos + 8;
     let next = payload.checked_add(size)?.checked_add(size & 1)?;
-    if next > end {
+    // The last chunk's padding byte may be missing from a file.
+    if payload + size > end {
         return None;
     }
-    Some((id, payload, size, next))
+    Some((id, payload, size, next.min(end)))
 }
 
 fn find_chunk(data: &[u8], start: usize, end: usize, want: &[u8; 4]) -> Option<(usize, usize)> {
@@ -63,50 +124,32 @@ fn find_list(data: &[u8], start: usize, end: usize, want: &[u8; 4]) -> Option<(u
     None
 }
 
-fn parse_strf(data: &[u8], payload: usize, size: usize) -> Result<Strf<'_>> {
-    if size < 40 {
-        return Err(VideoError::InvalidData("AVI BITMAPINFOHEADER"));
-    }
-    let bi_size = u32_le_at(data, payload)? as usize;
-    let compression = fourcc_at(data, payload + 16)?;
-    let bit_count = u16_le_at(data, payload + 14)?;
-    let raw_codec = match compression {
-        [0, 0, 0, 0] | [3, 0, 0, 0] => match bit_count {
-            32 => Codec::RawBgra,
-            24 => Codec::RawBgr,
-            8 => Codec::RawGray,
-            _ => Codec::Unknown(u32::from_be_bytes(compression)),
-        },
-        [1, 0, 0, 0] => Codec::Rle8,
-        [2, 0, 0, 0] => Codec::Rle4,
-        _ => Codec::from_avi(compression),
-    };
-    let palette_start = payload + bi_size.max(40).min(size);
-    let palette = &data[palette_start.min(payload + size)..payload + size];
-    let extra_start = payload + bi_size.min(size);
-    let extra = if extra_start < payload + size {
-        &data[extra_start..payload + size]
-    } else {
-        &data[0..0]
-    };
-    Ok(Strf {
-        codec: raw_codec,
-        bottom_up: (i32::from_le_bytes([
-            data[payload + 8],
-            data[payload + 9],
-            data[payload + 10],
-            data[payload + 11],
-        ])) > 0,
-        palette,
-        extra,
-    })
+/// The chosen video stream of a file.
+struct Stream {
+    dib: bool,
+    number: u8,
+    width: u32,
+    height: u32,
+    codec: Codec,
+    bottom_up: bool,
+    scale: u32,
+    rate: u32,
+    /// Palette or codec data, as offsets into the file.
+    extra: core::ops::Range<usize>,
 }
 
-pub(crate) fn info(input: &[u8]) -> Result<AviInfo> {
+/// Where the first RIFF's chunks end. The RIFF size may be wrong or truncated.
+fn riff_end(input: &[u8]) -> Result<usize> {
+    Ok(input
+        .len()
+        .min((u32_le_at(input, 4)? as usize).saturating_add(8)))
+}
+
+fn video_stream(input: &[u8]) -> Result<Stream> {
     if input.len() < 12 || &input[..4] != b"RIFF" || &input[8..12] != b"AVI " {
         return Err(VideoError::UnknownFormat);
     }
-    let end = input.len().min(u32_le_at(input, 4)? as usize + 8);
+    let end = riff_end(input)?;
     let (hdrl_start, hdrl_len) =
         find_list(input, 12, end, b"hdrl").ok_or(VideoError::InvalidData("AVI hdrl"))?;
     let hdrl_end = hdrl_start + hdrl_len;
@@ -116,190 +159,238 @@ pub(crate) fn info(input: &[u8]) -> Result<AviInfo> {
     if avih_len < 40 {
         return Err(VideoError::InvalidData("AVI avih size"));
     }
-    let total_frames = u32_le_at(input, avih + 16)?;
-    let width = u32_le_at(input, avih + 32)?;
-    let height = u32_le_at(input, avih + 36)?;
+    let avih_width = u32_le_at(input, avih + 32)?;
+    let avih_height = u32_le_at(input, avih + 36)?;
 
     let mut pos = hdrl_start;
-    let mut selected = None;
+    let mut number = 0u8;
     while let Some((id, payload, size, next)) = scan(input, pos, hdrl_end) {
-        if &id == b"LIST" && size >= 4 && &input[payload..payload + 4] == b"strl" {
-            let s_start = payload + 4;
-            let s_end = payload + size;
-            if let (Some((strh, _)), Some((strf, strf_len))) = (
-                find_chunk(input, s_start, s_end, b"strh"),
-                find_chunk(input, s_start, s_end, b"strf"),
-            ) {
-                if strh + 4 <= input.len() && &input[strh..strh + 4] == b"vids" {
-                    let handler = fourcc_at(input, strh + 4).unwrap_or([0; 4]);
-                    let scale = u32_le_at(input, strh + 20).unwrap_or(0);
-                    let rate = u32_le_at(input, strh + 24).unwrap_or(0);
-                    let strf = parse_strf(input, strf, strf_len)?;
-                    let codec = if strf.codec == Codec::Unknown(0) {
-                        Codec::from_avi(handler)
-                    } else {
-                        strf.codec
-                    };
-                    selected = Some((codec, strf.bottom_up, strf.palette, strf.extra, scale, rate));
-                    break;
+        pos = next;
+        if &id != b"LIST" || size < 4 || &input[payload..payload + 4] != b"strl" {
+            continue;
+        }
+        let s_start = payload + 4;
+        let s_end = payload + size;
+        let this = number;
+        number = number.saturating_add(1);
+        let (Some((strh, strh_len)), Some((strf, strf_len))) = (
+            find_chunk(input, s_start, s_end, b"strh"),
+            find_chunk(input, s_start, s_end, b"strf"),
+        ) else {
+            continue;
+        };
+        if strh_len < 4 || &input[strh..strh + 4] != b"vids" {
+            continue;
+        }
+        let handler = fourcc_at(input, strh + 4).unwrap_or([0; 4]);
+        let scale = u32_le_at(input, strh + 20).unwrap_or(0);
+        let rate = u32_le_at(input, strh + 24).unwrap_or(0);
+        let bih = parse_bitmap_info(&input[strf..strf + strf_len])?;
+        let codec = if bih.codec == Codec::Unknown(0) {
+            Codec::from_avi(handler)
+        } else {
+            bih.codec
+        };
+        let width = if bih.width != 0 { bih.width } else { avih_width };
+        let height = if bih.height != 0 {
+            bih.height
+        } else {
+            avih_height
+        };
+        return Ok(Stream {
+            dib: bih.dib,
+            number: this,
+            width,
+            height,
+            codec,
+            bottom_up: bih.bottom_up,
+            scale,
+            rate,
+            extra: strf + bih.palette.start..strf + bih.palette.end,
+        });
+    }
+    Err(VideoError::InvalidData("AVI video stream"))
+}
+
+/// Whether `id` is a data chunk of stream `number`: `##dc` or `##db`.
+fn is_video_chunk(id: &[u8; 4], number: u8) -> bool {
+    id[2] == b'd'
+        && matches!(id[3], b'c' | b'b')
+        && id[0].is_ascii_digit()
+        && id[1].is_ascii_digit()
+        && (id[0] - b'0') * 10 + (id[1] - b'0') == number
+}
+
+/// Walks a `movi` list, descending into `rec ` lists, until `f` returns false.
+fn walk_movi<F>(data: &[u8], start: usize, end: usize, number: u8, f: &mut F) -> Result<bool>
+where
+    F: FnMut(usize, usize) -> Result<bool>,
+{
+    let mut pos = start;
+    while let Some((id, payload, size, next)) = scan(data, pos, end) {
+        pos = next;
+        if &id == b"LIST" && size >= 4 && &data[payload..payload + 4] == b"rec " {
+            let mut inner = payload + 4;
+            // rec lists don't nest, so this needs no recursion.
+            while let Some((id, payload, size, next)) = scan(data, inner, payload + size) {
+                inner = next;
+                if is_video_chunk(&id, number) && !f(payload, size)? {
+                    return Ok(false);
+                }
+            }
+        } else if is_video_chunk(&id, number) && !f(payload, size)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Visits video chunks in file order, across the `RIFF AVIX` extensions of an
+/// OpenDML file, until `f` returns false.
+fn for_each_video_chunk<F>(input: &[u8], number: u8, mut f: F) -> Result<()>
+where
+    F: FnMut(usize, usize) -> Result<bool>,
+{
+    let end = riff_end(input)?;
+    if let Some((start, len)) = find_list(input, 12, end, b"movi") {
+        if !walk_movi(input, start, start + len, number, &mut f)? {
+            return Ok(());
+        }
+    }
+    let mut pos = end + (end & 1);
+    while let Some((id, payload, size, next)) = scan(input, pos, input.len()) {
+        pos = next;
+        if &id == b"RIFF" && size >= 4 && &input[payload..payload + 4] == b"AVIX" {
+            if let Some((start, len)) = find_list(input, payload + 4, payload + size, b"movi") {
+                if !walk_movi(input, start, start + len, number, &mut f)? {
+                    return Ok(());
                 }
             }
         }
-        pos = next;
-    }
-    let (codec, bottom_up, _palette, _extra, scale, rate) =
-        selected.ok_or(VideoError::InvalidData("AVI video stream"))?;
-
-    let mut frame_count = total_frames;
-    if frame_count == 0 {
-        if let Some((movi_start, movi_len)) = find_list(input, 12, end, b"movi") {
-            frame_count = count_video_chunks(input, movi_start, movi_start + movi_len);
-        }
-    }
-    let frame_rate = if scale != 0 && rate != 0 {
-        crate::reduce_fraction(rate, scale)
-    } else {
-        None
-    };
-    Ok(AviInfo {
-        width,
-        height,
-        codec,
-        frame_count,
-        frame_rate,
-        bottom_up,
-    })
-}
-
-fn count_video_chunks(data: &[u8], start: usize, end: usize) -> u32 {
-    let mut pos = start;
-    let mut count = 0u32;
-    while let Some((id, _payload, _size, next)) = scan(data, pos, end) {
-        if id[2] == b'd' && (id[3] == b'c' || id[3] == b'b') {
-            count = count.saturating_add(1);
-        }
-        pos = next;
-    }
-    count
-}
-
-fn for_each_video_chunk<'a, F>(data: &'a [u8], start: usize, end: usize, mut f: F) -> Result<()>
-where
-    F: FnMut(u32, &'a [u8]) -> Result<bool>,
-{
-    let mut pos = start;
-    let mut index = 0u32;
-    while let Some((id, payload, size, next)) = scan(data, pos, end) {
-        if id[2] == b'd' && (id[3] == b'c' || id[3] == b'b') {
-            let sample = &data[payload..payload + size];
-            if f(index, sample)? {
-                return Ok(());
-            }
-            index = index.saturating_add(1);
-        }
-        pos = next;
     }
     Ok(())
 }
 
-pub(crate) fn decode_frame(input: &[u8], index: u32, out: &mut [u8]) -> Result<u32> {
-    let info = info(input)?;
-    if index >= info.frame_count {
-        return Err(VideoError::FrameOutOfRange {
-            index,
-            count: info.frame_count,
-        });
-    }
-    let end = input.len().min(u32_le_at(input, 4)? as usize + 8);
-    let (movi_start, movi_len) =
-        find_list(input, 12, end, b"movi").ok_or(VideoError::InvalidData("AVI movi"))?;
-    let movi_end = movi_start + movi_len;
-    require_rgba(out, info.width, info.height)?;
-
-    // Locate the selected stream's header again for palette/extradata.
-    let strf = find_strf(input, end);
-    let palette = strf.as_ref().map(|s| s.palette).unwrap_or(&[]);
-    let extra = strf.as_ref().map(|s| s.extra).unwrap_or(&[]);
-
-    if info.codec == Codec::H264 {
-        let mut annex_b = AnnexBDecoder::new(index);
-        let mut avcc = if extra.len() > 7 && extra[0] == 1 {
-            Some(AvccDecoder::new(extra, index)?)
-        } else {
-            None
-        };
-        let mut found = false;
-        for_each_video_chunk(input, movi_start, movi_end, |_, sample| {
-            let hit = if let Some(decoder) = avcc.as_mut() {
-                decoder.push(sample, out)?
-            } else {
-                annex_b.push(sample, out)?
-            };
-            if hit {
-                found = true;
-                return Ok(true);
-            }
-            Ok(false)
-        })?;
-        if !found {
-            let hit = if let Some(decoder) = avcc.as_mut() {
-                decoder.finish(out)?
-            } else {
-                annex_b.finish(out)?
-            };
-            if !hit {
-                return Err(VideoError::FrameOutOfRange {
-                    index,
-                    count: info.frame_count,
-                });
-            }
+pub(crate) fn info(input: &[u8]) -> Result<AviInfo> {
+    let stream = video_stream(input)?;
+    // avih's total is wrong for OpenDML and truncated files. The chunks are
+    // what's actually playable.
+    let mut frame_count = 0u32;
+    let mut first = None;
+    for_each_video_chunk(input, stream.number, |offset, size| {
+        frame_count = frame_count.saturating_add(1);
+        if first.is_none() && size > 0 {
+            first = Some(offset..offset + size);
         }
-        return Ok(0);
-    }
-
-    let mut sample = None;
-    for_each_video_chunk(input, movi_start, movi_end, |i, data| {
-        if i == index {
-            sample = Some(data);
-            return Ok(true);
-        }
-        Ok(false)
+        Ok(true)
     })?;
-    let sample = sample.ok_or(VideoError::FrameOutOfRange {
-        index,
-        count: info.frame_count,
-    })?;
-
-    match info.codec {
-        Codec::Mjpeg => mjpeg::decode_sample(sample, out)?,
-        Codec::Rle8 => rle::decode_rle8(sample, info.width, info.height, palette, out)?,
-        Codec::Rle4 => rle::decode_rle4(sample, info.width, info.height, palette, out)?,
-        codec if codec.pixel_format().is_some() => {
-            raw::decode(sample, codec, info.width, info.height, info.bottom_up, out)?
-        }
-        codec => return Err(VideoError::UnsupportedCodec(codec.name())),
-    }
-    Ok(0)
-}
-
-fn find_strf<'a>(data: &'a [u8], end: usize) -> Option<Strf<'a>> {
-    let (hdrl_start, hdrl_len) = find_list(data, 12, end, b"hdrl")?;
-    let hdrl_end = hdrl_start + hdrl_len;
-    let mut pos = hdrl_start;
-    while let Some((id, payload, size, next)) = scan(data, pos, hdrl_end) {
-        if &id == b"LIST" && size >= 4 && &data[payload..payload + 4] == b"strl" {
-            let s_start = payload + 4;
-            let s_end = payload + size;
-            if let (Some((strh, _)), Some((strf, strf_len))) = (
-                find_chunk(data, s_start, s_end, b"strh"),
-                find_chunk(data, s_start, s_end, b"strf"),
-            ) {
-                if strh + 4 <= data.len() && &data[strh..strh + 4] == b"vids" {
-                    return parse_strf(data, strf, strf_len).ok();
+    let frame_rate = if stream.scale != 0 && stream.rate != 0 {
+        crate::reduce_fraction(stream.rate, stream.scale)
+    } else {
+        None
+    };
+    let mut display = DisplayMetadata::default();
+    let mut colour = StreamColour::default();
+    let (mut width, mut height) = (stream.width, stream.height);
+    if let Some(range) = first {
+        let sample = &input[range];
+        match stream.codec {
+            Codec::Mjpeg => {
+                if let Ok(image) = feos_image::jpeg::info(sample) {
+                    width = image.width;
+                    height = image.height;
                 }
             }
+            Codec::H264 => {
+                let extra = &input[stream.extra.clone()];
+                let sps = if extra.first() == Some(&1) {
+                    crate::h264::info_from_avcc(extra).ok()
+                } else {
+                    crate::h264::info_from_sample(sample, None)
+                        .or_else(|| crate::h264::info_from_annex_b(extra).ok())
+                };
+                if let Some(sps) = sps {
+                    width = sps.width;
+                    height = sps.height;
+                    crate::merge_sps_metadata(&mut display, &mut colour, &sps);
+                }
+            }
+            _ => {}
         }
-        pos = next;
     }
-    None
+    Ok(AviInfo {
+        width,
+        height,
+        codec: stream.codec,
+        frame_count,
+        frame_rate,
+        display,
+        colour,
+    })
+}
+
+/// A sample table and what's needed to read the samples.
+pub(crate) struct AviIndex {
+    pub index: Index,
+    pub extra: core::ops::Range<usize>,
+    /// For a true DIB, whether it's bottom-up.
+    pub dib: Option<bool>,
+}
+
+/// Applies the `idx1` key-frame flags. Entries are in file order, so the nth
+/// entry for this stream describes its nth chunk, whatever base the offsets
+/// use. Returns false if the file has no usable index.
+fn apply_idx1(input: &[u8], number: u8, index: &mut Index) -> bool {
+    let Ok(end) = riff_end(input) else {
+        return false;
+    };
+    let Some((start, len)) = find_chunk(input, 12, end, b"idx1") else {
+        return false;
+    };
+    const AVIIF_KEYFRAME: u32 = 0x10;
+    let mut at = 0usize;
+    for entry in input[start..start + len].chunks_exact(16) {
+        let id = [entry[0], entry[1], entry[2], entry[3]];
+        if !is_video_chunk(&id, number) {
+            continue;
+        }
+        let Some(sample) = index.samples.get_mut(at) else {
+            break;
+        };
+        let flags = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
+        if flags & AVIIF_KEYFRAME != 0 {
+            sample.flags |= FLAG_KEY;
+        } else {
+            sample.flags &= !FLAG_KEY;
+        }
+        at += 1;
+    }
+    at != 0
+}
+
+pub(crate) fn build_index(input: &[u8], limits: &DecoderLimits) -> Result<AviIndex> {
+    let stream = video_stream(input)?;
+    let mut index = Index::default();
+    // Without an idx1 only the first frame of a delta codec is certain to be
+    // complete. Intra codecs set every flag in the decoder.
+    for_each_video_chunk(input, stream.number, |offset, size| {
+        let flags = if index.samples.is_empty() { FLAG_KEY } else { 0 };
+        index.push(limits, input.len(), offset, size, 0, flags)?;
+        Ok(true)
+    })?;
+    apply_idx1(input, stream.number, &mut index);
+    if let Some(first) = index.samples.first_mut() {
+        first.flags |= FLAG_KEY;
+    }
+    let frame_rate = if stream.scale != 0 && stream.rate != 0 {
+        crate::reduce_fraction(stream.rate, stream.scale)
+    } else {
+        None
+    };
+    index.set_uniform_timing(frame_rate);
+    Ok(AviIndex {
+        index,
+        extra: stream.extra,
+        dib: stream.dib.then_some(stream.bottom_up),
+    })
 }

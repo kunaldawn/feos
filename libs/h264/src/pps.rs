@@ -38,6 +38,9 @@ pub fn parse_pps(rbsp: &[u8], sps: Option<&Sps>) -> Result<Pps, DecodeError> {
 
     let pic_parameter_set_id = r.read_ue()?;
     let seq_parameter_set_id = r.read_ue()?;
+    if pic_parameter_set_id > 255 || seq_parameter_set_id > 31 {
+        return Err(DecodeError::InvalidSyntax("parameter set id out of range"));
+    }
     let entropy_coding_mode_flag = r.read_bit()? != 0;
     let bottom_field_pic_order_in_frame_present_flag = r.read_bit()? != 0;
     let num_slice_groups_minus1 = r.read_ue()?;
@@ -56,9 +59,19 @@ pub fn parse_pps(rbsp: &[u8], sps: Option<&Sps>) -> Result<Pps, DecodeError> {
     }
     let weighted_pred_flag = r.read_bit()? != 0;
     let weighted_bipred_idc = r.read_bits(2)? as u8;
+    if weighted_bipred_idc > 2 {
+        return Err(DecodeError::InvalidSyntax("weighted_bipred_idc out of range"));
+    }
     let pic_init_qp_minus26 = r.read_se()?;
     let pic_init_qs_minus26 = r.read_se()?;
     let chroma_qp_index_offset = r.read_se()?;
+    // Bit depth above 8 is rejected separately, so 8-bit ranges apply here.
+    if !(-26..=25).contains(&pic_init_qp_minus26)
+        || !(-26..=25).contains(&pic_init_qs_minus26)
+        || !(-12..=12).contains(&chroma_qp_index_offset)
+    {
+        return Err(DecodeError::InvalidSyntax("PPS QP out of range"));
+    }
     let deblocking_filter_control_present_flag = r.read_bit()? != 0;
     let constrained_intra_pred_flag = r.read_bit()? != 0;
     let redundant_pic_cnt_present_flag = r.read_bit()? != 0;
@@ -78,22 +91,25 @@ pub fn parse_pps(rbsp: &[u8], sps: Option<&Sps>) -> Result<Pps, DecodeError> {
         pic_scaling_matrix_present_flag = r.read_bit()? != 0;
         if pic_scaling_matrix_present_flag {
             let count = 6 + if transform_8x8_mode_flag { 2 } else { 0 };
+            // Fall-back rule A (no SPS matrix) or B (spec Table 7-2): the first
+            // list of each group comes from the default or the SPS, the rest
+            // from the previous list.
+            let sps_has_list = sps.is_some_and(|s| s.seq_scaling_matrix_present_flag);
             for i in 0..count {
                 let present = r.read_bit()? != 0;
                 if present {
                     if i < 6 {
-                        scaling_list_4x4[i] = crate::sps::parse_scaling_list::<16>(&mut r)?;
+                        scaling_list_4x4[i] = crate::sps::parse_list_4x4(&mut r, i)?;
                     } else {
-                        scaling_list_8x8[i - 6] = crate::sps::parse_scaling_list::<64>(&mut r)?;
+                        scaling_list_8x8[i - 6] = crate::sps::parse_list_8x8(&mut r, i - 6)?;
                     }
-                } else if i < 6 {
-                    // Fallback: use SPS list, or default from Table 7-2
-                    let sps_has_list = sps.is_some_and(|s| s.seq_scaling_matrix_present_flag);
+                } else if i == 0 || i == 3 {
                     if !sps_has_list {
                         scaling_list_4x4[i] = crate::sps::fallback_4x4(&scaling_list_4x4, i);
                     }
-                    // If SPS has lists, scaling_list_4x4[i] already has the SPS value
-                } else if i < 8 && !sps.is_some_and(|s| s.seq_scaling_matrix_present_flag) {
+                } else if i < 6 {
+                    scaling_list_4x4[i] = crate::sps::fallback_4x4(&scaling_list_4x4, i);
+                } else if !sps_has_list {
                     scaling_list_8x8[i - 6] = if i == 6 {
                         crate::sps::DEFAULT_SCALING_8X8_INTRA
                     } else {
@@ -103,6 +119,9 @@ pub fn parse_pps(rbsp: &[u8], sps: Option<&Sps>) -> Result<Pps, DecodeError> {
             }
         }
         second_chroma_qp_index_offset = r.read_se()?;
+        if !(-12..=12).contains(&second_chroma_qp_index_offset) {
+            return Err(DecodeError::InvalidSyntax("PPS chroma QP offset out of range"));
+        }
     }
 
     Ok(Pps {

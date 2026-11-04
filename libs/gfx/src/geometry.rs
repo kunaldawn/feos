@@ -76,6 +76,13 @@ impl Rect {
             && (point.y as i64) < self.bottom()
     }
 
+    /// The part of this rectangle inside a `width * height` canvas, or an
+    /// empty rectangle when they do not overlap.
+    pub(crate) fn clipped_to_canvas(self, width: usize, height: usize) -> Self {
+        self.intersect(Self::new(0, 0, width as u32, height as u32))
+            .unwrap_or(Self::new(0, 0, 0, 0))
+    }
+
     /// Returns the overlapping region, or `None` if the rectangles are
     /// disjoint.
     pub fn intersect(self, other: Self) -> Option<Self> {

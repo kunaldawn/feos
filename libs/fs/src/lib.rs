@@ -17,8 +17,9 @@
 //!
 //! Disk backends walk the directory tree once at mount time into a small
 //! in-memory index (one allocation per entry) and read file data on demand
-//! through the [`BlockDevice`]. A RAM-backed device is included for embedding
-//! and for tests:
+//! through the [`BlockDevice`]. Reads check the file's cluster chain the first
+//! time and keep a cursor, so sequential reads don't walk it again. A RAM-backed
+//! device is included for embedding and for tests:
 //!
 //! ```no_run
 //! use feos_fs::{mount_image, EntryKind, FileSystem};
@@ -67,6 +68,7 @@ pub use mount::MountTable;
 pub use volume::{detect, VolumeKind};
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 #[cfg(test)]
 mod tests;
@@ -143,6 +145,10 @@ impl EntryKind {
 }
 
 /// Maximum number of path components [`FileSystem::path`] can walk.
+///
+/// The disk backends also stop here when walking a volume, and refuse changes
+/// that would nest deeper, so recursive walkers have a known bound. A deeper
+/// tree on an untrusted volume marks it [damaged](FileSystem::is_damaged).
 pub const MAX_PATH_DEPTH: usize = 32;
 
 /// A read-only filesystem view.
@@ -151,8 +157,25 @@ pub const MAX_PATH_DEPTH: usize = 32;
 /// [`read`](FileSystem::read), so callers control the buffer size and no
 /// allocation is required after mounting.
 pub trait FileSystem: Sync {
-    /// Number of nodes in the filesystem.
+    /// Number of live nodes in the filesystem.
+    ///
+    /// Node IDs can exceed this after a removal: use
+    /// [`node_id_limit`](FileSystem::node_id_limit) to bound them.
     fn node_count(&self) -> usize;
+
+    /// One past the highest node ID that is in use.
+    fn node_id_limit(&self) -> usize {
+        self.node_count()
+    }
+
+    /// Whether mounting found damage and skipped part of the volume.
+    ///
+    /// A damaged volume mounts so that what's intact can be read, but it can
+    /// list fewer files than it holds, and writes to it fail with
+    /// [`FsError::Corrupt`].
+    fn is_damaged(&self) -> bool {
+        false
+    }
 
     /// Returns the kind of `node`.
     fn kind(&self, node: NodeId) -> Option<EntryKind>;
@@ -171,8 +194,47 @@ pub trait FileSystem: Sync {
     /// Copies bytes from `node`, starting at `offset`, into `out`.
     ///
     /// Returns the number of bytes copied; zero means end-of-file or that
-    /// `node` is not a file.
+    /// `node` is not a file. It also means the read failed, because there's no
+    /// way to say so: code that handles untrusted volumes should prefer
+    /// [`try_read`](FileSystem::try_read).
     fn read(&self, node: NodeId, offset: usize, out: &mut [u8]) -> usize;
+
+    /// Like [`read`](FileSystem::read), but reports failure.
+    ///
+    /// `Ok(0)` only ever means end-of-file. A truncated or cyclic cluster chain
+    /// is [`FsError::Corrupt`] rather than short or repeated data, and a device
+    /// failure is passed on. `out` may have been partly filled on error.
+    fn try_read(&self, node: NodeId, offset: usize, out: &mut [u8]) -> Result<usize, FsError> {
+        match self.kind(node) {
+            None => Err(FsError::NotFound),
+            Some(EntryKind::Directory) => Err(FsError::NotFile),
+            Some(EntryKind::File) => Ok(self.read(node, offset, out)),
+        }
+    }
+
+    /// Reads a whole file into a new buffer.
+    ///
+    /// The size comes from the disk, and it may be larger than the heap, so
+    /// allocation failure is [`FsError::OutOfMemory`] rather than a panic.
+    fn read_to_vec(&self, node: NodeId) -> Result<Vec<u8>, FsError> {
+        if self.kind(node).is_none() {
+            return Err(FsError::NotFound);
+        }
+        let size = self.size(node);
+        let mut data = Vec::new();
+        data.try_reserve_exact(size)
+            .map_err(|_| FsError::OutOfMemory)?;
+        data.resize(size, 0);
+        let mut done = 0usize;
+        while done < size {
+            let count = self.try_read(node, done, &mut data[done..])?;
+            if count == 0 {
+                return Err(FsError::Corrupt);
+            }
+            done += count;
+        }
+        Ok(data)
+    }
 
     /// Number of children of `node`.
     fn child_count(&self, node: NodeId) -> usize;

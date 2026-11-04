@@ -37,11 +37,12 @@ pub struct InflateResult {
     pub consumed: usize,
 }
 
+/// LSB-first bit reader over a 64-bit window.
 struct BitReader<'a> {
     data: &'a [u8],
     pos: usize,
-    bits: u32,
-    count: u8,
+    bits: u64,
+    count: u32,
 }
 
 impl<'a> BitReader<'a> {
@@ -54,62 +55,82 @@ impl<'a> BitReader<'a> {
         }
     }
 
-    fn bit(&mut self) -> Result<u32> {
-        if self.count == 0 {
-            let byte = *self
-                .data
-                .get(self.pos)
-                .ok_or(CompressError::UnexpectedEnd)?;
-            self.pos += 1;
-            self.bits = byte as u32;
-            self.count = 8;
+    /// Tops the window up to at least 56 bits while input remains.
+    fn refill(&mut self) {
+        if let Some(chunk) = self.data.get(self.pos..self.pos + 8) {
+            let word = u64::from_le_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            ]);
+            self.bits |= word << self.count;
+            let taken = (63 - self.count) >> 3;
+            self.pos += taken as usize;
+            self.count += taken * 8;
+            return;
         }
-        let value = self.bits & 1;
-        self.bits >>= 1;
-        self.count -= 1;
-        Ok(value)
+        while self.count <= 56 {
+            let Some(&byte) = self.data.get(self.pos) else {
+                return;
+            };
+            self.bits |= (byte as u64) << self.count;
+            self.pos += 1;
+            self.count += 8;
+        }
+    }
+
+    fn consume(&mut self, n: u32) {
+        self.bits >>= n;
+        self.count -= n;
     }
 
     fn read(&mut self, n: u8) -> Result<u32> {
-        let mut value = 0;
-        for (shift, _) in (0..n).enumerate() {
-            value |= self.bit()? << shift;
+        let n = n as u32;
+        if self.count < n {
+            self.refill();
+            if self.count < n {
+                return Err(CompressError::UnexpectedEnd);
+            }
         }
+        let value = (self.bits & ((1u64 << n) - 1)) as u32;
+        self.consume(n);
         Ok(value)
     }
 
+    /// Drops to the next byte boundary and returns whole unread bytes to the
+    /// input, so stored blocks can be copied directly.
     fn align(&mut self) {
+        self.pos -= (self.count / 8) as usize;
         self.bits = 0;
         self.count = 0;
     }
 
     fn read_u16_le(&mut self) -> Result<u16> {
         debug_assert_eq!(self.count, 0);
-        let low = *self
+        let bytes = self
             .data
-            .get(self.pos)
-            .ok_or(CompressError::UnexpectedEnd)? as u16;
-        let high = *self
-            .data
-            .get(self.pos + 1)
-            .ok_or(CompressError::UnexpectedEnd)? as u16;
+            .get(self.pos..self.pos + 2)
+            .ok_or(CompressError::UnexpectedEnd)?;
+        let value = u16::from_le_bytes([bytes[0], bytes[1]]);
         self.pos += 2;
-        Ok(low | (high << 8))
+        Ok(value)
     }
 
-    fn read_u8(&mut self) -> Result<u8> {
-        let byte = *self
-            .data
-            .get(self.pos)
-            .ok_or(CompressError::UnexpectedEnd)?;
-        self.pos += 1;
-        Ok(byte)
+    /// Input bytes used so far, counting a partly read byte as used.
+    fn consumed(&self) -> usize {
+        self.pos - (self.count / 8) as usize
     }
 }
+
+/// Bits resolved by the fast table. Longer codes take the canonical walk.
+const LOOKUP_BITS: u32 = 9;
+const LOOKUP_SIZE: usize = 1 << LOOKUP_BITS;
+const LOOKUP_LEN_BITS: u32 = 4;
 
 struct Huffman {
     count: [u16; MAX_BITS + 1],
     symbol: [u16; MAX_SYMBOLS],
+    /// `symbol << 4 | length` for each code of at most [`LOOKUP_BITS`] bits,
+    /// indexed by the next input bits. Zero means a longer or unassigned code.
+    lookup: [u16; LOOKUP_SIZE],
 }
 
 impl Huffman {
@@ -125,6 +146,7 @@ impl Huffman {
             return Ok(Self {
                 count,
                 symbol: [0; MAX_SYMBOLS],
+                lookup: [0; LOOKUP_SIZE],
             });
         }
 
@@ -154,18 +176,64 @@ impl Huffman {
             }
         }
 
-        Ok(Self { count, symbol })
+        // Assign canonical codes in `symbol` order, and fill every table slot
+        // whose low bits are the (bit-reversed) code.
+        let mut lookup = [0u16; LOOKUP_SIZE];
+        let mut code = 0u32;
+        let mut slot = 0usize;
+        for length in 1..=LOOKUP_BITS {
+            for _ in 0..count[length as usize] {
+                let reversed = code.reverse_bits() >> (32 - length);
+                let entry = (symbol[slot] << LOOKUP_LEN_BITS) | length as u16;
+                let mut index = reversed as usize;
+                while index < LOOKUP_SIZE {
+                    lookup[index] = entry;
+                    index += 1 << length;
+                }
+                code += 1;
+                slot += 1;
+            }
+            code <<= 1;
+        }
+
+        Ok(Self {
+            count,
+            symbol,
+            lookup,
+        })
     }
 
+    #[inline]
     fn decode(&self, reader: &mut BitReader<'_>) -> Result<u16> {
+        if reader.count < MAX_BITS as u32 {
+            reader.refill();
+        }
+        let entry = self.lookup[reader.bits as usize & (LOOKUP_SIZE - 1)];
+        if entry != 0 {
+            let length = (entry & ((1 << LOOKUP_LEN_BITS) - 1)) as u32;
+            if length > reader.count {
+                return Err(CompressError::UnexpectedEnd);
+            }
+            reader.consume(length);
+            return Ok(entry >> LOOKUP_LEN_BITS);
+        }
+        self.decode_long(reader)
+    }
+
+    /// Canonical bit-by-bit walk, for codes the table doesn't resolve.
+    fn decode_long(&self, reader: &mut BitReader<'_>) -> Result<u16> {
         let mut code: i32 = 0;
         let mut first: i32 = 0;
         let mut index: i32 = 0;
         for len in 1..=MAX_BITS {
-            code |= reader.bit()? as i32;
+            if len as u32 > reader.count {
+                return Err(CompressError::UnexpectedEnd);
+            }
+            code |= ((reader.bits >> (len - 1)) & 1) as i32;
             let count = self.count[len] as i32;
             if code - first < count {
                 let slot = index + (code - first);
+                reader.consume(len as u32);
                 return self
                     .symbol
                     .get(slot as usize)
@@ -289,10 +357,12 @@ pub fn inflate_with_consumed(input: &[u8], out: &mut [u8]) -> Result<InflateResu
                         available: out.len(),
                     });
                 }
-                for _ in 0..length {
-                    out[written] = reader.read_u8()?;
-                    written += 1;
-                }
+                let source = input
+                    .get(reader.pos..reader.pos + length)
+                    .ok_or(CompressError::UnexpectedEnd)?;
+                out[written..end].copy_from_slice(source);
+                reader.pos += length;
+                written = end;
             }
             1 | 2 => {
                 let (literal, distance) = if block_type == 1 {
@@ -334,10 +404,15 @@ pub fn inflate_with_consumed(input: &[u8], out: &mut [u8]) -> Result<InflateResu
                                     available: out.len(),
                                 });
                             }
-                            for _ in 0..length {
-                                out[written] = out[written - dist];
-                                written += 1;
+                            if dist >= length {
+                                out.copy_within(written - dist..written - dist + length, written);
+                            } else {
+                                // An overlapping match repeats its own output.
+                                for index in written..end {
+                                    out[index] = out[index - dist];
+                                }
                             }
+                            written = end;
                         }
                         _ => return Err(CompressError::InvalidData("invalid literal symbol")),
                     }
@@ -352,6 +427,6 @@ pub fn inflate_with_consumed(input: &[u8], out: &mut [u8]) -> Result<InflateResu
 
     Ok(InflateResult {
         written,
-        consumed: reader.pos,
+        consumed: reader.consumed(),
     })
 }

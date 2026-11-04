@@ -13,6 +13,7 @@ use feos_hal::{Clock, Cpu, Power};
 pub mod boot;
 pub mod cpu;
 pub mod exceptions;
+pub mod gdt;
 pub mod irq;
 pub mod power;
 pub mod smp;
@@ -27,17 +28,31 @@ pub static ARCH: X86_64 = X86_64;
 
 /// Initializes the architecture's one-time boot state.
 ///
-/// Called by the kernel after the console is up. It installs the IDT and
-/// calibrates the TSC against the PIT, both of which need to happen before
-/// interrupts are unmasked.
+/// Called by the kernel after the console is up. It installs the per-CPU stacks
+/// and the IDT and calibrates the TSC against the PM timer, all of which need to
+/// happen before interrupts are unmasked. Install the fault handler first.
 pub fn init() {
+    gdt::init();
     exceptions::init();
     timer::init();
+}
+
+/// Describes the boot information pointer for the boot log.
+pub fn boot_info_label(boot_info: usize) -> &'static str {
+    if boot_info != 0 {
+        "multiboot information"
+    } else {
+        "no multiboot information"
+    }
 }
 
 impl Clock for X86_64 {
     fn frequency(&self) -> u64 {
         timer::frequency()
+    }
+
+    fn name(&self) -> &'static str {
+        "TSC"
     }
 
     fn ticks(&self) -> u64 {
@@ -74,5 +89,13 @@ impl Cpu for X86_64 {
 
     fn halt(&self) -> ! {
         cpu::halt()
+    }
+
+    fn privilege_prefix(&self) -> &'static str {
+        "ring "
+    }
+
+    fn id_name(&self) -> &'static str {
+        "CPUID.0:EAX"
     }
 }

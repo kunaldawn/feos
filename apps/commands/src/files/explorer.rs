@@ -1,17 +1,19 @@
-//! The Windows XP-style File Explorer.
+//! The File Explorer.
 //!
 //! The explorer is deliberately self-contained: it owns its menus, toolbar,
-//! folder tree, address bar, search pane, four view modes, preview pane,
-//! dialogs, pointer handling and keyboard shortcuts. It is still
-//! allocation-free and works without a mouse, because the serial console is
-//! the only keyboard on the QEMU board.
+//! folder tree, address bar, search pane, five view modes, preview pane,
+//! dialogs, pointer handling and keyboard shortcuts. Listings and text are
+//! allocation-free; only decoded images use the heap, and a failed allocation
+//! just means no picture. It works without a mouse, because a serial console
+//! may be the only keyboard.
 
 use core::cmp::Ordering;
 use core::fmt::Write;
 
 use alloc::vec;
+use alloc::vec::Vec;
 
-use feos_app::{Context, WindowContext, WindowFrame};
+use feos_app::{shell, Context, WindowContext, WindowFrame};
 use feos_fs::{FileSystem, NodeId};
 use feos_gfx::{Canvas, Color, Point, Rect};
 use feos_gui::{
@@ -19,19 +21,30 @@ use feos_gui::{
     VerticalAlign,
 };
 use feos_hal::PointerEvent;
-use feos_keys::SerialKeys;
+use feos_keys::{EvdevKeys, SerialKeys};
 use feos_sync::SpinLock;
 use feos_text::Text;
 
+use super::preview::{self, Decoded};
 use super::{format_size, PATH_MAX};
 
 const MAX_ENTRIES: usize = 256;
 const MAX_SEARCH: usize = 128;
 const MAX_TREE: usize = 256;
 const MAX_HISTORY: usize = 32;
-const SELECTION_WORDS: usize = 16;
+/// Words of the selection bitset, one bit per listing row.
+const SELECTION_WORDS: usize = MAX_ENTRIES / 64;
 const PREVIEW_MAX: usize = 4096;
+/// The viewer's window onto its file, refilled as it scrolls.
 const VIEWER_MAX: usize = 8192;
+/// Largest picture kept for the preview pane and the viewer.
+const IMAGE_BOX: (u32, u32) = (640, 480);
+/// Largest thumbnail.
+const THUMB_BOX: (u32, u32) = (96, 80);
+/// Thumbnails kept. Evicted oldest first.
+const THUMB_CACHE: usize = 32;
+/// How far a pressed row must move before it becomes a drag.
+const DRAG_THRESHOLD: i32 = 6;
 
 const ROW_HEIGHT: i32 = 20;
 const HEADER_HEIGHT: i32 = 21;
@@ -75,6 +88,7 @@ enum ViewMode {
     Icons,
     List,
     Tiles,
+    Thumbnails,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -160,6 +174,7 @@ enum Action {
     ViewIcons,
     ViewList,
     ViewTiles,
+    ViewThumbnails,
     ToggleFolders,
     ToggleSearch,
     HideExplorerBar,
@@ -242,13 +257,12 @@ const FILE_MENU: &[MenuItem] = &[
 const EDIT_MENU: &[MenuItem] = &[
     disabled("Undo", "Ctrl+Z"),
     disabled("Cut", "Ctrl+X"),
-    disabled("Copy", "Ctrl+C"),
-    disabled("Paste", "Ctrl+V"),
+    item("Copy", "Ctrl+C", Action::CopyPath),
+    item("Paste", "Ctrl+V", Action::Paste),
     sep(),
     item("Select All", "Ctrl+A", Action::SelectAll),
     item("Invert Selection", "", Action::InvertSelection),
     sep(),
-    item("Copy Path", "", Action::CopyPath),
 ];
 
 const VIEW_MENU: &[MenuItem] = &[
@@ -261,7 +275,7 @@ const VIEW_MENU: &[MenuItem] = &[
     item("Preview Pane", "", Action::TogglePreview),
     item("Hide Explorer Bar", "", Action::HideExplorerBar),
     sep(),
-    disabled("Thumbnails (unavailable)", ""),
+    item("Thumbnails", "", Action::ViewThumbnails),
     item("Tiles", "", Action::ViewTiles),
     item("Icons", "", Action::ViewIcons),
     item("List", "", Action::ViewList),
@@ -387,6 +401,42 @@ enum DragMode {
     Marquee {
         start: Point,
     },
+    /// A row was pressed and may become a drag between apps.
+    Row {
+        start: Point,
+        node: NodeId,
+    },
+}
+
+/// What a listing row needs from the filesystem, read once when it is listed.
+#[derive(Clone, Copy)]
+struct EntryInfo {
+    size: usize,
+    is_dir: bool,
+    /// Index into [`TYPE_NAMES`].
+    type_index: u8,
+}
+
+impl EntryInfo {
+    const EMPTY: Self = Self {
+        size: 0,
+        is_dir: false,
+        type_index: 0,
+    };
+
+    fn read(fs: &dyn FileSystem, node: NodeId) -> Self {
+        Self {
+            size: fs.size(node),
+            is_dir: fs.is_dir(node),
+            type_index: type_index(node, fs),
+        }
+    }
+}
+
+/// A decoded thumbnail, or a record that this node has none.
+struct Thumb {
+    node: NodeId,
+    image: Option<Decoded>,
 }
 
 #[derive(Clone, Copy)]
@@ -402,8 +452,19 @@ struct ExplorerState {
     screen: Rect,
     current: NodeId,
     entries: [NodeId; MAX_ENTRIES],
+    /// Cached per-row data, in step with `entries`.
+    infos: [EntryInfo; MAX_ENTRIES],
     entry_count: usize,
+    /// Children the listed folder really has, which can exceed `MAX_ENTRIES`.
+    total_entries: usize,
+    /// Whether `entries` currently holds search results.
+    listed_search: bool,
     cursor: usize,
+    /// The cursor position the scroll offset was last fitted to. Scrolling only
+    /// follows the cursor when it moves, so the wheel can look elsewhere.
+    pinned_cursor: usize,
+    /// The keyboard moved the cursor (even onto the same row): bring it back.
+    pin_pending: bool,
     anchor: usize,
     selected: [u64; SELECTION_WORDS],
     scroll: usize,
@@ -425,12 +486,19 @@ struct ExplorerState {
     include_subfolders: bool,
     search_results: [NodeId; MAX_SEARCH],
     search_count: usize,
+    /// The search stopped at `MAX_SEARCH` with matches still to find.
+    search_truncated: bool,
     history: [NodeId; MAX_HISTORY],
     history_len: usize,
     history_pos: usize,
-    expanded: [u64; SELECTION_WORDS],
+    /// Expanded folders. Node ids on a mounted volume can be large, so this
+    /// lists ids rather than indexing a bitset by them.
+    expanded: [NodeId; MAX_TREE],
+    expanded_len: usize,
     tree: [NodeId; MAX_TREE],
     tree_depth: [u8; MAX_TREE],
+    /// Cached "has subfolders" for each tree row.
+    tree_children: [bool; MAX_TREE],
     tree_len: usize,
     tree_cursor: usize,
     tree_scroll: usize,
@@ -438,10 +506,23 @@ struct ExplorerState {
     preview_len: usize,
     preview_node: Option<NodeId>,
     preview_scroll: usize,
+    /// The part of the viewed file starting at `viewer_offset`.
     viewer: [u8; VIEWER_MAX],
     viewer_len: usize,
-    viewer_scroll: usize,
-    viewer_lines: usize,
+    /// Byte offset of the first line shown.
+    viewer_offset: usize,
+    viewer_binary: bool,
+    /// The one decoded picture kept for the preview pane and the viewer.
+    image: Option<Decoded>,
+    /// The node `image` was decoded from, also set when decoding failed.
+    image_node: Option<NodeId>,
+    thumbs: Vec<Thumb>,
+    /// The oldest entry of `thumbs`, next to be replaced.
+    thumb_next: usize,
+    /// Visible thumbnails are still waiting to be decoded.
+    thumbs_pending: bool,
+    /// A dropped path, waiting for the next frame and its filesystem.
+    pending_drop: Option<Text<96>>,
     dialog: Dialog,
     menu_open: Option<MenuKind>,
     menu_hover: usize,
@@ -473,8 +554,13 @@ impl ExplorerState {
             screen,
             current: fs.root(),
             entries: [NodeId::ROOT; MAX_ENTRIES],
+            infos: [EntryInfo::EMPTY; MAX_ENTRIES],
             entry_count: 0,
+            total_entries: 0,
+            listed_search: false,
             cursor: 0,
+            pinned_cursor: 0,
+            pin_pending: false,
             anchor: 0,
             selected: [0; SELECTION_WORDS],
             scroll: 0,
@@ -496,12 +582,15 @@ impl ExplorerState {
             include_subfolders: true,
             search_results: [NodeId::ROOT; MAX_SEARCH],
             search_count: 0,
+            search_truncated: false,
             history: [NodeId::ROOT; MAX_HISTORY],
             history_len: 0,
             history_pos: 0,
-            expanded: [0; SELECTION_WORDS],
+            expanded: [NodeId::ROOT; MAX_TREE],
+            expanded_len: 0,
             tree: [NodeId::ROOT; MAX_TREE],
             tree_depth: [0; MAX_TREE],
+            tree_children: [false; MAX_TREE],
             tree_len: 0,
             tree_cursor: 0,
             tree_scroll: 0,
@@ -511,8 +600,14 @@ impl ExplorerState {
             preview_scroll: 0,
             viewer: [0; VIEWER_MAX],
             viewer_len: 0,
-            viewer_scroll: 0,
-            viewer_lines: 0,
+            viewer_offset: 0,
+            viewer_binary: false,
+            image: None,
+            image_node: None,
+            thumbs: Vec::new(),
+            thumb_next: 0,
+            thumbs_pending: false,
+            pending_drop: None,
             dialog: Dialog::None,
             menu_open: None,
             menu_hover: 0,
@@ -536,7 +631,7 @@ impl ExplorerState {
             window_h: screen.height as i32 - 60,
             exit: false,
         };
-        set_bit(&mut state.expanded, fs.root().0 as usize);
+        state.set_expanded(fs.root());
         state.history[0] = fs.root();
         state.history_len = 1;
         state.history_pos = 0;
@@ -583,16 +678,16 @@ impl ExplorerState {
         self.focused_node().unwrap_or(self.current)
     }
 
-    fn is_selected(&self, node: NodeId) -> bool {
-        bit(&self.selected, node.0 as usize)
+    fn is_selected(&self, index: usize) -> bool {
+        bit(&self.selected, index)
     }
 
-    fn select_node(&mut self, node: NodeId) {
-        set_bit(&mut self.selected, node.0 as usize);
+    fn select_index(&mut self, index: usize) {
+        set_bit(&mut self.selected, index);
     }
 
-    fn deselect_node(&mut self, node: NodeId) {
-        clear_bit(&mut self.selected, node.0 as usize);
+    fn deselect_index(&mut self, index: usize) {
+        clear_bit(&mut self.selected, index);
     }
 
     fn clear_selection(&mut self) {
@@ -601,38 +696,37 @@ impl ExplorerState {
 
     fn select_all(&mut self) {
         for index in 0..self.entry_count {
-            self.select_node(self.entries[index]);
+            self.select_index(index);
         }
     }
 
     fn invert_selection(&mut self) {
         for index in 0..self.entry_count {
-            let node = self.entries[index];
-            if self.is_selected(node) {
-                self.deselect_node(node);
+            if self.is_selected(index) {
+                self.deselect_index(index);
             } else {
-                self.select_node(node);
+                self.select_index(index);
             }
         }
     }
 
     fn select_only(&mut self, index: usize) {
         self.clear_selection();
-        if let Some(node) = self.entries.get(index).copied() {
+        if index < self.entry_count {
             self.cursor = index;
             self.anchor = index;
-            self.select_node(node);
+            self.select_index(index);
         }
     }
 
     fn toggle_at(&mut self, index: usize) {
-        if let Some(node) = self.entries.get(index).copied() {
+        if index < self.entry_count {
             self.cursor = index;
             self.anchor = index;
-            if self.is_selected(node) {
-                self.deselect_node(node);
+            if self.is_selected(index) {
+                self.deselect_index(index);
             } else {
-                self.select_node(node);
+                self.select_index(index);
             }
         }
     }
@@ -641,7 +735,34 @@ impl ExplorerState {
         self.clear_selection();
         let (start, end) = if from <= to { (from, to) } else { (to, from) };
         for index in start..=end.min(self.entry_count.saturating_sub(1)) {
-            self.select_node(self.entries[index]);
+            self.select_index(index);
+        }
+    }
+
+    fn is_expanded(&self, node: NodeId) -> bool {
+        self.expanded[..self.expanded_len].contains(&node)
+    }
+
+    fn set_expanded(&mut self, node: NodeId) {
+        if self.is_expanded(node) {
+            return;
+        }
+        if self.expanded_len == MAX_TREE {
+            // Forget the folder expanded longest ago, but never the root.
+            self.expanded.copy_within(2.., 1);
+            self.expanded_len -= 1;
+        }
+        self.expanded[self.expanded_len] = node;
+        self.expanded_len += 1;
+    }
+
+    fn clear_expanded(&mut self, node: NodeId) {
+        if let Some(index) = self.expanded[..self.expanded_len]
+            .iter()
+            .position(|item| *item == node)
+        {
+            self.expanded.copy_within(index + 1..self.expanded_len, index);
+            self.expanded_len -= 1;
         }
     }
 
@@ -659,21 +780,56 @@ impl ExplorerState {
             self.anchor = index;
         }
         self.cursor = index;
+        self.pin_pending = true;
         self.sync_preview(fs);
     }
 
     fn selected_count(&self) -> usize {
         (0..self.entry_count)
-            .filter(|index| self.is_selected(self.entries[*index]))
+            .filter(|index| self.is_selected(*index))
             .count()
     }
 
-    fn selected_bytes(&self, fs: &dyn FileSystem) -> usize {
+    fn selected_bytes(&self) -> usize {
         (0..self.entry_count)
-            .filter(|index| self.is_selected(self.entries[*index]))
-            .filter(|index| fs.is_file(self.entries[*index]))
-            .map(|index| fs.size(self.entries[index]))
-            .sum()
+            .filter(|index| self.is_selected(*index) && !self.infos[*index].is_dir)
+            .fold(0usize, |total, index| {
+                total.saturating_add(self.infos[index].size)
+            })
+    }
+
+    /// Whichever line of text the status bar opens with.
+    fn listing_summary(&self) -> Text<160> {
+        let mut text = Text::new();
+        if self.searching() {
+            if self.search_truncated {
+                let _ = write!(text, "First {} matches shown; refine the search", self.entry_count);
+            } else {
+                let _ = write!(text, "{} item(s) found", self.entry_count);
+            }
+        } else if self.total_entries > self.entry_count {
+            let _ = write!(
+                text,
+                "Showing the first {} of {} objects",
+                self.entry_count, self.total_entries
+            );
+        } else {
+            let _ = write!(text, "{} object(s)", self.entry_count);
+        }
+        text
+    }
+
+    /// Leaves the search pane, forgetting its results.
+    fn leave_search(&mut self) {
+        if self.bar == ExplorerBar::Search {
+            self.bar = ExplorerBar::Folders;
+            if self.focus == Focus::Search {
+                self.focus = Focus::List;
+            }
+        }
+        self.search.clear();
+        self.search_count = 0;
+        self.search_truncated = false;
     }
 
     fn navigate(&mut self, fs: &dyn FileSystem, node: NodeId, record: bool) {
@@ -688,11 +844,7 @@ impl ExplorerState {
             self.refresh(fs);
             return;
         }
-        if self.bar == ExplorerBar::Search {
-            self.bar = ExplorerBar::Folders;
-            self.search.clear();
-            self.search_count = 0;
-        }
+        self.leave_search();
         self.current = node;
         self.cursor = 0;
         self.anchor = 0;
@@ -749,6 +901,8 @@ impl ExplorerState {
 
     fn jump_history(&mut self, fs: &dyn FileSystem) {
         let node = self.history[self.history_pos];
+        // Results found under the previous folder do not belong in this one.
+        self.leave_search();
         self.current = node;
         self.cursor = 0;
         self.anchor = 0;
@@ -778,7 +932,18 @@ impl ExplorerState {
 
     fn refresh(&mut self, fs: &dyn FileSystem) {
         let old = self.focused_node();
-        self.rebuild(fs);
+        // A file may have changed under the same node.
+        self.thumbs.clear();
+        self.thumb_next = 0;
+        self.image = None;
+        self.image_node = None;
+        self.preview_node = None;
+        if self.searching() {
+            // Results are what the folder held when they were found.
+            self.run_search(fs);
+        } else {
+            self.rebuild(fs);
+        }
         if let Some(node) = old {
             if let Some(index) = self.entry_position(node) {
                 self.cursor = index;
@@ -791,8 +956,23 @@ impl ExplorerState {
 
     fn rebuild(&mut self, fs: &dyn FileSystem) {
         let old = self.focused_node();
+        // The selection is a bit per row, so it follows its nodes across a
+        // re-sort.
+        let mut kept = [NodeId::ROOT; MAX_ENTRIES];
+        let mut kept_len = 0;
+        for index in 0..self.entry_count {
+            if self.is_selected(index) {
+                kept[kept_len] = self.entries[index];
+                kept_len += 1;
+            }
+        }
+        let anchor = self.entries.get(self.anchor).copied();
+        self.clear_selection();
+
         self.entry_count = 0;
-        if self.searching() {
+        self.listed_search = self.searching();
+        if self.listed_search {
+            self.total_entries = self.search_count;
             for index in 0..self.search_count {
                 if self.entry_count == MAX_ENTRIES {
                     break;
@@ -802,6 +982,7 @@ impl ExplorerState {
             }
         } else {
             let count = fs.child_count(self.current);
+            self.total_entries = count;
             for index in 0..count {
                 if self.entry_count == MAX_ENTRIES {
                     break;
@@ -811,9 +992,20 @@ impl ExplorerState {
                     self.entry_count += 1;
                 }
             }
-            self.sort_entries(fs);
+        }
+        self.sort_entries(fs);
+        for index in 0..self.entry_count {
+            self.infos[index] = EntryInfo::read(fs, self.entries[index]);
         }
 
+        for node in &kept[..kept_len] {
+            if let Some(index) = self.entry_position(*node) {
+                self.select_index(index);
+            }
+        }
+        self.anchor = anchor
+            .and_then(|node| self.entry_position(node))
+            .unwrap_or(0);
         self.cursor = old.and_then(|node| self.entry_position(node)).unwrap_or(0);
         if self.entry_count == 0 {
             self.cursor = 0;
@@ -842,26 +1034,26 @@ impl ExplorerState {
     }
 
     fn expand_ancestors(&mut self, fs: &dyn FileSystem, node: NodeId) {
-        set_bit(&mut self.expanded, fs.root().0 as usize);
+        self.set_expanded(fs.root());
         let mut current = fs.parent(node);
         while let Some(parent) = current {
-            set_bit(&mut self.expanded, parent.0 as usize);
+            self.set_expanded(parent);
             current = fs.parent(parent);
         }
     }
 
     fn toggle_expanded(&mut self, fs: &dyn FileSystem, node: NodeId) {
-        if bit(&self.expanded, node.0 as usize) {
-            clear_bit(&mut self.expanded, node.0 as usize);
+        if self.is_expanded(node) {
+            self.clear_expanded(node);
         } else {
-            set_bit(&mut self.expanded, node.0 as usize);
+            self.set_expanded(node);
         }
         self.rebuild_tree(fs);
     }
 
     fn rebuild_tree(&mut self, fs: &dyn FileSystem) {
         self.tree_len = 0;
-        set_bit(&mut self.expanded, fs.root().0 as usize);
+        self.set_expanded(fs.root());
         self.walk_tree(fs, fs.root(), 0);
         if self.tree_len > 0 {
             if let Some(index) = self
@@ -886,8 +1078,9 @@ impl ExplorerState {
         }
         self.tree[self.tree_len] = node;
         self.tree_depth[self.tree_len] = depth.min(255) as u8;
+        self.tree_children[self.tree_len] = has_subdirectories(fs, node);
         self.tree_len += 1;
-        if !bit(&self.expanded, node.0 as usize) {
+        if !self.is_expanded(node) {
             return;
         }
         for index in 0..fs.child_count(node) {
@@ -904,6 +1097,7 @@ impl ExplorerState {
 
     fn run_search(&mut self, fs: &dyn FileSystem) {
         self.search_count = 0;
+        self.search_truncated = false;
         let mut query = Text::<64>::new();
         query.set(self.search.as_str());
         if !query.is_empty() {
@@ -926,11 +1120,11 @@ impl ExplorerState {
         recurse: bool,
         depth: usize,
     ) {
-        if depth > 12 || self.search_count >= MAX_SEARCH {
+        if depth > 12 || self.search_truncated {
             return;
         }
         for index in 0..fs.child_count(directory) {
-            if self.search_count >= MAX_SEARCH {
+            if self.search_truncated {
                 return;
             }
             let Some(child) = fs.child_at(directory, index) else {
@@ -938,6 +1132,10 @@ impl ExplorerState {
             };
             let name = fs.name(child).unwrap_or("");
             if contains_ignore_ascii_case(name, query) {
+                if self.search_count == MAX_SEARCH {
+                    self.search_truncated = true;
+                    return;
+                }
                 self.search_results[self.search_count] = child;
                 self.search_count += 1;
             }
@@ -957,17 +1155,52 @@ impl ExplorerState {
         self.preview_len = 0;
         if fs.is_file(node) {
             self.preview_len = fs.read(node, 0, &mut self.preview);
+            if self.preview_open {
+                self.ensure_image(fs, node);
+            }
         }
     }
 
-    fn open_focused(&mut self, fs: &dyn FileSystem) {
+    /// Decodes `node` for the preview pane or viewer, unless that is already
+    /// the cached picture or it is not a picture at all.
+    fn ensure_image(&mut self, fs: &dyn FileSystem, node: NodeId) {
+        if self.image_node == Some(node) {
+            return;
+        }
+        self.image_node = Some(node);
+        self.image = preview::decode_fit(fs, node, IMAGE_BOX.0, IMAGE_BOX.1);
+    }
+
+    /// The cached picture of `node`, if it has one.
+    fn image_of(&self, node: NodeId) -> Option<&Decoded> {
+        if self.image_node == Some(node) {
+            self.image.as_ref()
+        } else {
+            None
+        }
+    }
+
+    fn open_focused(&mut self, fs: &dyn FileSystem, now: u64) {
         if let Some(node) = self.focused_node() {
-            if fs.is_dir(node) {
-                self.navigate(fs, node, true);
-            } else {
-                self.open_viewer(fs, node);
+            self.open_node(fs, node, now);
+        }
+    }
+
+    /// Enters a folder, or opens a file with its associated app when the
+    /// desktop has one for it, and in the viewer otherwise.
+    fn open_node(&mut self, fs: &dyn FileSystem, node: NodeId, now: u64) {
+        if fs.is_dir(node) {
+            self.navigate(fs, node, true);
+            return;
+        }
+        let mut buffer = [0u8; PATH_MAX];
+        if let Some(path) = fs.path(node, &mut buffer) {
+            if host::open_file(path) {
+                self.set_message("Opening with the associated application.", now);
+                return;
             }
         }
+        self.open_viewer(fs, node);
     }
 
     fn open_viewer(&mut self, fs: &dyn FileSystem, node: NodeId) {
@@ -975,10 +1208,140 @@ impl ExplorerState {
             self.navigate(fs, node, true);
             return;
         }
+        self.viewer_offset = 0;
         self.viewer_len = fs.read(node, 0, &mut self.viewer);
-        self.viewer_scroll = 0;
-        self.viewer_lines = viewer_line_count(&self.viewer[..self.viewer_len]);
+        self.viewer_binary = !is_text(&self.viewer[..self.viewer_len]);
+        self.ensure_image(fs, node);
         self.dialog = Dialog::Viewer(node);
+    }
+
+    /// Acts on arguments from the desktop: a path to open at, or `--search`.
+    fn apply_args(&mut self, fs: &dyn FileSystem, args: &str, now: u64) {
+        let args = args.trim();
+        if args.is_empty() {
+            return;
+        }
+        if args == "--search" {
+            self.perform(fs, Action::Search, None, now);
+            return;
+        }
+        match fs.resolve(args) {
+            Some(node) if fs.is_dir(node) => self.navigate(fs, node, true),
+            Some(node) => {
+                self.reveal(fs, node);
+                self.open_viewer(fs, node);
+            }
+            None => self.set_message("That path was not found.", now),
+        }
+    }
+
+    /// Shows the folder holding `node`, with `node` selected.
+    fn reveal(&mut self, fs: &dyn FileSystem, node: NodeId) {
+        if let Some(parent) = fs.parent(node) {
+            self.navigate(fs, parent, true);
+        }
+        if let Some(index) = self.entry_position(node) {
+            self.select_only(index);
+            self.pin_pending = true;
+        }
+    }
+
+    /// Takes a path dropped on this window.
+    fn take_drop(&mut self, fs: &dyn FileSystem, now: u64) {
+        let Some(path) = self.pending_drop.take() else {
+            return;
+        };
+        match fs.resolve(path.as_str()) {
+            Some(node) if fs.is_dir(node) => self.navigate(fs, node, true),
+            Some(node) => self.reveal(fs, node),
+            None => self.set_message("That path was not found.", now),
+        }
+    }
+
+    /// Copies the selected paths, or the focused one, to the clipboard.
+    fn copy_paths(&mut self, fs: &dyn FileSystem, node: Option<NodeId>, now: u64) {
+        let mut text = Text::<{ shell::CLIPBOARD_MAX }>::new();
+        let mut count = 0;
+        let mut buffer = [0u8; PATH_MAX];
+        for index in 0..self.entry_count {
+            if self.is_selected(index) {
+                if let Some(path) = fs.path(self.entries[index], &mut buffer) {
+                    if count > 0 {
+                        text.push('\n');
+                    }
+                    text.push_str(path);
+                    count += 1;
+                }
+            }
+        }
+        if count == 0 {
+            if let Some(path) = node.and_then(|node| fs.path(node, &mut buffer)) {
+                text.push_str(path);
+                count = 1;
+            }
+        }
+        if count > 0 {
+            shell::clipboard_set(text.as_str());
+            self.set_message("Copied the path to the clipboard.", now);
+        }
+    }
+
+    /// Pastes the clipboard into the search box if it has focus, and otherwise
+    /// into the address bar.
+    fn paste(&mut self) {
+        let mut buffer = [0u8; PATH_MAX];
+        let pasted = shell::clipboard_get(&mut buffer);
+        let line = pasted.lines().next().unwrap_or("");
+        if self.focus == Focus::Search {
+            if self.search.insert_str(line) {
+                self.search_dirty = true;
+            }
+        } else {
+            self.focus = Focus::Address;
+            self.address_edit = true;
+            self.address.insert_str(line);
+        }
+    }
+
+    /// Decodes at most one more visible thumbnail. A frame stays responsive,
+    /// and [`needs_frames`] asks the desktop for another until none are left.
+    fn update_thumbs(&mut self, fs: &dyn FileSystem) {
+        self.thumbs_pending = false;
+        if self.view != ViewMode::Thumbnails {
+            return;
+        }
+        let layout = Layout::compute(self.screen, self);
+        let metrics = grid_metrics(self, layout.list, layout.main.width);
+        let first = self.scroll * metrics.columns;
+        let last = ((self.scroll + metrics.visible_rows) * metrics.columns).min(self.entry_count);
+        let mut decoded = false;
+        for index in first..last {
+            if !is_image_type(self.infos[index].type_index) {
+                continue;
+            }
+            let node = self.entries[index];
+            if self.thumbs.iter().any(|thumb| thumb.node == node) {
+                continue;
+            }
+            if decoded {
+                self.thumbs_pending = true;
+                return;
+            }
+            let thumb = Thumb {
+                node,
+                image: preview::decode_fit(fs, node, THUMB_BOX.0, THUMB_BOX.1),
+            };
+            if self.thumbs.len() == THUMB_CACHE {
+                self.thumbs[self.thumb_next] = thumb;
+                self.thumb_next = (self.thumb_next + 1) % THUMB_CACHE;
+            } else if self.thumbs.try_reserve(1).is_ok() {
+                self.thumbs.push(thumb);
+            } else {
+                // No memory for the record either; the row keeps its icon.
+                continue;
+            }
+            decoded = true;
+        }
     }
 
     fn show_notice(&mut self, title: &str, body: &str, now: u64) {
@@ -1001,9 +1364,9 @@ impl ExplorerState {
 
     fn read_only(&mut self, now: u64) {
         self.show_notice(
-            "Read-only filesystem",
-            "This filesystem is compiled into the kernel image. Delete, rename, \
-             copy, paste and new-folder operations are not available.",
+            "Read-only view",
+            "File Explorer reads files but cannot change them. Delete, rename \
+             and new-folder operations are not available here.",
             now,
         );
     }
@@ -1027,7 +1390,7 @@ impl ExplorerState {
         if fs.is_dir(node) {
             self.navigate(fs, node, true);
         } else {
-            self.open_viewer(fs, node);
+            self.open_node(fs, node, now);
             self.address.set(input.as_str());
         }
     }
@@ -1060,6 +1423,7 @@ impl ExplorerState {
             Action::ViewIcons => self.view == ViewMode::Icons,
             Action::ViewList => self.view == ViewMode::List,
             Action::ViewTiles => self.view == ViewMode::Tiles,
+            Action::ViewThumbnails => self.view == ViewMode::Thumbnails,
             Action::SortName => self.sort == SortKey::Name,
             Action::SortSize => self.sort == SortKey::Size,
             Action::SortType => self.sort == SortKey::Type,
@@ -1089,11 +1453,7 @@ impl ExplorerState {
             Action::None => {}
             Action::Open => {
                 if let Some(node) = node {
-                    if fs.is_dir(node) {
-                        self.navigate(fs, node, true);
-                    } else {
-                        self.open_viewer(fs, node);
-                    }
+                    self.open_node(fs, node, now);
                 }
             }
             Action::Explore => {
@@ -1128,6 +1488,7 @@ impl ExplorerState {
             Action::ViewIcons => self.view = ViewMode::Icons,
             Action::ViewList => self.view = ViewMode::List,
             Action::ViewTiles => self.view = ViewMode::Tiles,
+            Action::ViewThumbnails => self.view = ViewMode::Thumbnails,
             Action::ToggleFolders => {
                 self.bar = if self.bar == ExplorerBar::Folders {
                     ExplorerBar::None
@@ -1176,19 +1537,15 @@ impl ExplorerState {
                 self.rebuild(fs);
             }
             Action::CopyPath => {
-                if let Some(node) = node {
-                    let mut buffer = [0u8; PATH_MAX];
-                    let path = fs.path(node, &mut buffer).unwrap_or("/");
-                    self.address.set(path);
-                    self.address_edit = false;
-                    self.set_message("Path copied to the Address bar.", now);
-                }
+                self.copy_paths(fs, node, now);
             }
             Action::FolderOptions => self.dialog = Dialog::Options,
             Action::About => self.dialog = Dialog::About,
             Action::Delete => self.read_only(now),
             Action::NewFolder => self.read_only(now),
-            Action::Cut | Action::Copy | Action::Paste => self.read_only(now),
+            Action::Copy => self.copy_paths(fs, node, now),
+            Action::Paste => self.paste(),
+            Action::Cut => self.read_only(now),
             Action::MapDrive => self.show_notice(
                 "Map Network Drive",
                 "Network drives are not available on this board.",
@@ -1198,7 +1555,7 @@ impl ExplorerState {
                 "File Explorer Help",
                 "Use the mouse or the arrow keys. F3 searches, F5 refreshes, \
                  Ctrl+L focuses the Address bar, Backspace goes up, Enter opens \
-                 an item, and Esc closes the explorer.",
+                 an item, and Esc leaves a search or closes a menu.",
                 now,
             ),
             Action::Home | Action::MyComputer | Action::Desktop => {
@@ -1221,6 +1578,7 @@ impl ExplorerState {
             self.sort = sort;
             self.sort_desc = false;
         }
+        self.sort_pending = true;
     }
 
     fn cycle_focus(&mut self, reverse: bool) {
@@ -1314,8 +1672,8 @@ impl ExplorerState {
             if !has_subdirectories(fs, node) {
                 return;
             }
-            if !bit(&self.expanded, node.0 as usize) {
-                set_bit(&mut self.expanded, node.0 as usize);
+            if !self.is_expanded(node) {
+                self.set_expanded(node);
                 self.rebuild_tree(fs);
             } else if self.tree_cursor + 1 < self.tree_len
                 && self.tree_depth[self.tree_cursor + 1] > self.tree_depth[self.tree_cursor]
@@ -1328,8 +1686,8 @@ impl ExplorerState {
 
     fn tree_collapse(&mut self, fs: &dyn FileSystem) {
         if let Some(node) = self.tree.get(self.tree_cursor).copied() {
-            if bit(&self.expanded, node.0 as usize) && has_subdirectories(fs, node) {
-                clear_bit(&mut self.expanded, node.0 as usize);
+            if self.is_expanded(node) && has_subdirectories(fs, node) {
+                self.clear_expanded(node);
                 self.rebuild_tree(fs);
             } else if let Some(parent) = fs.parent(node) {
                 if let Some(index) = self
@@ -1364,6 +1722,14 @@ impl ExplorerState {
         if self.tree_scroll > max {
             self.tree_scroll = max;
         }
+    }
+
+    /// Keeps the tree's scroll in range without chasing its cursor, so wheel
+    /// scrolling stays where it was put.
+    fn limit_tree_scroll(&mut self) {
+        let layout = Layout::compute(self.screen, self);
+        let visible = (layout.tree.height as i32 / TREE_ROW).max(1) as usize;
+        self.tree_scroll = self.tree_scroll.min(self.tree_len.saturating_sub(visible));
     }
 
     fn max_scroll(&self) -> usize {
@@ -1414,7 +1780,7 @@ impl ExplorerState {
         }
 
         if self.mouse_down {
-            self.update_drag();
+            self.update_drag(fs);
         }
 
         if let Some(false) = report.left {
@@ -1434,8 +1800,19 @@ impl ExplorerState {
         self.exit
     }
 
-    fn update_drag(&mut self) {
+    fn update_drag(&mut self, fs: &dyn FileSystem) {
         match self.drag {
+            DragMode::Row { start, node } => {
+                let dx = (self.pointer.x - start.x).abs();
+                let dy = (self.pointer.y - start.y).abs();
+                if dx.max(dy) >= DRAG_THRESHOLD {
+                    self.drag = DragMode::None;
+                    let mut buffer = [0u8; PATH_MAX];
+                    if let Some(path) = fs.path(node, &mut buffer) {
+                        host::begin_drag(path);
+                    }
+                }
+            }
             DragMode::Move { dx, dy } => {
                 if !self.maximized {
                     self.window_x = self.pointer.x - dx;
@@ -1462,22 +1839,24 @@ impl ExplorerState {
                     const MIN_HEIGHT: i32 = 480;
                     let dx = self.pointer.x - pointer_x;
                     let dy = self.pointer.y - pointer_y;
-                    let max_right = self.screen.width as i32;
-                    let max_bottom = self.screen.height as i32;
+                    // On a screen smaller than the minimum window, the minimum
+                    // wins over staying on screen.
+                    let max_right = (self.screen.width as i32).max(MIN_WIDTH);
+                    let max_bottom = (self.screen.height as i32).max(MIN_HEIGHT);
                     let mut left = x;
                     let mut top = y;
-                    let mut right = (x + width).min(max_right);
-                    let mut bottom = (y + height).min(max_bottom);
+                    let mut right = (x + width).min(max_right).max(MIN_WIDTH);
+                    let mut bottom = (y + height).min(max_bottom).max(MIN_HEIGHT);
 
                     if edge.moves_left() {
                         left = (x + dx).clamp(0, right - MIN_WIDTH);
                     } else if edge.moves_right() {
-                        right = (x + width + dx).clamp(left + MIN_WIDTH, max_right);
+                        right = (x + width + dx).clamp(left + MIN_WIDTH, max_right.max(left + MIN_WIDTH));
                     }
                     if edge.moves_top() {
                         top = (y + dy).clamp(0, bottom - MIN_HEIGHT);
                     } else if edge.moves_bottom() {
-                        bottom = (y + height + dy).clamp(top + MIN_HEIGHT, max_bottom);
+                        bottom = (y + height + dy).clamp(top + MIN_HEIGHT, max_bottom.max(top + MIN_HEIGHT));
                     }
 
                     self.window_x = left;
@@ -1513,7 +1892,7 @@ impl ExplorerState {
             if let Some(rect) = entry_rect(self, layout, metrics, index) {
                 if rect.right_i32() >= x0 && rect.x <= x1 && rect.bottom_i32() >= y0 && rect.y <= y1
                 {
-                    self.select_node(self.entries[index]);
+                    self.select_index(index);
                 }
             }
         }
@@ -1700,7 +2079,12 @@ impl ExplorerState {
             }
             if layout.list.contains(point) {
                 if let Some(index) = entry_at(self, layout, point) {
+                    let node = self.entries[index];
                     self.click_entry(fs, index, point, now, false);
+                    // A press that opened nothing may turn into a drag.
+                    if self.last_click_node == Some(node) && self.dialog == Dialog::None {
+                        self.drag = DragMode::Row { start: point, node };
+                    }
                 } else {
                     self.clear_selection();
                     self.anchor = self.cursor;
@@ -1723,7 +2107,7 @@ impl ExplorerState {
         let same = self.last_click_node == self.entries.get(index).copied()
             && now.saturating_sub(self.last_click_ms) < 480;
         if right {
-            if !self.is_selected(self.entries[index]) {
+            if !self.is_selected(index) {
                 self.select_only(index);
             } else {
                 self.cursor = index;
@@ -1738,7 +2122,7 @@ impl ExplorerState {
         self.sync_preview(fs);
         if same {
             self.last_click_node = None;
-            self.open_focused(fs);
+            self.open_focused(fs, now);
         }
         let _ = point;
     }
@@ -1747,25 +2131,15 @@ impl ExplorerState {
         let Some(header) = layout.header else {
             return;
         };
-        let width = header.width as i32;
-        let name = width * 45 / 100;
-        let size = width * 15 / 100;
-        let kind = width * 24 / 100;
+        let (name, size) = column_widths(header.width as i32);
         let key = if point.x < header.x + name {
             SortKey::Name
         } else if point.x < header.x + name + size {
             SortKey::Size
-        } else if point.x < header.x + name + size + kind {
-            SortKey::Type
         } else {
-            return;
+            SortKey::Type
         };
         self.set_sort(key);
-        // Header clicks rebuild below; the filesystem is supplied by the caller
-        // through refresh in the event loop. This action only re-orders local
-        // entries, so mark the sort dirty via a dedicated field-less rebuild is
-        // not possible here; the next event refreshes it. See `after_input`.
-        self.sort_pending = true;
     }
 
     fn sidebar_click(
@@ -1790,7 +2164,7 @@ impl ExplorerState {
                         let arrow_x = layout.tree.x + 5 + depth * 12;
                         if point.x >= arrow_x
                             && point.x < arrow_x + 14
-                            && has_subdirectories(fs, node)
+                            && self.tree_children[index]
                         {
                             self.toggle_expanded(fs, node);
                             if let Some(index) = self
@@ -1837,6 +2211,7 @@ impl ExplorerState {
                 if search_clear_rect(sidebar).contains(point) {
                     self.search.clear();
                     self.search_count = 0;
+                    self.search_truncated = false;
                     self.rebuild(fs);
                     return false;
                 }
@@ -1967,17 +2342,48 @@ impl ExplorerState {
         }
     }
 
+    /// Moves the viewer by `delta` lines (or 16-byte rows of a binary file).
+    ///
+    /// The viewer holds only the bytes on screen and reads the rest as needed,
+    /// so the size of the file makes no difference to how far it can go.
     fn scroll_viewer(&mut self, fs: &dyn FileSystem, node: NodeId, delta: isize) {
         if !fs.is_file(node) {
             return;
         }
-        let visible = self.viewer_visible_lines();
-        let max = self.viewer_lines.saturating_sub(visible);
-        if delta < 0 {
-            self.viewer_scroll = self.viewer_scroll.saturating_sub((-delta) as usize);
+        let size = fs.size(node);
+        let offset = self.viewer_offset;
+        let count = delta.unsigned_abs();
+        let next = if self.viewer_binary {
+            let bytes = count.saturating_mul(16);
+            let last = self.viewer_last_offset(fs, node);
+            if delta < 0 {
+                offset.saturating_sub(bytes)
+            } else {
+                offset.saturating_add(bytes).min(last)
+            }
+        } else if delta < 0 {
+            preview::lines_before(fs, node, offset, count)
         } else {
-            self.viewer_scroll = (self.viewer_scroll + delta as usize).min(max);
+            preview::lines_after(fs, node, offset, count).min(size)
+        };
+        self.seek_viewer(fs, node, next);
+    }
+
+    /// Where the viewer stops, so the last screenful is full.
+    fn viewer_last_offset(&self, fs: &dyn FileSystem, node: NodeId) -> usize {
+        let size = fs.size(node);
+        let visible = self.viewer_visible_lines();
+        if self.viewer_binary {
+            let rows = size.div_ceil(16);
+            rows.saturating_sub(visible).saturating_mul(16)
+        } else {
+            preview::lines_before(fs, node, size, visible)
         }
+    }
+
+    fn seek_viewer(&mut self, fs: &dyn FileSystem, node: NodeId, offset: usize) {
+        self.viewer_offset = offset;
+        self.viewer_len = fs.read(node, offset, &mut self.viewer);
     }
 
     fn viewer_visible_lines(&self) -> usize {
@@ -1993,9 +2399,10 @@ impl ExplorerState {
     }
 
     fn after_input(&mut self, fs: &dyn FileSystem, now: u64) {
+        self.take_drop(fs, now);
         if self.sort_pending {
             self.sort_pending = false;
-            self.refresh(fs);
+            self.rebuild(fs);
         }
         if self.search_dirty {
             self.search_dirty = false;
@@ -2003,12 +2410,24 @@ impl ExplorerState {
                 self.run_search(fs);
             }
         }
+        // Leaving the search pane, by any route, must take its results along.
+        if self.listed_search != self.searching() {
+            self.rebuild(fs);
+        }
         if self.message_until != 0 && now >= self.message_until {
             self.message.clear();
             self.message_until = 0;
         }
-        self.ensure_cursor_visible();
-        self.clamp_tree_scroll();
+        // Follow the cursor only when it moved: this runs on every event,
+        // including the wheel event that just scrolled away from it.
+        if self.pin_pending || self.cursor != self.pinned_cursor {
+            self.pin_pending = false;
+            self.pinned_cursor = self.cursor;
+            self.ensure_cursor_visible();
+        } else {
+            self.clamp_scroll();
+        }
+        self.limit_tree_scroll();
         self.sync_preview(fs);
     }
 
@@ -2105,7 +2524,7 @@ impl ExplorerState {
                     return self.perform(fs, Action::Refresh, None, now);
                 }
                 Key::Character('o') => {
-                    self.open_focused(fs);
+                    self.open_focused(fs, now);
                     return false;
                 }
                 Key::Character('p') => {
@@ -2113,6 +2532,10 @@ impl ExplorerState {
                 }
                 Key::Character('c') => {
                     return self.perform(fs, Action::CopyPath, None, now);
+                }
+                Key::Character('v') => {
+                    self.paste();
+                    return false;
                 }
                 Key::Character('i') => {
                     self.invert_selection();
@@ -2150,6 +2573,11 @@ impl ExplorerState {
                 }
                 Key::Enter => {
                     return self.perform(fs, Action::Properties, None, now);
+                }
+                // In a window the desktop takes Alt+F4 before this sees it.
+                Key::F4 => {
+                    self.exit = true;
+                    return true;
                 }
                 _ => {}
             }
@@ -2255,8 +2683,8 @@ impl ExplorerState {
                 }
             }
             Key::Backspace => self.go_up(fs),
-            Key::Escape => self.exit = true,
-            Key::Character('q') => self.exit = true,
+            Key::Escape if !self.embedded => self.exit = true,
+            Key::Character('q') if !self.embedded => self.exit = true,
             _ => {}
         }
     }
@@ -2273,7 +2701,7 @@ impl ExplorerState {
                 }
             }
             Key::Left => self.go_up(fs),
-            Key::Right => self.open_focused(fs),
+            Key::Right => self.open_focused(fs, now),
             Key::Home => self.move_cursor(fs, 0, shift, ctrl),
             Key::End => {
                 if self.entry_count > 0 {
@@ -2291,7 +2719,7 @@ impl ExplorerState {
                     );
                 }
             }
-            Key::Enter => self.open_focused(fs),
+            Key::Enter => self.open_focused(fs, now),
             Key::Space => {
                 if self.entry_count > 0 {
                     self.toggle_at(self.cursor);
@@ -2309,8 +2737,16 @@ impl ExplorerState {
             }
             Key::Delete => self.read_only(now),
             Key::Backspace => self.go_up(fs),
+            // A hosted window closes through its chrome or Alt+F4, so a stray
+            // key cannot throw away where the user was. Without chrome, these
+            // are the way out.
+            Key::Escape if self.embedded || self.searching() => {
+                if self.searching() {
+                    self.leave_search();
+                }
+            }
             Key::Escape => self.exit = true,
-            Key::Character('q') if !ctrl => self.exit = true,
+            Key::Character('q') if !ctrl && !self.embedded => self.exit = true,
             _ => {}
         }
     }
@@ -2377,10 +2813,10 @@ impl ExplorerState {
                 Key::Down => self.scroll_viewer(fs, node, 1),
                 Key::PageUp => self.scroll_viewer(fs, node, -12),
                 Key::PageDown => self.scroll_viewer(fs, node, 12),
-                Key::Home => self.viewer_scroll = 0,
+                Key::Home => self.seek_viewer(fs, node, 0),
                 Key::End => {
-                    let visible = self.viewer_visible_lines();
-                    self.viewer_scroll = self.viewer_lines.saturating_sub(visible);
+                    let last = self.viewer_last_offset(fs, node);
+                    self.seek_viewer(fs, node, last);
                 }
                 _ => {}
             },
@@ -2426,7 +2862,7 @@ impl ExplorerState {
         }
         if !layout.window.contains(point) {
             // Modal dialogs ignore clicks outside; only the close/OK buttons
-            // dismiss them, matching XP's property sheets.
+            // dismiss them.
         }
         let _ = (fs, now);
         false
@@ -2494,64 +2930,71 @@ fn file_extension(name: &str) -> &str {
     }
 }
 
-fn type_name(node: NodeId, fs: &dyn FileSystem) -> &'static str {
+const TYPE_NAMES: [&str; 11] = [
+    "File",
+    "File Folder",
+    "Text Document",
+    "Markdown File",
+    "Rust Source",
+    "TOML File",
+    "YAML Document",
+    "JSON File",
+    "Image",
+    "App Bundle",
+    "Archive",
+];
+const TYPE_IMAGE: u8 = 8;
+
+fn type_index(node: NodeId, fs: &dyn FileSystem) -> u8 {
     if fs.is_dir(node) {
-        return "File Folder";
+        return 1;
     }
     let extension = file_extension(fs.name(node).unwrap_or(""));
-    if extension.eq_ignore_ascii_case("txt") {
-        "Text Document"
-    } else if extension.eq_ignore_ascii_case("md") {
-        "Markdown File"
-    } else if extension.eq_ignore_ascii_case("rs") {
-        "Rust Source"
-    } else if extension.eq_ignore_ascii_case("toml") {
-        "TOML File"
-    } else if extension.eq_ignore_ascii_case("yaml") || extension.eq_ignore_ascii_case("yml") {
-        "YAML Document"
-    } else if extension.eq_ignore_ascii_case("json") {
-        "JSON File"
-    } else if extension.eq_ignore_ascii_case("bmp")
-        || extension.eq_ignore_ascii_case("png")
-        || extension.eq_ignore_ascii_case("qoi")
-        || extension.eq_ignore_ascii_case("ppm")
-        || extension.eq_ignore_ascii_case("jpg")
-    {
-        "Image"
-    } else if extension.eq_ignore_ascii_case("fapp") {
-        "App Bundle"
-    } else if extension.eq_ignore_ascii_case("zip")
-        || extension.eq_ignore_ascii_case("tar")
-        || extension.eq_ignore_ascii_case("gz")
-    {
-        "Archive"
+    let matches = |names: &[&str]| names.iter().any(|name| extension.eq_ignore_ascii_case(name));
+    if matches(&["txt"]) {
+        2
+    } else if matches(&["md"]) {
+        3
+    } else if matches(&["rs"]) {
+        4
+    } else if matches(&["toml"]) {
+        5
+    } else if matches(&["yaml", "yml"]) {
+        6
+    } else if matches(&["json"]) {
+        7
+    } else if matches(&["bmp", "png", "qoi", "ppm", "jpg", "jpeg"]) {
+        TYPE_IMAGE
+    } else if matches(&["fapp"]) {
+        9
+    } else if matches(&["zip", "tar", "gz"]) {
+        10
     } else {
-        "File"
+        0
     }
 }
 
-fn file_accent(name: &str) -> Color {
-    let extension = file_extension(name);
-    if extension.eq_ignore_ascii_case("txt") || extension.eq_ignore_ascii_case("md") {
-        Color::rgb(60, 130, 220)
-    } else if extension.eq_ignore_ascii_case("rs") {
-        Color::rgb(222, 112, 52)
-    } else if extension.eq_ignore_ascii_case("json")
-        || extension.eq_ignore_ascii_case("yaml")
-        || extension.eq_ignore_ascii_case("yml")
-        || extension.eq_ignore_ascii_case("toml")
-    {
-        Color::rgb(90, 160, 80)
-    } else if extension.eq_ignore_ascii_case("bmp")
-        || extension.eq_ignore_ascii_case("png")
-        || extension.eq_ignore_ascii_case("qoi")
-        || extension.eq_ignore_ascii_case("ppm")
-        || extension.eq_ignore_ascii_case("jpg")
-    {
-        Color::rgb(176, 82, 196)
-    } else {
-        Color::rgb(120, 120, 120)
+fn type_name(node: NodeId, fs: &dyn FileSystem) -> &'static str {
+    TYPE_NAMES[type_index(node, fs) as usize]
+}
+
+const fn is_image_type(index: u8) -> bool {
+    index == TYPE_IMAGE
+}
+
+fn type_accent(index: u8) -> Color {
+    match index {
+        2 | 3 => Color::rgb(60, 130, 220),
+        4 => Color::rgb(222, 112, 52),
+        5..=7 => Color::rgb(90, 160, 80),
+        TYPE_IMAGE => Color::rgb(176, 82, 196),
+        _ => Color::rgb(120, 120, 120),
     }
+}
+
+/// The widths of the Name and Size columns; Type takes the rest.
+fn column_widths(width: i32) -> (i32, i32) {
+    (width * 50 / 100, width * 15 / 100)
 }
 
 fn compare_nodes(
@@ -2597,16 +3040,24 @@ fn has_subdirectories(fs: &dyn FileSystem, node: NodeId) -> bool {
     false
 }
 
-fn viewer_line_count(bytes: &[u8]) -> usize {
-    if core::str::from_utf8(bytes).is_ok() && !bytes.contains(&0) {
-        bytes.iter().filter(|byte| **byte == b'\n').count() + 1
-    } else {
-        (bytes.len() + 15) / 16
+/// Whether `bytes`, which may stop partway through a character, read as text.
+fn is_text(bytes: &[u8]) -> bool {
+    if bytes.contains(&0) {
+        return false;
+    }
+    match core::str::from_utf8(bytes) {
+        Ok(_) => true,
+        // No `error_len` means the input just ran out mid-character.
+        Err(error) => error.error_len().is_none(),
     }
 }
 
-fn is_text(bytes: &[u8]) -> bool {
-    core::str::from_utf8(bytes).is_ok() && !bytes.contains(&0)
+/// The part of `bytes` that is valid UTF-8, from the start.
+fn text_prefix(bytes: &[u8]) -> &str {
+    match core::str::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => core::str::from_utf8(&bytes[..error.valid_up_to()]).unwrap_or(""),
+    }
 }
 
 fn first_enabled(kind: MenuKind, state: &ExplorerState, fs: &dyn FileSystem) -> usize {
@@ -3129,6 +3580,7 @@ fn grid_metrics(state: &ExplorerState, list: Rect, main_width: u32) -> GridMetri
         ViewMode::Icons => (112, 82),
         ViewMode::Tiles => (218, 52),
         ViewMode::List => (190, ROW_HEIGHT),
+        ViewMode::Thumbnails => (128, 118),
     };
     let columns = match state.view {
         ViewMode::Details => 1,
@@ -3194,7 +3646,6 @@ fn entry_at(state: &ExplorerState, layout: Layout, point: Point) -> Option<usize
     }
 }
 
-/// Runs the interactive XP-style explorer.
 /// State of an explorer hosted inside a desktop window.
 static WINDOW: SpinLock<Option<ExplorerState>> = SpinLock::new(None);
 
@@ -3211,6 +3662,8 @@ pub(super) fn open_window(fs: &dyn FileSystem, context: &WindowContext<'_, '_>) 
     state.show_cursor = false;
     state.embedded = true;
     state.maximized = true;
+    state.apply_args(fs, context.args, context.now_ms);
+    state.after_input(fs, context.now_ms);
     *WINDOW.lock() = Some(state);
     true
 }
@@ -3257,6 +3710,68 @@ pub(super) fn close_window() {
     *WINDOW.lock() = None;
 }
 
+/// Hands a dropped path to the open window, if there is one.
+pub(super) fn accept_drop(payload: &str) -> bool {
+    let mut guard = WINDOW.lock();
+    let Some(state) = guard.as_mut() else {
+        return false;
+    };
+    state.pending_drop = Some(Text::from_str(payload));
+    true
+}
+
+/// Whether the window has work left that needs frames without input.
+pub(super) fn needs_frames() -> bool {
+    WINDOW
+        .try_lock()
+        .is_some_and(|guard| guard.as_ref().is_some_and(|state| state.thumbs_pending))
+}
+
+/// The ways the explorer reaches the desktop session. Tests record these
+/// instead of posting to queues other tests could be draining.
+#[cfg(not(test))]
+mod host {
+    use feos_app::shell;
+
+    /// Opens `path` with its associated app. Returns `false` without a session
+    /// or an association, and the caller falls back to the viewer.
+    pub fn open_file(path: &str) -> bool {
+        shell::session_active() && shell::request_open_file(path)
+    }
+
+    pub fn begin_drag(path: &str) {
+        if shell::session_active() {
+            shell::begin_drag(path);
+        }
+    }
+}
+
+#[cfg(test)]
+mod host {
+    use std::cell::{Cell, RefCell};
+    use std::string::{String, ToString};
+
+    std::thread_local! {
+        pub static SESSION: Cell<bool> = const { Cell::new(false) };
+        pub static OPENED: RefCell<Option<String>> = const { RefCell::new(None) };
+        pub static DRAGGED: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    pub fn open_file(path: &str) -> bool {
+        if SESSION.with(Cell::get) && feos_app::shell::association_for(path).is_some() {
+            OPENED.with(|cell| *cell.borrow_mut() = Some(path.to_string()));
+            return true;
+        }
+        false
+    }
+
+    pub fn begin_drag(path: &str) {
+        if SESSION.with(Cell::get) {
+            DRAGGED.with(|cell| *cell.borrow_mut() = Some(path.to_string()));
+        }
+    }
+}
+
 pub fn run(fs: &dyn FileSystem, context: &mut Context<'_>) {
     let platform = context.platform;
     let suspend = context.suspend;
@@ -3284,6 +3799,7 @@ pub fn run(fs: &dyn FileSystem, context: &mut Context<'_>) {
 
     let mut input = Input::new();
     let mut keys = SerialKeys::new();
+    let mut evdev = EvdevKeys::new();
     let mut dirty = true;
     let mut last_notice = false;
 
@@ -3300,6 +3816,16 @@ pub fn run(fs: &dyn FileSystem, context: &mut Context<'_>) {
         let now = platform.clock.uptime_ms();
         if keys.poll(now, &mut input) {
             break;
+        }
+        // This loop owns the machine while it runs, so a virtio keyboard has to
+        // be read here too or it would go dead until the explorer closes.
+        if let Some(keyboard) = platform.keyboard {
+            while input.keyboard_capacity() >= 2 {
+                let Some(event) = keyboard.poll() else {
+                    break;
+                };
+                evdev.feed(event, &mut input);
+            }
         }
 
         let mut pointer_changed = false;
@@ -3399,6 +3925,7 @@ fn render(canvas: &mut Canvas<'_>, fs: &dyn FileSystem, state: &mut ExplorerStat
         canvas.width() as u32,
         canvas.height() as u32,
     ));
+    state.update_thumbs(fs);
     let mut painter = Painter::new(canvas);
     draw_backdrop(&mut painter, state);
     let layout = Layout::compute(state.screen, state);
@@ -3900,9 +4427,9 @@ fn draw_tree(
             painter.fill_rect(row_rect, SELECT_SOFT);
         }
         let x = layout.tree.x + 5 + depth * 12;
-        if has_subdirectories(fs, node) {
+        if state.tree_children[index] {
             let cy = y + TREE_ROW / 2;
-            let points = if bit(&state.expanded, node.0 as usize) {
+            let points = if state.is_expanded(node) {
                 [
                     Point::new(x, cy - 2),
                     Point::new(x + 8, cy - 2),
@@ -4200,6 +4727,7 @@ fn draw_main(
         ViewMode::Icons => draw_icons(painter, fs, state, layout),
         ViewMode::List => draw_list(painter, fs, state, layout),
         ViewMode::Tiles => draw_tiles(painter, fs, state, layout),
+        ViewMode::Thumbnails => draw_thumbnails(painter, fs, state, layout),
     }
 }
 
@@ -4218,9 +4746,9 @@ fn draw_details(
         BORDER,
     );
     let width = header.width as i32;
-    let name_w = width * 45 / 100;
-    let size_w = width * 15 / 100;
-    let type_w = width * 24 / 100;
+    let (name_w, size_w) = column_widths(width);
+    let type_w = width - name_w - size_w;
+    // The filesystems record no timestamps, so there is no Modified column.
     let columns = [
         (header.x, name_w, "Name", Some(SortKey::Name)),
         (header.x + name_w, size_w, "Size", Some(SortKey::Size)),
@@ -4229,12 +4757,6 @@ fn draw_details(
             type_w,
             "Type",
             Some(SortKey::Type),
-        ),
-        (
-            header.x + name_w + size_w + type_w,
-            width - name_w - size_w - type_w,
-            "Modified",
-            None,
         ),
     ];
     for (x, w, label, key) in columns {
@@ -4317,7 +4839,8 @@ fn draw_detail_row(
         return;
     };
     let node = state.entries[index];
-    let selected = state.is_selected(node);
+    let info = state.infos[index];
+    let selected = state.is_selected(index);
     let hovered = row.contains(state.pointer) && state.has_pointer;
     if selected {
         painter.fill_rect(row, SELECT);
@@ -4325,7 +4848,7 @@ fn draw_detail_row(
         painter.fill_rect(row, HOVER_LIGHT);
     }
     let fg = if selected { Color::WHITE } else { TEXT };
-    draw_node_icon(painter, node, fs, Rect::new(row.x + 4, row.y + 2, 16, 16));
+    draw_entry_icon(painter, info, Rect::new(row.x + 4, row.y + 2, 16, 16));
     painter.draw_text_ellipsis(
         Rect::new(row.x + 25, row.y, (name_w - 28).max(10) as u32, row.height),
         fs.name(node).unwrap_or("?"),
@@ -4334,10 +4857,10 @@ fn draw_detail_row(
         Align::Start,
         VerticalAlign::Middle,
     );
-    let size = if fs.is_dir(node) {
+    let size = if info.is_dir {
         Text::<16>::from_str("")
     } else {
-        format_size(fs.size(node))
+        format_size(info.size)
     };
     painter.draw_text_ellipsis(
         Rect::new(
@@ -4359,22 +4882,8 @@ fn draw_detail_row(
             (type_w - 8).max(10) as u32,
             row.height,
         ),
-        type_name(node, fs),
+        TYPE_NAMES[info.type_index as usize],
         if selected { Color::WHITE } else { TEXT },
-        1,
-        Align::Start,
-        VerticalAlign::Middle,
-    );
-    painter.draw_text_ellipsis(
-        Rect::new(
-            row.x + name_w + size_w + type_w + 4,
-            row.y,
-            row.width
-                .saturating_sub((name_w + size_w + type_w + 8) as u32),
-            row.height,
-        ),
-        "-",
-        if selected { Color::WHITE } else { MUTED },
         1,
         Align::Start,
         VerticalAlign::Middle,
@@ -4396,15 +4905,15 @@ fn draw_icons(
             continue;
         };
         let node = state.entries[index];
-        let selected = state.is_selected(node);
+        let info = state.infos[index];
+        let selected = state.is_selected(index);
         let hovered = cell.contains(state.pointer) && state.has_pointer;
         if hovered && !selected {
             painter.fill_rect(cell.inset(2), HOVER_LIGHT);
         }
-        draw_node_icon(
+        draw_entry_icon(
             painter,
-            node,
-            fs,
+            info,
             Rect::new(cell.x + (cell.width as i32 - 40) / 2, cell.y + 5, 40, 36),
         );
         let label = Rect::new(cell.x + 3, cell.y + 46, cell.width.saturating_sub(6), 17);
@@ -4427,10 +4936,10 @@ fn draw_icons(
             Align::Center,
             VerticalAlign::Middle,
         );
-        let detail = if fs.is_dir(node) {
+        let detail = if info.is_dir {
             Text::<16>::from_str("File Folder")
         } else {
-            format_size(fs.size(node))
+            format_size(info.size)
         };
         painter.draw_text_ellipsis(
             Rect::new(cell.x + 3, cell.y + 64, cell.width.saturating_sub(6), 14),
@@ -4466,14 +4975,15 @@ fn draw_list(
             continue;
         };
         let node = state.entries[index];
-        let selected = state.is_selected(node);
+        let info = state.infos[index];
+        let selected = state.is_selected(index);
         let hovered = cell.contains(state.pointer) && state.has_pointer;
         if selected {
             painter.fill_rect(cell, SELECT);
         } else if hovered {
             painter.fill_rect(cell, HOVER_LIGHT);
         }
-        draw_node_icon(painter, node, fs, Rect::new(cell.x + 3, cell.y + 2, 16, 16));
+        draw_entry_icon(painter, info, Rect::new(cell.x + 3, cell.y + 2, 16, 16));
         painter.draw_text_ellipsis(
             Rect::new(
                 cell.x + 24,
@@ -4513,14 +5023,15 @@ fn draw_tiles(
             continue;
         };
         let node = state.entries[index];
-        let selected = state.is_selected(node);
+        let info = state.infos[index];
+        let selected = state.is_selected(index);
         let hovered = cell.contains(state.pointer) && state.has_pointer;
         if selected {
             painter.fill_rect(cell.inset(1), SELECT);
         } else if hovered {
             painter.fill_rect(cell.inset(1), HOVER_LIGHT);
         }
-        draw_node_icon(painter, node, fs, Rect::new(cell.x + 5, cell.y + 8, 30, 30));
+        draw_entry_icon(painter, info, Rect::new(cell.x + 5, cell.y + 8, 30, 30));
         painter.draw_text_ellipsis(
             Rect::new(cell.x + 42, cell.y + 6, cell.width.saturating_sub(46), 18),
             fs.name(node).unwrap_or("?"),
@@ -4531,16 +5042,16 @@ fn draw_tiles(
         );
         painter.draw_text_ellipsis(
             Rect::new(cell.x + 42, cell.y + 26, cell.width.saturating_sub(46), 16),
-            type_name(node, fs),
+            TYPE_NAMES[info.type_index as usize],
             if selected { Color::WHITE } else { MUTED },
             1,
             Align::Start,
             VerticalAlign::Middle,
         );
-        let detail = if fs.is_dir(node) {
+        let detail = if info.is_dir {
             Text::<16>::from_str("Folder")
         } else {
-            format_size(fs.size(node))
+            format_size(info.size)
         };
         painter.draw_text_ellipsis(
             Rect::new(cell.x + 42, cell.y + 44, cell.width.saturating_sub(46), 14),
@@ -4559,6 +5070,91 @@ fn draw_tiles(
         metrics.visible_rows,
         metrics.rows,
     );
+}
+
+fn draw_thumbnails(
+    painter: &mut Painter<'_, '_>,
+    fs: &dyn FileSystem,
+    state: &mut ExplorerState,
+    layout: Layout,
+) {
+    let metrics = grid_metrics(state, layout.list, layout.main.width);
+    let clip = painter.push_clip(layout.list);
+    let first = state.scroll * metrics.columns;
+    let last = ((state.scroll + metrics.visible_rows) * metrics.columns).min(state.entry_count);
+    for index in first..last {
+        let Some(cell) = entry_rect(state, layout, metrics, index) else {
+            continue;
+        };
+        let node = state.entries[index];
+        let selected = state.is_selected(index);
+        let hovered = cell.contains(state.pointer) && state.has_pointer;
+        if hovered && !selected {
+            painter.fill_rect(cell.inset(2), HOVER_LIGHT);
+        }
+        let frame = Rect::new(cell.x + 12, cell.y + 6, THUMB_BOX.0 + 8, THUMB_BOX.1 + 8);
+        painter.stroke_rect(frame, 1, if selected { SELECT } else { BORDER });
+        let thumb = state
+            .thumbs
+            .iter()
+            .find(|thumb| thumb.node == node)
+            .and_then(|thumb| thumb.image.as_ref());
+        match thumb {
+            Some(image) => draw_image(painter, image, frame.inset(4)),
+            None => draw_entry_icon(
+                painter,
+                state.infos[index],
+                Rect::new(frame.x + 32, frame.y + 26, 40, 36),
+            ),
+        }
+        let label = Rect::new(cell.x + 3, cell.y + 96, cell.width.saturating_sub(6), 17);
+        if selected {
+            painter.fill_rect(label, SELECT);
+        }
+        painter.draw_text_ellipsis(
+            label,
+            fs.name(node).unwrap_or("?"),
+            if selected { Color::WHITE } else { TEXT },
+            1,
+            Align::Center,
+            VerticalAlign::Middle,
+        );
+    }
+    painter.restore_clip(clip);
+    draw_scrollbar(
+        painter,
+        layout.list,
+        state.scroll,
+        metrics.visible_rows,
+        metrics.rows,
+    );
+}
+
+/// Draws `image` centred in `rect`, shrunk to fit if it has to be.
+fn draw_image(painter: &mut Painter<'_, '_>, image: &Decoded, rect: Rect) {
+    if rect.is_empty() {
+        return;
+    }
+    let (width, height) = preview::fit_size(image.width, image.height, rect.width, rect.height);
+    let x = rect.x + (rect.width as i32 - width as i32) / 2;
+    let y = rect.y + (rect.height as i32 - height as i32) / 2;
+    if width == image.width && height == image.height {
+        painter.blit(x, y, width, height, &image.pixels);
+        return;
+    }
+    for row in 0..height {
+        let source_y = (row as u64 * image.height as u64 / height as u64) as usize;
+        for column in 0..width {
+            let source_x = (column as u64 * image.width as u64 / width as u64) as usize;
+            if let Some(pixel) = image.pixels.get(source_y * image.width as usize + source_x) {
+                painter.put_pixel(
+                    x + column as i32,
+                    y + row as i32,
+                    Color::from_u32(*pixel),
+                );
+            }
+        }
+    }
 }
 
 fn draw_preview(
@@ -4680,13 +5276,15 @@ fn draw_preview_content(
             );
             y += 16;
         }
+    } else if let Some(image) = state.image_of(node) {
+        draw_image(painter, image, rect);
     } else {
         let bytes = &state.preview[..state.preview_len];
         if is_text(bytes) {
-            let text = core::str::from_utf8(bytes).unwrap_or("");
-            draw_scrolled_text(painter, rect, text, state.preview_scroll, TEXT);
+            draw_scrolled_text(painter, rect, text_prefix(bytes), state.preview_scroll, TEXT);
         } else {
-            draw_hex_dump(painter, rect, bytes, state.preview_scroll);
+            let skip = state.preview_scroll.saturating_mul(16).min(bytes.len());
+            draw_hex_dump(painter, rect, &bytes[skip..], skip);
         }
         if state.preview_len < fs.size(node) {
             painter.draw_text_ellipsis(
@@ -4737,10 +5335,8 @@ fn draw_status_bar(
     let mut left = Text::<160>::new();
     if state.message_until > now && !state.message.is_empty() {
         left.set(state.message.as_str());
-    } else if state.searching() {
-        let _ = write!(left, "{} item(s) found", state.entry_count);
     } else {
-        let _ = write!(left, "{} object(s)", state.entry_count);
+        left = state.listing_summary();
     }
     if state.selected_count() > 0 && !(state.message_until > now) {
         let _ = write!(left, "    {} selected", state.selected_count());
@@ -4759,15 +5355,16 @@ fn draw_status_bar(
         VerticalAlign::Middle,
     );
     let mut middle = Text::<96>::new();
-    if let Some(node) = state.focused_node() {
-        if fs.is_file(node) {
-            let _ = write!(middle, "{}", format_size(fs.size(node)));
+    if state.focused_node().is_some() {
+        let info = state.infos[state.cursor];
+        if info.is_dir {
+            let _ = write!(middle, "{}", TYPE_NAMES[info.type_index as usize]);
         } else {
-            let _ = write!(middle, "{}", type_name(node, fs));
+            let _ = write!(middle, "{}", format_size(info.size));
         }
     }
     if state.selected_count() > 1 {
-        let _ = write!(middle, "   {}", format_size(state.selected_bytes(fs)));
+        let _ = write!(middle, "   {}", format_size(state.selected_bytes()));
     }
     painter.draw_text_ellipsis(
         Rect::new(
@@ -4801,7 +5398,11 @@ fn draw_status_bar(
             right.width.saturating_sub(21),
             right.height,
         ),
-        "My Computer",
+        if fs.is_damaged() {
+            "Damaged volume: some files may be missing"
+        } else {
+            "My Computer"
+        },
         TEXT,
         1,
         Align::Start,
@@ -5137,15 +5738,15 @@ fn draw_about(painter: &mut Painter<'_, '_>, layout: DialogLayout) {
         Color::rgb(0, 60, 170),
         2,
     );
-    painter.draw_text(body.x + 70, body.y + 28, "Windows XP-style shell", MUTED, 1);
+    painter.draw_text(body.x + 70, body.y + 28, "A classic file browser", MUTED, 1);
     let lines = [
-        "A complete, allocation-free file explorer:",
+        "A complete file explorer:",
         "menu bar, standard buttons, address bar, folder tree,",
-        "search pane, four view modes, preview pane, dialogs,",
+        "search pane, five view modes, preview pane, dialogs,",
         "context menus, mouse input, wheel scrolling and",
         "keyboard navigation.",
         "",
-        "The filesystem is read-only and embedded in the kernel.",
+        "It reads files; it cannot change them.",
         "feos 0.1.0",
     ];
     let mut y = body.y + 64;
@@ -5232,9 +5833,7 @@ fn draw_properties(
         paint_property_line(painter, body.x + 8, y, "Contains", count.as_str());
         y += 20;
     }
-    paint_property_line(painter, body.x + 8, y, "Modified", "Not available");
-    y += 20;
-    paint_property_line(painter, body.x + 8, y, "Attributes", "Read-only");
+    paint_property_line(painter, body.x + 8, y, "Attributes", "Read-only in File Explorer");
     y += 26;
     painter.fill_rect(
         Rect::new(body.x + 8, y, body.width.saturating_sub(16), 1),
@@ -5244,14 +5843,7 @@ fn draw_properties(
     painter.draw_text(
         body.x + 8,
         y,
-        "This item lives in the filesystem image embedded in the kernel.",
-        MUTED,
-        1,
-    );
-    painter.draw_text(
-        body.x + 8,
-        y + 16,
-        "File and folder changes require rebuilding the image.",
+        "File Explorer reads this item but cannot change it.",
         MUTED,
         1,
     );
@@ -5278,35 +5870,40 @@ fn draw_viewer(
         body.width.saturating_sub(20),
         body.height.saturating_sub(10),
     );
-    let clip = painter.push_clip(text_rect);
-    let bytes = &state.viewer[..state.viewer_len];
-    if is_text(bytes) {
-        let text = core::str::from_utf8(bytes).unwrap_or("");
-        draw_scrolled_text(painter, text_rect, text, state.viewer_scroll, TEXT);
+    let image_size = state.image_of(node).map(|image| (image.width, image.height));
+    if let Some(image) = state.image_of(node) {
+        draw_image(painter, image, text_rect);
     } else {
-        draw_hex_dump(painter, text_rect, bytes, state.viewer_scroll);
-    }
-    painter.restore_clip(clip);
-    let visible = (text_rect.height / 10).max(1) as usize;
-    draw_scrollbar(
-        painter,
-        text_rect,
-        state.viewer_scroll,
-        visible,
-        state.viewer_lines,
-    );
-    let mut footer = Text::<128>::new();
-    let _ = write!(
-        footer,
-        "{} bytes   [{}]   {}read-only",
-        fs.size(node),
-        if is_text(bytes) { "text" } else { "binary" },
-        if state.viewer_len < fs.size(node) {
-            "truncated   "
+        let clip = painter.push_clip(text_rect);
+        let bytes = &state.viewer[..state.viewer_len];
+        if state.viewer_binary {
+            draw_hex_dump(painter, text_rect, bytes, state.viewer_offset);
         } else {
-            ""
+            draw_scrolled_text(painter, text_rect, text_prefix(bytes), 0, TEXT);
         }
-    );
+        painter.restore_clip(clip);
+        // Lines vary in length, so the bar tracks bytes; 64 is about a line.
+        let visible = (text_rect.height / 10).max(1) as usize;
+        draw_scrollbar(
+            painter,
+            text_rect,
+            state.viewer_offset / 64,
+            visible,
+            fs.size(node) / 64 + visible,
+        );
+    }
+    let mut footer = Text::<128>::new();
+    if let Some((width, height)) = image_size {
+        let _ = write!(footer, "{} bytes   [{width}x{height} image]", fs.size(node));
+    } else {
+        let _ = write!(
+            footer,
+            "{} bytes   [{}]   at {}   read-only",
+            fs.size(node),
+            if state.viewer_binary { "binary" } else { "text" },
+            state.viewer_offset,
+        );
+    }
     painter.draw_text_ellipsis(
         Rect::new(
             body.x + 7,
@@ -5378,17 +5975,19 @@ fn draw_scrolled_text(
     }
 }
 
-fn draw_hex_dump(painter: &mut Painter<'_, '_>, rect: Rect, bytes: &[u8], offset: usize) {
-    let rows = (bytes.len() + 15) / 16;
+/// Draws `bytes` as rows of hex. Rows are labelled from `base`, the file offset
+/// of `bytes[0]`; the preview pane instead scrolls within its buffer by rows.
+fn draw_hex_dump(painter: &mut Painter<'_, '_>, rect: Rect, bytes: &[u8], base: usize) {
+    let rows = bytes.len().div_ceil(16);
     let mut y = rect.y;
-    for row in offset..rows {
+    for row in 0..rows {
         if y + 10 > rect.bottom_i32() {
             break;
         }
         let start = row * 16;
         let end = (start + 16).min(bytes.len());
         let mut line = Text::<96>::new();
-        let _ = write!(line, "{:04X}  ", start);
+        let _ = write!(line, "{:08X}  ", base.saturating_add(start));
         for index in 0..16 {
             if start + index < end {
                 let _ = write!(line, "{:02X} ", bytes[start + index]);
@@ -5497,7 +6096,15 @@ fn draw_node_icon(painter: &mut Painter<'_, '_>, node: NodeId, fs: &dyn FileSyst
     if fs.is_dir(node) {
         draw_folder_icon(painter, rect);
     } else {
-        draw_file_icon(painter, rect, file_accent(fs.name(node).unwrap_or("")));
+        draw_file_icon(painter, rect, type_accent(type_index(node, fs)));
+    }
+}
+
+fn draw_entry_icon(painter: &mut Painter<'_, '_>, info: EntryInfo, rect: Rect) {
+    if info.is_dir {
+        draw_folder_icon(painter, rect);
+    } else {
+        draw_file_icon(painter, rect, type_accent(info.type_index));
     }
 }
 
@@ -5605,21 +6212,1275 @@ mod tests {
     }
 
     #[test]
-    fn viewer_line_count_handles_text_and_binary() {
-        assert_eq!(viewer_line_count(b"one\ntwo\n"), 3);
-        assert_eq!(viewer_line_count(&[0u8; 32]), 2);
-    }
-
-    #[test]
     fn bit_sets_are_bounded() {
         let mut words = [0u64; SELECTION_WORDS];
         set_bit(&mut words, 0);
-        set_bit(&mut words, 511);
+        set_bit(&mut words, MAX_ENTRIES - 1);
         set_bit(&mut words, 4096);
         assert!(bit(&words, 0));
-        assert!(bit(&words, 511));
+        assert!(bit(&words, MAX_ENTRIES - 1));
         assert!(!bit(&words, 4096));
         clear_bit(&mut words, 0);
         assert!(!bit(&words, 0));
+    }
+
+    // Scripted tests ------------------------------------------------------
+
+    use core::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::format;
+    use std::string::String;
+    use std::sync::{Mutex, MutexGuard};
+    use std::vec::Vec;
+
+    use feos_app::{
+        App, AppRegistry, BoardInfo, Platform, ProcessInfo, Processes, SpawnError,
+    };
+    use feos_fs::EntryKind;
+    use feos_hal::{Clock, Cpu, Power};
+
+    struct FakeNode {
+        name: String,
+        parent: Option<u32>,
+        directory: bool,
+        data: Vec<u8>,
+        children: Vec<u32>,
+    }
+
+    /// A deterministic in-memory filesystem that counts how often row data is
+    /// asked for.
+    struct FakeFs {
+        nodes: Vec<FakeNode>,
+        size_calls: AtomicUsize,
+    }
+
+    impl FakeFs {
+        fn empty() -> Self {
+            Self {
+                nodes: std::vec![FakeNode {
+                    name: String::from("/"),
+                    parent: None,
+                    directory: true,
+                    data: Vec::new(),
+                    children: Vec::new(),
+                }],
+                size_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn add(&mut self, parent: u32, name: &str, directory: bool, data: Vec<u8>) -> u32 {
+            let id = self.nodes.len() as u32;
+            self.nodes.push(FakeNode {
+                name: String::from(name),
+                parent: Some(parent),
+                directory,
+                data,
+                children: Vec::new(),
+            });
+            self.nodes[parent as usize].children.push(id);
+            id
+        }
+
+        fn dir(&mut self, parent: u32, name: &str) -> u32 {
+            self.add(parent, name, true, Vec::new())
+        }
+
+        fn file(&mut self, parent: u32, name: &str, data: &[u8]) -> u32 {
+            self.add(parent, name, false, data.to_vec())
+        }
+
+        /// The tree most tests browse.
+        fn sample() -> Self {
+            let mut fs = Self::empty();
+            let docs = fs.dir(0, "docs");
+            fs.file(docs, "alpha.txt", b"alpha\nsecond line\n");
+            fs.file(docs, "bravo.md", &[b'b'; 3000]);
+            fs.file(docs, "charlie.txt", b"c");
+            let sub = fs.dir(docs, "sub");
+            fs.file(sub, "alpha-deep.txt", b"deep");
+            let media = fs.dir(0, "media");
+            fs.file(media, "clip.mp4", &[0u8; 64]);
+            let pics = fs.dir(0, "pics");
+            fs.file(pics, "red.ppm", &ppm(4, 2, [255, 0, 0]));
+            fs.file(pics, "wide.ppm", &ppm(800, 100, [0, 255, 0]));
+            fs.file(pics, "notes.txt", b"not a picture");
+            fs.file(pics, "broken.png", b"\x89PNG\r\n\x1a\nnope");
+            let many = fs.dir(0, "many");
+            for index in 0..300 {
+                fs.file(many, &format!("file{index:03}.txt"), b"x");
+            }
+            let lines: String = (0..60_000).map(|index| format!("line {index}\n")).collect();
+            fs.file(0, "big.log", lines.as_bytes());
+            fs.file(0, "big.bin", &std::vec![0xabu8; 200_000]);
+            fs
+        }
+
+        fn id(&self, path: &str) -> NodeId {
+            self.resolve(path).expect(path)
+        }
+    }
+
+    fn ppm(width: u32, height: u32, color: [u8; 3]) -> Vec<u8> {
+        let mut bytes = format!("P6\n{width} {height}\n255\n").into_bytes();
+        for _ in 0..width * height {
+            bytes.extend_from_slice(&color);
+        }
+        bytes
+    }
+
+    impl FileSystem for FakeFs {
+        fn node_count(&self) -> usize {
+            self.nodes.len()
+        }
+        fn kind(&self, node: NodeId) -> Option<EntryKind> {
+            self.nodes.get(node.0 as usize).map(|node| {
+                if node.directory {
+                    EntryKind::Directory
+                } else {
+                    EntryKind::File
+                }
+            })
+        }
+        fn name(&self, node: NodeId) -> Option<&str> {
+            self.nodes.get(node.0 as usize).map(|node| node.name.as_str())
+        }
+        fn parent(&self, node: NodeId) -> Option<NodeId> {
+            self.nodes
+                .get(node.0 as usize)
+                .and_then(|node| node.parent)
+                .map(NodeId)
+        }
+        fn size(&self, node: NodeId) -> usize {
+            self.size_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            self.nodes.get(node.0 as usize).map_or(0, |node| node.data.len())
+        }
+        fn read(&self, node: NodeId, offset: usize, out: &mut [u8]) -> usize {
+            let Some(data) = self.nodes.get(node.0 as usize).map(|node| &node.data) else {
+                return 0;
+            };
+            if offset >= data.len() {
+                return 0;
+            }
+            let count = out.len().min(data.len() - offset);
+            out[..count].copy_from_slice(&data[offset..offset + count]);
+            count
+        }
+        fn child_count(&self, node: NodeId) -> usize {
+            self.nodes.get(node.0 as usize).map_or(0, |node| node.children.len())
+        }
+        fn child_at(&self, node: NodeId, index: usize) -> Option<NodeId> {
+            self.nodes
+                .get(node.0 as usize)
+                .and_then(|node| node.children.get(index))
+                .map(|id| NodeId(*id))
+        }
+    }
+
+    const SIZE: Rect = Rect::new(0, 0, 1000, 700);
+
+    fn hosted(fs: &FakeFs) -> std::boxed::Box<ExplorerState> {
+        let mut state = std::boxed::Box::new(ExplorerState::new(fs, SIZE));
+        state.embedded = true;
+        state.show_cursor = false;
+        state
+    }
+
+    fn key(state: &mut ExplorerState, fs: &FakeFs, key: Key, modifiers: Modifiers) {
+        if state.handle_key(fs, key, modifiers, 1000) {
+            state.exit = true;
+        }
+        state.after_input(fs, 1000);
+    }
+
+    fn pointer(state: &mut ExplorerState, fs: &FakeFs, report: PointerEvent, now: u64) {
+        state.handle_pointer(fs, report, now);
+        state.after_input(fs, now);
+    }
+
+    fn press(state: &mut ExplorerState, fs: &FakeFs, point: Point, now: u64) {
+        let report = PointerEvent {
+            x: point.x as u16,
+            y: point.y as u16,
+            left: Some(true),
+            ..PointerEvent::default()
+        };
+        pointer(state, fs, report, now);
+    }
+
+    fn release(state: &mut ExplorerState, fs: &FakeFs, point: Point, now: u64) {
+        let report = PointerEvent {
+            x: point.x as u16,
+            y: point.y as u16,
+            left: Some(false),
+            ..PointerEvent::default()
+        };
+        pointer(state, fs, report, now);
+    }
+
+    fn row_point(state: &ExplorerState, index: usize) -> Point {
+        let layout = Layout::compute(state.screen, state);
+        let metrics = grid_metrics(state, layout.list, layout.main.width);
+        let rect = entry_rect(state, layout, metrics, index).expect("row is on screen");
+        Point::new(rect.x + 10, rect.y + 5)
+    }
+
+    fn names(state: &ExplorerState, fs: &FakeFs) -> Vec<String> {
+        (0..state.entry_count)
+            .map(|index| String::from(fs.name(state.entries[index]).unwrap()))
+            .collect()
+    }
+
+    fn at(state: &mut ExplorerState, fs: &FakeFs, path: &str) {
+        state.navigate(fs, fs.id(path), true);
+        state.after_input(fs, 1000);
+    }
+
+    fn select(state: &mut ExplorerState, fs: &FakeFs, name: &str) -> usize {
+        let index = names(state, fs).iter().position(|entry| entry == name).unwrap();
+        state.select_only(index);
+        state.after_input(fs, 1000);
+        index
+    }
+
+    #[test]
+    fn bare_escape_and_q_do_not_close_a_hosted_window() {
+        let fs = FakeFs::sample();
+        let mut state = hosted(&fs);
+        for focus in [Focus::List, Focus::Tree] {
+            state.focus = focus;
+            key(&mut state, &fs, Key::Escape, Modifiers::NONE);
+            key(&mut state, &fs, Key::Character('q'), Modifiers::NONE);
+            assert!(!state.exit);
+        }
+    }
+
+    #[test]
+    fn escape_still_closes_the_chromeless_foreground_explorer() {
+        let fs = FakeFs::sample();
+        let mut state = ExplorerState::new(&fs, SIZE);
+        key(&mut state, &fs, Key::Escape, Modifiers::NONE);
+        assert!(state.exit);
+    }
+
+    #[test]
+    fn escape_closes_a_menu_a_dialog_and_a_search_before_anything_else() {
+        let fs = FakeFs::sample();
+        let mut state = hosted(&fs);
+        state.menu_open = Some(MenuKind::File);
+        key(&mut state, &fs, Key::Escape, Modifiers::NONE);
+        assert!(state.menu_open.is_none());
+        state.dialog = Dialog::About;
+        key(&mut state, &fs, Key::Escape, Modifiers::NONE);
+        assert!(state.dialog == Dialog::None);
+
+        state.perform(&fs, Action::Search, None, 0);
+        state.search.set("alpha");
+        state.run_search(&fs);
+        assert!(state.listed_search);
+        state.focus = Focus::List;
+        key(&mut state, &fs, Key::Escape, Modifiers::NONE);
+        assert!(!state.searching());
+        assert!(!state.exit);
+        assert!(!state.listed_search);
+    }
+
+    #[test]
+    fn the_wheel_scrolls_away_from_the_cursor_and_the_keyboard_comes_back() {
+        let fs = FakeFs::sample();
+        let mut state = hosted(&fs);
+        at(&mut state, &fs, "/many");
+        let layout = Layout::compute(state.screen, &state);
+        let inside = Point::new(layout.list.x + 40, layout.list.y + 40);
+        let wheel = PointerEvent {
+            x: inside.x as u16,
+            y: inside.y as u16,
+            wheel: -1,
+            ..PointerEvent::default()
+        };
+        pointer(&mut state, &fs, wheel, 1000);
+        assert_eq!(state.scroll, 3, "the same frame's after_input undid the wheel");
+        pointer(&mut state, &fs, wheel, 1000);
+        assert_eq!(state.scroll, 6);
+        assert_eq!(state.cursor, 0);
+
+        // Moving the pointer is not moving the cursor.
+        let moved = PointerEvent {
+            x: inside.x as u16,
+            y: inside.y as u16 + 3,
+            ..PointerEvent::default()
+        };
+        pointer(&mut state, &fs, moved, 1000);
+        assert_eq!(state.scroll, 6);
+
+        key(&mut state, &fs, Key::Down, Modifiers::NONE);
+        assert_eq!(state.cursor, 1);
+        assert_eq!(state.scroll, 1, "the keyboard brings the cursor into view");
+    }
+
+    #[test]
+    fn the_wheel_also_scrolls_the_folder_tree() {
+        let mut fs = FakeFs::empty();
+        for index in 0..80 {
+            fs.dir(0, &format!("d{index:02}"));
+        }
+        let mut state = hosted(&fs);
+        let layout = Layout::compute(state.screen, &state);
+        let wheel = PointerEvent {
+            x: layout.tree.x as u16 + 10,
+            y: layout.tree.y as u16 + 10,
+            wheel: -1,
+            ..PointerEvent::default()
+        };
+        pointer(&mut state, &fs, wheel, 1000);
+        assert_eq!(state.tree_scroll, 3);
+    }
+
+    #[test]
+    fn leaving_the_search_pane_replaces_its_results() {
+        let fs = FakeFs::sample();
+        let mut state = hosted(&fs);
+        at(&mut state, &fs, "/docs");
+        state.perform(&fs, Action::Search, None, 0);
+        state.search.set("alpha");
+        state.search_dirty = true;
+        state.after_input(&fs, 0);
+        assert_eq!(names(&state, &fs), ["alpha-deep.txt", "alpha.txt"]);
+
+        state.perform(&fs, Action::ToggleFolders, None, 0);
+        state.after_input(&fs, 0);
+        assert_eq!(names(&state, &fs).len(), 4, "still listing search results");
+
+        // Showing the pane again restores the query's results.
+        state.perform(&fs, Action::ToggleSearch, None, 0);
+        state.after_input(&fs, 0);
+        assert_eq!(names(&state, &fs).len(), 2);
+
+        state.perform(&fs, Action::HideExplorerBar, None, 0);
+        state.after_input(&fs, 0);
+        assert_eq!(names(&state, &fs).len(), 4);
+    }
+
+    #[test]
+    fn going_back_does_not_keep_the_old_folders_results() {
+        let fs = FakeFs::sample();
+        let mut state = hosted(&fs);
+        at(&mut state, &fs, "/docs");
+        at(&mut state, &fs, "/media");
+        state.history_back(&fs);
+        state.perform(&fs, Action::Search, None, 0);
+        state.search.set("alpha");
+        state.run_search(&fs);
+        assert!(state.searching());
+        state.history_back(&fs);
+        state.after_input(&fs, 0);
+        assert!(!state.searching());
+        assert_eq!(state.current, fs.root());
+        assert_eq!(state.entry_count, fs.child_count(fs.root()));
+    }
+
+    #[test]
+    fn view_sort_reorders_at_once_including_search_results() {
+        let fs = FakeFs::sample();
+        let mut state = hosted(&fs);
+        at(&mut state, &fs, "/docs");
+        assert_eq!(names(&state, &fs)[1], "alpha.txt");
+        state.perform(&fs, Action::SortSize, None, 0);
+        state.after_input(&fs, 0);
+        assert_eq!(names(&state, &fs), ["sub", "charlie.txt", "alpha.txt", "bravo.md"]);
+
+        state.perform(&fs, Action::Search, None, 0);
+        state.search.set("a");
+        state.run_search(&fs);
+        let before = names(&state, &fs);
+        state.perform(&fs, Action::SortDescending, None, 0);
+        state.after_input(&fs, 0);
+        let after = names(&state, &fs);
+        assert_ne!(before, after, "sort had no effect on search results");
+    }
+
+    #[test]
+    fn the_selection_and_cursor_follow_their_files_across_a_sort() {
+        let fs = FakeFs::sample();
+        let mut state = hosted(&fs);
+        at(&mut state, &fs, "/docs");
+        select(&mut state, &fs, "bravo.md");
+        state.perform(&fs, Action::SortSize, None, 0);
+        state.after_input(&fs, 0);
+        let index = names(&state, &fs).iter().position(|name| name == "bravo.md").unwrap();
+        assert!(state.is_selected(index));
+        assert_eq!(state.cursor, index);
+        assert_eq!(state.selected_count(), 1);
+    }
+
+    #[test]
+    fn capped_listings_say_so() {
+        let fs = FakeFs::sample();
+        let mut state = hosted(&fs);
+        at(&mut state, &fs, "/many");
+        assert_eq!(state.entry_count, MAX_ENTRIES);
+        assert_eq!(
+            state.listing_summary().as_str(),
+            "Showing the first 256 of 300 objects"
+        );
+
+        state.perform(&fs, Action::Search, None, 0);
+        state.search.set("file");
+        state.run_search(&fs);
+        assert_eq!(state.entry_count, MAX_SEARCH);
+        assert!(state.search_truncated);
+        assert_eq!(
+            state.listing_summary().as_str(),
+            "First 128 matches shown; refine the search"
+        );
+
+        state.search.set("file299");
+        state.run_search(&fs);
+        assert_eq!(state.listing_summary().as_str(), "1 item(s) found");
+    }
+
+    #[test]
+    fn selection_and_tree_expansion_work_past_node_id_1024() {
+        let mut fs = FakeFs::empty();
+        for index in 0..2000 {
+            fs.file(0, &format!("pad{index}"), b"");
+        }
+        let high = fs.dir(0, "high");
+        let child = fs.dir(high, "child");
+        fs.file(child, "a", b"");
+        fs.file(child, "b", b"");
+        assert!(high > 1024);
+
+        let mut state = hosted(&fs);
+        at(&mut state, &fs, "/high/child");
+        state.select_all();
+        assert_eq!(state.selected_count(), 2);
+        assert!(state.tree[..state.tree_len].contains(&NodeId(child)));
+        state.invert_selection();
+        assert_eq!(state.selected_count(), 0);
+
+        state.toggle_expanded(&fs, NodeId(high));
+        assert!(!state.tree[..state.tree_len].contains(&NodeId(child)));
+        state.toggle_expanded(&fs, NodeId(high));
+        assert!(state.tree[..state.tree_len].contains(&NodeId(child)));
+    }
+
+    #[test]
+    fn expanding_more_folders_than_fit_forgets_the_oldest_not_the_root() {
+        let mut fs = FakeFs::empty();
+        for index in 0..MAX_TREE + 8 {
+            fs.dir(0, &format!("d{index}"));
+        }
+        let mut state = hosted(&fs);
+        for index in 1..fs.node_count() {
+            state.set_expanded(NodeId(index as u32));
+        }
+        assert_eq!(state.expanded_len, MAX_TREE);
+        assert!(state.is_expanded(fs.root()));
+        state.rebuild_tree(&fs);
+    }
+
+    #[test]
+    fn arguments_open_a_folder_a_file_or_the_search_pane() {
+        let fs = FakeFs::sample();
+        let mut state = hosted(&fs);
+        state.apply_args(&fs, "/docs", 0);
+        assert_eq!(state.current, fs.id("/docs"));
+
+        let mut state = hosted(&fs);
+        state.apply_args(&fs, "  --search ", 0);
+        assert!(state.bar == ExplorerBar::Search);
+        assert!(state.focus == Focus::Search);
+
+        let mut state = hosted(&fs);
+        state.apply_args(&fs, "/docs/alpha.txt", 0);
+        assert_eq!(state.current, fs.id("/docs"));
+        assert!(state.dialog == Dialog::Viewer(fs.id("/docs/alpha.txt")));
+
+        let mut state = hosted(&fs);
+        state.apply_args(&fs, "/nowhere", 0);
+        assert_eq!(state.current, fs.root());
+        assert!(!state.message.is_empty());
+
+        let mut state = hosted(&fs);
+        state.apply_args(&fs, "", 0);
+        assert_eq!(state.current, fs.root());
+    }
+
+    fn with_session<R>(f: impl FnOnce() -> R) -> R {
+        host::SESSION.with(|cell| cell.set(true));
+        host::OPENED.with(|cell| *cell.borrow_mut() = None);
+        host::DRAGGED.with(|cell| *cell.borrow_mut() = None);
+        let result = f();
+        host::SESSION.with(|cell| cell.set(false));
+        result
+    }
+
+    #[test]
+    fn double_clicking_media_opens_its_associated_app() {
+        let fs = FakeFs::sample();
+        with_session(|| {
+            let mut state = hosted(&fs);
+            at(&mut state, &fs, "/media");
+            let point = row_point(&state, 0);
+            press(&mut state, &fs, point, 1000);
+            release(&mut state, &fs, point, 1010);
+            press(&mut state, &fs, point, 1100);
+            release(&mut state, &fs, point, 1110);
+            assert_eq!(
+                host::OPENED.with(|cell| cell.borrow().clone()).as_deref(),
+                Some("/media/clip.mp4")
+            );
+            assert!(state.dialog == Dialog::None, "the hex viewer opened as well");
+        });
+    }
+
+    #[test]
+    fn files_without_an_app_or_a_session_open_in_the_viewer() {
+        let fs = FakeFs::sample();
+        with_session(|| {
+            let mut state = hosted(&fs);
+            at(&mut state, &fs, "/docs");
+            select(&mut state, &fs, "alpha.txt");
+            state.open_focused(&fs, 0);
+            assert!(matches!(state.dialog, Dialog::Viewer(_)));
+            assert!(host::OPENED.with(|cell| cell.borrow().is_none()));
+        });
+        let mut state = hosted(&fs);
+        at(&mut state, &fs, "/media");
+        state.open_focused(&fs, 0);
+        assert!(matches!(state.dialog, Dialog::Viewer(_)));
+    }
+
+    #[test]
+    fn dragging_a_row_past_the_threshold_starts_a_drag() {
+        let fs = FakeFs::sample();
+        with_session(|| {
+            let mut state = hosted(&fs);
+            at(&mut state, &fs, "/docs");
+            let index = names(&state, &fs).iter().position(|n| n == "alpha.txt").unwrap();
+            let point = row_point(&state, index);
+            press(&mut state, &fs, point, 1000);
+            let small = PointerEvent {
+                x: point.x as u16 + 2,
+                y: point.y as u16,
+                ..PointerEvent::default()
+            };
+            pointer(&mut state, &fs, small, 1001);
+            assert!(host::DRAGGED.with(|cell| cell.borrow().is_none()));
+            let far = PointerEvent {
+                x: point.x as u16 + 20,
+                y: point.y as u16,
+                ..PointerEvent::default()
+            };
+            pointer(&mut state, &fs, far, 1002);
+            assert_eq!(
+                host::DRAGGED.with(|cell| cell.borrow().clone()).as_deref(),
+                Some("/docs/alpha.txt")
+            );
+            release(&mut state, &fs, point, 1003);
+        });
+    }
+
+    #[test]
+    fn a_dropped_path_navigates_there() {
+        let fs = FakeFs::sample();
+        let mut state = hosted(&fs);
+        state.pending_drop = Some(Text::from_str("/docs"));
+        state.after_input(&fs, 0);
+        assert_eq!(state.current, fs.id("/docs"));
+
+        state.pending_drop = Some(Text::from_str("/media/clip.mp4"));
+        state.after_input(&fs, 0);
+        assert_eq!(state.current, fs.id("/media"));
+        assert_eq!(state.focused_node(), Some(fs.id("/media/clip.mp4")));
+        assert!(state.dialog == Dialog::None);
+
+        state.pending_drop = Some(Text::from_str("/gone"));
+        state.after_input(&fs, 0);
+        assert_eq!(state.current, fs.id("/media"));
+    }
+
+    #[test]
+    fn copy_puts_the_path_on_the_clipboard_and_paste_fills_the_address_bar() {
+        let fs = FakeFs::sample();
+        let mut state = hosted(&fs);
+        at(&mut state, &fs, "/docs");
+        select(&mut state, &fs, "alpha.txt");
+        let address = state.address;
+        key(&mut state, &fs, Key::Character('c'), Modifiers::CTRL);
+        let mut buffer = [0u8; 64];
+        assert_eq!(shell::clipboard_get(&mut buffer), "/docs/alpha.txt");
+        assert_eq!(state.address.as_str(), address.as_str(), "copy no longer edits the bar");
+
+        state.address.clear();
+        key(&mut state, &fs, Key::Character('v'), Modifiers::CTRL);
+        assert!(state.focus == Focus::Address);
+        assert_eq!(state.address.as_str(), "/docs/alpha.txt");
+    }
+
+    #[test]
+    fn a_picture_previews_as_a_picture_and_the_rest_do_not() {
+        let fs = FakeFs::sample();
+        let mut state = hosted(&fs);
+        at(&mut state, &fs, "/pics");
+        select(&mut state, &fs, "red.ppm");
+        let image = state.image_of(fs.id("/pics/red.ppm")).expect("decoded");
+        assert_eq!((image.width, image.height), (4, 2));
+        assert_eq!(image.pixels[0], 0x00ff_0000);
+
+        select(&mut state, &fs, "notes.txt");
+        assert!(state.image_of(fs.id("/pics/notes.txt")).is_none());
+        select(&mut state, &fs, "broken.png");
+        assert!(state.image_of(fs.id("/pics/broken.png")).is_none());
+
+        // Pictures larger than the box are shrunk when decoded, keeping shape.
+        select(&mut state, &fs, "wide.ppm");
+        let image = state.image_of(fs.id("/pics/wide.ppm")).expect("decoded");
+        assert_eq!(image.width, IMAGE_BOX.0);
+        assert_eq!(image.height, 80);
+        assert_eq!(image.pixels.len(), 640 * 80);
+    }
+
+    #[test]
+    fn fit_size_keeps_the_shape_and_never_returns_zero() {
+        assert_eq!(preview::fit_size(10, 10, 100, 100), (10, 10));
+        assert_eq!(preview::fit_size(200, 100, 100, 100), (100, 50));
+        assert_eq!(preview::fit_size(100, 200, 100, 100), (50, 100));
+        assert_eq!(preview::fit_size(10_000, 1, 10, 10), (10, 1));
+        assert_eq!(preview::fit_size(1, 10_000, 10, 10), (1, 10));
+    }
+
+    #[test]
+    fn thumbnails_decode_one_per_frame_for_visible_rows() {
+        let fs = FakeFs::sample();
+        let mut state = hosted(&fs);
+        at(&mut state, &fs, "/pics");
+        state.perform(&fs, Action::ViewThumbnails, None, 0);
+        // broken.png, red.ppm, wide.ppm are named as pictures; notes.txt is not.
+        state.update_thumbs(&fs);
+        assert_eq!(state.thumbs.len(), 1);
+        assert!(state.thumbs_pending);
+        state.update_thumbs(&fs);
+        state.update_thumbs(&fs);
+        assert_eq!(state.thumbs.len(), 3);
+        state.update_thumbs(&fs);
+        assert!(!state.thumbs_pending);
+        let decoded = state.thumbs.iter().filter(|thumb| thumb.image.is_some()).count();
+        assert_eq!(decoded, 2, "the broken file keeps its icon");
+        for thumb in &state.thumbs {
+            if let Some(image) = &thumb.image {
+                assert!(image.width <= THUMB_BOX.0 && image.height <= THUMB_BOX.1);
+            }
+        }
+    }
+
+    #[test]
+    fn the_thumbnail_cache_stays_bounded() {
+        let mut fs = FakeFs::empty();
+        let image = ppm(2, 2, [1, 2, 3]);
+        for index in 0..THUMB_CACHE + 40 {
+            fs.file(0, &format!("p{index:03}.ppm"), &image);
+        }
+        let mut state = hosted(&fs);
+        state.perform(&fs, Action::ViewThumbnails, None, 0);
+        state.preview_open = false;
+        for _ in 0..4 {
+            for _ in 0..80 {
+                state.update_thumbs(&fs);
+            }
+            state.scroll += 2;
+        }
+        assert!(state.thumbs.len() <= THUMB_CACHE);
+    }
+
+    #[test]
+    fn the_viewer_reaches_the_whole_of_a_large_text_file() {
+        let fs = FakeFs::sample();
+        let node = fs.id("/big.log");
+        let mut state = hosted(&fs);
+        state.open_viewer(&fs, node);
+        assert!(!state.viewer_binary);
+        assert_eq!(state.viewer_offset, 0);
+        let text = |state: &ExplorerState| {
+            String::from(text_prefix(&state.viewer[..state.viewer_len.min(40)]))
+        };
+        assert!(text(&state).starts_with("line 0\n"));
+
+        state.scroll_viewer(&fs, node, 3);
+        assert!(text(&state).starts_with("line 3\n"));
+        state.scroll_viewer(&fs, node, -2);
+        assert!(text(&state).starts_with("line 1\n"));
+        state.scroll_viewer(&fs, node, -50);
+        assert_eq!(state.viewer_offset, 0);
+
+        // Well past the old 8 KiB limit.
+        state.scroll_viewer(&fs, node, 5000);
+        assert!(text(&state).starts_with("line 5000\n"));
+        state.scroll_viewer(&fs, node, -4999);
+        assert!(text(&state).starts_with("line 1\n"));
+
+        key(&mut state, &fs, Key::End, Modifiers::NONE);
+        let visible = state.viewer_visible_lines();
+        let expected = format!("line {}\n", 60_000 - visible);
+        assert!(text(&state).starts_with(&expected), "{:?}", text(&state));
+        key(&mut state, &fs, Key::Down, Modifiers::NONE);
+        key(&mut state, &fs, Key::Home, Modifiers::NONE);
+        assert_eq!(state.viewer_offset, 0);
+        assert!(text(&state).starts_with("line 0\n"));
+    }
+
+    #[test]
+    fn the_viewer_never_scrolls_past_the_last_line() {
+        let fs = FakeFs::sample();
+        let node = fs.id("/docs/alpha.txt");
+        let mut state = hosted(&fs);
+        state.open_viewer(&fs, node);
+        state.scroll_viewer(&fs, node, 100);
+        assert_eq!(state.viewer_offset, b"alpha\n".len());
+        state.scroll_viewer(&fs, node, -100);
+        assert_eq!(state.viewer_offset, 0);
+    }
+
+    #[test]
+    fn the_viewer_pages_through_a_large_binary_file() {
+        let fs = FakeFs::sample();
+        let node = fs.id("/big.bin");
+        let mut state = hosted(&fs);
+        state.open_viewer(&fs, node);
+        assert!(state.viewer_binary);
+        state.scroll_viewer(&fs, node, 1000);
+        assert_eq!(state.viewer_offset, 16_000);
+        assert!(state.viewer_len > 0);
+        key(&mut state, &fs, Key::End, Modifiers::NONE);
+        let last = state.viewer_offset;
+        assert_eq!(last % 16, 0);
+        assert!(last > VIEWER_MAX);
+        state.scroll_viewer(&fs, node, 5);
+        assert_eq!(state.viewer_offset, last, "scrolled past the end");
+    }
+
+    #[test]
+    fn line_scanning_handles_files_without_a_final_newline() {
+        let mut fs = FakeFs::empty();
+        let file = NodeId(fs.file(0, "a", b"one\ntwo\nthree"));
+        assert_eq!(preview::lines_after(&fs, file, 0, 1), 4);
+        assert_eq!(preview::lines_after(&fs, file, 0, 2), 8);
+        assert_eq!(preview::lines_after(&fs, file, 0, 9), 8);
+        assert_eq!(preview::lines_before(&fs, file, 8, 1), 4);
+        assert_eq!(preview::lines_before(&fs, file, 8, 2), 0);
+        assert_eq!(preview::lines_before(&fs, file, 13, 1), 8);
+        assert_eq!(preview::lines_before(&fs, file, 13, 2), 4);
+        let empty = NodeId(fs.file(0, "e", b""));
+        assert_eq!(preview::lines_before(&fs, empty, 0, 3), 0);
+        assert_eq!(preview::lines_after(&fs, empty, 0, 3), 0);
+    }
+
+    #[test]
+    fn text_cut_partway_through_a_character_is_still_text() {
+        let bytes = "caf\u{e9}".as_bytes();
+        assert!(is_text(&bytes[..4]));
+        assert_eq!(text_prefix(&bytes[..4]), "caf");
+        assert!(is_text(bytes));
+        assert!(!is_text(&[b'a', 0xff, b'b']));
+        assert!(!is_text(&[0, 1, 2]));
+    }
+
+    #[test]
+    fn rows_do_not_ask_the_filesystem_again_on_every_frame() {
+        let fs = FakeFs::sample();
+        let mut state = hosted(&fs);
+        at(&mut state, &fs, "/many");
+        let mut pixels = std::vec![0u32; SIZE.width as usize * SIZE.height as usize];
+        let mut canvas =
+            Canvas::new(&mut pixels, SIZE.width as usize, SIZE.height as usize, SIZE.width as usize)
+                .unwrap();
+        render(&mut canvas, &fs, &mut state, 0);
+        fs.size_calls.store(0, AtomicOrdering::Relaxed);
+        render(&mut canvas, &fs, &mut state, 0);
+        let calls = fs.size_calls.load(AtomicOrdering::Relaxed);
+        assert!(calls <= 2, "a frame made {calls} size calls");
+    }
+
+    #[test]
+    fn nothing_says_windows_on_screen() {
+        for text in [FILE_MENU, EDIT_MENU, VIEW_MENU, FAVORITES_MENU, TOOLS_MENU, HELP_MENU]
+            .iter()
+            .flat_map(|menu| menu.iter())
+            .map(|item| item.label)
+            .chain(TYPE_NAMES)
+        {
+            assert!(!text.contains("Windows"), "{text}");
+            assert!(!text.contains("XP"), "{text}");
+        }
+    }
+
+    // Golden images -------------------------------------------------------
+
+    fn golden_hash(pixels: &[u32]) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for pixel in pixels {
+            for byte in pixel.to_le_bytes() {
+                hash ^= byte as u64;
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        hash
+    }
+
+    fn golden_frame(
+        results: &mut Vec<(String, u64)>,
+        name: &str,
+        fs: &FakeFs,
+        state: &mut ExplorerState,
+        width: usize,
+        height: usize,
+    ) {
+        let mut pixels = std::vec![0u32; width * height];
+        let mut canvas = Canvas::new(&mut pixels, width, height, width).unwrap();
+        render(&mut canvas, fs, state, 0);
+        let hash = golden_hash(canvas.pixels());
+        results.push((String::from(name), hash));
+        let mut bytes = format!("P6\n{width} {height}\n255\n").into_bytes();
+        for pixel in &pixels {
+            bytes.extend_from_slice(&[(pixel >> 16) as u8, (pixel >> 8) as u8, *pixel as u8]);
+        }
+        let directory = std::env::temp_dir().join("feos-golden");
+        let _ = std::fs::create_dir_all(&directory);
+        let _ = std::fs::write(directory.join(format!("explorer_{name}.ppm")), bytes);
+    }
+
+    #[test]
+    fn golden_explorer_frames() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/explorer_golden.txt");
+        let fs = FakeFs::sample();
+        let mut results = Vec::new();
+
+        let (width, height) = (1000usize, 700usize);
+        let mut state = hosted(&fs);
+        golden_frame(&mut results, "root_details", &fs, &mut state, width, height);
+
+        at(&mut state, &fs, "/docs");
+        select(&mut state, &fs, "alpha.txt");
+        golden_frame(&mut results, "docs_selected", &fs, &mut state, width, height);
+
+        for (name, action) in [
+            ("icons", Action::ViewIcons),
+            ("list", Action::ViewList),
+            ("tiles", Action::ViewTiles),
+        ] {
+            state.perform(&fs, action, None, 0);
+            golden_frame(&mut results, name, &fs, &mut state, width, height);
+        }
+
+        at(&mut state, &fs, "/pics");
+        state.perform(&fs, Action::ViewThumbnails, None, 0);
+        for _ in 0..4 {
+            state.update_thumbs(&fs);
+        }
+        golden_frame(&mut results, "thumbnails", &fs, &mut state, width, height);
+        state.perform(&fs, Action::ViewDetails, None, 0);
+
+        select(&mut state, &fs, "red.ppm");
+        golden_frame(&mut results, "picture_preview", &fs, &mut state, width, height);
+
+        state.perform(&fs, Action::Search, None, 0);
+        state.search.set("alpha");
+        state.current = fs.root();
+        state.run_search(&fs);
+        golden_frame(&mut results, "search", &fs, &mut state, width, height);
+        state.leave_search();
+        state.after_input(&fs, 0);
+
+        state.menu_open = Some(MenuKind::View);
+        golden_frame(&mut results, "view_menu", &fs, &mut state, width, height);
+        state.menu_open = None;
+
+        state.dialog = Dialog::About;
+        golden_frame(&mut results, "about", &fs, &mut state, width, height);
+        state.dialog = Dialog::None;
+
+        state.open_viewer(&fs, fs.id("/big.log"));
+        state.scroll_viewer(&fs, fs.id("/big.log"), 100);
+        golden_frame(&mut results, "viewer", &fs, &mut state, width, height);
+        state.dialog = Dialog::None;
+
+        // The smallest window the desktop allows a hosted app, then less.
+        let mut small = hosted(&fs);
+        golden_frame(&mut results, "minimum", &fs, &mut small, 720, 450);
+        let mut tiny = hosted(&fs);
+        golden_frame(&mut results, "tiny", &fs, &mut tiny, 200, 120);
+
+        let mut text = String::new();
+        for (name, hash) in &results {
+            text.push_str(&format!("{name} {hash:016x}\n"));
+        }
+        if std::env::var_os("FEOS_UPDATE_GOLDEN").is_some() {
+            std::fs::create_dir_all(std::path::Path::new(path).parent().unwrap()).unwrap();
+            std::fs::write(path, &text).unwrap();
+            return;
+        }
+        let expected =
+            std::fs::read_to_string(path).expect("golden file: run with FEOS_UPDATE_GOLDEN=1");
+        assert_eq!(
+            expected,
+            text,
+            "frames changed; PPMs are in {:?}. If intended, rerun with FEOS_UPDATE_GOLDEN=1.",
+            std::env::temp_dir().join("feos-golden")
+        );
+    }
+
+    // Random input --------------------------------------------------------
+
+    struct Random(u64);
+
+    impl Random {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, limit: u64) -> u64 {
+            self.next() % limit
+        }
+    }
+
+    const SIZES: [(usize, usize); 9] = [
+        (1, 1),
+        (2, 3),
+        (16, 16),
+        (40, 500),
+        (500, 30),
+        (320, 240),
+        (640, 480),
+        (721, 479),
+        (1000, 700),
+    ];
+
+    fn random_event(random: &mut Random, width: usize, height: usize) -> Event {
+        let point = Point::new(
+            random.below(width as u64 + 30) as i32,
+            random.below(height as u64 + 30) as i32,
+        );
+        match random.below(14) {
+            0..=4 => Event::PointerMoved(point),
+            5 | 6 => Event::PointerDown {
+                pos: point,
+                button: feos_gui::MouseButton::Left,
+            },
+            7 | 8 => Event::PointerUp {
+                pos: point,
+                button: feos_gui::MouseButton::Left,
+            },
+            9 => Event::PointerDown {
+                pos: point,
+                button: feos_gui::MouseButton::Right,
+            },
+            10 => Event::PointerWheel(random.below(9) as i32 - 4),
+            11 => Event::Text((b'a' + random.below(26) as u8) as char),
+            _ => {
+                const KEYS: [Key; 24] = [
+                    Key::Tab,
+                    Key::Enter,
+                    Key::Escape,
+                    Key::Space,
+                    Key::Backspace,
+                    Key::Delete,
+                    Key::Insert,
+                    Key::Left,
+                    Key::Right,
+                    Key::Up,
+                    Key::Down,
+                    Key::Home,
+                    Key::End,
+                    Key::PageUp,
+                    Key::PageDown,
+                    Key::F1,
+                    Key::F3,
+                    Key::F5,
+                    Key::F6,
+                    Key::F10,
+                    Key::Character('q'),
+                    Key::Character('c'),
+                    Key::Character('v'),
+                    Key::Character('a'),
+                ];
+                const MODIFIERS: [Modifiers; 5] = [
+                    Modifiers::NONE,
+                    Modifiers::NONE,
+                    Modifiers::SHIFT,
+                    Modifiers::CTRL,
+                    Modifiers::ALT,
+                ];
+                Event::KeyDown(
+                    KEYS[random.below(KEYS.len() as u64) as usize],
+                    MODIFIERS[random.below(MODIFIERS.len() as u64) as usize],
+                )
+            }
+        }
+    }
+
+    fn assert_consistent(state: &ExplorerState, seed: u64) {
+        assert!(state.entry_count <= MAX_ENTRIES, "seed {seed}");
+        assert!(state.search_count <= MAX_SEARCH, "seed {seed}");
+        assert!(state.tree_len <= MAX_TREE, "seed {seed}");
+        assert!(state.expanded_len <= MAX_TREE, "seed {seed}");
+        assert!(state.history_pos < state.history_len.max(1), "seed {seed}");
+        assert!(state.entry_count == 0 || state.cursor < state.entry_count, "seed {seed}");
+        assert!(state.viewer_len <= VIEWER_MAX, "seed {seed}");
+        assert_eq!(state.listed_search, state.searching(), "seed {seed}");
+    }
+
+    /// Foreground explorers have their own title bar, resize grips and exit
+    /// keys, which a hosted one never reaches. Drive those too.
+    #[test]
+    fn random_input_on_small_canvases_never_panics_in_the_foreground_form() {
+        let fs = FakeFs::sample();
+        for (seed, (width, height)) in SIZES.iter().cycle().take(36).enumerate() {
+            let seed = seed as u64 + 1;
+            let mut random = Random(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let mut pixels = std::vec![0u32; width * height];
+            let screen = Rect::new(0, 0, *width as u32, *height as u32);
+            let mut state = std::boxed::Box::new(ExplorerState::new(&fs, screen));
+            state.maximized = seed % 2 == 0;
+            for step in 0..300u64 {
+                let now = step * 40;
+                for _ in 0..random.below(4) {
+                    let event = random_event(&mut random, *width, *height);
+                    apply_event(&mut state, &fs, event, now);
+                }
+                state.after_input(&fs, now);
+                let mut canvas = Canvas::new(&mut pixels, *width, *height, *width).unwrap();
+                render(&mut canvas, &fs, &mut state, now);
+                assert_consistent(&state, seed);
+                state.exit = false;
+            }
+        }
+    }
+
+    fn apply_event(state: &mut ExplorerState, fs: &FakeFs, event: Event, now: u64) {
+        let at = |point: Point| (point.x.clamp(0, u16::MAX as i32) as u16, point.y.clamp(0, u16::MAX as i32) as u16);
+        let report = match event {
+            Event::PointerMoved(point) => {
+                let (x, y) = at(point);
+                Some(PointerEvent { x, y, ..PointerEvent::default() })
+            }
+            Event::PointerDown { pos, button } => {
+                let (x, y) = at(pos);
+                let mut report = PointerEvent { x, y, ..PointerEvent::default() };
+                match button {
+                    feos_gui::MouseButton::Left => report.left = Some(true),
+                    _ => report.right = Some(true),
+                }
+                Some(report)
+            }
+            Event::PointerUp { pos, .. } => {
+                let (x, y) = at(pos);
+                Some(PointerEvent { x, y, left: Some(false), ..PointerEvent::default() })
+            }
+            Event::PointerWheel(wheel) => {
+                let (x, y) = at(state.pointer);
+                Some(PointerEvent { x, y, wheel, ..PointerEvent::default() })
+            }
+            Event::KeyDown(key, modifiers) => {
+                state.handle_key(fs, key, modifiers, now);
+                None
+            }
+            Event::Text(ch) => {
+                state.handle_text(ch);
+                None
+            }
+            _ => None,
+        };
+        if let Some(report) = report {
+            state.handle_pointer(fs, report, now);
+        }
+    }
+
+    // The hosted path, through the real window glue ----------------------
+
+    struct FakeClock;
+    impl Clock for FakeClock {
+        fn frequency(&self) -> u64 {
+            1_000_000
+        }
+        fn ticks(&self) -> u64 {
+            0
+        }
+        fn spin_ms(&self, _ms: u64) {}
+    }
+    struct FakePower;
+    impl Power for FakePower {
+        fn system_off(&self) -> ! {
+            panic!("system_off")
+        }
+        fn system_reset(&self) -> ! {
+            panic!("system_reset")
+        }
+    }
+    struct FakeCpu;
+    impl Cpu for FakeCpu {
+        fn current_el(&self) -> u64 {
+            1
+        }
+        fn midr(&self) -> u64 {
+            0
+        }
+        fn halt(&self) -> ! {
+            panic!("halt")
+        }
+    }
+    struct NoProcesses;
+    impl Processes for NoProcesses {
+        fn spawn(&self, _app: &'static dyn App, _args: &str) -> Result<u32, SpawnError> {
+            Err(SpawnError::NoFreeSlot)
+        }
+        fn kill(&self, _pid: u32) -> bool {
+            false
+        }
+        fn current(&self) -> u32 {
+            1
+        }
+        fn snapshot(&self, _out: &mut [ProcessInfo]) -> usize {
+            0
+        }
+    }
+    struct NoApps;
+    impl AppRegistry for NoApps {
+        fn find(&self, _name: &str) -> Option<&'static dyn App> {
+            None
+        }
+    }
+    static CLOCK: FakeClock = FakeClock;
+    static POWER: FakePower = FakePower;
+    static CPU: FakeCpu = FakeCpu;
+    static PROCESSES: NoProcesses = NoProcesses;
+    static APPS: NoApps = NoApps;
+
+    fn platform() -> Platform {
+        Platform {
+            board: BoardInfo {
+                name: "test",
+                arch: "test",
+                console_base: 0,
+                framebuffer_addr: 0,
+                kernel_range: (0, 0),
+                bss_range: (0, 0),
+            },
+            clock: &CLOCK,
+            power: &POWER,
+            cpu: &CPU,
+            audio: None,
+            pointer: None,
+            keyboard: None,
+            processes: &PROCESSES,
+            memory: None,
+            apps: &APPS,
+            filesystem: None,
+        }
+    }
+
+    /// `WINDOW` is one static, so tests of the window glue take turns.
+    static WINDOW_TESTS: Mutex<()> = Mutex::new(());
+
+    fn window_turn() -> MutexGuard<'static, ()> {
+        WINDOW_TESTS.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn window_frame(
+        fs: &FakeFs,
+        platform: &Platform,
+        pixels: &mut [u32],
+        width: usize,
+        height: usize,
+        input: &Input,
+        args: &str,
+        open: bool,
+    ) -> WindowFrame {
+        let mut canvas = Canvas::new(pixels, width, height, width).unwrap();
+        let mut context = WindowContext {
+            args,
+            canvas: &mut canvas,
+            input,
+            platform,
+            now_ms: 1000,
+            origin: Point::new(0, 0),
+            pointer_active: true,
+            keyboard_active: true,
+        };
+        if open {
+            assert!(open_window(fs, &context));
+        }
+        frame_window(fs, &mut context)
+    }
+
+    #[test]
+    fn opening_with_arguments_and_reopening_with_new_ones_goes_there() {
+        let _turn = window_turn();
+        let fs = FakeFs::sample();
+        let platform = platform();
+        let mut pixels = std::vec![0u32; 800 * 600];
+        let input = Input::new();
+        window_frame(&fs, &platform, &mut pixels, 800, 600, &input, "/docs", true);
+        assert_eq!(WINDOW.lock().as_ref().unwrap().current, fs.id("/docs"));
+        close_window();
+        window_frame(&fs, &platform, &mut pixels, 800, 600, &input, "--search", true);
+        assert!(WINDOW.lock().as_ref().unwrap().bar == ExplorerBar::Search);
+        close_window();
+        assert!(!needs_frames());
+        assert!(!accept_drop("/docs"));
+    }
+
+    #[test]
+    fn a_hosted_window_closes_only_when_asked() {
+        let _turn = window_turn();
+        let fs = FakeFs::sample();
+        let platform = platform();
+        let mut pixels = std::vec![0u32; 800 * 600];
+        let mut input = Input::new();
+        input.push(Event::KeyDown(Key::Escape, Modifiers::NONE));
+        input.push(Event::KeyDown(Key::Character('q'), Modifiers::NONE));
+        assert_eq!(
+            window_frame(&fs, &platform, &mut pixels, 800, 600, &input, "", true),
+            WindowFrame::Continue
+        );
+        WINDOW.lock().as_mut().unwrap().menu_open = None;
+        {
+            let mut guard = WINDOW.lock();
+            let state = guard.as_mut().unwrap();
+            state.perform(&fs, Action::Close, None, 0);
+        }
+        let input = Input::new();
+        assert_eq!(
+            window_frame(&fs, &platform, &mut pixels, 800, 600, &input, "", false),
+            WindowFrame::Close
+        );
+        close_window();
+    }
+
+    #[test]
+    fn random_input_through_the_window_glue_never_panics() {
+        let _turn = window_turn();
+        let fs = FakeFs::sample();
+        let platform = platform();
+        for (seed, (width, height)) in SIZES.iter().enumerate() {
+            let seed = seed as u64 + 1;
+            let mut random = Random(seed.wrapping_mul(0x2545_f491_4f6c_dd1d) | 1);
+            let mut pixels = std::vec![0u32; width * height];
+            let mut input = Input::new();
+            for step in 0..400 {
+                input.clear_events();
+                for _ in 0..random.below(5) {
+                    input.push(random_event(&mut random, *width, *height));
+                }
+                let frame =
+                    window_frame(&fs, &platform, &mut pixels, *width, *height, &input, "", step == 0);
+                if frame == WindowFrame::Close {
+                    panic!("seed {seed} step {step}: random input closed the window");
+                }
+                assert_consistent(WINDOW.lock().as_ref().unwrap(), seed);
+            }
+            close_window();
+        }
     }
 }

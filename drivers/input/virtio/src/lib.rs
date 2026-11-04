@@ -14,12 +14,14 @@
 
 #![no_std]
 
-use core::sync::atomic::{fence, Ordering};
-
-use feos_hal::{KeyboardEvent, PointerEvent};
+use feos_hal::{dma, KeyboardEvent, PointerEvent};
 
 /// Number of descriptors in the event queue. Must be a power of two.
-pub const QUEUE_SIZE: usize = 16;
+///
+/// One tablet report takes up to five descriptors, and a release that doesn't
+/// fit is lost, which leaves a button or modifier stuck. So this needs to hold
+/// what a stalled poller can miss. QEMU's virtio-input queues hold at most 64.
+pub const QUEUE_SIZE: usize = 64;
 
 /// Number of decoded key transitions buffered for the caller.
 pub const KEY_QUEUE_SIZE: usize = 32;
@@ -94,6 +96,8 @@ mod input {
     pub const BTN_LEFT: u16 = 0x110;
     pub const BTN_RIGHT: u16 = 0x111;
     pub const BTN_MIDDLE: u16 = 0x112;
+    pub const BTN_GEAR_DOWN: u16 = 0x150;
+    pub const BTN_GEAR_UP: u16 = 0x151;
 
     pub const KEY_A: u16 = 30;
 
@@ -527,7 +531,7 @@ impl VirtioInput {
         self.queue.avail.idx = QUEUE_SIZE as u16;
         self.avail_idx = QUEUE_SIZE as u16;
         self.published_idx = QUEUE_SIZE as u16;
-        fence(Ordering::Release);
+        dma::wmb();
 
         let desc = core::ptr::addr_of!(self.queue.desc) as u64;
         let avail = core::ptr::addr_of!(self.queue.avail) as u64;
@@ -554,7 +558,7 @@ impl VirtioInput {
             return;
         }
         self.published_idx = self.avail_idx;
-        fence(Ordering::Release);
+        dma::wmb();
         // SAFETY: `avail.idx` is part of the queue owned by this driver.
         unsafe {
             core::ptr::write_volatile(
@@ -562,7 +566,7 @@ impl VirtioInput {
                 self.avail_idx,
             );
         }
-        fence(Ordering::Release);
+        dma::wmb();
         self.write32(reg::QUEUE_NOTIFY, 0);
     }
 
@@ -633,6 +637,16 @@ impl VirtioInput {
                 }
                 None
             }
+            // A tablet reports position with EV_ABS but still sends its wheel as
+            // EV_REL, so the wheel is accepted from every kind of pointer.
+            input::EV_REL
+                if event.code == input::REL_WHEEL && matches!(self.kind, DeviceKind::Pointer(_)) =>
+            {
+                self.pending_wheel = self.pending_wheel.saturating_add(event.value as i32);
+                // A wheel notch is a discrete action; report it now so a notch
+                // and its SYN never cancel out.
+                self.take_report()
+            }
             input::EV_REL if self.kind == DeviceKind::Pointer(PointerKind::Relative) => {
                 match event.code {
                     input::REL_X => {
@@ -647,12 +661,6 @@ impl VirtioInput {
                         self.pending_y = Some(next as u16);
                         None
                     }
-                    input::REL_WHEEL => {
-                        self.pending_wheel = self.pending_wheel.saturating_add(event.value as i32);
-                        // A wheel notch is a discrete action; report it now so
-                        // a notch and its SYN never cancel out.
-                        self.take_report()
-                    }
                     _ => None,
                 }
             }
@@ -662,6 +670,19 @@ impl VirtioInput {
                     pressed: event.value != 0,
                 });
                 None
+            }
+            // Older QEMU versions send the wheel as these two buttons.
+            input::EV_KEY if event.code == input::BTN_GEAR_UP => {
+                self.pending_wheel = self
+                    .pending_wheel
+                    .saturating_add((event.value != 0) as i32);
+                self.take_report()
+            }
+            input::EV_KEY if event.code == input::BTN_GEAR_DOWN => {
+                self.pending_wheel = self
+                    .pending_wheel
+                    .saturating_sub((event.value != 0) as i32);
+                self.take_report()
             }
             input::EV_KEY => {
                 let before = (self.left, self.right, self.middle);
@@ -742,7 +763,6 @@ impl VirtioInput {
             return None;
         }
 
-        fence(Ordering::Acquire);
         // SAFETY: the device writes the used ring in the queue memory owned by
         // this driver; the index is volatile because it changes asynchronously.
         let used_idx =
@@ -750,6 +770,8 @@ impl VirtioInput {
         if self.used_seen == used_idx {
             return None;
         }
+        // The ring entry and event buffer were written before the index.
+        dma::rmb();
 
         let slot = (self.used_seen as usize) % QUEUE_SIZE;
         // SAFETY: `slot` is inside the used ring.
@@ -893,6 +915,69 @@ mod tests {
             })
         );
         assert_eq!(device.take_key(), None);
+    }
+
+    #[test]
+    fn a_tablet_reports_the_wheel() {
+        // DRV-5: EV_REL was only accepted from relative pointers, and QEMU's
+        // default pointer on this machine is a tablet.
+        let mut device = VirtioInput::new();
+        device.width = 100;
+        device.height = 100;
+        for (value, wheel) in [(1, 1), (u32::MAX, -1)] {
+            let report = device
+                .handle_event(RawEvent {
+                    kind: input::EV_REL,
+                    code: input::REL_WHEEL,
+                    value,
+                })
+                .expect("wheel report");
+            assert_eq!(report.wheel, wheel);
+        }
+    }
+
+    #[test]
+    fn a_tablet_ignores_relative_motion_but_a_mouse_uses_it() {
+        let mut device = VirtioInput::new();
+        device.width = 100;
+        device.height = 100;
+        let motion = RawEvent {
+            kind: input::EV_REL,
+            code: input::REL_X,
+            value: 5,
+        };
+        assert!(device.handle_event(motion).is_none());
+        assert_eq!(device.pending_x, None);
+
+        device.kind = DeviceKind::Pointer(PointerKind::Relative);
+        assert!(device.handle_event(motion).is_none());
+        assert_eq!(device.pending_x, Some(5));
+    }
+
+    #[test]
+    fn gear_buttons_report_as_the_wheel() {
+        let mut device = VirtioInput::new();
+        device.width = 100;
+        device.height = 100;
+        let press = |code| RawEvent {
+            kind: input::EV_KEY,
+            code,
+            value: 1,
+        };
+        assert_eq!(device.handle_event(press(input::BTN_GEAR_UP)).unwrap().wheel, 1);
+        assert_eq!(device.handle_event(press(input::BTN_GEAR_DOWN)).unwrap().wheel, -1);
+    }
+
+    #[test]
+    fn a_keyboard_ignores_the_wheel() {
+        let mut device = VirtioInput::new();
+        device.kind = DeviceKind::Keyboard;
+        let wheel = RawEvent {
+            kind: input::EV_REL,
+            code: input::REL_WHEEL,
+            value: 1,
+        };
+        assert!(device.handle_event(wheel).is_none());
     }
 
     #[test]

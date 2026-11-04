@@ -7,6 +7,8 @@
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use feos_port_io::{inl, outb};
+
 use crate::smp::MAX_CPUS;
 
 /// PIT input clock.
@@ -22,20 +24,6 @@ const CALIBRATION_TICKS: u32 = 100_000;
 static FREQUENCY: AtomicU64 = AtomicU64::new(0);
 static PERIOD: AtomicU64 = AtomicU64::new(0);
 static IDLE_HINTS: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
-
-#[inline]
-unsafe fn outb(port: u16, value: u8) {
-    // SAFETY: callers pass a valid x86 I/O port.
-    unsafe { asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack)) };
-}
-
-#[inline]
-unsafe fn inl(port: u16) -> u32 {
-    let value: u32;
-    // SAFETY: callers pass a valid x86 I/O port.
-    unsafe { asm!("in eax, dx", out("eax") value, in("dx") port, options(nomem, nostack)) };
-    value
-}
 
 /// Reads the timestamp counter.
 pub fn ticks() -> u64 {
@@ -98,7 +86,7 @@ pub fn frequency() -> u64 {
 
 /// Milliseconds elapsed since the counter started.
 pub fn uptime_ms() -> u64 {
-    ticks().saturating_mul(1000).checked_div(frequency()).unwrap_or(0)
+    feos_hal::ticks_to_ms(ticks(), frequency())
 }
 
 /// Busy-waits for roughly `ms` milliseconds.
@@ -112,6 +100,9 @@ pub fn spin_ms(ms: u64) {
 }
 
 /// Waits for roughly `ms` milliseconds in a low-power state.
+///
+/// The kernel's clock blocks the process instead once the scheduler is running,
+/// so this only serves code running before it starts.
 pub fn idle_ms(ms: u64) {
     let frequency = frequency();
     let delta = frequency.saturating_mul(ms) / 1000;
@@ -122,8 +113,9 @@ pub fn idle_ms(ms: u64) {
     while ticks().wrapping_sub(start) < delta {
         IDLE_HINTS[cpu].store(true, Ordering::Relaxed);
         // SAFETY: unmask, halt until the next interrupt, then mask again so
-        // the loop can decide whether it is done.
-        unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) };
+        // the loop can decide whether it is done. The handler preserves this
+        // thread's state.
+        unsafe { asm!("sti", "hlt", "cli", options(nostack)) };
     }
 
     crate::irq::restore(flags);

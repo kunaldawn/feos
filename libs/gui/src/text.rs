@@ -71,6 +71,7 @@ impl<const N: usize> TextBuffer<N> {
             cursor -= 1;
         }
         self.cursor = cursor;
+        self.drop_empty_selection();
     }
 
     /// Replaces the contents with `text`.
@@ -164,6 +165,7 @@ impl<const N: usize> TextBuffer<N> {
         if self.cursor > 0 {
             self.cursor = self.previous_boundary(self.cursor);
         }
+        self.drop_empty_selection();
     }
 
     /// Moves the cursor one character right.
@@ -182,6 +184,7 @@ impl<const N: usize> TextBuffer<N> {
         if self.cursor < self.len {
             self.cursor = self.next_boundary(self.cursor);
         }
+        self.drop_empty_selection();
     }
 
     /// Moves to the start of the buffer.
@@ -192,6 +195,7 @@ impl<const N: usize> TextBuffer<N> {
             self.anchor = None;
         }
         self.cursor = 0;
+        self.drop_empty_selection();
     }
 
     /// Moves to the end of the buffer.
@@ -202,12 +206,14 @@ impl<const N: usize> TextBuffer<N> {
             self.anchor = None;
         }
         self.cursor = self.len;
+        self.drop_empty_selection();
     }
 
     /// Selects the whole buffer.
     pub fn select_all(&mut self) {
         self.anchor = Some(0);
         self.cursor = self.len;
+        self.drop_empty_selection();
     }
 
     /// The selection as `(start, end)` byte offsets, if non-empty.
@@ -232,12 +238,22 @@ impl<const N: usize> TextBuffer<N> {
     /// Deletes the selected text. Returns `true` when something was removed.
     pub fn delete_selection(&mut self) -> bool {
         let Some((start, end)) = self.selection() else {
+            // An anchor at the cursor selects nothing, and must not outlive
+            // the edit that is about to move text underneath it.
+            self.anchor = None;
             return false;
         };
         self.remove_range(start, end);
         self.cursor = start;
         self.anchor = None;
         true
+    }
+
+    /// Forgets an anchor that no longer selects anything.
+    fn drop_empty_selection(&mut self) {
+        if self.anchor == Some(self.cursor) {
+            self.anchor = None;
+        }
     }
 
     /// Removes `start..end` and shifts the rest left.
@@ -422,5 +438,98 @@ mod tests {
         let mut out = [0u8; 16];
         assert_eq!(format_f32(12.345, 1, &mut out), "12.3");
         assert_eq!(format_f32(-0.5, 2, &mut out), "-0.50");
+    }
+
+    #[test]
+    fn shift_left_then_shift_right_then_backspace_keeps_the_buffer_valid() {
+        let mut buffer = TextBuffer::<16>::with_text("abc");
+        buffer.set_cursor(3);
+        buffer.move_left(true);
+        buffer.move_right(true);
+        assert_eq!(buffer.selection(), None);
+        assert!(buffer.backspace());
+        assert_eq!(buffer.as_str(), "ab");
+        // The stale anchor made this index past the end of the text.
+        assert_eq!(buffer.selected_text(), None);
+    }
+
+    /// Small deterministic generator: the crate has no dependencies, and a
+    /// failing seed must reproduce exactly.
+    struct Random(u64);
+
+    impl Random {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, limit: u64) -> u64 {
+            self.next() % limit
+        }
+    }
+
+    fn assert_invariants<const N: usize>(buffer: &TextBuffer<N>, seed: u64, step: usize) {
+        let text = buffer.as_str();
+        assert_eq!(text.len(), buffer.len(), "seed {seed} step {step}");
+        assert!(buffer.len() <= N, "seed {seed} step {step}");
+        assert!(buffer.cursor() <= buffer.len(), "seed {seed} step {step}");
+        assert!(
+            text.is_char_boundary(buffer.cursor()),
+            "cursor off a boundary: seed {seed} step {step}"
+        );
+        if let Some((start, end)) = buffer.selection() {
+            assert!(start < end, "seed {seed} step {step}");
+            assert!(end <= buffer.len(), "seed {seed} step {step}");
+            assert!(text.is_char_boundary(start), "seed {seed} step {step}");
+            assert!(text.is_char_boundary(end), "seed {seed} step {step}");
+            let _ = buffer.selected_text();
+        }
+    }
+
+    #[test]
+    fn random_edit_sequences_keep_cursor_and_anchor_valid() {
+        const CHARS: [char; 6] = ['a', 'z', ' ', '\u{e9}', '\u{20ac}', '\u{1f600}'];
+        for seed in 1..200u64 {
+            let mut random = Random(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let mut buffer = TextBuffer::<24>::new();
+            for step in 0..400 {
+                let extend = random.below(2) == 0;
+                match random.below(13) {
+                    0 | 1 | 2 => {
+                        buffer.insert(CHARS[random.below(CHARS.len() as u64) as usize]);
+                    }
+                    3 => {
+                        buffer.insert_str("\u{e9}x");
+                    }
+                    4 => {
+                        buffer.backspace();
+                    }
+                    5 => {
+                        buffer.delete();
+                    }
+                    6 => buffer.move_left(extend),
+                    7 => buffer.move_right(extend),
+                    8 => buffer.move_home(extend),
+                    9 => buffer.move_end(extend),
+                    10 => buffer.select_all(),
+                    11 => buffer.set_cursor(random.below(32) as usize),
+                    _ => {
+                        buffer.delete_selection();
+                    }
+                }
+                assert_invariants(&buffer, seed, step);
+            }
+        }
+    }
+
+    #[test]
+    fn long_text_set_truncates_on_a_boundary_with_a_valid_cursor() {
+        for length in 0..40 {
+            let text: std::string::String = core::iter::repeat('\u{20ac}').take(length).collect();
+            let buffer = TextBuffer::<10>::with_text(&text);
+            assert_invariants(&buffer, 0, length);
+        }
     }
 }

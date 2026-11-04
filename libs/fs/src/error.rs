@@ -24,6 +24,11 @@ pub enum FsError {
     TooManyNodes,
     /// The volume has no free clusters left.
     NoSpace,
+    /// The heap could not supply memory for this operation.
+    OutOfMemory,
+    /// The directory tree would nest deeper than
+    /// [`MAX_PATH_DEPTH`](crate::MAX_PATH_DEPTH).
+    TooDeep,
     /// A file or directory with that name already exists.
     NameExists,
     /// The requested entry does not exist.
@@ -52,6 +57,8 @@ impl fmt::Display for FsError {
             Self::Corrupt => "corrupt filesystem metadata",
             Self::TooManyNodes => "too many filesystem entries",
             Self::NoSpace => "no space left on the volume",
+            Self::OutOfMemory => "out of memory",
+            Self::TooDeep => "directory tree is nested too deeply",
             Self::NameExists => "name already exists",
             Self::NotFound => "entry not found",
             Self::NotDirectory => "not a directory",

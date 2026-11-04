@@ -7,6 +7,12 @@ use feos_gfx::{Point, Size};
 /// Maximum number of events buffered for a single frame.
 pub const MAX_EVENTS: usize = 64;
 
+/// Queue slots only pointer events may use.
+///
+/// A burst of typing must not crowd out a button release, which would leave
+/// every widget under the pointer behaving as if the button were still held.
+pub const POINTER_RESERVE: usize = 16;
+
 /// Keyboard modifier keys.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Modifiers(u8);
@@ -168,12 +174,22 @@ impl Input {
         }
     }
 
-    /// Enqueues one event. Returns `false` when the frame queue is full.
-    pub fn push(&mut self, event: Event) -> bool {
-        if self.count == MAX_EVENTS {
-            return false;
-        }
+    /// Number of keyboard events that still fit in this frame's queue.
+    ///
+    /// An input source that can hold events back, such as a keyboard ring,
+    /// should stop draining at zero and leave the rest for the next frame.
+    pub const fn keyboard_capacity(&self) -> usize {
+        (MAX_EVENTS - POINTER_RESERVE).saturating_sub(self.count)
+    }
 
+    /// Enqueues one event. Returns `false` when the event was not queued.
+    ///
+    /// Pointer and modifier state is applied even when the queue is full, so
+    /// [`pointer_down`](Self::pointer_down) stays truthful and
+    /// [`Ui`](crate::Ui) can still see a press or release that lost its event.
+    /// Keyboard events cannot take the last [`POINTER_RESERVE`] slots, and
+    /// consecutive pointer moves share one slot.
+    pub fn push(&mut self, event: Event) -> bool {
         match event {
             Event::PointerMoved(pos) => self.pointer = pos,
             Event::PointerDown { pos, button } => {
@@ -195,6 +211,25 @@ impl Input {
             Event::Focus(focused) => self.focused = focused,
             Event::Resize(size) => self.size = size,
             Event::None | Event::PointerWheel(_) | Event::Text(_) => {}
+        }
+
+        if let Event::PointerMoved(_) = event {
+            if self.count > 0 && matches!(self.events[self.count - 1], Event::PointerMoved(_)) {
+                self.events[self.count - 1] = event;
+                return true;
+            }
+        }
+        let keyboard = matches!(
+            event,
+            Event::KeyDown(..) | Event::KeyUp(..) | Event::Text(_)
+        );
+        let limit = if keyboard {
+            MAX_EVENTS - POINTER_RESERVE
+        } else {
+            MAX_EVENTS
+        };
+        if self.count >= limit {
+            return false;
         }
 
         self.events[self.count] = event;
@@ -272,6 +307,27 @@ impl Input {
             filtered.count += 1;
         }
 
+        filtered
+    }
+
+    /// Returns a copy of this input with the events `keep` rejects removed.
+    pub fn filtered(&self, mut keep: impl FnMut(&Event) -> bool) -> Self {
+        let mut filtered = Self {
+            events: [Event::None; MAX_EVENTS],
+            count: 0,
+            pointer: self.pointer,
+            pointer_down: self.pointer_down,
+            secondary_down: self.secondary_down,
+            modifiers: self.modifiers,
+            focused: self.focused,
+            size: self.size,
+        };
+        for event in &self.events[..self.count] {
+            if keep(event) {
+                filtered.events[filtered.count] = *event;
+                filtered.count += 1;
+            }
+        }
         filtered
     }
 
@@ -371,5 +427,51 @@ mod tests {
         assert!(modifiers.contains(Modifiers::SHIFT));
         assert!(!modifiers.contains(Modifiers::ALT));
         assert_eq!((modifiers & Modifiers::SHIFT), Modifiers::SHIFT);
+    }
+
+    #[test]
+    fn typing_cannot_crowd_out_a_button_release() {
+        let mut input = Input::new();
+        input.push(Event::PointerDown {
+            pos: Point::new(1, 1),
+            button: MouseButton::Left,
+        });
+        let mut queued = 0;
+        for _ in 0..MAX_EVENTS * 2 {
+            if input.push(Event::Text('x')) {
+                queued += 1;
+            }
+        }
+        assert_eq!(queued, MAX_EVENTS - POINTER_RESERVE - 1);
+        assert_eq!(input.keyboard_capacity(), 0);
+        assert!(input.push(Event::PointerUp {
+            pos: Point::new(1, 1),
+            button: MouseButton::Left,
+        }));
+        assert!(!input.pointer_down());
+    }
+
+    #[test]
+    fn pointer_state_survives_a_full_queue() {
+        let mut input = Input::new();
+        for index in 0..MAX_EVENTS {
+            input.push(Event::PointerWheel(index as i32));
+        }
+        assert!(!input.push(Event::PointerDown {
+            pos: Point::new(9, 9),
+            button: MouseButton::Left,
+        }));
+        assert!(input.pointer_down());
+        assert_eq!(input.pointer(), Point::new(9, 9));
+    }
+
+    #[test]
+    fn consecutive_moves_share_one_slot() {
+        let mut input = Input::new();
+        for x in 0..200 {
+            assert!(input.push(Event::PointerMoved(Point::new(x, 0))));
+        }
+        assert_eq!(input.len(), 1);
+        assert_eq!(input.pointer(), Point::new(199, 0));
     }
 }

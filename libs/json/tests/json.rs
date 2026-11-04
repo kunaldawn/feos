@@ -133,6 +133,31 @@ fn rejects_malformed_input() {
 }
 
 #[test]
+fn literal_errors_report_the_offending_byte() {
+    let mut arena = [JsonNode::EMPTY; 8];
+    assert_eq!(
+        JsonDocument::parse("[nul]", &mut arena).err(),
+        Some(JsonError::UnexpectedByte {
+            offset: 4,
+            byte: b']'
+        })
+    );
+    let mut arena = [JsonNode::EMPTY; 8];
+    assert_eq!(
+        JsonDocument::parse("  [true, fxlse]", &mut arena).err(),
+        Some(JsonError::UnexpectedByte {
+            offset: 10,
+            byte: b'x'
+        })
+    );
+    let mut arena = [JsonNode::EMPTY; 8];
+    assert_eq!(
+        JsonDocument::parse("[nu", &mut arena).err(),
+        Some(JsonError::UnexpectedEnd)
+    );
+}
+
+#[test]
 fn enforces_depth_and_node_limits() {
     let mut deep = String::new();
     for _ in 0..feos_json::MAX_DEPTH + 6 {

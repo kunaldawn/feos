@@ -1,31 +1,32 @@
-//! `taskmgr`: a Windows XP-style Task Manager.
+//! `taskmgr`: the Task Manager.
 //!
-//! The task manager is a foreground application. It reads live data from the
-//! kernel [`Processes`](feos_app::Processes) service and the HAL memory
-//! service, keeps its own sampling history, and paints an XP Luna interface:
+//! The task manager reads live data from the kernel
+//! [`Processes`](feos_app::Processes) service and the HAL memory service,
+//! keeps its own sampling history, and paints a classic desktop interface:
 //!
 //! * **Applications** - the running tasks, with End Task / Switch To.
 //! * **Processes** - sortable PID/CPU/CPU-time/memory/threads/priority columns,
 //!   End Process, Properties and a context menu.
 //! * **Performance** - combined or per-core CPU history graphs, a memory
-//!   graph, totals, commit charge, physical memory and kernel memory.
+//!   graph, totals, memory in use and heap figures.
 //! * **Networking** - the adapter view, with an honest "no adapter" state on
 //!   boards that have no network driver.
 //! * **Users** - the console user session.
 //!
 //! Menus (File, Options, View, Help), dialogs (Run, Select Columns, Process
-//! Properties, About, Help, End Process, Log Off), update-speed control,
-//! always-on-top / minimize options, status bar, sortable headers, scrolling,
-//! mouse and serial-keyboard support are all implemented here. Like the rest
-//! of the GUI, it is allocation-free apart from the off-screen frame buffer.
+//! Properties, About, Help, End Process), update-speed control, status bar,
+//! sortable headers, scrolling, mouse and serial-keyboard support are all
+//! implemented here. Like the rest of the GUI, it is allocation-free apart from
+//! the off-screen frame buffer.
 
 use core::cmp::Ordering;
 use core::fmt::Write;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering as AtomicOrdering};
 
 use alloc::vec;
 
 use feos_app::{
-    App, Context, Platform, ProcessInfo, ProcessState, SystemInfo, WindowContext, WindowFrame,
+    shell, App, Context, KillResult, Platform, ProcessInfo, ProcessState, SystemInfo, WindowContext, WindowFrame,
     MAX_CPUS, MAX_PROCESSES,
 };
 use feos_console::println;
@@ -100,7 +101,7 @@ impl App for TaskManager {
     }
 
     fn description(&self) -> &'static str {
-        "inspect applications, processes, CPU and memory with an XP-style task manager"
+        "inspect applications, processes, CPU and memory"
     }
 
     fn foreground(&self) -> bool {
@@ -112,11 +113,11 @@ impl App for TaskManager {
     }
 
     fn animates(&self) -> bool {
-        true
+        WINDOW_ANIMATES.load(AtomicOrdering::Relaxed)
     }
 
     fn animation_period_ms(&self) -> u32 {
-        500
+        WINDOW_PERIOD_MS.load(AtomicOrdering::Relaxed)
     }
 
     fn open_window(&self, context: &WindowContext<'_, '_>) -> bool {
@@ -129,6 +130,10 @@ impl App for TaskManager {
 
     fn close_window(&self) {
         close_task_manager();
+    }
+
+    fn background_tick(&self, platform: &Platform, now_ms: u64) {
+        tick_task_manager(platform, now_ms);
     }
 
     fn run(&self, context: &mut Context<'_>) {
@@ -344,6 +349,14 @@ struct Row {
     threads: u16,
     priority: u8,
     started_ms: u64,
+    /// The process is blocked, sleeping or waiting for a lock.
+    blocked: bool,
+    /// A kill is waiting for the process's next safe point.
+    kill_pending: bool,
+    /// Most stack used so far and reserved, or zero when the kernel has no
+    /// figures for this process.
+    stack_used: usize,
+    stack_size: usize,
 }
 
 impl Row {
@@ -358,9 +371,19 @@ impl Row {
         threads: 0,
         priority: 0,
         started_ms: 0,
+        blocked: false,
+        kill_pending: false,
+        stack_used: 0,
+        stack_size: 0,
     };
 
     fn status_name(&self) -> &'static str {
+        if self.kill_pending {
+            return "Ending";
+        }
+        if self.blocked {
+            return "Waiting";
+        }
         match self.state {
             ProcessState::Running => "Running",
             ProcessState::Ready => "Ready",
@@ -400,7 +423,6 @@ enum Dialog {
     Help,
     Properties(u32),
     EndProcess { pid: u32, tab: Tab },
-    LogOff,
 }
 
 /// The edge or corner used to resize the task manager window.
@@ -468,9 +490,6 @@ enum Action {
     EndProcess,
     Close,
     Refresh,
-    AlwaysOnTop,
-    MinimizeOnUse,
-    HideWhenMinimized,
     SpeedHigh,
     SpeedNormal,
     SpeedLow,
@@ -590,9 +609,6 @@ struct State {
     mem_head: usize,
 
     update: UpdateSpeed,
-    always_on_top: bool,
-    minimize_on_use: bool,
-    hide_when_minimized: bool,
     show_status: bool,
     show_cpu_graph: bool,
     show_mem_graph: bool,
@@ -669,9 +685,6 @@ impl State {
             mem_len: 0,
             mem_head: 0,
             update: UpdateSpeed::Normal,
-            always_on_top: true,
-            minimize_on_use: false,
-            hide_when_minimized: false,
             show_status: true,
             show_cpu_graph: true,
             show_mem_graph: true,
@@ -822,13 +835,6 @@ impl State {
                     }
                 }
             }
-            Tab::Users => {
-                for index in 0..2 {
-                    if button_rect(list.buttons, index, 2).contains(self.pointer) {
-                        return 500 + index as u64;
-                    }
-                }
-            }
             _ => {}
         }
         0
@@ -867,6 +873,70 @@ impl State {
 
     /// Samples the kernel and recomputes the percentages.
     fn sample(&mut self, platform: &Platform, now: u64) {
+        self.sample_with(platform, now, 1, true);
+    }
+
+    /// Takes a scheduled sample if one is due.
+    ///
+    /// Frames only arrive while the window has a reason to redraw, so several
+    /// intervals may have passed since the last sample. The percentages are
+    /// averages over that whole gap, and they are recorded once per interval
+    /// so the graphs keep to the time span their label claims.
+    fn sample_if_due(&mut self, platform: &Platform, now: u64, details: bool) -> bool {
+        if self.update == UpdateSpeed::Paused {
+            return false;
+        }
+        let interval = self.update.interval_ms();
+        let elapsed = now.wrapping_sub(self.last_sample_ms);
+        if elapsed < interval {
+            return false;
+        }
+        let intervals = (elapsed / interval).clamp(1, HISTORY as u64) as usize;
+        self.sample_with(platform, now, intervals, details);
+        true
+    }
+
+    /// Changes the update speed. Resuming from a pause records the next sample
+    /// once, since the graph was deliberately frozen in between.
+    fn set_update(&mut self, update: UpdateSpeed, now: u64) {
+        if self.update == UpdateSpeed::Paused && update != UpdateSpeed::Paused {
+            self.last_sample_ms = now.saturating_sub(update.interval_ms());
+        }
+        self.update = update;
+    }
+
+    /// Whether the desktop needs to keep sending frames while this is shown.
+    ///
+    /// Everything on the Networking and Users tabs is fixed, so those tabs cost
+    /// nothing until there is input, and a paused window has nothing to update.
+    fn wants_frames(&self, now: u64) -> bool {
+        if self.notice_active(now) {
+            return true;
+        }
+        self.update != UpdateSpeed::Paused
+            && matches!(
+                self.tab,
+                Tab::Applications | Tab::Processes | Tab::Performance
+            )
+    }
+
+    /// How often this window wants frames: as often as it samples, or soon
+    /// enough to take a notice down on time.
+    fn frame_period_ms(&self, now: u64) -> u32 {
+        let sampling = match self.update {
+            UpdateSpeed::Paused => 500,
+            speed => speed.interval_ms().min(u32::MAX as u64) as u32,
+        };
+        if self.notice_active(now) {
+            sampling.min(500)
+        } else {
+            sampling
+        }
+    }
+
+    /// `details` asks the kernel for each process's stack and wait state, which
+    /// walks its stack. A minimized window does not need them.
+    fn sample_with(&mut self, platform: &Platform, now: u64, pushes: usize, details: bool) {
         let mut infos = [ProcessInfo::EMPTY; MAX_PROCESSES];
         let count = platform.processes.snapshot(&mut infos);
         let system = platform.processes.system();
@@ -881,6 +951,7 @@ impl State {
         let mut previous = [Previous::EMPTY; MAX_PROCESSES];
         let mut row_count = 0;
         let mut previous_count = 0;
+        let mut reserved_memory = 0usize;
 
         for info in infos.iter().take(count.min(MAX_PROCESSES)) {
             previous[previous_count] = Previous {
@@ -895,6 +966,13 @@ impl State {
 
             let before = self.find_previous(info.pid);
             let delta = info.cpu_ticks.saturating_sub(before);
+            let detail = if details {
+                platform.processes.detail(info.pid)
+            } else {
+                None
+            }
+            .unwrap_or_default();
+            reserved_memory = reserved_memory.saturating_add(info.memory_bytes);
             rows[row_count] = Row {
                 pid: info.pid,
                 name: Text::from_str(info.name()),
@@ -902,10 +980,20 @@ impl State {
                 cpu_percent: percentage(delta, total_delta),
                 cpu_ticks: info.cpu_ticks,
                 cpu_time_ms: info.cpu_ticks.saturating_mul(1_000) / hz,
-                memory_bytes: info.memory_bytes,
+                // Reserved stacks are all the same size, so what a process has
+                // actually touched is the figure that says something about it.
+                memory_bytes: if detail.stack_size > 0 {
+                    detail.stack_used.saturating_add(detail.heap_bytes)
+                } else {
+                    info.memory_bytes
+                },
                 threads: info.threads,
                 priority: info.priority,
                 started_ms: info.started_ms,
+                blocked: detail.blocked,
+                kill_pending: detail.kill_pending,
+                stack_used: detail.stack_used,
+                stack_size: detail.stack_size,
             };
             row_count += 1;
         }
@@ -923,13 +1011,9 @@ impl State {
             .map(|memory| memory.info())
             .unwrap_or_default();
         self.memory = memory;
-        let process_memory: usize = self.rows[..self.row_count]
-            .iter()
-            .map(|row| row.memory_bytes)
-            .sum();
-        self.commit_total = memory.heap_used_bytes.saturating_add(process_memory);
-        self.commit_limit = memory.heap_total_bytes.saturating_add(process_memory);
-        // "Memory Usage" is physical memory in use, not just the kernel heap:
+        self.commit_total = memory.heap_used_bytes.saturating_add(reserved_memory);
+        self.commit_limit = memory.heap_total_bytes.saturating_add(reserved_memory);
+        // "Memory Usage" is the system image's memory in use, not just the heap:
         // the heap alone is usually a few hundred KiB against a 64 MiB arena,
         // which rounded to 0% and left the graph flat.
         self.memory_percent = percentage(memory.used_bytes as u64, memory.total_bytes as u64);
@@ -939,18 +1023,20 @@ impl State {
 
         self.sort_rows();
         self.clamp_selection();
-        push_history(
-            &mut self.cpu_history,
-            &mut self.cpu_len,
-            &mut self.cpu_head,
-            self.cpu_percent,
-        );
-        push_history(
-            &mut self.mem_history,
-            &mut self.mem_len,
-            &mut self.mem_head,
-            self.memory_percent,
-        );
+        for _ in 0..pushes {
+            push_history(
+                &mut self.cpu_history,
+                &mut self.cpu_len,
+                &mut self.cpu_head,
+                self.cpu_percent,
+            );
+            push_history(
+                &mut self.mem_history,
+                &mut self.mem_len,
+                &mut self.mem_head,
+                self.memory_percent,
+            );
+        }
 
         let online = system.cpus.clamp(1, MAX_CPUS);
         for cpu in 0..MAX_CPUS {
@@ -967,12 +1053,14 @@ impl State {
             self.last_core_total_ticks[cpu] = total;
             self.last_core_idle_ticks[cpu] = idle;
             self.cpu_core_percent[cpu] = percent;
-            push_history(
-                &mut self.cpu_core_history[cpu],
-                &mut self.cpu_core_len[cpu],
-                &mut self.cpu_core_head[cpu],
-                percent,
-            );
+            for _ in 0..pushes {
+                push_history(
+                    &mut self.cpu_core_history[cpu],
+                    &mut self.cpu_core_len[cpu],
+                    &mut self.cpu_core_head[cpu],
+                    percent,
+                );
+            }
         }
 
         self.last_sample_ms = now;
@@ -1081,7 +1169,7 @@ impl State {
             return;
         }
         let scroll = self.scroll_mut(tab);
-        let next = (*scroll as i32 + delta).clamp(0, max as i32);
+        let next = (*scroll as i32).saturating_add(delta).clamp(0, max as i32);
         *scroll = next as usize;
     }
 
@@ -1123,16 +1211,24 @@ impl State {
             .find(|row| row.pid == pid)
             .map(|row| row.name)
             .unwrap_or_else(|| Text::from_str("process"));
-        if platform.processes.kill(pid) {
-            let mut message = Text::<160>::new();
-            let _ = write!(message, "Ended '{}' (PID {pid}).", name.as_str());
-            self.set_notice(now, message.as_str());
-            self.sample(platform, now);
-        } else {
-            self.set_notice(
-                now,
-                "Unable to end the process. It may already have exited.",
-            );
+        let mut message = Text::<160>::new();
+        match platform.processes.try_kill(pid) {
+            KillResult::Killed => {
+                let _ = write!(message, "Ended '{}' (PID {pid}).", name.as_str());
+                self.set_notice(now, message.as_str());
+                self.sample(platform, now);
+            }
+            KillResult::Pending | KillResult::AlreadyPending => {
+                let _ = write!(message, "Ending '{}' (PID {pid})...", name.as_str());
+                self.set_notice(now, message.as_str());
+                self.sample(platform, now);
+            }
+            KillResult::NotFound => {
+                self.set_notice(now, "That process has already exited.");
+            }
+            KillResult::Protected => {
+                self.set_notice(now, "Access is denied: this process cannot be ended.");
+            }
         }
     }
 
@@ -1144,13 +1240,26 @@ impl State {
             return;
         }
 
+        // The desktop knows which bundles exist, and gives a windowed app its
+        // window. Everything else here is for when no session is listening.
+        if routes_through_desktop(self.embedded, shell::session_active()) {
+            let mut message = Text::<160>::new();
+            if shell::request_run(command.as_str()) {
+                let _ = write!(message, "Opening '{}'...", command.as_str());
+            } else {
+                let _ = write!(message, "Too many requests are waiting; try again.");
+            }
+            self.set_notice(now, message.as_str());
+            return;
+        }
+
         let mut split = command.as_str().splitn(2, char::is_whitespace);
         let name = split.next().unwrap_or("");
         let args = split.next().unwrap_or("").trim();
 
         let Some(app) = platform.apps.find(name) else {
             let mut message = Text::<160>::new();
-            let _ = write!(message, "Windows cannot find '{}'.", name);
+            let _ = write!(message, "Cannot find '{}'.", name);
             self.set_notice(now, message.as_str());
             return;
         };
@@ -1181,6 +1290,15 @@ impl State {
             }
         }
     }
+}
+
+/// Whether New Task should hand its command to the desktop session.
+///
+/// A hosted window returns to the session between frames, so a request is acted
+/// on at once. The blocking foreground path keeps the session waiting until it
+/// returns, so it runs commands itself.
+const fn routes_through_desktop(embedded: bool, session_active: bool) -> bool {
+    embedded && session_active
 }
 
 /// Longest command accepted by the Run dialog.
@@ -1234,6 +1352,19 @@ fn format_memory(bytes: usize) -> Text<20> {
         let tenths = (bytes as u64 * 10) / (1024 * 1024);
         let _ = write!(text, "{}.{} MB", tenths / 10, tenths % 10);
     }
+    text
+}
+
+/// The time the graphs' history covers at this update speed.
+fn history_span(update: UpdateSpeed) -> Text<20> {
+    let mut text = Text::<20>::new();
+    match update {
+        UpdateSpeed::Paused => text.set("Paused"),
+        speed => {
+            let _ = write!(text, "{} seconds", HISTORY as u64 * speed.interval_ms() / 1_000);
+            true
+        }
+    };
     text
 }
 
@@ -1372,7 +1503,6 @@ fn dialog_panel(layout: Layout, dialog: Dialog) -> Rect {
         Dialog::Help => (560, 440),
         Dialog::Properties(_) => (480, 400),
         Dialog::EndProcess { .. } => (440, 200),
-        Dialog::LogOff => (440, 200),
         Dialog::None => (1, 1),
     };
     Rect::new(0, 0, width, height).center_in(layout.window.inset(12))
@@ -1380,10 +1510,9 @@ fn dialog_panel(layout: Layout, dialog: Dialog) -> Rect {
 
 fn dialog_buttons(dialog: Dialog) -> &'static [&'static str] {
     match dialog {
-        Dialog::Run => &["OK", "Cancel", "Browse..."],
+        Dialog::Run => &["OK", "Cancel"],
         Dialog::Columns => &["OK", "Cancel"],
         Dialog::EndProcess { .. } => &["Yes", "No"],
-        Dialog::LogOff => &["Log Off", "Cancel"],
         Dialog::About | Dialog::Help | Dialog::Properties(_) => &["OK"],
         Dialog::None => &[],
     }
@@ -1501,6 +1630,17 @@ fn state_cursor_shape(state: &State) -> feos_gui::CursorShape {
 
 /// State of a task manager hosted inside a desktop window.
 static WINDOW: SpinLock<Option<State>> = SpinLock::new(None);
+/// Whether the hosted window wants frames without input. Starts false, so a
+/// window that has not opened yet costs nothing.
+static WINDOW_ANIMATES: AtomicBool = AtomicBool::new(false);
+/// How often the hosted window wants those frames.
+static WINDOW_PERIOD_MS: AtomicU32 = AtomicU32::new(1_000);
+
+/// Publishes what [`App::animates`] reports, which cannot reach the state.
+fn publish_animation(state: &State, now: u64) {
+    WINDOW_ANIMATES.store(state.wants_frames(now), AtomicOrdering::Relaxed);
+    WINDOW_PERIOD_MS.store(state.frame_period_ms(now), AtomicOrdering::Relaxed);
+}
 
 pub(super) fn open_task_manager(context: &WindowContext<'_, '_>) -> bool {
     let screen = Rect::new(
@@ -1515,6 +1655,7 @@ pub(super) fn open_task_manager(context: &WindowContext<'_, '_>) -> bool {
     state.embedded = true;
     state.maximized = true;
     state.sample(context.platform, context.now_ms);
+    publish_animation(&state, context.now_ms);
     *WINDOW.lock() = Some(state);
     true
 }
@@ -1538,22 +1679,29 @@ pub(super) fn frame_task_manager(context: &mut WindowContext<'_, '_>) -> WindowF
         return WindowFrame::Close;
     }
 
-    let due = state.update != UpdateSpeed::Paused
-        && now.wrapping_sub(state.last_sample_ms) >= state.update.interval_ms();
-    if due {
-        state.sample(platform, now);
-    }
+    state.sample_if_due(platform, now, true);
     if state.notice_until != 0 && now >= state.notice_until {
         state.notice.clear();
         state.notice_until = 0;
     }
 
     render(context.canvas, platform, state, now);
+    publish_animation(state, now);
     WindowFrame::Continue
 }
 
 pub(super) fn close_task_manager() {
+    WINDOW_ANIMATES.store(false, AtomicOrdering::Relaxed);
     *WINDOW.lock() = None;
+}
+
+/// Keeps the graphs' history moving while the window is minimized.
+fn tick_task_manager(platform: &Platform, now: u64) {
+    if let Some(mut guard) = WINDOW.try_lock() {
+        if let Some(state) = guard.as_mut() {
+            state.sample_if_due(platform, now, false);
+        }
+    }
 }
 
 fn run(context: &mut Context<'_>) {
@@ -1666,10 +1814,7 @@ fn run(context: &mut Context<'_>) {
             break;
         }
 
-        let due = state.update != UpdateSpeed::Paused
-            && now.wrapping_sub(state.last_sample_ms) >= state.update.interval_ms();
-        if due {
-            state.sample(platform, now);
+        if state.sample_if_due(platform, now, true) {
             dirty = true;
         }
 
@@ -1785,14 +1930,16 @@ impl State {
                         let mut bottom = (y + height).min(max_bottom);
 
                         if edge.moves_left() {
-                            left = (x + dx).clamp(0, right - MIN_WIDTH);
+                            left = (x + dx).clamp(0, (right - MIN_WIDTH).max(0));
                         } else if edge.moves_right() {
-                            right = (x + width + dx).clamp(left + MIN_WIDTH, max_right);
+                            right = (x + width + dx)
+                                .clamp(left + MIN_WIDTH, max_right.max(left + MIN_WIDTH));
                         }
                         if edge.moves_top() {
-                            top = (y + dy).clamp(0, bottom - MIN_HEIGHT);
+                            top = (y + dy).clamp(0, (bottom - MIN_HEIGHT).max(0));
                         } else if edge.moves_bottom() {
-                            bottom = (y + height + dy).clamp(top + MIN_HEIGHT, max_bottom);
+                            bottom = (y + height + dy)
+                                .clamp(top + MIN_HEIGHT, max_bottom.max(top + MIN_HEIGHT));
                         }
 
                         self.window_x = left;
@@ -1825,14 +1972,9 @@ impl State {
     }
 
     fn clamp_window(&mut self) {
-        self.window_w = self
-            .window_w
-            .clamp(720, self.screen.width as i32)
-            .min(self.screen.width as i32);
-        self.window_h = self
-            .window_h
-            .clamp(480, self.screen.height as i32)
-            .min(self.screen.height as i32);
+        // A screen smaller than the minimum window wins over the minimum.
+        self.window_w = self.window_w.max(720).min(self.screen.width as i32);
+        self.window_h = self.window_h.max(480).min(self.screen.height as i32);
         self.window_x = self
             .window_x
             .clamp(0, (self.screen.width as i32 - self.window_w).max(0));
@@ -1963,9 +2105,8 @@ impl State {
         }
 
         match self.tab {
-            Tab::Applications => self.handle_applications_click(layout, now),
+            Tab::Applications => self.handle_applications_click(platform, layout, now),
             Tab::Processes => self.handle_processes_click(layout, now),
-            Tab::Users => self.handle_users_click(platform, layout, now),
             _ => {}
         }
     }
@@ -2004,7 +2145,7 @@ impl State {
     fn on_wheel(&mut self, delta: i32) {
         let layout = Layout::compute(self.screen, self);
         if self.dialog == Dialog::Help {
-            self.dialog_scroll = (self.dialog_scroll as i32 - delta * 2).max(0) as usize;
+            self.dialog_scroll = (self.dialog_scroll as i32).saturating_sub(delta.saturating_mul(2)).max(0) as usize;
             return;
         }
         if self.dialog != Dialog::None {
@@ -2014,17 +2155,17 @@ impl State {
         let visible = visible_rows(list.rows);
         match self.tab {
             Tab::Applications => {
-                self.scroll_by(Tab::Applications, -delta, visible);
+                self.scroll_by(Tab::Applications, delta.saturating_neg(), visible);
             }
             Tab::Processes => {
-                self.scroll_by(Tab::Processes, -delta, visible);
+                self.scroll_by(Tab::Processes, delta.saturating_neg(), visible);
             }
             Tab::Users => {}
             _ => {}
         }
     }
 
-    fn handle_applications_click(&mut self, layout: Layout, now: u64) {
+    fn handle_applications_click(&mut self, platform: &Platform, layout: Layout, now: u64) {
         let list = list_layout(layout);
         if let Some(index) = row_at(list.rows, self.pointer, self.app_scroll) {
             if index < self.row_count {
@@ -2036,7 +2177,7 @@ impl State {
                 self.last_click_pid = Some(pid);
                 self.last_click_ms = now;
                 if double {
-                    self.switch_to(now);
+                    self.switch_to(platform, now);
                 }
             }
             return;
@@ -2044,7 +2185,7 @@ impl State {
         if button_rect(list.buttons, 0, 3).contains(self.pointer) {
             self.end_selected();
         } else if button_rect(list.buttons, 1, 3).contains(self.pointer) {
-            self.switch_to(now);
+            self.switch_to(platform, now);
         } else if button_rect(list.buttons, 2, 3).contains(self.pointer) {
             self.run_text.clear();
             self.dialog = Dialog::Run;
@@ -2083,27 +2224,40 @@ impl State {
         }
     }
 
-    fn handle_users_click(&mut self, platform: &Platform, layout: Layout, now: u64) {
-        let list = list_layout(layout);
-        if button_rect(list.buttons, 0, 2).contains(self.pointer) {
-            self.set_notice(now, "The console session cannot be disconnected.");
-        } else if button_rect(list.buttons, 1, 2).contains(self.pointer) {
-            let _ = platform;
-            self.dialog = Dialog::LogOff;
-        }
-    }
-
-    fn switch_to(&mut self, now: u64) {
-        if let Some(row) = self.selected_row() {
-            if row.pid == 1 {
-                self.set_notice(now, "Task Manager is already the active task.");
-                return;
-            }
+    /// Brings the selected task's window forward, if it has one.
+    ///
+    /// The kernel's process table does not know about windows, and a command
+    /// with no window must not be started a second time by asking for it. So a
+    /// row can only be switched to when its name is a windowed app, which the
+    /// session then focuses (or opens).
+    fn switch_to(&mut self, platform: &Platform, now: u64) {
+        let Some(row) = self.selected_row().copied() else {
+            self.set_notice(now, "Select a task to switch to.");
+            return;
+        };
+        if !self.embedded {
+            // The blocking path covers the desktop; leaving is how to reach it.
             self.exit = true;
             self.exit_message = "switching to the desktop";
-        } else {
-            self.set_notice(now, "Select a task to switch to.");
+            return;
         }
+        let mut message = Text::<160>::new();
+        match platform.apps.find(row.name.as_str()).filter(|app| app.windowed()) {
+            Some(app) if shell::session_active() && shell::request_run(app.name()) => {
+                let _ = write!(message, "Switching to '{}'...", row.name.as_str());
+            }
+            _ if row.pid == 1 => {
+                let _ = write!(message, "This is the desktop session; it has no window.");
+            }
+            _ => {
+                let _ = write!(
+                    message,
+                    "'{}' runs in the background and has no window.",
+                    row.name.as_str()
+                );
+            }
+        }
+        self.set_notice(now, message.as_str());
     }
 
     fn handle_menu_click(
@@ -2202,10 +2356,8 @@ impl State {
                 if index == 0 {
                     self.dialog = Dialog::None;
                     self.launch(platform, now);
-                } else if index == 1 {
-                    self.dialog = Dialog::None;
                 } else {
-                    self.set_notice(now, "Browse is unavailable in this build.");
+                    self.dialog = Dialog::None;
                 }
             }
             Dialog::Columns => {
@@ -2220,15 +2372,6 @@ impl State {
                 self.dialog = Dialog::None;
                 if index == 0 {
                     self.confirm_end(platform, pid, now);
-                }
-            }
-            Dialog::LogOff => {
-                if index == 0 {
-                    self.dialog = Dialog::None;
-                    self.exit = true;
-                    self.exit_message = "logging off to the desktop";
-                } else {
-                    self.dialog = Dialog::None;
                 }
             }
             Dialog::About | Dialog::Help | Dialog::Properties(_) | Dialog::None => {
@@ -2319,7 +2462,10 @@ impl State {
         }
 
         match key {
-            Key::Escape => {
+            // A hosted window closes through its title bar or Alt+F4, so a stray
+            // Esc cannot throw its sampled history away. The blocking path has
+            // no window manager to do that.
+            Key::Escape if !self.embedded => {
                 self.exit = true;
                 self.exit_message = "";
             }
@@ -2384,7 +2530,7 @@ impl State {
             }
             Key::Enter => {
                 if self.tab == Tab::Applications {
-                    self.switch_to(now);
+                    self.switch_to(platform, now);
                 } else if self.tab == Tab::Processes {
                     if let Some(row) = self.selected_row() {
                         self.dialog = Dialog::Properties(row.pid);
@@ -2482,23 +2628,6 @@ impl State {
                 count += 1;
             }
             Menu::Options => {
-                out[count] =
-                    MenuItem::checked("Always On Top", Action::AlwaysOnTop, self.always_on_top);
-                count += 1;
-                out[count] = MenuItem::checked(
-                    "Minimize on Use",
-                    Action::MinimizeOnUse,
-                    self.minimize_on_use,
-                );
-                count += 1;
-                out[count] = MenuItem::checked(
-                    "Hide When Minimized",
-                    Action::HideWhenMinimized,
-                    self.hide_when_minimized,
-                );
-                count += 1;
-                out[count] = MenuItem::separator();
-                count += 1;
                 out[count] = MenuItem::checked(
                     "Update Speed: High",
                     Action::SpeedHigh,
@@ -2568,7 +2697,7 @@ impl State {
                 count += 1;
                 out[count] = MenuItem::separator();
                 count += 1;
-                out[count] = MenuItem::new("About Windows Task Manager", Action::About, true);
+                out[count] = MenuItem::new("About Task Manager", Action::About, true);
                 count += 1;
             }
         }
@@ -2588,13 +2717,10 @@ impl State {
                 self.exit_message = "";
             }
             Action::Refresh => self.sample(platform, now),
-            Action::AlwaysOnTop => self.always_on_top = !self.always_on_top,
-            Action::MinimizeOnUse => self.minimize_on_use = !self.minimize_on_use,
-            Action::HideWhenMinimized => self.hide_when_minimized = !self.hide_when_minimized,
-            Action::SpeedHigh => self.update = UpdateSpeed::High,
-            Action::SpeedNormal => self.update = UpdateSpeed::Normal,
-            Action::SpeedLow => self.update = UpdateSpeed::Low,
-            Action::SpeedPaused => self.update = UpdateSpeed::Paused,
+            Action::SpeedHigh => self.set_update(UpdateSpeed::High, now),
+            Action::SpeedNormal => self.set_update(UpdateSpeed::Normal, now),
+            Action::SpeedLow => self.set_update(UpdateSpeed::Low, now),
+            Action::SpeedPaused => self.set_update(UpdateSpeed::Paused, now),
             Action::SelectColumns => {
                 self.column_backup = self.column_visible;
                 self.dialog = Dialog::Columns;
@@ -2609,7 +2735,7 @@ impl State {
                 self.dialog_scroll = 0;
             }
             Action::About => self.dialog = Dialog::About,
-            Action::SwitchTo => self.switch_to(now),
+            Action::SwitchTo => self.switch_to(platform, now),
             Action::Properties => {
                 if let Some(row) = self.selected_row() {
                     self.dialog = Dialog::Properties(row.pid);
@@ -2683,15 +2809,11 @@ fn context_items(tab: Tab) -> &'static [(&'static str, Action)] {
         &[
             ("Switch To", Action::SwitchTo),
             ("End Task", Action::EndTask),
-            ("Bring to Front", Action::SwitchTo),
             ("Properties", Action::Properties),
         ]
     } else {
         &[
             ("End Process", Action::EndProcess),
-            ("End Process Tree", Action::EndProcess),
-            ("Set Priority", Action::None),
-            ("Debug", Action::None),
             ("Properties", Action::Properties),
         ]
     }
@@ -2849,7 +2971,7 @@ fn draw_window(painter: &mut Painter<'_, '_>, state: &State, layout: Layout, now
     if state.maximized {
         painter.fill_rect(layout.inner, FACE);
     } else {
-        // Paint only the 3 px Luna border, then the client area. Filling the
+        // Paint only the 3 px border, then the client area. Filling the
         // whole window first and covering it again doubles the pixel traffic.
         let border = Color::rgb(58, 145, 255);
         painter.fill_rect(
@@ -2898,7 +3020,7 @@ fn draw_window(painter: &mut Painter<'_, '_>, state: &State, layout: Layout, now
                 (buttons_left - layout.title.x - 35).max(10) as u32,
                 layout.title.height,
             ),
-            "Windows Task Manager",
+            "Task Manager",
             Color::WHITE,
             2,
             Align::Start,
@@ -3106,7 +3228,7 @@ fn draw_content(
 
 fn application_name(row: &Row) -> &str {
     if row.pid == 1 {
-        "Windows Task Manager"
+        "Desktop session"
     } else {
         row.name.as_str()
     }
@@ -3653,6 +3775,7 @@ fn draw_performance(painter: &mut Painter<'_, '_>, state: &State, layout: Layout
                     state.mem_head,
                     GRAPH_MEM,
                     GRAPH_MEM_LABEL,
+                    span.as_str(),
                 );
             } else {
                 // Side by side when there is room; stack them in a narrow
@@ -3675,6 +3798,7 @@ fn draw_performance(painter: &mut Painter<'_, '_>, state: &State, layout: Layout
                     state.mem_head,
                     GRAPH_MEM,
                     GRAPH_MEM_LABEL,
+                    span.as_str(),
                 );
             }
         } else if state.show_cpu_graph {
@@ -3690,6 +3814,7 @@ fn draw_performance(painter: &mut Painter<'_, '_>, state: &State, layout: Layout
                 state.mem_head,
                 GRAPH_MEM,
                 GRAPH_MEM_LABEL,
+                span.as_str(),
             );
         }
     }
@@ -3699,6 +3824,7 @@ fn draw_performance(painter: &mut Painter<'_, '_>, state: &State, layout: Layout
 
 /// Draws either the aggregate CPU line or one mini-graph per online core.
 fn draw_cpu_graphs(painter: &mut Painter<'_, '_>, rect: Rect, state: &State) {
+    let span = history_span(state.update);
     if state.cpu_view == CpuView::Combined {
         draw_graph_panel(
             painter,
@@ -3710,6 +3836,7 @@ fn draw_cpu_graphs(painter: &mut Painter<'_, '_>, rect: Rect, state: &State) {
             state.cpu_head,
             GRAPH_CPU,
             GRAPH_LABEL,
+            span.as_str(),
         );
         return;
     }
@@ -3738,6 +3865,7 @@ fn draw_cpu_graphs(painter: &mut Painter<'_, '_>, rect: Rect, state: &State) {
             state.cpu_core_head[cpu],
             GRAPH_CPU,
             GRAPH_LABEL,
+            span.as_str(),
         );
     }
 }
@@ -3752,6 +3880,7 @@ fn draw_graph_panel(
     head: usize,
     color: Color,
     label_color: Color,
+    span: &str,
 ) {
     if rect.is_empty() {
         return;
@@ -3775,7 +3904,7 @@ fn draw_graph_panel(
         rect.width.saturating_sub(16),
         rect.height.saturating_sub(28),
     );
-    draw_graph(painter, graph, history, len, head, color, label_color);
+    draw_graph(painter, graph, history, len, head, color, label_color, span);
 }
 
 fn draw_graph(
@@ -3786,6 +3915,7 @@ fn draw_graph(
     head: usize,
     color: Color,
     label_color: Color,
+    span: &str,
 ) {
     if rect.is_empty() {
         return;
@@ -3840,9 +3970,9 @@ fn draw_graph(
     }
 
     painter.draw_text(
-        rect.right_i32() - 84,
+        rect.right_i32() - 6 - painter.text_width(span, 1),
         rect.bottom_i32() - 10,
-        "60 seconds",
+        span,
         Color::rgb(120, 120, 120),
         1,
     );
@@ -3876,7 +4006,7 @@ fn draw_performance_stats(painter: &mut Painter<'_, '_>, area: Rect, state: &Sta
     draw_stat_panel(
         painter,
         commit.inset_each(0, 3, 4, 0),
-        "Commit Charge",
+        "Allocated",
         &[
             ("Total", commit_total),
             ("Limit", commit_limit),
@@ -3886,29 +4016,29 @@ fn draw_performance_stats(painter: &mut Painter<'_, '_>, area: Rect, state: &Sta
 
     let physical_total = format_memory(state.memory.total_bytes);
     let available = format_memory(state.memory.free_bytes);
-    let cache = format_memory(state.memory.heap_free_bytes);
+    let in_use = format_memory(state.memory.used_bytes);
     draw_stat_panel(
         painter,
         physical.inset_each(4, 0, 0, 3),
-        "Physical Memory",
+        "System Image",
         &[
             ("Total", physical_total),
             ("Available", available),
-            ("System Cache", cache),
+            ("In Use", in_use),
         ],
     );
 
-    let kernel_total = format_memory(state.memory.used_bytes);
-    let paged = format_memory(0);
-    let nonpaged = format_memory(state.memory.heap_used_bytes);
+    let heap_total = format_memory(state.memory.heap_total_bytes);
+    let heap_used = format_memory(state.memory.heap_used_bytes);
+    let heap_free = format_memory(state.memory.heap_free_bytes);
     draw_stat_panel(
         painter,
         kernel.inset_each(4, 3, 0, 0),
-        "Kernel Memory",
+        "Kernel Heap",
         &[
-            ("Total", kernel_total),
-            ("Paged", paged),
-            ("Nonpaged", nonpaged),
+            ("Total", heap_total),
+            ("Used", heap_used),
+            ("Free", heap_free),
         ],
     );
 }
@@ -4001,6 +4131,7 @@ fn draw_networking(painter: &mut Painter<'_, '_>, state: &State, layout: Layout)
         0,
         Color::rgb(0, 220, 220),
         Color::rgb(0, 210, 210),
+        "No data",
     );
 
     let rows = [
@@ -4073,23 +4204,6 @@ fn draw_users(painter: &mut Painter<'_, '_>, state: &State, layout: Layout) {
         Rect::new(list.rows.x, list.rows.y + ROW_HEIGHT, list.rows.width, 1),
         Color::rgb(238, 238, 232),
     );
-
-    draw_button(
-        painter,
-        button_rect(list.buttons, 0, 2),
-        "Disconnect",
-        false,
-        false,
-        state.pointer,
-    );
-    draw_button(
-        painter,
-        button_rect(list.buttons, 1, 2),
-        "Log Off",
-        true,
-        false,
-        state.pointer,
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -4115,7 +4229,7 @@ fn draw_status(painter: &mut Painter<'_, '_>, state: &State, layout: Layout) {
             let _ = write!(second, "CPU Usage: {}%", state.cpu_percent);
             let _ = write!(
                 third,
-                "Commit Charge: {} / {}",
+                "Allocated: {} / {}",
                 format_memory(state.commit_total).as_str(),
                 format_memory(state.commit_limit).as_str()
             );
@@ -4125,7 +4239,7 @@ fn draw_status(painter: &mut Painter<'_, '_>, state: &State, layout: Layout) {
             let _ = write!(second, "CPU Usage: {}%", state.cpu_percent);
             let _ = write!(
                 third,
-                "Commit Charge: {} / {}",
+                "Allocated: {} / {}",
                 format_memory(state.commit_total).as_str(),
                 format_memory(state.commit_limit).as_str()
             );
@@ -4135,23 +4249,16 @@ fn draw_status(painter: &mut Painter<'_, '_>, state: &State, layout: Layout) {
             let _ = write!(second, "Memory Usage: {}%", state.memory_percent);
             let _ = write!(third, "Processes: {}", state.system.processes);
         }
+        // These two tabs show nothing that changes, so they ask for no frames;
+        // figures that move would go stale here.
         Tab::Networking => {
             first.set("Network: No adapter");
-            let _ = write!(second, "CPU Usage: {}%", state.cpu_percent);
-            let _ = write!(
-                third,
-                "Uptime: {}",
-                format_duration(state.system.uptime_ms).as_str()
-            );
+            second.set("Adapters: 0");
         }
         Tab::Users => {
             first.set("Users: 1");
             second.set("Session: Console");
-            let _ = write!(
-                third,
-                "Uptime: {}",
-                format_duration(state.system.uptime_ms).as_str()
-            );
+            third.set("User: feos");
         }
     }
 
@@ -4329,12 +4436,11 @@ fn draw_notice(painter: &mut Painter<'_, '_>, state: &State, layout: Layout, _no
 fn dialog_title(dialog: Dialog) -> &'static str {
     match dialog {
         Dialog::Run => "Run",
-        Dialog::About => "About Windows Task Manager",
+        Dialog::About => "About Task Manager",
         Dialog::Columns => "Select Columns",
         Dialog::Help => "Task Manager Help",
         Dialog::Properties(_) => "Process Properties",
         Dialog::EndProcess { .. } => "Task Manager Warning",
-        Dialog::LogOff => "Log Off Windows",
         Dialog::None => "",
     }
 }
@@ -4388,7 +4494,6 @@ fn draw_dialog(
         Dialog::Help => draw_help_dialog(painter, state, body),
         Dialog::Properties(pid) => draw_properties_dialog(painter, state, pid, body),
         Dialog::EndProcess { pid, .. } => draw_end_dialog(painter, state, pid, body),
-        Dialog::LogOff => draw_logoff_dialog(painter, body),
         Dialog::None => {}
     }
 
@@ -4447,7 +4552,7 @@ fn draw_about_dialog(
     body: Rect,
 ) {
     draw_taskmgr_icon(painter, Rect::new(body.x, body.y, 40, 40));
-    painter.draw_text(body.x + 52, body.y + 2, "Windows Task Manager", TEXT, 2);
+    painter.draw_text(body.x + 52, body.y + 2, "Task Manager", TEXT, 2);
     painter.draw_text(body.x + 52, body.y + 24, "feos task manager", MUTED, 1);
     painter.draw_text(body.x + 52, body.y + 38, "Version 1.0 (feos)", MUTED, 1);
 
@@ -4513,11 +4618,14 @@ const HELP_LINES: &[&str] = &[
     "",
     "Applications",
     "  Lists the tasks running on this system. Select a task and choose",
-    "  End Task to stop it, or Switch To to return to the desktop.",
+    "  End Task to stop it, or Switch To to bring its window forward.",
+    "  Apps in desktop windows are drawn by the desktop session, PID 1,",
+    "  so they are not listed separately and their CPU time counts there.",
     "",
     "Processes",
     "  Shows every kernel process with its PID, CPU usage, CPU time,",
-    "  memory usage, thread count, start time, status and priority.",
+    "  memory touched (stack and heap), thread count, start time, status",
+    "  and priority.",
     "  Click a column heading to sort; click it again to reverse.",
     "  Double-click a process to open its properties.",
     "",
@@ -4528,9 +4636,10 @@ const HELP_LINES: &[&str] = &[
     "  for each online core. Each core needs its own runnable thread; one",
     "  desktop task can only occupy one core. Spawn background tasks to",
     "  exercise the other cores.",
-    "  The memory graph shows commit charge against the heap limit.",
-    "  Totals, commit charge, physical memory and kernel memory are",
-    "  sampled from the live kernel and the static heap.",
+    "  The memory graph shows the system image's memory in use. Allocated",
+    "  is the heap in use plus every process's reserved stack.",
+    "  Each graph covers 120 samples: 60, 120 or 240 seconds depending on",
+    "  Options > Update Speed.",
     "",
     "Networking",
     "  Lists the network adapters. This board has no network driver,",
@@ -4612,7 +4721,7 @@ fn draw_properties_dialog(painter: &mut Painter<'_, '_>, state: &State, pid: u32
             "Threads",
             Text::<32>::from_str(format_count(row.threads as usize).as_str()),
         ),
-        ("Handles", Text::<32>::from_str(format_count(0).as_str())),
+        ("Stack Used", stack_text(row)),
         ("Priority", Text::from_str(row.priority_name())),
         (
             "Started",
@@ -4637,6 +4746,21 @@ fn draw_properties_dialog(painter: &mut Painter<'_, '_>, state: &State, pid: u32
     painter.fill_rect(Rect::new(body.x, y + 18, body.width, 20), FIELD);
     painter.stroke_rect(Rect::new(body.x, y + 18, body.width, 20), 1, FIELD_BORDER);
     painter.draw_text(body.x + 4, y + 24, row.name.as_str(), TEXT, 1);
+}
+
+fn stack_text(row: &Row) -> Text<32> {
+    let mut text = Text::<32>::new();
+    if row.stack_size == 0 {
+        text.set("n/a");
+    } else {
+        let _ = write!(
+            text,
+            "{} of {}",
+            format_memory(row.stack_used).as_str(),
+            format_memory(row.stack_size).as_str()
+        );
+    }
+    text
 }
 
 fn text_value(value: u64) -> Text<32> {
@@ -4679,27 +4803,6 @@ fn draw_end_dialog(painter: &mut Painter<'_, '_>, state: &State, pid: u32, body:
     painter.draw_text_wrapped(
         Rect::new(body.x + 40, body.y + 46, body.width.saturating_sub(40), 50),
         "If an open program is associated with this process, it will close and you could lose unsaved data.",
-        MUTED,
-        1,
-    );
-}
-
-fn draw_logoff_dialog(painter: &mut Painter<'_, '_>, body: Rect) {
-    paint_icon(
-        painter,
-        Rect::new(body.x, body.y + 4, 28, 28),
-        Icon::LogOut,
-        Color::rgb(0, 100, 190),
-    );
-    painter.draw_text_wrapped(
-        Rect::new(body.x + 40, body.y, body.width.saturating_sub(40), 40),
-        "Logging off closes Task Manager and returns to the desktop session.",
-        TEXT,
-        1,
-    );
-    painter.draw_text_wrapped(
-        Rect::new(body.x + 40, body.y + 44, body.width.saturating_sub(40), 40),
-        "No other session will be affected.",
         MUTED,
         1,
     );
@@ -4963,6 +5066,7 @@ mod render_tests {
             threads: 1,
             priority: 8,
             started_ms: 0,
+            ..Row::EMPTY
         };
         state.rows[1] = Row {
             pid: 2,
@@ -4975,6 +5079,7 @@ mod render_tests {
             threads: 1,
             priority: 8,
             started_ms: 1_000,
+            ..Row::EMPTY
         };
         state.selected_pid = Some(2);
         state.cursor = 1;
@@ -5155,7 +5260,6 @@ mod render_tests {
                 pid: 2,
                 tab: Tab::Processes,
             },
-            Dialog::LogOff,
         ] {
             state.dialog = dialog;
             draw_dialog(&mut painter, &platform, &state, layout, 1_000);
@@ -5200,7 +5304,7 @@ mod preview_tests {
         std::fs::write(path, out).expect("write preview");
     }
 
-    fn preview_state(screen: Rect) -> State {
+    pub(super) fn preview_state(screen: Rect) -> State {
         let mut state = test_state(screen);
         let names = ["shell", "tick", "player", "files", "tone", "desktop"];
         let percents = [34u8, 18, 12, 7, 4, 2];
@@ -5222,6 +5326,7 @@ mod preview_tests {
                 threads: 1,
                 priority: 8,
                 started_ms: index as u64 * 10_000,
+                ..Row::EMPTY
             };
         }
         state.selected_pid = Some(3);
@@ -5524,5 +5629,625 @@ mod cursor_tests {
         let button = button_rect(list.buttons, 0, 2);
         state.pointer = Point::new(button.x + 4, button.y + 4);
         assert!(state.hover_signature() >= 500);
+    }
+}
+
+#[cfg(test)]
+mod behavior_tests {
+    use super::render_tests::{platform, test_state};
+    use super::*;
+    use feos_app::{Processes, ProcessDetail, SpawnError};
+    use std::sync::Mutex;
+
+    /// The hosted window's state is one static, so tests of it take turns.
+    pub(super) static WINDOW_TESTS: Mutex<()> = Mutex::new(());
+
+    pub(super) fn hosted_state(screen: Rect) -> State {
+        let mut state = test_state(screen);
+        state.embedded = true;
+        state.maximized = true;
+        state
+    }
+
+    #[test]
+    fn escape_cannot_close_a_hosted_window() {
+        let platform = platform();
+        let mut state = hosted_state(Rect::new(0, 0, 900, 600));
+        state.handle_key(&platform, Key::Escape, Modifiers::NONE, 10);
+        assert!(!state.exit);
+    }
+
+    #[test]
+    fn escape_closes_an_open_menu_or_dialog_but_not_the_window() {
+        let platform = platform();
+        let mut state = hosted_state(Rect::new(0, 0, 900, 600));
+        state.menu = Some(Menu::File);
+        state.handle_key(&platform, Key::Escape, Modifiers::NONE, 10);
+        assert!(state.menu.is_none());
+        state.dialog = Dialog::About;
+        state.handle_key(&platform, Key::Escape, Modifiers::NONE, 10);
+        assert!(state.dialog == Dialog::None);
+        assert!(!state.exit);
+    }
+
+    #[test]
+    fn the_blocking_path_can_still_leave_with_escape() {
+        let platform = platform();
+        let mut state = test_state(Rect::new(0, 0, 900, 600));
+        state.handle_key(&platform, Key::Escape, Modifiers::NONE, 10);
+        assert!(state.exit);
+    }
+
+    #[test]
+    fn every_context_item_does_something() {
+        for tab in [Tab::Applications, Tab::Processes] {
+            for (label, action) in context_items(tab) {
+                assert!(*action != Action::None, "{label} is dead");
+            }
+        }
+    }
+
+    #[test]
+    fn the_options_menu_only_offers_what_works() {
+        let state = test_state(Rect::new(0, 0, 900, 600));
+        let mut items = [MenuItem::new("", Action::None, false); 12];
+        let count = state.menu_items(Menu::Options, &mut items);
+        assert_eq!(count, 4);
+        assert!(items[..count].iter().all(|item| item.label.starts_with("Update Speed")));
+    }
+
+    #[test]
+    fn switching_to_a_windowless_task_explains_itself_and_stays_open() {
+        let platform = platform();
+        let mut state = hosted_state(Rect::new(0, 0, 900, 600));
+        state.selected_pid = Some(2);
+        state.switch_to(&platform, 10);
+        assert!(!state.exit, "Switch To used to just close Task Manager");
+        assert!(state.notice.as_str().contains("no window"), "{}", state.notice.as_str());
+    }
+
+    #[test]
+    fn new_task_goes_to_the_desktop_only_from_a_hosted_window_in_a_session() {
+        assert!(routes_through_desktop(true, true));
+        assert!(!routes_through_desktop(true, false));
+        assert!(!routes_through_desktop(false, true));
+    }
+
+    #[test]
+    fn the_graph_label_matches_the_real_history_span() {
+        assert_eq!(history_span(UpdateSpeed::High).as_str(), "60 seconds");
+        assert_eq!(history_span(UpdateSpeed::Normal).as_str(), "120 seconds");
+        assert_eq!(history_span(UpdateSpeed::Low).as_str(), "240 seconds");
+        assert_eq!(history_span(UpdateSpeed::Paused).as_str(), "Paused");
+    }
+
+    #[test]
+    fn a_gap_between_frames_still_fills_the_history_in_real_time() {
+        let platform = platform();
+        let mut state = State::new(Rect::new(0, 0, 900, 600));
+        state.sample(&platform, 1_000);
+        assert_eq!(state.cpu_len, 1);
+        assert!(!state.sample_if_due(&platform, 1_500, true));
+        assert!(state.sample_if_due(&platform, 6_000, true));
+        assert_eq!(state.cpu_len, 6);
+        assert_eq!(state.mem_len, 6);
+        assert_eq!(state.cpu_core_len[0], 6);
+        // A very long gap cannot do more than replace the whole history.
+        assert!(state.sample_if_due(&platform, 10_000_000, true));
+        assert_eq!(state.cpu_len, HISTORY);
+    }
+
+    #[test]
+    fn resuming_from_a_pause_does_not_invent_history() {
+        let platform = platform();
+        let mut state = State::new(Rect::new(0, 0, 900, 600));
+        state.sample(&platform, 1_000);
+        state.set_update(UpdateSpeed::Paused, 1_000);
+        assert!(!state.sample_if_due(&platform, 90_000, true));
+        state.set_update(UpdateSpeed::Normal, 90_000);
+        assert!(state.sample_if_due(&platform, 90_000, true));
+        assert_eq!(state.cpu_len, 2);
+    }
+
+    #[test]
+    fn only_tabs_that_change_ask_for_frames() {
+        let mut state = hosted_state(Rect::new(0, 0, 900, 600));
+        for tab in [Tab::Applications, Tab::Processes, Tab::Performance] {
+            state.tab = tab;
+            assert!(state.wants_frames(10));
+        }
+        for tab in [Tab::Networking, Tab::Users] {
+            state.tab = tab;
+            assert!(!state.wants_frames(10));
+        }
+        state.tab = Tab::Performance;
+        state.update = UpdateSpeed::Paused;
+        assert!(!state.wants_frames(10));
+        // A notice still has to be taken down on time.
+        state.set_notice(10, "hello");
+        assert!(state.wants_frames(10));
+        assert!(state.frame_period_ms(10) <= 500);
+    }
+
+    #[test]
+    fn the_frame_period_follows_the_update_speed() {
+        let mut state = hosted_state(Rect::new(0, 0, 900, 600));
+        state.update = UpdateSpeed::Normal;
+        assert_eq!(state.frame_period_ms(10), 1_000);
+        state.update = UpdateSpeed::Low;
+        assert_eq!(state.frame_period_ms(10), 2_000);
+        state.update = UpdateSpeed::High;
+        assert_eq!(state.frame_period_ms(10), 500);
+    }
+
+    #[test]
+    fn animation_starts_with_the_window_and_ends_with_it() {
+        let _turn = WINDOW_TESTS.lock().unwrap_or_else(|poison| poison.into_inner());
+        let platform = platform();
+        let app = TaskManager;
+        close_task_manager();
+        assert!(!app.animates());
+
+        let input = Input::new();
+        let mut pixels = vec![0u32; 800 * 500];
+        let mut canvas = Canvas::new(&mut pixels, 800, 500, 800).unwrap();
+        let context = WindowContext {
+            args: "",
+            canvas: &mut canvas,
+            input: &input,
+            platform: &platform,
+            now_ms: 1_000,
+            origin: Point::new(0, 0),
+            pointer_active: false,
+            keyboard_active: false,
+        };
+        assert!(app.open_window(&context));
+        assert!(app.animates());
+        assert_eq!(app.animation_period_ms(), 1_000);
+        app.close_window();
+        assert!(!app.animates());
+    }
+
+    #[test]
+    fn a_minimized_window_keeps_sampling_through_its_background_tick() {
+        let _turn = WINDOW_TESTS.lock().unwrap_or_else(|poison| poison.into_inner());
+        let platform = platform();
+        let app = TaskManager;
+        let mut state = State::new(Rect::new(0, 0, 900, 600));
+        state.sample(&platform, 1_000);
+        *WINDOW.lock() = Some(state);
+        for now in [1_100, 2_000, 3_000, 4_000] {
+            app.background_tick(&platform, now);
+        }
+        let samples = WINDOW.lock().as_ref().map(|state| state.cpu_len);
+        close_task_manager();
+        assert_eq!(samples, Some(4));
+        // With no window it has nothing to do.
+        app.background_tick(&platform, 9_000);
+    }
+
+    struct Detailed;
+    impl Processes for Detailed {
+        fn spawn(&self, _app: &'static dyn App, _args: &str) -> Result<u32, SpawnError> {
+            Err(SpawnError::NoFreeSlot)
+        }
+        fn kill(&self, _pid: u32) -> bool {
+            false
+        }
+        fn current(&self) -> u32 {
+            1
+        }
+        fn snapshot(&self, out: &mut [ProcessInfo]) -> usize {
+            out[0] = ProcessInfo {
+                pid: 7,
+                state: ProcessState::Ready,
+                memory_bytes: 128 * 1024,
+                ..ProcessInfo::EMPTY
+            };
+            1
+        }
+        fn detail(&self, _pid: u32) -> Option<ProcessDetail> {
+            Some(ProcessDetail {
+                blocked: true,
+                kill_pending: false,
+                stack_size: 128 * 1024,
+                stack_used: 8 * 1024,
+                heap_bytes: 2 * 1024,
+            })
+        }
+    }
+
+    #[test]
+    fn mem_usage_and_status_come_from_the_kernel_when_it_can_say() {
+        static DETAILED: Detailed = Detailed;
+        let platform = Platform {
+            processes: &DETAILED,
+            ..platform()
+        };
+        let mut state = State::new(Rect::new(0, 0, 900, 600));
+        state.sample(&platform, 1_000);
+        let row = state.rows[0];
+        assert_eq!(row.memory_bytes, 10 * 1024, "not the constant reservation");
+        assert_eq!(row.status_name(), "Waiting");
+        assert_eq!(stack_text(&row).as_str(), "8 K of 128 K");
+        // Allocated still counts what is reserved.
+        assert_eq!(state.commit_total, 6 * 1024 * 1024 + 128 * 1024);
+
+        // The minimized path skips the walk over every stack.
+        state.sample_with(&platform, 2_000, 1, false);
+        assert_eq!(state.rows[0].memory_bytes, 128 * 1024);
+        assert_eq!(state.rows[0].status_name(), "Ready");
+    }
+
+    #[test]
+    fn a_failed_kill_says_why() {
+        let platform = platform();
+        let mut state = test_state(Rect::new(0, 0, 900, 600));
+        state.confirm_end(&platform, 2, 10);
+        assert!(state.notice.as_str().contains("already exited"));
+    }
+}
+
+#[cfg(test)]
+mod golden_tests {
+    use super::behavior_tests::hosted_state;
+    use super::preview_tests::preview_state;
+    use super::render_tests::platform;
+    use super::*;
+
+    const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/taskmgr_golden.txt");
+
+    fn golden_hash(pixels: &[u32]) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for pixel in pixels {
+            for byte in pixel.to_le_bytes() {
+                hash ^= byte as u64;
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        hash
+    }
+
+    fn write_ppm(name: &str, pixels: &[u32], width: usize, height: usize) {
+        let mut bytes = std::format!("P6\n{width} {height}\n255\n").into_bytes();
+        for pixel in pixels {
+            bytes.extend_from_slice(&[(pixel >> 16) as u8, (pixel >> 8) as u8, *pixel as u8]);
+        }
+        let directory = std::env::temp_dir().join("feos-golden");
+        let _ = std::fs::create_dir_all(&directory);
+        let _ = std::fs::write(directory.join(std::format!("{name}.ppm")), bytes);
+    }
+
+    /// A stable state: fixed rows, history and clock, with no pointer over
+    /// anything.
+    fn stable(width: u32, height: u32, tab: Tab) -> State {
+        let screen = Rect::new(0, 0, width, height);
+        let mut state = preview_state(screen);
+        state.embedded = hosted_state(screen).embedded;
+        state.maximized = true;
+        state.tab = tab;
+        state.pointer = Point::new(-100, -100);
+        state
+    }
+
+    fn frame(
+        results: &mut std::vec::Vec<(std::string::String, u64)>,
+        name: &str,
+        mut state: State,
+        width: usize,
+        height: usize,
+    ) {
+        let platform = platform();
+        let mut pixels = vec![0u32; width * height];
+        let mut canvas = Canvas::new(&mut pixels, width, height, width).unwrap();
+        render(&mut canvas, &platform, &mut state, 1_000);
+        write_ppm(name, &pixels, width, height);
+        results.push((name.into(), golden_hash(&pixels)));
+    }
+
+    #[test]
+    fn golden_task_manager_frames() {
+        let mut results = std::vec::Vec::new();
+        let sizes = [
+            ("normal", 898usize, 590usize),
+            ("minimum", 720, 480),
+            ("tiny", 320, 240),
+            ("single", 1, 1),
+        ];
+        for (size, width, height) in sizes {
+            for tab in Tab::ALL {
+                let state = stable(width as u32, height as u32, tab);
+                let name = std::format!("taskmgr_{size}_{}", tab.title().to_lowercase());
+                frame(&mut results, &name, state, width, height);
+            }
+        }
+
+        let mut state = stable(898, 590, Tab::Performance);
+        state.cpu_view = CpuView::PerCore;
+        for cpu in 0..2 {
+            state.cpu_core_len[cpu] = HISTORY;
+            state.cpu_core_percent[cpu] = 30 + cpu as u8 * 20;
+            for index in 0..HISTORY {
+                state.cpu_core_history[cpu][index] = ((index * 5 + cpu * 17) % 80) as u8;
+            }
+        }
+        frame(&mut results, "taskmgr_normal_per_core", state, 898, 590);
+
+        for (name, dialog) in [
+            ("run", Dialog::Run),
+            ("about", Dialog::About),
+            ("columns", Dialog::Columns),
+            ("help", Dialog::Help),
+            ("properties", Dialog::Properties(3)),
+            (
+                "end_process",
+                Dialog::EndProcess {
+                    pid: 3,
+                    tab: Tab::Processes,
+                },
+            ),
+        ] {
+            let mut state = stable(898, 590, Tab::Processes);
+            state.dialog = dialog;
+            frame(&mut results, &std::format!("taskmgr_dialog_{name}"), state, 898, 590);
+        }
+        for menu in Menu::ALL {
+            let mut state = stable(898, 590, Tab::Processes);
+            state.menu = Some(menu);
+            let name = std::format!("taskmgr_menu_{}", menu.title().to_lowercase());
+            frame(&mut results, &name, state, 898, 590);
+        }
+
+        let mut text = std::string::String::new();
+        for (name, hash) in &results {
+            text.push_str(&std::format!("{name} {hash:016x}\n"));
+        }
+        if std::env::var_os("FEOS_UPDATE_GOLDEN").is_some() {
+            std::fs::create_dir_all(std::path::Path::new(GOLDEN).parent().unwrap()).unwrap();
+            std::fs::write(GOLDEN, &text).unwrap();
+            return;
+        }
+        let expected =
+            std::fs::read_to_string(GOLDEN).expect("golden file: run with FEOS_UPDATE_GOLDEN=1");
+        assert_eq!(
+            expected,
+            text,
+            "frames changed; PPMs are in {:?}. If this is intended, rerun with FEOS_UPDATE_GOLDEN=1.",
+            std::env::temp_dir().join("feos-golden")
+        );
+    }
+}
+
+#[cfg(test)]
+mod fuzz_tests {
+    use super::behavior_tests::WINDOW_TESTS;
+    use super::render_tests::platform;
+    use super::*;
+    use core::sync::atomic::{AtomicU64, Ordering as Atomic};
+    use feos_app::{Processes, SpawnError};
+    use feos_gui::MouseButton;
+
+    /// A full process table whose counters keep moving.
+    struct Busy(AtomicU64);
+    impl Processes for Busy {
+        fn spawn(&self, _app: &'static dyn App, _args: &str) -> Result<u32, SpawnError> {
+            Ok(99)
+        }
+        fn kill(&self, pid: u32) -> bool {
+            pid % 2 == 0
+        }
+        fn current(&self) -> u32 {
+            1
+        }
+        fn snapshot(&self, out: &mut [ProcessInfo]) -> usize {
+            let tick = self.0.fetch_add(7, Atomic::Relaxed);
+            let count = (2 + (tick / 7) % 15).min(out.len() as u64) as usize;
+            for (index, slot) in out.iter_mut().take(count).enumerate() {
+                let mut name = [0u8; feos_app::PROCESS_NAME_MAX];
+                name[..4].copy_from_slice(b"proc");
+                *slot = ProcessInfo {
+                    pid: index as u32 + 1,
+                    state: ProcessState::Ready,
+                    name,
+                    name_len: 4,
+                    cpu_ticks: tick * (index as u64 + 1),
+                    memory_bytes: 128 * 1024,
+                    ..ProcessInfo::EMPTY
+                };
+            }
+            count
+        }
+        fn system(&self) -> SystemInfo {
+            let tick = self.0.load(Atomic::Relaxed);
+            SystemInfo {
+                uptime_ms: tick,
+                total_ticks: tick,
+                idle_ticks: tick / 3,
+                ticks_per_second: 100,
+                processes: 3,
+                threads: 3,
+                cpus: 8,
+                ..SystemInfo::EMPTY
+            }
+        }
+    }
+
+    struct Random(u64);
+    impl Random {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, limit: u64) -> u64 {
+            self.next() % limit
+        }
+    }
+
+    fn random_event(random: &mut Random, width: i32, height: i32) -> Event {
+        let point = Point::new(
+            random.below(width as u64 + 30) as i32 - 15,
+            random.below(height as u64 + 30) as i32 - 15,
+        );
+        match random.below(14) {
+            0..=3 => Event::PointerMoved(point),
+            4 | 5 => Event::PointerDown {
+                pos: point,
+                button: MouseButton::Left,
+            },
+            6 | 7 => Event::PointerUp {
+                pos: point,
+                button: MouseButton::Left,
+            },
+            8 => Event::PointerDown {
+                pos: point,
+                button: MouseButton::Right,
+            },
+            9 => Event::PointerWheel(random.below(21) as i32 - 10),
+            10 => Event::Text((b'a' + random.below(26) as u8) as char),
+            _ => {
+                const KEYS: [Key; 17] = [
+                    Key::Tab,
+                    Key::Enter,
+                    Key::Escape,
+                    Key::Backspace,
+                    Key::Delete,
+                    Key::Left,
+                    Key::Right,
+                    Key::Up,
+                    Key::Down,
+                    Key::Home,
+                    Key::End,
+                    Key::PageUp,
+                    Key::PageDown,
+                    Key::F1,
+                    Key::F5,
+                    Key::F10,
+                    Key::Character('q'),
+                ];
+                const MODIFIERS: [Modifiers; 3] =
+                    [Modifiers::NONE, Modifiers::SHIFT, Modifiers::CTRL];
+                Event::KeyDown(
+                    KEYS[random.below(KEYS.len() as u64) as usize],
+                    MODIFIERS[random.below(3) as usize],
+                )
+            }
+        }
+    }
+
+    const SIZES: [(usize, usize); 8] = [
+        (1, 1),
+        (2, 3),
+        (40, 500),
+        (500, 30),
+        (120, 90),
+        (320, 240),
+        (720, 480),
+        (1024, 728),
+    ];
+
+    /// Random input through the same entry points the desktop uses.
+    #[test]
+    fn random_input_on_small_canvases_never_panics_a_hosted_window() {
+        static BUSY: Busy = Busy(AtomicU64::new(0));
+        let _turn = WINDOW_TESTS.lock().unwrap_or_else(|poison| poison.into_inner());
+        let platform = Platform {
+            processes: &BUSY,
+            ..platform()
+        };
+        let app = TaskManager;
+        for (seed, (width, height)) in SIZES.iter().copied().cycle().take(32).enumerate() {
+            let mut random = Random((seed as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let mut pixels = vec![0u32; width * height];
+            let mut input = Input::new();
+            let mut now = 1_000u64;
+            let mut open = false;
+            for _ in 0..400 {
+                for _ in 0..random.below(4) {
+                    input.push(random_event(&mut random, width as i32, height as i32));
+                }
+                now += random.below(1_500);
+                let mut canvas = Canvas::new(&mut pixels, width, height, width).unwrap();
+                let mut context = WindowContext {
+                    args: "",
+                    canvas: &mut canvas,
+                    input: &input,
+                    platform: &platform,
+                    now_ms: now,
+                    origin: Point::new(0, 0),
+                    pointer_active: true,
+                    keyboard_active: true,
+                };
+                if !open {
+                    assert!(app.open_window(&context));
+                    open = true;
+                }
+                if app.frame_window(&mut context) == WindowFrame::Close {
+                    app.close_window();
+                    open = false;
+                }
+                input.clear_events();
+                if random.below(16) == 0 {
+                    app.background_tick(&platform, now);
+                }
+            }
+            app.close_window();
+        }
+    }
+
+    /// The blocking path's window has a title bar and resize edges to hit.
+    #[test]
+    fn random_input_on_small_canvases_never_panics_the_foreground_window() {
+        static BUSY: Busy = Busy(AtomicU64::new(0));
+        let platform = Platform {
+            processes: &BUSY,
+            ..platform()
+        };
+        for (seed, (width, height)) in SIZES.iter().copied().cycle().take(32).enumerate() {
+            let mut random = Random((seed as u64 + 77).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let mut pixels = vec![0u32; width * height];
+            let screen = Rect::new(0, 0, width as u32, height as u32);
+            let mut state = State::new(screen);
+            state.sample(&platform, 0);
+            let mut now = 1_000u64;
+            for _ in 0..400 {
+                now += random.below(700);
+                let event = random_event(&mut random, width as i32, height as i32);
+                let at = |point: Point| PointerEvent {
+                    x: point.x.clamp(0, u16::MAX as i32) as u16,
+                    y: point.y.clamp(0, u16::MAX as i32) as u16,
+                    ..PointerEvent::default()
+                };
+                match event {
+                    Event::PointerMoved(point) => state.handle_pointer(&platform, at(point), now),
+                    Event::PointerDown { pos, button } | Event::PointerUp { pos, button } => {
+                        let down = matches!(event, Event::PointerDown { .. });
+                        let mut report = at(pos);
+                        match button {
+                            MouseButton::Left => report.left = Some(down),
+                            _ => report.right = Some(down),
+                        }
+                        state.handle_pointer(&platform, report, now);
+                    }
+                    Event::PointerWheel(delta) => {
+                        let mut report = at(state.pointer);
+                        report.wheel = delta;
+                        state.handle_pointer(&platform, report, now);
+                    }
+                    Event::Text(ch) => state.handle_text(&platform, ch, now),
+                    Event::KeyDown(key, modifiers) => {
+                        state.handle_key(&platform, key, modifiers, now)
+                    }
+                    _ => {}
+                }
+                let _ = state.hover_signature();
+                let _ = state_cursor_shape(&state);
+                state.exit = false;
+                state.sample_if_due(&platform, now, true);
+                let mut canvas = Canvas::new(&mut pixels, width, height, width).unwrap();
+                render(&mut canvas, &platform, &mut state, now);
+            }
+        }
     }
 }

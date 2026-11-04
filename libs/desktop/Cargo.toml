@@ -1,6 +1,6 @@
 [package]
 name = "feos-desktop"
-description = "Configurable desktop environment, window manager and XP-style taskbar for feos"
+description = "Configurable desktop environment, window manager and classic-style taskbar for feos"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -22,7 +22,8 @@ use feos_driver_virtio_input::{PointerKind, VirtioInput};
 use feos_fs::{FileSystem, MemoryBlockDevice, MountTable, StaticFs};
 use feos_gfx::Canvas;
 use feos_hal::{
-    Audio, Clock, InterruptController, Keyboard, KeyboardEvent, Pointer, PointerEvent, Serial,
+    Audio, Board, Clock, InterruptController, Keyboard, KeyboardEvent, Pointer, PointerEvent,
+    Serial,
 };
 use feos_sync::SpinLock;
 
@@ -62,6 +63,12 @@ pub const GIC_CPU_BASE: usize = 0x0801_0000;
 /// QEMU's default `virt` configuration has no GIC security extensions, so the
 /// physical timer is PPI 30 and is acknowledged as a Group 0 interrupt.
 pub const TIMER_IRQ: u32 = 30;
+
+/// SGI that stops a CPU for good.
+pub const IPI_STOP: u32 = 0;
+
+/// SGI that asks a CPU to reschedule.
+pub const IPI_RESCHEDULE: u32 = 1;
 
 /// CPUs the board can bring up.
 ///
@@ -119,13 +126,20 @@ pub static INTERRUPT_CONTROLLER: GicV2 = GicV2::new(GIC_DIST_BASE, GIC_CPU_BASE)
 /// Initializes the GIC and enables the timer interrupt on the boot CPU.
 pub fn init_interrupts() {
     INTERRUPT_CONTROLLER.init();
+    enable_cpu_lines();
+}
+
+/// Enables the lines each CPU banks for itself.
+fn enable_cpu_lines() {
     INTERRUPT_CONTROLLER.enable(TIMER_IRQ);
+    INTERRUPT_CONTROLLER.enable(IPI_STOP);
+    INTERRUPT_CONTROLLER.enable(IPI_RESCHEDULE);
 }
 
 /// Initializes the calling CPU's GIC interface and timer PPI.
 pub fn init_cpu_interrupts() {
     INTERRUPT_CONTROLLER.init_cpu();
-    INTERRUPT_CONTROLLER.enable(TIMER_IRQ);
+    enable_cpu_lines();
 }
 
 /// Returns the interrupt controller shared with the kernel IRQ handler.
@@ -265,9 +279,6 @@ fn console_writer(text: &str) {
 
 fn console_byte_writer(bytes: &[u8]) {
     for &byte in bytes {
-        if byte == b'\n' {
-            UART0.write_byte(b'\r');
-        }
         UART0.write_byte(byte);
     }
 }
@@ -407,6 +418,8 @@ extern "C" {
     static __kernel_start: u8;
     static __bss_start: u8;
     static __bss_end: u8;
+    static __stack_bottom: u8;
+    static __stack_top: u8;
     static __kernel_end: u8;
 }
 
@@ -424,4 +437,113 @@ pub fn bss_range() -> (usize, usize) {
         core::ptr::addr_of!(__bss_start) as usize,
         core::ptr::addr_of!(__bss_end) as usize,
     )
+}
+
+/// Address range `[start, end)` of the boot stack.
+pub fn stack_range() -> (usize, usize) {
+    (
+        core::ptr::addr_of!(__stack_bottom) as usize,
+        core::ptr::addr_of!(__stack_top) as usize,
+    )
+}
+
+/// This board, as the kernel sees it.
+pub struct QemuVirt;
+
+impl Board for QemuVirt {
+    const NAME: &'static str = NAME;
+    const ARCH: &'static str = ARCH;
+    const CONSOLE_NAME: &'static str = CONSOLE_NAME;
+    const CONSOLE_BASE: usize = CONSOLE_BASE;
+    const INTERRUPT_CONTROLLER_NAME: &'static str = INTERRUPT_CONTROLLER_NAME;
+    const POINTER_NAME: &'static str = POINTER_NAME;
+    const POINTER_HINT: &'static str = POINTER_HINT;
+    const KEYBOARD_NAME: &'static str = KEYBOARD_NAME;
+    const KEYBOARD_HINT: &'static str = KEYBOARD_HINT;
+    const TIMER_IRQ: u32 = TIMER_IRQ;
+    const IPI_STOP: u32 = IPI_STOP;
+    const IPI_RESCHEDULE: u32 = IPI_RESCHEDULE;
+    const MAX_CPUS: usize = MAX_CPUS;
+
+    type Display = Canvas<'static>;
+    type AudioDevice = AudioDevice;
+    type PointerKind = PointerKind;
+    type FileSystem = dyn FileSystem;
+
+    fn init_console() {
+        init_console();
+    }
+
+    fn write_emergency(bytes: &[u8]) {
+        for &byte in bytes {
+            if byte == b'\n' {
+                UART0.write_byte(b'\r');
+            }
+            UART0.write_byte(byte);
+        }
+    }
+
+    fn init_interrupts() {
+        init_interrupts();
+    }
+
+    fn init_cpu_interrupts() {
+        init_cpu_interrupts();
+    }
+
+    fn interrupts() -> &'static dyn InterruptController {
+        interrupts()
+    }
+
+    fn cpu_mpidr(index: usize) -> u64 {
+        cpu_mpidr(index)
+    }
+
+    fn init_display() -> Option<Canvas<'static>> {
+        init_display()
+    }
+
+    fn back_buffer() -> Option<Canvas<'static>> {
+        back_buffer()
+    }
+
+    fn framebuffer_addr() -> usize {
+        framebuffer_addr()
+    }
+
+    fn init_audio(clock: &'static dyn Clock) -> Option<AudioDevice> {
+        init_audio(clock)
+    }
+
+    fn init_pointer() -> Option<PointerKind> {
+        init_pointer()
+    }
+
+    fn pointer() -> Option<&'static dyn Pointer> {
+        pointer()
+    }
+
+    fn init_keyboard() -> bool {
+        init_keyboard()
+    }
+
+    fn keyboard() -> Option<&'static dyn Keyboard> {
+        keyboard()
+    }
+
+    fn filesystem() -> &'static dyn FileSystem {
+        filesystem()
+    }
+
+    fn kernel_range() -> (usize, usize) {
+        kernel_range()
+    }
+
+    fn bss_range() -> (usize, usize) {
+        bss_range()
+    }
+
+    fn stack_range() -> (usize, usize) {
+        stack_range()
+    }
 }

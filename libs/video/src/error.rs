@@ -33,6 +33,27 @@ pub enum VideoError {
     },
     /// A conversion or index computation overflowed `usize`.
     Overflow,
+    /// The video needs more memory than is available.
+    OutOfMemory,
+    /// The video exceeds a configured limit.
+    LimitExceeded(&'static str),
+}
+
+impl VideoError {
+    /// Whether later frames of the same video can't succeed either. Other
+    /// errors concern one damaged frame, and playback can carry on past it.
+    pub const fn is_fatal(&self) -> bool {
+        matches!(
+            self,
+            Self::UnknownFormat
+                | Self::UnsupportedFormat
+                | Self::UnsupportedFeature(_)
+                | Self::UnsupportedCodec(_)
+                | Self::OutOfMemory
+                | Self::LimitExceeded(_)
+                | Self::Overflow
+        )
+    }
 }
 
 impl fmt::Display for VideoError {
@@ -59,6 +80,8 @@ impl fmt::Display for VideoError {
                 write!(f, "frame {index} out of range (stream has {count} frames)")
             }
             Self::Overflow => write!(f, "video dimensions overflow"),
+            Self::OutOfMemory => write!(f, "not enough memory for this video"),
+            Self::LimitExceeded(what) => write!(f, "video too large: {what}"),
         }
     }
 }
@@ -95,6 +118,7 @@ impl From<feos_h264::DecodeError> for VideoError {
             DecodeError::UnexpectedEof => Self::UnexpectedEnd,
             DecodeError::InvalidSyntax(what) => Self::InvalidData(what),
             DecodeError::Unsupported(what) => Self::UnsupportedFeature(what),
+            DecodeError::OutOfMemory => Self::OutOfMemory,
         }
     }
 }

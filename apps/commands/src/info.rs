@@ -30,10 +30,19 @@ impl App for Info {
             "  cpus            : {} online",
             platform.processes.system().cpus.max(1)
         );
-        println!("  exception level : EL{}", platform.cpu.current_el());
-        println!("  MIDR_EL1        : {:#018x}", platform.cpu.midr());
         println!(
-            "  generic timer   : {} Hz, uptime {} ms",
+            "  privilege level : {}{}",
+            platform.cpu.privilege_prefix(),
+            platform.cpu.current_el()
+        );
+        println!(
+            "  cpu id          : {:#018x} ({})",
+            platform.cpu.midr(),
+            platform.cpu.id_name()
+        );
+        println!(
+            "  clock           : {}, {} Hz, uptime {} ms",
+            platform.clock.name(),
             platform.clock.frequency(),
             platform.clock.uptime_ms()
         );

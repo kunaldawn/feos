@@ -5,7 +5,7 @@
 //! actually puts on a screen: search fields, selects, menus, tables, trees,
 //! alerts, toasts, pagination, split panes and more. The `advanced` submodule
 //! adds masked/multiline inputs, range controls, tag editors and cascaders;
-//! `patterns` adds Windows/Fluent composition surfaces such as title bars,
+//! `patterns` adds desktop composition surfaces such as title bars,
 //! property grids, chat threads, sheets, command palettes and result pages.
 //!
 //! Every component follows the same rules as the primitives:

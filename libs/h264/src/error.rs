@@ -21,6 +21,9 @@ pub enum DecodeError {
     /// (e.g. interlaced coding, High 10/4:2:2/4:4:4 profiles, SP/SI slices,
     /// slice groups / FMO).
     Unsupported(&'static str),
+    /// The stream needs more memory than the configured
+    /// [`Limits`](crate::decoder::Limits) allow, or an allocation failed.
+    OutOfMemory,
 }
 
 impl fmt::Display for DecodeError {
@@ -29,6 +32,7 @@ impl fmt::Display for DecodeError {
             DecodeError::UnexpectedEof => write!(f, "unexpected end of bitstream"),
             DecodeError::InvalidSyntax(msg) => write!(f, "invalid syntax: {}", msg),
             DecodeError::Unsupported(msg) => write!(f, "unsupported: {}", msg),
+            DecodeError::OutOfMemory => write!(f, "not enough memory for this stream"),
         }
     }
 }

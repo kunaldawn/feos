@@ -292,11 +292,15 @@ fn exfat_boot_checksum(region: &[u8]) -> u32 {
 fn exfat_name_hash(name: &str) -> u16 {
     let mut hash = 0u16;
     for unit in name.encode_utf16() {
-        let unit = if unit <= 0x7f {
-            (unit as u8).to_ascii_uppercase() as u16
-        } else {
-            unit
-        };
+        // The hash covers the up-cased name, non-ASCII units included. These
+        // fixtures have no up-case table, so the driver uses Unicode rules.
+        let unit = char::from_u32(unit as u32).map_or(unit, |character| {
+            let mut upper = character.to_uppercase();
+            match (upper.next(), upper.next()) {
+                (Some(single), None) if single as u32 <= 0xffff => single as u32 as u16,
+                _ => unit,
+            }
+        });
         hash = hash.rotate_right(1).wrapping_add(unit & 0xff);
         hash = hash.rotate_right(1).wrapping_add(unit >> 8);
     }
@@ -779,4 +783,22 @@ fn read_all(fs: &dyn FileSystem, node: NodeId) -> Vec<u8> {
     let read = fs.read(node, 0, &mut data);
     data.truncate(read);
     data
+}
+
+/// Fills the root's first cluster so that a new entry set ends in its last slot.
+/// Each short-named file takes a long-name entry and a short entry.
+#[test]
+fn fat32_entry_set_in_the_last_slot_of_a_directory_can_be_removed_and_renamed() {
+    let (mut image, _) = build_fat32();
+    let mut fs = Fat32::mount(MemoryBlockDeviceMut::new(&mut image)).unwrap();
+    let mut last = None;
+    for name in ["aaaa.txt", "bbbb.txt", "cccc.txt", "dddd.txt"] {
+        last = Some(fs.create_file(NodeId::ROOT, name).unwrap());
+    }
+    let last = last.unwrap();
+    fs.rename(last, NodeId::ROOT, "eeee.txt").unwrap();
+    let renamed = fs.resolve("/eeee.txt").unwrap();
+    fs.remove(renamed).unwrap();
+    assert_eq!(fs.resolve("/eeee.txt"), None);
+    assert_eq!(fs.resolve("/dddd.txt"), None);
 }

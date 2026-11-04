@@ -36,9 +36,13 @@ mod slice;
 mod slice_context;
 mod sps;
 
-pub use decoder::{Decoder, Frame, OrderedDecoder};
+pub use decoder::{Decoder, Frame, Limits, OrderedDecoder};
 pub use error::DecodeError;
-pub use nal::{AvccConfig, NalUnit, NalUnitType, parse_annex_b, parse_avcc, parse_avcc_config};
+pub use nal::{
+    AvccConfig, NalUnit, NalUnitType, annex_b_ranges, annex_b_units, avcc_ranges, avcc_units,
+    parse_annex_b, parse_avcc, parse_avcc_config, parse_nal_bytes,
+};
+pub use sps::{SpsInfo, Vui, sps_info};
 
 #[cfg(test)]
 mod tests {

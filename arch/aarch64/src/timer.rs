@@ -3,8 +3,8 @@
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::cpu;
 use crate::smp::MAX_CPUS;
+use crate::{cpu, irq};
 
 /// Frequency of the system counter in Hz (from CNTFRQ_EL0).
 pub fn frequency() -> u64 {
@@ -22,8 +22,7 @@ pub fn ticks() -> u64 {
 
 /// Milliseconds elapsed since the counter started.
 pub fn uptime_ms() -> u64 {
-    let freq = frequency();
-    ticks().saturating_mul(1000).checked_div(freq).unwrap_or(0)
+    feos_hal::ticks_to_ms(ticks(), frequency())
 }
 
 /// Busy-waits for roughly `ms` milliseconds.
@@ -53,7 +52,9 @@ static IDLE_HINTS: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; M
 ///
 /// The scheduler's periodic tick wakes the CPU, so this never sleeps longer
 /// than one tick. Each wait marks the current tick as idle, which lets the
-/// task manager distinguish spinning from genuinely waiting work.
+/// task manager distinguish spinning from genuinely waiting work. The kernel's
+/// clock blocks the process instead once the scheduler is running, so this only
+/// serves code with interrupts masked or running before it starts.
 pub fn idle_ms(ms: u64) {
     let freq = frequency();
     if freq == 0 {
@@ -62,14 +63,20 @@ pub fn idle_ms(ms: u64) {
 
     let start = ticks();
     let delta = freq.saturating_mul(ms) / 1000;
-    let cpu = cpu::index().min(MAX_CPUS - 1);
+    let flags = irq::save_and_disable();
 
     while ticks().wrapping_sub(start) < delta {
+        // The mask keeps this task on this CPU from the hint until the wait,
+        // so the hint lands on the CPU that actually waits, and no tick can
+        // fall between them. `wfi` still wakes on a masked interrupt.
+        let cpu = cpu::index().min(MAX_CPUS - 1);
         IDLE_HINTS[cpu].store(true, Ordering::Relaxed);
-        // SAFETY: `WFI` only suspends execution until an interrupt. The
-        // scheduler's 100 Hz timer guarantees that one arrives promptly.
-        unsafe { asm!("wfi", options(nomem, nostack)) };
+        // SAFETY: `wfi` only suspends execution; the unmask is what lets the
+        // pending tick run, and the handler preserves this thread's state.
+        unsafe { asm!("wfi", "msr daifclr, #2", "isb", "msr daifset, #2", options(nostack)) };
     }
+
+    irq::restore(flags);
 }
 
 /// Returns and clears the idle hint recorded by [`idle_ms`] on this CPU.
@@ -100,9 +107,10 @@ pub fn start_periodic(hz: u64) {
     }
 
     // Program the first deadline before unmasking the timer.
+    let deadline = ticks().wrapping_add(period);
     unsafe {
         asm!("msr cntp_ctl_el0, {}", in(reg) 0u64, options(nomem, nostack));
-        asm!("msr cntp_tval_el0, {}", in(reg) period, options(nomem, nostack));
+        asm!("msr cntp_cval_el0, {}", in(reg) deadline, options(nomem, nostack));
         asm!("msr cntp_ctl_el0, {}", in(reg) 1u64, options(nomem, nostack));
         asm!("isb", options(nomem, nostack));
     }
@@ -115,9 +123,17 @@ pub fn tick() -> bool {
         return false;
     }
 
-    // Writing TVAL clears the condition and schedules the next deadline.
+    // Advance the deadline by exactly one period, so the time spent reaching
+    // this handler doesn't accumulate as drift. After a long stall, skip the
+    // missed ticks instead of firing once per period until caught up.
+    let previous: u64;
+    // SAFETY: reading the timer's compare value has no side effects.
+    unsafe { asm!("mrs {}, cntp_cval_el0", out(reg) previous, options(nomem, nostack)) };
+    let deadline = feos_hal::next_deadline(previous, period, ticks());
+
+    // Writing CVAL clears the condition and schedules the next deadline.
     unsafe {
-        asm!("msr cntp_tval_el0, {}", in(reg) period, options(nomem, nostack));
+        asm!("msr cntp_cval_el0, {}", in(reg) deadline, options(nomem, nostack));
         asm!("isb", options(nomem, nostack));
     }
     true

@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1
 
-FROM rust:1-slim-bookworm
+# Keep in step with rust-toolchain.toml and `rust-version` in Cargo.toml.
+FROM rust:1.99.1-slim-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -14,6 +15,7 @@ RUN apt-get update \
         dosfstools \
         exfatprogs \
         make \
+        python3-minimal \
         qemu-system-arm \
         qemu-system-x86 \
         qemu-system-gui \
@@ -25,7 +27,10 @@ RUN rustup target add aarch64-unknown-none x86_64-unknown-none
 WORKDIR /src
 COPY . .
 
-RUN chmod +x scripts/*.sh \
+# The test disks are made here so that `make docker-run` starts from a cached
+# build instead of relinking both kernels on every start.
+RUN chmod +x scripts/*.sh scripts/*.py \
+    && ./scripts/make-test-disks.sh \
     && cargo build --release --target aarch64-unknown-none \
     && cargo build --release --target x86_64-unknown-none
 

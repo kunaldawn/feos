@@ -13,22 +13,29 @@
 
 #![cfg_attr(not(test), no_std)]
 
+extern crate alloc;
+
+use alloc::vec::Vec;
 use core::cell::Cell;
 
+use feos_app::shell::{Level, Request};
 use feos_app::{App, Context, Platform};
 use feos_console::println;
 use feos_desktop::{
-    Desktop, DesktopConfig, DesktopResponse, DesktopTheme, LaunchOutcome, ServiceStatus,
-    StartMenuCommand, ThemeName,
+    CommandTarget, Desktop, DesktopConfig, DesktopResponse, LaunchOutcome, ServiceStatus,
+    StartMenuCommand,
 };
 use feos_gfx::{Canvas, Rect};
 use feos_gui::Input;
+use core::fmt::Write as _;
+
 use feos_sync::SpinLock;
 
 mod folder {
     include!(concat!(env!("OUT_DIR"), "/folder.rs"));
 }
 
+mod hosted;
 mod session;
 
 pub use folder::FOLDER;
@@ -75,14 +82,21 @@ impl App for DesktopApp {
             || args.eq_ignore_ascii_case("session")
             || args.eq_ignore_ascii_case("boot")
         {
-            // The shell has no off-screen buffer; the boot path supplies one.
-            let mut back = None;
+            // The boot path supplies an off-screen buffer; the shell has none
+            // of its own, so keep one here for every `desktop` it starts.
+            let mut back = shell_back_buffer(context.display);
             run_session(context.display, &mut back, context.platform);
+            *SHELL_BACK.lock() = back;
             return;
         }
 
+        // The session holds this lock for as long as it runs, so anything that
+        // waited for it from a spawned process would spin until log off.
         let config = load_config();
-        let mut session = SESSION.lock();
+        let Some(mut session) = SESSION.try_lock() else {
+            println!("desktop: session busy; try again after logging off");
+            return;
+        };
         prepare(&mut session, config, context.platform, true);
         let desktop = &mut *session;
 
@@ -121,6 +135,42 @@ impl App for DesktopApp {
     }
 }
 
+/// The back buffer kept between `desktop` runs from the shell.
+static SHELL_BACK: SpinLock<Option<Canvas<'static>>> = SpinLock::new(None);
+
+/// Allocates a zeroed pixel buffer, or `None` when the heap cannot spare it.
+fn allocate_pixels(width: usize, height: usize) -> Option<&'static mut [u32]> {
+    let length = width.checked_mul(height)?;
+    let mut pixels = Vec::new();
+    pixels.try_reserve_exact(length).ok()?;
+    pixels.resize(length, 0u32);
+    Some(pixels.leak())
+}
+
+/// Returns a back buffer matching `display`, so a session started from the
+/// shell composes off-screen too and does not tear.
+fn shell_back_buffer(display: &Option<Canvas<'static>>) -> Option<Canvas<'static>> {
+    let front = display.as_ref()?;
+    let (width, height) = (front.width(), front.height());
+    let kept = SHELL_BACK.lock().take();
+    if let Some(back) = kept.filter(|back| back.width() == width && back.height() == height) {
+        return Some(back);
+    }
+    let pixels = allocate_pixels(width, height);
+    if pixels.is_none() {
+        println!("[desktop] no memory for a back buffer; frames may tear");
+    }
+    Canvas::new(pixels?, width, height, width)
+}
+
+/// Hands the session its canvas-sized caches, once. Without them the desktop
+/// repaints its wallpaper every frame and clips off-screen windows, but works.
+fn provide_buffers(desktop: &mut Session, width: usize, height: usize) {
+    if !desktop.has_buffers() {
+        desktop.set_buffers(allocate_pixels(width, height), allocate_pixels(width, height));
+    }
+}
+
 /// Parses the embedded configuration, falling back to defaults.
 fn load_config() -> DesktopConfig {
     match DesktopConfig::parse(CONFIG_YAML) {
@@ -149,7 +199,8 @@ fn prepare(desktop: &mut Session, config: DesktopConfig, platform: &Platform, an
     }
 
     if !desktop.session_started() {
-        let started = desktop.start_session(platform.apps, platform.processes);
+        let registry = hosted::Registry(platform.apps);
+        let started = desktop.start_session(&registry, platform.processes);
         if announce && started > 0 {
             println!("[desktop] {started} autostart service(s) started");
         }
@@ -163,6 +214,8 @@ fn render(desktop: &mut Session, context: &mut Context<'_>) {
         return;
     }
 
+    // These one-shot frames go straight to the framebuffer, with the pointer.
+    desktop.set_retained(false);
     let input = Input::new();
     let uptime = platform.clock.uptime_ms();
     let response = {
@@ -230,6 +283,34 @@ fn finish_foreground(desktop: &mut Session, window: usize, suspended: bool) {
     }
 }
 
+/// Tells the user about a launch that went wrong, on screen and on serial.
+fn report_failure(desktop: &mut Session, platform: &Platform, name: &str, detail: &str) {
+    println!("[desktop] {name}: {detail}");
+    let now = platform.clock.uptime_ms();
+    desktop.notify_text(name, detail, Level::Error, now);
+}
+
+/// Carries out something an app asked the session to do. Returns `true` when an
+/// app ran in the foreground.
+fn apply_request(
+    desktop: &mut Session,
+    request: Request,
+    platform: &Platform,
+    display: &mut Option<Canvas<'static>>,
+) -> bool {
+    match request {
+        Request::Run(command) => run_command(desktop, command.as_str(), platform, display),
+        Request::Open { bundle, args } => {
+            let args = (!args.is_empty()).then_some(args.as_str());
+            launch_id_with(desktop, bundle.as_str(), args, platform, display)
+        }
+        Request::BeginDrag(payload) => {
+            desktop.begin_drag(payload.as_str());
+            false
+        }
+    }
+}
+
 fn apply_response(
     desktop: &mut Session,
     response: &DesktopResponse,
@@ -237,8 +318,10 @@ fn apply_response(
     display: &mut Option<Canvas<'static>>,
 ) -> bool {
     let mut ran_foreground = false;
+    let registry = hosted::Registry(platform.apps);
     if let Some(request) = response.launch {
-        match desktop.launch(request.app, platform.apps, platform.processes) {
+        let args = (!request.args.is_empty()).then_some(request.args.as_str());
+        match desktop.launch_with(request.app, args, &registry, platform.processes) {
             LaunchOutcome::Spawned { pid, .. } => {
                 println!("[desktop] launched '{}' as pid {pid}", request.entry)
             }
@@ -268,17 +351,27 @@ fn apply_response(
             LaunchOutcome::AlreadyRunning { pid, .. } => {
                 println!("[desktop] '{}' is already running ({pid:?})", request.entry)
             }
-            LaunchOutcome::UnknownApp => println!("[desktop] launch failed: unknown application"),
-            LaunchOutcome::NoWindowSlot => println!("[desktop] launch failed: no free window slot"),
-            LaunchOutcome::UnknownEntry => {
-                println!(
-                    "[desktop] launch failed: entry '{}' is not registered",
-                    request.entry
-                )
+            LaunchOutcome::UnknownApp => {
+                report_failure(desktop, platform, "Could not open", "unknown application")
             }
-            LaunchOutcome::SpawnFailed(error) => {
-                println!("[desktop] launch failed: {error:?}")
-            }
+            LaunchOutcome::NoWindowSlot => report_failure(
+                desktop,
+                platform,
+                "Could not open",
+                "too many windows are open; close one and try again",
+            ),
+            LaunchOutcome::UnknownEntry => report_failure(
+                desktop,
+                platform,
+                request.entry.as_str(),
+                "this entry point is not registered",
+            ),
+            LaunchOutcome::SpawnFailed(error) => report_failure(
+                desktop,
+                platform,
+                request.entry.as_str(),
+                spawn_error_text(error),
+            ),
         }
     }
 
@@ -297,57 +390,55 @@ fn apply_response(
             platform.power.system_reset();
         }
         StartMenuCommand::LogOff => println!("[desktop] log off requested"),
-        StartMenuCommand::Settings => cycle_theme(desktop),
+        // The desktop opens its own settings dialog; nothing reaches here.
+        StartMenuCommand::Settings | StartMenuCommand::Run => {}
+        StartMenuCommand::Refresh => {
+            let report = desktop.scan(FOLDER);
+            let mut detail = feos_text::Text::<64>::new();
+            let _ = write!(
+                detail,
+                "{} applications found, {} skipped",
+                report.installed, report.skipped
+            );
+            let now = platform.clock.uptime_ms();
+            desktop.notify_text("Refreshed", detail.as_str(), Level::Info, now);
+        }
         StartMenuCommand::MyComputer => {
-            ran_foreground |= launch_id(desktop, "files", platform, display);
+            ran_foreground |= launch_id_with(desktop, "files", Some("/"), platform, display);
         }
         StartMenuCommand::MyDocuments => {
-            ran_foreground |= launch_id(desktop, "files", platform, display);
+            ran_foreground |= launch_id_with(desktop, "files", Some("/docs"), platform, display);
         }
         StartMenuCommand::ControlPanel => {
             ran_foreground |= launch_id(desktop, "system-info", platform, display);
         }
         StartMenuCommand::Help => {
-            ran_foreground |= launch_id(desktop, "terminal", platform, display);
+            ran_foreground |= launch_id(desktop, "console", platform, display);
         }
-        StartMenuCommand::Run => {}
         StartMenuCommand::Search => {
-            ran_foreground |= launch_id(desktop, "files", platform, display);
+            ran_foreground |= launch_id_with(desktop, "files", Some("--search"), platform, display);
         }
     }
 
     ran_foreground
 }
 
-/// Cycles through the three Luna colour schemes, giving the Start menu's
-/// "Desktop Settings" entry a visible effect.
-fn cycle_theme(desktop: &mut Session) {
-    let mut config = *desktop.config();
-    config.theme = match config.theme {
-        ThemeName::XpBlue => ThemeName::XpOlive,
-        ThemeName::XpOlive => ThemeName::XpSilver,
-        _ => ThemeName::XpBlue,
-    };
-    let palette = match config.theme {
-        ThemeName::XpOlive => DesktopTheme::xp_olive(),
-        ThemeName::XpSilver => DesktopTheme::xp_silver(),
-        _ => DesktopTheme::xp_blue(),
-    };
-    config.wallpaper.top = palette.wallpaper_top;
-    config.wallpaper.bottom = palette.wallpaper_bottom;
-    config.wallpaper.grid = palette.wallpaper_grid;
-    desktop.set_config(config);
-    println!(
-        "[desktop] theme changed to {}",
-        desktop.config().theme.name()
-    );
+/// What to tell the user when the kernel refuses a process.
+fn spawn_error_text(error: feos_app::SpawnError) -> &'static str {
+    match error {
+        feos_app::SpawnError::NoFreeSlot => "no free process slot; end a task and try again",
+        feos_app::SpawnError::ArgsTooLong => "its arguments are too long",
+        #[allow(unreachable_patterns)]
+        _ => "the kernel could not start a process",
+    }
 }
 
-/// Handles a command entered in the Run dialog.
+/// Handles a command entered in the Run dialog or sent by an app.
 ///
-/// A catalog id opens the matching bundle; otherwise the name is resolved
-/// through the shell registry, so commands such as `ps`, `tone` and `files`
-/// work exactly as they do at the serial prompt.
+/// The desktop decides where it goes: a bundle (so a windowed app gets a
+/// window) in preference to anything else. Only a command no bundle offers can
+/// take the blocking foreground path, or run as a process, whose output goes to
+/// the serial console.
 fn run_command(
     desktop: &mut Session,
     command: &str,
@@ -358,40 +449,47 @@ fn run_command(
     if command.is_empty() {
         return false;
     }
-    if desktop.catalog().find_id(command).is_some() {
-        return launch_id(desktop, command, platform, display);
-    }
-
-    let mut parts = command.splitn(2, char::is_whitespace);
-    let name = parts.next().unwrap_or("");
-    let args = parts.next().unwrap_or("").trim();
-    let Some(runtime) = platform.apps.find(name) else {
-        println!("[desktop] run: '{command}' was not found");
-        return false;
-    };
-
-    if runtime.foreground() {
-        let viewport = foreground_viewport(desktop, display);
-        let mut context = Context {
-            args,
-            display,
-            viewport,
-            suspend: None,
-            suspend_area: None,
-            platform,
-        };
-        runtime.run(&mut context);
-        true
-    } else {
-        match platform.processes.spawn(runtime, args) {
-            Ok(pid) => {
-                println!("[desktop] run: '{command}' started as pid {pid}");
-                false
+    let registry = hosted::Registry(platform.apps);
+    match desktop.resolve_command(command, &registry) {
+        CommandTarget::Bundle { index, args } => {
+            let id = desktop
+                .catalog()
+                .get(index)
+                .map(|app| app.manifest.id)
+                .unwrap_or_default();
+            launch_id_with(desktop, id.as_str(), args, platform, display)
+        }
+        CommandTarget::Foreground { app, args } => {
+            let viewport = foreground_viewport(desktop, display);
+            let mut context = Context {
+                args,
+                display,
+                viewport,
+                suspend: None,
+                suspend_area: None,
+                platform,
+            };
+            app.run(&mut context);
+            true
+        }
+        CommandTarget::Spawn { app, args } => {
+            match platform.processes.spawn(app, args) {
+                Ok(pid) => {
+                    println!("[desktop] run: '{command}' started as pid {pid}");
+                    let mut detail = feos_text::Text::<64>::new();
+                    let _ = write!(detail, "pid {pid}; its output goes to the serial console");
+                    let now = platform.clock.uptime_ms();
+                    desktop.notify_text(app.name(), detail.as_str(), Level::Info, now);
+                }
+                Err(error) => {
+                    report_failure(desktop, platform, command, spawn_error_text(error));
+                }
             }
-            Err(error) => {
-                println!("[desktop] run: could not start '{command}': {error:?}");
-                false
-            }
+            false
+        }
+        CommandTarget::NotFound => {
+            report_failure(desktop, platform, command, "not found");
+            false
         }
     }
 }
@@ -406,15 +504,36 @@ fn launch_id(
     platform: &Platform,
     display: &mut Option<Canvas<'static>>,
 ) -> bool {
+    launch_id_with(desktop, id, None, platform, display)
+}
+
+/// [`launch_id`], with arguments replacing the manifest's.
+fn launch_id_with(
+    desktop: &mut Session,
+    id: &str,
+    typed_args: Option<&str>,
+    platform: &Platform,
+    display: &mut Option<Canvas<'static>>,
+) -> bool {
     let Some(index) = desktop.catalog().find_id(id) else {
-        println!("desktop: no installed application with id '{id}'");
+        report_failure(desktop, platform, id, "no installed application has this id");
         return false;
     };
-    let (entry, args) = {
+    let entry = {
         let app = desktop.catalog().get(index).expect("index from find_id");
-        (app.manifest.entry, app.manifest.args)
+        app.manifest.entry
     };
-    match desktop.launch(index, platform.apps, platform.processes) {
+    let registry = hosted::Registry(platform.apps);
+    let outcome = desktop.launch_with(index, typed_args, &registry, platform.processes);
+    let args = match outcome {
+        LaunchOutcome::Foreground { window } => desktop
+            .windows()
+            .get(window)
+            .map(|window| window.args)
+            .unwrap_or_default(),
+        _ => Default::default(),
+    };
+    match outcome {
         LaunchOutcome::Spawned { window, pid } => {
             println!("[desktop] '{id}' opened in window {window} as pid {pid}");
             false
@@ -446,19 +565,24 @@ fn launch_id(
             false
         }
         LaunchOutcome::UnknownEntry => {
-            println!("[desktop] '{id}' has no registered entry point");
+            report_failure(desktop, platform, id, "this entry point is not registered");
             false
         }
         LaunchOutcome::UnknownApp => {
-            println!("[desktop] catalog entry vanished");
+            report_failure(desktop, platform, id, "its catalog entry has gone");
             false
         }
         LaunchOutcome::NoWindowSlot => {
-            println!("[desktop] no free window slot");
+            report_failure(
+                desktop,
+                platform,
+                id,
+                "too many windows are open; close one and try again",
+            );
             false
         }
         LaunchOutcome::SpawnFailed(error) => {
-            println!("[desktop] could not spawn '{id}': {error:?}");
+            report_failure(desktop, platform, id, spawn_error_text(error));
             false
         }
     }
@@ -478,7 +602,8 @@ fn run_app(
         let app = desktop.catalog().get(index).expect("index from find_id");
         (app.manifest.entry, app.manifest.args)
     };
-    match desktop.launch(index, platform.apps, platform.processes) {
+    let registry = hosted::Registry(platform.apps);
+    match desktop.launch(index, &registry, platform.processes) {
         LaunchOutcome::Spawned { window, pid } => {
             println!("[desktop] '{id}' started in window {window} as pid {pid}")
         }
@@ -527,6 +652,11 @@ fn run_service(desktop: &mut Session, request: &str, platform: &Platform) {
         return;
     };
 
+    let registry = hosted::Registry(platform.apps);
+    if desktop.windowed_bundle(id, &registry).is_some() {
+        println!("desktop: '{id}' is a windowed app, not a service; use 'desktop run {id}'");
+        return;
+    }
     if !desktop.register_service(id, platform.apps) {
         println!("desktop: service table is full");
         return;
@@ -651,6 +781,14 @@ mod tests {
         let viewport = foreground_viewport(&desktop, &None).expect("work area");
         assert_eq!(viewport, Rect::new(0, 0, 1024, 728));
         assert_eq!(viewport.height, desktop.work_area().height);
+    }
+
+    #[test]
+    fn every_bundle_entry_resolves_to_a_real_description() {
+        for app in session().catalog().iter() {
+            assert!(!app.manifest.description.as_str().contains("Windows"), "{}", app.id());
+            assert!(!app.manifest.description.as_str().contains("VLC"), "{}", app.id());
+        }
     }
 
     #[test]

@@ -769,10 +769,11 @@ impl SliceContext<'_> {
                 && cbp_luma != 0
                 && no_sub_less_8x8_b
                 && reader.read_bit()? != 0;
+            self.mb_is_8x8dct[mb_idx] = use_8x8_dct_b;
 
             let qp_y = if cbp_luma != 0 || cbp_chroma != 0 {
                 let mb_qp_delta = reader.read_se()?;
-                ((self.prev_mb_qp + mb_qp_delta + 52) % 52 + 52) % 52
+                (self.prev_mb_qp + (mb_qp_delta % 52) + 52) % 52
             } else {
                 self.prev_mb_qp
             };
@@ -1098,6 +1099,11 @@ impl SliceContext<'_> {
                 ),
             ] {
                 let chroma_scale = &sp.scaling_list_4x4[scale_idx];
+                let qp_c = if scale_idx % 3 == 2 {
+                    chroma_qp(qp_y, sp.second_chroma_qp_index_offset)
+                } else {
+                    qp_c
+                };
                 if cbp_chroma >= 1 {
                     inverse_hadamard_2x2(plane_dc);
                     dequant_chroma_dc(plane_dc, qp_c, chroma_scale[0]);
@@ -1453,10 +1459,11 @@ impl SliceContext<'_> {
                 && cbp_luma != 0
                 && no_sub_less_8x8
                 && reader.read_bit()? != 0;
+            self.mb_is_8x8dct[mb_idx] = use_8x8_dct;
 
             let qp_y = if cbp_luma != 0 || cbp_chroma != 0 {
                 let mb_qp_delta = reader.read_se()?;
-                ((self.prev_mb_qp + mb_qp_delta + 52) % 52 + 52) % 52
+                (self.prev_mb_qp + (mb_qp_delta % 52) + 52) % 52
             } else {
                 self.prev_mb_qp
             };
@@ -1677,6 +1684,11 @@ impl SliceContext<'_> {
                     ),
                 ] {
                     let chroma_scale = &sp.scaling_list_4x4[scale_idx];
+                    let qp_c = if scale_idx % 3 == 2 {
+                        chroma_qp(qp_y, sp.second_chroma_qp_index_offset)
+                    } else {
+                        qp_c
+                    };
                     if cbp_chroma >= 1 {
                         inverse_hadamard_2x2(plane_dc);
                         dequant_chroma_dc(plane_dc, qp_c, chroma_scale[0]);
@@ -1832,6 +1844,7 @@ impl SliceContext<'_> {
 
             // Check 8x8 transform flag
             let use_8x8_intra = sp.transform_8x8_mode_flag && reader.read_bit()? != 0;
+            self.mb_is_8x8dct[mb_idx] = use_8x8_intra;
 
             // Parse prediction modes: 4 for I8x8, 16 for I4x4
             let num_modes = if use_8x8_intra { 4 } else { 16 };
@@ -1885,7 +1898,7 @@ impl SliceContext<'_> {
 
             if cbp_luma != 0 || cbp_chroma != 0 {
                 let mb_qp_delta = reader.read_se()?;
-                qp_y = ((self.prev_mb_qp + mb_qp_delta + 52) % 52 + 52) % 52;
+                qp_y = (self.prev_mb_qp + (mb_qp_delta % 52) + 52) % 52;
             } else {
                 qp_y = self.prev_mb_qp;
             }
@@ -2013,7 +2026,7 @@ impl SliceContext<'_> {
             intra_chroma_pred_mode = mode as u8;
 
             let mb_qp_delta = reader.read_se()?;
-            qp_y = ((self.prev_mb_qp + mb_qp_delta + 52) % 52 + 52) % 52;
+            qp_y = (self.prev_mb_qp + (mb_qp_delta % 52) + 52) % 52;
             self.prev_mb_qp = qp_y;
             qp_c = chroma_qp(qp_y, sp.chroma_qp_index_offset);
 
@@ -2217,6 +2230,11 @@ impl SliceContext<'_> {
             ),
         ] {
             let chroma_scale = &sp.scaling_list_4x4[scale_idx];
+            let qp_c = if scale_idx % 3 == 2 {
+                chroma_qp(qp_y, sp.second_chroma_qp_index_offset)
+            } else {
+                qp_c
+            };
             if cbp_chroma >= 1 {
                 inverse_hadamard_2x2(plane_dc);
                 dequant_chroma_dc(plane_dc, qp_c, chroma_scale[0]);

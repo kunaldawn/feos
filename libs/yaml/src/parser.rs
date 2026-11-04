@@ -1,7 +1,7 @@
 //! Indentation-aware YAML parser.
 
 use crate::document::{Kind, YamlNode};
-use crate::scalar::{Chomp, ScalarStyle, YamlScalar};
+use crate::scalar::{decode_escape, Chomp, ScalarStyle, YamlScalar};
 use crate::{NodeId, Result, YamlError, MAX_DEPTH, NO_NODE};
 
 pub(crate) fn parse<'a>(input: &'a str, nodes: &mut [YamlNode<'a>]) -> Result<NodeId> {
@@ -14,19 +14,35 @@ pub(crate) fn parse<'a>(input: &'a str, nodes: &mut [YamlNode<'a>]) -> Result<No
     parser.skip_directives()?;
 
     let Some(line) = parser.peek_line()? else {
-        let node = parser.alloc(nodes)?;
-        nodes[node as usize].kind = Kind::Scalar(YamlScalar::plain(""));
-        return Ok(node);
+        return parser.null_node(nodes);
     };
 
-    let root = parser.parse_block(nodes, line.indent, 0)?;
+    let first = strip_comment(line.content);
+    let root = if line.indent == 0 && is_document_marker(first) {
+        parser.null_node(nodes)?
+    } else if let Some(rest) = first.strip_prefix("--- ").filter(|_| line.indent == 0) {
+        // `--- value` puts the root node on the marker line.
+        parser.consume(line);
+        let rest = rest.trim_start();
+        if is_block_indicator(rest) {
+            parser.parse_block_scalar(nodes, rest, None)?
+        } else {
+            parser.parse_inline_value(nodes, rest, None, 0)?
+        }
+    } else {
+        parser.parse_block(nodes, line.indent, None, 0)?
+    };
 
     if let Some(line) = parser.peek_line()? {
-        let content = strip_comment(line.content).trim_end();
-        if content == "..." {
+        let content = strip_comment(line.content);
+        if line.indent == 0 && content == "..." {
             parser.consume(line);
-        } else {
+        } else if line.indent == 0 && content == "---" {
             return Err(YamlError::MultipleDocuments);
+        } else {
+            // Content the root node could not absorb is a layout error, not
+            // a second document.
+            return Err(YamlError::InvalidIndentation { offset: line.start });
         }
         if parser.peek_line()?.is_some() {
             return Err(YamlError::MultipleDocuments);
@@ -116,15 +132,31 @@ impl<'a> Parser<'a> {
         line.start + line.indent + index
     }
 
+    /// Rejects `? key` complex-key syntax, which is not modelled.
+    fn reject_complex_key(&self, line: Line<'_>, content: &str) -> Result<()> {
+        if content == "?" || content.starts_with("? ") {
+            return Err(YamlError::UnexpectedToken {
+                offset: self.offset(line, 0),
+                byte: b'?',
+            });
+        }
+        Ok(())
+    }
+
     /// Absolute input offset of a slice that was taken from [`Parser::input`].
     fn base_of(&self, text: &str) -> usize {
         text.as_ptr() as usize - self.input.as_ptr() as usize
     }
 
+    /// Parses the block node starting at the next line.
+    ///
+    /// `parent` is the indentation of the enclosing collection, or `None` for
+    /// the document root, where block scalars may start in column zero.
     fn parse_block(
         &mut self,
         nodes: &mut [YamlNode<'a>],
         indent: usize,
+        parent: Option<usize>,
         depth: usize,
     ) -> Result<NodeId> {
         if depth > MAX_DEPTH {
@@ -134,26 +166,32 @@ impl<'a> Parser<'a> {
         if line.indent != indent {
             return Err(YamlError::InvalidIndentation { offset: line.start });
         }
-        let content = strip_comment(line.content).trim_end();
+        let content = strip_comment(line.content);
+        self.reject_complex_key(line, content)?;
 
         if is_sequence_item(content) {
-            self.parse_sequence(nodes, indent, depth)
+            self.parse_sequence(nodes, indent, depth, None)
         } else if find_mapping_colon(content).is_some() {
             self.parse_mapping(nodes, indent, depth, None)
         } else if is_block_indicator(content) {
             self.consume(line);
-            self.parse_block_scalar(nodes, content, indent, depth)
+            self.parse_block_scalar(nodes, content, parent)
         } else {
             self.consume(line);
-            self.parse_inline_value(nodes, content, indent, depth)
+            self.parse_inline_value(nodes, content, parent, depth)
         }
     }
 
+    /// Parses a block sequence whose dashes sit at column `indent`.
+    ///
+    /// `first_item` is an item that already started on the current line, as in
+    /// the inner sequence of `- - a`.
     fn parse_sequence(
         &mut self,
         nodes: &mut [YamlNode<'a>],
         indent: usize,
         depth: usize,
+        first_item: Option<&'a str>,
     ) -> Result<NodeId> {
         if depth > MAX_DEPTH {
             return Err(YamlError::DepthLimit);
@@ -161,33 +199,44 @@ impl<'a> Parser<'a> {
         let sequence = self.alloc(nodes)?;
         let mut first = NO_NODE;
         let mut last = NO_NODE;
+        let mut pending = first_item;
 
         loop {
-            let Some(line) = self.peek_line()? else {
-                break;
+            let content = if let Some(content) = pending.take() {
+                content
+            } else {
+                let Some(line) = self.peek_line()? else {
+                    break;
+                };
+                if line.indent < indent {
+                    break;
+                }
+                if line.indent > indent {
+                    return Err(YamlError::InvalidIndentation { offset: line.start });
+                }
+                let content = strip_comment(line.content);
+                if !is_sequence_item(content) {
+                    break;
+                }
+                self.consume(line);
+                content
             };
-            if line.indent < indent {
-                break;
-            }
-            if line.indent > indent {
-                return Err(YamlError::InvalidIndentation { offset: line.start });
-            }
-            let content = strip_comment(line.content).trim_end();
-            if !is_sequence_item(content) {
-                break;
-            }
 
             let rest = content[1..].trim_start();
-            self.consume(line);
+            // `rest` is a suffix of `content`, so this is the item's real
+            // column: `-   a: 1` continues at column 4, not column 2.
+            let column = indent + (content.len() - rest.len());
 
             let child = if rest.is_empty() {
                 self.parse_nested(nodes, indent, depth + 1)?
+            } else if is_sequence_item(rest) {
+                self.parse_sequence(nodes, column, depth + 1, Some(rest))?
             } else if find_mapping_colon(rest).is_some() {
-                self.parse_mapping(nodes, indent + 2, depth + 1, Some(rest))?
+                self.parse_mapping(nodes, column, depth + 1, Some(rest))?
             } else if is_block_indicator(rest) {
-                self.parse_block_scalar(nodes, rest, indent, depth + 1)?
+                self.parse_block_scalar(nodes, rest, Some(indent))?
             } else {
-                self.parse_inline_value(nodes, rest, indent, depth + 1)?
+                self.parse_inline_value(nodes, rest, Some(indent), depth + 1)?
             };
 
             if first == NO_NODE {
@@ -231,12 +280,15 @@ impl<'a> Parser<'a> {
             if line.indent > indent {
                 return Err(YamlError::InvalidIndentation { offset: line.start });
             }
-            let content = strip_comment(line.content).trim_end();
-            if is_sequence_item(content) {
-                break;
-            }
+            let content = strip_comment(line.content);
             if is_document_marker(content) {
                 break;
+            }
+            self.reject_complex_key(line, content)?;
+            if is_sequence_item(content) {
+                // A sequence at this column can only be a key's value, and
+                // that case is consumed by `add_mapping_entry`.
+                return Err(YamlError::InvalidIndentation { offset: line.start });
             }
             if find_mapping_colon(content).is_none() {
                 return Err(YamlError::MissingColon {
@@ -267,11 +319,11 @@ impl<'a> Parser<'a> {
         let rest = content[colon + 1..].trim_start();
 
         let child = if rest.is_empty() {
-            self.parse_nested(nodes, indent, depth + 1)?
+            self.parse_mapping_value(nodes, indent, depth + 1)?
         } else if is_block_indicator(rest) {
-            self.parse_block_scalar(nodes, rest, indent, depth + 1)?
+            self.parse_block_scalar(nodes, rest, Some(indent))?
         } else {
-            self.parse_inline_value(nodes, rest, indent, depth + 1)?
+            self.parse_inline_value(nodes, rest, Some(indent), depth + 1)?
         };
 
         nodes[child as usize].key = Some(key);
@@ -284,6 +336,22 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// A mapping value on the following lines. Unlike a sequence item's value,
+    /// it may be a sequence at the key's own column (`tags:\n- a`).
+    fn parse_mapping_value(
+        &mut self,
+        nodes: &mut [YamlNode<'a>],
+        indent: usize,
+        depth: usize,
+    ) -> Result<NodeId> {
+        if let Some(line) = self.peek_line()? {
+            if line.indent == indent && is_sequence_item(strip_comment(line.content)) {
+                return self.parse_sequence(nodes, indent, depth, None);
+            }
+        }
+        self.parse_nested(nodes, indent, depth)
+    }
+
     fn parse_nested(
         &mut self,
         nodes: &mut [YamlNode<'a>],
@@ -292,7 +360,7 @@ impl<'a> Parser<'a> {
     ) -> Result<NodeId> {
         if let Some(line) = self.peek_line()? {
             if line.indent > parent_indent {
-                return self.parse_block(nodes, line.indent, depth);
+                return self.parse_block(nodes, line.indent, Some(parent_indent), depth);
             }
         }
         self.null_node(nodes)
@@ -308,7 +376,7 @@ impl<'a> Parser<'a> {
         &mut self,
         nodes: &mut [YamlNode<'a>],
         text: &'a str,
-        parent_indent: usize,
+        parent: Option<usize>,
         depth: usize,
     ) -> Result<NodeId> {
         let text = text.trim();
@@ -317,31 +385,19 @@ impl<'a> Parser<'a> {
         }
         if let Some(byte) = text.as_bytes().first() {
             match byte {
-                b'*' => {
+                b'*' | b'&' => {
                     return Err(YamlError::UnsupportedAlias {
-                        offset: self.pos.saturating_sub(text.len()),
+                        offset: self.base_of(text),
                     })
                 }
-                b'&' | b'!' => {
-                    // Anchors and tags are not modelled. Skip the token and
-                    // parse the value that follows it.
-                    let rest = text
-                        .split_once(char::is_whitespace)
-                        .map(|(_, rest)| rest.trim_start())
-                        .unwrap_or("");
-                    if rest.is_empty() {
-                        return self.null_node(nodes);
-                    }
-                    return self.parse_inline_value(nodes, rest, parent_indent, depth);
+                b'!' => {
+                    return Err(YamlError::UnsupportedTag {
+                        offset: self.base_of(text),
+                    })
                 }
                 b'[' | b'{' => {
                     let (id, used) = self.parse_flow(nodes, text, depth + 1)?;
-                    if !text[used..].trim().is_empty() {
-                        return Err(YamlError::UnexpectedToken {
-                            offset: self.pos.saturating_sub(text.len()) + used,
-                            byte: text.as_bytes()[used],
-                        });
-                    }
+                    self.expect_end(text, used)?;
                     return Ok(id);
                 }
                 b'\'' => {
@@ -355,7 +411,7 @@ impl<'a> Parser<'a> {
                     return self.scalar_node(nodes, scalar);
                 }
                 b'|' | b'>' => {
-                    return self.parse_block_scalar(nodes, text, parent_indent, depth);
+                    return self.parse_block_scalar(nodes, text, parent);
                 }
                 _ => {}
             }
@@ -368,7 +424,7 @@ impl<'a> Parser<'a> {
             Ok(())
         } else {
             Err(YamlError::UnexpectedToken {
-                offset: self.pos.saturating_sub(text.len()) + used,
+                offset: self.base_of(text) + used,
                 byte: text.as_bytes()[used],
             })
         }
@@ -387,8 +443,11 @@ impl<'a> Parser<'a> {
     fn parse_key(&self, text: &'a str) -> Result<YamlScalar<'a>> {
         let text = text.trim();
         if text.is_empty() {
-            return Err(YamlError::MissingColon { offset: 0 });
+            return Err(YamlError::MissingColon {
+                offset: self.base_of(text),
+            });
         }
+        let offset = self.base_of(text);
         match text.as_bytes()[0] {
             b'\'' => {
                 let (scalar, used) = scan_single(text, 0, self.base_of(text))?;
@@ -400,95 +459,91 @@ impl<'a> Parser<'a> {
                 self.expect_end(text, used)?;
                 Ok(scalar)
             }
-            b'*' => Err(YamlError::UnsupportedAlias { offset: 0 }),
-            b'[' | b'{' => Err(YamlError::MissingColon { offset: 0 }),
+            b'*' | b'&' => Err(YamlError::UnsupportedAlias { offset }),
+            b'!' => Err(YamlError::UnsupportedTag { offset }),
+            b'[' | b'{' => Err(YamlError::MissingColon { offset }),
             _ => Ok(YamlScalar::plain(text)),
         }
     }
 
+    /// Parses a block scalar whose indicator was on the line just consumed.
+    ///
+    /// `parent` is the indentation of the enclosing collection. The scalar ends
+    /// at the first non-blank line indented less than its content; whatever
+    /// that line is, it belongs to the enclosing block.
     fn parse_block_scalar(
         &mut self,
         nodes: &mut [YamlNode<'a>],
         indicator: &'a str,
-        parent_indent: usize,
-        _depth: usize,
+        parent: Option<usize>,
     ) -> Result<NodeId> {
+        let offset = self.base_of(indicator);
         let indicator = indicator.trim();
         let style = match indicator.as_bytes().first() {
             Some(b'|') => ScalarStyle::Literal,
             Some(b'>') => ScalarStyle::Folded,
-            _ => return Err(YamlError::MissingColon { offset: 0 }),
+            _ => return Err(YamlError::MissingColon { offset }),
         };
-        let mut chomp = Chomp::Clip;
-        for byte in indicator.bytes().skip(1) {
+        let mut chomp = None;
+        let mut explicit = None;
+        for (index, byte) in indicator.bytes().enumerate().skip(1) {
+            let duplicate = match byte {
+                b'-' | b'+' => chomp.is_some(),
+                b'1'..=b'9' => explicit.is_some(),
+                _ => true,
+            };
+            if duplicate {
+                return Err(YamlError::UnexpectedToken {
+                    offset: offset + index,
+                    byte,
+                });
+            }
             match byte {
-                b'-' => chomp = Chomp::Strip,
-                b'+' => chomp = Chomp::Keep,
-                b'0'..=b'9' => {}
-                b' ' | b'\t' | b'#' => break,
-                other => {
-                    return Err(YamlError::UnexpectedToken {
-                        offset: self.pos,
-                        byte: other,
-                    })
-                }
+                b'-' => chomp = Some(Chomp::Strip),
+                b'+' => chomp = Some(Chomp::Keep),
+                digit => explicit = Some((digit - b'0') as usize),
             }
         }
+        let chomp = chomp.unwrap_or(Chomp::Clip);
+
+        let minimum = parent.map_or(0, |parent| parent + 1);
+        let mut content_indent = explicit.map(|digits| parent.unwrap_or(0) + digits);
 
         let block_start = self.pos;
         let bytes = self.input.as_bytes();
         let mut scan = self.pos;
-        let mut content_indent = None;
-        let mut end;
-        let mut has_content = false;
 
         loop {
             if scan >= bytes.len() {
-                end = scan;
                 break;
             }
-            let line_start = scan;
             let mut line_end = scan;
             while line_end < bytes.len() && bytes[line_end] != b'\n' {
                 line_end += 1;
             }
-            let raw = &self.input[line_start..line_end];
-            let mut indent = 0usize;
-            while indent < raw.len() && raw.as_bytes()[indent] == b' ' {
-                indent += 1;
-            }
-            if raw.as_bytes().get(indent) == Some(&b'\t') {
-                return Err(YamlError::TabIndentation {
-                    offset: line_start + indent,
-                });
-            }
-            let blank = raw[indent..].trim().is_empty();
-            if !blank {
-                if indent <= parent_indent {
-                    end = line_start;
+            let raw = &self.input[scan..line_end];
+            let indent = raw.bytes().take_while(|&byte| byte == b' ').count();
+            if !raw.trim().is_empty() {
+                let marker = parent.is_none() && is_document_marker(raw.trim_end());
+                if marker || indent < content_indent.unwrap_or(minimum) {
                     break;
                 }
                 content_indent.get_or_insert(indent);
-                has_content = true;
             }
-            end = if line_end < bytes.len() {
+            scan = if line_end < bytes.len() {
                 line_end + 1
             } else {
                 line_end
             };
-            scan = end;
         }
 
-        self.pos = end;
-        if !has_content {
-            return self.null_node(nodes);
-        }
-        let indent = content_indent.unwrap_or(parent_indent + 1);
-        let raw = &self.input[block_start..end];
-        self.scalar_node(
-            nodes,
-            YamlScalar::block(raw, style, indent.min(u8::MAX as usize) as u8, chomp),
-        )
+        self.pos = scan;
+        let indent = content_indent.unwrap_or(minimum);
+        let indent = u8::try_from(indent).map_err(|_| YamlError::InvalidIndentation {
+            offset: block_start,
+        })?;
+        let raw = &self.input[block_start..scan];
+        self.scalar_node(nodes, YamlScalar::block(raw, style, indent, chomp))
     }
 
     fn parse_flow(
@@ -519,7 +574,14 @@ impl<'a> Parser<'a> {
         let Some(&byte) = flow.bytes.get(flow.pos) else {
             return Err(YamlError::UnexpectedEnd);
         };
+        let base = self.base_of(text);
         match byte {
+            b'*' | b'&' => Err(YamlError::UnsupportedAlias {
+                offset: base + flow.pos,
+            }),
+            b'!' => Err(YamlError::UnsupportedTag {
+                offset: base + flow.pos,
+            }),
             b'[' => self.flow_sequence(nodes, flow, text, depth),
             b'{' => self.flow_mapping(nodes, flow, text, depth),
             b'\'' => {
@@ -533,7 +595,7 @@ impl<'a> Parser<'a> {
                 self.scalar_node(nodes, scalar)
             }
             b']' | b'}' | b',' => Err(YamlError::UnexpectedToken {
-                offset: flow.pos,
+                offset: base + flow.pos,
                 byte,
             }),
             _ => {
@@ -591,11 +653,15 @@ impl<'a> Parser<'a> {
                 }
                 Some(&byte) => {
                     return Err(YamlError::UnexpectedToken {
-                        offset: flow.pos,
+                        offset: self.base_of(text) + flow.pos,
                         byte,
                     })
                 }
-                None => return Err(YamlError::UnterminatedFlow { offset: flow.pos }),
+                None => {
+                    return Err(YamlError::UnterminatedFlow {
+                        offset: self.base_of(text) + flow.pos,
+                    })
+                }
             }
         }
         nodes[sequence as usize].kind = Kind::Sequence;
@@ -624,7 +690,9 @@ impl<'a> Parser<'a> {
             let key = self.flow_key(flow, text)?;
             flow.skip_space();
             if flow.bytes.get(flow.pos) != Some(&b':') {
-                return Err(YamlError::MissingColon { offset: flow.pos });
+                return Err(YamlError::MissingColon {
+                    offset: self.base_of(text) + flow.pos,
+                });
             }
             flow.pos += 1;
             let child = self.flow_value(nodes, flow, text, depth + 1)?;
@@ -651,11 +719,15 @@ impl<'a> Parser<'a> {
                 }
                 Some(&byte) => {
                     return Err(YamlError::UnexpectedToken {
-                        offset: flow.pos,
+                        offset: self.base_of(text) + flow.pos,
                         byte,
                     })
                 }
-                None => return Err(YamlError::UnterminatedFlow { offset: flow.pos }),
+                None => {
+                    return Err(YamlError::UnterminatedFlow {
+                        offset: self.base_of(text) + flow.pos,
+                    })
+                }
             }
         }
         nodes[mapping as usize].kind = Kind::Mapping;
@@ -677,6 +749,12 @@ impl<'a> Parser<'a> {
                 Ok(scalar)
             }
             None => Err(YamlError::UnexpectedEnd),
+            Some(b'*' | b'&') => Err(YamlError::UnsupportedAlias {
+                offset: self.base_of(text) + flow.pos,
+            }),
+            Some(b'!') => Err(YamlError::UnsupportedTag {
+                offset: self.base_of(text) + flow.pos,
+            }),
             _ => {
                 let start = flow.pos;
                 while let Some(&byte) = flow.bytes.get(flow.pos) {
@@ -687,7 +765,9 @@ impl<'a> Parser<'a> {
                 }
                 let raw = text[start..flow.pos].trim();
                 if raw.is_empty() {
-                    return Err(YamlError::MissingColon { offset: flow.pos });
+                    return Err(YamlError::MissingColon {
+                        offset: self.base_of(text) + flow.pos,
+                    });
                 }
                 Ok(YamlScalar::plain(raw))
             }
@@ -732,85 +812,107 @@ fn is_block_indicator(content: &str) -> bool {
         && (bytes.len() == 1 || matches!(bytes[1], b'+' | b'-' | b'0'..=b'9' | b' ' | b'\t' | b'#'))
 }
 
-fn strip_comment(content: &str) -> &str {
+/// What one line's structure scan found.
+struct LineScan {
+    /// First `:` at flow depth zero that separates a key from a value.
+    colon: Option<usize>,
+    /// Start of a trailing `#` comment.
+    comment: Option<usize>,
+}
+
+/// Finds a line's mapping colon and comment.
+///
+/// Quotes only open a quoted scalar at the start of a token. An apostrophe in
+/// the middle of a plain scalar (`don't panic`) is ordinary text, as is a
+/// bracket (`foo[1]`) outside a flow collection.
+fn scan_line(content: &str) -> LineScan {
     let bytes = content.as_bytes();
-    let mut single = false;
-    let mut double = false;
-    let mut escaped = false;
+    let mut scan = LineScan {
+        colon: None,
+        comment: None,
+    };
+    let mut token_start = true;
+    let mut depth = 0usize;
     let mut i = 0usize;
     while i < bytes.len() {
         let byte = bytes[i];
-        if double {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                double = false;
+        let next_is_break = matches!(bytes.get(i + 1), None | Some(b' ' | b'\t'));
+        match byte {
+            b' ' | b'\t' => {}
+            b'\'' if token_start => {
+                let Some(close) = closing_single(bytes, i + 1) else {
+                    return scan;
+                };
+                i = close;
+                token_start = false;
             }
-        } else if single {
-            if byte == b'\'' {
-                if bytes.get(i + 1) == Some(&b'\'') {
-                    i += 1;
-                } else {
-                    single = false;
-                }
+            b'"' if token_start => {
+                let Some(close) = closing_double(bytes, i + 1) else {
+                    return scan;
+                };
+                i = close;
+                token_start = false;
             }
-        } else {
-            match byte {
-                b'\'' => single = true,
-                b'"' => double = true,
-                b'#' if i == 0 || matches!(bytes[i - 1], b' ' | b'\t') => {
-                    return content[..i].trim_end();
-                }
-                _ => {}
+            b'#' if i == 0 || matches!(bytes[i - 1], b' ' | b'\t') => {
+                scan.comment = Some(i);
+                return scan;
             }
+            b'[' | b'{' if token_start || depth > 0 => {
+                depth += 1;
+                token_start = true;
+            }
+            b']' | b'}' if depth > 0 => {
+                depth -= 1;
+                token_start = false;
+            }
+            b',' if depth > 0 => token_start = true,
+            b':' if next_is_break && depth > 0 => token_start = true,
+            b':' if next_is_break && scan.colon.is_none() => {
+                scan.colon = Some(i);
+                token_start = true;
+            }
+            b'-' | b'?' if token_start && depth == 0 && next_is_break => {}
+            _ => token_start = false,
         }
         i += 1;
     }
-    content.trim_end()
+    scan
+}
+
+fn closing_single(bytes: &[u8], mut i: usize) -> Option<usize> {
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            if bytes.get(i + 1) != Some(&b'\'') {
+                return Some(i);
+            }
+            i += 1;
+        }
+        i += 1;
+    }
+    None
+}
+
+fn closing_double(bytes: &[u8], mut i: usize) -> Option<usize> {
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => return Some(i),
+            b'\\' => i += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn strip_comment(content: &str) -> &str {
+    match scan_line(content).comment {
+        Some(comment) => content[..comment].trim_end(),
+        None => content.trim_end(),
+    }
 }
 
 fn find_mapping_colon(content: &str) -> Option<usize> {
-    let bytes = content.as_bytes();
-    let mut single = false;
-    let mut double = false;
-    let mut escaped = false;
-    let mut depth = 0usize;
-    for (i, &byte) in bytes.iter().enumerate() {
-        if double {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                double = false;
-            }
-            continue;
-        }
-        if single {
-            if byte == b'\'' {
-                if bytes.get(i + 1) == Some(&b'\'') {
-                    continue;
-                }
-                single = false;
-            }
-            continue;
-        }
-        match byte {
-            b'\'' => single = true,
-            b'"' => double = true,
-            b'[' | b'{' => depth += 1,
-            b']' | b'}' => depth = depth.saturating_sub(1),
-            b':' if depth == 0 => {
-                if matches!(bytes.get(i + 1), None | Some(b' ' | b'\t')) {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
+    scan_line(content).colon
 }
 
 fn scan_single<'a>(text: &'a str, start: usize, base: usize) -> Result<(YamlScalar<'a>, usize)> {
@@ -848,17 +950,17 @@ fn scan_double<'a>(text: &'a str, start: usize, base: usize) -> Result<(YamlScal
                 ))
             }
             b'\\' => {
+                let escape = i;
                 i += 1;
                 if i >= bytes.len() {
                     return Err(YamlError::UnterminatedQuote {
                         offset: base + start,
                     });
                 }
-                match bytes[i] {
-                    b'x' => i += 2,
-                    b'u' => i += 4,
-                    b'U' => i += 8,
-                    _ => i += 1,
+                if decode_escape(bytes, &mut i).is_none() {
+                    return Err(YamlError::InvalidEscape {
+                        offset: base + escape,
+                    });
                 }
             }
             _ => i += 1,

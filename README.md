@@ -444,8 +444,8 @@ Useful overrides:
 |--------------------------------------|-------------------------------------------|
 | `make run`                           | AArch64 VNC display on `127.0.0.1:5900`   |
 | `make run-x64`                       | x86_64 VNC display on `127.0.0.1:5900`    |
-| `FEOS_DISPLAY=gtk make run`          | Native GTK window (if QEMU has GTK)       |
-| `FEOS_DISPLAY=none make run`         | Headless: serial console only             |
+| `make run QEMU_DISPLAY=gtk`           | Native GTK window (if QEMU has GTK)       |
+| `make run QEMU_DISPLAY=none`          | Headless: serial console only             |
 | `make run QEMU_DISPLAY=vnc=0.0.0.0:0`| VNC reachable from other machines         |
 | `make run AUDIODEV=alsa,id=snd0`      | Live ALSA output (needs `/dev/snd`)       |
 | `make run AUDIODEV=pa,id=snd0`        | Live PulseAudio/PipeWire output           |
@@ -1434,7 +1434,9 @@ virtio-gpu and audio, and `apps/` for an animation or audio app.
 
 ## License
 
-MIT OR Apache-2.0.
+Most crates are `MIT OR Apache-2.0`. `feos-dosbox`, `feos-dosbox-app`, the kernel
+crate and the linked `feos` binary are `GPL-2.0-or-later`. See
+[`LICENSING.md`](LICENSING.md).
 
 The 8x8 bitmap font data in `libs/gfx/src/font.rs` is the public-domain
 `font8x8_basic` table by Daniel Hepper, based on Marcel Sondaar's public-domain

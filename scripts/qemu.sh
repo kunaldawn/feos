@@ -1,6 +1,7 @@
 #!/bin/sh
 # Boot the kernel in QEMU's aarch64 `virt` machine with ramfb display, a
-# virtio tablet pointer, a virtio keyboard and an Intel HDA audio device.
+# virtio tablet pointer, a virtio keyboard and an Intel HDA audio device. Set
+# FEOS_QEMU_ARGS to replace the input devices and add QEMU arguments (`-accel kvm`).
 #
 #   ./scripts/qemu.sh [path/to/kernel.elf]
 #
@@ -21,6 +22,7 @@ DISPLAY_BACKEND="${FEOS_DISPLAY:-vnc=127.0.0.1:0}"
 AUDIODEV="${FEOS_AUDIODEV:-wav,id=snd0,path=target/audio/qemu.wav,out.frequency=48000,out.channels=2,out.format=s16}"
 SMP="${FEOS_SMP:-4}"
 MEM="${FEOS_MEM:-512M}"
+QEMU="${FEOS_QEMU:-qemu-system-aarch64}"
 
 if [ ! -f "$KERNEL" ]; then
     echo "kernel not found: $KERNEL" >&2
@@ -30,18 +32,19 @@ fi
 
 mkdir -p target/audio
 
-exec qemu-system-aarch64 \
+# FEOS_QEMU_ARGS is deliberately word-split: it holds extra QEMU arguments.
+# shellcheck disable=SC2086
+exec "$QEMU" \
     -machine virt \
     -cpu cortex-a53 \
     -smp "$SMP" \
     -m "$MEM" \
     -net none \
     -device ramfb \
-    -device virtio-tablet-device \
-    -device virtio-keyboard-device \
     -audiodev "$AUDIODEV" \
     -device intel-hda \
     -device hda-output,audiodev=snd0 \
     -display "$DISPLAY_BACKEND" \
     -serial mon:stdio \
-    -kernel "$KERNEL"
+    -kernel "$KERNEL" \
+    ${FEOS_QEMU_ARGS:---device virtio-tablet-device -device virtio-keyboard-device}

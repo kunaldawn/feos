@@ -2,10 +2,10 @@ use alloc::vec::Vec;
 
 use alloc::collections::{BTreeMap, VecDeque};
 
-use alloc::rc::Rc;
+use alloc::sync::Arc;
 
 use crate::bitstream::BitstreamReader;
-use crate::deblock::{self, MbInfo, MbType};
+use crate::deblock::{self, DeblockParams, MbInfo, MbType};
 use crate::decode_cabac::CabacMbResult;
 use crate::dpb::{DecodedPicture, Dpb, ReferenceStatus};
 use crate::error::DecodeError;
@@ -18,35 +18,160 @@ use crate::sps::{Sps, parse_sps};
 
 /// A decoded YUV 4:2:0 frame.
 ///
-/// The Y plane is `width × height` bytes; the U and V planes are each
-/// `(width/2) × (height/2)` bytes (4:2:0 chroma subsampling). Pixels are
-/// stored row-major with no inter-row padding (stride == width).
+/// The planes hold the whole coded picture and are shared with the decoder's
+/// reference buffer, so a cropped stream such as 1080p needs no extra copy.
+/// Use [`y_row`](Self::y_row), [`u_row`](Self::u_row) and
+/// [`v_row`](Self::v_row) to read the visible picture: `width × height` luma
+/// samples and `(width/2) × (height/2)` samples per chroma plane.
 ///
 /// Frames returned by [`Decoder::decode_nal`] are emitted in **decode order**,
 /// not display order. To present them in the intended order, sort by
-/// `pic_order_cnt` within each GOP. See the crate-level documentation for the
-/// recommended pattern (and a common pitfall around IDR boundary handling).
+/// `pic_order_cnt` within each GOP, or use [`OrderedDecoder`].
 #[derive(Debug, Clone)]
 pub struct Frame {
     /// Display width in luma samples.
     pub width: u32,
     /// Display height in luma samples.
     pub height: u32,
-    /// Luma plane, `width * height` bytes, row-major.
-    pub y: Rc<Vec<u8>>,
-    /// Cb chroma plane, `(width/2) * (height/2)` bytes, row-major.
-    pub u: Rc<Vec<u8>>,
-    /// Cr chroma plane, `(width/2) * (height/2)` bytes, row-major.
-    pub v: Rc<Vec<u8>>,
+    /// Coded luma plane.
+    pub y: Arc<Vec<u8>>,
+    /// Coded Cb chroma plane.
+    pub u: Arc<Vec<u8>>,
+    /// Coded Cr chroma plane.
+    pub v: Arc<Vec<u8>>,
+    /// Bytes between luma rows.
+    pub y_stride: usize,
+    /// Bytes between chroma rows.
+    pub uv_stride: usize,
+    /// Offset of the first visible luma sample.
+    pub y_offset: usize,
+    /// Offset of the first visible sample of each chroma plane.
+    pub uv_offset: usize,
     /// Picture order count — the H.264 spec's display ordering value.
     /// Use this to sort frames into display order within a GOP.
     pub pic_order_cnt: i32,
+    /// True when this picture restarts picture order counting (an IDR, or a
+    /// picture with memory management operation 5): everything decoded earlier
+    /// is displayed before it.
+    pub poc_reset: bool,
+    /// True for an IDR picture.
+    pub is_idr: bool,
+    /// The value of [`Decoder::set_tag`] when this picture's first slice was
+    /// decoded. Lets a demuxer tie output frames back to container samples.
+    pub tag: u64,
+}
+
+impl Frame {
+    /// Visible samples of luma row `row`.
+    pub fn y_row(&self, row: usize) -> &[u8] {
+        let start = self.y_offset + row * self.y_stride;
+        &self.y[start..start + self.width as usize]
+    }
+
+    /// Visible samples of Cb row `row`.
+    pub fn u_row(&self, row: usize) -> &[u8] {
+        let start = self.uv_offset + row * self.uv_stride;
+        &self.u[start..start + self.width as usize / 2]
+    }
+
+    /// Visible samples of Cr row `row`.
+    pub fn v_row(&self, row: usize) -> &[u8] {
+        let start = self.uv_offset + row * self.uv_stride;
+        &self.v[start..start + self.width as usize / 2]
+    }
+
+    /// Appends the visible picture to `out` as planar I420.
+    pub fn append_i420(&self, out: &mut Vec<u8>) {
+        for row in 0..self.height as usize {
+            out.extend_from_slice(self.y_row(row));
+        }
+        for row in 0..self.height as usize / 2 {
+            out.extend_from_slice(self.u_row(row));
+        }
+        for row in 0..self.height as usize / 2 {
+            out.extend_from_slice(self.v_row(row));
+        }
+    }
+}
+
+/// Resource limits for a [`Decoder`]. The kernel heap is small and allocation
+/// failure is fatal there, so pictures are checked against these before any
+/// storage is allocated, and every picture allocation is fallible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// Largest accepted coded width in luma samples.
+    pub max_width: u32,
+    /// Largest accepted coded height in luma samples.
+    pub max_height: u32,
+    /// Largest accepted estimate of the memory a stream needs: reference
+    /// pictures, reorder queue and per-macroblock working state.
+    pub max_memory: usize,
+}
+
+impl Default for Limits {
+    /// Up to 1080p at conforming reference counts, within a 64 MiB heap.
+    fn default() -> Self {
+        Self {
+            max_width: 16384,
+            max_height: 16384,
+            max_memory: 48 * 1024 * 1024,
+        }
+    }
+}
+
+/// Bytes per macroblock in the planes of one picture.
+const PLANE_BYTES_PER_MB: usize = 384;
+/// Bytes per macroblock kept alongside a reference picture for direct
+/// prediction: two motion vector planes and reference index and POC planes.
+const MOTION_BYTES_PER_MB: usize = 16 * (4 + 4 + 1 + 1 + 4);
+/// Bytes per macroblock of working state, excluding motion vectors kept with
+/// the picture.
+const SCRATCH_BYTES_PER_MB: usize = 24
+    + 2 * 16 * 4
+    + core::mem::size_of::<MbInfo>()
+    + 16
+    + core::mem::size_of::<u16>()
+    + 4
+    + 16
+    + 3
+    + core::mem::size_of::<u16>();
+
+/// Estimates the memory a stream needs at its reference and reorder depths.
+fn stream_memory(sps: &Sps) -> usize {
+    let mbs = sps.mb_width() as usize * sps.mb_height() as usize;
+    let references = sps.max_num_ref_frames as usize + 1;
+    // Frames queued for output hold planes only. One more is held by a caller
+    // that keeps the current frame for redraws.
+    let queued = sps.reorder_depth() + 1;
+    let per_mb = references * (PLANE_BYTES_PER_MB + MOTION_BYTES_PER_MB)
+        + queued * PLANE_BYTES_PER_MB
+        + SCRATCH_BYTES_PER_MB;
+    mbs.saturating_mul(per_mb)
+}
+
+/// Allocates a filled vector, reporting failure instead of aborting.
+fn try_vec<T: Clone>(value: T, len: usize) -> Result<Vec<T>, DecodeError> {
+    let mut items = Vec::new();
+    items
+        .try_reserve_exact(len)
+        .map_err(|_| DecodeError::OutOfMemory)?;
+    items.resize(len, value);
+    Ok(items)
+}
+
+/// Overwrites `items` with `len` copies of `value`, reusing its storage.
+fn refill<T: Clone>(items: &mut Vec<T>, value: T, len: usize) -> Result<(), DecodeError> {
+    items.clear();
+    items
+        .try_reserve_exact(len)
+        .map_err(|_| DecodeError::OutOfMemory)?;
+    items.resize(len, value);
+    Ok(())
 }
 
 /// Mutable picture storage used while decoding. It is kept private so the
 /// public frame API can share completed planes with the DPB without copying
 /// the decoded pixels.
-#[derive(Clone)]
 pub(crate) struct WorkFrame {
     pub width: u32,
     pub height: u32,
@@ -56,23 +181,13 @@ pub(crate) struct WorkFrame {
     pub pic_order_cnt: i32,
 }
 
-/// In-progress picture state shared across slices within the same frame.
-#[derive(Clone)]
-struct PictureState {
-    frame: WorkFrame,
-    frame_num: u32,
-    poc: i32,
-    nal_unit_type: NalUnitType,
-    nal_ref_idc: u8,
-    // Per-MB arrays that persist across slices
+/// Per-macroblock working state. It isn't needed once a picture is finished,
+/// so one set is recycled between pictures instead of being reallocated.
+#[derive(Default)]
+struct MbScratch {
     nc_luma: Vec<u8>,
     nc_cb: Vec<u8>,
     nc_cr: Vec<u8>,
-    mv_store_l0: Vec<[i16; 2]>,
-    mv_store_l1: Vec<[i16; 2]>,
-    ref_idx_store_l0: Vec<i8>,
-    ref_poc_store_l0: Vec<i32>,
-    ref_idx_store_l1: Vec<i8>,
     mvd_store: Vec<[i16; 2]>,
     mvd_store_l1: Vec<[i16; 2]>,
     mb_info: Vec<deblock::MbInfo>,
@@ -88,28 +203,63 @@ struct PictureState {
     /// Per-MB slice ID for slice boundary detection. MBs from different
     /// slices are treated as unavailable for CABAC context and MV prediction.
     mb_slice_id: Vec<u16>,
+    /// Per-MB-pair field decoding flag (MBAFF only). Indexed by pair address.
+    mb_field_decoding: Vec<bool>,
+}
+
+impl MbScratch {
+    /// Sizes and clears the state for a picture of `total_mbs` macroblocks.
+    fn prepare(&mut self, total_mbs: usize) -> Result<(), DecodeError> {
+        refill(&mut self.nc_luma, 0u8, total_mbs * 16)?;
+        refill(&mut self.nc_cb, 0u8, total_mbs * 4)?;
+        refill(&mut self.nc_cr, 0u8, total_mbs * 4)?;
+        refill(&mut self.mvd_store, [0i16; 2], total_mbs * 16)?;
+        refill(&mut self.mvd_store_l1, [0i16; 2], total_mbs * 16)?;
+        refill(&mut self.mb_info, deblock::MbInfo::default(), total_mbs)?;
+        refill(&mut self.i4x4_modes, 2u8, total_mbs * 16)?;
+        refill(&mut self.mb_cbp, 0u16, total_mbs)?;
+        refill(&mut self.mb_chroma_pred, 0u8, total_mbs)?;
+        refill(&mut self.mb_is_8x8dct, false, total_mbs)?;
+        refill(&mut self.mb_skip, false, total_mbs)?;
+        refill(&mut self.mb_is_direct, false, total_mbs)?;
+        refill(&mut self.blk_is_direct, false, total_mbs * 16)?;
+        refill(&mut self.is_i16x16, false, total_mbs)?;
+        refill(&mut self.mb_slice_id, 0u16, total_mbs)?;
+        refill(&mut self.mb_field_decoding, false, total_mbs.div_ceil(2))?;
+        Ok(())
+    }
+}
+
+/// In-progress picture state shared across slices within the same frame.
+struct PictureState {
+    frame: WorkFrame,
+    frame_num: u32,
+    poc: i32,
+    nal_unit_type: NalUnitType,
+    nal_ref_idc: u8,
+    // Motion data kept with the picture for direct prediction.
+    mv_store_l0: Vec<[i16; 2]>,
+    mv_store_l1: Vec<[i16; 2]>,
+    ref_idx_store_l0: Vec<i8>,
+    ref_poc_store_l0: Vec<i32>,
+    ref_idx_store_l1: Vec<i8>,
+    scratch: MbScratch,
     /// Current slice ID counter (incremented for each new slice).
     current_slice_id: u16,
-    #[allow(dead_code)]
-    prev_mb_qp: i32,
-    #[allow(dead_code)]
-    last_qp_delta_nonzero: bool,
     // Slice header info for finalization
     mmco_ops: Vec<(u32, u32)>,
     long_term_reference_flag: bool,
     is_intra_slice: bool,
-    // Deblock parameters (from first slice; per-slice deblock offsets
-    // could differ but we use the first slice's values)
-    disable_deblocking_filter_idc: u32,
-    slice_alpha_c0_offset_div2: i32,
-    slice_beta_offset_div2: i32,
-    chroma_qp_index_offset: i32,
+    /// `delta_pic_order_cnt_bottom`, for the POC reset of MMCO 5.
+    delta_poc_bottom: i32,
     mb_width: u32,
     mb_height: u32,
-    /// Per-MB-pair field decoding flag (MBAFF only). Indexed by pair address.
-    mb_field_decoding: Vec<bool>,
+    /// Luma columns and rows hidden by the SPS crop.
+    crop_x: u32,
+    crop_y: u32,
     /// True if this picture uses MBAFF (mb_adaptive_frame_field_flag && !field_pic_flag).
     mbaff_frame_flag: bool,
+    tag: u64,
 }
 
 /// Streaming H.264 decoder.
@@ -150,6 +300,12 @@ pub struct Decoder {
     /// Frames finalized before a later NAL failed.  Keep them queued so a
     /// recoverable slice error cannot silently discard decoded output.
     deferred_output: VecDeque<Frame>,
+    limits: Limits,
+    /// Working state saved from the last finished picture.
+    scratch_pool: Option<MbScratch>,
+    /// Reorder depth of the active SPS.
+    reorder_depth: usize,
+    tag: u64,
 }
 
 impl Default for Decoder {
@@ -159,15 +315,42 @@ impl Default for Decoder {
 }
 
 impl Decoder {
-    /// Create a new decoder with empty parameter set tables and DPB.
+    /// Create a new decoder with empty parameter set tables and DPB, and
+    /// default [`Limits`].
     pub fn new() -> Self {
+        Self::with_limits(Limits::default())
+    }
+
+    /// Create a new decoder that refuses streams beyond `limits` with
+    /// [`DecodeError::OutOfMemory`].
+    pub fn with_limits(limits: Limits) -> Self {
         Self {
             sps_table: BTreeMap::new(),
             pps_table: BTreeMap::new(),
             dpb: Dpb::new(0),
             pending: None,
             deferred_output: VecDeque::new(),
+            limits,
+            scratch_pool: None,
+            reorder_depth: 0,
+            tag: 0,
         }
+    }
+
+    /// Sets the tag recorded on pictures started from now on. See
+    /// [`Frame::tag`].
+    pub fn set_tag(&mut self, tag: u64) {
+        self.tag = tag;
+    }
+
+    /// Forgets all pictures so decoding can restart at an IDR, keeping the
+    /// parameter sets and recyclable storage.
+    pub fn reset(&mut self) {
+        if let Some(ps) = self.pending.take() {
+            self.scratch_pool = Some(ps.scratch);
+        }
+        self.dpb.reset();
+        self.deferred_output.clear();
     }
 
     /// Feed a single NAL unit to the decoder.
@@ -189,7 +372,7 @@ impl Decoder {
         match nal.nal_unit_type {
             NalUnitType::Sps => {
                 let sps = parse_sps(&nal.rbsp)?;
-                self.dpb.set_max_ref_frames(sps.max_num_ref_frames);
+                sps.check_supported().map_err(DecodeError::Unsupported)?;
                 self.sps_table.insert(sps.seq_parameter_set_id, sps);
                 Ok(self.take_deferred_output())
             }
@@ -226,37 +409,17 @@ impl Decoder {
                 // Decode this slice (creates or continues PictureState).
                 // For CAVLC multi-slice, end-of-slice detection may fail,
                 // causing errors from reading past the slice boundary. If
-                // we had a pending picture, the already-decoded MBs are
-                // valid, so we treat the error as end-of-slice.
-                //
-                // Since decode_slice takes self.pending via take(), we must
-                // save a backup for continuation slices so we can restore it
-                // if the decode fails mid-slice.
-                let had_pending = !is_new_picture && self.pending.is_some();
-                let pending_backup = if had_pending {
-                    self.pending.clone()
-                } else {
-                    None
-                };
-                match self.decode_slice(nal) {
-                    Ok(()) => {}
-                    Err(_e) if self.pending.is_some() => {}
-                    Err(_e) if had_pending => {
-                        // decode_slice consumed self.pending but failed before
-                        // reassembling it. Restore the backup so already-decoded
-                        // MBs from earlier slices are preserved.
-                        self.pending = pending_backup;
-                    }
-                    Err(e) => {
-                        if let Some(frame) = prev_frame {
-                            self.deferred_output.push_back(frame);
-                        }
-                        return Err(e);
-                    }
-                }
-
+                // we had a pending picture, decode_slice keeps it, and the
+                // already-decoded MBs are valid, so the error is treated as
+                // the end of the slice.
+                let result = self.decode_slice(nal);
                 if let Some(frame) = prev_frame {
                     self.deferred_output.push_back(frame);
+                }
+                if let Err(e) = result {
+                    if self.pending.is_none() || matches!(e, DecodeError::OutOfMemory) {
+                        return Err(e);
+                    }
                 }
                 Ok(self.take_deferred_output())
             }
@@ -267,16 +430,18 @@ impl Decoder {
     /// Finalize any pending picture and return it. Call this after the last
     /// NAL has been fed via [`decode_nal`](Self::decode_nal) to retrieve the
     /// final frame, which is otherwise held internally awaiting a new picture
-    /// to trigger its release.
+    /// to trigger its release. Call it until it returns `None` if decoding
+    /// reported errors, as a frame may also be queued from before an error.
     pub fn flush(&mut self) -> Option<Frame> {
         if let Some(frame) = self.finalize_pending() {
             self.deferred_output.push_back(frame);
         }
-        debug_assert!(
-            self.deferred_output.len() <= 1,
-            "deferred_output should never exceed one frame; flush drains one"
-        );
         self.take_deferred_output()
+    }
+
+    /// Frames an [`OrderedDecoder`] must hold back for the active SPS.
+    pub(crate) fn reorder_depth(&self) -> usize {
+        self.reorder_depth
     }
 
     #[inline]
@@ -310,23 +475,21 @@ impl Decoder {
         let mut ps = self.pending.take()?;
 
         // Apply deblocking filter
-        deblock::filter_frame_mbaff(
+        deblock::filter_frame(
             &mut ps.frame,
-            &ps.mb_info,
+            &ps.scratch.mb_info,
             ps.mb_width as usize,
-            ps.disable_deblocking_filter_idc,
-            ps.slice_alpha_c0_offset_div2,
-            ps.slice_beta_offset_div2,
-            ps.chroma_qp_index_offset,
             ps.mbaff_frame_flag,
         );
+        self.scratch_pool = Some(ps.scratch);
 
-        if ps.nal_unit_type == NalUnitType::SliceIdr {
+        let is_idr = ps.nal_unit_type == NalUnitType::SliceIdr;
+        if is_idr {
             self.dpb.clear();
         }
 
         let reference = if ps.nal_ref_idc > 0 {
-            if ps.nal_unit_type == NalUnitType::SliceIdr && ps.long_term_reference_flag {
+            if is_idr && ps.long_term_reference_flag {
                 ReferenceStatus::LongTerm(0) // IDR with long_term_reference_flag → LT idx 0
             } else {
                 ReferenceStatus::ShortTerm
@@ -335,27 +498,25 @@ impl Decoder {
             ReferenceStatus::Unused
         };
 
+        let max_frame_num = self.dpb.max_frame_num();
+        // picNumX = CurrPicNum - (difference_of_pic_nums_minus1 + 1), which is
+        // negative when the target's frame_num is above the current one. The
+        // DPB stores frame_num, so map back through MaxFrameNum (spec 8.2.4.1).
+        let pic_num_x = |diff_minus1: u32| -> u32 {
+            (ps.frame_num as i64 - diff_minus1 as i64 - 1).rem_euclid(max_frame_num as i64) as u32
+        };
+        let mut poc_reset = is_idr;
         for &(op, param) in &ps.mmco_ops {
             match op {
-                1 => {
-                    let pic_num_to_remove = ps.frame_num as i32 - ((param & 0xFFFF) as i32 + 1);
-                    self.dpb.mark_short_term_unused(pic_num_to_remove as u32);
-                }
-                2 => {
-                    self.dpb.mark_long_term_unused(param);
-                }
-                3 => {
-                    let abs_diff_minus1 = param & 0xFFFF;
-                    let long_term_frame_idx = param >> 16;
-                    let pic_num = ps.frame_num as i32 - (abs_diff_minus1 as i32 + 1);
-                    self.dpb
-                        .assign_long_term(pic_num as u32, long_term_frame_idx);
-                }
-                4 => {
-                    self.dpb.set_max_long_term_frame_idx(param);
-                }
+                1 => self.dpb.mark_short_term_unused(pic_num_x(param & 0xFFFF)),
+                2 => self.dpb.mark_long_term_unused(param),
+                3 => self
+                    .dpb
+                    .assign_long_term(pic_num_x(param & 0xFFFF), param >> 16),
+                4 => self.dpb.set_max_long_term_frame_idx(param),
                 5 => {
                     self.dpb.clear_all_refs();
+                    poc_reset = true;
                 }
                 6 => {
                     // Will be applied after insert (current pic must be in DPB first)
@@ -364,64 +525,48 @@ impl Decoder {
             }
         }
 
-        // Keep the coded-size planes in the DPB. Motion compensation indexes
-        // reference pictures using the macroblock-aligned stride, so cropping
-        // them before insertion corrupts later P/B pictures. The public frame
-        // may still be cropped below.
-        let coded_w = (ps.mb_width * 16) as usize;
-        if coded_w == 0 {
-            return None;
-        }
-        let coded_h = ps.frame.y.len() / coded_w;
-        let display_w = ps.frame.width as usize;
-        let display_h = ps.frame.height as usize;
-        if display_w > coded_w || display_h > coded_h || coded_w * coded_h > ps.frame.y.len() {
-            return None;
-        }
-
-        // Move the decoder-owned planes into Rc exactly once. The DPB and the
-        // returned frame share them when no visible crop is needed.
-        let full_y = Rc::new(ps.frame.y);
-        let full_u = Rc::new(ps.frame.u);
-        let full_v = Rc::new(ps.frame.v);
-        let (y, u, v) = if coded_w == display_w && coded_h == display_h {
-            (full_y.clone(), full_u.clone(), full_v.clone())
+        // After MMCO 5 the picture counts as frame_num 0 with its POC rebased
+        // to zero, for everything decoded later (spec 8.2.1, 7.4.3).
+        let has_mmco5 = ps.mmco_ops.iter().any(|&(op, _)| op == 5);
+        let (frame_num, poc) = if has_mmco5 {
+            self.dpb.reset_after_mmco5(ps.delta_poc_bottom);
+            (0, 0)
         } else {
-            let mut y = vec![0u8; display_w * display_h];
-            for r in 0..display_h {
-                y[r * display_w..(r + 1) * display_w]
-                    .copy_from_slice(&full_y[r * coded_w..r * coded_w + display_w]);
-            }
-            let chroma_coded_w = coded_w / 2;
-            let chroma_w = display_w / 2;
-            let chroma_h = display_h / 2;
-            let mut u = vec![0u8; chroma_w * chroma_h];
-            let mut v = vec![0u8; chroma_w * chroma_h];
-            for r in 0..chroma_h {
-                u[r * chroma_w..(r + 1) * chroma_w]
-                    .copy_from_slice(&full_u[r * chroma_coded_w..r * chroma_coded_w + chroma_w]);
-                v[r * chroma_w..(r + 1) * chroma_w]
-                    .copy_from_slice(&full_v[r * chroma_coded_w..r * chroma_coded_w + chroma_w]);
-            }
-            (Rc::new(y), Rc::new(u), Rc::new(v))
+            (ps.frame_num, ps.poc)
         };
+
+        // The DPB and the returned frame share the coded-size planes. Motion
+        // compensation indexes reference pictures using the macroblock-aligned
+        // stride; the frame's offsets and strides describe the visible crop.
+        let coded_w = ps.mb_width as usize * 16;
+        let coded_h = ps.mb_height as usize * 16;
+        let full_y = Arc::new(ps.frame.y);
+        let full_u = Arc::new(ps.frame.u);
+        let full_v = Arc::new(ps.frame.v);
         let output = Frame {
             width: ps.frame.width,
             height: ps.frame.height,
-            y: y.clone(),
-            u: u.clone(),
-            v: v.clone(),
-            pic_order_cnt: ps.poc,
+            y: full_y.clone(),
+            u: full_u.clone(),
+            v: full_v.clone(),
+            y_stride: coded_w,
+            uv_stride: coded_w / 2,
+            y_offset: ps.crop_y as usize * coded_w + ps.crop_x as usize,
+            uv_offset: (ps.crop_y as usize / 2) * (coded_w / 2) + ps.crop_x as usize / 2,
+            pic_order_cnt: poc,
+            poc_reset,
+            is_idr,
+            tag: ps.tag,
         };
-        let pic = Rc::new(DecodedPicture {
+        let pic = Arc::new(DecodedPicture {
             y: full_y,
             u: full_u,
             v: full_v,
-            width: ps.mb_width * 16,
-            height: (ps.frame.height.div_ceil(16)) * 16,
-            frame_num: ps.frame_num,
-            pic_order_cnt: ps.poc,
-            long_term_frame_idx: core::cell::Cell::new(match reference {
+            width: coded_w as u32,
+            height: coded_h as u32,
+            frame_num,
+            pic_order_cnt: poc,
+            long_term_frame_idx: crate::dpb::LongTermIdx::new(match reference {
                 ReferenceStatus::LongTerm(idx) => Some(idx),
                 _ => None,
             }),
@@ -439,7 +584,7 @@ impl Decoder {
         // MMCO op=6: mark current picture as long-term (after insert)
         for &(op, param) in &ps.mmco_ops {
             if op == 6 {
-                self.dpb.mark_current_as_long_term(param, ps.frame_num);
+                self.dpb.mark_current_as_long_term(param, frame_num);
             }
         }
 
@@ -489,11 +634,16 @@ impl Decoder {
         let current_poc = self
             .dpb
             .compute_poc(sps, &header, nal.nal_unit_type, nal.nal_ref_idc);
+        // Interlaced coding isn't implemented: the field macroblock paths don't
+        // match a reference decoder under CAVLC, and CABAC ignores the field flag.
+        if header.mbaff_frame_flag {
+            return Err(DecodeError::Unsupported("MBAFF is not supported"));
+        }
 
         // Build reference picture lists
         let max_pic_num = 1u32 << sps.log2_max_frame_num_minus4.saturating_add(4).min(31);
         let mut ref_pic_list = if is_p_slice {
-            let mut refs = self.dpb.short_term_ref_list();
+            let mut refs = self.dpb.short_term_ref_list(header.frame_num, max_pic_num);
             // Pad ref list if shorter than num_ref_idx_l0_active (spec 8.2.4.2.1:
             // if the list is shorter, duplicate the last entry to fill)
             if !refs.is_empty() {
@@ -577,11 +727,16 @@ impl Decoder {
                     _ref_pic_list_l1
                         .iter()
                         .map(|ref_l1| {
-                            let td = (ref_l1.pic_order_cnt - ref_l0.pic_order_cnt).clamp(-128, 127);
+                            let td = ref_l1
+                                .pic_order_cnt
+                                .saturating_sub(ref_l0.pic_order_cnt)
+                                .clamp(-128, 127);
                             if td == 0 {
                                 32
                             } else {
-                                let tb = (current_poc - ref_l0.pic_order_cnt).clamp(-128, 127);
+                                let tb = current_poc
+                                    .saturating_sub(ref_l0.pic_order_cnt)
+                                    .clamp(-128, 127);
                                 let tx = (16384 + (td.abs() / 2)) / td;
                                 let w1 = (tb * tx + 32) >> 8;
                                 if !(-64..=128).contains(&w1) {
@@ -606,16 +761,39 @@ impl Decoder {
 
         let width = sps.width();
         let height = sps.height();
-        // Reject absurd dimensions that would cause allocation overflow.
-        // H.264 Level 6.2 max is 8192x4320; allow up to 16384x16384 for headroom.
-        if width == 0 || height == 0 || width > 16384 || height > 16384 {
+        // Geometry comes from the SPS's coded units, not the cropped size:
+        // crops of 16 samples or more would otherwise change the stride, and
+        // MBAFF relies on the even height of frame_mbs_only_flag == 0.
+        let mb_width = sps.mb_width();
+        let mb_height = sps.mb_height();
+        let coded_width = sps.coded_width();
+        let coded_height = sps.coded_height();
+        if width == 0 || height == 0 {
             return Err(DecodeError::InvalidSyntax("SPS dimensions out of range"));
         }
-        let mb_width = width.div_ceil(16);
-        let mb_height = height.div_ceil(16);
-        let coded_width = mb_width * 16;
-        let coded_height = mb_height * 16;
         let total_mbs = (mb_width * mb_height) as usize;
+
+        // Reference pictures are read with this picture's geometry, so a
+        // parameter set change without an IDR can't use the old ones.
+        let refs_match = |refs: &[Arc<DecodedPicture>]| {
+            refs.iter()
+                .all(|r| r.width == coded_width && r.height == coded_height)
+        };
+        if !refs_match(&ref_pic_list)
+            || !refs_match(&_ref_pic_list_l0)
+            || !refs_match(&_ref_pic_list_l1)
+        {
+            return Err(DecodeError::InvalidSyntax(
+                "reference picture size differs from the current picture",
+            ));
+        }
+        if (is_p_slice && ref_pic_list.is_empty())
+            || (is_b_slice && (_ref_pic_list_l0.is_empty() || _ref_pic_list_l1.is_empty()))
+        {
+            return Err(DecodeError::InvalidSyntax(
+                "inter slice without reference pictures",
+            ));
+        }
 
         let slice_qp = header.qp_y(pps);
 
@@ -624,109 +802,92 @@ impl Decoder {
         // so per-MB data from earlier slices is visible for MV prediction,
         // CABAC neighbor contexts, and deblocking.
         let is_continuation = header.first_mb_in_slice > 0
-            && self.pending.is_some()
-            && self.pending.as_ref().unwrap().mb_slice_id.len() == total_mbs;
-        let ps = if is_continuation {
-            self.pending.take().unwrap()
+            && self
+                .pending
+                .as_ref()
+                .is_some_and(|ps| ps.mb_width == mb_width && ps.mb_height == mb_height);
+        let mut ps = if let Some(ps) = self.pending.take().filter(|_| is_continuation) {
+            ps
         } else {
+            if coded_width > self.limits.max_width
+                || coded_height > self.limits.max_height
+                || stream_memory(sps) > self.limits.max_memory
+            {
+                return Err(DecodeError::OutOfMemory);
+            }
+            self.dpb.set_max_ref_frames(sps.max_num_ref_frames);
+            self.reorder_depth = sps.reorder_depth();
+            let mut scratch = self.scratch_pool.take().unwrap_or_default();
+            scratch.prepare(total_mbs)?;
             PictureState {
                 frame: WorkFrame {
                     width,
                     height,
-                    y: vec![0u8; (coded_width * coded_height) as usize],
-                    u: vec![0u8; (coded_width * coded_height / 4) as usize],
-                    v: vec![0u8; (coded_width * coded_height / 4) as usize],
+                    y: try_vec(0u8, (coded_width * coded_height) as usize)?,
+                    u: try_vec(0u8, (coded_width * coded_height / 4) as usize)?,
+                    v: try_vec(0u8, (coded_width * coded_height / 4) as usize)?,
                     pic_order_cnt: current_poc,
                 },
                 frame_num: header.frame_num,
                 poc: current_poc,
                 nal_unit_type: nal.nal_unit_type,
                 nal_ref_idc: nal.nal_ref_idc,
-                nc_luma: vec![0u8; total_mbs * 16],
-                nc_cb: vec![0u8; total_mbs * 4],
-                nc_cr: vec![0u8; total_mbs * 4],
-                mv_store_l0: vec![[0i16; 2]; total_mbs * 16],
-                mv_store_l1: vec![[0i16; 2]; total_mbs * 16],
-                ref_idx_store_l0: vec![-1i8; total_mbs * 16],
-                ref_poc_store_l0: vec![-1i32; total_mbs * 16],
-                ref_idx_store_l1: vec![-1i8; total_mbs * 16],
-                mvd_store: vec![[0i16; 2]; total_mbs * 16],
-                mvd_store_l1: vec![[0i16; 2]; total_mbs * 16],
-                mb_info: vec![deblock::MbInfo::default(); total_mbs],
-                i4x4_modes: vec![2u8; total_mbs * 16],
-                mb_cbp: vec![0u16; total_mbs],
-                mb_chroma_pred: vec![0u8; total_mbs],
-                mb_is_8x8dct: vec![false; total_mbs],
-                mb_skip: vec![false; total_mbs],
-                mb_is_direct: vec![false; total_mbs],
-                blk_is_direct: vec![false; total_mbs * 16],
-                is_i16x16: vec![false; total_mbs],
-                mb_slice_id: vec![0u16; total_mbs],
+                mv_store_l0: try_vec([0i16; 2], total_mbs * 16)?,
+                mv_store_l1: try_vec([0i16; 2], total_mbs * 16)?,
+                ref_idx_store_l0: try_vec(-1i8, total_mbs * 16)?,
+                ref_poc_store_l0: try_vec(-1i32, total_mbs * 16)?,
+                ref_idx_store_l1: try_vec(-1i8, total_mbs * 16)?,
+                scratch,
                 current_slice_id: 0,
-                prev_mb_qp: slice_qp,
-                last_qp_delta_nonzero: false,
-                mmco_ops: header.mmco_ops.clone(),
-                long_term_reference_flag: header.long_term_reference_flag,
-                is_intra_slice: header.slice_type == SliceType::I,
-                disable_deblocking_filter_idc: header.disable_deblocking_filter_idc,
-                slice_alpha_c0_offset_div2: header.slice_alpha_c0_offset_div2,
-                slice_beta_offset_div2: header.slice_beta_offset_div2,
-                chroma_qp_index_offset: pps.chroma_qp_index_offset,
+                mmco_ops: Vec::new(),
+                long_term_reference_flag: false,
+                is_intra_slice: false,
+                delta_poc_bottom: 0,
                 mb_width,
                 mb_height,
-                mb_field_decoding: vec![false; total_mbs.div_ceil(2)],
+                crop_x: sps.crop_left(),
+                crop_y: sps.crop_top(),
                 mbaff_frame_flag: header.mbaff_frame_flag,
+                tag: self.tag,
             }
         };
 
-        // Destructure into local variables so existing code works unchanged
+        // Destructure so the macroblock loop below reads as plain locals.
         let PictureState {
-            mut frame,
-            frame_num: _ps_frame_num,
-            poc: _ps_poc,
-            nal_unit_type: _ps_nal_type,
-            nal_ref_idc: _ps_nal_ref_idc,
-            mut nc_luma,
-            mut nc_cb,
-            mut nc_cr,
-            mut mv_store_l0,
-            mut mv_store_l1,
-            mut ref_idx_store_l0,
-            mut ref_poc_store_l0,
-            mut ref_idx_store_l1,
-            mut mvd_store,
-            mut mvd_store_l1,
-            mut mb_info,
-            mut i4x4_modes,
-            mut mb_cbp,
-            mut mb_chroma_pred,
-            mut mb_is_8x8dct,
-            mut mb_skip,
-            mut mb_is_direct,
-            mut blk_is_direct,
-            mut is_i16x16,
-            mut mb_slice_id,
-            mut current_slice_id,
-            prev_mb_qp: _,
-            last_qp_delta_nonzero: _,
-            mmco_ops: _ps_mmco_ops,
-            long_term_reference_flag: _ps_lt_ref_flag,
-            is_intra_slice: _ps_is_intra,
-            disable_deblocking_filter_idc: ps_deblock_idc,
-            slice_alpha_c0_offset_div2: ps_alpha,
-            slice_beta_offset_div2: ps_beta,
-            chroma_qp_index_offset: ps_chroma_qp_offset,
-            mb_width: _ps_mb_width,
-            mb_height: _ps_mb_height,
-            mb_field_decoding: mut _mb_field_decoding,
-            mbaff_frame_flag: _ps_mbaff,
-        } = ps;
+            frame,
+            mv_store_l0,
+            mv_store_l1,
+            ref_idx_store_l0,
+            ref_poc_store_l0,
+            ref_idx_store_l1,
+            scratch,
+            current_slice_id,
+            ..
+        } = &mut ps;
+        let MbScratch {
+            nc_luma,
+            nc_cb,
+            nc_cr,
+            mvd_store,
+            mvd_store_l1,
+            mb_info,
+            i4x4_modes,
+            mb_cbp,
+            mb_chroma_pred,
+            mb_is_8x8dct,
+            mb_skip,
+            mb_is_direct,
+            blk_is_direct,
+            is_i16x16,
+            mb_slice_id,
+            mb_field_decoding,
+        } = scratch;
 
         // Increment slice ID for continuation slices so boundary checks work
         if is_continuation {
-            current_slice_id += 1;
+            *current_slice_id = current_slice_id.wrapping_add(1);
         }
-        let this_slice_id = current_slice_id;
+        let this_slice_id = *current_slice_id;
 
         // Each slice reinitializes its own QP from the slice header
         let mut prev_mb_qp = slice_qp;
@@ -769,36 +930,36 @@ impl Decoder {
         macro_rules! make_ctx {
             () => {
                 SliceContext {
-                    frame: &mut frame,
+                    frame: &mut *frame,
                     stride,
                     width: coded_width,
                     height: coded_height,
                     mb_width,
-                    nc_luma: &mut nc_luma,
-                    nc_cb: &mut nc_cb,
-                    nc_cr: &mut nc_cr,
-                    mv_store_l0: &mut mv_store_l0,
-                    mv_store_l1: &mut mv_store_l1,
-                    ref_idx_store_l0: &mut ref_idx_store_l0,
-                    ref_poc_store_l0: &mut ref_poc_store_l0,
-                    ref_idx_store_l1: &mut ref_idx_store_l1,
-                    mvd_store: &mut mvd_store,
-                    mvd_store_l1: &mut mvd_store_l1,
-                    mb_info: &mut mb_info,
-                    i4x4_modes: &mut i4x4_modes,
-                    mb_cbp: &mut mb_cbp,
-                    mb_chroma_pred: &mut mb_chroma_pred,
-                    mb_is_8x8dct: &mut mb_is_8x8dct,
-                    mb_skip: &mut mb_skip,
-                    mb_is_direct: &mut mb_is_direct,
-                    blk_is_direct: &mut blk_is_direct,
-                    is_i16x16: &mut is_i16x16,
-                    mb_slice_id: &mut mb_slice_id,
+                    nc_luma: &mut *nc_luma,
+                    nc_cb: &mut *nc_cb,
+                    nc_cr: &mut *nc_cr,
+                    mv_store_l0: &mut *mv_store_l0,
+                    mv_store_l1: &mut *mv_store_l1,
+                    ref_idx_store_l0: &mut *ref_idx_store_l0,
+                    ref_poc_store_l0: &mut *ref_poc_store_l0,
+                    ref_idx_store_l1: &mut *ref_idx_store_l1,
+                    mvd_store: &mut *mvd_store,
+                    mvd_store_l1: &mut *mvd_store_l1,
+                    mb_info: &mut *mb_info,
+                    i4x4_modes: &mut *i4x4_modes,
+                    mb_cbp: &mut *mb_cbp,
+                    mb_chroma_pred: &mut *mb_chroma_pred,
+                    mb_is_8x8dct: &mut *mb_is_8x8dct,
+                    mb_skip: &mut *mb_skip,
+                    mb_is_direct: &mut *mb_is_direct,
+                    blk_is_direct: &mut *blk_is_direct,
+                    is_i16x16: &mut *is_i16x16,
+                    mb_slice_id: &mut *mb_slice_id,
                     this_slice_id,
                     prev_mb_qp,
                     last_qp_delta_nonzero,
                     mbaff,
-                    mb_field_decoding: &mut _mb_field_decoding,
+                    mb_field_decoding: &mut *mb_field_decoding,
                     ly_stride: mb_ly_stride,
                     ly_offset: mb_ly_offset,
                     lc_stride: mb_lc_stride,
@@ -819,6 +980,17 @@ impl Decoder {
             scaling_list_8x8: &pps.scaling_list_8x8,
             constrained_intra_pred_flag: pps.constrained_intra_pred_flag,
             chroma_qp_index_offset: pps.chroma_qp_index_offset,
+            second_chroma_qp_index_offset: pps.second_chroma_qp_index_offset,
+            deblock: DeblockParams {
+                filter_idc: header.disable_deblocking_filter_idc as u8,
+                alpha_offset_div2: header.slice_alpha_c0_offset_div2 as i8,
+                beta_offset_div2: header.slice_beta_offset_div2 as i8,
+                chroma_qp_offset: [
+                    pps.chroma_qp_index_offset as i8,
+                    pps.second_chroma_qp_index_offset as i8,
+                ],
+                slice_id: this_slice_id,
+            },
             ref_pic_list: &ref_pic_list,
             ref_pic_list_l0: &_ref_pic_list_l0,
             ref_pic_list_l1: &_ref_pic_list_l1,
@@ -837,10 +1009,11 @@ impl Decoder {
         } else {
             header.first_mb_in_slice as usize
         };
-        if mb_idx >= total_mbs {
-            return Err(DecodeError::InvalidSyntax("first_mb_in_slice out of range"));
-        }
-        while mb_idx < total_mbs {
+        let slice_result = (|| -> Result<(), DecodeError> {
+            if mb_idx >= total_mbs {
+                return Err(DecodeError::InvalidSyntax("first_mb_in_slice out of range"));
+            }
+            while mb_idx < total_mbs {
             // CAVLC end-of-slice: check before reading any new syntax elements.
             // Skip this check when counting down a skip run (no reads needed).
             if !use_cabac && mb_skip_run <= 0 && !reader.more_rbsp_data() {
@@ -938,7 +1111,7 @@ impl Decoder {
                     let is_top = mb_idx % 2 == 0;
                     let top_was_skipped = !is_top && mb_skip[mb_idx - 1];
                     if is_top || top_was_skipped {
-                        _mb_field_decoding[mb_idx / 2] = reader.read_bit()? != 0;
+                        mb_field_decoding[mb_idx / 2] = reader.read_bit()? != 0;
                     }
                 }
             }
@@ -947,7 +1120,7 @@ impl Decoder {
             if mbaff && !(is_p_slice || is_b_slice) {
                 let is_top = mb_idx % 2 == 0;
                 if is_top {
-                    _mb_field_decoding[mb_idx / 2] = reader.read_bit()? != 0;
+                    mb_field_decoding[mb_idx / 2] = reader.read_bit()? != 0;
                 }
             }
 
@@ -968,59 +1141,49 @@ impl Decoder {
             }
         }
 
+            Ok(())
+        })();
+
         // Post-loop: fill deblock info and ref POC table
         let first_mb = if mbaff {
-            (header.first_mb_in_slice as usize) * 2
+            (header.first_mb_in_slice as usize).saturating_mul(2)
         } else {
             header.first_mb_in_slice as usize
         };
-        make_ctx!().finalize_mb_info(first_mb, mb_idx.min(total_mbs), &params);
+        if first_mb < total_mbs {
+            make_ctx!().finalize_mb_info(first_mb, mb_idx.min(total_mbs), &params);
+        }
 
-        // Store state back into pending PictureState.
         // Deblocking and DPB insertion happen in finalize_pending().
-        self.pending = Some(PictureState {
-            frame,
-            frame_num: header.frame_num,
-            poc: current_poc,
-            nal_unit_type: nal.nal_unit_type,
-            nal_ref_idc: nal.nal_ref_idc,
-            nc_luma,
-            nc_cb,
-            nc_cr,
-            mv_store_l0,
-            mv_store_l1,
-            ref_idx_store_l0,
-            ref_poc_store_l0,
-            ref_idx_store_l1,
-            mvd_store,
-            mvd_store_l1,
-            mb_info,
-            i4x4_modes,
-            mb_cbp,
-            mb_chroma_pred,
-            mb_is_8x8dct,
-            mb_skip,
-            mb_is_direct,
-            blk_is_direct,
-            is_i16x16,
-            mb_slice_id,
-            current_slice_id,
-            prev_mb_qp,
-            last_qp_delta_nonzero,
-            mmco_ops: header.mmco_ops.clone(),
-            long_term_reference_flag: header.long_term_reference_flag,
-            is_intra_slice: header.slice_type == SliceType::I,
-            disable_deblocking_filter_idc: ps_deblock_idc,
-            slice_alpha_c0_offset_div2: ps_alpha,
-            slice_beta_offset_div2: ps_beta,
-            chroma_qp_index_offset: ps_chroma_qp_offset,
-            mb_width,
-            mb_height,
-            mb_field_decoding: _mb_field_decoding,
-            mbaff_frame_flag: header.mbaff_frame_flag,
-        });
+        ps.frame_num = header.frame_num;
+        ps.poc = current_poc;
+        ps.nal_unit_type = nal.nal_unit_type;
+        ps.nal_ref_idc = nal.nal_ref_idc;
+        ps.long_term_reference_flag = header.long_term_reference_flag;
+        ps.delta_poc_bottom = header.delta_pic_order_cnt_bottom;
+        // Motion data from I and P slices differs, so the picture only counts
+        // as intra if all its slices were.
+        let intra_slice = header.slice_type == SliceType::I;
+        ps.is_intra_slice = intra_slice && (!is_continuation || ps.is_intra_slice);
+        ps.mbaff_frame_flag = header.mbaff_frame_flag;
+        ps.mmco_ops = header.mmco_ops;
 
-        Ok(())
+        match slice_result {
+            Ok(()) => {
+                self.pending = Some(ps);
+                Ok(())
+            }
+            Err(e) => {
+                // A continuation slice keeps the macroblocks earlier slices
+                // decoded; a failed first slice leaves nothing worth showing.
+                if is_continuation {
+                    self.pending = Some(ps);
+                } else {
+                    self.scratch_pool = Some(ps.scratch);
+                }
+                Err(e)
+            }
+        }
     }
 }
 
@@ -1037,11 +1200,11 @@ impl Decoder {
 ///
 /// # How it works
 ///
-/// Internally tracks GOP boundaries (each IDR starts a new GOP) and buffers
-/// decoded frames. Frames are emitted in `(gop_id, pic_order_cnt)` order.
-/// On each IDR boundary, all buffered frames from the previous GOP are
-/// drained and returned. The buffer also has a maximum depth (16 frames)
-/// to bound latency for streams with infrequent IDRs.
+/// Internally tracks GOP boundaries (each IDR or POC reset starts a new GOP)
+/// and buffers decoded frames. Frames are emitted in `(gop_id, pic_order_cnt)`
+/// order. On each boundary, all buffered frames from the previous GOP are
+/// drained and returned. The buffer depth follows the SPS, which bounds both
+/// latency and memory for streams with infrequent IDRs.
 ///
 /// # Example
 ///
@@ -1072,9 +1235,8 @@ pub struct OrderedDecoder {
     /// Monotonically incrementing GOP id, bumped on each IDR boundary.
     gop_id: u32,
     /// Maximum frames to keep in the buffer before forcing the lowest
-    /// (oldest) one out. Bounds reorder latency for streams with
-    /// infrequent IDRs.
-    max_depth: usize,
+    /// (oldest) one out, or `None` to follow the active SPS.
+    max_depth: Option<usize>,
 }
 
 impl Default for OrderedDecoder {
@@ -1084,27 +1246,47 @@ impl Default for OrderedDecoder {
 }
 
 impl OrderedDecoder {
-    /// Create a new ordering decoder with a default reorder buffer depth of
-    /// 16 frames (sufficient for any practical bframes setting).
+    /// Create a new ordering decoder whose reorder buffer depth follows the
+    /// active SPS: its `max_num_reorder_frames`, otherwise the level's limit.
     pub fn new() -> Self {
+        Self::with_limits(Limits::default())
+    }
+
+    /// Create an ordering decoder that follows the active SPS and refuses
+    /// streams beyond `limits`.
+    pub fn with_limits(limits: Limits) -> Self {
         Self {
-            inner: Decoder::new(),
+            inner: Decoder::with_limits(limits),
             buffer: Vec::new(),
             gop_id: 0,
-            max_depth: 16,
+            max_depth: None,
         }
     }
 
     /// Create a new ordering decoder with a custom maximum buffer depth.
     /// Larger values give more reordering headroom for unusual bitstreams
-    /// but increase end-to-end latency.
+    /// but increase end-to-end latency and memory use.
     pub fn with_max_depth(max_depth: usize) -> Self {
         Self {
             inner: Decoder::new(),
             buffer: Vec::new(),
             gop_id: 0,
-            max_depth: max_depth.max(1),
+            max_depth: Some(max_depth.max(1)),
         }
+    }
+
+    /// Sets the tag recorded on pictures started from now on. See
+    /// [`Frame::tag`].
+    pub fn set_tag(&mut self, tag: u64) {
+        self.inner.set_tag(tag);
+    }
+
+    /// Forgets all pictures so decoding can restart at an IDR, keeping the
+    /// parameter sets.
+    pub fn reset(&mut self) {
+        self.inner.reset();
+        self.buffer.clear();
+        self.gop_id = 0;
     }
 
     /// Feed a single NAL unit and return any frames that are now ready
@@ -1116,43 +1298,45 @@ impl OrderedDecoder {
     /// are released.
     pub fn decode_nal(&mut self, nal: &NalUnit) -> Result<Vec<Frame>, DecodeError> {
         let mut output = Vec::new();
-        let is_idr = nal.nal_unit_type == NalUnitType::SliceIdr;
 
         // Decode the NAL. Note that decode_nal returns the PREVIOUS frame
         // (the picture that just got finalized when this NAL started a new
-        // one), so the returned frame still belongs to the current gop_id.
+        // one).
         if let Some(frame) = self.inner.decode_nal(nal)? {
-            self.buffer.push((self.gop_id, frame));
-        }
-
-        // After pushing, advance the GOP if this NAL was an IDR start.
-        // This must happen AFTER the push so the previous GOP's last frame
-        // gets the correct (old) gop_id.
-        if is_idr {
-            self.gop_id += 1;
-            // The previous GOP is now complete — drain everything from it
-            // in display order.
-            self.drain_completed_gops(&mut output);
+            self.push(frame, &mut output);
         }
 
         // Bound buffer depth to limit reorder latency.
-        while self.buffer.len() > self.max_depth {
+        let depth = self.max_depth.unwrap_or(self.inner.reorder_depth());
+        while self.buffer.len() > depth {
             output.push(self.pop_lowest());
         }
 
         Ok(output)
     }
 
+    /// Buffers a frame. A picture that resets POC ends the previous GOP, and
+    /// the whole of that GOP is displayed before it.
+    fn push(&mut self, frame: Frame, output: &mut Vec<Frame>) {
+        if frame.poc_reset {
+            self.gop_id = self.gop_id.wrapping_add(1);
+            self.drain_completed_gops(output);
+        }
+        self.buffer.push((self.gop_id, frame));
+    }
+
     /// Flush all remaining buffered frames at end-of-stream, in display order.
     /// Call this once after the last `decode_nal`.
     pub fn flush(&mut self) -> Vec<Frame> {
-        // First, get any final pending frame from the inner decoder.
-        if let Some(frame) = self.inner.flush() {
-            self.buffer.push((self.gop_id, frame));
+        let mut output = Vec::new();
+        // First, get any final pending frames from the inner decoder.
+        while let Some(frame) = self.inner.flush() {
+            self.push(frame, &mut output);
         }
         // Drain everything in (gop, poc) order.
         self.buffer.sort_by_key(|(g, f)| (*g, f.pic_order_cnt));
-        self.buffer.drain(..).map(|(_, f)| f).collect()
+        output.extend(self.buffer.drain(..).map(|(_, f)| f));
+        output
     }
 
     /// Frame rate from the most recently parsed SPS's VUI timing info,
@@ -1199,10 +1383,14 @@ impl OrderedDecoder {
     }
 }
 
-/// Motion vector prediction for P_8x8 sub-partitions.
-/// `px`, `py`: sub-partition position within the macroblock (pixel coordinates).
-/// `spw`, `sph`: sub-partition dimensions.
-#[allow(clippy::too_many_arguments)]
+// A later decode worker moves decoders and frames between tasks.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<Decoder>();
+    assert_send::<OrderedDecoder>();
+    assert_send::<Frame>();
+};
+
 #[cfg(all(test, feature = "upstream-tests"))]
 mod tests {
     use super::*;

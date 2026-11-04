@@ -1,7 +1,7 @@
 //! A configurable desktop environment for feos.
 //!
 //! The desktop is the session layer above the GUI toolkit. It owns the
-//! wallpaper, application shortcuts, the window manager, the XP-style taskbar
+//! wallpaper, application shortcuts, the window manager, the classic-style taskbar
 //! and Start menu, and an init/service supervisor. Everything is driven by a
 //! YAML [`DesktopConfig`], so a board can change the look and the startup
 //! behaviour without touching code.
@@ -22,6 +22,10 @@
 //! which keeps the frame logic testable on the host. [`Desktop::launch`] is
 //! the separate entry point that performs the lookup and spawn.
 //!
+//! A session that keeps its last frame calls [`Desktop::set_retained`]. Every
+//! frame still runs all of its hit testing, but paints only the part of the
+//! screen that changed and reports it in [`DesktopResponse::damage`].
+//!
 //! ```no_run
 //! use feos_desktop::{Desktop, DesktopConfig};
 //! use feos_gui::Input;
@@ -36,14 +40,20 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod keyboard;
+pub mod notify;
 pub mod paint;
 pub mod start_menu;
 pub mod taskbar;
 pub mod theme;
 pub mod window;
 
+#[cfg(test)]
+mod scripted;
+
 use core::fmt::Write as _;
 
+use feos_app::shell::{Level, Notification};
 use feos_app::{
     App, AppRegistry, Platform, ProcessInfo, ProcessState, Processes, SpawnError, WindowContext,
     WindowFrame, MAX_PROCESSES,
@@ -51,10 +61,12 @@ use feos_app::{
 use feos_bundle::{AppCatalog, InstalledApp, ScanReport};
 use feos_gfx::{Canvas, Color, Point, Rect};
 use feos_gui::{
-    Align, Id, Input, InteractionState, Key, Modifiers, RectExt, Sense, Ui, VerticalAlign,
+    Align, Event, Id, Input, InteractionState, Key, Modifiers, RectExt, Sense, Ui, VerticalAlign,
 };
 use feos_init::{Init, MAX_SERVICES};
 use feos_text::Text;
+
+use notify::Notifications;
 
 pub use config::{
     ConfigError, DesktopConfig, ShortcutConfig, StartMenuConfig, TaskbarConfig, TaskbarPosition,
@@ -62,11 +74,13 @@ pub use config::{
 };
 pub use feos_bundle::{BundleFormat, DirEntry};
 pub use feos_init::{InitError, RestartPolicy, ServiceState, ServiceStatus};
+pub use keyboard::KeyboardLayout;
+pub use paint::CursorShape;
 pub use start_menu::{StartMenuCommand, StartMenuState};
 pub use theme::{DesktopTheme, ThemeName};
 pub use window::{
-    DesktopWindow, ResizeEdge, WindowManager, WindowState, MAX_WINDOWS, MIN_WINDOW_HEIGHT,
-    MIN_WINDOW_WIDTH,
+    DesktopWindow, ResizeEdge, WindowManager, WindowState, WindowStatus, MAX_WINDOWS,
+    MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH,
 };
 
 /// Default maximum number of applications in the catalog.
@@ -87,8 +101,8 @@ pub struct LaunchRequest {
     pub app: usize,
     /// Shell registry entry point from the manifest.
     pub entry: Text<32>,
-    /// Arguments from the manifest.
-    pub args: Text<64>,
+    /// Arguments for this launch: the window's own, or the manifest's.
+    pub args: Text<96>,
     /// Window opened for the application.
     pub window: usize,
 }
@@ -150,6 +164,15 @@ pub struct DesktopResponse {
     /// Minimum interval between animated frames, in milliseconds (0 when no
     /// window is animating).
     pub animation_period_ms: u32,
+    /// The part of the canvas this frame changed. `None` when it changed
+    /// nothing, which only a retained session sees; a caller presenting from
+    /// an off-screen buffer copies just this rectangle.
+    pub damage: Option<Rect>,
+    /// Desktop state changed after the frame was painted (a window closed, say),
+    /// so one more frame is needed to show the result.
+    pub state_changed: bool,
+    /// The pointer shape for this position, for a caller drawing its own.
+    pub cursor: CursorShape,
 }
 
 impl DesktopResponse {
@@ -173,15 +196,105 @@ enum ContextAction {
     Properties,
 }
 
-/// Position of the desktop context menu.
-#[derive(Clone, Copy, Debug, Default)]
+const CONTEXT_ITEMS: [MenuItem<ContextAction>; 4] = [
+    MenuItem::new("Refresh", ContextAction::Refresh, false),
+    MenuItem::new("Show Desktop", ContextAction::ShowDesktop, false),
+    MenuItem::new("Task Manager", ContextAction::TaskManager, true),
+    MenuItem::new("Properties", ContextAction::Properties, true),
+];
+
+/// A command chosen from a window's system menu.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum WindowAction {
+    #[default]
+    None,
+    Restore,
+    Minimize,
+    Maximize,
+    Close,
+}
+
+const WINDOW_ITEMS: [MenuItem<WindowAction>; 4] = [
+    MenuItem::new("Restore", WindowAction::Restore, false),
+    MenuItem::new("Minimize", WindowAction::Minimize, false),
+    MenuItem::new("Maximize", WindowAction::Maximize, false),
+    MenuItem::new("Close  Alt+F4", WindowAction::Close, true),
+];
+
+/// One row of a pop-up menu.
+#[derive(Clone, Copy)]
+struct MenuItem<T: Copy> {
+    label: &'static str,
+    action: T,
+    separator_before: bool,
+}
+
+impl<T: Copy> MenuItem<T> {
+    const fn new(label: &'static str, action: T, separator_before: bool) -> Self {
+        Self {
+            label,
+            action,
+            separator_before,
+        }
+    }
+}
+
+/// Position and highlight of a pop-up menu.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ContextMenuState {
     open: bool,
     x: i32,
     y: i32,
+    highlighted: usize,
 }
 
-/// The XP-style "Run..." dialog.
+impl ContextMenuState {
+    const CLOSED: Self = Self {
+        open: false,
+        x: 0,
+        y: 0,
+        highlighted: 0,
+    };
+
+    fn show(&mut self, point: Point) {
+        *self = Self {
+            open: true,
+            x: point.x,
+            y: point.y,
+            highlighted: NOTHING_HIGHLIGHTED,
+        };
+    }
+}
+
+/// Where a typed command should go.
+#[derive(Clone, Copy)]
+pub enum CommandTarget<'a> {
+    /// Open a catalog bundle, which is how a windowed app gets its window.
+    Bundle {
+        /// Catalog index.
+        index: usize,
+        /// Arguments replacing the manifest's, if any were typed.
+        args: Option<&'a str>,
+    },
+    /// Run the app through the synchronous foreground path.
+    Foreground {
+        /// The resolved app.
+        app: &'static dyn App,
+        /// Arguments.
+        args: &'a str,
+    },
+    /// Start the app as a background process.
+    Spawn {
+        /// The resolved app.
+        app: &'static dyn App,
+        /// Arguments.
+        args: &'a str,
+    },
+    /// Nothing has that name.
+    NotFound,
+}
+
+/// The "Run..." dialog.
 #[derive(Clone, Copy, Debug)]
 struct RunDialogState {
     open: bool,
@@ -223,7 +336,7 @@ struct ShutdownDialogState {
     open: bool,
 }
 
-/// What the user chose in the "Log Off Windows" dialog.
+/// What the user chose in the "Log Off" dialog.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 enum LogoffAction {
     #[default]
@@ -233,7 +346,7 @@ enum LogoffAction {
 }
 
 /// Remembers the previous click so icons and title bars can distinguish a
-/// single click from a double click, as Windows XP does.
+/// single click from a double click.
 ///
 /// A double click is a second click on the same target within half a second
 /// and within a few pixels of the first. After a double click the tracker is
@@ -250,6 +363,11 @@ struct ClickMemory {
 impl ClickMemory {
     const INTERVAL_MS: u64 = 500;
     const SLOP: i32 = 4;
+
+    /// Forgets the last click, so the next one cannot complete a pair.
+    fn forget(&mut self) {
+        self.valid = false;
+    }
 
     fn hit(&mut self, target: u32, position: Point, now_ms: u64) -> bool {
         let double = self.valid
@@ -269,6 +387,55 @@ impl ClickMemory {
         }
         double
     }
+}
+
+/// What decided how one window was last painted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct PaintedWindow {
+    open: bool,
+    state: WindowState,
+    rect: Rect,
+    z: u32,
+    focused: bool,
+    hosted: bool,
+    started: bool,
+    launched: bool,
+    status: WindowStatus,
+}
+
+impl PaintedWindow {
+    const CLOSED: Self = Self {
+        open: false,
+        state: WindowState::Normal,
+        rect: Rect::new(0, 0, 0, 0),
+        z: 0,
+        focused: false,
+        hosted: false,
+        started: false,
+        launched: false,
+        status: WindowStatus::Ready,
+    };
+
+    fn visible_rect(&self) -> Option<Rect> {
+        (self.open && self.state != WindowState::Minimized).then_some(self.rect)
+    }
+}
+
+/// Everything outside the windows that decided the last painted frame.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct PaintedDesktop {
+    /// A menu, dialog or drag covers the screen.
+    overlay: bool,
+    start_open: bool,
+    start_all_programs: bool,
+    start_highlighted: usize,
+    start_scroll: usize,
+    selection: usize,
+    context: ContextMenuState,
+    window_menu: ContextMenuState,
+    toasts: usize,
+    unread: usize,
+    show_desktop: bool,
 }
 
 /// A complete desktop session.
@@ -301,12 +468,44 @@ pub struct Desktop<
     shutdown: ShutdownDialogState,
     /// Whether the tray clock's Date and Time dialog is open.
     clock_open: bool,
-    /// Whether the "Log Off Windows" confirmation dialog is open.
+    /// Whether the "Log Off" confirmation dialog is open.
     logoff_open: bool,
     /// Whether "Show Desktop" is active.
     show_desktop: bool,
     /// Window that captured the current pointer drag, if any.
     pointer_window: Option<usize>,
+    /// A window's system menu.
+    window_menu: ContextMenuState,
+    /// The window that menu belongs to.
+    window_menu_target: usize,
+    /// Whether the Display Properties dialog is open.
+    settings_open: bool,
+    /// Whether the notification history is open.
+    notifications_open: bool,
+    /// Toasts and their history.
+    notifications: Notifications,
+    /// A path being dragged between apps.
+    drag: Option<Text<96>>,
+    /// Processes whose windows closed, until they are gone.
+    pending_kill: [Option<u32>; N],
+
+    // Retained rendering ---------------------------------------------------
+    /// The canvas keeps the last frame, and the caller draws the cursor.
+    retained: bool,
+    /// The next frame must repaint everything.
+    repaint_all: bool,
+    /// Canvas-sized cache of the wallpaper and shortcut icons.
+    background: Option<&'static mut [u32]>,
+    background_valid: bool,
+    /// Canvas-sized surface for hosting a window partly off-screen.
+    scratch: Option<&'static mut [u32]>,
+    painted_windows: [PaintedWindow; N],
+    painted_desktop: Option<PaintedDesktop>,
+    painted_size: (u32, u32),
+    painted_pointer: Point,
+    painted_clock: Text<16>,
+    /// The windows that last had the pointer and the keyboard.
+    painted_routes: (Option<usize>, Option<usize>),
 }
 
 impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
@@ -317,6 +516,7 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             open: config.start_menu.initially_open,
             highlighted: 0,
             all_programs: false,
+            scroll: 0,
         };
         Self {
             config,
@@ -336,18 +536,111 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
                 y: 0,
                 valid: false,
             },
-            context: ContextMenuState {
-                open: false,
-                x: 0,
-                y: 0,
-            },
+            context: ContextMenuState::CLOSED,
             run_dialog: RunDialogState::new(),
             shutdown: ShutdownDialogState { open: false },
             clock_open: false,
             logoff_open: false,
             show_desktop: false,
             pointer_window: None,
+            window_menu: ContextMenuState::CLOSED,
+            window_menu_target: 0,
+            settings_open: false,
+            notifications_open: false,
+            notifications: Notifications::new(),
+            drag: None,
+            pending_kill: [None; N],
+            retained: false,
+            repaint_all: true,
+            background: None,
+            background_valid: false,
+            scratch: None,
+            painted_windows: [PaintedWindow::CLOSED; N],
+            painted_desktop: None,
+            painted_size: (0, 0),
+            painted_pointer: Point::new(0, 0),
+            painted_clock: Text::EMPTY,
+            painted_routes: (None, None),
         }
+    }
+
+    /// Switches retained rendering on or off.
+    ///
+    /// In retained mode the caller promises that the canvas still holds the
+    /// previous frame, and draws the pointer itself from
+    /// [`DesktopResponse::cursor`]. Each frame then repaints only what changed
+    /// and reports it in [`DesktopResponse::damage`]. Hosted apps paint only
+    /// when they have input, are due an animation frame, or are uncovered.
+    pub fn set_retained(&mut self, retained: bool) {
+        self.retained = retained;
+        self.repaint_all = true;
+    }
+
+    /// Gives the desktop canvas-sized buffers for its optional caches.
+    ///
+    /// `background` caches the wallpaper and shortcut icons. `scratch` hosts a
+    /// window that is partly off-screen, so the app keeps its full size and is
+    /// clipped when copied out. Either may be `None`: without `scratch`, such
+    /// an app sees only its visible part.
+    pub fn set_buffers(
+        &mut self,
+        background: Option<&'static mut [u32]>,
+        scratch: Option<&'static mut [u32]>,
+    ) {
+        self.background = background;
+        self.scratch = scratch;
+        self.background_valid = false;
+        self.repaint_all = true;
+    }
+
+    /// Returns `true` once [`set_buffers`](Self::set_buffers) has provided the
+    /// caches.
+    pub const fn has_buffers(&self) -> bool {
+        self.background.is_some() || self.scratch.is_some()
+    }
+
+    /// Makes the next frame repaint the whole canvas, for when something else
+    /// drew on it.
+    pub fn invalidate(&mut self) {
+        self.repaint_all = true;
+    }
+
+    /// Shows a notification.
+    pub fn notify(&mut self, notification: Notification, now_ms: u64) {
+        self.notifications.push(notification, now_ms);
+        self.repaint_all = true;
+    }
+
+    /// Shows a notification from a title and a line of detail.
+    pub fn notify_text(&mut self, title: &str, body: &str, level: Level, now_ms: u64) {
+        self.notify(
+            Notification {
+                title: Text::from_str(title),
+                body: Text::from_str(body),
+                level,
+            },
+            now_ms,
+        );
+    }
+
+    /// The notification state.
+    pub const fn notifications(&self) -> &Notifications {
+        &self.notifications
+    }
+
+    /// Hides toasts whose time is up. Returns `true` when a frame is needed.
+    pub fn expire_toasts(&mut self, now_ms: u64) -> bool {
+        let changed = self.notifications.expire(now_ms);
+        if changed {
+            self.repaint_all = true;
+        }
+        changed
+    }
+
+    /// Starts dragging `payload`, normally a file path. The drag ends on the
+    /// next left-button release, or on Escape.
+    pub fn begin_drag(&mut self, payload: &str) {
+        self.drag = Some(Text::from_str(payload));
     }
 
     /// The active configuration.
@@ -359,9 +652,24 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
     ///
     /// Open windows are kept; the init restart policy is updated in place.
     pub fn set_config(&mut self, config: DesktopConfig) {
+        if self.config != config {
+            self.background_valid = false;
+            self.repaint_all = true;
+        }
         self.config = config;
         self.theme = DesktopTheme::from_config(&config);
         self.init.set_policy(config.init.policy);
+    }
+
+    /// Switches to a colour scheme, including its wallpaper.
+    pub fn set_theme(&mut self, name: ThemeName) {
+        let mut config = self.config;
+        config.theme = name;
+        let palette = name.palette();
+        config.wallpaper.top = palette.wallpaper_top;
+        config.wallpaper.bottom = palette.wallpaper_bottom;
+        config.wallpaper.grid = palette.wallpaper_grid;
+        self.set_config(config);
     }
 
     /// The resolved visual theme.
@@ -433,33 +741,193 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
         self.selection = next.clamp(0, count as i32 - 1) as usize;
     }
 
-    /// Minimises every window, or restores them when "Show Desktop" is
-    /// clicked a second time.
+    /// Minimises every window, or restores the ones this hid when "Show
+    /// Desktop" is clicked a second time. Windows the user minimised beforehand
+    /// stay minimised.
     fn toggle_show_desktop(&mut self) {
         if self.show_desktop {
-            for index in 0..N {
-                if self
-                    .windows
-                    .get(index)
-                    .is_some_and(|window| window.open && window.state == WindowState::Minimized)
-                {
+            let mut order: [usize; N] = core::array::from_fn(|index| index);
+            order.sort_unstable_by_key(|index| {
+                self.windows.get(*index).map_or(0, |window| window.z)
+            });
+            for index in order {
+                let hidden = self.windows.get_mut(index).is_some_and(|window| {
+                    let hidden = window.open
+                        && window.hidden_by_show_desktop
+                        && window.state == WindowState::Minimized;
+                    window.hidden_by_show_desktop = false;
+                    hidden
+                });
+                if hidden {
                     self.windows.restore(index);
                 }
             }
             self.show_desktop = false;
         } else {
             for index in 0..N {
-                self.windows.minimize(index);
+                if self.windows.minimize(index) {
+                    if let Some(window) = self.windows.get_mut(index) {
+                        window.hidden_by_show_desktop = true;
+                    }
+                }
             }
             self.show_desktop = true;
         }
         self.start_menu.close();
     }
 
+    /// Whether a dialog or pop-up menu has the keyboard and pointer to itself.
+    fn modal_open(&self) -> bool {
+        self.run_dialog.open
+            || self.shutdown.open
+            || self.clock_open
+            || self.logoff_open
+            || self.context.open
+            || self.window_menu.open
+            || self.settings_open
+            || self.notifications_open
+    }
+
+    /// Closes a window, its app and any process started for it.
+    ///
+    /// Killing can need more than one attempt, so [`tick_session`] keeps trying
+    /// until the process has gone.
+    ///
+    /// [`tick_session`]: Self::tick_session
+    pub fn close_window(&mut self, index: usize) -> bool {
+        let Some(window) = self.windows.get(index).copied() else {
+            return false;
+        };
+        if !window.open {
+            return false;
+        }
+        if let Some(runtime) = window.runtime {
+            if window.app_started {
+                runtime.close_window();
+            }
+        }
+        if let Some(pid) = window.pid {
+            if let Some(slot) = self.pending_kill.iter_mut().find(|slot| slot.is_none()) {
+                *slot = Some(pid);
+            }
+        }
+        if self.pointer_window == Some(index) {
+            self.pointer_window = None;
+        }
+        self.windows.close(index)
+    }
+
+    /// Handles the shortcuts that work no matter what has the keyboard.
+    fn handle_shortcuts(&mut self, input: &Input) {
+        for (key, modifiers) in input.keys() {
+            if !is_shortcut(key, modifiers) {
+                continue;
+            }
+            match key {
+                Key::Escape => {
+                    self.close_overlays();
+                    self.start_menu.show();
+                }
+                Key::Tab => {
+                    self.close_overlays();
+                    self.start_menu.close();
+                    self.show_desktop = false;
+                    if modifiers.contains(Modifiers::SHIFT) {
+                        self.windows.cycle_backward();
+                    } else {
+                        self.windows.cycle_forward();
+                    }
+                }
+                Key::F4 => {
+                    if self.modal_open() {
+                        self.close_overlays();
+                    } else if let Some(index) = self.windows.focused() {
+                        self.close_window(index);
+                    } else {
+                        self.start_menu.close();
+                        self.shutdown.open = true;
+                    }
+                }
+                Key::Space => {
+                    self.close_overlays();
+                    if let Some(index) = self.windows.focused() {
+                        if let Some(window) = self.windows.get(index) {
+                            let point = Point::new(window.rect.x + 4, window.rect.y + 30);
+                            self.open_window_menu(index, point);
+                            self.window_menu.highlighted = 0;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn open_window_menu(&mut self, index: usize, point: Point) {
+        self.window_menu_target = index;
+        self.window_menu.show(point);
+        self.start_menu.close();
+    }
+
+    /// Closes every dialog and pop-up menu, as a shortcut that changes context
+    /// does. The Run dialog keeps its text cleared.
+    fn close_overlays(&mut self) {
+        self.run_dialog.close();
+        self.shutdown.open = false;
+        self.clock_open = false;
+        self.logoff_open = false;
+        self.context.open = false;
+        self.window_menu.open = false;
+        self.settings_open = false;
+        self.notifications_open = false;
+    }
+
+    fn apply_window_action(&mut self, index: usize, action: WindowAction) {
+        match action {
+            WindowAction::None => {}
+            WindowAction::Restore => {
+                let state = self.windows.get(index).map(|window| window.state);
+                match state {
+                    Some(WindowState::Minimized) => {
+                        self.windows.restore(index);
+                    }
+                    Some(WindowState::Maximized) => {
+                        self.windows.toggle_maximize(index, self.work_area);
+                    }
+                    _ => {}
+                }
+            }
+            WindowAction::Minimize => {
+                self.windows.minimize(index);
+            }
+            WindowAction::Maximize => {
+                let normal = self
+                    .windows
+                    .get(index)
+                    .is_some_and(|window| window.state != WindowState::Maximized);
+                if normal {
+                    self.windows.toggle_maximize(index, self.work_area);
+                }
+            }
+            WindowAction::Close => {
+                self.close_window(index);
+            }
+        }
+    }
+
     /// Feeds typed text and editing keys into the Run dialog.
     fn handle_run_keys(&mut self, input: &Input, submit: &mut bool) {
         for ch in input.text() {
             if !ch.is_control() {
+                self.run_dialog.text.push(ch);
+            }
+        }
+        if input.keys().any(|(key, modifiers)| {
+            modifiers.contains(Modifiers::CTRL) && matches!(key, Key::Character('v' | 'V'))
+        }) {
+            let mut buffer = [0u8; 96];
+            let pasted = feos_app::shell::clipboard_get(&mut buffer);
+            for ch in pasted.chars().filter(|ch| !ch.is_control()) {
                 self.run_dialog.text.push(ch);
             }
         }
@@ -481,16 +949,6 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
     /// wallpaper selection and `Space` opens the menu. `Enter` activation is
     /// handled by [`render`](Self::render) once the frame is laid out.
     fn handle_keyboard(&mut self, input: &Input, config: &DesktopConfig) {
-        // XP's Ctrl+Esc opens the Start menu even when an application has
-        // keyboard focus. Space only opens it from the desktop.
-        if input
-            .keys()
-            .any(|(key, modifiers)| key == Key::Escape && modifiers.contains(Modifiers::CTRL))
-        {
-            self.start_menu.show();
-            return;
-        }
-
         let up = input.keys().any(|(key, _)| key == Key::Up);
         let down = input.keys().any(|(key, _)| key == Key::Down);
         let left = input.keys().any(|(key, _)| key == Key::Left);
@@ -583,6 +1041,10 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
     pub fn scan(&mut self, entries: &[DirEntry<'_>]) -> ScanReport {
         let report = self.catalog.scan(entries);
         self.selection = self.selection.min(self.catalog.len().saturating_sub(1));
+        let catalog = &self.catalog;
+        self.windows.remap_apps(|id| catalog.find_id(id));
+        self.background_valid = false;
+        self.repaint_all = true;
         report
     }
 
@@ -598,6 +1060,15 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
     /// The window size comes from the manifest, falling back to the global
     /// defaults, and is clamped to the current work area.
     pub fn open_app(&mut self, index: usize) -> Option<usize> {
+        self.open_app_with(index, None)
+    }
+
+    /// Opens (or focuses) the window for catalog entry `index`, optionally with
+    /// arguments replacing the manifest's.
+    ///
+    /// Windowed apps keep one session per window, so asking an open window for
+    /// different arguments restarts its app with them.
+    pub fn open_app_with(&mut self, index: usize, args: Option<&str>) -> Option<usize> {
         let app = *self.catalog.get(index)?;
         self.show_desktop = false;
         let work_area = if self.work_area.is_empty() {
@@ -615,14 +1086,35 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
         } else {
             app.manifest.window_height
         };
-        self.windows.open(
+        let was_open = self
+            .windows
+            .get_open_for(index)
+            .is_some();
+        let slot = self.windows.open(
             index,
             app.name(),
             work_area,
             width,
             height,
             self.config.windows.cascade,
-        )
+        )?;
+        if let Some(window) = self.windows.get_mut(slot) {
+            if !was_open {
+                window.bundle.set(app.id());
+                window.args.set(args.unwrap_or(app.manifest.args.as_str()));
+            } else if let Some(args) = args {
+                if !window.args.eq_str(args) {
+                    window.args.set(args);
+                    if window.app_started {
+                        if let Some(runtime) = window.runtime {
+                            runtime.close_window();
+                        }
+                        window.app_started = false;
+                    }
+                }
+            }
+        }
+        Some(slot)
     }
 
     /// Launches catalog entry `index` through the shell registry.
@@ -635,10 +1127,21 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
         registry: &dyn AppRegistry,
         processes: &dyn Processes,
     ) -> LaunchOutcome {
+        self.launch_with(index, None, registry, processes)
+    }
+
+    /// [`launch`](Self::launch), with arguments replacing the manifest's.
+    pub fn launch_with(
+        &mut self,
+        index: usize,
+        args: Option<&str>,
+        registry: &dyn AppRegistry,
+        processes: &dyn Processes,
+    ) -> LaunchOutcome {
         let Some(app) = self.catalog.get(index).copied() else {
             return LaunchOutcome::UnknownApp;
         };
-        let Some(window_index) = self.open_app(index) else {
+        let Some(window_index) = self.open_app_with(index, args) else {
             return LaunchOutcome::NoWindowSlot;
         };
 
@@ -652,8 +1155,14 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
         }
 
         let Some(runtime) = registry.find(app.manifest.entry.as_str()) else {
+            if let Some(window) = self.windows.get_mut(window_index) {
+                window.status = WindowStatus::UnknownEntry;
+            }
             return LaunchOutcome::UnknownEntry;
         };
+        if let Some(window) = self.windows.get_mut(window_index) {
+            window.status = WindowStatus::Ready;
+        }
         if runtime.windowed() {
             if let Some(window) = self.windows.get_mut(window_index) {
                 if window.runtime.is_none() {
@@ -670,7 +1179,12 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
                 window: window_index,
             };
         }
-        match processes.spawn(runtime, app.manifest.args.as_str()) {
+        let spawn_args = self
+            .windows
+            .get(window_index)
+            .map(|window| window.args)
+            .unwrap_or(Text::EMPTY);
+        match processes.spawn(runtime, spawn_args.as_str()) {
             Ok(pid) => {
                 if let Some(window) = self.windows.get_mut(window_index) {
                     window.pid = Some(pid);
@@ -681,7 +1195,74 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
                     pid,
                 }
             }
-            Err(error) => LaunchOutcome::SpawnFailed(error),
+            Err(error) => {
+                if let Some(window) = self.windows.get_mut(window_index) {
+                    window.status = WindowStatus::SpawnFailed;
+                }
+                LaunchOutcome::SpawnFailed(error)
+            }
+        }
+    }
+
+    /// Decides what a command typed into the Run dialog should do.
+    ///
+    /// A bundle id wins, then a file path with an associated app, then a shell
+    /// command. A command with a bundle is opened through the bundle, so it
+    /// gets a window: `taskmgr` and `process-monitor` do the same thing. Only a
+    /// command no bundle offers can reach the foreground or background paths.
+    pub fn resolve_command<'c>(
+        &self,
+        command: &'c str,
+        registry: &dyn AppRegistry,
+    ) -> CommandTarget<'c> {
+        let command = command.trim();
+        if command.is_empty() {
+            return CommandTarget::NotFound;
+        }
+        if let Some(index) = self.catalog.find_id(command) {
+            return CommandTarget::Bundle { index, args: None };
+        }
+
+        let (name, args) = match command.split_once(char::is_whitespace) {
+            Some((name, args)) => (name, args.trim()),
+            None => (command, ""),
+        };
+        let typed_args = (!args.is_empty()).then_some(args);
+        if let Some(index) = self.catalog.find_id(name) {
+            return CommandTarget::Bundle {
+                index,
+                args: typed_args,
+            };
+        }
+
+        if command.starts_with('/') {
+            if let Some(index) =
+                feos_app::shell::association_for(command).and_then(|id| self.catalog.find_id(id))
+            {
+                return CommandTarget::Bundle {
+                    index,
+                    args: Some(command),
+                };
+            }
+        }
+
+        let Some(runtime) = registry.find(name) else {
+            return CommandTarget::NotFound;
+        };
+        if let Some(index) = self
+            .catalog
+            .iter()
+            .position(|app| runtime.matches(app.manifest.entry.as_str()))
+        {
+            return CommandTarget::Bundle {
+                index,
+                args: typed_args,
+            };
+        }
+        if runtime.foreground() {
+            CommandTarget::Foreground { app: runtime, args }
+        } else {
+            CommandTarget::Spawn { app: runtime, args }
         }
     }
 
@@ -700,12 +1281,35 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
         let config = self.config.init;
         self.init = Init::new(config.policy, config.max_restarts);
 
+        // A windowed app has no process to supervise: it lives in a window the
+        // desktop drives. Open those, and give the rest to the supervisor.
+        let mut opened = 0;
         for id in config.autostart() {
-            self.register_service(id.as_str(), registry);
+            let id = id.as_str();
+            if let Some(index) = self.windowed_bundle(id, registry) {
+                if matches!(
+                    self.launch(index, registry, processes),
+                    LaunchOutcome::Windowed { .. }
+                ) {
+                    opened += 1;
+                }
+                continue;
+            }
+            self.register_service(id, registry);
         }
 
         self.session_started = true;
-        self.init.start_all(processes)
+        self.init.start_all(processes) + opened
+    }
+
+    /// The catalog index of `id`, when it names a bundle whose app is windowed.
+    pub fn windowed_bundle(&self, id: &str, registry: &dyn AppRegistry) -> Option<usize> {
+        let index = self.catalog.find_id(id)?;
+        let manifest = &self.catalog.get(index)?.manifest;
+        registry
+            .find(manifest.entry.as_str())
+            .filter(|app| app.windowed())
+            .map(|_| index)
     }
 
     /// Registers one service without starting it.
@@ -747,6 +1351,21 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
 
         let mut live = [ProcessInfo::EMPTY; MAX_PROCESSES];
         let count = processes.snapshot(&mut live);
+
+        // A closed window's process goes away with it. Keep asking until it
+        // has: a kill can fail while the target is running on another CPU.
+        for slot in &mut self.pending_kill {
+            let Some(pid) = *slot else {
+                continue;
+            };
+            let alive = live[..count]
+                .iter()
+                .any(|process| process.pid == pid && process.state != ProcessState::Exited);
+            if !alive || processes.kill(pid) {
+                *slot = None;
+            }
+        }
+
         for index in 0..N {
             let Some(window) = self.windows.get_mut(index) else {
                 continue;
@@ -765,6 +1384,20 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
         }
 
         changed
+    }
+
+    /// Gives minimized hosted apps their background tick.
+    pub fn tick_background(&mut self, platform: &Platform, now_ms: u64) {
+        for index in 0..N {
+            let Some(window) = self.windows.get(index) else {
+                continue;
+            };
+            if window.open && window.app_started && window.state == WindowState::Minimized {
+                if let Some(runtime) = window.runtime {
+                    runtime.background_tick(platform, now_ms);
+                }
+            }
+        }
     }
 
     /// Copies the service status table into `out`.
@@ -820,61 +1453,70 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
         let canvas_rect = Rect::new(0, 0, canvas.width() as u32, canvas.height() as u32);
         let layout = taskbar::layout(canvas_rect, &config.taskbar);
         self.work_area = layout.work_area(canvas_rect, config.taskbar.position);
+
+        // Shortcuts act first and are then hidden from everything below, so
+        // Alt+Tab does not also reach the app or count as a plain Tab.
+        self.handle_shortcuts(input);
+        let filtered = input.filtered(|event| match event {
+            Event::KeyDown(key, modifiers) => !is_shortcut(*key, *modifiers),
+            _ => true,
+        });
+        let input = &filtered;
+
         let run_dialog_open = self.run_dialog.open;
-        let shutdown_open = self.shutdown.open;
-        let clock_open = self.clock_open;
-        let logoff_open = self.logoff_open;
+        let modal_at_start = self.modal_open();
+        let window_owns_keyboard = self
+            .windows
+            .focused_window()
+            .is_some_and(|window| window.runtime.is_some() && window.state != WindowState::Minimized);
+        let enter_pressed = input.keys().any(|(key, _)| key == Key::Enter);
+        let escape_pressed = input.keys().any(|(key, _)| key == Key::Escape);
+
         let mut run_submit = false;
+        let mut context_choice = None;
+        let mut window_choice = None;
         if run_dialog_open {
             self.handle_run_keys(input, &mut run_submit);
-        } else if shutdown_open {
-            if input.keys().any(|(key, _)| key == Key::Escape) {
+        } else if self.context.open {
+            context_choice = handle_menu_keys(&mut self.context, &CONTEXT_ITEMS, input);
+        } else if self.window_menu.open {
+            window_choice = handle_menu_keys(&mut self.window_menu, &WINDOW_ITEMS, input);
+        } else if self.modal_open() {
+            if escape_pressed {
                 self.shutdown.open = false;
-            }
-        } else if clock_open {
-            if input.keys().any(|(key, _)| key == Key::Escape) {
                 self.clock_open = false;
-            }
-        } else if logoff_open {
-            if input.keys().any(|(key, _)| key == Key::Escape) {
                 self.logoff_open = false;
+                self.settings_open = false;
+                self.notifications_open = false;
             }
-        } else {
-            // With a hosted app focused, Tab/Space/arrow keys belong to the
-            // app. Ctrl+Esc is the XP shortcut that always opens Start, and an
-            // already open menu always owns the keyboard.
-            let ctrl_escape = input
-                .keys()
-                .any(|(key, modifiers)| key == Key::Escape && modifiers.contains(Modifiers::CTRL));
-            let window_owns_keyboard = self
-                .windows
-                .focused_window()
-                .is_some_and(|window| window.runtime.is_some());
-            if self.start_menu.open || !window_owns_keyboard || ctrl_escape {
-                self.handle_keyboard(input, &config);
+        } else if self.drag.is_some() {
+            if escape_pressed {
+                self.drag = None;
             }
+        } else if self.start_menu.open || !window_owns_keyboard {
+            // With a hosted app focused, Tab, Space and the arrow keys belong
+            // to the app. An open menu always owns the keyboard.
+            self.handle_keyboard(input, &config);
         }
 
-        // The desktop consumes Tab/Space/Enter itself; keep the toolkit from
-        // activating a focused widget for the same key press.
-        let pointer_input = input.without_keyboard();
-        let mut ui = Ui::new(canvas, &theme.ui, &pointer_input, &mut self.interaction);
+        // Pointer routing -----------------------------------------------------
+        let pointer = input.pointer();
+        let pressed_now = input.events().any(|event| {
+            matches!(event, Event::PointerDown { .. })
+        });
+        let released_now = !input.pointer_down() && !input.secondary_down();
+        let modal = self.modal_open();
+        let start_open = self.start_menu.open;
+        let drag_active = self.drag.is_some();
+        let dropped = drag_active && !input.pointer_down();
+        let desktop_overlay = start_open || modal || modal_at_start || (drag_active && !dropped);
 
-        // Follow the pointer into the window that owns the current drag. This
-        // keeps a resize or text selection alive even when the pointer crosses
-        // the window border.
-        let desktop_overlay = self.start_menu.open
-            || self.context.open
-            || run_dialog_open
-            || shutdown_open
-            || clock_open
-            || logoff_open;
-        let pointer_in_work_area = self.work_area.contains(ui.pointer());
-        if (ui.pointer_pressed() || ui.secondary_pressed())
-            && !desktop_overlay
-            && pointer_in_work_area
-        {
-            self.pointer_window = self.windows.topmost_content_at(ui.pointer());
+        let toast_area = self.notifications.area(&layout, self.work_area);
+        let in_toast = toast_area.contains(pointer);
+        let in_bar = layout.bar.contains(pointer);
+        let pointer_in_work_area = self.work_area.contains(pointer) && !in_toast;
+        if pressed_now && !desktop_overlay && pointer_in_work_area {
+            self.pointer_window = self.windows.topmost_content_at(pointer);
         }
         let pointer_window = if desktop_overlay {
             None
@@ -883,7 +1525,7 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             // even when the pointer crosses the taskbar or another window.
             self.pointer_window
         } else if pointer_in_work_area {
-            self.windows.topmost_content_at(ui.pointer())
+            self.windows.topmost_content_at(pointer)
         } else {
             None
         };
@@ -897,25 +1539,86 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             })
         };
 
-        let over_window = pointer_in_work_area && self.windows.topmost_at(ui.pointer()).is_some();
-        paint::draw_wallpaper(&mut ui, &theme, &config.wallpaper);
+        // What this frame must repaint ----------------------------------------
+        let painted_windows = self.window_snapshot();
+        let painted_desktop = self.desktop_snapshot();
+        let damage = self.compute_damage(
+            input,
+            uptime_ms,
+            canvas_rect,
+            &layout,
+            &clock,
+            pointer_window,
+            keyboard_window,
+            &painted_windows,
+            &painted_desktop,
+        );
+        let size = (canvas_rect.width, canvas_rect.height);
+        if self.painted_size != size {
+            self.background_valid = false;
+        }
+        self.painted_windows = painted_windows;
+        self.painted_desktop = Some(painted_desktop);
+        self.painted_size = size;
+        self.painted_pointer = pointer;
+        self.painted_clock = clock;
+        self.painted_routes = (pointer_window, keyboard_window);
+        self.repaint_all = false;
+
+        // The desktop consumes Tab/Space/Enter itself; keep the toolkit from
+        // activating a focused widget for the same key press.
+        let pointer_input = input.without_keyboard();
+        let mut ui = Ui::new(canvas, &theme.ui, &pointer_input, &mut self.interaction);
+        ui.painter.set_paint_mask(damage);
+
+        // Which surface the pointer really touches. Each surface below is told
+        // whether something above it covers the pointer, so hit testing follows
+        // the stacking order instead of the order things are drawn in.
+        let panel = if start_open {
+            start_menu::panel_rect(
+                canvas_rect,
+                &config.start_menu,
+                &layout,
+                config.taskbar.position,
+            )
+        } else {
+            Rect::new(0, 0, 0, 0)
+        };
+        let in_panel = panel.contains(pointer);
+        let above_bar = modal || drag_active || in_panel || in_toast;
+        let above_windows = above_bar || in_bar || start_open;
+        let over_window = pointer_in_work_area && self.windows.topmost_at(pointer).is_some();
+
+        // Background ----------------------------------------------------------
+        let cached = paint_background(
+            &mut ui,
+            &theme,
+            &config,
+            &self.catalog,
+            self.work_area,
+            self.background.as_deref_mut(),
+            &mut self.background_valid,
+        );
 
         let mut launch_index = None;
+        let mut launch_args: Option<Text<96>> = None;
         let mut shortcut_clicked = None;
         if config.icons.show_icons {
+            ui.set_pointer_occluded(above_windows || over_window);
             shortcut_clicked = render_shortcuts(
                 &mut ui,
                 &theme,
-                &config.icons,
+                &config,
                 &self.catalog,
                 self.work_area,
                 self.selection,
+                cached,
             );
         }
 
         if let Some(index) = shortcut_clicked {
-            // A single click selects the icon, exactly as XP does; the second
-            // click within the double-click interval opens it.
+            // A single click selects the icon; the second click within the
+            // double-click interval opens it.
             self.selection = index;
             if self
                 .clicks
@@ -925,12 +1628,25 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             }
         }
 
+        // Windows, bottom to top ----------------------------------------------
         let mut order = [0usize; N];
         let count = self.windows.z_order(&mut order);
         let work_area = self.work_area;
         let mut close_after = [false; N];
-        for &index in &order[..count] {
-            close_after[index] = render_window(
+        let mut menu_request = None;
+        for position in 0..count {
+            let index = order[position];
+            let covered = order[position + 1..count].iter().any(|above| {
+                self.windows
+                    .get(*above)
+                    .is_some_and(|window| window.rect.contains(pointer))
+            });
+            ui.set_pointer_occluded(above_windows || covered);
+            let paint_app = self
+                .windows
+                .get(index)
+                .is_some_and(|window| !window.rect.clipped_to(damage).is_empty());
+            let outcome = render_window(
                 &mut ui,
                 &theme,
                 &mut self.windows,
@@ -943,20 +1659,16 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
                 platform,
                 pointer_window == Some(index),
                 keyboard_window == Some(index),
+                paint_app,
+                self.scratch.as_deref_mut(),
             );
-        }
-        for index in 0..N {
-            if !close_after[index] {
-                continue;
+            close_after[index] = outcome.close;
+            if let Some(point) = outcome.menu {
+                menu_request = Some((index, point));
             }
-            if let Some(window) = self.windows.get(index) {
-                if let Some(runtime) = window.runtime {
-                    runtime.close_window();
-                }
-            }
-            self.windows.close(index);
         }
 
+        ui.set_pointer_occluded(above_bar);
         let taskbar_response = taskbar::render(
             &mut ui,
             &theme,
@@ -965,8 +1677,10 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             &self.windows,
             &self.catalog,
             clock.as_str(),
+            self.notifications.unread(),
         );
 
+        ui.set_pointer_occluded(modal || drag_active || in_toast);
         let menu_response = start_menu::render(
             &mut ui,
             &theme,
@@ -977,32 +1691,48 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             &mut self.start_menu,
         );
 
-        let pointer = ui.pointer();
+        ui.set_pointer_occluded(modal || drag_active);
+        self.notifications
+            .render_toasts(&mut ui, &theme, &layout, self.work_area);
+        ui.set_pointer_occluded(false);
+
         let pointer_pressed = ui.pointer_pressed();
         let pointer_released = ui.pointer_released();
         let secondary_released = ui.secondary_released();
 
-        // A right click on the wallpaper opens the XP desktop menu. Right
-        // clicks on a window, the Start menu or the taskbar belong to those
-        // surfaces instead.
+        // A right click on the wallpaper opens the desktop menu. Right clicks
+        // on a window, the Start menu or the taskbar belong to those surfaces,
+        // and none of them react while a dialog is up.
         if secondary_released
+            && !modal_at_start
+            && !drag_active
             && !over_window
-            && !layout.bar.contains(pointer)
+            && !in_bar
+            && !in_toast
             && !menu_response.panel.contains(pointer)
         {
             self.start_menu.close();
-            self.context.open = true;
-            self.context.x = pointer.x;
-            self.context.y = pointer.y;
+            self.context.show(pointer);
         }
 
-        let context_action = render_context_menu(
+        let context_action = context_choice.or(render_menu(
             &mut ui,
             &theme,
             &mut self.context,
             self.work_area,
             pointer_pressed,
-        );
+            &CONTEXT_ITEMS,
+            "desktop.context",
+        ));
+        let window_action = window_choice.or(render_menu(
+            &mut ui,
+            &theme,
+            &mut self.window_menu,
+            self.work_area,
+            pointer_pressed,
+            &WINDOW_ITEMS,
+            "desktop.window_menu",
+        ));
 
         let run_clicked = if self.run_dialog.open {
             render_run_dialog(&mut ui, &theme, self.work_area, &mut self.run_dialog)
@@ -1028,28 +1758,57 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             LogoffAction::None
         };
 
-        // The pointer is painted last so it stays visible over windows and the
-        // Start menu, exactly like the XP cursor. Its shape follows the window
-        // edge underneath it.
-        let cursor = ui.pointer();
-        let over_desktop_menu = self.start_menu.open
-            || self.context.open
-            || self.run_dialog.open
-            || self.shutdown.open
-            || self.clock_open
-            || self.logoff_open
-            || layout.bar.contains(cursor);
-        let cursor_shape = if over_desktop_menu {
-            paint::CursorShape::Arrow
+        let settings_action = if self.settings_open {
+            render_settings_dialog(&mut ui, &theme, self.work_area, &config)
         } else {
-            window_cursor_shape(&self.windows, cursor)
+            SettingsAction::None
         };
-        paint::draw_cursor_shape(&mut ui.painter, cursor.x, cursor.y, cursor_shape);
 
-        let pointer = ui.pointer();
+        if self.notifications_open {
+            let _blocker = ui.interact(
+                Id::from_name("desktop.notifications.modal"),
+                ui.canvas_rect(),
+                Sense::click(),
+            );
+            let history = self
+                .notifications
+                .render_history(&mut ui, &theme, &layout, self.work_area);
+            if pointer_pressed && !history.contains(pointer) {
+                self.notifications_open = false;
+            }
+        }
+
+        if let Some(payload) = self.drag {
+            paint::draw_drag_label(&mut ui.painter, &theme, pointer, payload.as_str());
+        }
+
+        // The pointer is painted last so it stays visible over windows and the
+        // Start menu. Its shape follows the window edge underneath it.
+        let over_desktop_menu = self.start_menu.open
+            || modal
+            || self.drag.is_some()
+            || in_bar
+            || in_toast;
+        let cursor_shape = if over_desktop_menu {
+            CursorShape::Arrow
+        } else {
+            window_cursor_shape(&self.windows, pointer)
+        };
+        response.cursor = cursor_shape;
+        if !self.retained {
+            paint::draw_cursor_shape(&mut ui.painter, pointer.x, pointer.y, cursor_shape);
+        }
+
         drop(ui);
 
-        if pointer_released || secondary_released {
+        // State changes -------------------------------------------------------
+        for (index, close) in close_after.iter().enumerate() {
+            if *close {
+                self.close_window(index);
+            }
+        }
+
+        if pointer_released || released_now {
             self.pointer_window = None;
         }
 
@@ -1065,15 +1824,19 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             self.clock_open = false;
         }
 
-        let escape = input.keys().any(|(key, _)| key == Key::Escape);
-        let enter = !run_dialog_open
-            && !shutdown_open
-            && !clock_open
-            && !logoff_open
-            && input.keys().any(|(key, _)| key == Key::Enter);
+        let enter =
+            enter_pressed && !modal_at_start && !(self.drag.is_some() || drag_active);
 
         if taskbar_response.start_clicked {
             self.start_menu.toggle();
+        }
+
+        if let Some((index, point)) = menu_request {
+            self.windows.focus(index);
+            self.open_window_menu(index, point);
+        }
+        if let Some(index) = taskbar_response.task_menu {
+            self.open_window_menu(index, pointer);
         }
 
         if let Some(index) = taskbar_response.task_clicked {
@@ -1129,6 +1892,13 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             response.tray_clicked = true;
         }
 
+        if taskbar_response.bell_clicked {
+            self.start_menu.close();
+            self.notifications.mark_read();
+            self.notifications.dismiss_all();
+            self.notifications_open = true;
+        }
+
         let mut launch_index = menu_response.launched.or(launch_index);
         if let Some(index) = taskbar_response.quick_clicked {
             self.start_menu.close();
@@ -1151,8 +1921,17 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             self.context.open = false;
             command = StartMenuCommand::None;
         }
-        match context_action {
-            ContextAction::None | ContextAction::Refresh => {}
+        if command == StartMenuCommand::Settings {
+            self.settings_open = true;
+            self.context.open = false;
+            command = StartMenuCommand::None;
+        }
+        match context_action.unwrap_or_default() {
+            ContextAction::None => {}
+            ContextAction::Refresh => {
+                self.repaint_all = true;
+                command = StartMenuCommand::Refresh;
+            }
             ContextAction::ShowDesktop => {
                 self.toggle_show_desktop();
             }
@@ -1161,7 +1940,21 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
                     launch_index = Some(index);
                 }
             }
-            ContextAction::Properties => command = StartMenuCommand::Settings,
+            ContextAction::Properties => self.settings_open = true,
+        }
+        if let Some(action) = window_action {
+            self.apply_window_action(self.window_menu_target, action);
+        }
+
+        match settings_action {
+            SettingsAction::None => {}
+            SettingsAction::Theme(name) => self.set_theme(name),
+            SettingsAction::Layout(layout) => {
+                let mut next = self.config;
+                next.keyboard_layout = layout;
+                self.set_config(next);
+            }
+            SettingsAction::Close => self.settings_open = false,
         }
 
         match shutdown_action {
@@ -1191,19 +1984,47 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
                 .start_menu
                 .selected(self.catalog.len())
                 .or(launch_index);
-        } else if enter && self.selection < self.catalog.len() {
-            // Enter launches the wallpaper shortcut selected with the arrows.
+        } else if enter && !window_owns_keyboard && self.selection < self.catalog.len() {
+            // Enter launches the wallpaper shortcut selected with the arrows,
+            // but a focused app's Enter is that app's.
             launch_index = Some(self.selection).or(launch_index);
+        }
+
+        // A dragged path ends where the button came up: a shortcut opens it, and
+        // an open window is offered it.
+        if dropped {
+            if let Some(payload) = self.drag.take() {
+                if let Some(index) =
+                    shortcut_at(&config, &self.catalog, self.work_area, pointer).filter(|_| !over_window)
+                {
+                    launch_index = Some(index);
+                    launch_args = Some(payload);
+                } else if let Some(index) = self.windows.topmost_at(pointer).filter(|_| !in_bar) {
+                    let window = self.windows.get(index).copied();
+                    let taken = window
+                        .and_then(|window| window.runtime)
+                        .is_some_and(|runtime| runtime.accept_drop(payload.as_str()));
+                    if taken {
+                        self.windows.focus(index);
+                    }
+                }
+            }
         }
 
         if let Some(index) = launch_index {
             self.show_desktop = false;
-            if let Some(window) = self.open_app(index) {
+            let args = launch_args.as_ref().map(|args| args.as_str());
+            if let Some(window) = self.open_app_with(index, args) {
                 if let Some(app) = self.catalog.get(index) {
+                    let args = self
+                        .windows
+                        .get(window)
+                        .map(|window| window.args)
+                        .unwrap_or(Text::EMPTY);
                     response.launch = Some(LaunchRequest {
                         app: index,
                         entry: app.manifest.entry,
-                        args: app.manifest.args,
+                        args,
                         window,
                     });
                 }
@@ -1217,23 +2038,27 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             && !taskbar_response.start_clicked
             && self.start_menu.open
             && !menu_response.panel.contains(pointer)
-            && !layout.bar.contains(pointer)
+            && !in_bar
         {
             self.start_menu.close();
         }
 
-        // Clicking the wallpaper moves keyboard focus off the active window,
-        // exactly like XP.
+        // Clicking the wallpaper moves keyboard focus off the active window.
         if pointer_pressed
             && !over_window
-            && !self.start_menu.open
-            && !layout.bar.contains(pointer)
+            && !start_open
+            && !modal_at_start
+            && !in_bar
+            && !in_toast
             && !menu_response.panel.contains(pointer)
         {
             self.windows.clear_focus();
         }
 
-        if escape {
+        if input
+            .keys()
+            .any(|(key, modifiers)| key == Key::Escape && !modifiers.contains(Modifiers::CTRL))
+        {
             self.start_menu.close();
         }
 
@@ -1257,7 +2082,211 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
                 }
             }
         }
+
+        response.damage = (!damage.is_empty()).then_some(damage);
+        // Closing a dialog gives the app the keyboard back from the next frame.
+        let overlay_after = self.start_menu.open || self.modal_open() || self.drag.is_some();
+        response.state_changed = self.repaint_all
+            || desktop_overlay != overlay_after
+            || self.window_snapshot() != self.painted_windows
+            || Some(self.desktop_snapshot()) != self.painted_desktop;
         response
+    }
+
+    fn window_snapshot(&self) -> [PaintedWindow; N] {
+        core::array::from_fn(|index| {
+            let Some(window) = self.windows.get(index) else {
+                return PaintedWindow::CLOSED;
+            };
+            if !window.open {
+                return PaintedWindow::CLOSED;
+            }
+            PaintedWindow {
+                open: true,
+                state: window.state,
+                rect: window.rect,
+                z: window.z,
+                focused: self.windows.is_focused(index),
+                hosted: window.runtime.is_some(),
+                started: window.app_started,
+                launched: window.launched,
+                status: window.status,
+            }
+        })
+    }
+
+    fn desktop_snapshot(&self) -> PaintedDesktop {
+        PaintedDesktop {
+            overlay: self.start_menu.open || self.modal_open() || self.drag.is_some(),
+            start_open: self.start_menu.open,
+            start_all_programs: self.start_menu.all_programs,
+            start_highlighted: self.start_menu.highlighted,
+            start_scroll: self.start_menu.scroll,
+            selection: self.selection,
+            context: self.context,
+            window_menu: self.window_menu,
+            toasts: self.notifications.visible_count(),
+            unread: self.notifications.unread(),
+            show_desktop: self.show_desktop,
+        }
+    }
+
+    /// The part of the canvas this frame has to repaint.
+    ///
+    /// Hosted apps paint a whole window or nothing, straight into the canvas.
+    /// So a window that touches the damage joins it, which makes the windows
+    /// above and below it repaint as well, until the set stops growing.
+    #[allow(clippy::too_many_arguments)]
+    fn compute_damage(
+        &self,
+        input: &Input,
+        now_ms: u64,
+        canvas: Rect,
+        layout: &taskbar::TaskbarLayout,
+        clock: &Text<16>,
+        pointer_window: Option<usize>,
+        keyboard_window: Option<usize>,
+        windows: &[PaintedWindow; N],
+        desktop: &PaintedDesktop,
+    ) -> Rect {
+        let Some(previous) = self.painted_desktop.as_ref() else {
+            return canvas;
+        };
+        let size = (canvas.width, canvas.height);
+        if !self.retained
+            || self.repaint_all
+            || self.painted_size != size
+            || desktop.overlay
+            || previous.overlay
+            || previous != desktop
+        {
+            return canvas;
+        }
+
+        let mut damage = Rect::new(0, 0, 0, 0);
+        for (now, then) in windows.iter().zip(self.painted_windows.iter()) {
+            if now != then {
+                if let Some(rect) = now.visible_rect() {
+                    damage = union(damage, rect);
+                }
+                if let Some(rect) = then.visible_rect() {
+                    damage = union(damage, rect);
+                }
+                // Task buttons show every window's state.
+                damage = union(damage, layout.bar);
+            }
+        }
+        if clock != &self.painted_clock {
+            damage = union(damage, layout.bar);
+        }
+
+        // An app draws differently once it has or loses the pointer or keyboard.
+        let (old_pointer, old_keyboard) = self.painted_routes;
+        for (old, new) in [(old_pointer, pointer_window), (old_keyboard, keyboard_window)] {
+            if old != new {
+                for index in [old, new].into_iter().flatten() {
+                    if let Some(rect) = windows.get(index).and_then(PaintedWindow::visible_rect) {
+                        damage = union(damage, rect);
+                    }
+                }
+            }
+        }
+
+        let pointer = input.pointer();
+        let pointer_events = input.events().any(|event| {
+            matches!(
+                event,
+                Event::PointerMoved(_)
+                    | Event::PointerDown { .. }
+                    | Event::PointerUp { .. }
+                    | Event::PointerWheel(_)
+            )
+        });
+        if pointer_events || pointer != self.painted_pointer {
+            damage = union(damage, self.pointer_damage(pointer, layout));
+            damage = union(damage, self.pointer_damage(self.painted_pointer, layout));
+            if let Some(window) = pointer_window.and_then(|index| self.windows.get(index)) {
+                damage = union(damage, window.rect);
+            }
+        }
+
+        let keyboard_events = input
+            .events()
+            .any(|event| matches!(event, Event::KeyDown(..) | Event::KeyUp(..) | Event::Text(_)));
+        if keyboard_events {
+            if let Some(window) = keyboard_window.and_then(|index| self.windows.get(index)) {
+                damage = union(damage, window.rect);
+            }
+        }
+
+        for index in 0..N {
+            let Some(window) = self.windows.get(index) else {
+                continue;
+            };
+            if !window.open || window.state == WindowState::Minimized {
+                continue;
+            }
+            if let Some(runtime) = window.runtime.filter(|runtime| runtime.animates()) {
+                let period = runtime.animation_period_ms().max(1) as u64;
+                if now_ms.saturating_sub(window.last_frame_ms) >= period {
+                    damage = union(damage, window.rect);
+                }
+            }
+        }
+
+        // Hosted apps paint all of a window or none of it.
+        if !damage.is_empty() {
+            loop {
+                let mut grew = false;
+                for window in windows.iter() {
+                    let Some(rect) = window.visible_rect() else {
+                        continue;
+                    };
+                    if !rect.clipped_to(damage).is_empty() {
+                        let next = union(damage, rect);
+                        if next != damage {
+                            damage = next;
+                            grew = true;
+                        }
+                    }
+                }
+                if !grew {
+                    break;
+                }
+            }
+        }
+        damage.clipped_to(canvas)
+    }
+
+    /// What can look different when the pointer enters or leaves `point`.
+    fn pointer_damage(&self, point: Point, layout: &taskbar::TaskbarLayout) -> Rect {
+        if layout.bar.contains(point) {
+            return layout.bar;
+        }
+        let toasts = self.notifications.area(layout, self.work_area);
+        if toasts.contains(point) {
+            return toasts;
+        }
+        if let Some(window) = self
+            .windows
+            .topmost_at(point)
+            .and_then(|index| self.windows.get(index))
+        {
+            let title = Rect::new(
+                window.rect.x,
+                window.rect.y,
+                window.rect.width,
+                window::TITLE_HEIGHT + 2,
+            );
+            return if title.contains(point) {
+                title
+            } else {
+                window.rect
+            };
+        }
+        shortcut_at(&self.config, &self.catalog, self.work_area, point)
+            .and_then(|index| shortcut_cell(&self.config, self.work_area, index))
+            .unwrap_or(Rect::new(0, 0, 0, 0))
     }
 }
 
@@ -1265,6 +2294,327 @@ impl<const N: usize, const A: usize, const S: usize> Default for Desktop<N, A, S
     fn default() -> Self {
         Self::new(DesktopConfig::default())
     }
+}
+
+/// The smallest rectangle containing both, treating an empty one as nothing.
+fn union(a: Rect, b: Rect) -> Rect {
+    if a.is_empty() {
+        return b;
+    }
+    if b.is_empty() {
+        return a;
+    }
+    let x0 = a.x.min(b.x);
+    let y0 = a.y.min(b.y);
+    let x1 = a.right_i32().max(b.right_i32());
+    let y1 = a.bottom_i32().max(b.bottom_i32());
+    Rect::new(x0, y0, (x1 - x0) as u32, (y1 - y0) as u32)
+}
+
+/// A desktop-wide shortcut, which no app ever sees.
+fn is_shortcut(key: Key, modifiers: Modifiers) -> bool {
+    let alt = modifiers.contains(Modifiers::ALT);
+    let ctrl = modifiers.contains(Modifiers::CTRL);
+    match key {
+        Key::Escape => ctrl,
+        Key::Tab | Key::F4 | Key::Space => alt,
+        _ => false,
+    }
+}
+
+/// Moves a pop-up menu's highlight, and returns the action Enter chose.
+fn handle_menu_keys<T: Copy>(
+    state: &mut ContextMenuState,
+    items: &[MenuItem<T>],
+    input: &Input,
+) -> Option<T> {
+    let count = items.len();
+    let mut chosen = None;
+    for (key, _) in input.keys() {
+        match key {
+            Key::Up => {
+                state.highlighted = match state.highlighted {
+                    0 => count - 1,
+                    NOTHING_HIGHLIGHTED => count - 1,
+                    other => other - 1,
+                };
+            }
+            Key::Down => {
+                state.highlighted = match state.highlighted {
+                    NOTHING_HIGHLIGHTED => 0,
+                    other => (other + 1) % count,
+                };
+            }
+            Key::Enter => {
+                if let Some(item) = items.get(state.highlighted) {
+                    chosen = Some(item.action);
+                }
+                state.open = false;
+            }
+            Key::Escape => state.open = false,
+            _ => {}
+        }
+    }
+    chosen
+}
+
+/// [`ContextMenuState::highlighted`] when no row is highlighted.
+const NOTHING_HIGHLIGHTED: usize = usize::MAX;
+
+/// Draws the wallpaper and, when a cache is available, the shortcut icons from
+/// it. Returns `true` when the icons were drawn from the cache.
+fn paint_background<const UI: usize, const A: usize>(
+    ui: &mut Ui<'_, '_, '_, UI>,
+    theme: &DesktopTheme,
+    config: &DesktopConfig,
+    catalog: &AppCatalog<A>,
+    work_area: Rect,
+    cache: Option<&mut [u32]>,
+    valid: &mut bool,
+) -> bool {
+    let full = ui.canvas_rect();
+    let width = full.width as usize;
+    let height = full.height as usize;
+    let Some(cache) = cache.filter(|cache| cache.len() >= width * height) else {
+        paint::draw_wallpaper_on(&mut ui.painter, theme, &config.wallpaper);
+        return false;
+    };
+
+    if !*valid {
+        if let Some(mut layer) = Canvas::new(cache, width, height, width) {
+            let mut painter = feos_gui::Painter::new(&mut layer);
+            paint::draw_wallpaper_on(&mut painter, theme, &config.wallpaper);
+            if config.icons.show_icons {
+                for index in 0..catalog.len().min(MAX_DESKTOP_ICONS) {
+                    let Some(cell) = shortcut_cell(config, work_area, index) else {
+                        break;
+                    };
+                    paint_shortcut(&mut painter, theme, config, catalog, index, cell, false);
+                }
+            }
+        }
+        *valid = true;
+    }
+    ui.painter.restore_layer(full, cache, width, height);
+    true
+}
+
+/// The rectangle of shortcut `index`, or `None` past the last one that fits.
+fn shortcut_cell(config: &DesktopConfig, work_area: Rect, index: usize) -> Option<Rect> {
+    if work_area.is_empty() {
+        return None;
+    }
+    let icons = &config.icons;
+    let icon_size = icons.icon_size.clamp(24, 96) as i32;
+    let label_height = if icons.show_labels { 34 } else { 8 };
+    let cell_width = (icon_size + 60).max(150);
+    let cell_height = icon_size + label_height;
+    let rows = (work_area.height as i32 / cell_height).max(1);
+    let row = index as i32 % rows;
+    let column = index as i32 / rows;
+    let cell = Rect::new(
+        work_area.x + 10 + column * (cell_width + 6),
+        work_area.y + 10 + row * cell_height,
+        cell_width as u32,
+        cell_height as u32,
+    );
+    (cell.right_i32() <= work_area.right_i32() && cell.bottom_i32() <= work_area.bottom_i32())
+        .then_some(cell)
+}
+
+/// The shortcut under `point`, if any.
+fn shortcut_at<const A: usize>(
+    config: &DesktopConfig,
+    catalog: &AppCatalog<A>,
+    work_area: Rect,
+    point: Point,
+) -> Option<usize> {
+    if !config.icons.show_icons {
+        return None;
+    }
+    (0..catalog.len().min(MAX_DESKTOP_ICONS)).find(|index| {
+        shortcut_cell(config, work_area, *index).is_some_and(|cell| cell.contains(point))
+    })
+}
+
+fn paint_shortcut<const A: usize>(
+    painter: &mut feos_gui::Painter<'_, '_>,
+    theme: &DesktopTheme,
+    config: &DesktopConfig,
+    catalog: &AppCatalog<A>,
+    index: usize,
+    cell: Rect,
+    hovered: bool,
+) {
+    let icons = &config.icons;
+    let icon_size = icons.icon_size.clamp(24, 96) as i32;
+    if let Some(app) = catalog.get(index) {
+        let icon_rect = Rect::new(
+            cell.x + (cell.width as i32 - icon_size) / 2,
+            cell.y + 2,
+            icon_size as u32,
+            icon_size as u32,
+        );
+        paint::draw_icon(painter, &app.icon, icon_rect, theme.caption_button);
+        if icons.show_labels {
+            draw_shortcut_label(
+                painter,
+                Rect::new(cell.x + 2, cell.y + icon_size + 2, cell.width - 4, 30),
+                app.name(),
+                if hovered {
+                    theme.desktop_text_hover
+                } else {
+                    theme.desktop_text
+                },
+            );
+        }
+    }
+}
+
+/// A choice in the Display Properties dialog.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum SettingsAction {
+    #[default]
+    None,
+    Theme(ThemeName),
+    Layout(KeyboardLayout),
+    Close,
+}
+
+fn render_settings_dialog<const N: usize>(
+    ui: &mut Ui<'_, '_, '_, N>,
+    theme: &DesktopTheme,
+    work_area: Rect,
+    config: &DesktopConfig,
+) -> SettingsAction {
+    const WIDTH: u32 = 420;
+    const HEIGHT: u32 = 256;
+    const TITLE: u32 = 28;
+    const ROW: u32 = 24;
+
+    let x = work_area.x + (work_area.width as i32 - WIDTH as i32) / 2;
+    let y = work_area.y + (work_area.height as i32 - HEIGHT as i32) / 2;
+    let panel = Rect::new(x.max(work_area.x), y.max(work_area.y), WIDTH, HEIGHT);
+
+    let _blocker = ui.interact(
+        Id::from_name("desktop.settings.modal"),
+        ui.canvas_rect(),
+        Sense::click(),
+    );
+
+    ui.painter.shadow(panel, 8, 10, 120);
+    ui.painter.fill_rounded_rect(panel, 4, theme.menu_bg);
+    ui.painter
+        .stroke_rounded_rect(panel, 4, 1, theme.menu_border);
+    let title = Rect::new(panel.x + 1, panel.y + 1, panel.width - 2, TITLE);
+    ui.painter
+        .fill_vertical_gradient(title, theme.title_active_top, theme.title_active_bottom);
+    ui.painter.draw_text_ellipsis(
+        Rect::new(title.x + 10, title.y, title.width.saturating_sub(20), TITLE),
+        "Display Properties",
+        theme.title_text,
+        1,
+        Align::Start,
+        VerticalAlign::Middle,
+    );
+
+    let mut action = SettingsAction::None;
+    let top = panel.y + TITLE as i32 + 8;
+    let column = |index: i32| panel.x + 12 + index * 200;
+    for (index, heading) in ["Colour scheme", "Keyboard layout"].iter().enumerate() {
+        ui.painter.draw_text_ellipsis(
+            Rect::new(column(index as i32), top, 190, 18),
+            heading,
+            theme.menu_muted,
+            1,
+            Align::Start,
+            VerticalAlign::Middle,
+        );
+    }
+
+    let mut row_y = top + 20;
+    for (index, name) in ThemeName::ALL.iter().enumerate() {
+        let row = Rect::new(column(0), row_y, 190, ROW);
+        let id = Id::from_name("desktop.settings.theme").child(index as u64 + 1);
+        let hit = ui.interact(id, row, Sense::click());
+        if hit.clicked {
+            action = SettingsAction::Theme(*name);
+        }
+        draw_setting_row(ui, theme, row, name.name(), hit.hovered, config.theme == *name);
+        row_y += ROW as i32;
+    }
+
+    let mut row_y = top + 20;
+    for (index, layout) in KeyboardLayout::ALL.iter().enumerate() {
+        let row = Rect::new(column(1), row_y, 190, ROW);
+        let id = Id::from_name("desktop.settings.layout").child(index as u64 + 1);
+        let hit = ui.interact(id, row, Sense::click());
+        if hit.clicked {
+            action = SettingsAction::Layout(*layout);
+        }
+        draw_setting_row(
+            ui,
+            theme,
+            row,
+            layout.name(),
+            hit.hovered,
+            config.keyboard_layout == *layout,
+        );
+        row_y += ROW as i32;
+    }
+
+    let close = Rect::new(panel.right_i32() - 88, panel.bottom_i32() - 34, 72, 24);
+    let close_hit = ui.interact(Id::from_name("desktop.settings.close"), close, Sense::click());
+    ui.painter.fill_rounded_rect(
+        close,
+        3,
+        if close_hit.hovered {
+            theme.caption_button.lerp(Color::WHITE, 40)
+        } else {
+            theme.caption_button
+        },
+    );
+    ui.painter
+        .stroke_rounded_rect(close, 3, 1, theme.menu_border);
+    ui.painter
+        .draw_text_centered(close, "Close", Color::WHITE, 1);
+    if close_hit.clicked {
+        action = SettingsAction::Close;
+    }
+    action
+}
+
+fn draw_setting_row<const N: usize>(
+    ui: &mut Ui<'_, '_, '_, N>,
+    theme: &DesktopTheme,
+    row: Rect,
+    label: &str,
+    hovered: bool,
+    selected: bool,
+) {
+    if hovered {
+        ui.painter.fill_rounded_rect(row, 2, theme.menu_hover);
+    }
+    let mark = Rect::new(row.x + 6, row.y + 7, 10, 10);
+    ui.painter.stroke_rect(mark, 1, theme.menu_text);
+    if selected {
+        ui.painter.fill_rect(
+            Rect::new(mark.x + 2, mark.y + 2, 6, 6),
+            theme.menu_text,
+        );
+    }
+    ui.painter.draw_text_ellipsis(
+        Rect::new(row.x + 24, row.y, row.width.saturating_sub(28), row.height),
+        label,
+        if hovered {
+            theme.menu_hover_text
+        } else {
+            theme.menu_text
+        },
+        1,
+        Align::Start,
+        VerticalAlign::Middle,
+    );
 }
 
 fn render_logoff_dialog<const N: usize>(
@@ -1290,7 +2640,7 @@ fn render_logoff_dialog<const N: usize>(
         .stroke_rounded_rect(panel, 4, 1, theme.menu_border);
 
     let title = Rect::new(panel.x + 1, panel.y + 1, panel.width - 2, TITLE);
-    ui.painter.canvas_mut().fill_vertical_gradient(
+    ui.painter.fill_vertical_gradient(
         title,
         theme.title_active_top,
         theme.title_active_bottom,
@@ -1302,7 +2652,7 @@ fn render_logoff_dialog<const N: usize>(
             title.width.saturating_sub(20),
             title.height,
         ),
-        "Log Off Windows",
+        "Log Off",
         theme.title_text,
         1,
         Align::Start,
@@ -1418,7 +2768,7 @@ fn render_clock_dialog<const N: usize>(
         .stroke_rounded_rect(panel, 4, 1, theme.menu_border);
 
     let title = Rect::new(panel.x + 1, panel.y + 1, panel.width - 2, TITLE);
-    ui.painter.canvas_mut().fill_vertical_gradient(
+    ui.painter.fill_vertical_gradient(
         title,
         theme.title_active_top,
         theme.title_active_bottom,
@@ -1558,7 +2908,7 @@ fn render_shutdown_dialog<const N: usize>(
         .stroke_rounded_rect(panel, 4, 1, theme.menu_border);
 
     let title = Rect::new(panel.x + 1, panel.y + 1, panel.width - 2, TITLE);
-    ui.painter.canvas_mut().fill_vertical_gradient(
+    ui.painter.fill_vertical_gradient(
         title,
         theme.title_active_top,
         theme.title_active_bottom,
@@ -1693,7 +3043,7 @@ fn render_run_dialog<const N: usize>(
         .stroke_rounded_rect(panel, 4, 1, theme.menu_border);
 
     let title = Rect::new(panel.x + 1, panel.y + 1, panel.width - 2, TITLE);
-    ui.painter.canvas_mut().fill_vertical_gradient(
+    ui.painter.fill_vertical_gradient(
         title,
         theme.title_active_top,
         theme.title_active_bottom,
@@ -1809,29 +3159,26 @@ fn render_run_dialog<const N: usize>(
     ok_hit.clicked
 }
 
-fn render_context_menu<const N: usize>(
+fn render_menu<const N: usize, T: Copy>(
     ui: &mut Ui<'_, '_, '_, N>,
     theme: &DesktopTheme,
     state: &mut ContextMenuState,
     work_area: Rect,
     pointer_pressed: bool,
-) -> ContextAction {
+    items: &[MenuItem<T>],
+    name: &str,
+) -> Option<T> {
     if !state.open {
-        return ContextAction::None;
+        return None;
     }
 
     const WIDTH: u32 = 196;
     const ROW: u32 = 24;
     const PAD: u32 = 4;
     const SEP: u32 = 6;
-    const ITEMS: [(&str, ContextAction); 4] = [
-        ("Refresh", ContextAction::Refresh),
-        ("Show Desktop", ContextAction::ShowDesktop),
-        ("Task Manager", ContextAction::TaskManager),
-        ("Properties", ContextAction::Properties),
-    ];
 
-    let height = PAD * 2 + ROW * ITEMS.len() as u32 + SEP * 2;
+    let separators = items.iter().filter(|item| item.separator_before).count() as u32;
+    let height = PAD * 2 + ROW * items.len() as u32 + SEP * separators;
     let x = state
         .x
         .min(work_area.right_i32() - WIDTH as i32)
@@ -1844,15 +3191,12 @@ fn render_context_menu<const N: usize>(
 
     // Consume a press outside the menu so it only dismisses the menu instead
     // of also activating the window or icon beneath it.
-    let _blocker = ui.interact(
-        Id::from_name("desktop.context.modal"),
-        ui.canvas_rect(),
-        Sense::click(),
-    );
+    let base = Id::from_name(name);
+    let _blocker = ui.interact(base.child(0xffff), ui.canvas_rect(), Sense::click());
 
     if pointer_pressed && !panel.contains(ui.pointer()) {
         state.open = false;
-        return ContextAction::None;
+        return None;
     }
 
     ui.painter.shadow(panel, 6, 8, 120);
@@ -1860,10 +3204,10 @@ fn render_context_menu<const N: usize>(
     ui.painter
         .stroke_rounded_rect(panel, 3, 1, theme.menu_border);
 
-    let mut action = ContextAction::None;
+    let mut action = None;
     let mut row_y = panel.y + PAD as i32;
-    for (index, (label, item_action)) in ITEMS.iter().enumerate() {
-        if index == 2 || index == 3 {
+    for (index, item) in items.iter().enumerate() {
+        if item.separator_before {
             ui.painter.fill_rect(
                 Rect::new(
                     panel.x + 6,
@@ -1877,15 +3221,19 @@ fn render_context_menu<const N: usize>(
         }
 
         let row = Rect::new(panel.x + 2, row_y, panel.width.saturating_sub(4), ROW);
-        let id = Id::from_name("desktop.context.item").child(index as u64 + 1);
+        let id = base.child(index as u64 + 1);
         let hit = ui.interact(id, row, Sense::click());
         if hit.hovered {
+            state.highlighted = index;
+        }
+        let lit = hit.hovered || state.highlighted == index;
+        if lit {
             ui.painter.fill_rounded_rect(row, 2, theme.menu_hover);
         }
         ui.painter.draw_text_ellipsis(
             Rect::new(row.x + 26, row.y, row.width.saturating_sub(30), row.height),
-            label,
-            if hit.hovered {
+            item.label,
+            if lit {
                 theme.menu_hover_text
             } else {
                 theme.menu_text
@@ -1895,7 +3243,7 @@ fn render_context_menu<const N: usize>(
             VerticalAlign::Middle,
         );
         if hit.clicked {
-            action = *item_action;
+            action = Some(item.action);
             state.open = false;
         }
         row_y += ROW as i32;
@@ -1907,38 +3255,38 @@ fn render_context_menu<const N: usize>(
 fn render_shortcuts<const N: usize, const A: usize>(
     ui: &mut Ui<'_, '_, '_, N>,
     theme: &DesktopTheme,
-    config: &ShortcutConfig,
+    config: &DesktopConfig,
     catalog: &AppCatalog<A>,
     work_area: Rect,
     selection: usize,
+    cached: bool,
 ) -> Option<usize> {
     if catalog.is_empty() || work_area.is_empty() {
         return None;
     }
 
-    let icon_size = config.icon_size.clamp(24, 96) as i32;
-    let label_height = if config.show_labels { 34 } else { 8 };
-    let cell_width = (icon_size + 60).max(150);
-    let cell_height = icon_size + label_height;
-    let rows = (work_area.height as i32 / cell_height).max(1);
     let mut launched = None;
-
     for index in 0..catalog.len().min(MAX_DESKTOP_ICONS) {
-        let row = index as i32 % rows;
-        let column = index as i32 / rows;
-        let cell = Rect::new(
-            work_area.x + 10 + column * (cell_width + 6),
-            work_area.y + 10 + row * cell_height,
-            cell_width as u32,
-            cell_height as u32,
-        );
-        if cell.right_i32() > work_area.right_i32() || cell.bottom_i32() > work_area.bottom_i32() {
+        let Some(cell) = shortcut_cell(config, work_area, index) else {
             break;
-        }
+        };
 
         let id = Id::from_name("desktop.shortcut").child(index as u64 + 1);
         let hit = ui.interact(id, cell, Sense::click());
         let selected = index == selection;
+        if hit.clicked {
+            launched = Some(index);
+        }
+        // The cache already holds every icon in its plain state. Only a
+        // highlighted one has to be drawn again, over clean wallpaper.
+        if cached {
+            if !selected && !hit.hovered {
+                continue;
+            }
+            let clip = ui.painter.push_clip(cell);
+            paint::draw_wallpaper_on(&mut ui.painter, theme, &config.wallpaper);
+            ui.painter.restore_clip(clip);
+        }
         if selected {
             ui.painter
                 .fill_rounded_rect_alpha(cell, 4, theme.menu_hover_text, 55);
@@ -1949,33 +3297,25 @@ fn render_shortcuts<const N: usize, const A: usize>(
             ui.painter
                 .fill_rounded_rect_alpha(cell, 4, theme.menu_hover, 70);
         }
-        if let Some(app) = catalog.get(index) {
-            let icon_rect = Rect::new(
-                cell.x + (cell_width - icon_size) / 2,
-                cell.y + 2,
-                icon_size as u32,
-                icon_size as u32,
-            );
-            paint::draw_icon(&mut ui.painter, &app.icon, icon_rect, theme.caption_button);
-            if config.show_labels {
-                draw_shortcut_label(
-                    &mut ui.painter,
-                    Rect::new(cell.x + 2, cell.y + icon_size + 2, cell.width - 4, 30),
-                    app.name(),
-                    if hit.hovered {
-                        theme.desktop_text_hover
-                    } else {
-                        theme.desktop_text
-                    },
-                );
-            }
-        }
-        if hit.clicked {
-            launched = Some(index);
-        }
+        paint_shortcut(
+            &mut ui.painter,
+            theme,
+            config,
+            catalog,
+            index,
+            cell,
+            hit.hovered,
+        );
     }
 
     launched
+}
+
+/// What a window asked for while it was drawn.
+#[derive(Clone, Copy, Default)]
+struct WindowOutcome {
+    close: bool,
+    menu: Option<Point>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1992,12 +3332,15 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
     platform: Option<&Platform>,
     pointer_active: bool,
     keyboard_active: bool,
-) -> bool {
+    paint_app: bool,
+    scratch: Option<&mut [u32]>,
+) -> WindowOutcome {
+    let mut outcome = WindowOutcome::default();
     let Some(window) = windows.get(index).copied() else {
-        return false;
+        return outcome;
     };
     if !window.open || window.state == WindowState::Minimized {
-        return false;
+        return outcome;
     }
 
     let focused = windows.is_focused(index);
@@ -2008,7 +3351,7 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
     };
     let rect = window.rect;
     if rect.width < 80 || rect.height < 40 {
-        return false;
+        return outcome;
     }
 
     // Frame ---------------------------------------------------------------
@@ -2027,7 +3370,6 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
         (theme.title_inactive_top, theme.title_inactive_bottom)
     };
     ui.painter
-        .canvas_mut()
         .fill_vertical_gradient(title, title_top, title_bottom);
     ui.painter.fill_rect(
         Rect::new(title.x, title.bottom_i32() - 1, title.width, 1),
@@ -2039,12 +3381,19 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
         title,
         Sense::drag().with(Sense::CLICK),
     );
-    if title_drag.pressed {
+    // A held button keeps reporting `pressed`; only the first frame raises, or
+    // holding the button down would count as a state change on every frame.
+    if title_drag.pressed && !windows.is_focused(index) {
         windows.focus(index);
     }
+    if ui.pointer_pressed() && title_drag.active {
+        if let Some(window) = windows.get_mut(index) {
+            window.title_moved = false;
+        }
+    }
     if title_drag.dragged {
-        // Dragging a maximised caption restores the window first, exactly as
-        // XP does, then continues moving the restored rectangle.
+        // Dragging a maximised caption restores the window first, then
+        // continues moving the restored rectangle.
         if windows
             .get(index)
             .is_some_and(|window| window.state == WindowState::Maximized)
@@ -2057,14 +3406,31 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
             title_drag.drag_delta.y,
             work_area,
         );
+        if let Some(window) = windows.get_mut(index) {
+            window.title_moved = true;
+        }
     }
-    // Double-clicking a caption maximises or restores the window, matching the
-    // XP window manager.
-    if title_drag.clicked
-        && !title_drag.dragged
-        && clicks.hit(0x2000_0000 | index as u32, ui.pointer(), now_ms)
-    {
-        windows.toggle_maximize(index, work_area);
+    // Double-clicking a caption maximises or restores the window. The release
+    // that ends a drag is not a click, so it cannot start or finish a pair.
+    if title_drag.clicked {
+        if windows.get(index).is_some_and(|window| window.title_moved) {
+            clicks.forget();
+        } else if clicks.hit(0x2000_0000 | index as u32, ui.pointer(), now_ms) {
+            windows.toggle_maximize(index, work_area);
+        }
+    }
+    if title_drag.secondary_clicked {
+        outcome.menu = Some(ui.pointer());
+    }
+    // The icon opens the system menu.
+    let icon_slot = Rect::new(title.x + 3, title.y + 3, 22, title_height.saturating_sub(6));
+    let icon_hit = ui.interact(
+        Id::from_name("desktop.window.icon").child(index as u64 + 1),
+        icon_slot,
+        Sense::click(),
+    );
+    if icon_hit.clicked {
+        outcome.menu = Some(Point::new(rect.x + 4, rect.y + title_height as i32 + 2));
     }
 
     if let Some(app) = catalog.get(window.app) {
@@ -2150,15 +3516,12 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
     );
 
     if close_hit.clicked {
-        if let Some(runtime) = window.runtime {
-            runtime.close_window();
-        }
-        windows.close(index);
-        return false;
+        outcome.close = true;
+        return outcome;
     }
     if minimize_hit.clicked {
         windows.minimize(index);
-        return false;
+        return outcome;
     }
     if maximize_hit.clicked {
         windows.toggle_maximize(index, work_area);
@@ -2167,47 +3530,70 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
     // Content -------------------------------------------------------------
     let content = window::content_rect(rect);
     let clip = ui.painter.push_clip(content);
-    ui.painter.fill_rect(content, theme.window_bg);
+    if paint_app {
+        ui.painter.fill_rect(content, theme.window_bg);
+    }
 
     let body_id = Id::from_name("desktop.window.body").child(index as u64 + 1);
     let body = ui.interact(body_id, content, Sense::click());
-    if body.clicked || body.pressed {
+    if (body.clicked || body.pressed) && !windows.is_focused(index) {
         windows.focus(index);
     }
 
-    let mut close_requested = false;
     let windowed_runtime = window.runtime.filter(|runtime| runtime.windowed());
     if let (Some(runtime), Some(platform)) = (windowed_runtime, platform) {
-        let args = catalog
-            .get(window.app)
-            .map(|app| app.manifest.args.as_str())
-            .unwrap_or("");
-        let mut started = window.app_started;
-        // A window dragged past the framebuffer edge still gets the visible
-        // part of its content. Passing the unclipped rectangle would make
-        // `sub_canvas` fail and leave the frame with only its background.
-        let app_area = content.clipped_to(ui.painter.canvas_rect());
-        if let Some(mut app_canvas) = ui.painter.canvas_mut().sub_canvas(app_area) {
-            let mut context = WindowContext {
-                args,
-                canvas: &mut app_canvas,
-                input,
-                platform,
-                now_ms,
-                origin: Point::new(app_area.x, app_area.y),
-                pointer_active,
-                keyboard_active,
-            };
-            if !started {
-                started = runtime.open_window(&context);
-                if started {
-                    if let Some(window) = windows.get_mut(index) {
-                        window.app_started = true;
+        if paint_app {
+            let visible = content.clipped_to(ui.painter.canvas_rect());
+            let width = content.width as usize;
+            let height = content.height as usize;
+            // The app lays itself out for its window, not for however much of
+            // the window is on screen. When part of it is off-screen, give the
+            // app a full-size surface and copy out what shows.
+            match scratch.filter(|buffer| {
+                visible != content && !content.is_empty() && buffer.len() >= width * height
+            }) {
+                Some(buffer) => {
+                    if let Some(mut surface) = Canvas::new(buffer, width, height, width) {
+                        surface.clear(theme.window_bg);
+                        outcome.close = run_hosted_app(
+                            runtime,
+                            windows,
+                            index,
+                            &window,
+                            &mut surface,
+                            input,
+                            platform,
+                            now_ms,
+                            Point::new(content.x, content.y),
+                            pointer_active,
+                            keyboard_active,
+                        );
+                        ui.painter.blit(
+                            content.x,
+                            content.y,
+                            content.width,
+                            content.height,
+                            surface.pixels(),
+                        );
                     }
                 }
-            }
-            if started && runtime.frame_window(&mut context) == WindowFrame::Close {
-                close_requested = true;
+                None => {
+                    if let Some(mut surface) = ui.painter.canvas_mut().sub_canvas(visible) {
+                        outcome.close = run_hosted_app(
+                            runtime,
+                            windows,
+                            index,
+                            &window,
+                            &mut surface,
+                            input,
+                            platform,
+                            now_ms,
+                            Point::new(visible.x, visible.y),
+                            pointer_active,
+                            keyboard_active,
+                        );
+                    }
+                }
             }
         }
     } else if let Some(app) = catalog.get(window.app) {
@@ -2300,13 +3686,19 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
                 VerticalAlign::Middle,
             );
 
-            let status = if window.launched {
-                "Running in a background process"
-            } else {
-                "Ready - choose the app again to run it"
+            let status = match window.status {
+                WindowStatus::UnknownEntry => "This entry point is not in the shell registry",
+                WindowStatus::SpawnFailed => "The kernel could not start a process for this app",
+                WindowStatus::OpenFailed => "The app could not open its window",
+                WindowStatus::Ready if window.launched => {
+                    "Running in the background; its output goes to the serial console"
+                }
+                WindowStatus::Ready => "Not running - choose the app again to start it",
             };
             let status_color = if window.launched {
                 theme.task_button
+            } else if window.status != WindowStatus::Ready {
+                theme.close_button
             } else {
                 theme.menu_muted
             };
@@ -2368,7 +3760,54 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
         }
     }
 
-    close_requested
+    outcome
+}
+
+/// Starts a hosted app if needed and runs one frame of it. Returns `true` when
+/// the app asked to close.
+#[allow(clippy::too_many_arguments)]
+fn run_hosted_app<const N: usize>(
+    runtime: &'static dyn App,
+    windows: &mut WindowManager<N>,
+    index: usize,
+    window: &DesktopWindow,
+    canvas: &mut Canvas<'_>,
+    input: &Input,
+    platform: &Platform,
+    now_ms: u64,
+    origin: Point,
+    pointer_active: bool,
+    keyboard_active: bool,
+) -> bool {
+    let mut context = WindowContext {
+        args: window.args.as_str(),
+        canvas,
+        input,
+        platform,
+        now_ms,
+        origin,
+        pointer_active,
+        keyboard_active,
+    };
+    let mut started = window.app_started;
+    if !started {
+        started = runtime.open_window(&context);
+        if let Some(slot) = windows.get_mut(index) {
+            slot.app_started = started;
+            slot.status = if started {
+                WindowStatus::Ready
+            } else {
+                WindowStatus::OpenFailed
+            };
+        }
+    }
+    if !started {
+        return false;
+    }
+    if let Some(slot) = windows.get_mut(index) {
+        slot.last_frame_ms = now_ms;
+    }
+    runtime.frame_window(&mut context) == WindowFrame::Close
 }
 
 /// Registers the eight invisible resize grips around a normal window.
@@ -2403,10 +3842,7 @@ fn resize_edges<const UI: usize, const N: usize>(
             ResizeEdge::TopLeft,
             Rect::new(rect.x, rect.y, corner, corner),
         ),
-        (
-            ResizeEdge::TopRight,
-            Rect::new(right - RESIZE_CORNER, rect.y, corner, corner),
-        ),
+        (ResizeEdge::TopRight, top_right_grip(rect, ui.pointer())),
         (
             ResizeEdge::BottomLeft,
             Rect::new(rect.x, bottom - RESIZE_CORNER, corner, corner),
@@ -2463,7 +3899,7 @@ fn resize_edges<const UI: usize, const N: usize>(
             .child(index as u64 + 1)
             .child(edge as u64 + 1);
         let response = ui.interact(id, area, Sense::drag());
-        if response.pressed {
+        if response.pressed && !windows.is_focused(index) {
             windows.focus(index);
         }
         if response.dragged {
@@ -2475,6 +3911,30 @@ fn resize_edges<const UI: usize, const N: usize>(
                 work_area,
             );
         }
+    }
+}
+
+/// The top-right resize grip for a pointer at `point`.
+///
+/// The close button sits in this corner, so unlike the others the grip is only
+/// the thin L along the outside edges. It takes whichever arm is nearer, since
+/// one id can only be registered once per frame.
+fn top_right_grip(rect: Rect, point: Point) -> Rect {
+    let right = rect.right_i32();
+    if point.x >= right - RESIZE_EDGE {
+        Rect::new(
+            right - RESIZE_EDGE,
+            rect.y,
+            RESIZE_EDGE as u32,
+            RESIZE_CORNER as u32,
+        )
+    } else {
+        Rect::new(
+            right - RESIZE_CORNER,
+            rect.y,
+            RESIZE_CORNER as u32,
+            RESIZE_EDGE as u32,
+        )
     }
 }
 
@@ -2497,7 +3957,9 @@ fn resize_edge_at(rect: Rect, point: Point) -> Option<ResizeEdge> {
     if left && top {
         Some(ResizeEdge::TopLeft)
     } else if right && top {
-        Some(ResizeEdge::TopRight)
+        top_right_grip(rect, point)
+            .contains(point)
+            .then_some(ResizeEdge::TopRight)
     } else if left && bottom {
         Some(ResizeEdge::BottomLeft)
     } else if right && bottom {

@@ -116,7 +116,11 @@ fn next_chunk<'a>(input: &'a [u8], pos: usize) -> Result<([u8; 4], &'a [u8], usi
         input[pos + 7],
     ];
     let data_offset = pos + 8;
-    need(input.len(), data_offset, length + 4)?;
+    need(
+        input.len(),
+        data_offset,
+        length.checked_add(4).ok_or(ImageError::Overflow)?,
+    )?;
     let data = &input[data_offset..data_offset + length];
     let expected = be_u32(input, data_offset + length)?;
     let mut crc = Crc32::new();
@@ -337,10 +341,7 @@ pub fn decode(input: &[u8], out: &mut [u8], scratch: &mut [u8]) -> Result<ImageI
                 available: scratch.len(),
             });
         }
-        feos_compress::zlib::decompress(
-            &input[idat.first_data..idat.end],
-            &mut scratch[..raw_len],
-        )?;
+        inflate_exact(&input[idat.first_data..idat.end], &mut scratch[..raw_len])?;
     } else {
         let required = raw_len
             .checked_add(idat.total)
@@ -353,7 +354,7 @@ pub fn decode(input: &[u8], out: &mut [u8], scratch: &mut [u8]) -> Result<ImageI
         }
         let (raw, compressed) = scratch.split_at_mut(raw_len);
         let written = copy_idat(input, pos, compressed)?;
-        feos_compress::zlib::decompress(&compressed[..written], raw)?;
+        inflate_exact(&compressed[..written], raw)?;
     }
 
     unfilter(header, &mut scratch[..raw_len])?;
@@ -367,6 +368,19 @@ pub fn decode(input: &[u8], out: &mut [u8], scratch: &mut [u8]) -> Result<ImageI
         trns_rgb,
     );
     Ok(info)
+}
+
+/// Inflates the image data, which must fill `raw` exactly.
+fn inflate_exact(compressed: &[u8], raw: &mut [u8]) -> Result<()> {
+    match feos_compress::zlib::decompress(compressed, raw) {
+        Ok(written) if written == raw.len() => Ok(()),
+        Ok(_) => Err(ImageError::InvalidData("PNG image data is too short")),
+        // `raw` is sized from IHDR, so this is the file's fault, not the caller's.
+        Err(feos_compress::CompressError::BufferTooSmall { .. }) => {
+            Err(ImageError::InvalidData("PNG image data is too long"))
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn unfilter(header: Header, raw: &mut [u8]) -> Result<()> {

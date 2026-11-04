@@ -13,7 +13,7 @@ use crate::theme::DesktopTheme;
 /// Draws a decoded bundle icon, scaling it to `rect` with nearest-neighbour
 /// sampling. An empty icon becomes a small coloured placeholder.
 pub fn draw_icon(painter: &mut Painter<'_, '_>, icon: &Icon, rect: Rect, fallback: Color) {
-    if rect.is_empty() {
+    if rect.is_empty() || !painter.visible(rect) {
         return;
     }
     if icon.is_empty() {
@@ -53,15 +53,22 @@ pub fn draw_wallpaper<const N: usize>(
     theme: &DesktopTheme,
     config: &WallpaperConfig,
 ) {
-    let full = ui.canvas_rect();
+    draw_wallpaper_on(&mut ui.painter, theme, config);
+}
+
+/// Paints the part of the configured wallpaper inside the painter's clip.
+pub fn draw_wallpaper_on(
+    painter: &mut Painter<'_, '_>,
+    theme: &DesktopTheme,
+    config: &WallpaperConfig,
+) {
+    let full = painter.canvas_rect();
     match config.style {
         WallpaperStyle::Solid => {
-            ui.painter.canvas_mut().fill_rect(full, config.top);
+            painter.fill_rect(full, config.top);
         }
         WallpaperStyle::Gradient | WallpaperStyle::Grid => {
-            ui.painter
-                .canvas_mut()
-                .fill_vertical_gradient(full, config.top, config.bottom);
+            painter.fill_vertical_gradient(full, config.top, config.bottom);
         }
     }
 
@@ -69,14 +76,12 @@ pub fn draw_wallpaper<const N: usize>(
         let step = 48;
         let mut x = full.x;
         while x < full.right_i32() {
-            ui.painter
-                .fill_rect(Rect::new(x, full.y, 1, full.height), config.grid);
+            painter.fill_rect(Rect::new(x, full.y, 1, full.height), config.grid);
             x += step;
         }
         let mut y = full.y;
         while y < full.bottom_i32() {
-            ui.painter
-                .fill_rect(Rect::new(full.x, y, full.width, 1), config.grid);
+            painter.fill_rect(Rect::new(full.x, y, full.width, 1), config.grid);
             y += step;
         }
     }
@@ -94,8 +99,30 @@ pub fn draw_wallpaper<const N: usize>(
             feos_gfx::Point::new(full.right_i32(), full.bottom_i32()),
             feos_gfx::Point::new(full.x, full.bottom_i32()),
         ];
-        ui.painter.fill_polygon(&points, hill);
+        painter.fill_polygon(&points, hill);
     }
+}
+
+/// Draws the label that follows the pointer during a drag.
+pub fn draw_drag_label(
+    painter: &mut Painter<'_, '_>,
+    theme: &DesktopTheme,
+    pointer: feos_gfx::Point,
+    text: &str,
+) {
+    let name = text.rsplit('/').next().unwrap_or(text);
+    let width = (painter.text_width(name, 1) + 12).clamp(40, 260) as u32;
+    let rect = Rect::new(pointer.x + 14, pointer.y + 14, width, 22);
+    painter.fill_rect_alpha(rect, theme.menu_hover, 200);
+    painter.stroke_rect(rect, 1, theme.menu_border);
+    painter.draw_text_ellipsis(
+        Rect::new(rect.x + 6, rect.y, width.saturating_sub(12), rect.height),
+        name,
+        theme.menu_hover_text,
+        1,
+        feos_gui::Align::Start,
+        feos_gui::VerticalAlign::Middle,
+    );
 }
 
 /// Formats the taskbar clock from uptime.
@@ -136,7 +163,7 @@ pub fn draw_start_flag(painter: &mut Painter<'_, '_>, rect: Rect) {
     }
 }
 
-pub use feos_gui::{draw_cursor, draw_cursor_shape, CursorShape};
+pub use feos_gui::{cursor_bounds, draw_cursor, draw_cursor_shape, CursorShape};
 
 #[cfg(test)]
 mod tests {

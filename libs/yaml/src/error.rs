@@ -50,9 +50,14 @@ pub enum YamlError {
     NodeLimit,
     /// More than one document was supplied.
     MultipleDocuments,
-    /// An anchor alias was used. Aliases are not supported.
+    /// An anchor or alias was used. Neither is supported.
     UnsupportedAlias {
-        /// Byte offset of the alias.
+        /// Byte offset of the anchor or alias.
+        offset: usize,
+    },
+    /// A `!tag` was used. Tags are not supported.
+    UnsupportedTag {
+        /// Byte offset of the tag.
         offset: usize,
     },
     /// A buffer supplied by the caller is too small.
@@ -85,6 +90,9 @@ impl fmt::Display for YamlError {
             Self::MultipleDocuments => write!(f, "multiple YAML documents are not supported"),
             Self::UnsupportedAlias { offset } => {
                 write!(f, "anchors and aliases are not supported (offset {offset})")
+            }
+            Self::UnsupportedTag { offset } => {
+                write!(f, "tags are not supported (offset {offset})")
             }
             Self::BufferTooSmall => write!(f, "output buffer is too small"),
         }

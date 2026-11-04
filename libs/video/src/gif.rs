@@ -4,7 +4,10 @@
 //! canvas in `out` and a scratch buffer large enough for the LZW index plane
 //! plus one saved canvas (used by disposal method 3).
 
+use alloc::vec::Vec;
+
 use crate::error::{need, require_rgba, Result, VideoError};
+use crate::index::{DecoderLimits, Index, FLAG_KEY};
 
 const MAX_CODES: usize = 4096;
 
@@ -71,53 +74,137 @@ fn skip_sub_blocks(data: &[u8], mut pos: usize) -> Result<usize> {
     }
 }
 
+/// One frame's headers, read from its graphic control extension and image
+/// descriptor.
+#[derive(Clone, Copy, Debug)]
+struct FrameHeader {
+    left: usize,
+    top: usize,
+    width: usize,
+    height: usize,
+    /// Local colour table, as offsets into the input.
+    palette: Option<(usize, usize)>,
+    interlaced: bool,
+    min_code: u8,
+    /// Start of the LZW sub-blocks.
+    data: usize,
+    /// Where the next block starts.
+    next: usize,
+    disposal: u8,
+    transparent: Option<u8>,
+    delay_ms: u32,
+}
+
+/// Reads blocks from `pos` up to and including the next frame. `None` means the
+/// stream is over: at a trailer, or at the end of the file for one without
+/// a trailer, which browsers and most players also accept.
+fn next_frame(input: &[u8], mut pos: usize) -> Result<Option<FrameHeader>> {
+    let mut disposal = 0u8;
+    let mut transparent = None;
+    let mut delay_ms = 0u32;
+    loop {
+        let Some(&block) = input.get(pos) else {
+            return Ok(None);
+        };
+        pos += 1;
+        match block {
+            0x21 => {
+                let Some(&label) = input.get(pos) else {
+                    return Ok(None);
+                };
+                pos += 1;
+                if label == 0xf9 {
+                    let Some(&size) = input.get(pos) else {
+                        return Ok(None);
+                    };
+                    let size = size as usize;
+                    if need(input.len(), pos + 1, size).is_err() {
+                        return Ok(None);
+                    }
+                    if size >= 4 {
+                        let packed = input[pos + 1];
+                        delay_ms = u16::from_le_bytes([input[pos + 2], input[pos + 3]]) as u32 * 10;
+                        disposal = (packed >> 2) & 0x07;
+                        transparent = if packed & 0x01 != 0 {
+                            Some(input[pos + 4])
+                        } else {
+                            None
+                        };
+                    }
+                    pos += 1 + size;
+                }
+                let Ok(next) = skip_sub_blocks(input, pos) else {
+                    return Ok(None);
+                };
+                pos = next;
+            }
+            0x2c => {
+                if need(input.len(), pos, 9).is_err() {
+                    return Ok(None);
+                }
+                let left = u16::from_le_bytes([input[pos], input[pos + 1]]) as usize;
+                let top = u16::from_le_bytes([input[pos + 2], input[pos + 3]]) as usize;
+                let width = u16::from_le_bytes([input[pos + 4], input[pos + 5]]) as usize;
+                let height = u16::from_le_bytes([input[pos + 6], input[pos + 7]]) as usize;
+                let packed = input[pos + 8];
+                pos += 9;
+                let mut palette = None;
+                if packed & 0x80 != 0 {
+                    let len = (1usize << ((packed & 0x07) as usize + 1)) * 3;
+                    if need(input.len(), pos, len).is_err() {
+                        return Ok(None);
+                    }
+                    palette = Some((pos, pos + len));
+                    pos += len;
+                }
+                let Some(&min_code) = input.get(pos) else {
+                    return Ok(None);
+                };
+                if min_code > 8 {
+                    return Err(VideoError::InvalidData("GIF LZW code size"));
+                }
+                pos += 1;
+                // A frame cut off by the end of the file shows what it has.
+                let next = skip_sub_blocks(input, pos).unwrap_or(input.len());
+                return Ok(Some(FrameHeader {
+                    left,
+                    top,
+                    width,
+                    height,
+                    palette,
+                    interlaced: packed & 0x40 != 0,
+                    min_code,
+                    data: pos,
+                    next,
+                    disposal,
+                    transparent,
+                    delay_ms,
+                }));
+            }
+            0x3b => return Ok(None),
+            _ => return Err(VideoError::InvalidData("GIF block")),
+        }
+    }
+}
+
 fn parse_info(input: &[u8]) -> Result<GifInfo> {
     let head = header(input)?;
     let mut pos = head.pos;
     let mut frames = 0u32;
     let mut first_delay = 0u32;
-    let mut delay = 0u32;
     loop {
-        let block = *input.get(pos).ok_or(VideoError::UnexpectedEnd)?;
-        pos += 1;
-        match block {
-            0x21 => {
-                let label = *input.get(pos).ok_or(VideoError::UnexpectedEnd)?;
-                pos += 1;
-                if label == 0xf9 {
-                    let size = *input.get(pos).ok_or(VideoError::UnexpectedEnd)? as usize;
-                    need(input.len(), pos + 1, size)?;
-                    if size >= 4 {
-                        delay = u16::from_le_bytes([input[pos + 2], input[pos + 3]]) as u32 * 10;
-                    }
-                    pos = skip_sub_blocks(input, pos + 1 + size)?;
-                } else {
-                    pos = skip_sub_blocks(input, pos)?;
-                }
-            }
-            0x2c => {
-                need(input.len(), pos, 9)?;
-                let packed = input[pos + 8];
-                pos += 9;
-                if packed & 0x80 != 0 {
-                    let colors = 1usize << ((packed & 0x07) as usize + 1);
-                    let len = colors * 3;
-                    need(input.len(), pos, len)?;
-                    pos += len;
-                }
-                let min_code = *input.get(pos).ok_or(VideoError::UnexpectedEnd)?;
-                if min_code > 8 {
-                    return Err(VideoError::InvalidData("GIF LZW code size"));
-                }
-                pos += 1;
+        match next_frame(input, pos) {
+            Ok(Some(frame)) => {
                 if frames == 0 {
-                    first_delay = delay;
+                    first_delay = frame.delay_ms;
                 }
                 frames = frames.saturating_add(1);
-                pos = skip_sub_blocks(input, pos)?;
+                pos = frame.next;
             }
-            0x3b => break,
-            _ => return Err(VideoError::InvalidData("GIF block")),
+            Ok(None) => break,
+            // Junk after real frames ends the animation early.
+            Err(_) if frames > 0 => break,
+            Err(error) => return Err(error),
         }
     }
     if frames == 0 {
@@ -154,32 +241,31 @@ impl<'a> SubBlocks<'a> {
         Self { data, pos, left: 0 }
     }
 
-    fn next_byte(&mut self) -> Result<Option<u8>> {
+    /// The next data byte. `None` at the terminator, or where a truncated file
+    /// ends.
+    fn next_byte(&mut self) -> Option<u8> {
         if self.left == 0 {
-            let n = *self.data.get(self.pos).ok_or(VideoError::UnexpectedEnd)? as usize;
+            let n = *self.data.get(self.pos)? as usize;
             self.pos += 1;
             if n == 0 {
-                return Ok(None);
+                return None;
             }
             self.left = n;
         }
-        need(self.data.len(), self.pos, 1)?;
-        let byte = self.data[self.pos];
+        let byte = *self.data.get(self.pos)?;
         self.pos += 1;
         self.left -= 1;
-        Ok(Some(byte))
-    }
-
-    fn finish(mut self) -> Result<usize> {
-        if self.left != 0 {
-            need(self.data.len(), self.pos, self.left)?;
-            self.pos += self.left;
-        }
-        skip_sub_blocks(self.data, self.pos)
+        Some(byte)
     }
 }
 
-fn lzw_decode(reader: &mut SubBlocks<'_>, min_code_size: u8, out: &mut [u8]) -> Result<usize> {
+/// Decodes LZW data, passing each run of indices to `sink`. A stream that runs
+/// out without an end code is treated as complete: the frame shows what it has.
+fn lzw_decode(
+    reader: &mut SubBlocks<'_>,
+    min_code_size: u8,
+    sink: &mut dyn FnMut(&[u8]),
+) -> Result<()> {
     if !(2..=8).contains(&min_code_size) {
         return Err(VideoError::InvalidData("GIF LZW minimum code size"));
     }
@@ -197,11 +283,12 @@ fn lzw_decode(reader: &mut SubBlocks<'_>, min_code_size: u8, out: &mut [u8]) -> 
     let mut previous: Option<usize> = None;
     let mut bits = 0u32;
     let mut bit_count = 0u32;
-    let mut written = 0usize;
 
     loop {
         while bit_count < code_size {
-            let byte = reader.next_byte()?.ok_or(VideoError::UnexpectedEnd)?;
+            let Some(byte) = reader.next_byte() else {
+                return Ok(());
+            };
             bits |= (byte as u32) << bit_count;
             bit_count += 8;
         }
@@ -236,6 +323,9 @@ fn lzw_decode(reader: &mut SubBlocks<'_>, min_code_size: u8, out: &mut [u8]) -> 
                     cursor = prefix[cursor] as usize;
                 }
                 first = suffix[cursor];
+                if top == 0 {
+                    return Err(VideoError::InvalidData("GIF LZW chain"));
+                }
                 top -= 1;
                 stack[top] = first;
             } else if code == next {
@@ -256,6 +346,9 @@ fn lzw_decode(reader: &mut SubBlocks<'_>, min_code_size: u8, out: &mut [u8]) -> 
                     stack[top] = suffix[cursor];
                     cursor = prefix[cursor] as usize;
                 }
+                if top == 0 {
+                    return Err(VideoError::InvalidData("GIF LZW chain"));
+                }
                 top -= 1;
                 stack[top] = suffix[cursor];
             } else {
@@ -270,15 +363,7 @@ fn lzw_decode(reader: &mut SubBlocks<'_>, min_code_size: u8, out: &mut [u8]) -> 
             stack[top] = first;
         }
 
-        let count = MAX_CODES - top;
-        if written + count > out.len() {
-            return Err(VideoError::BufferTooSmall {
-                required: written + count,
-                available: out.len(),
-            });
-        }
-        out[written..written + count].copy_from_slice(&stack[top..]);
-        written += count;
+        sink(&stack[top..]);
 
         if let Some(prev) = previous {
             if next < MAX_CODES {
@@ -293,7 +378,7 @@ fn lzw_decode(reader: &mut SubBlocks<'_>, min_code_size: u8, out: &mut [u8]) -> 
         previous = Some(code);
     }
 
-    Ok(written)
+    Ok(())
 }
 
 #[inline]
@@ -314,49 +399,64 @@ fn interlaced_row(index: usize, height: usize) -> usize {
     index.min(height.saturating_sub(1))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draw_frame(
-    indices: &[u8],
-    width: usize,
-    height: usize,
-    left: usize,
-    top: usize,
-    canvas_width: usize,
-    canvas_height: usize,
-    palette: &[u8],
-    transparent: Option<u8>,
-    interlaced: bool,
-    out: &mut [u8],
-) {
-    for src_y in 0..height {
-        let y = if interlaced {
-            interlaced_row(src_y, height)
-        } else {
-            src_y
-        };
-        let y = top + y;
-        if y >= canvas_height {
-            continue;
-        }
-        for x in 0..width {
-            let dx = left + x;
-            if dx >= canvas_width {
-                continue;
+/// Decodes one frame's pixels onto `canvas`, clipping to its bounds, so a frame
+/// larger than the canvas is fine. Pixels a short stream doesn't reach keep what
+/// was there.
+fn draw_frame(input: &[u8], head: &Header<'_>, frame: &FrameHeader, canvas: &mut [u8]) -> Result<()> {
+    if frame.width == 0 || frame.height == 0 {
+        return Err(VideoError::InvalidData("GIF frame dimensions"));
+    }
+    let palette = frame.palette.map_or(head.global, |(a, b)| &input[a..b]);
+    let canvas_width = head.width as usize;
+    let canvas_height = head.height as usize;
+    let mut position = 0usize;
+    let total = frame.width.saturating_mul(frame.height);
+    let mut reader = SubBlocks::new(input, frame.data);
+    lzw_decode(&mut reader, frame.min_code, &mut |indices| {
+        for &index in indices {
+            if position >= total {
+                return;
             }
-            let index = indices[src_y * width + x];
-            if transparent == Some(index) {
+            let src_y = position / frame.width;
+            let src_x = position % frame.width;
+            position += 1;
+            let row = if frame.interlaced {
+                interlaced_row(src_y, frame.height)
+            } else {
+                src_y
+            };
+            let y = frame.top + row;
+            let x = frame.left + src_x;
+            if x >= canvas_width || y >= canvas_height || frame.transparent == Some(index) {
                 continue;
             }
             let pi = index as usize * 3;
-            if pi + 2 >= palette.len() {
-                continue;
+            if let Some(rgb) = palette.get(pi..pi + 3) {
+                let o = (y * canvas_width + x) * 4;
+                canvas[o..o + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
             }
-            let o = (y * canvas_width + dx) * 4;
-            out[o] = palette[pi];
-            out[o + 1] = palette[pi + 1];
-            out[o + 2] = palette[pi + 2];
-            out[o + 3] = 255;
         }
+    })
+}
+
+/// Applies a frame's disposal method once it has been shown. Disposal 2 restores
+/// the frame's rectangle to transparent, which is what browsers do, rather than
+/// painting the opaque background colour.
+fn dispose(head: &Header<'_>, frame: &FrameHeader, canvas: &mut [u8], saved: &[u8]) {
+    let canvas_width = head.width as usize;
+    match frame.disposal {
+        2 => {
+            let bottom = (frame.top + frame.height).min(head.height as usize);
+            let right = (frame.left + frame.width).min(canvas_width);
+            for y in frame.top..bottom {
+                for x in frame.left..right {
+                    let o = (y * canvas_width + x) * 4;
+                    canvas[o..o + 4].copy_from_slice(&[0, 0, 0, 0]);
+                }
+            }
+        }
+        3 => canvas.copy_from_slice(saved),
+        _ => {}
     }
 }
 
@@ -379,135 +479,172 @@ pub(crate) fn decode_frame(
             available: scratch.len(),
         });
     }
-    let (indices, saved) = scratch.split_at_mut(pixels);
-
-    for px in out[..canvas_len].chunks_exact_mut(4) {
-        px.copy_from_slice(&[0, 0, 0, 0]);
-    }
+    let saved = &mut scratch[pixels..pixels + canvas_len];
+    let canvas = &mut out[..canvas_len];
+    canvas.fill(0);
 
     let mut pos = head.pos;
     let mut frame_index = 0u32;
-    let mut disposal = 0u8;
-    let mut transparent = None;
-    let mut gce_delay = 0u32;
+    while let Some(frame) = next_frame(input, pos)? {
+        if frame.disposal == 3 {
+            saved.copy_from_slice(canvas);
+        }
+        draw_frame(input, &head, &frame, canvas)?;
+        if frame_index == index {
+            return Ok(frame.delay_ms);
+        }
+        frame_index += 1;
+        dispose(&head, &frame, canvas, saved);
+        pos = frame.next;
+    }
+    Err(VideoError::FrameOutOfRange {
+        index,
+        count: frame_index,
+    })
+}
 
+/// Browsers treat a delay under 20 ms as 100 ms, and animations are authored for
+/// that, so an unset delay doesn't mean as fast as possible.
+fn playable_delay(delay_ms: u32) -> u32 {
+    if delay_ms < 20 {
+        100
+    } else {
+        delay_ms
+    }
+}
+
+/// Builds the frame table: where each frame's blocks start, when it's shown, and
+/// which frames repaint the whole canvas and so need nothing before them.
+pub(crate) fn build_index(input: &[u8], limits: &DecoderLimits) -> Result<Index> {
+    let head = header(input)?;
+    let mut index = Index::default();
+    let mut pos = head.pos;
+    let mut time = 0i64;
+    let mut last_delay = 100;
     loop {
-        let block = *input.get(pos).ok_or(VideoError::UnexpectedEnd)?;
-        pos += 1;
-        match block {
-            0x21 => {
-                let label = *input.get(pos).ok_or(VideoError::UnexpectedEnd)?;
-                pos += 1;
-                if label == 0xf9 {
-                    let size = *input.get(pos).ok_or(VideoError::UnexpectedEnd)? as usize;
-                    need(input.len(), pos + 1, size)?;
-                    if size >= 4 {
-                        let packed = input[pos + 1];
-                        gce_delay =
-                            u16::from_le_bytes([input[pos + 2], input[pos + 3]]) as u32 * 10;
-                        disposal = (packed >> 2) & 0x07;
-                        transparent = if packed & 0x01 != 0 {
-                            Some(input[pos + 4])
-                        } else {
-                            None
-                        };
-                    }
-                    pos = skip_sub_blocks(input, pos + 1 + size)?;
-                } else {
-                    pos = skip_sub_blocks(input, pos)?;
-                }
-            }
-            0x2c => {
-                need(input.len(), pos, 9)?;
-                let left = u16::from_le_bytes([input[pos], input[pos + 1]]) as usize;
-                let top = u16::from_le_bytes([input[pos + 2], input[pos + 3]]) as usize;
-                let width = u16::from_le_bytes([input[pos + 4], input[pos + 5]]) as usize;
-                let height = u16::from_le_bytes([input[pos + 6], input[pos + 7]]) as usize;
-                let packed = input[pos + 8];
-                pos += 9;
-                if width == 0 || height == 0 {
-                    return Err(VideoError::InvalidData("GIF frame dimensions"));
-                }
-                let local;
-                if packed & 0x80 != 0 {
-                    let colors = 1usize << ((packed & 0x07) as usize + 1);
-                    let len = colors * 3;
-                    need(input.len(), pos, len)?;
-                    local = &input[pos..pos + len];
-                    pos += len;
-                } else {
-                    local = head.global;
-                }
-                let interlaced = packed & 0x40 != 0;
-                let min_code = *input.get(pos).ok_or(VideoError::UnexpectedEnd)?;
-                if min_code > 8 {
-                    return Err(VideoError::InvalidData("GIF LZW code size"));
-                }
-                pos += 1;
-                let mut reader = SubBlocks::new(input, pos);
-                let index_count = width.checked_mul(height).ok_or(VideoError::Overflow)?;
-                if index_count > indices.len() {
-                    return Err(VideoError::BufferTooSmall {
-                        required: index_count,
-                        available: indices.len(),
-                    });
-                }
-                let decoded = lzw_decode(&mut reader, min_code, &mut indices[..index_count])?;
-                if decoded < index_count {
-                    // Some encoders end the LZW stream early; pad with the
-                    // last index so a short frame still has defined pixels.
-                    let fill = indices.get(decoded.saturating_sub(1)).copied().unwrap_or(0);
-                    for item in &mut indices[decoded..index_count] {
-                        *item = fill;
-                    }
-                }
-                pos = reader.finish()?;
+        let frame = match next_frame(input, pos) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(_) if !index.samples.is_empty() => break,
+            Err(error) => return Err(error),
+        };
+        let covers = frame.left == 0
+            && frame.top == 0
+            && frame.width >= head.width as usize
+            && frame.height >= head.height as usize
+            && frame.transparent.is_none();
+        let flags = if covers || index.samples.is_empty() {
+            FLAG_KEY
+        } else {
+            0
+        };
+        index.push(limits, input.len(), pos, frame.next.max(pos) - pos, time, flags)?;
+        last_delay = playable_delay(frame.delay_ms);
+        time = time.saturating_add(last_delay as i64);
+        pos = frame.next;
+    }
+    index.last_delay_ms = last_delay;
+    Ok(index)
+}
 
-                if disposal == 3 {
-                    saved.copy_from_slice(&out[..canvas_len]);
-                }
-                draw_frame(
-                    &indices[..index_count],
-                    width,
-                    height,
-                    left,
-                    top,
-                    head.width as usize,
-                    head.height as usize,
-                    local,
-                    transparent,
-                    interlaced,
-                    out,
-                );
-                if frame_index == index {
-                    return Ok(gce_delay);
-                }
-                frame_index += 1;
+/// The composited animation state behind the stateful decoder.
+pub(crate) struct GifStream {
+    canvas: Vec<u8>,
+    saved: Vec<u8>,
+    /// The frame now composited on the canvas and waiting for disposal.
+    shown: Option<(u32, FrameHeader)>,
+}
 
-                match disposal {
-                    2 => {
-                        // Restore the frame rectangle to the background.
-                        for y in top..(top + height).min(head.height as usize) {
-                            for x in left..(left + width).min(head.width as usize) {
-                                let o = (y * head.width as usize + x) * 4;
-                                out[o..o + 4].copy_from_slice(&head.background);
-                            }
-                        }
-                    }
-                    3 => out[..canvas_len].copy_from_slice(saved),
-                    _ => {}
+impl GifStream {
+    pub(crate) fn new(width: u32, height: u32) -> Result<Self> {
+        let len = crate::pixel::rgba_len(width, height)?;
+        Ok(Self {
+            canvas: zeroed(len)?,
+            saved: zeroed(len)?,
+            shown: None,
+        })
+    }
+
+    /// Composites up to `budget` frames towards `target`. Returns true when
+    /// `out` holds it.
+    pub(crate) fn advance(
+        &mut self,
+        input: &[u8],
+        index: &Index,
+        target: u32,
+        budget: u32,
+        out: &mut [u8],
+    ) -> Result<bool> {
+        let head = header(input)?;
+        let len = self.canvas.len();
+        require_rgba(out, head.width, head.height)?;
+        let key = crate::decoder::key_at_or_before(index, target);
+        let restart = match self.shown {
+            Some((shown, _)) => target < shown || key as u32 > shown,
+            None => true,
+        };
+        let mut next = match self.shown {
+            Some((shown, _)) if !restart => shown,
+            _ => key as u32,
+        };
+        if restart {
+            self.canvas.fill(0);
+            self.shown = None;
+        }
+        let mut fed = 0;
+        loop {
+            if let Some((shown, frame)) = self.shown {
+                if shown == target {
+                    out[..len].copy_from_slice(&self.canvas);
+                    return Ok(true);
                 }
-                disposal = 0;
-                transparent = None;
-                gce_delay = 0;
+                dispose(&head, &frame, &mut self.canvas, &self.saved);
+                next = shown + 1;
+                self.shown = None;
             }
-            0x3b => {
-                return Err(VideoError::FrameOutOfRange {
-                    index,
-                    count: frame_index,
-                });
+            if fed >= budget {
+                // Remember the position by re-entering from the last frame.
+                return self.park(next, input, index);
             }
-            _ => return Err(VideoError::InvalidData("GIF block")),
+            fed += 1;
+            let sample = index.samples.get(next as usize).copied().ok_or(
+                VideoError::FrameOutOfRange {
+                    index: target,
+                    count: index.samples.len() as u32,
+                },
+            )?;
+            let frame = next_frame(input, sample.offset as usize)?
+                .ok_or(VideoError::InvalidData("GIF frame table"))?;
+            if frame.disposal == 3 {
+                self.saved.copy_from_slice(&self.canvas);
+            }
+            // A damaged frame leaves the canvas as it was, and the animation
+            // carries on.
+            let _ = draw_frame(input, &head, &frame, &mut self.canvas);
+            self.shown = Some((next, frame));
         }
     }
+
+    /// Stops between frames: frame `next` is composited on the following call.
+    fn park(&mut self, next: u32, input: &[u8], index: &Index) -> Result<bool> {
+        // Nothing to dispose of: `shown` of `next - 1` was disposed already, so
+        // record that with a frame whose disposal does nothing.
+        if next > 0 {
+            let sample = index.samples[(next - 1) as usize];
+            if let Some(mut frame) = next_frame(input, sample.offset as usize)? {
+                frame.disposal = 0;
+                self.shown = Some((next - 1, frame));
+            }
+        }
+        Ok(false)
+    }
+}
+
+fn zeroed(len: usize) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| VideoError::OutOfMemory)?;
+    bytes.resize(len, 0);
+    Ok(bytes)
 }

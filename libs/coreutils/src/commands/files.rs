@@ -4,115 +4,119 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use super::opts::{bad_option, Opt, Opts};
 use super::{
-    error, format_size, is_option, parse_usize, path_error, usage, write_line, write_out, Ctx,
+    error, format_size, parse_usize, path_error, usage, write_line, write_out, Ctx, MAX_WALK_DEPTH,
 };
 use crate::fs::{base_name, join as fs_join, FsError, Kind, Meta};
-use crate::glob::glob_match;
 
 #[derive(Clone, Copy)]
 struct LsOptions {
     long: bool,
     all: bool,
+    almost_all: bool,
     human: bool,
     recursive: bool,
     directory: bool,
     reverse: bool,
     classify: bool,
+    by_size: bool,
 }
 
 pub(super) fn ls(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
     let mut options = LsOptions {
         long: false,
         all: false,
+        almost_all: false,
         human: false,
         recursive: false,
         directory: false,
         reverse: false,
         classify: false,
+        by_size: false,
     };
-    let mut paths: Vec<String> = Vec::new();
-    let mut parse_options = true;
-
-    for arg in args {
-        if parse_options && arg == "--" {
-            parse_options = false;
-        } else if parse_options && is_option(arg) {
-            for flag in arg[1..].chars() {
-                match flag {
-                    'l' => options.long = true,
-                    'a' => options.all = true,
-                    'h' => options.human = true,
-                    'R' => options.recursive = true,
-                    'd' => options.directory = true,
-                    'r' => options.reverse = true,
-                    'F' => options.classify = true,
-                    '1' => {}
-                    other => {
-                        error(ctx.stderr, "ls", &format!("invalid option -- '{other}'"));
-                        return 2;
-                    }
-                }
-            }
-        } else {
-            paths.push(arg.clone());
+    let mut opts = Opts::new(args, "laAhRdrF1S");
+    while let Some(opt) = opts.next() {
+        match opt {
+            Opt::Flag('l') => options.long = true,
+            Opt::Flag('a') => options.all = true,
+            Opt::Flag('A') => options.almost_all = true,
+            Opt::Flag('h') => options.human = true,
+            Opt::Flag('R') => options.recursive = true,
+            Opt::Flag('d') => options.directory = true,
+            Opt::Flag('r') => options.reverse = true,
+            Opt::Flag('F') => options.classify = true,
+            Opt::Flag('S') => options.by_size = true,
+            Opt::Flag('1') => {}
+            other => return bad_option(ctx, "ls", other),
         }
     }
-
+    let mut paths = core::mem::take(&mut opts.operands);
     if paths.is_empty() {
         paths.push(String::from("."));
     }
 
     let mut status = 0;
-    for (index, path) in paths.iter().enumerate() {
-        let header = paths.len() > 1;
+    let mut first = true;
+    let header = paths.len() > 1;
+    // Files come first and directories get headers, as POSIX describes.
+    let mut directories: Vec<&String> = Vec::new();
+    for path in &paths {
         match ctx.fs.meta(path) {
             Ok(meta) if meta.kind == Kind::File || options.directory => {
-                if header {
-                    write_line(ctx.stdout, format_args!("{path}:"));
-                }
-                print_entry(ctx, base_name(path), meta, &options);
+                print_entry(ctx, path, meta, &options);
+                first = false;
             }
-            Ok(_) => {
-                if header {
-                    if index > 0 {
-                        write_line(ctx.stdout, format_args!(""));
-                    }
-                    write_line(ctx.stdout, format_args!("{path}:"));
-                }
-                if let Err(err) = ls_directory(ctx, path, &options) {
-                    path_error(ctx.stderr, "ls", path, err);
-                    status = 1;
-                }
-            }
+            Ok(_) => directories.push(path),
             Err(err) => {
                 path_error(ctx.stderr, "ls", path, err);
-                status = 1;
+                status = 2;
             }
+        }
+    }
+    for path in directories {
+        if header {
+            if !first {
+                write_line(ctx.stdout, format_args!(""));
+            }
+            write_line(ctx.stdout, format_args!("{path}:"));
+        }
+        first = false;
+        if let Err(err) = ls_directory(ctx, path, &options, 0) {
+            path_error(ctx.stderr, "ls", path, err);
+            status = 2;
         }
     }
     status
 }
 
-fn ls_directory(ctx: &mut Ctx<'_>, path: &str, options: &LsOptions) -> Result<(), FsError> {
+fn ls_directory(
+    ctx: &mut Ctx<'_>,
+    path: &str,
+    options: &LsOptions,
+    depth: usize,
+) -> Result<(), FsError> {
+    if depth > MAX_WALK_DEPTH {
+        return Err(FsError::TooDeep);
+    }
     let mut entries = ctx.fs.read_dir(path)?;
+    if !options.all && !options.almost_all {
+        entries.retain(|entry| !entry.name.starts_with('.'));
+    }
+    if options.by_size {
+        entries.sort_by(|left, right| right.size.cmp(&left.size));
+    }
     if options.all {
-        entries.insert(
-            0,
-            crate::fs::DirEntry {
-                name: String::from("."),
-                kind: Kind::Dir,
-                size: 0,
-            },
-        );
-        entries.insert(
-            0,
-            crate::fs::DirEntry {
-                name: String::from(".."),
-                kind: Kind::Dir,
-                size: 0,
-            },
-        );
+        for name in [".", ".."] {
+            entries.insert(
+                if name == "." { 0 } else { 1 },
+                crate::fs::DirEntry {
+                    name: String::from(name),
+                    kind: Kind::Dir,
+                    size: 0,
+                },
+            );
+        }
     }
     if options.reverse {
         entries.reverse();
@@ -131,10 +135,13 @@ fn ls_directory(ctx: &mut Ctx<'_>, path: &str, options: &LsOptions) -> Result<()
             if entry.kind != Kind::Dir || entry.name == "." || entry.name == ".." {
                 continue;
             }
+            if ctx.cancelled() {
+                break;
+            }
             let child = fs_join(path, &entry.name);
             write_line(ctx.stdout, format_args!(""));
             write_line(ctx.stdout, format_args!("{child}:"));
-            ls_directory(ctx, &child, options)?;
+            ls_directory(ctx, &child, options, depth + 1)?;
         }
     }
     Ok(())
@@ -172,27 +179,18 @@ pub(super) fn cat(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
     let mut number_nonblank = false;
     let mut squeeze = false;
     let mut show_ends = false;
-    let mut files: Vec<String> = Vec::new();
-
-    for arg in args {
-        if is_option(arg) && arg != "-" {
-            for flag in arg[1..].chars() {
-                match flag {
-                    'n' => number = true,
-                    'b' => number_nonblank = true,
-                    's' => squeeze = true,
-                    'A' => show_ends = true,
-                    'E' => show_ends = true,
-                    other => {
-                        error(ctx.stderr, "cat", &format!("invalid option -- '{other}'"));
-                        return 2;
-                    }
-                }
-            }
-        } else {
-            files.push(arg.clone());
+    let mut opts = Opts::new(args, "nbsAEu");
+    while let Some(opt) = opts.next() {
+        match opt {
+            Opt::Flag('n') => number = true,
+            Opt::Flag('b') => number_nonblank = true,
+            Opt::Flag('s') => squeeze = true,
+            Opt::Flag('A' | 'E') => show_ends = true,
+            Opt::Flag('u') => {}
+            other => return bad_option(ctx, "cat", other),
         }
     }
+    let mut files = core::mem::take(&mut opts.operands);
     if files.is_empty() {
         files.push(String::from("-"));
     }
@@ -200,8 +198,18 @@ pub(super) fn cat(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
     let mut status = 0;
     let mut line_number = 1usize;
     let mut blank_run = false;
+    let plain = !(number || number_nonblank || squeeze || show_ends);
 
     for file in files {
+        if plain {
+            // Plain `cat` streams, so a file bigger than the heap still works.
+            if let Err(err) = copy_to_stdout(ctx, &file) {
+                path_error(ctx.stderr, "cat", &file, err);
+                status = 1;
+            }
+            continue;
+        }
+
         let data = match super::read_path(ctx, &file) {
             Ok(data) => data,
             Err(err) => {
@@ -210,11 +218,6 @@ pub(super) fn cat(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
                 continue;
             }
         };
-
-        if !(number || number_nonblank || squeeze || show_ends) {
-            ctx.stdout.write(&data);
-            continue;
-        }
 
         for line in super::split_lines(&data) {
             let has_newline = line.ends_with(b"\n");
@@ -246,27 +249,40 @@ pub(super) fn cat(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
     status
 }
 
+/// Copies a file or standard input to standard output in small pieces.
+fn copy_to_stdout(ctx: &mut Ctx<'_>, file: &str) -> Result<(), FsError> {
+    let mut chunk = [0u8; 4096];
+    let mut offset = 0usize;
+    loop {
+        let read = if file == "-" {
+            ctx.stdin.read(&mut chunk)
+        } else {
+            ctx.fs.read_at(file, offset, &mut chunk)?
+        };
+        if read == 0 {
+            return Ok(());
+        }
+        ctx.stdout.write(&chunk[..read]);
+        offset += read;
+        if ctx.cancelled() {
+            return Ok(());
+        }
+    }
+}
+
 pub(super) fn mkdir(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
     let mut parents = false;
     let mut verbose = false;
-    let mut dirs: Vec<String> = Vec::new();
-
-    for arg in args {
-        if is_option(arg) {
-            for flag in arg[1..].chars() {
-                match flag {
-                    'p' => parents = true,
-                    'v' => verbose = true,
-                    other => {
-                        error(ctx.stderr, "mkdir", &format!("invalid option -- '{other}'"));
-                        return 2;
-                    }
-                }
-            }
-        } else {
-            dirs.push(arg.clone());
+    let mut opts = Opts::new(args, "pvm:");
+    while let Some(opt) = opts.next() {
+        match opt {
+            Opt::Flag('p') => parents = true,
+            Opt::Flag('v') => verbose = true,
+            Opt::Value('m', _) => {}
+            other => return bad_option(ctx, "mkdir", other),
         }
     }
+    let dirs = core::mem::take(&mut opts.operands);
     if dirs.is_empty() {
         return usage(ctx.stderr, "mkdir", "mkdir [-pv] DIR...");
     }
@@ -313,24 +329,15 @@ fn create_parents(ctx: &mut Ctx<'_>, path: &str) -> Result<(), FsError> {
 pub(super) fn rmdir(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
     let mut parents = false;
     let mut verbose = false;
-    let mut dirs: Vec<String> = Vec::new();
-
-    for arg in args {
-        if is_option(arg) {
-            for flag in arg[1..].chars() {
-                match flag {
-                    'p' => parents = true,
-                    'v' => verbose = true,
-                    other => {
-                        error(ctx.stderr, "rmdir", &format!("invalid option -- '{other}'"));
-                        return 2;
-                    }
-                }
-            }
-        } else {
-            dirs.push(arg.clone());
+    let mut opts = Opts::new(args, "pv");
+    while let Some(opt) = opts.next() {
+        match opt {
+            Opt::Flag('p') => parents = true,
+            Opt::Flag('v') => verbose = true,
+            other => return bad_option(ctx, "rmdir", other),
         }
     }
+    let dirs = core::mem::take(&mut opts.operands);
     if dirs.is_empty() {
         return usage(ctx.stderr, "rmdir", "rmdir [-pv] DIR...");
     }
@@ -372,26 +379,18 @@ pub(super) fn rm(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
     let mut force = false;
     let mut verbose = false;
     let mut dir_ok = false;
-    let mut paths: Vec<String> = Vec::new();
-
-    for arg in args {
-        if is_option(arg) && arg != "-" {
-            for flag in arg[1..].chars() {
-                match flag {
-                    'r' | 'R' => recursive = true,
-                    'f' => force = true,
-                    'v' => verbose = true,
-                    'd' => dir_ok = true,
-                    other => {
-                        error(ctx.stderr, "rm", &format!("invalid option -- '{other}'"));
-                        return 2;
-                    }
-                }
-            }
-        } else {
-            paths.push(arg.clone());
+    let mut opts = Opts::new(args, "rRfvdi");
+    while let Some(opt) = opts.next() {
+        match opt {
+            Opt::Flag('r' | 'R') => recursive = true,
+            Opt::Flag('f') => force = true,
+            Opt::Flag('v') => verbose = true,
+            Opt::Flag('d') => dir_ok = true,
+            Opt::Flag('i') => {}
+            other => return bad_option(ctx, "rm", other),
         }
     }
+    let paths = core::mem::take(&mut opts.operands);
     if paths.is_empty() {
         if force {
             return 0;
@@ -401,6 +400,15 @@ pub(super) fn rm(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
 
     let mut status = 0;
     for path in paths {
+        if path == "." || path == ".." || path.ends_with("/.") || path.ends_with("/..") {
+            error(
+                ctx.stderr,
+                "rm",
+                &format!("refusing to remove '.' or '..': skipping '{path}'"),
+            );
+            status = 1;
+            continue;
+        }
         if path == "/" || path == "/*" {
             error(ctx.stderr, "rm", "refusing to remove '/'");
             status = 1;
@@ -412,7 +420,12 @@ pub(super) fn rm(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
             status = 1;
             continue;
         }
-        match remove_any(ctx, &absolute, recursive, dir_ok) {
+        if path.ends_with('/') && ctx.fs.meta(&path) == Err(FsError::NotDir) {
+            path_error(ctx.stderr, "rm", &path, FsError::NotDir);
+            status = 1;
+            continue;
+        }
+        match remove_any(ctx, &absolute, recursive, dir_ok, 0) {
             Ok(()) => {
                 if verbose {
                     write_line(ctx.stdout, format_args!("removed '{path}'"));
@@ -433,7 +446,11 @@ fn remove_any(
     absolute: &str,
     recursive: bool,
     dir_ok: bool,
+    depth: usize,
 ) -> Result<(), FsError> {
+    if depth > MAX_WALK_DEPTH {
+        return Err(FsError::TooDeep);
+    }
     let meta = ctx.fs.meta(absolute)?;
     match meta.kind {
         Kind::File => ctx.fs.remove_file(absolute),
@@ -447,7 +464,7 @@ fn remove_any(
             let entries = ctx.fs.read_dir(absolute)?;
             for entry in entries {
                 let child = fs_join(absolute, &entry.name);
-                remove_any(ctx, &child, true, false)?;
+                remove_any(ctx, &child, true, false, depth + 1)?;
             }
             ctx.fs.remove_dir(absolute)
         }
@@ -458,31 +475,24 @@ pub(super) fn cp(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
     let mut recursive = false;
     let mut no_clobber = false;
     let mut verbose = false;
-    let mut operands: Vec<String> = Vec::new();
-
-    for arg in args {
-        if is_option(arg) && arg != "-" {
-            for flag in arg[1..].chars() {
-                match flag {
-                    'r' | 'R' => recursive = true,
-                    'n' => no_clobber = true,
-                    'v' => verbose = true,
-                    'f' | 'i' | 'p' => {}
-                    other => {
-                        error(ctx.stderr, "cp", &format!("invalid option -- '{other}'"));
-                        return 2;
-                    }
-                }
-            }
-        } else {
-            operands.push(arg.clone());
+    let mut opts = Opts::new(args, "rRnvfipa");
+    while let Some(opt) = opts.next() {
+        match opt {
+            Opt::Flag('r' | 'R' | 'a') => recursive = true,
+            Opt::Flag('n') => no_clobber = true,
+            Opt::Flag('v') => verbose = true,
+            Opt::Flag('f' | 'i' | 'p') => {}
+            other => return bad_option(ctx, "cp", other),
         }
     }
+    let mut operands = core::mem::take(&mut opts.operands);
     if operands.len() < 2 {
         return usage(ctx.stderr, "cp", "cp [-rRfvn] SRC... DEST");
     }
 
-    let dest = operands.pop().unwrap();
+    let Some(dest) = operands.pop() else {
+        return 2;
+    };
     let dest_meta = ctx.fs.meta(&dest).ok();
     if operands.len() > 1 && !matches!(dest_meta, Some(meta) if meta.kind == Kind::Dir) {
         error(ctx.stderr, "cp", "target is not a directory");
@@ -532,7 +542,11 @@ fn copy_one(
         return Err(FsError::InvalidPath);
     }
 
-    copy_tree(ctx, &source_abs, &target, no_clobber)
+    if source_abs == target {
+        return Err(FsError::InvalidPath);
+    }
+
+    copy_tree(ctx, &source_abs, &target, no_clobber, 0)
 }
 
 fn copy_tree(
@@ -540,7 +554,11 @@ fn copy_tree(
     source: &str,
     target: &str,
     no_clobber: bool,
+    depth: usize,
 ) -> Result<(), FsError> {
+    if depth > MAX_WALK_DEPTH {
+        return Err(FsError::TooDeep);
+    }
     let meta = ctx.fs.meta(source)?;
     match meta.kind {
         Kind::File => {
@@ -566,7 +584,7 @@ fn copy_tree(
             for entry in entries {
                 let child_source = fs_join(source, &entry.name);
                 let child_target = fs_join(target, &entry.name);
-                copy_tree(ctx, &child_source, &child_target, no_clobber)?;
+                copy_tree(ctx, &child_source, &child_target, no_clobber, depth + 1)?;
             }
             Ok(())
         }
@@ -576,30 +594,23 @@ fn copy_tree(
 pub(super) fn mv(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
     let mut no_clobber = false;
     let mut verbose = false;
-    let mut operands: Vec<String> = Vec::new();
-
-    for arg in args {
-        if is_option(arg) && arg != "-" {
-            for flag in arg[1..].chars() {
-                match flag {
-                    'n' => no_clobber = true,
-                    'v' => verbose = true,
-                    'f' | 'i' => {}
-                    other => {
-                        error(ctx.stderr, "mv", &format!("invalid option -- '{other}'"));
-                        return 2;
-                    }
-                }
-            }
-        } else {
-            operands.push(arg.clone());
+    let mut opts = Opts::new(args, "nvfi");
+    while let Some(opt) = opts.next() {
+        match opt {
+            Opt::Flag('n') => no_clobber = true,
+            Opt::Flag('v') => verbose = true,
+            Opt::Flag('f' | 'i') => {}
+            other => return bad_option(ctx, "mv", other),
         }
     }
+    let mut operands = core::mem::take(&mut opts.operands);
     if operands.len() < 2 {
         return usage(ctx.stderr, "mv", "mv [-fvn] SRC... DEST");
     }
 
-    let dest = operands.pop().unwrap();
+    let Some(dest) = operands.pop() else {
+        return 2;
+    };
     let dest_meta = ctx.fs.meta(&dest).ok();
     if operands.len() > 1 && !matches!(dest_meta, Some(meta) if meta.kind == Kind::Dir) {
         error(ctx.stderr, "mv", "target is not a directory");
@@ -655,34 +666,27 @@ fn move_one(
         if meta.kind == Kind::Dir {
             return Err(FsError::Exists);
         }
+        if source_meta.kind == Kind::Dir {
+            return Err(FsError::NotDir);
+        }
         ctx.fs.remove_file(&target)?;
     }
 
-    let _ = source_meta;
     ctx.fs.rename(&source_abs, &target)?;
     Ok(true)
 }
 
 pub(super) fn touch(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
     let mut no_create = false;
-    let mut files: Vec<String> = Vec::new();
-
-    for arg in args {
-        if is_option(arg) {
-            for flag in arg[1..].chars() {
-                match flag {
-                    'c' => no_create = true,
-                    'a' | 'm' | 't' | 'd' | 'r' => {}
-                    other => {
-                        error(ctx.stderr, "touch", &format!("invalid option -- '{other}'"));
-                        return 2;
-                    }
-                }
-            }
-        } else {
-            files.push(arg.clone());
+    let mut opts = Opts::new(args, "camt:d:r:");
+    while let Some(opt) = opts.next() {
+        match opt {
+            Opt::Flag('c') => no_create = true,
+            Opt::Flag('a' | 'm') | Opt::Value('t' | 'd' | 'r', _) => {}
+            other => return bad_option(ctx, "touch", other),
         }
     }
+    let files = core::mem::take(&mut opts.operands);
     if files.is_empty() {
         return usage(ctx.stderr, "touch", "touch [-c] FILE...");
     }
@@ -701,119 +705,6 @@ pub(super) fn touch(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
         }
     }
     status
-}
-
-pub(super) fn find(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
-    let mut paths: Vec<String> = Vec::new();
-    let mut name: Option<String> = None;
-    let mut kind: Option<Kind> = None;
-    let mut max_depth: Option<usize> = None;
-    let mut min_depth = 0usize;
-    let mut print0 = false;
-    let mut index = 0usize;
-
-    while index < args.len() {
-        let arg = &args[index];
-        match arg.as_str() {
-            "-name" => {
-                index += 1;
-                name = args.get(index).cloned();
-            }
-            "-type" => {
-                index += 1;
-                kind = match args.get(index).map(String::as_str) {
-                    Some("f") => Some(Kind::File),
-                    Some("d") => Some(Kind::Dir),
-                    _ => None,
-                };
-            }
-            "-maxdepth" => {
-                index += 1;
-                max_depth = args.get(index).and_then(|value| parse_usize(value));
-            }
-            "-mindepth" => {
-                index += 1;
-                min_depth = args
-                    .get(index)
-                    .and_then(|value| parse_usize(value))
-                    .unwrap_or(0);
-            }
-            "-print" | "-print0" => print0 = arg == "-print0",
-            _ if is_option(arg) => {
-                error(ctx.stderr, "find", &format!("unknown predicate '{arg}'"));
-                return 2;
-            }
-            _ => paths.push(arg.clone()),
-        }
-        index += 1;
-    }
-
-    if paths.is_empty() {
-        paths.push(String::from("."));
-    }
-
-    let mut status = 0;
-    for path in paths {
-        let mut found = false;
-        if let Err(err) = find_walk(
-            ctx,
-            &path,
-            0,
-            name.as_deref(),
-            kind,
-            max_depth,
-            min_depth,
-            print0,
-            &mut found,
-        ) {
-            path_error(ctx.stderr, "find", &path, err);
-            status = 1;
-        }
-    }
-    status
-}
-
-#[allow(clippy::too_many_arguments)]
-fn find_walk(
-    ctx: &mut Ctx<'_>,
-    display: &str,
-    depth: usize,
-    name: Option<&str>,
-    kind: Option<Kind>,
-    max_depth: Option<usize>,
-    min_depth: usize,
-    print0: bool,
-    found: &mut bool,
-) -> Result<(), FsError> {
-    let meta = ctx.fs.meta(display)?;
-    let name_ok = name
-        .map(|pattern| glob_match(pattern, base_name(display)))
-        .unwrap_or(true);
-    let kind_ok = kind.map(|expected| meta.kind == expected).unwrap_or(true);
-    if depth >= min_depth && name_ok && kind_ok {
-        let terminator = if print0 { '\0' } else { '\n' };
-        write_out(ctx.stdout, format_args!("{display}{terminator}"));
-        *found = true;
-    }
-
-    if meta.kind == Kind::Dir && max_depth.map(|max| depth < max).unwrap_or(true) {
-        let entries = ctx.fs.read_dir(display)?;
-        for entry in entries {
-            let child = fs_join(display, &entry.name);
-            find_walk(
-                ctx,
-                &child,
-                depth + 1,
-                name,
-                kind,
-                max_depth,
-                min_depth,
-                print0,
-                found,
-            )?;
-        }
-    }
-    Ok(())
 }
 
 pub(super) fn stat(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
@@ -858,27 +749,15 @@ pub(super) fn stat(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
 pub(super) fn tree(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
     let mut all = false;
     let mut max_depth = usize::MAX;
-    let mut paths: Vec<String> = Vec::new();
-
-    let mut index = 0usize;
-    while index < args.len() {
-        let arg = &args[index];
-        if arg == "-a" {
-            all = true;
-        } else if arg == "-L" {
-            index += 1;
-            max_depth = args
-                .get(index)
-                .and_then(|value| parse_usize(value))
-                .unwrap_or(usize::MAX);
-        } else if is_option(arg) {
-            error(ctx.stderr, "tree", &format!("invalid option '{arg}'"));
-            return 2;
-        } else {
-            paths.push(arg.clone());
+    let mut opts = Opts::new(args, "aL:");
+    while let Some(opt) = opts.next() {
+        match opt {
+            Opt::Flag('a') => all = true,
+            Opt::Value('L', value) => max_depth = parse_usize(value).unwrap_or(usize::MAX),
+            other => return bad_option(ctx, "tree", other),
         }
-        index += 1;
     }
+    let mut paths = core::mem::take(&mut opts.operands);
     if paths.is_empty() {
         paths.push(String::from("."));
     }
@@ -926,6 +805,9 @@ fn tree_walk(
     if depth >= max_depth {
         return Ok(());
     }
+    if depth > MAX_WALK_DEPTH {
+        return Err(FsError::TooDeep);
+    }
     let mut entries = ctx.fs.read_dir(path)?;
     if !all {
         entries.retain(|entry| !entry.name.starts_with('.'));
@@ -956,25 +838,17 @@ pub(super) fn du(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
     let mut summary = false;
     let mut human = false;
     let mut all = false;
-    let mut paths: Vec<String> = Vec::new();
-
-    for arg in args {
-        if is_option(arg) {
-            for flag in arg[1..].chars() {
-                match flag {
-                    's' => summary = true,
-                    'h' => human = true,
-                    'a' => all = true,
-                    other => {
-                        error(ctx.stderr, "du", &format!("invalid option -- '{other}'"));
-                        return 2;
-                    }
-                }
-            }
-        } else {
-            paths.push(arg.clone());
+    let mut opts = Opts::new(args, "sahk");
+    while let Some(opt) = opts.next() {
+        match opt {
+            Opt::Flag('s') => summary = true,
+            Opt::Flag('h') => human = true,
+            Opt::Flag('a') => all = true,
+            Opt::Flag('k') => {}
+            other => return bad_option(ctx, "du", other),
         }
     }
+    let mut paths = core::mem::take(&mut opts.operands);
     if paths.is_empty() {
         paths.push(String::from("."));
     }
@@ -982,7 +856,7 @@ pub(super) fn du(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
     let mut status = 0;
     for path in paths {
         let mut total = 0usize;
-        if let Err(err) = du_walk(ctx, &path, summary, all, human, &mut total, true) {
+        if let Err(err) = du_walk(ctx, &path, summary, all, human, &mut total, 0) {
             path_error(ctx.stderr, "du", &path, err);
             status = 1;
         }
@@ -997,8 +871,12 @@ fn du_walk(
     all: bool,
     human: bool,
     total: &mut usize,
-    root: bool,
+    depth: usize,
 ) -> Result<usize, FsError> {
+    if depth > MAX_WALK_DEPTH {
+        return Err(FsError::TooDeep);
+    }
+    let root = depth == 0;
     let meta = ctx.fs.meta(path)?;
     let mut size = match meta.kind {
         Kind::File => meta.size,
@@ -1009,14 +887,14 @@ fn du_walk(
         let entries = ctx.fs.read_dir(path)?;
         for entry in entries {
             let child = fs_join(path, &entry.name);
-            size += du_walk(ctx, &child, summary, all, human, total, false)?;
+            size = size.saturating_add(du_walk(ctx, &child, summary, all, human, total, depth + 1)?);
         }
     }
 
-    *total += match meta.kind {
+    *total = total.saturating_add(match meta.kind {
         Kind::File => meta.size,
         Kind::Dir => 0,
-    };
+    });
 
     if (root && summary) || (!summary && (meta.kind == Kind::Dir || all)) {
         let shown = if human {

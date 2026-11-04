@@ -53,6 +53,9 @@ impl Mp3Decoder {
     /// A return value of zero means no further frame could be found. Frames
     /// that cannot be decoded yet (for example the first frame before the bit
     /// reservoir is filled) consume input but append no samples.
+    ///
+    /// A Layer I or Layer II frame returns
+    /// [`AudioError::UnsupportedFeature`]: only Layer III is implemented.
     pub fn decode_frame(
         &mut self,
         input: &[u8],
@@ -60,12 +63,17 @@ impl Mp3Decoder {
         written: &mut usize,
     ) -> Result<usize> {
         let mut pcm = [0i16; MAX_SAMPLES_PER_FRAME];
+        // A search that finds no frame leaves the field untouched.
+        self.frame.layer = 0;
         let samples = self
             .decoder
             .decode_frame(input, Some(&mut pcm), &mut self.frame);
         let consumed = self.frame.frame_bytes;
         if consumed == 0 {
             return Ok(0);
+        }
+        if matches!(self.frame.layer, 1 | 2) {
+            return Err(AudioError::UnsupportedFeature("MP3 layer"));
         }
         if self.frame.channels != 0 {
             self.channels = self.frame.channels;
@@ -123,11 +131,6 @@ pub fn info(input: &[u8]) -> Result<AudioInfo> {
         frames,
         format: AudioFormat::Mp3,
     })
-}
-
-/// MP3 decoding keeps its state on the stack and needs no extra scratch.
-pub fn scratch_len(_input: &[u8]) -> Result<usize> {
-    Ok(0)
 }
 
 /// Decodes an entire MP3 stream to interleaved signed 16-bit samples.

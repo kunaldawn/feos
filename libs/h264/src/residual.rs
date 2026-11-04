@@ -171,15 +171,9 @@ pub fn dequant_chroma_dc(dc: &mut [i32; 4], qp: i32, scale_dc: u8) {
     let qp_rem = (qp % 6) as usize;
     let v = LEVEL_SCALE[qp_rem][0] * scale_dc as i32;
 
-    if qp_per >= 5 {
-        for d in dc.iter_mut() {
-            *d = d.wrapping_mul(v).wrapping_shl((qp_per - 5) as u32);
-        }
-    } else {
-        let round = 1 << (4 - qp_per);
-        for d in dc.iter_mut() {
-            *d = (d.wrapping_mul(v).wrapping_add(round)) >> (5 - qp_per);
-        }
+    // dcC = ((f * LevelScale) << (qP / 6)) >> 5, with no rounding term.
+    for d in dc.iter_mut() {
+        *d = d.wrapping_mul(v).wrapping_shl(qp_per as u32) >> 5;
     }
 }
 

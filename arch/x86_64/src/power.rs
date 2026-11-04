@@ -1,32 +1,22 @@
 //! Machine power control.
 //!
-//! QEMU's q35 chipset exposes the ACPI PM1a control register at port `0x604`;
-//! writing `SLP_TYP=5` with `SLP_EN` set powers the machine off. The reset
-//! control register at `0xCF9` is the standard PCI reset mechanism.
+//! QEMU's q35 chipset exposes the ACPI PM1a control register at port `0x604`.
+//! Its DSDT's `_S5` package gives `SLP_TYP=0`, and writing that with `SLP_EN` set
+//! powers the machine off. The value is hard-coded because the kernel doesn't
+//! parse ACPI tables yet. The reset control register at `0xCF9` is the standard
+//! PCI reset mechanism.
 
-use core::arch::asm;
+use feos_port_io::{outb, outw};
 
 use crate::cpu;
 
 /// ACPI PM1a control register on QEMU's q35 machine.
 const PM1A_CNT: u16 = 0x604;
-const SLP_TYP_S5: u16 = 5;
+const SLP_TYP_S5: u16 = 0;
 const SLP_EN: u16 = 1 << 13;
 
 /// PCI reset control register.
 const RESET_CNTRL: u16 = 0xcf9;
-
-#[inline]
-unsafe fn outw(port: u16, value: u16) {
-    // SAFETY: callers pass a valid x86 I/O port.
-    unsafe { asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack)) };
-}
-
-#[inline]
-unsafe fn outb(port: u16, value: u8) {
-    // SAFETY: callers pass a valid x86 I/O port.
-    unsafe { asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack)) };
-}
 
 /// Powers the machine off (QEMU exits).
 pub fn system_off() -> ! {

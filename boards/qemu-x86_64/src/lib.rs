@@ -19,7 +19,7 @@ use feos_driver_ramfb::Ramfb;
 use feos_driver_uart16550::Uart16550;
 use feos_fs::{FileSystem, MemoryBlockDevice, MountTable, StaticFs};
 use feos_gfx::Canvas;
-use feos_hal::{Audio, Clock, InterruptController, Keyboard, Pointer, Serial};
+use feos_hal::{Audio, Board, Clock, InterruptController, Keyboard, Pointer, Serial};
 use feos_sync::SpinLock;
 
 /// Human-readable board name, shown by the `info` app.
@@ -61,18 +61,25 @@ pub const IOAPIC_BASE: usize = 0xfec0_0000;
 /// The PIT is connected to GSI 2, so vector `32 + 2 = 34`.
 pub const TIMER_IRQ: u32 = 34;
 
+/// Vector of the IPI that stops a CPU for good.
+pub const IPI_STOP: u32 = 49;
+
+/// Vector of the IPI that asks a CPU to reschedule.
+pub const IPI_RESCHEDULE: u32 = 50;
+
 /// CPUs the board can bring up.
 ///
 /// The current x86_64 port runs on the boot processor; the scheduler still
 /// reports its normal per-core accounting for that one CPU.
 pub const MAX_CPUS: usize = 1;
 
-/// Address assigned to BAR0 of the Intel HDA controller.
+/// Address assigned to BAR0 of the Intel HDA controller when firmware left it
+/// unprogrammed.
 ///
 /// This lies in the PCI memory hole below 4 GiB, just above QEMU's q35 ECAM
 /// window (`0xb000_0000..0xc000_0000`), and is 16 KiB aligned, matching the
-/// controller's BAR size. Firmware-less boots leave BARs unprogrammed, so the
-/// board assigns this address itself.
+/// controller's BAR size. SeaBIOS assigns BARs when it loads the kernel, so
+/// its choice is normally kept: it knows about the machine's other devices.
 pub const HDA_BAR0: usize = 0xc000_0000;
 
 /// Intel vendor ID.
@@ -123,7 +130,7 @@ pub static INPUT: I8042 = I8042::new();
 /// Finds and initialises the PS/2 pointer.
 pub fn init_pointer() -> Option<PointerKind> {
     if INPUT.init(DISPLAY_WIDTH as u16, DISPLAY_HEIGHT as u16) {
-        Some(PointerKind::Ps2)
+        Some(INPUT.pointer_kind())
     } else {
         None
     }
@@ -196,9 +203,6 @@ fn console_writer(text: &str) {
 
 fn console_byte_writer(bytes: &[u8]) {
     for &byte in bytes {
-        if byte == b'\n' {
-            UART0.write_byte(b'\r');
-        }
         UART0.write_byte(byte);
     }
 }
@@ -306,12 +310,19 @@ pub fn init_audio(clock: &'static dyn Clock) -> Option<AudioDevice> {
     let pci = PciPort::new();
     let controller = pci.find(PCI_VENDOR_INTEL, PCI_DEVICE_ICH6_HDA)?;
 
-    if !controller.assign_memory_bar(0, HDA_BAR0 as u64) {
-        return None;
-    }
+    // Keep a BAR from firmware if it's below 4 GiB, which is all this board maps.
+    let bar = match controller.memory_bar_address(0) {
+        Some(address) if address != 0 && address < 0x1_0000_0000 => address as usize,
+        _ => {
+            if !controller.assign_memory_bar(0, HDA_BAR0 as u64) {
+                return None;
+            }
+            HDA_BAR0
+        }
+    };
     controller.enable();
 
-    let codec = AUDIO.init(HDA_BAR0, clock)?;
+    let codec = AUDIO.init(bar, clock)?;
     Some(AudioDevice {
         device: &AUDIO,
         codec,
@@ -322,6 +333,8 @@ extern "C" {
     static __kernel_start: u8;
     static __bss_start: u8;
     static __bss_end: u8;
+    static __stack_bottom: u8;
+    static __stack_top: u8;
     static __kernel_end: u8;
 }
 
@@ -339,4 +352,113 @@ pub fn bss_range() -> (usize, usize) {
         core::ptr::addr_of!(__bss_start) as usize,
         core::ptr::addr_of!(__bss_end) as usize,
     )
+}
+
+/// Address range `[start, end)` of the boot stack.
+pub fn stack_range() -> (usize, usize) {
+    (
+        core::ptr::addr_of!(__stack_bottom) as usize,
+        core::ptr::addr_of!(__stack_top) as usize,
+    )
+}
+
+/// This board, as the kernel sees it.
+pub struct QemuX86_64;
+
+impl Board for QemuX86_64 {
+    const NAME: &'static str = NAME;
+    const ARCH: &'static str = ARCH;
+    const CONSOLE_NAME: &'static str = CONSOLE_NAME;
+    const CONSOLE_BASE: usize = CONSOLE_BASE;
+    const INTERRUPT_CONTROLLER_NAME: &'static str = INTERRUPT_CONTROLLER_NAME;
+    const POINTER_NAME: &'static str = POINTER_NAME;
+    const POINTER_HINT: &'static str = POINTER_HINT;
+    const KEYBOARD_NAME: &'static str = KEYBOARD_NAME;
+    const KEYBOARD_HINT: &'static str = KEYBOARD_HINT;
+    const TIMER_IRQ: u32 = TIMER_IRQ;
+    const IPI_STOP: u32 = IPI_STOP;
+    const IPI_RESCHEDULE: u32 = IPI_RESCHEDULE;
+    const MAX_CPUS: usize = MAX_CPUS;
+
+    type Display = Canvas<'static>;
+    type AudioDevice = AudioDevice;
+    type PointerKind = PointerKind;
+    type FileSystem = dyn FileSystem;
+
+    fn init_console() {
+        init_console();
+    }
+
+    fn write_emergency(bytes: &[u8]) {
+        for &byte in bytes {
+            if byte == b'\n' {
+                UART0.write_byte(b'\r');
+            }
+            UART0.write_byte(byte);
+        }
+    }
+
+    fn init_interrupts() {
+        init_interrupts();
+    }
+
+    fn init_cpu_interrupts() {
+        init_cpu_interrupts();
+    }
+
+    fn interrupts() -> &'static dyn InterruptController {
+        interrupts()
+    }
+
+    fn cpu_mpidr(index: usize) -> u64 {
+        cpu_mpidr(index)
+    }
+
+    fn init_display() -> Option<Canvas<'static>> {
+        init_display()
+    }
+
+    fn back_buffer() -> Option<Canvas<'static>> {
+        back_buffer()
+    }
+
+    fn framebuffer_addr() -> usize {
+        framebuffer_addr()
+    }
+
+    fn init_audio(clock: &'static dyn Clock) -> Option<AudioDevice> {
+        init_audio(clock)
+    }
+
+    fn init_pointer() -> Option<PointerKind> {
+        init_pointer()
+    }
+
+    fn pointer() -> Option<&'static dyn Pointer> {
+        pointer()
+    }
+
+    fn init_keyboard() -> bool {
+        init_keyboard()
+    }
+
+    fn keyboard() -> Option<&'static dyn Keyboard> {
+        keyboard()
+    }
+
+    fn filesystem() -> &'static dyn FileSystem {
+        filesystem()
+    }
+
+    fn kernel_range() -> (usize, usize) {
+        kernel_range()
+    }
+
+    fn bss_range() -> (usize, usize) {
+        bss_range()
+    }
+
+    fn stack_range() -> (usize, usize) {
+        stack_range()
+    }
 }

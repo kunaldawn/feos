@@ -2,13 +2,14 @@
 
 use core::arch::asm;
 
-/// Stops the CPU until an event occurs, forever.
+/// Masks every interrupt and stops this CPU for good.
 ///
-/// This is the kernel's idle loop and the final state of every fatal path.
+/// This is the final state of every fatal path. With the mask set, the tick can
+/// wake `wfe` but can't run a handler, so the CPU stays here.
 pub fn halt() -> ! {
     loop {
-        // SAFETY: `wfe` is available at EL1 and has no memory side effects.
-        unsafe { asm!("wfe", options(nomem, nostack)) }
+        // SAFETY: `daifset` and `wfe` are available at EL1.
+        unsafe { asm!("msr daifset, #0xf", "wfe", options(nomem, nostack)) }
     }
 }
 

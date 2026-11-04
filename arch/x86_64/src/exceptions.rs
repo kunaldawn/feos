@@ -1,16 +1,21 @@
 //! Interrupt descriptor table and fault reporting.
 //!
-//! The IDT points vectors 0..47 at the stubs in `interrupts.S`. Exceptions
+//! The IDT points vectors 0..50 at the stubs in `interrupts.S`. Exceptions
 //! (vectors 0..31) build a [`FaultInfo`] and forward it to the handler
-//! registered with [`set_handler`], then halt. Hardware interrupts (vectors
-//! 32..47) go through the recoverable path in [`crate::irq`] instead.
+//! registered with [`set_handler`], then halt. Hardware interrupts, the software
+//! switch and IPIs (vectors 32..50) go through the recoverable path in
+//! [`crate::irq`] instead.
+//!
+//! Each gate names a per-CPU stack from the TSS, so a fault still has a working
+//! stack when the task's own stack pointer is bad.
 
 use core::arch::asm;
+use core::fmt;
 use core::mem::transmute;
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::cpu;
+use crate::{cpu, gdt};
 
 /// State captured when an exception is taken.
 #[derive(Clone, Copy, Debug)]
@@ -27,9 +32,30 @@ pub struct FaultInfo {
     pub spsr: u64,
     /// Interrupted stack pointer.
     pub sp: u64,
+    /// General-purpose registers except `rsp`, named by [`REGISTER_NAMES`].
+    pub regs: [u64; 15],
 }
 
+/// Names of [`FaultInfo::regs`], in order.
+pub const REGISTER_NAMES: [&str; 15] = [
+    "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "r8", "r9", "r10", "r11", "r12", "r13", "r14",
+    "r15",
+];
+
 impl FaultInfo {
+    /// Writes the general-purpose registers, four to a line.
+    pub fn write_registers(&self, out: &mut dyn fmt::Write) -> fmt::Result {
+        for (index, (name, value)) in REGISTER_NAMES.iter().zip(self.regs).enumerate() {
+            let separator = if index % 4 == 3 || index == self.regs.len() - 1 {
+                "\n"
+            } else {
+                " "
+            };
+            write!(out, "{name:<3}={value:016x}{separator}")?;
+        }
+        Ok(())
+    }
+
     /// Exception class. On x86 this is the vector itself.
     pub const fn exception_class(&self) -> u64 {
         self.index
@@ -111,11 +137,11 @@ impl IdtEntry {
         zero: 0,
     };
 
-    fn new(handler: u64, selector: u16, type_attr: u8) -> Self {
+    fn new(handler: u64, selector: u16, type_attr: u8, ist: u8) -> Self {
         Self {
             offset_low: handler as u16,
             selector,
-            ist: 0,
+            ist,
             type_attr,
             offset_mid: (handler >> 16) as u16,
             offset_high: (handler >> 32) as u32,
@@ -134,8 +160,11 @@ struct IdtPointer {
 
 static mut IDT: [IdtEntry; 256] = [IdtEntry::MISSING; 256];
 
+/// Vectors with a stub in `interrupts.S`.
+const STUBS: usize = 51;
+
 extern "C" {
-    static isr_stub_table: [u64; 48];
+    static isr_stub_table: [u64; STUBS];
     static isr_spurious: u64;
 }
 
@@ -145,15 +174,16 @@ pub fn init() {
     // is a private static and every entry is written below.
     let table = unsafe { &mut *addr_of_mut!(IDT) };
 
-    for (index, entry) in table.iter_mut().enumerate().take(48) {
-        // SAFETY: the assembly table has exactly 48 entries.
+    for (index, entry) in table.iter_mut().enumerate().take(STUBS) {
+        // SAFETY: the assembly table has exactly `STUBS` entries.
         let handler = unsafe { isr_stub_table[index] };
-        *entry = IdtEntry::new(handler, 0x08, 0x8e);
+        let stack = if index < 32 { gdt::IST_FAULT } else { gdt::IST_IRQ };
+        *entry = IdtEntry::new(handler, 0x08, 0x8e, stack);
     }
 
     let spurious = addr_of!(isr_spurious) as u64;
-    for entry in table.iter_mut().skip(48) {
-        *entry = IdtEntry::new(spurious, 0x08, 0x8e);
+    for entry in table.iter_mut().skip(STUBS) {
+        *entry = IdtEntry::new(spurious, 0x08, 0x8e, gdt::IST_IRQ);
     }
 
     let pointer = IdtPointer {
@@ -199,6 +229,10 @@ pub(crate) fn handle(frame: &crate::irq::TrapFrame) {
         far: if frame.vector == 14 { cr2() } else { 0 },
         spsr: frame.rflags,
         sp: frame.rsp,
+        regs: [
+            frame.rax, frame.rbx, frame.rcx, frame.rdx, frame.rsi, frame.rdi, frame.rbp, frame.r8,
+            frame.r9, frame.r10, frame.r11, frame.r12, frame.r13, frame.r14, frame.r15,
+        ],
     };
 
     if let Some(handler) = handler() {

@@ -158,7 +158,7 @@ requires changing the interpreter.
 
 ## Licensing
 
-`feos-dosbox` is original code, licensed with the rest of FEOS under
-`MIT OR Apache-2.0`. `rust-dos` is GPL-2.0-or-later, so its source cannot be
-copied into this workspace without changing FEOS's licence; this crate borrows
-only public DOS/PC interface knowledge, not its implementation.
+`feos-dosbox` is `GPL-2.0-or-later`. Its OPL3 core is an LGPL-2.1-or-later port of
+Nuked-OPL3 reached through `rust-dos`, and its `F80` type comes from `rust-dos`.
+Because the kernel links this crate statically, the `feos` binary is GPL too. See
+[`LICENSING.md`](../LICENSING.md).

@@ -17,13 +17,17 @@
 #![forbid(unsafe_code)]
 
 use core::fmt;
+use core::hash::{Hash, Hasher};
 use core::ops::Deref;
 
 /// A UTF-8 string with a fixed maximum byte length.
 ///
 /// `N` includes no terminator: a `Text<8>` can hold eight bytes. Longer input
 /// is truncated on a character boundary by [`Text::set`].
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Equality and hashing look only at the current contents, so bytes left over
+/// from a longer earlier value never affect them.
+#[derive(Clone, Copy)]
 pub struct Text<const N: usize> {
     bytes: [u8; N],
     len: usize,
@@ -206,10 +210,30 @@ impl<const N: usize> fmt::Display for Text<N> {
     }
 }
 
+impl<const N: usize> PartialEq for Text<N> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl<const N: usize> Eq for Text<N> {}
+
+impl<const N: usize> Hash for Text<N> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
+    }
+}
+
+/// Writing reports [`fmt::Error`] when the value did not fit. The prefix that
+/// fit on a character boundary is kept, so callers that only want a best-effort
+/// label can ignore the result.
 impl<const N: usize> fmt::Write for Text<N> {
     fn write_str(&mut self, value: &str) -> fmt::Result {
-        self.push_str(value);
-        Ok(())
+        if self.push_str(value) {
+            Ok(())
+        } else {
+            Err(fmt::Error)
+        }
     }
 }
 
@@ -267,6 +291,42 @@ mod tests {
         assert_eq!(text.pop(), Some('h'));
         assert_eq!(text.pop(), None);
         assert!(text.is_empty());
+    }
+
+    #[test]
+    fn equality_ignores_bytes_left_by_a_longer_value() {
+        let mut text = Text::<8>::new();
+        text.set("abcd");
+        text.set("ab");
+        assert!(text == Text::<8>::from_str("ab"));
+    }
+
+    #[test]
+    fn hash_ignores_bytes_left_by_a_longer_value() {
+        use std::collections::hash_map::DefaultHasher;
+
+        fn hash_of(text: &Text<8>) -> u64 {
+            let mut hasher = DefaultHasher::new();
+            text.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        let mut text = Text::<8>::new();
+        text.set("abcd");
+        text.clear();
+        text.push_str("ab");
+        assert_eq!(hash_of(&text), hash_of(&Text::from_str("ab")));
+    }
+
+    #[test]
+    fn formatting_reports_truncation_and_stops() {
+        let mut text = Text::<4>::new();
+        assert!(write!(text, "{}{}", "abcdef", "x").is_err());
+        assert_eq!(text.as_str(), "abcd");
+        // Nothing after the failed piece may be appended.
+        let mut text = Text::<4>::new();
+        assert!(write!(text, "{}{}", "éé€", "x").is_err());
+        assert_eq!(text.as_str(), "éé");
     }
 
     #[test]

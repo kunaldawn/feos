@@ -1,18 +1,19 @@
 //! `feos-image` is a dependency-free image codec library for the feos kernel.
 //!
-//! Decoders write straight into a caller-provided RGBA8888 buffer and never
-//! allocate. Some formats need additional working memory; that space is also
-//! supplied by the caller through the `scratch` argument of
-//! [`decode`](decode()).
+//! Decoders write straight into a caller-provided RGBA8888 buffer. PNG needs
+//! additional working memory, which the caller supplies through the `scratch`
+//! argument of [`decode`](decode()). The one allocation in the crate is
+//! coefficient storage for progressive and multi-scan JPEG. It is fallible and
+//! bounded by [`jpeg::MAX_COEFFICIENT_BYTES`]; see [`jpeg`].
 //!
 //! Supported formats:
 //!
 //! | Format | Decode | Encode |
 //! |--------|--------|--------|
 //! | PNG    | yes (non-interlaced and Adam7; 1/2/4/8/16-bit; palette, gray, RGB, RGBA) | RGBA, uncompressed zlib |
-//! | JPEG   | baseline and extended sequential, 8-bit | no |
-//! | BMP    | 1/4/8/16/24/32-bit uncompressed and bitfields | 24-bit |
-//! | PPM    | P5/P6 binary, 8/16-bit | P6 |
+//! | JPEG   | baseline, extended sequential and progressive, 8-bit; gray, YCbCr, RGB, CMYK, YCCK | no |
+//! | BMP    | 1/4/8/16/24/32-bit uncompressed, bitfields, RLE8 and RLE4 | 24-bit |
+//! | PNM    | P1-P6 ASCII and binary, 8/16-bit | P6 |
 //! | QOI    | yes | yes |
 //!
 //! ```
@@ -32,6 +33,8 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+extern crate alloc;
+
 pub mod bmp;
 mod error;
 pub mod jpeg;
@@ -50,7 +53,7 @@ pub enum ImageFormat {
     Jpeg,
     /// Windows bitmap.
     Bmp,
-    /// Portable pixmap (P5/P6).
+    /// Netpbm PBM, PGM and PPM (P1 to P6).
     Ppm,
     /// Quite OK Image format.
     Qoi,
@@ -100,7 +103,7 @@ pub fn detect(input: &[u8]) -> Option<ImageFormat> {
         Some(ImageFormat::Bmp)
     } else if input.starts_with(b"qoif") {
         Some(ImageFormat::Qoi)
-    } else if input.len() >= 2 && input[0] == b'P' && matches!(input[1], b'5' | b'6') {
+    } else if ppm::is_magic(input) {
         Some(ImageFormat::Ppm)
     } else {
         None

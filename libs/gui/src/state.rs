@@ -4,6 +4,9 @@ use feos_gfx::{Point, Rect};
 
 use crate::id::Id;
 
+/// Maximum number of floating surfaces the hit test tracks per frame.
+pub const MAX_OVERLAYS: usize = 8;
+
 /// Maximum number of widgets that can participate in tab navigation.
 pub const MAX_FOCUS_ORDER: usize = 64;
 
@@ -40,6 +43,14 @@ pub struct InteractionState<const N: usize = 32> {
     scroll: [ScrollSlot; N],
     last_pointer: Point,
     pointer_valid: bool,
+    /// Left button state at the end of the previous frame.
+    last_down: bool,
+    /// Overlay rectangles registered during the current frame.
+    overlays: [Rect; MAX_OVERLAYS],
+    overlay_count: usize,
+    /// Overlay rectangles from the previous frame, used for hit testing.
+    previous_overlays: [Rect; MAX_OVERLAYS],
+    previous_overlay_count: usize,
     frame: u64,
 }
 
@@ -58,6 +69,11 @@ impl<const N: usize> InteractionState<N> {
             scroll: [ScrollSlot::EMPTY; N],
             last_pointer: Point::new(0, 0),
             pointer_valid: false,
+            last_down: false,
+            overlays: [Rect::new(0, 0, 0, 0); MAX_OVERLAYS],
+            overlay_count: 0,
+            previous_overlays: [Rect::new(0, 0, 0, 0); MAX_OVERLAYS],
+            previous_overlay_count: 0,
             frame: 0,
         }
     }
@@ -70,6 +86,9 @@ impl<const N: usize> InteractionState<N> {
         self.focus_order_len = 0;
         self.focus_at_frame_start = self.focus;
         self.hovered = Id::NONE;
+        self.previous_overlays = self.overlays;
+        self.previous_overlay_count = self.overlay_count;
+        self.overlay_count = 0;
         self.frame = self.frame.wrapping_add(1);
     }
 
@@ -159,6 +178,35 @@ impl<const N: usize> InteractionState<N> {
     /// Clears hover, focus, press and scroll state.
     pub fn clear(&mut self) {
         *self = Self::new();
+    }
+
+    /// Registers a floating surface for the next frame's hit test and returns
+    /// its stacking level, or `None` when the table is full.
+    pub(crate) fn register_overlay(&mut self, rect: Rect) -> Option<usize> {
+        if self.overlay_count == MAX_OVERLAYS {
+            return None;
+        }
+        self.overlays[self.overlay_count] = rect;
+        self.overlay_count += 1;
+        Some(self.overlay_count)
+    }
+
+    /// Returns `true` when an overlay at `level` or above covered `point`
+    /// last frame. Level 0 is the page; an overlay's own contents run at the
+    /// level [`register_overlay`](Self::register_overlay) returned.
+    pub(crate) fn overlay_covers(&self, level: usize, point: Point) -> bool {
+        self.previous_overlays[..self.previous_overlay_count]
+            .iter()
+            .enumerate()
+            .any(|(index, rect)| index >= level && rect.contains(point))
+    }
+
+    pub(crate) const fn last_down(&self) -> bool {
+        self.last_down
+    }
+
+    pub(crate) fn set_last_down(&mut self, down: bool) {
+        self.last_down = down;
     }
 
     pub(crate) fn last_pointer(&self) -> Option<Point> {

@@ -1,4 +1,4 @@
-//! Windows/Fluent-inspired composition patterns.
+//! Desktop composition patterns.
 //!
 //! These components sit above the primitives: avatar groups, property grids,
 //! log and code viewers, chat threads, title bars, selector bars, sheets and
@@ -788,7 +788,7 @@ impl<'a, 'b, 's, const N: usize> Ui<'a, 'b, 's, N> {
     }
 
     /// A horizontal selector bar with an accent underline under the active
-    /// item. This is the Windows "selector bar" / Fluent pivot pattern.
+    /// item. This is a selector bar, or pivot.
     pub fn selector_bar(&mut self, selected: &mut usize, labels: &[&str]) -> Response {
         let metrics = self.theme.metrics;
         let palette = self.theme.palette;
@@ -1495,7 +1495,8 @@ impl<'a, 'b, 's, const N: usize> Ui<'a, 'b, 's, N> {
         let content = content_height.max(viewport_height).max(1);
         let max_offset = (content - viewport_height).max(0);
         let thumb_height = ((viewport_height as f32 / content as f32) * rect.height as f32)
-            .clamp(18.0, rect.height as f32) as i32;
+            .max(18.0)
+            .min(rect.height as f32) as i32;
         if response.active && self.pointer_down() && rect.height as i32 > thumb_height {
             let fraction = ((self.pointer().y - rect.y - thumb_height / 2) as f32
                 / (rect.height - thumb_height as u32) as f32)

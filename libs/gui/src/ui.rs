@@ -81,6 +81,10 @@ pub struct Ui<'a, 'b, 's, const N: usize = 32> {
     escape_pressed: bool,
     enter_pressed: bool,
     space_pressed: bool,
+    /// A surface above the one being drawn covers the pointer.
+    pointer_occluded: bool,
+    /// Stacking level of the overlay being drawn (0 is the page).
+    overlay_level: usize,
 }
 
 impl<'a, 'b, 's, const N: usize> Ui<'a, 'b, 's, N> {
@@ -121,8 +125,21 @@ impl<'a, 'b, 's, const N: usize> Ui<'a, 'b, 's, N> {
             escape_pressed: false,
             enter_pressed: false,
             space_pressed: false,
+            pointer_occluded: false,
+            overlay_level: 0,
         };
         ui.scan_events();
+
+        // A press or release can lose its event when a frame's queue is full,
+        // but `Input` still applies its state. Recover the edge from the state
+        // so a widget cannot stay stuck in the pressed state.
+        let was_down = ui.state.last_down();
+        if ui.pointer_down && !was_down {
+            ui.pointer_pressed = true;
+        } else if !ui.pointer_down && was_down {
+            ui.pointer_released = true;
+        }
+        ui.state.set_last_down(ui.pointer_down);
 
         if ui.tab_pressed {
             if ui.shift() {
@@ -424,9 +441,58 @@ impl<'a, 'b, 's, const N: usize> Ui<'a, 'b, 's, N> {
         Rect::new(0, 0, width.max(0) as u32, height.max(0) as u32).center_in(rect)
     }
 
-    /// Returns `true` when the pointer is over `rect` and inside the clip.
+    /// Returns `true` when the pointer is over `rect`, inside the clip and not
+    /// covered by a surface above the one being drawn.
     pub fn pointer_over(&self, rect: Rect) -> bool {
-        self.painter.clip_contains(self.pointer) && rect.contains(self.pointer)
+        !self.pointer_occluded
+            && !self.state.overlay_covers(self.overlay_level, self.pointer)
+            && self.painter.clip_contains(self.pointer)
+            && rect.contains(self.pointer)
+    }
+
+    /// Declares that a surface drawn later in this frame covers the pointer,
+    /// so widgets drawn until the next call must not respond to it.
+    ///
+    /// The toolkit keeps no z-order, because whoever owns the surfaces already
+    /// knows it. A window manager calls this before each surface.
+    pub fn set_pointer_occluded(&mut self, occluded: bool) {
+        self.pointer_occluded = occluded;
+    }
+
+    /// Returns `true` while the pointer is marked as covered.
+    pub const fn pointer_occluded(&self) -> bool {
+        self.pointer_occluded
+    }
+
+    /// Marks everything drawn from here on as a floating surface over `rect`,
+    /// for the rest of the frame.
+    ///
+    /// This is [`overlay`](Self::overlay) for code that cannot use a closure:
+    /// a popup drawn at the end of a widget, for example. Floating surfaces
+    /// are already drawn late, so what follows belongs to them or sits above.
+    pub fn float(&mut self, rect: Rect) {
+        if let Some(level) = self.state.register_overlay(rect) {
+            self.overlay_level = level;
+        }
+    }
+
+    /// Draws a floating surface over `rect`.
+    ///
+    /// A popup is drawn late in the frame so it paints on top, which is too
+    /// late to stop the widgets beneath it from reacting in the same frame.
+    /// Registering the rectangle here makes them ignore the pointer from the
+    /// next frame on, one frame of latency that only matters on the frame the
+    /// popup opens. Widgets inside `f` still respond; overlays opened later
+    /// cover this one in turn.
+    pub fn overlay<R>(&mut self, rect: Rect, f: impl FnOnce(&mut Self) -> R) -> R {
+        let Some(level) = self.state.register_overlay(rect) else {
+            return f(self);
+        };
+        let previous = self.overlay_level;
+        self.overlay_level = level;
+        let result = f(self);
+        self.overlay_level = previous;
+        result
     }
 
     /// Lays out a widget and processes pointer/keyboard interaction.
@@ -511,5 +577,91 @@ impl<const N: usize> Drop for Ui<'_, '_, '_, N> {
         if self.pointer_released {
             self.state.set_active(Id::NONE);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(
+        state: &mut InteractionState<4>,
+        input: &Input,
+        mut draw: impl FnMut(&mut Ui<'_, '_, '_, 4>),
+    ) {
+        let mut pixels = [0u32; 64 * 64];
+        let mut canvas = Canvas::new(&mut pixels, 64, 64, 64).unwrap();
+        let theme = Theme::default();
+        let mut ui = Ui::new(&mut canvas, &theme, input, state);
+        draw(&mut ui);
+    }
+
+    #[test]
+    fn an_occluded_widget_ignores_the_pointer() {
+        let rect = Rect::new(0, 0, 32, 32);
+        let id = Id::from_name("below");
+        let mut state = InteractionState::<4>::new();
+        let mut input = Input::new();
+        input.push(Event::PointerDown {
+            pos: Point::new(4, 4),
+            button: MouseButton::Left,
+        });
+        frame(&mut state, &input, |ui| {
+            ui.set_pointer_occluded(true);
+            let hit = ui.interact(id, rect, Sense::click());
+            assert!(!hit.hovered && !hit.pressed);
+            ui.set_pointer_occluded(false);
+            let hit = ui.interact(Id::from_name("above"), rect, Sense::click());
+            assert!(hit.hovered && hit.pressed);
+        });
+        assert_ne!(state.active(), id);
+    }
+
+    #[test]
+    fn an_overlay_blocks_widgets_beneath_it_from_the_next_frame() {
+        let rect = Rect::new(0, 0, 32, 32);
+        let mut state = InteractionState::<4>::new();
+        let mut input = Input::new();
+        input.set_pointer(Point::new(4, 4));
+        let draw = |ui: &mut Ui<'_, '_, '_, 4>, expect_below: bool| {
+            let below = ui.interact(Id::from_name("below"), rect, Sense::click());
+            assert_eq!(below.hovered, expect_below);
+            let inside = ui.overlay(rect, |ui| {
+                ui.interact(Id::from_name("inside"), rect, Sense::click())
+            });
+            assert!(inside.hovered);
+        };
+        frame(&mut state, &input, |ui| draw(ui, true));
+        frame(&mut state, &input, |ui| draw(ui, false));
+    }
+
+    #[test]
+    fn a_release_lost_to_a_full_queue_still_ends_the_press() {
+        let rect = Rect::new(0, 0, 32, 32);
+        let id = Id::from_name("button");
+        let mut state = InteractionState::<4>::new();
+        let mut input = Input::new();
+        input.push(Event::PointerDown {
+            pos: Point::new(4, 4),
+            button: MouseButton::Left,
+        });
+        frame(&mut state, &input, |ui| {
+            ui.interact(id, rect, Sense::click());
+        });
+        assert_eq!(state.active(), id);
+
+        input.clear_events();
+        for _ in 0..crate::input::MAX_EVENTS {
+            input.push(Event::PointerWheel(1));
+        }
+        assert!(!input.push(Event::PointerUp {
+            pos: Point::new(4, 4),
+            button: MouseButton::Left,
+        }));
+        frame(&mut state, &input, |ui| {
+            let hit = ui.interact(id, rect, Sense::click());
+            assert!(hit.clicked);
+        });
+        assert_eq!(state.active(), Id::NONE);
     }
 }

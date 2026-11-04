@@ -1,10 +1,16 @@
 //! FLV demuxing (Sorenson H.263, VP6, AVC and HEVC tags).
 
+use alloc::vec::Vec;
+
 use crate::bitstream::{u24_be_at, u32_at};
 use crate::codec::Codec;
-use crate::error::{require_rgba, Result, VideoError};
-use crate::h264::{AnnexBDecoder, AvccDecoder};
-use crate::{h264, mjpeg, raw};
+use crate::error::{Result, VideoError};
+use crate::h264;
+use crate::index::{try_push, DecoderLimits, Index, FLAG_KEY};
+use crate::{DisplayMetadata, StreamColour};
+
+/// Sequence headers kept per file. One is normal; each costs a parse on a seek.
+const MAX_SEQUENCE_HEADERS: usize = 64;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FlvInfo {
@@ -13,46 +19,53 @@ pub(crate) struct FlvInfo {
     pub codec: Codec,
     pub frame_count: u32,
     pub frame_rate: Option<(u32, u32)>,
+    pub display: DisplayMetadata,
+    pub colour: StreamColour,
 }
 
 struct VideoTag<'a> {
     codec: Codec,
     frame_type: u8,
     packet_type: u8,
+    /// AVC composition time offset in milliseconds.
+    composition_ms: i32,
     body: &'a [u8],
 }
 
-fn video_tag(data: &[u8]) -> Result<VideoTag<'_>> {
-    if data.is_empty() {
-        return Err(VideoError::UnexpectedEnd);
-    }
-    let frame_type = data[0] >> 4;
-    let codec_id = data[0] & 0x0f;
-    let codec = Codec::from_flv(codec_id);
+/// Parses a video tag. A tag too short to hold its headers carries no video,
+/// which is not a reason to refuse the file.
+fn video_tag(data: &[u8]) -> Option<VideoTag<'_>> {
+    let first = *data.first()?;
+    let frame_type = first >> 4;
+    let codec = Codec::from_flv(first & 0x0f);
     if codec == Codec::H264 || codec == Codec::Hevc {
-        if data.len() < 5 {
-            return Err(VideoError::UnexpectedEnd);
-        }
-        Ok(VideoTag {
+        let header = data.get(1..5)?;
+        let raw = u32::from_be_bytes([0, header[1], header[2], header[3]]);
+        // Sign-extend 24 bits.
+        let composition_ms = ((raw << 8) as i32) >> 8;
+        Some(VideoTag {
             codec,
             frame_type,
-            packet_type: data[1],
+            packet_type: header[0],
+            composition_ms,
             body: &data[5..],
         })
     } else {
-        Ok(VideoTag {
+        Some(VideoTag {
             codec,
             frame_type,
             packet_type: 1,
+            composition_ms: 0,
             body: &data[1..],
         })
     }
 }
 
-/// Iterates FLV tags, calling `f(tag_type, body)`.
+/// Iterates FLV tags, calling `f(tag_type, timestamp_ms, body)`. A truncated
+/// last tag ends the walk: what came before it still plays.
 fn for_each_tag<'a, F>(input: &'a [u8], mut f: F) -> Result<()>
 where
-    F: FnMut(u8, &'a [u8]) -> Result<bool>,
+    F: FnMut(u8, u32, &'a [u8]) -> Result<bool>,
 {
     if input.len() < 9 || &input[..3] != b"FLV" {
         return Err(VideoError::UnknownFormat);
@@ -66,15 +79,16 @@ where
     if pos > input.len() {
         return Err(VideoError::UnexpectedEnd);
     }
-    while pos + 11 <= input.len() {
+    while pos.saturating_add(11) <= input.len() {
         let tag_type = input[pos];
         let size = u24_be_at(input, pos + 1)? as usize;
+        let timestamp = u24_be_at(input, pos + 4)? | ((input[pos + 7] as u32) << 24);
         let data_start = pos + 11;
         let end = data_start.checked_add(size).ok_or(VideoError::Overflow)?;
         if end > input.len() {
-            return Err(VideoError::UnexpectedEnd);
+            return Ok(());
         }
-        if f(tag_type, &input[data_start..end])? {
+        if f(tag_type, timestamp, &input[data_start..end])? {
             return Ok(());
         }
         pos = end + 4;
@@ -104,6 +118,9 @@ fn fps_fraction(fps: f64) -> Option<(u32, u32)> {
         if difference < 0.02 {
             return Some(fraction);
         }
+    }
+    if fps > 1_000_000.0 {
+        return None;
     }
     let scaled = fps * 1000.0;
     let numerator = (scaled + 0.5) as u32;
@@ -153,15 +170,27 @@ impl<'a> Amf<'a> {
 
 fn update_metadata(meta: &mut Metadata, name: &[u8], value: f64) {
     match name {
-        b"width" => meta.width = Some(value.max(0.0) as u32),
-        b"height" => meta.height = Some(value.max(0.0) as u32),
+        b"width" => meta.width = Some(value.clamp(0.0, 16384.0) as u32),
+        b"height" => meta.height = Some(value.clamp(0.0, 16384.0) as u32),
         b"framerate" => meta.frame_rate = fps_fraction(value),
         _ => {}
     }
 }
 
-fn skip_amf_value(amf: &mut Amf<'_>, meta: &mut Metadata) -> Option<()> {
-    match amf.byte()? {
+/// Deepest AMF nesting followed. Real metadata uses two or three levels, and
+/// the parsers recurse, so this bounds the stack use of a hostile script tag.
+const MAX_AMF_DEPTH: u32 = 16;
+
+fn skip_amf_value(amf: &mut Amf<'_>, meta: &mut Metadata, depth: u32) -> Option<()> {
+    let marker = amf.byte()?;
+    skip_amf_payload(amf, marker, meta, depth)
+}
+
+fn skip_amf_payload(amf: &mut Amf<'_>, marker: u8, meta: &mut Metadata, depth: u32) -> Option<()> {
+    if depth >= MAX_AMF_DEPTH {
+        return None;
+    }
+    match marker {
         0x00 => {
             amf.f64be()?;
         }
@@ -170,17 +199,17 @@ fn skip_amf_value(amf: &mut Amf<'_>, meta: &mut Metadata) -> Option<()> {
             let len = amf.u16be()? as usize;
             amf.skip(len)?;
         }
-        0x03 => amf_property_list(amf, meta)?,
+        0x03 => amf_property_list(amf, meta, depth + 1)?,
         0x05 | 0x06 => {}
         0x07 => amf.skip(2)?,
         0x08 => {
             amf.u32be()?;
-            amf_property_list(amf, meta)?;
+            amf_property_list(amf, meta, depth + 1)?;
         }
         0x0a => {
             let count = amf.u32be()?;
             for _ in 0..count {
-                skip_amf_value(amf, meta)?;
+                skip_amf_value(amf, meta, depth + 1)?;
             }
         }
         0x0b => amf.skip(10)?,
@@ -193,7 +222,7 @@ fn skip_amf_value(amf: &mut Amf<'_>, meta: &mut Metadata) -> Option<()> {
     Some(())
 }
 
-fn amf_property_list(amf: &mut Amf<'_>, meta: &mut Metadata) -> Option<()> {
+fn amf_property_list(amf: &mut Amf<'_>, meta: &mut Metadata, depth: u32) -> Option<()> {
     loop {
         if amf.data.get(amf.pos..).and_then(|s| s.get(..3))? == [0, 0, 0x09] {
             amf.pos += 3;
@@ -201,36 +230,14 @@ fn amf_property_list(amf: &mut Amf<'_>, meta: &mut Metadata) -> Option<()> {
         }
         let len = amf.u16be()? as usize;
         let name = amf.bytes(len)?;
-        match amf.byte()? {
+        let marker = amf.byte()?;
+        match marker {
             0x00 => {
                 let value = amf.f64be()?;
                 update_metadata(meta, name, value);
             }
-            0x01 => amf.skip(1)?,
-            0x02 => {
-                let len = amf.u16be()? as usize;
-                amf.skip(len)?;
-            }
-            0x03 => amf_property_list(amf, meta)?,
-            0x05 | 0x06 => {}
-            0x07 => amf.skip(2)?,
-            0x08 => {
-                amf.u32be()?;
-                amf_property_list(amf, meta)?;
-            }
             0x09 => return Some(()),
-            0x0a => {
-                let count = amf.u32be()?;
-                for _ in 0..count {
-                    skip_amf_value(amf, meta)?;
-                }
-            }
-            0x0b => amf.skip(10)?,
-            0x0c => {
-                let len = amf.u32be()? as usize;
-                amf.skip(len)?;
-            }
-            _ => return None,
+            _ => skip_amf_payload(amf, marker, meta, depth)?,
         }
     }
 }
@@ -251,9 +258,9 @@ fn metadata(body: &[u8]) -> Option<Metadata> {
     match amf.byte()? {
         0x08 => {
             amf.u32be()?;
-            amf_property_list(&mut amf, &mut meta)?;
+            amf_property_list(&mut amf, &mut meta, 0)?;
         }
-        0x03 => amf_property_list(&mut amf, &mut meta)?,
+        0x03 => amf_property_list(&mut amf, &mut meta, 0)?,
         _ => return None,
     }
     Some(Metadata {
@@ -266,20 +273,27 @@ fn metadata(body: &[u8]) -> Option<Metadata> {
 pub(crate) fn info(input: &[u8]) -> Result<FlvInfo> {
     let mut codec = Codec::Unknown(0);
     let mut frame_count = 0u32;
+    let mut sps_found = false;
     let mut dimensions = None;
     let mut frame_rate = None;
-    let mut config: &[u8] = &[];
-    for_each_tag(input, |tag_type, body| {
+    let mut display = DisplayMetadata::default();
+    let mut colour = StreamColour::default();
+    for_each_tag(input, |tag_type, _, body| {
         match tag_type {
             9 => {
-                let tag = video_tag(body)?;
+                let Some(tag) = video_tag(body) else {
+                    return Ok(false);
+                };
                 codec = tag.codec;
                 if tag.codec == Codec::H264 && tag.packet_type == 0 {
-                    config = tag.body;
-                    if let Ok(info) = h264::info_from_avcc(tag.body) {
-                        dimensions = Some((info.width, info.height));
+                    if !sps_found {
+                        if let Ok(sps) = h264::info_from_avcc(tag.body) {
+                            sps_found = true;
+                            dimensions = Some((sps.width, sps.height));
+                            crate::merge_sps_metadata(&mut display, &mut colour, &sps);
+                        }
                     }
-                } else if tag.packet_type == 1 {
+                } else if tag.packet_type == 1 && tag.frame_type != 5 {
                     frame_count = frame_count.saturating_add(1);
                 }
             }
@@ -299,10 +313,6 @@ pub(crate) fn info(input: &[u8]) -> Result<FlvInfo> {
         }
         Ok(false)
     })?;
-    if codec == Codec::H264 && dimensions.is_none() && !config.is_empty() {
-        let info = h264::info_from_avcc(config)?;
-        dimensions = Some((info.width, info.height));
-    }
     let (width, height) = dimensions.unwrap_or((0, 0));
     Ok(FlvInfo {
         width,
@@ -310,101 +320,53 @@ pub(crate) fn info(input: &[u8]) -> Result<FlvInfo> {
         codec,
         frame_count,
         frame_rate,
+        display,
+        colour,
     })
 }
 
-pub(crate) fn decode_frame(input: &[u8], index: u32, out: &mut [u8]) -> Result<u32> {
-    let info = info(input)?;
-    if info.codec != Codec::H264 {
-        return Err(VideoError::UnsupportedCodec(info.codec.name()));
-    }
-    if index >= info.frame_count {
-        return Err(VideoError::FrameOutOfRange {
-            index,
-            count: info.frame_count,
-        });
-    }
-    require_rgba(out, info.width, info.height)?;
+/// A sample table and the AVC sequence headers that apply to it.
+pub(crate) struct FlvIndex {
+    pub index: Index,
+    /// Each sequence header, and the sample it applies from.
+    pub configs: Vec<(u32, core::ops::Range<usize>)>,
+}
 
-    let mut config: &[u8] = &[];
-    for_each_tag(input, |tag_type, body| {
-        if tag_type == 9 {
-            let tag = video_tag(body)?;
-            if tag.codec == Codec::H264 && tag.packet_type == 0 {
-                config = tag.body;
-                return Ok(true);
+pub(crate) fn build_index(input: &[u8], limits: &DecoderLimits) -> Result<FlvIndex> {
+    let mut index = Index::default();
+    let mut configs = Vec::new();
+    for_each_tag(input, |tag_type, timestamp, body| {
+        if tag_type != 9 {
+            return Ok(false);
+        }
+        let Some(tag) = video_tag(body) else {
+            return Ok(false);
+        };
+        if tag.codec != Codec::H264 {
+            return Ok(false);
+        }
+        let offset = tag.body.as_ptr() as usize - input.as_ptr() as usize;
+        match tag.packet_type {
+            0 => {
+                if configs.len() >= MAX_SEQUENCE_HEADERS {
+                    return Err(VideoError::LimitExceeded("too many AVC sequence headers"));
+                }
+                try_push(
+                    &mut configs,
+                    (
+                        index.samples.len() as u32,
+                        offset..offset + tag.body.len(),
+                    ),
+                )?;
             }
+            1 if tag.frame_type != 5 => {
+                let pts = timestamp as i32 as i64 + tag.composition_ms as i64;
+                let flags = if tag.frame_type == 1 { FLAG_KEY } else { 0 };
+                index.push(limits, input.len(), offset, tag.body.len(), pts, flags)?;
+            }
+            _ => {}
         }
         Ok(false)
     })?;
-
-    if !config.is_empty() {
-        let mut decoder = AvccDecoder::new(config, index)?;
-        let mut done = false;
-        for_each_tag(input, |tag_type, body| {
-            if tag_type != 9 {
-                return Ok(false);
-            }
-            let tag = video_tag(body)?;
-            if tag.codec != Codec::H264 || tag.packet_type != 1 {
-                return Ok(false);
-            }
-            if decoder.push(tag.body, out)? {
-                done = true;
-                return Ok(true);
-            }
-            Ok(false)
-        })?;
-        if !done && decoder.finish(out)? {
-            done = true;
-        }
-        if done {
-            return Ok(0);
-        }
-    } else {
-        let mut decoder = AnnexBDecoder::new(index);
-        let mut done = false;
-        for_each_tag(input, |tag_type, body| {
-            if tag_type != 9 {
-                return Ok(false);
-            }
-            let tag = video_tag(body)?;
-            if tag.codec != Codec::H264 || tag.packet_type != 1 {
-                return Ok(false);
-            }
-            if decoder.push(tag.body, out)? {
-                done = true;
-                return Ok(true);
-            }
-            Ok(false)
-        })?;
-        if !done && decoder.finish(out)? {
-            done = true;
-        }
-        if done {
-            return Ok(0);
-        }
-    }
-    Err(VideoError::FrameOutOfRange {
-        index,
-        count: info.frame_count,
-    })
-}
-
-// These helpers keep the module symmetric with the other containers; FLV
-// samples for the codecs we can decode in future are exposed through
-// `video_tag`.
-#[allow(dead_code)]
-fn _reserved(tag: VideoTag<'_>) -> (u8, u8, &[u8]) {
-    (tag.frame_type, tag.packet_type, tag.body)
-}
-
-#[allow(dead_code)]
-fn _decode_mjpeg(sample: &[u8], out: &mut [u8]) -> Result<()> {
-    mjpeg::decode_sample(sample, out)
-}
-
-#[allow(dead_code)]
-fn _decode_raw(sample: &[u8], codec: Codec, w: u32, h: u32, out: &mut [u8]) -> Result<()> {
-    raw::decode(sample, codec, w, h, false, out)
+    Ok(FlvIndex { index, configs })
 }

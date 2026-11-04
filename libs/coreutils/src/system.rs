@@ -55,6 +55,11 @@ pub trait System: Sync {
         1000
     }
 
+    /// Seconds since the Unix epoch, when the platform has a real-time clock.
+    fn unix_time(&self) -> Option<u64> {
+        None
+    }
+
     /// Milliseconds since boot.
     fn uptime_ms(&self) -> u64 {
         0

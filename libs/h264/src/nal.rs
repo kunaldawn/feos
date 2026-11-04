@@ -1,6 +1,7 @@
 //! H.264 NAL unit framing — Annex B and AVCC parsers.
 //!
-//! Provides two parser entry points:
+//! Provides two parser entry points, each also available as an iterator
+//! ([`annex_b_units`], [`avcc_units`]) that doesn't build a list:
 //!
 //! - [`parse_annex_b`] for start-code delimited bitstreams
 //!   (`.h264` files, RTP payloads, broadcast TS).
@@ -94,50 +95,103 @@ pub struct NalUnit<'a> {
 ///              nal.nal_unit_type, nal.nal_ref_idc, nal.rbsp.len());
 /// }
 /// ```
+///
+/// The list is capped at [`MAX_ANNEX_B_NALS`] entries so that a file of
+/// nothing but start codes can't exhaust the heap. Prefer [`annex_b_units`]
+/// for anything larger than a sample: it needs no list at all.
 pub fn parse_annex_b(data: &[u8]) -> Vec<NalUnit<'_>> {
     let mut nals = Vec::new();
-    // Find first start code
-    let mut i = match find_start_code(data, 0) {
-        Some((pos, _)) => pos,
-        None => return nals,
-    };
-
-    loop {
-        // i points to first byte after start code (the NAL header byte)
-        if i >= data.len() {
+    for nal in annex_b_units(data).take(MAX_ANNEX_B_NALS) {
+        if nals.try_reserve(1).is_err() {
             break;
         }
-
-        // Find the next start code to determine where this NAL ends
-        let nal_end = match find_start_code(data, i) {
-            Some((pos, sc_start)) => {
-                let end = sc_start;
-                // Strip trailing zeros before the start code
-                let mut e = end;
-                while e > i && data[e - 1] == 0 {
-                    e -= 1;
-                }
-                (e, Some(pos))
-            }
-            None => (data.len(), None),
-        };
-
-        if let Some(nal) = parse_nal_bytes(&data[i..nal_end.0]) {
-            nals.push(nal);
-        }
-
-        match nal_end.1 {
-            Some(pos) => i = pos,
-            None => break,
-        }
+        nals.push(nal);
     }
-
     nals
 }
 
+/// Most NAL units [`parse_annex_b`] returns from one call.
+pub const MAX_ANNEX_B_NALS: usize = 1 << 16;
+
+/// Iterates the NAL units of an Annex B bytestream without allocating a list.
+///
+/// Emulation prevention is removed as each unit is produced, so only the unit
+/// being read is held in memory. A unit whose unescaped copy can't be allocated
+/// is skipped.
+pub fn annex_b_units(data: &[u8]) -> AnnexBUnits<'_> {
+    AnnexBUnits {
+        ranges: annex_b_ranges(data),
+    }
+}
+
+/// Iterator returned by [`annex_b_units`].
+#[derive(Clone)]
+pub struct AnnexBUnits<'a> {
+    ranges: AnnexBRanges<'a>,
+}
+
+impl<'a> Iterator for AnnexBUnits<'a> {
+    type Item = NalUnit<'a>;
+
+    fn next(&mut self) -> Option<NalUnit<'a>> {
+        let data = self.ranges.data;
+        for range in self.ranges.by_ref() {
+            if let Some(nal) = parse_nal_bytes(&data[range]) {
+                return Some(nal);
+            }
+        }
+        None
+    }
+}
+
+/// Iterates the byte ranges of the NAL units in an Annex B bytestream, header
+/// byte included and trailing zeros excluded. Nothing is copied or unescaped,
+/// so this suits indexing a file.
+pub fn annex_b_ranges(data: &[u8]) -> AnnexBRanges<'_> {
+    let next = find_start_code(data, 0).map(|(pos, _)| pos);
+    AnnexBRanges { data, next }
+}
+
+/// Iterator returned by [`annex_b_ranges`].
+#[derive(Clone)]
+pub struct AnnexBRanges<'a> {
+    data: &'a [u8],
+    next: Option<usize>,
+}
+
+impl Iterator for AnnexBRanges<'_> {
+    type Item = core::ops::Range<usize>;
+
+    fn next(&mut self) -> Option<core::ops::Range<usize>> {
+        loop {
+            let start = self.next?;
+            if start >= self.data.len() {
+                self.next = None;
+                return None;
+            }
+            let (end, next) = match find_start_code(self.data, start) {
+                Some((pos, sc_start)) => {
+                    // Strip trailing zeros before the start code
+                    let mut end = sc_start;
+                    while end > start && self.data[end - 1] == 0 {
+                        end -= 1;
+                    }
+                    (end, Some(pos))
+                }
+                None => (self.data.len(), None),
+            };
+            self.next = next;
+            if end > start {
+                return Some(start..end);
+            }
+        }
+    }
+}
+
 /// Parse a single NAL unit from raw bytes (header byte + payload).
-/// Returns `None` if the slice is empty or has the forbidden_zero_bit set.
-fn parse_nal_bytes(nal_data: &[u8]) -> Option<NalUnit<'_>> {
+/// Returns `None` if the slice is empty, has the forbidden_zero_bit set, or
+/// its unescaped payload can't be allocated.
+pub fn parse_nal_bytes(nal_data: &[u8]) -> Option<NalUnit<'_>> {
     if nal_data.is_empty() {
         return None;
     }
@@ -148,7 +202,7 @@ fn parse_nal_bytes(nal_data: &[u8]) -> Option<NalUnit<'_>> {
     }
     let nal_ref_idc = (header >> 5) & 0x03;
     let nal_unit_type = NalUnitType::from(header & 0x1F);
-    let rbsp = remove_emulation_prevention(&nal_data[1..]);
+    let rbsp = remove_emulation_prevention(&nal_data[1..])?;
     Some(NalUnit {
         nal_ref_idc,
         nal_unit_type,
@@ -293,29 +347,74 @@ pub fn parse_avcc_config(data: &[u8]) -> Result<AvccConfig<'_>, &'static str> {
 /// is stored separately in the MP4 `avcC` box and must be parsed with
 /// `parse_avcc_config` and fed to the decoder before any sample NALs.
 pub fn parse_avcc(data: &[u8], length_size: usize) -> Vec<NalUnit<'_>> {
-    let mut nals = Vec::new();
-    if length_size != 1 && length_size != 2 && length_size != 4 {
-        return nals;
+    avcc_units(data, length_size).collect()
+}
+
+/// Iterates the NAL units of a length-prefixed AVCC sample without building a
+/// list. Stops at a truncated unit or an invalid `length_size`. A unit whose
+/// unescaped copy can't be allocated is skipped.
+pub fn avcc_units(data: &[u8], length_size: usize) -> AvccUnits<'_> {
+    AvccUnits {
+        ranges: avcc_ranges(data, length_size),
     }
-    let mut i = 0;
-    while i + length_size <= data.len() {
-        let len = match length_size {
-            1 => data[i] as usize,
-            2 => u16::from_be_bytes([data[i], data[i + 1]]) as usize,
-            4 => u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as usize,
-            _ => unreachable!(),
+}
+
+/// Iterator returned by [`avcc_units`].
+#[derive(Clone)]
+pub struct AvccUnits<'a> {
+    ranges: AvccRanges<'a>,
+}
+
+impl<'a> Iterator for AvccUnits<'a> {
+    type Item = NalUnit<'a>;
+
+    fn next(&mut self) -> Option<NalUnit<'a>> {
+        let data = self.ranges.data;
+        for range in self.ranges.by_ref() {
+            if let Some(nal) = parse_nal_bytes(&data[range]) {
+                return Some(nal);
+            }
+        }
+        None
+    }
+}
+
+/// Iterates the byte ranges of the NAL units of an AVCC sample, header byte
+/// included. Nothing is copied or unescaped, so this suits indexing a file.
+pub fn avcc_ranges(data: &[u8], length_size: usize) -> AvccRanges<'_> {
+    AvccRanges {
+        data,
+        length_size,
+        pos: 0,
+    }
+}
+
+/// Iterator returned by [`avcc_ranges`].
+#[derive(Clone)]
+pub struct AvccRanges<'a> {
+    data: &'a [u8],
+    length_size: usize,
+    pos: usize,
+}
+
+impl Iterator for AvccRanges<'_> {
+    type Item = core::ops::Range<usize>;
+
+    fn next(&mut self) -> Option<core::ops::Range<usize>> {
+        let i = self.pos;
+        let data = self.data;
+        let header = data.get(i..i.checked_add(self.length_size)?)?;
+        let len = match *header {
+            [a] => a as usize,
+            [a, b] => u16::from_be_bytes([a, b]) as usize,
+            [a, b, c, d] => u32::from_be_bytes([a, b, c, d]) as usize,
+            _ => return None,
         };
-        i += length_size;
-        if i + len > data.len() {
-            // Truncated NAL — stop parsing
-            break;
-        }
-        if let Some(nal) = parse_nal_bytes(&data[i..i + len]) {
-            nals.push(nal);
-        }
-        i += len;
+        let start = i + self.length_size;
+        let end = start.checked_add(len).filter(|&end| end <= data.len())?;
+        self.pos = end;
+        Some(start..end)
     }
-    nals
 }
 
 /// Find the next start code starting from `offset`.
@@ -339,15 +438,16 @@ fn find_start_code(data: &[u8], offset: usize) -> Option<(usize, usize)> {
 /// Remove emulation prevention bytes (0x03 in 00 00 03 sequences).
 /// Returns a borrowed slice when no emulation prevention bytes are found
 /// (the common case), avoiding allocation entirely.
-fn remove_emulation_prevention(data: &[u8]) -> Cow<'_, [u8]> {
+fn remove_emulation_prevention(data: &[u8]) -> Option<Cow<'_, [u8]>> {
     // Fast path: scan for 00 00 03. If none found, return borrowed slice.
     let has_epb = data.windows(3).any(|w| w[0] == 0 && w[1] == 0 && w[2] == 3);
     if !has_epb {
-        return Cow::Borrowed(data);
+        return Some(Cow::Borrowed(data));
     }
 
     // Slow path: copy with emulation prevention removal.
-    let mut rbsp = Vec::with_capacity(data.len());
+    let mut rbsp = Vec::new();
+    rbsp.try_reserve_exact(data.len()).ok()?;
     let mut i = 0;
     while i < data.len() {
         if i + 2 < data.len() && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 3 {
@@ -359,7 +459,7 @@ fn remove_emulation_prevention(data: &[u8]) -> Cow<'_, [u8]> {
             i += 1;
         }
     }
-    Cow::Owned(rbsp)
+    Some(Cow::Owned(rbsp))
 }
 
 #[cfg(all(test, feature = "upstream-tests"))]
@@ -384,7 +484,7 @@ mod tests {
     #[test]
     fn test_emulation_prevention_removal() {
         let input = [0x00, 0x00, 0x03, 0x01, 0xAB];
-        let rbsp = remove_emulation_prevention(&input);
+        let rbsp = remove_emulation_prevention(&input).unwrap();
         assert_eq!(&*rbsp, &[0x00, 0x00, 0x01, 0xAB]);
         assert!(
             matches!(rbsp, Cow::Owned(_)),
@@ -396,7 +496,7 @@ mod tests {
     fn test_emulation_prevention_zero_copy() {
         // No emulation prevention bytes → should return borrowed slice (no allocation)
         let input = [0x01, 0x02, 0x03, 0x04];
-        let rbsp = remove_emulation_prevention(&input);
+        let rbsp = remove_emulation_prevention(&input).unwrap();
         assert_eq!(&*rbsp, &input);
         assert!(
             matches!(rbsp, Cow::Borrowed(_)),

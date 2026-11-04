@@ -28,6 +28,7 @@
 //!     stdout: &mut stdout,
 //!     stderr: &mut stderr,
 //!     system: &NoSystem,
+//!     depth: 0,
 //! };
 //! assert_eq!(run("mkdir", &["docs".into()], &mut ctx), 0);
 //! assert!(fs.is_dir("/docs"));
@@ -47,8 +48,8 @@ pub mod regex;
 pub mod sha256;
 pub mod system;
 
-pub use commands::{command, is_command, run, CommandSpec, Ctx, COMMANDS};
-pub use env::Env;
+pub use commands::{command, is_command, run, CommandFn, CommandSpec, Ctx, COMMANDS};
+pub use env::{Env, Var, VarError};
 pub use fs::{base_name, join, normalize, parent, DirEntry, FsError, Kind, Meta, OverlayFs, Vfs};
-pub use io::{BytesInput, BytesOutput, Input, NullInput, NullOutput, Output};
+pub use io::{BytesInput, BytesOutput, Input, NullInput, NullOutput, Output, MAX_STREAM_BYTES};
 pub use system::{MemoryInfo, NoSystem, System};

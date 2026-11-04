@@ -3,7 +3,7 @@ name: File Explorer
 version: 1.1.0
 entry: files
 category: System
-description: Browse, search and preview files with an XP-style explorer
+description: Browse, search and preview files
 icon: icon.bmp
 window:
   width: 760

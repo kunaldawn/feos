@@ -1,0 +1,10 @@
+id: gui-gallery
+name: Component Gallery
+version: 1.0.0
+entry: gui
+category: Utilities
+description: Try every feos-gui widget with live input
+icon: icon.bmp
+window:
+  width: 900
+  height: 640

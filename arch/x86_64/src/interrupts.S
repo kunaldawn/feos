@@ -2,8 +2,10 @@
  * x86_64 interrupt entry stubs.
  *
  * Vectors 0..31 are CPU exceptions; vectors 32..47 are hardware IRQs (the
- * x86_64 port routes the PIT through vector 34). Each stub normalises the
- * stack to:
+ * x86_64 port routes the PIT through vector 34); vector 48 is the software
+ * switch and vectors 49..50 are inter-processor interrupts. The IDT switches
+ * each one to a per-CPU stack through the TSS, so none of this frame is on the
+ * interrupted task's stack. Each stub normalises the stack to:
  *
  *     vector
  *     error code
@@ -80,6 +82,9 @@ ISR_NOERR 44
 ISR_NOERR 45
 ISR_NOERR 46
 ISR_NOERR 47
+ISR_NOERR 48
+ISR_NOERR 49
+ISR_NOERR 50
 
 /* Any unexpected interrupt returns without touching the stack. */
 .global isr_spurious
@@ -105,8 +110,7 @@ interrupt_common:
     pushq %r15
 
     /* XMM0..XMM15 occupy the first 256 bytes of the TrapFrame. `movups`
-     * keeps this correct even when the interrupted stack is only 8-byte
-     * aligned. */
+     * doesn't depend on the stubs' 8-byte frame alignment. */
     subq $256, %rsp
     movups %xmm0,   0(%rsp)
     movups %xmm1,  16(%rsp)
@@ -136,9 +140,8 @@ interrupt_common:
     /* The CPU frame at frame_base + 392 is already a complete long-mode
      * IRET frame: RIP, CS, RFLAGS, RSP, SS. The scheduler may have replaced
      * it with another task's saved frame, but it is still in the required
-     * layout. Point RSP at it and return directly; copying the frame to the
-     * target task's stack would overlap the source when the interrupted RSP
-     * was not 16-byte aligned (the CPU aligns the frame when pushing it). */
+     * layout. Point RSP at it and return directly: IRET loads the task's own
+     * RSP from it, leaving this per-CPU stack free for the next interrupt. */
     movq %rsp, %r15
     leaq 392(%r15), %rsp
 
@@ -186,5 +189,6 @@ isr_stub_table:
     .quad isr24, isr25, isr26, isr27, isr28, isr29, isr30, isr31
     .quad isr32, isr33, isr34, isr35, isr36, isr37, isr38, isr39
     .quad isr40, isr41, isr42, isr43, isr44, isr45, isr46, isr47
+    .quad isr48, isr49, isr50
 
 .section .note.GNU-stack, "", @progbits

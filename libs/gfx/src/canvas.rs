@@ -3,6 +3,8 @@
 use crate::color::Color;
 use crate::font;
 use crate::geometry::{Rect, Size};
+#[cfg(test)]
+use crate::geometry::Point;
 
 /// A 2D drawing surface backed by a 32-bit XRGB8888 pixel buffer.
 ///
@@ -232,34 +234,76 @@ impl<'a> Canvas<'a> {
     }
 
     /// Draws a line with Bresenham's algorithm. Both endpoints are included.
-    pub fn line(&mut self, mut x0: i32, mut y0: i32, x1: i32, y1: i32, color: Color) {
+    pub fn line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, color: Color) {
+        let clip = Rect::new(0, 0, self.width as u32, self.height as u32);
+        self.line_clipped(x0, y0, x1, y1, clip, color);
+    }
+
+    /// Draws the part of a line that falls inside `clip`.
+    ///
+    /// The range of steps that can be visible is computed up front, so a very
+    /// long or far off-screen line costs only as much as its visible part.
+    /// The pixels are the same ones an unclipped walk would visit.
+    pub fn line_clipped(
+        &mut self,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+        clip: Rect,
+        color: Color,
+    ) {
+        let clip = clip.clipped_to_canvas(self.width, self.height);
+        if clip.is_empty() {
+            return;
+        }
+        let (min_x, max_x) = (clip.x as i64, clip.right() - 1);
+        let (min_y, max_y) = (clip.y as i64, clip.bottom() - 1);
+        let (x0, y0, x1, y1) = (x0 as i64, y0 as i64, x1 as i64, y1 as i64);
+        if x0.max(x1) < min_x || x0.min(x1) > max_x || y0.max(y1) < min_y || y0.min(y1) > max_y {
+            return;
+        }
+
         let dx = (x1 - x0).abs();
+        let dy = (y1 - y0).abs();
         let sx = if x0 < x1 { 1 } else { -1 };
-        let dy = -(y1 - y0).abs();
         let sy = if y0 < y1 { 1 } else { -1 };
-        let mut err = dx + dy;
+        let raw = color.raw();
 
-        loop {
-            self.put_pixel(x0, y0, color);
-            if x0 == x1 && y0 == y1 {
-                break;
-            }
+        if dx == 0 && dy == 0 {
+            self.pixels[y0 as usize * self.stride + x0 as usize] = raw;
+            return;
+        }
 
-            let e2 = 2 * err;
-            if e2 >= dy {
-                if x0 == x1 {
-                    break;
-                }
-                err += dy;
-                x0 += sx;
+        // Walk the major axis; the minor coordinate is a rounded multiple of
+        // the slope, which is what Bresenham's error term computes.
+        let (major, minor, major_start, minor_start, major_step, minor_step, major_range) =
+            if dx >= dy {
+                (dx, dy, x0, y0, sx, sy, (min_x, max_x))
+            } else {
+                (dy, dx, y0, x0, sy, sx, (min_y, max_y))
+            };
+        let (low, high) = major_range;
+        let (first, last) = if major_step > 0 {
+            ((low - major_start).max(0), (high - major_start).min(major))
+        } else {
+            ((major_start - high).max(0), (major_start - low).min(major))
+        };
+
+        let mut step = first;
+        while step <= last {
+            let offset = ((2 * step as i128 * minor as i128 + major as i128) / (2 * major as i128)) as i64;
+            let along = major_start + major_step * step;
+            let across = minor_start + minor_step * offset;
+            let (x, y) = if dx >= dy {
+                (along, across)
+            } else {
+                (across, along)
+            };
+            if x >= min_x && x <= max_x && y >= min_y && y <= max_y {
+                self.pixels[y as usize * self.stride + x as usize] = raw;
             }
-            if e2 <= dx {
-                if y0 == y1 {
-                    break;
-                }
-                err += dx;
-                y0 += sy;
-            }
+            step += 1;
         }
     }
 
@@ -324,32 +368,143 @@ impl<'a> Canvas<'a> {
 
     /// Fills `rect` with a vertical gradient from `top` to `bottom`.
     pub fn fill_vertical_gradient(&mut self, rect: Rect, top: Color, bottom: Color) {
+        let clip = Rect::new(0, 0, self.width as u32, self.height as u32);
+        self.fill_vertical_gradient_clipped(rect, clip, top, bottom);
+    }
+
+    /// Fills the part of a vertical gradient that falls inside `clip`.
+    ///
+    /// The colour of a row depends only on its position in `rect`, so a
+    /// clipped redraw matches the same rows of a full one, and rows outside
+    /// `clip` cost nothing.
+    pub fn fill_vertical_gradient_clipped(
+        &mut self,
+        rect: Rect,
+        clip: Rect,
+        top: Color,
+        bottom: Color,
+    ) {
         if rect.is_empty() {
+            return;
+        }
+        let clip = clip.clipped_to_canvas(self.width, self.height);
+        let x0 = (rect.x as i64).max(clip.x as i64);
+        let x1 = rect.right().min(clip.right());
+        let y0 = (rect.y as i64).max(clip.y as i64);
+        let y1 = rect.bottom().min(clip.bottom());
+        if x0 >= x1 || y0 >= y1 {
             return;
         }
 
         let denominator = rect.height.saturating_sub(1).max(1) as u64;
-        for row in 0..rect.height {
-            let t = ((row as u64 * 255) / denominator) as u8;
-            self.fill_rect(
-                Rect::new(rect.x, rect.y.saturating_add(row as i32), rect.width, 1),
-                top.lerp(bottom, t),
-            );
+        for y in y0..y1 {
+            let row = (y - rect.y as i64) as u64;
+            let t = ((row * 255) / denominator) as u8;
+            let raw = top.lerp(bottom, t).raw();
+            let start = y as usize * self.stride;
+            self.pixels[start + x0 as usize..start + x1 as usize].fill(raw);
+        }
+    }
+
+    /// Blends `color` over `rect` with constant `alpha`, clipped to the canvas.
+    pub fn blend_rect(&mut self, rect: Rect, color: Color, alpha: u8) {
+        if alpha == 0 || rect.is_empty() {
+            return;
+        }
+        let x0 = rect.x.max(0).min(self.width as i32) as usize;
+        let y0 = rect.y.max(0).min(self.height as i32) as usize;
+        let x1 = rect.right().clamp(0, self.width as i64) as usize;
+        let y1 = rect.bottom().clamp(0, self.height as i64) as usize;
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        if alpha == 255 {
+            self.fill_rect(rect, color);
+            return;
+        }
+
+        // One channel multiply per pixel, written against the row slice so the
+        // loop has no per-pixel bounds or clip checks.
+        let inv = 255 - alpha as u32;
+        let t = alpha as u32;
+        let (r, g, b) = (
+            color.r() as u32 * t,
+            color.g() as u32 * t,
+            color.b() as u32 * t,
+        );
+        for y in y0..y1 {
+            let start = y * self.stride;
+            for pixel in &mut self.pixels[start + x0..start + x1] {
+                let old = *pixel;
+                let nr = (((old >> 16) & 0xff) * inv + r) / 255;
+                let ng = (((old >> 8) & 0xff) * inv + g) / 255;
+                let nb = ((old & 0xff) * inv + b) / 255;
+                *pixel = (nr << 16) | (ng << 8) | nb;
+            }
         }
     }
 
     /// Draws one character with an 8x8 bitmap font. `scale` magnifies each
     /// font pixel into a `scale * scale` square (clamped to 1..=64).
     pub fn draw_char(&mut self, x: i32, y: i32, ch: char, color: Color, scale: u32) {
-        let scale = scale.clamp(1, 64);
-        let glyph = font::glyph(ch);
+        let clip = Rect::new(0, 0, self.width as u32, self.height as u32);
+        self.draw_char_clipped(x, y, ch, color, scale, clip);
+    }
 
+    /// Draws the part of one character that falls inside `clip`, one run of
+    /// set bits at a time.
+    pub fn draw_char_clipped(
+        &mut self,
+        x: i32,
+        y: i32,
+        ch: char,
+        color: Color,
+        scale: u32,
+        clip: Rect,
+    ) {
+        let scale = scale.clamp(1, 64);
+        let clip = clip.clipped_to_canvas(self.width, self.height);
+        if clip.is_empty() {
+            return;
+        }
+        let step = scale as i64;
+        let (clip_x0, clip_x1) = (clip.x as i64, clip.right());
+        let (clip_y0, clip_y1) = (clip.y as i64, clip.bottom());
+        let (x, y) = (x as i64, y as i64);
+        if x >= clip_x1
+            || x + font::GLYPH_WIDTH as i64 * step <= clip_x0
+            || y >= clip_y1
+            || y + font::GLYPH_HEIGHT as i64 * step <= clip_y0
+        {
+            return;
+        }
+
+        let raw = color.raw();
+        let glyph = font::glyph(ch);
         for (row, bits) in glyph.iter().enumerate() {
-            for col in 0..font::GLYPH_WIDTH {
-                if bits & (1 << col) != 0 {
-                    let px = x.saturating_add(col as i32 * scale as i32);
-                    let py = y.saturating_add(row as i32 * scale as i32);
-                    self.fill_rect(Rect::new(px, py, scale, scale), color);
+            let top = y + row as i64 * step;
+            let y0 = top.max(clip_y0);
+            let y1 = (top + step).min(clip_y1);
+            if y0 >= y1 || *bits == 0 {
+                continue;
+            }
+            let mut col = 0usize;
+            while col < font::GLYPH_WIDTH {
+                if bits & (1 << col) == 0 {
+                    col += 1;
+                    continue;
+                }
+                let start = col;
+                while col < font::GLYPH_WIDTH && bits & (1 << col) != 0 {
+                    col += 1;
+                }
+                let x0 = (x + start as i64 * step).max(clip_x0);
+                let x1 = (x + col as i64 * step).min(clip_x1);
+                if x0 < x1 {
+                    for py in y0..y1 {
+                        let base = py as usize * self.stride;
+                        self.pixels[base + x0 as usize..base + x1 as usize].fill(raw);
+                    }
                 }
             }
         }
@@ -401,26 +556,84 @@ impl<'a> Canvas<'a> {
     /// Copies a packed `width * height` XRGB8888 image to `(x, y)`, clipping
     /// at the canvas edges.
     pub fn blit(&mut self, x: i32, y: i32, width: u32, height: u32, pixels: &[u32]) {
-        let width = width as usize;
-        let height = height as usize;
-        if width == 0 || height == 0 || pixels.len() < width * height {
+        let clip = Rect::new(0, 0, self.width as u32, self.height as u32);
+        self.blit_clipped(x, y, width, height, pixels, clip);
+    }
+
+    /// Copies the part of a packed image that falls inside `clip`, one row
+    /// slice at a time.
+    pub fn blit_clipped(
+        &mut self,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        pixels: &[u32],
+        clip: Rect,
+    ) {
+        let source_width = width as usize;
+        let source_height = height as usize;
+        let Some(required) = source_width.checked_mul(source_height) else {
+            return;
+        };
+        if required == 0 || pixels.len() < required {
             return;
         }
 
-        for row in 0..height {
-            let py = y as i64 + row as i64;
-            if py < 0 || py >= self.height as i64 {
-                continue;
-            }
+        let clip = clip.clipped_to_canvas(self.width, self.height);
+        let x0 = (x as i64).max(clip.x as i64);
+        let y0 = (y as i64).max(clip.y as i64);
+        let x1 = (x as i64 + width as i64).min(clip.right());
+        let y1 = (y as i64 + height as i64).min(clip.bottom());
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
 
-            for col in 0..width {
-                let px = x as i64 + col as i64;
-                if px < 0 || px >= self.width as i64 {
-                    continue;
-                }
+        let columns = (x1 - x0) as usize;
+        let skip = (x0 - x as i64) as usize;
+        for py in y0..y1 {
+            let row = (py - y as i64) as usize;
+            let source = row * source_width + skip;
+            let target = py as usize * self.stride + x0 as usize;
+            self.pixels[target..target + columns]
+                .copy_from_slice(&pixels[source..source + columns]);
+        }
+    }
 
-                self.pixels[py as usize * self.stride + px as usize] = pixels[row * width + col];
+    /// Copies `rect` from `source` to the same position in this canvas.
+    ///
+    /// The rectangle is clipped to both canvases. This is the partial present
+    /// step for an off-screen buffer, and the restore step for a cached layer.
+    pub fn copy_rect_from(&mut self, source: &Canvas<'_>, rect: Rect) {
+        self.copy_rect_from_pixels(source.pixels, source.width, source.height, source.stride, rect);
+    }
+
+    /// Copies `rect` from a raw `width * height` buffer with `stride` pixels
+    /// per row to the same position in this canvas.
+    pub fn copy_rect_from_pixels(
+        &mut self,
+        pixels: &[u32],
+        width: usize,
+        height: usize,
+        stride: usize,
+        rect: Rect,
+    ) {
+        let x0 = rect.x.max(0) as i64;
+        let y0 = rect.y.max(0) as i64;
+        let x1 = rect.right().min(self.width as i64).min(width as i64);
+        let y1 = rect.bottom().min(self.height as i64).min(height as i64);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+
+        let columns = (x1 - x0) as usize;
+        for y in y0 as usize..y1 as usize {
+            let from = y * stride + x0 as usize;
+            let to = y * self.stride + x0 as usize;
+            if from + columns > pixels.len() {
+                return;
             }
+            self.pixels[to..to + columns].copy_from_slice(&pixels[from..from + columns]);
         }
     }
 }
@@ -604,5 +817,150 @@ mod tests {
         canvas.blit(-1, -1, 2, 2, &image);
         assert_eq!(canvas.pixel(0, 0), Some(Color::WHITE));
         assert_eq!(canvas.pixel(1, 0), Some(Color::BLACK));
+    }
+
+    #[test]
+    fn line_includes_both_endpoints_in_every_octant() {
+        for &(x1, y1) in &[
+            (39, 5),
+            (39, 25),
+            (0, 25),
+            (25, 39),
+            (5, 0),
+            (0, 0),
+            (39, 39),
+            (20, 39),
+        ] {
+            let mut pixels = [0u32; 40 * 40];
+            let mut surface = canvas(&mut pixels, 40, 40);
+            surface.line(20, 20, x1, y1, Color::WHITE);
+            assert_eq!(surface.pixel(20, 20), Some(Color::WHITE));
+            assert_eq!(surface.pixel(x1, y1), Some(Color::WHITE));
+        }
+    }
+
+    #[test]
+    fn a_far_off_screen_line_is_clipped_without_walking_it() {
+        let mut pixels = [0u32; 16 * 16];
+        let mut surface = canvas(&mut pixels, 16, 16);
+        // A walk over this range would take minutes in a dev build.
+        surface.line(i32::MIN / 2, 8, i32::MAX / 2, 8, Color::WHITE);
+        assert_eq!(surface.pixel(0, 8), Some(Color::WHITE));
+        assert_eq!(surface.pixel(15, 8), Some(Color::WHITE));
+        assert_eq!(surface.pixel(8, 7), Some(Color::BLACK));
+        surface.line(i32::MIN, i32::MIN, i32::MAX, i32::MAX, Color::RED);
+    }
+
+    #[test]
+    fn clipped_line_matches_the_visible_part_of_an_unclipped_one() {
+        let mut full = [0u32; 32 * 32];
+        let mut surface = canvas(&mut full, 32, 32);
+        surface.line(1, 2, 30, 17, Color::WHITE);
+        let mut clipped = [0u32; 32 * 32];
+        let mut other = canvas(&mut clipped, 32, 32);
+        let clip = Rect::new(8, 4, 10, 8);
+        other.line_clipped(1, 2, 30, 17, clip, Color::WHITE);
+        for y in 0..32i32 {
+            for x in 0..32i32 {
+                let expected = if clip.contains(Point::new(x, y)) {
+                    full[y as usize * 32 + x as usize]
+                } else {
+                    0
+                };
+                assert_eq!(clipped[y as usize * 32 + x as usize], expected, "{x},{y}");
+            }
+        }
+    }
+
+    #[test]
+    fn clipped_gradient_matches_the_same_rows_of_a_full_one() {
+        let rect = Rect::new(-4, -8, 40, 64);
+        let (top, bottom) = (Color::rgb(0, 10, 200), Color::rgb(250, 40, 0));
+        let mut full = [0u32; 32 * 32];
+        canvas(&mut full, 32, 32).fill_vertical_gradient(rect, top, bottom);
+        let mut part = [0u32; 32 * 32];
+        let clip = Rect::new(5, 5, 7, 9);
+        canvas(&mut part, 32, 32).fill_vertical_gradient_clipped(rect, clip, top, bottom);
+        for y in 0..32i32 {
+            for x in 0..32i32 {
+                let index = y as usize * 32 + x as usize;
+                if clip.contains(Point::new(x, y)) {
+                    assert_eq!(part[index], full[index]);
+                } else {
+                    assert_eq!(part[index], 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blit_clips_on_every_side_and_keeps_source_alignment() {
+        let source: [u32; 16] = core::array::from_fn(|index| index as u32 + 1);
+        let mut pixels = [0u32; 4 * 4];
+        canvas(&mut pixels, 4, 4).blit(-2, -2, 4, 4, &source);
+        assert_eq!(pixels[0], source[2 * 4 + 2]);
+        assert_eq!(pixels[1], source[2 * 4 + 3]);
+        assert_eq!(pixels[4], source[3 * 4 + 2]);
+        assert_eq!(pixels[2], 0);
+
+        let mut pixels = [0u32; 4 * 4];
+        canvas(&mut pixels, 4, 4).blit(3, 3, 4, 4, &source);
+        assert_eq!(pixels[15], source[0]);
+        assert_eq!(pixels[14], 0);
+
+        // An image larger than its slice, or one that overflows, is ignored.
+        let mut pixels = [0u32; 4 * 4];
+        canvas(&mut pixels, 4, 4).blit(0, 0, u32::MAX, u32::MAX, &source);
+        assert!(pixels.iter().all(|&pixel| pixel == 0));
+    }
+
+    #[test]
+    fn copy_rect_copies_only_the_requested_region() {
+        let mut source_pixels = [7u32; 8 * 8];
+        let source = canvas(&mut source_pixels, 8, 8);
+        let mut target_pixels = [0u32; 8 * 8];
+        let mut target = canvas(&mut target_pixels, 8, 8);
+        target.copy_rect_from(&source, Rect::new(6, 6, 100, 100));
+        assert_eq!(target.pixel(6, 6).map(|c| c.raw()), Some(7));
+        assert_eq!(target.pixel(7, 7).map(|c| c.raw()), Some(7));
+        assert_eq!(target.pixel(5, 6).map(|c| c.raw()), Some(0));
+        target.copy_rect_from(&source, Rect::new(-3, -3, 4, 4));
+        assert_eq!(target.pixel(0, 0).map(|c| c.raw()), Some(7));
+        assert_eq!(target.pixel(1, 1).map(|c| c.raw()), Some(0));
+    }
+
+    #[test]
+    fn blend_rect_matches_per_pixel_lerp() {
+        let mut pixels = [0u32; 4 * 4];
+        let mut surface = canvas(&mut pixels, 4, 4);
+        let base = Color::rgb(200, 100, 50);
+        let over = Color::rgb(10, 20, 30);
+        surface.fill_rect(Rect::new(0, 0, 4, 4), base);
+        surface.blend_rect(Rect::new(-1, -1, 3, 3), over, 90);
+        assert_eq!(surface.pixel(0, 0), Some(base.lerp(over, 90)));
+        assert_eq!(surface.pixel(1, 1), Some(base.lerp(over, 90)));
+        assert_eq!(surface.pixel(2, 2), Some(base));
+    }
+
+    #[test]
+    fn span_glyphs_match_a_pixel_by_pixel_scale_up() {
+        for scale in [1u32, 3] {
+            let mut pixels = [0u32; 32 * 32];
+            let mut surface = canvas(&mut pixels, 32, 32);
+            surface.draw_char(2, 3, 'R', Color::WHITE, scale);
+            let glyph = font::glyph('R');
+            for (row, bits) in glyph.iter().enumerate() {
+                for col in 0..font::GLYPH_WIDTH {
+                    let expected = if bits & (1 << col) != 0 {
+                        Color::WHITE
+                    } else {
+                        Color::BLACK
+                    };
+                    let px = 2 + col as i32 * scale as i32;
+                    let py = 3 + row as i32 * scale as i32;
+                    assert_eq!(surface.pixel(px, py), Some(expected));
+                }
+            }
+        }
     }
 }

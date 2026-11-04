@@ -10,8 +10,9 @@ pub const MANIFEST_MAX: usize = 4096;
 
 /// Metadata read from a bundle's `manifest.yaml`.
 ///
-/// All strings are fixed-capacity [`Text`] values; longer fields are truncated
-/// rather than rejected so a bundle written on another system still loads.
+/// All strings are fixed-capacity [`Text`] values. A longer field is rejected
+/// with [`BundleError::FieldTooLong`]: truncating an `entry` or `args` would
+/// quietly launch something else.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Manifest {
     /// Stable application identifier (`terminal`, `files`, ...).
@@ -62,32 +63,32 @@ impl Manifest {
         }
 
         let mut manifest = Self::EMPTY;
-        read_text(&document, root, "id", &mut manifest.id);
+        read_text(&document, root, "id", &mut manifest.id)?;
         if manifest.id.is_empty() {
             return Err(BundleError::MissingField("id"));
         }
-        read_text(&document, root, "name", &mut manifest.name);
+        read_text(&document, root, "name", &mut manifest.name)?;
         if manifest.name.is_empty() {
             manifest.name.set(manifest.id.as_str());
         }
-        read_text(&document, root, "version", &mut manifest.version);
+        read_text(&document, root, "version", &mut manifest.version)?;
         if manifest.version.is_empty() {
             manifest.version.set("1.0.0");
         }
-        read_text(&document, root, "entry", &mut manifest.entry);
+        read_text(&document, root, "entry", &mut manifest.entry)?;
         if manifest.entry.is_empty() {
             manifest.entry.set(manifest.id.as_str());
         }
-        read_text(&document, root, "category", &mut manifest.category);
+        read_text(&document, root, "category", &mut manifest.category)?;
         if manifest.category.is_empty() {
             manifest.category.set("Applications");
         }
-        read_text(&document, root, "description", &mut manifest.description);
-        read_text(&document, root, "icon", &mut manifest.icon);
+        read_text(&document, root, "description", &mut manifest.description)?;
+        read_text(&document, root, "icon", &mut manifest.icon)?;
         if manifest.icon.is_empty() {
             manifest.icon.set("icon.bmp");
         }
-        read_text(&document, root, "args", &mut manifest.args);
+        read_text(&document, root, "args", &mut manifest.args)?;
 
         manifest.window_width = 560;
         manifest.window_height = 380;
@@ -113,17 +114,25 @@ impl Manifest {
 fn read_text<const N: usize>(
     document: &YamlDocument<'_, '_>,
     root: NodeId,
-    key: &str,
+    key: &'static str,
     out: &mut Text<N>,
-) {
+) -> Result<()> {
     let Some(node) = document.get(root, key) else {
-        return;
+        return Ok(());
     };
+    if document.scalar(node).is_none() {
+        return Err(BundleError::InvalidField(key));
+    }
+    // The parser has validated escapes, so a failed decode can only mean the
+    // value is longer than any field.
     let mut buffer = [0u8; 256];
-    let Some(value) = document.as_str(node, &mut buffer) else {
-        return;
-    };
-    out.set(value);
+    let value = document
+        .as_str(node, &mut buffer)
+        .ok_or(BundleError::FieldTooLong(key))?;
+    if !out.set(value) {
+        return Err(BundleError::FieldTooLong(key));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -160,5 +169,44 @@ mod tests {
         assert_eq!(manifest.name.as_str(), "demo");
         assert_eq!(manifest.entry.as_str(), "demo");
         assert_eq!(manifest.category.as_str(), "Applications");
+    }
+
+    #[test]
+    fn oversized_fields_are_errors_not_defaults() {
+        // At 300 bytes this used to fall back to `id`, launching another command.
+        let long = "x".repeat(300);
+        let yaml = format!("id: demo\nentry: {long}\n");
+        assert_eq!(
+            Manifest::parse(&yaml),
+            Err(BundleError::FieldTooLong("entry"))
+        );
+        // Just over the field's own capacity used to be truncated.
+        let yaml = format!("id: demo\nargs: {}\n", "a".repeat(65));
+        assert_eq!(
+            Manifest::parse(&yaml),
+            Err(BundleError::FieldTooLong("args"))
+        );
+        let yaml = format!("id: {}\n", "a".repeat(33));
+        assert_eq!(Manifest::parse(&yaml), Err(BundleError::FieldTooLong("id")));
+
+        let yaml = format!("id: {}\nargs: {}\n", "a".repeat(32), "b".repeat(64));
+        let manifest = Manifest::parse(&yaml).unwrap();
+        assert_eq!(manifest.id.len(), 32);
+        assert_eq!(manifest.args.len(), 64);
+    }
+
+    #[test]
+    fn non_scalar_fields_are_errors() {
+        assert_eq!(
+            Manifest::parse("id: demo\nentry:\n  - a\n"),
+            Err(BundleError::InvalidField("entry"))
+        );
+        assert_eq!(
+            Manifest::parse("id: demo\nargs: \"\"\n")
+                .unwrap()
+                .args
+                .as_str(),
+            ""
+        );
     }
 }

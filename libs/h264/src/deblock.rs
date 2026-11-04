@@ -6,7 +6,6 @@
 
 use crate::decoder::WorkFrame;
 use crate::residual::chroma_qp;
-use crate::slice::SliceHeader;
 
 /// Macroblock type for boundary strength derivation.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -17,9 +16,29 @@ pub enum MbType {
     Inter,
 }
 
+/// Per-slice deblocking parameters, recorded on each macroblock because they
+/// may differ between the slices of one picture (spec 8.7).
+#[derive(Clone, Copy, Default)]
+pub struct DeblockParams {
+    /// `disable_deblocking_filter_idc`: 1 disables the filter for this slice,
+    /// 2 keeps it from crossing slice boundaries.
+    pub filter_idc: u8,
+    /// `slice_alpha_c0_offset_div2`, range -6..=6.
+    pub alpha_offset_div2: i8,
+    /// `slice_beta_offset_div2`, range -6..=6.
+    pub beta_offset_div2: i8,
+    /// `chroma_qp_index_offset` for Cb, then `second_chroma_qp_index_offset`
+    /// for Cr.
+    pub chroma_qp_offset: [i8; 2],
+    /// Identifies the slice, for `filter_idc == 2`.
+    pub slice_id: u16,
+}
+
 /// Per-macroblock metadata needed by the deblocking filter.
 #[derive(Clone, Default)]
 pub struct MbInfo {
+    /// Deblocking parameters of the slice containing this macroblock.
+    pub deblock: DeblockParams,
     pub mb_type: MbType,
     pub qp_y: i32,
     /// Per-4x4-block motion vectors for L0 (quarter-pel). 16 entries in raster scan.
@@ -74,93 +93,29 @@ const TC0_TABLE: [[i32; 3]; 52] = [
     [ 9,12,18], [10,13,20], [11,15,23], [13,17,25],
 ];
 
-/// Apply the deblocking filter to a fully decoded frame.
-pub fn filter_frame(
-    frame: &mut WorkFrame,
-    mb_info: &[MbInfo],
-    mb_width: usize,
-    _mb_height: usize,
-    header: &SliceHeader,
-    chroma_qp_index_offset: i32,
-) {
-    filter_frame_params(
-        frame,
-        mb_info,
-        mb_width,
-        header.disable_deblocking_filter_idc,
-        header.slice_alpha_c0_offset_div2,
-        header.slice_beta_offset_div2,
-        chroma_qp_index_offset,
-    );
+/// Thresholds for one chroma plane across an edge: (indexA, alpha, beta).
+#[inline]
+fn chroma_thresholds(
+    qp_p: i32,
+    qp_q: i32,
+    params: &DeblockParams,
+    plane: usize,
+) -> (usize, i32, i32) {
+    let offset = params.chroma_qp_offset[plane] as i32;
+    let qp_c_avg = (chroma_qp(qp_p, offset) + chroma_qp(qp_q, offset) + 1) >> 1;
+    let index_a = (qp_c_avg + params.alpha_offset_div2 as i32 * 2).clamp(0, 51) as usize;
+    let index_b = (qp_c_avg + params.beta_offset_div2 as i32 * 2).clamp(0, 51) as usize;
+    (index_a, ALPHA_TABLE[index_a], BETA_TABLE[index_b])
 }
 
-/// Apply deblocking with explicit parameters (no SliceHeader needed).
+/// Apply deblocking to a fully decoded frame (spec 8.7). Each macroblock uses
+/// the parameters of the slice that contains it.
 #[allow(clippy::needless_range_loop)]
-pub fn filter_frame_params(
-    frame: &mut WorkFrame,
-    mb_info: &[MbInfo],
-    mb_width: usize,
-    disable_deblocking_filter_idc: u32,
-    slice_alpha_c0_offset_div2: i32,
-    slice_beta_offset_div2: i32,
-    chroma_qp_index_offset: i32,
-) {
-    filter_frame_inner(
-        frame,
-        mb_info,
-        mb_width,
-        disable_deblocking_filter_idc,
-        slice_alpha_c0_offset_div2,
-        slice_beta_offset_div2,
-        chroma_qp_index_offset,
-        false,
-    );
-}
-
-/// Apply deblocking with MBAFF support.
-#[allow(clippy::too_many_arguments)]
-pub fn filter_frame_mbaff(
-    frame: &mut WorkFrame,
-    mb_info: &[MbInfo],
-    mb_width: usize,
-    disable_deblocking_filter_idc: u32,
-    slice_alpha_c0_offset_div2: i32,
-    slice_beta_offset_div2: i32,
-    chroma_qp_index_offset: i32,
-    mbaff: bool,
-) {
-    filter_frame_inner(
-        frame,
-        mb_info,
-        mb_width,
-        disable_deblocking_filter_idc,
-        slice_alpha_c0_offset_div2,
-        slice_beta_offset_div2,
-        chroma_qp_index_offset,
-        mbaff,
-    );
-}
-
-#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
-fn filter_frame_inner(
-    frame: &mut WorkFrame,
-    mb_info: &[MbInfo],
-    mb_width: usize,
-    disable_deblocking_filter_idc: u32,
-    slice_alpha_c0_offset_div2: i32,
-    slice_beta_offset_div2: i32,
-    chroma_qp_index_offset: i32,
-    mbaff: bool,
-) {
-    if disable_deblocking_filter_idc == 1 {
-        return;
-    }
+pub fn filter_frame(frame: &mut WorkFrame, mb_info: &[MbInfo], mb_width: usize, mbaff: bool) {
     if mb_width == 0 {
         return;
     }
 
-    let filter_offset_a = slice_alpha_c0_offset_div2.wrapping_mul(2);
-    let filter_offset_b = slice_beta_offset_div2.wrapping_mul(2);
     // WorkFrame planes retain macroblock-aligned coded dimensions; display
     // width may be cropped and is not a valid plane stride.
     let stride_y = mb_width * 16;
@@ -193,6 +148,12 @@ fn filter_frame_inner(
             (col * 16, row * 16, col, row)
         };
         let mb_q = &mb_info[mb_idx];
+        let params = mb_q.deblock;
+        if params.filter_idc == 1 {
+            continue;
+        }
+        let filter_offset_a = params.alpha_offset_div2 as i32 * 2;
+        let filter_offset_b = params.beta_offset_div2 as i32 * 2;
 
         // -- Vertical edges (left to right) --
         for edge in 0..4 {
@@ -220,6 +181,9 @@ fn filter_frame_inner(
                 mb_idx - 1
             };
             let mb_p = &mb_info[left_mb_idx];
+            if is_mb_edge && params.filter_idc == 2 && mb_p.deblock.slice_id != params.slice_id {
+                continue;
+            }
 
             let qp_q = mb_q.qp_y;
             let qp_p = mb_p.qp_y;
@@ -228,15 +192,6 @@ fn filter_frame_inner(
             let index_b = (qp_avg + filter_offset_b).clamp(0, 51) as usize;
             let alpha = ALPHA_TABLE[index_a];
             let beta = BETA_TABLE[index_b];
-
-            // Chroma QP (computed once per edge, used for chroma segments)
-            let qp_c_p = chroma_qp(qp_p, chroma_qp_index_offset);
-            let qp_c_q = chroma_qp(qp_q, chroma_qp_index_offset);
-            let qp_c_avg = (qp_c_p + qp_c_q + 1) >> 1;
-            let c_index_a = (qp_c_avg + filter_offset_a).clamp(0, 51) as usize;
-            let c_index_b = (qp_c_avg + filter_offset_b).clamp(0, 51) as usize;
-            let c_alpha = ALPHA_TABLE[c_index_a];
-            let c_beta = BETA_TABLE[c_index_b];
 
             // Compute bS for all 4 segments first
             let mut seg_bs = [0i32; 4];
@@ -284,7 +239,10 @@ fn filter_frame_inner(
                         seg_bs[cseg * 2 + 1],
                         seg_bs[cseg * 2 + 1],
                     ];
-                    for plane in [&mut frame.u, &mut frame.v] {
+                    for (plane_index, plane) in [&mut frame.u, &mut frame.v].into_iter().enumerate()
+                    {
+                        let (c_index_a, c_alpha, c_beta) =
+                            chroma_thresholds(qp_p, qp_q, &params, plane_index);
                         for i in 0..4 {
                             let pbs = c_bs[i];
                             if pbs == 0 {
@@ -353,6 +311,9 @@ fn filter_frame_inner(
                 mb_idx - mb_width
             };
             let mb_p = &mb_info[above_mb_idx];
+            if is_mb_edge && params.filter_idc == 2 && mb_p.deblock.slice_id != params.slice_id {
+                continue;
+            }
 
             let qp_q = mb_q.qp_y;
             let qp_p = mb_p.qp_y;
@@ -361,14 +322,6 @@ fn filter_frame_inner(
             let index_b = (qp_avg + filter_offset_b).clamp(0, 51) as usize;
             let alpha = ALPHA_TABLE[index_a];
             let beta = BETA_TABLE[index_b];
-
-            let qp_c_p = chroma_qp(qp_p, chroma_qp_index_offset);
-            let qp_c_q = chroma_qp(qp_q, chroma_qp_index_offset);
-            let qp_c_avg = (qp_c_p + qp_c_q + 1) >> 1;
-            let c_index_a = (qp_c_avg + filter_offset_a).clamp(0, 51) as usize;
-            let c_index_b = (qp_c_avg + filter_offset_b).clamp(0, 51) as usize;
-            let c_alpha = ALPHA_TABLE[c_index_a];
-            let c_beta = BETA_TABLE[c_index_b];
 
             // Compute bS for all 4 segments first
             let mut seg_bs = [0i32; 4];
@@ -417,7 +370,10 @@ fn filter_frame_inner(
                         seg_bs[cseg * 2 + 1],
                         seg_bs[cseg * 2 + 1],
                     ];
-                    for plane in [&mut frame.u, &mut frame.v] {
+                    for (plane_index, plane) in [&mut frame.u, &mut frame.v].into_iter().enumerate()
+                    {
+                        let (c_index_a, c_alpha, c_beta) =
+                            chroma_thresholds(qp_p, qp_q, &params, plane_index);
                         for i in 0..4 {
                             let pbs = c_bs[i];
                             if pbs == 0 {

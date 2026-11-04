@@ -16,6 +16,9 @@ fn dimensions(input: &[u8]) -> Result<(usize, usize)> {
     if width == 0 || height == 0 {
         return Err(ImageError::InvalidData("QOI image has no pixels"));
     }
+    if !matches!(input[12], 3 | 4) || input[13] > 1 {
+        return Err(ImageError::InvalidData("bad QOI header"));
+    }
     width.checked_mul(height).ok_or(ImageError::Overflow)?;
     Ok((width, height))
 }

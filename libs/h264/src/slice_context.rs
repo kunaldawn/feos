@@ -6,8 +6,9 @@
 
 use alloc::vec::Vec;
 
-use alloc::rc::Rc;
+use alloc::sync::Arc;
 
+use crate::deblock::DeblockParams;
 use crate::decoder::WorkFrame;
 
 #[allow(dead_code)] // Fields progressively used as methods are migrated
@@ -27,9 +28,11 @@ pub(crate) struct SliceParams<'a> {
     pub scaling_list_8x8: &'a [[u8; 64]; 2],
     pub constrained_intra_pred_flag: bool,
     pub chroma_qp_index_offset: i32,
-    pub ref_pic_list: &'a [Rc<DecodedPicture>],
-    pub ref_pic_list_l0: &'a [Rc<DecodedPicture>],
-    pub ref_pic_list_l1: &'a [Rc<DecodedPicture>],
+    pub second_chroma_qp_index_offset: i32,
+    pub deblock: DeblockParams,
+    pub ref_pic_list: &'a [Arc<DecodedPicture>],
+    pub ref_pic_list_l0: &'a [Arc<DecodedPicture>],
+    pub ref_pic_list_l1: &'a [Arc<DecodedPicture>],
     pub num_ref_idx_l0_active: u32,
     pub num_ref_idx_l1_active: u32,
     pub wctx: &'a WeightContext<'a>,
@@ -1294,13 +1297,23 @@ impl SliceContext<'_> {
             let info = &mut self.mb_info[mi];
             let base = mi * 16;
             info.list_count = list_count;
+            info.deblock = sp.deblock;
             info.is_8x8dct = self.mb_is_8x8dct[mi];
             for blk in 0..16 {
                 info.mv_l0[blk] = self.mv_store_l0[base + blk];
                 info.ref_idx_l0[blk] = self.ref_idx_store_l0[base + blk];
                 info.mv_l1[blk] = self.mv_store_l1[base + blk];
                 info.ref_idx_l1[blk] = self.ref_idx_store_l1[base + blk];
-                info.nnz[blk] = self.nc_luma[base + blk] > 0;
+                // An 8x8 transform's coefficients count for all four of its
+                // 4x4 blocks, but CAVLC's counts are kept per 4x4 quadrant
+                // (spec 8.7.2.1).
+                info.nnz[blk] = if self.mb_is_8x8dct[mi] {
+                    self.nc_luma[base + (blk & !3)..base + (blk & !3) + 4]
+                        .iter()
+                        .any(|&count| count > 0)
+                } else {
+                    self.nc_luma[base + blk] > 0
+                };
                 let ri_l0 = self.ref_idx_store_l0[base + blk];
                 info.ref_poc_l0[blk] = if ri_l0 >= 0 {
                     l0_list

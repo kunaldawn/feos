@@ -1,7 +1,17 @@
-//! Windows BMP decoding (1/4/8/16/24/32-bit) and 24-bit encoding.
+//! Windows BMP decoding and 24-bit encoding.
+//!
+//! The decoder reads 1/4/8/16/24/32-bit files, bottom-up and top-down, with
+//! `BI_BITFIELDS`/`BI_ALPHABITFIELDS` masks and `BI_RLE8`/`BI_RLE4` compression.
+//! Pixels an RLE stream skips take palette entry 0.
 
 use crate::error::{need, ImageError, Result};
 use crate::{ImageFormat, ImageInfo};
+
+const BI_RGB: u32 = 0;
+const BI_RLE8: u32 = 1;
+const BI_RLE4: u32 = 2;
+const BI_BITFIELDS: u32 = 3;
+const BI_ALPHABITFIELDS: u32 = 6;
 
 struct Header {
     width: usize,
@@ -53,18 +63,13 @@ fn parse(input: &[u8]) -> Result<Header> {
         let compression = le_u32(input, 30)?;
         let colors_used = le_u32(input, 46)?;
         let mut masks = [0u32; 4];
-        if compression == 3 {
-            if dib_size >= 52 {
-                masks[0] = le_u32(input, 54)?;
-                masks[1] = le_u32(input, 58)?;
-                masks[2] = le_u32(input, 62)?;
-                if dib_size >= 56 {
-                    masks[3] = le_u32(input, 66)?;
-                }
-            } else {
-                masks[0] = le_u32(input, 14 + 40)?;
-                masks[1] = le_u32(input, 14 + 44)?;
-                masks[2] = le_u32(input, 14 + 48)?;
+        if matches!(compression, BI_BITFIELDS | BI_ALPHABITFIELDS) {
+            // Inside a V2+ header, or straight after a 40-byte one.
+            masks[0] = le_u32(input, 54)?;
+            masks[1] = le_u32(input, 58)?;
+            masks[2] = le_u32(input, 62)?;
+            if dib_size >= 56 || compression == BI_ALPHABITFIELDS {
+                masks[3] = le_u32(input, 66)?;
             }
         }
         (
@@ -82,8 +87,17 @@ fn parse(input: &[u8]) -> Result<Header> {
     if !matches!(bpp, 1 | 4 | 8 | 16 | 24 | 32) {
         return Err(ImageError::UnsupportedFeature("BMP bit depth"));
     }
-    if !matches!(compression, 0 | 3) {
-        return Err(ImageError::UnsupportedFeature("BMP compression"));
+    let valid = match compression {
+        BI_RGB => true,
+        BI_RLE8 => bpp == 8,
+        BI_RLE4 => bpp == 4,
+        BI_BITFIELDS | BI_ALPHABITFIELDS => matches!(bpp, 16 | 32),
+        _ => return Err(ImageError::UnsupportedFeature("BMP compression")),
+    };
+    if !valid {
+        return Err(ImageError::InvalidData(
+            "BMP compression and depth disagree",
+        ));
     }
     if width == 0 || height == 0 {
         return Err(ImageError::InvalidData("bad BMP dimensions"));
@@ -104,7 +118,7 @@ fn parse(input: &[u8]) -> Result<Header> {
         0
     };
     let palette_stride = if dib_size == 12 { 3 } else { 4 };
-    let palette_offset = 14 + dib_size;
+    let palette_offset = dib_size.checked_add(14).ok_or(ImageError::Overflow)?;
     let stride = ((width * bpp as usize + 31) / 32) * 4;
 
     Ok(Header {
@@ -150,9 +164,10 @@ pub fn scratch_len(_input: &[u8]) -> Result<usize> {
     Ok(0)
 }
 
+/// Scales the field `mask` selects to 8 bits. An absent field reads as zero.
 fn extract(value: u32, mask: u32) -> u8 {
     if mask == 0 {
-        return 255;
+        return 0;
     }
     let shift = mask.trailing_zeros();
     let max = mask >> shift;
@@ -179,25 +194,35 @@ pub fn decode(input: &[u8], out: &mut [u8]) -> Result<ImageInfo> {
             available: out.len(),
         });
     }
-    need(input.len(), 0, raster_len(&header)?)?;
-
     if header.bpp <= 8 {
-        need(
-            input.len(),
-            header.palette_offset,
-            header.palette_len * header.palette_stride,
-        )?;
+        let palette_bytes = header
+            .palette_len
+            .checked_mul(header.palette_stride)
+            .ok_or(ImageError::Overflow)?;
+        need(input.len(), header.palette_offset, palette_bytes)?;
     }
+    if matches!(header.compression, BI_RLE8 | BI_RLE4) {
+        decode_rle(input, &header, out)?;
+        return Ok(info);
+    }
+    need(input.len(), 0, raster_len(&header)?)?;
 
     let default_masks = if header.bpp == 16 {
         [0x7c00, 0x03e0, 0x001f, 0]
     } else {
-        [0x00ff_0000, 0x0000_ff00, 0x0000_00ff, 0xff00_0000]
+        [0x00ff_0000, 0x0000_ff00, 0x0000_00ff, 0]
     };
-    let masks = if header.compression == 3 {
+    let masks = if matches!(header.compression, BI_BITFIELDS | BI_ALPHABITFIELDS) {
         header.masks
     } else {
         default_masks
+    };
+    let alpha = |value: u32| {
+        if masks[3] != 0 {
+            extract(value, masks[3])
+        } else {
+            255
+        }
     };
 
     for row in 0..header.height {
@@ -221,13 +246,7 @@ pub fn decode(input: &[u8], out: &mut [u8]) -> Result<ImageInfo> {
                             ((byte >> (7 - x % 8)) & 1) as usize
                         }
                     };
-                    if index >= header.palette_len {
-                        return Err(ImageError::InvalidData("BMP palette index out of range"));
-                    }
-                    let base = header.palette_offset + index * header.palette_stride;
-                    let b = input[base];
-                    let g = input[base + 1];
-                    let r = input[base + 2];
+                    let (r, g, b) = palette_color(input, &header, index)?;
                     (r, g, b, 255)
                 }
                 16 => {
@@ -236,7 +255,7 @@ pub fn decode(input: &[u8], out: &mut [u8]) -> Result<ImageInfo> {
                         extract(value, masks[0]),
                         extract(value, masks[1]),
                         extract(value, masks[2]),
-                        255,
+                        alpha(value),
                     )
                 }
                 24 => {
@@ -244,13 +263,13 @@ pub fn decode(input: &[u8], out: &mut [u8]) -> Result<ImageInfo> {
                     (input[base + 2], input[base + 1], input[base], 255)
                 }
                 _ => {
-                    let base = row_start + x * 4;
-                    let alpha = if header.compression == 3 && masks[3] != 0 {
-                        extract(le_u32(input, base)?, masks[3])
-                    } else {
-                        255
-                    };
-                    (input[base + 2], input[base + 1], input[base], alpha)
+                    let value = le_u32(input, row_start + x * 4)?;
+                    (
+                        extract(value, masks[0]),
+                        extract(value, masks[1]),
+                        extract(value, masks[2]),
+                        alpha(value),
+                    )
                 }
             };
             let index = (row * header.width + x) * 4;
@@ -261,6 +280,108 @@ pub fn decode(input: &[u8], out: &mut [u8]) -> Result<ImageInfo> {
         }
     }
     Ok(info)
+}
+
+fn palette_color(input: &[u8], header: &Header, index: usize) -> Result<(u8, u8, u8)> {
+    if index >= header.palette_len {
+        return Err(ImageError::InvalidData("BMP palette index out of range"));
+    }
+    let base = header.palette_offset + index * header.palette_stride;
+    Ok((input[base + 2], input[base + 1], input[base]))
+}
+
+/// Decodes `BI_RLE8` and `BI_RLE4` data.
+///
+/// Each command is two bytes: a run count and a value, or a zero and an escape
+/// (end of line, end of bitmap, delta, or a literal run). Literal runs are
+/// padded to 16 bits. Drawing past the right or bottom edge is an error.
+fn decode_rle(input: &[u8], header: &Header, out: &mut [u8]) -> Result<()> {
+    let (background_r, background_g, background_b) = palette_color(input, header, 0)?;
+    // Doubling copies, because a small file can name a very large image.
+    let len = header.width * header.height * 4;
+    out[..4].copy_from_slice(&[background_r, background_g, background_b, 255]);
+    let mut filled = 4;
+    while filled < len {
+        let count = filled.min(len - filled);
+        out.copy_within(0..count, filled);
+        filled += count;
+    }
+
+    let four_bit = header.compression == BI_RLE4;
+    let mut pos = header.data_offset;
+    // Rows count in file order, so row 0 is the bottom of a bottom-up image.
+    let mut x = 0usize;
+    let mut row = 0usize;
+    let put = |x: usize, row: usize, index: usize, out: &mut [u8]| -> Result<()> {
+        if x >= header.width || row >= header.height {
+            return Err(ImageError::InvalidData("BMP RLE data leaves the image"));
+        }
+        let y = if header.top_down {
+            row
+        } else {
+            header.height - 1 - row
+        };
+        let (r, g, b) = palette_color(input, header, index)?;
+        let at = (y * header.width + x) * 4;
+        out[at] = r;
+        out[at + 1] = g;
+        out[at + 2] = b;
+        Ok(())
+    };
+    let byte = |pos: usize| input.get(pos).copied().ok_or(ImageError::UnexpectedEnd);
+
+    loop {
+        let count = byte(pos)? as usize;
+        let value = byte(pos + 1)?;
+        pos += 2;
+        if count != 0 {
+            for i in 0..count {
+                let index = match (four_bit, i % 2) {
+                    (false, _) => value,
+                    (true, 0) => value >> 4,
+                    (true, _) => value & 0x0f,
+                };
+                put(x + i, row, index as usize, out)?;
+            }
+            x += count;
+            continue;
+        }
+        match value {
+            0 => {
+                x = 0;
+                row += 1;
+            }
+            1 => return Ok(()),
+            2 => {
+                x += byte(pos)? as usize;
+                row += byte(pos + 1)? as usize;
+                pos += 2;
+            }
+            literal => {
+                let literal = literal as usize;
+                for i in 0..literal {
+                    let index = if four_bit {
+                        let packed = byte(pos + i / 2)?;
+                        if i % 2 == 0 {
+                            packed >> 4
+                        } else {
+                            packed & 0x0f
+                        }
+                    } else {
+                        byte(pos + i)?
+                    };
+                    put(x + i, row, index as usize, out)?;
+                }
+                x += literal;
+                let bytes = if four_bit {
+                    literal.div_ceil(2)
+                } else {
+                    literal
+                };
+                pos += bytes + bytes % 2;
+            }
+        }
+    }
 }
 
 /// Encodes an RGBA8888 image as a 24-bit BMP.

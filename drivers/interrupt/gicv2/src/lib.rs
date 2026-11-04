@@ -9,11 +9,11 @@
 //! [`GicV2::init_cpu`] and enables the timer PPI for itself; GICv2 banks the
 //! CPU interface and the PPI configuration registers per core.
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 use core::ptr::{read_volatile, write_volatile};
 
-use feos_hal::InterruptController;
+use feos_hal::{InterruptController, IpiTarget, IrqClaim};
 
 /// Distributor register block.
 const GICD_CTLR: usize = 0x000;
@@ -21,6 +21,7 @@ const GICD_IGROUPR: usize = 0x080;
 const GICD_ISENABLER: usize = 0x100;
 const GICD_ICENABLER: usize = 0x180;
 const GICD_IPRIORITYR: usize = 0x400;
+const GICD_SGIR: usize = 0xf00;
 
 /// CPU interface register block.
 const GICC_CTLR: usize = 0x000;
@@ -31,6 +32,13 @@ const GICC_EOIR: usize = 0x010;
 
 /// Priority assigned to every interrupt the kernel enables.
 const PRIORITY: u32 = 0x80;
+
+/// `GICD_SGIR` target filter: send to every CPU but the requester.
+const SGIR_ALL_OTHERS: u32 = 0b01 << 24;
+/// `GICD_SGIR` target list shift.
+const SGIR_TARGET_SHIFT: u32 = 16;
+/// `GICC_IAR` interrupt ID field.
+const IAR_ID: u32 = 0x3ff;
 
 /// Interrupt ID reported by [`InterruptController::acknowledge`] when no real
 /// interrupt is pending.
@@ -122,7 +130,7 @@ impl InterruptController for GicV2 {
     }
 
     fn acknowledge(&self) -> u32 {
-        read32(self.cpu_interface + GICC_IAR) & 0x3ff
+        read32(self.cpu_interface + GICC_IAR) & IAR_ID
     }
 
     fn end(&self, irq: u32) {
@@ -132,6 +140,40 @@ impl InterruptController for GicV2 {
 
         write32(self.cpu_interface + GICC_EOIR, irq);
         barrier();
+    }
+
+    fn claim(&self) -> IrqClaim {
+        let raw = read32(self.cpu_interface + GICC_IAR);
+        IrqClaim {
+            id: raw & IAR_ID,
+            raw,
+        }
+    }
+
+    fn complete(&self, claim: IrqClaim) {
+        // For an SGI, GICC_EOIR must carry the source CPU that GICC_IAR
+        // reported, so this writes back the whole value.
+        write32(self.cpu_interface + GICC_EOIR, claim.raw);
+        barrier();
+    }
+
+    fn is_spurious(&self, id: u32) -> bool {
+        id >= 1020
+    }
+
+    fn send_ipi(&self, target: IpiTarget, id: u32) {
+        barrier();
+        write32(self.distributor + GICD_SGIR, sgir_value(target, id));
+        barrier();
+    }
+}
+
+/// Encodes a `GICD_SGIR` write.
+fn sgir_value(target: IpiTarget, id: u32) -> u32 {
+    let id = id & 0xf;
+    match target {
+        IpiTarget::Cpu(cpu) => (1u32 << (cpu as u32 & 7)) << SGIR_TARGET_SHIFT | id,
+        IpiTarget::AllOthers => SGIR_ALL_OTHERS | id,
     }
 }
 
@@ -150,5 +192,22 @@ fn write32(address: usize, value: u32) {
 #[inline]
 fn barrier() {
     // Order device accesses before the CPU continues.
-    unsafe { core::arch::asm!("dsb sy", "isb", options(nostack)) }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: a barrier has no effect other than ordering.
+    unsafe {
+        core::arch::asm!("dsb sy", "isb", options(nostack))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sgir_encodes_filter_target_and_id() {
+        assert_eq!(sgir_value(IpiTarget::AllOthers, 1), 0x0100_0001);
+        assert_eq!(sgir_value(IpiTarget::Cpu(0), 0), 0x0001_0000);
+        assert_eq!(sgir_value(IpiTarget::Cpu(3), 2), 0x0008_0002);
+        assert_eq!(sgir_value(IpiTarget::Cpu(7), 15), 0x0080_000f);
+    }
 }

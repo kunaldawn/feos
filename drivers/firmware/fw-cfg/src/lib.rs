@@ -18,9 +18,11 @@
 
 #![no_std]
 
-#[cfg(target_arch = "x86_64")]
-use core::arch::asm;
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
+use core::sync::atomic::{fence, Ordering};
+
+#[cfg(target_arch = "x86_64")]
+use feos_port_io::{inb, outl, outw};
 
 const DATA: usize = 0x00;
 const SELECTOR: usize = 0x08;
@@ -192,6 +194,10 @@ impl FwCfg {
             address: (data.as_ptr() as u64).to_be(),
         };
 
+        // The device reads the descriptor and the data when kicked, so both
+        // must be complete in memory first.
+        feos_hal::dma::wmb();
+
         // SAFETY: the descriptor is a live local, and the device is either
         // MMIO or a fixed I/O port range supplied by the board.
         unsafe {
@@ -213,8 +219,10 @@ impl FwCfg {
             }
 
             loop {
+                // The device writes the status through DMA.
                 let control = u32::from_be(read_volatile(addr_of!(access.control)));
                 if control == 0 {
+                    fence(Ordering::Acquire);
                     return true;
                 }
                 if control & CONTROL_ERROR != 0 {
@@ -224,27 +232,4 @@ impl FwCfg {
             }
         }
     }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-unsafe fn outw(port: u16, value: u16) {
-    // SAFETY: callers pass a valid x86 I/O port.
-    unsafe { asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack)) };
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-unsafe fn outl(port: u16, value: u32) {
-    // SAFETY: callers pass a valid x86 I/O port.
-    unsafe { asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack)) };
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-unsafe fn inb(port: u16) -> u8 {
-    let value: u8;
-    // SAFETY: callers pass a valid x86 I/O port.
-    unsafe { asm!("in al, dx", out("al") value, in("dx") port, options(nomem, nostack)) };
-    value
 }

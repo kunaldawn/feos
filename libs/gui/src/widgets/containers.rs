@@ -246,10 +246,11 @@ impl<'a, 'b, 's, const N: usize> Ui<'a, 'b, 's, N> {
 
         let canvas = self.canvas_rect();
         let min_visible = metrics.control_height * 3;
-        state.rect.x = state.rect.x.clamp(
-            -(state.rect.width as i32) + min_visible,
-            canvas.right_i32() - min_visible,
-        );
+        // On a canvas narrower than the visible margin the two bounds cross,
+        // which `clamp` treats as a bug. Prefer keeping the left edge reachable.
+        let min_x = -(state.rect.width as i32) + min_visible;
+        let max_x = (canvas.right_i32() - min_visible).max(min_x);
+        state.rect.x = state.rect.x.clamp(min_x, max_x);
         state.rect.y = state
             .rect
             .y
@@ -433,6 +434,8 @@ impl<'a, 'b, 's, const N: usize> Ui<'a, 'b, 's, N> {
         let metrics = self.theme.metrics;
         let palette = self.theme.palette;
 
+        // A dialog is modal: nothing behind it answers the pointer.
+        self.float(self.canvas_rect());
         self.painter
             .fill_rect_alpha(self.canvas_rect(), palette.overlay, 160);
         self.painter.shadow(rect, metrics.radius, 12, 180);

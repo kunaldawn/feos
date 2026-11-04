@@ -24,6 +24,9 @@ pub enum AudioError {
     },
     /// An integer overflowed the platform's `usize`.
     Overflow,
+    /// A working buffer could not be allocated. The stream may be fine; the
+    /// allocation is refused rather than aborting the kernel.
+    OutOfMemory,
 }
 
 impl fmt::Display for AudioError {
@@ -44,6 +47,7 @@ impl fmt::Display for AudioError {
                 "buffer too small: need {required} elements, have {available}"
             ),
             Self::Overflow => write!(f, "audio size overflow"),
+            Self::OutOfMemory => write!(f, "out of memory while decoding audio"),
         }
     }
 }

@@ -1,7 +1,7 @@
 //! Secondary-CPU startup.
 //!
-//! `boot.S` provides the PSCI entry point and a private stack for each
-//! secondary CPU. This module turns that low-level entry into a callback the
+//! `boot.S` provides the PSCI entry point and private stacks for each secondary
+//! CPU. This module turns that low-level entry into a callback the
 //! kernel can install, mirroring the IRQ and fault handler inversion: the
 //! architecture crate owns the entry mechanics, while the kernel owns the
 //! scheduler policy.
@@ -17,8 +17,8 @@ use crate::cpu;
 
 /// Maximum number of CPUs this architecture port can bring up.
 ///
-/// GICv2 supports up to eight CPUs per machine, and `boot.S` reserves one
-/// 128 KiB stack for each of them.
+/// GICv2 supports up to eight CPUs per machine, and `boot.S` reserves stacks
+/// for each of them.
 pub const MAX_CPUS: usize = 8;
 
 /// Callback invoked on a secondary CPU once its stack and vectors are ready.
@@ -29,9 +29,29 @@ pub type SecondaryHandler = fn(usize) -> !;
 
 static HANDLER: AtomicUsize = AtomicUsize::new(0);
 
-/// Installs the function called on every secondary CPU.
-pub fn set_handler(handler: SecondaryHandler) {
+/// Starts CPUs `1..limit` with `handler` as their entry point.
+///
+/// `mpidr` maps a logical CPU index to its firmware affinity value. Returns the
+/// number of CPUs firmware accepted and, when a request failed, the raw status
+/// code. AArch64 numbers its CPUs contiguously, so the first failure marks the
+/// end of the available range (for example `-smp 1` rejects CPU 1 and the loop
+/// stops).
+pub fn start_secondaries(
+    limit: usize,
+    mpidr: fn(usize) -> u64,
+    handler: SecondaryHandler,
+) -> (usize, Option<i64>) {
     HANDLER.store(handler as usize, Ordering::Release);
+
+    let entry = secondary_entry as *const () as u64;
+    let mut started = 0;
+    for cpu in 1..limit.min(MAX_CPUS) {
+        match crate::psci::cpu_on(mpidr(cpu), entry, cpu as u64) {
+            Ok(()) => started += 1,
+            Err(code) => return (started, Some(code)),
+        }
+    }
+    (started, None)
 }
 
 fn handler() -> Option<SecondaryHandler> {
@@ -47,11 +67,6 @@ fn handler() -> Option<SecondaryHandler> {
 
 extern "C" {
     fn secondary_entry(context: usize) -> !;
-}
-
-/// Address PSCI `CPU_ON` should jump to for a new secondary CPU.
-pub fn entry_address() -> usize {
-    secondary_entry as *const () as usize
 }
 
 /// Called from `secondary_entry` in `boot.S`.

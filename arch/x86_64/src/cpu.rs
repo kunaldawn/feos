@@ -39,9 +39,3 @@ pub fn set_index(_index: usize) {}
 pub fn midr_el1() -> u64 {
     core::arch::x86_64::__cpuid(0).eax as u64
 }
-
-/// EOI-free halt used by the idle loop.
-pub fn wait_for_event() {
-    // SAFETY: `hlt` is available at ring 0; interrupts may be enabled.
-    unsafe { asm!("hlt", options(nomem, nostack)) }
-}

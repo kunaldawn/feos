@@ -5,11 +5,10 @@
 //! state. QEMU's `-serial` option maps COM1 to the first serial port at
 //! `0x3f8`.
 
-#![no_std]
-
-use core::arch::asm;
+#![cfg_attr(not(test), no_std)]
 
 use feos_hal::Serial;
+use feos_port_io::{inb, outb};
 
 /// Transmit holding register (write) / receive buffer (read).
 const DATA: u16 = 0;
@@ -25,20 +24,35 @@ const MCR: u16 = 4;
 const LSR: u16 = 5;
 
 const LSR_DATA_READY: u8 = 1 << 0;
+/// Overrun, parity, framing and break.
+const LSR_ERRORS: u8 = 0x1e;
 const LSR_THR_EMPTY: u8 = 1 << 5;
+/// What an I/O port with no device behind it reads as.
+const LSR_ABSENT: u8 = 0xff;
 
-#[inline]
-unsafe fn outb(port: u16, value: u8) {
-    // SAFETY: callers pass the UART's valid I/O port range.
-    unsafe { asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack)) };
+/// Transmit polls before giving up on a stuck UART. At 115200 baud a byte takes
+/// under 100 us, far less than this many port reads.
+const TX_POLLS: usize = 100_000;
+
+/// Decodes a line status value into what [`Serial::read_byte`] should do.
+fn receive_action(lsr: u8) -> ReceiveAction {
+    if lsr == LSR_ABSENT || lsr & LSR_DATA_READY == 0 {
+        ReceiveAction::Nothing
+    } else if lsr & LSR_ERRORS != 0 {
+        ReceiveAction::Discard
+    } else {
+        ReceiveAction::Deliver
+    }
 }
 
-#[inline]
-unsafe fn inb(port: u16) -> u8 {
-    let value: u8;
-    // SAFETY: callers pass the UART's valid I/O port range.
-    unsafe { asm!("in al, dx", out("al") value, in("dx") port, options(nomem, nostack)) };
-    value
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ReceiveAction {
+    /// No byte is waiting, or there's no UART at all.
+    Nothing,
+    /// A byte is waiting but it was received with an error.
+    Discard,
+    /// A good byte is waiting.
+    Deliver,
 }
 
 /// A 16550-compatible UART instance.
@@ -97,17 +111,50 @@ impl Serial for Uart16550 {
     }
 
     fn write_byte(&self, byte: u8) {
-        while self.read(LSR) & LSR_THR_EMPTY == 0 {
+        // Bounded so a stuck UART costs characters, not the whole system.
+        for _ in 0..TX_POLLS {
+            if self.read(LSR) & LSR_THR_EMPTY != 0 {
+                break;
+            }
             core::hint::spin_loop();
         }
         self.write(DATA, byte);
     }
 
     fn read_byte(&self) -> Option<u8> {
-        if self.read(LSR) & LSR_DATA_READY != 0 {
-            Some(self.read(DATA))
-        } else {
-            None
+        // Reading DATA clears a per-byte error, so bad bytes are consumed. The
+        // bound keeps this a poll even if the status never clears.
+        for _ in 0..32 {
+            match receive_action(self.read(LSR)) {
+                ReceiveAction::Nothing => return None,
+                ReceiveAction::Discard => {
+                    let _ = self.read(DATA);
+                }
+                ReceiveAction::Deliver => return Some(self.read(DATA)),
+            }
         }
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_uart_reads_as_no_data() {
+        // DRV-15: 0xff has the data-ready bit set, so a machine without COM1
+        // used to deliver 0xff forever.
+        assert_eq!(receive_action(LSR_ABSENT), ReceiveAction::Nothing);
+    }
+
+    #[test]
+    fn line_status_decodes_data_and_errors() {
+        assert_eq!(receive_action(0x60), ReceiveAction::Nothing);
+        assert_eq!(receive_action(0x61), ReceiveAction::Deliver);
+        assert_eq!(receive_action(0x61 | 0x02), ReceiveAction::Discard);
+        assert_eq!(receive_action(0x61 | 0x08), ReceiveAction::Discard);
+        // Errors with no byte waiting have nothing to discard.
+        assert_eq!(receive_action(0x60 | 0x02), ReceiveAction::Nothing);
     }
 }

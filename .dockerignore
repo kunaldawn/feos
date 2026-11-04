@@ -5,3 +5,4 @@ docs/
 Dockerfile
 .dockerignore
 README.md
+data/

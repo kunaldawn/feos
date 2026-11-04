@@ -1,4 +1,4 @@
-//! The Windows XP-style Start menu.
+//! The XP-look Start menu.
 
 use feos_bundle::AppCatalog;
 use feos_gfx::{Color, Rect};
@@ -38,6 +38,8 @@ pub enum StartMenuCommand {
     Search,
     /// Open desktop settings.
     Settings,
+    /// Rescan the application folder and repaint.
+    Refresh,
     /// End the desktop session.
     LogOff,
     /// Power off the machine.
@@ -55,6 +57,8 @@ pub struct StartMenuState {
     pub highlighted: usize,
     /// Whether the all-programs grid is shown.
     pub all_programs: bool,
+    /// First row shown in the all-programs list.
+    pub scroll: usize,
 }
 
 impl StartMenuState {
@@ -64,6 +68,7 @@ impl StartMenuState {
             open: false,
             highlighted: 0,
             all_programs: false,
+            scroll: 0,
         }
     }
 
@@ -72,6 +77,7 @@ impl StartMenuState {
         self.open = true;
         self.highlighted = 0;
         self.all_programs = false;
+        self.scroll = 0;
     }
 
     /// Closes the menu.
@@ -116,6 +122,18 @@ impl StartMenuState {
         self.highlighted = next as usize;
     }
 
+    /// Scrolls the all-programs list so `rows` rows starting at
+    /// [`scroll`](Self::scroll) contain the highlight and fit `app_count`.
+    pub fn keep_highlight_visible(&mut self, rows: usize, app_count: usize) {
+        let rows = rows.max(1);
+        if self.highlighted < self.scroll {
+            self.scroll = self.highlighted;
+        } else if self.highlighted >= self.scroll + rows {
+            self.scroll = self.highlighted + 1 - rows;
+        }
+        self.scroll = self.scroll.min(app_count.saturating_sub(rows));
+    }
+
     /// The app that Enter should launch, if any.
     pub fn selected(&self, app_count: usize) -> Option<usize> {
         if app_count == 0 {
@@ -139,6 +157,29 @@ pub struct StartMenuResponse {
     pub closed: bool,
 }
 
+/// Where the Start menu appears, whether or not it is open.
+pub fn panel_rect(
+    canvas: Rect,
+    config: &StartMenuConfig,
+    taskbar: &TaskbarLayout,
+    position: TaskbarPosition,
+) -> Rect {
+    let max_height = match position {
+        TaskbarPosition::Bottom => (taskbar.bar.y - canvas.y - 8).max(120) as u32,
+        TaskbarPosition::Top => {
+            (canvas.bottom_i32() - taskbar.bar.bottom_i32() - 8).max(120) as u32
+        }
+    };
+    let width = config.width.min(canvas.width.saturating_sub(8)).max(260);
+    let height = config.height.min(max_height).max(220);
+    let x = (taskbar.bar.x + 2).min(canvas.right_i32() - width as i32 - 2);
+    let y = match position {
+        TaskbarPosition::Bottom => taskbar.bar.y - height as i32 - 2,
+        TaskbarPosition::Top => taskbar.bar.bottom_i32() + 2,
+    };
+    Rect::new(x.max(canvas.x + 2), y, width, height)
+}
+
 /// Draws the Start menu when `state.open` is set.
 pub fn render<const N: usize, const A: usize>(
     ui: &mut Ui<'_, '_, '_, N>,
@@ -154,21 +195,7 @@ pub fn render<const N: usize, const A: usize>(
         return response;
     }
 
-    let canvas = ui.canvas_rect();
-    let max_height = match position {
-        TaskbarPosition::Bottom => (taskbar.bar.y - canvas.y - 8).max(120) as u32,
-        TaskbarPosition::Top => {
-            (canvas.bottom_i32() - taskbar.bar.bottom_i32() - 8).max(120) as u32
-        }
-    };
-    let width = config.width.min(canvas.width.saturating_sub(8)).max(260);
-    let height = config.height.min(max_height).max(220);
-    let x = (taskbar.bar.x + 2).min(canvas.right_i32() - width as i32 - 2);
-    let y = match position {
-        TaskbarPosition::Bottom => taskbar.bar.y - height as i32 - 2,
-        TaskbarPosition::Top => taskbar.bar.bottom_i32() + 2,
-    };
-    let panel = Rect::new(x.max(canvas.x + 2), y, width, height);
+    let panel = panel_rect(ui.canvas_rect(), config, taskbar, position);
     response.panel = panel;
 
     ui.painter.shadow(panel, 8, 10, 130);
@@ -179,7 +206,7 @@ pub fn render<const N: usize, const A: usize>(
     // Header ------------------------------------------------------------
     let header_height = 58u32;
     let header = Rect::new(panel.x + 1, panel.y + 1, panel.width - 2, header_height);
-    ui.painter.canvas_mut().fill_vertical_gradient(
+    ui.painter.fill_vertical_gradient(
         header,
         theme.menu_header_top,
         theme.menu_header_bottom,
@@ -249,7 +276,7 @@ pub fn render<const N: usize, const A: usize>(
         panel.width - 2,
         footer_height,
     );
-    ui.painter.canvas_mut().fill_vertical_gradient(
+    ui.painter.fill_vertical_gradient(
         footer,
         theme.menu_header_bottom,
         theme.menu_header_top,
@@ -275,9 +302,18 @@ pub fn render<const N: usize, const A: usize>(
         let columns = GRID_COLUMNS as u32;
         let cell_width = (grid_area.width / columns).max(1);
         let cell_height = 38u32;
-        for index in 0..app_count {
+        let rows = (grid_area.height / cell_height).max(1) as usize;
+        if ui.pointer_over(grid_area) && ui.wheel() != 0 {
+            let moved = state.scroll as i32 - ui.wheel().signum();
+            state.scroll = moved.max(0) as usize;
+            state.highlighted = state.highlighted.min(app_count.saturating_sub(1));
+        } else {
+            state.keep_highlight_visible(rows, app_count);
+        }
+        state.scroll = state.scroll.min(app_count.saturating_sub(rows));
+        for index in state.scroll..app_count {
             let column = index as u32 % columns;
-            let row = index as u32 / columns;
+            let row = (index - state.scroll) as u32 / columns;
             let cell = Rect::new(
                 grid_area.x + (column * cell_width) as i32 + 2,
                 grid_area.y + (row * cell_height) as i32 + 1,

@@ -5,6 +5,7 @@ use feos_init::Config as InitConfig;
 use feos_text::Text;
 use feos_yaml::{YamlDocument, YamlNode};
 
+use crate::keyboard::KeyboardLayout;
 use crate::theme::ThemeName;
 
 /// Maximum application directories read from the configuration.
@@ -126,7 +127,7 @@ pub struct TaskbarConfig {
 }
 
 impl TaskbarConfig {
-    /// Default XP-style taskbar settings.
+    /// Default classic-style taskbar settings.
     pub const fn new() -> Self {
         Self {
             position: TaskbarPosition::Bottom,
@@ -165,7 +166,7 @@ pub struct StartMenuConfig {
 }
 
 impl StartMenuConfig {
-    /// Default XP-style start menu.
+    /// Default classic-style start menu.
     pub const fn new() -> Self {
         Self {
             width: 448,
@@ -195,7 +196,7 @@ pub struct ShortcutConfig {
 }
 
 impl ShortcutConfig {
-    /// Default XP-style desktop icons.
+    /// Default classic-style desktop icons.
     pub const fn new() -> Self {
         Self {
             show_icons: true,
@@ -264,6 +265,8 @@ pub struct DesktopConfig {
     pub extension_count: usize,
     /// Init/service manager settings.
     pub init: InitConfig,
+    /// Layout applied to the virtio keyboard.
+    pub keyboard_layout: KeyboardLayout,
 }
 
 impl DesktopConfig {
@@ -281,6 +284,7 @@ impl DesktopConfig {
             extensions: [Text::EMPTY; MAX_EXTENSIONS],
             extension_count: 0,
             init: InitConfig::new(),
+            keyboard_layout: KeyboardLayout::Us,
         }
     }
 
@@ -298,6 +302,14 @@ impl DesktopConfig {
         }
 
         let mut config = Self::new();
+
+        if let Some(keyboard) = document.get(root, "keyboard") {
+            if let Some(layout) = read_text_value(&document, keyboard, "layout")
+                .and_then(|value| KeyboardLayout::parse(&value))
+            {
+                config.keyboard_layout = layout;
+            }
+        }
 
         if let Some(value) = read_text_value(&document, root, "theme") {
             if let Some(theme) = ThemeName::parse(&value) {

@@ -95,6 +95,10 @@ pub enum BundleError {
     MissingFile,
     /// A required manifest field is absent.
     MissingField(&'static str),
+    /// A manifest field does not fit its fixed-capacity slot.
+    FieldTooLong(&'static str),
+    /// A manifest field is a sequence or mapping, not text.
+    InvalidField(&'static str),
     /// The manifest is not valid UTF-8.
     InvalidUtf8,
     /// The encoded manifest is larger than [`MANIFEST_LIMIT`].
@@ -220,6 +224,10 @@ impl<'a> Bundle<'a> {
         let len = match self.read_file("manifest.yaml", &mut buffer) {
             Ok(len) => len,
             Err(BundleError::MissingFile) => return Err(BundleError::MissingManifest),
+            Err(
+                BundleError::BufferTooSmall { .. }
+                | BundleError::Archive(ArchiveError::BufferTooSmall { .. }),
+            ) => return Err(BundleError::ManifestTooLarge),
             Err(error) => return Err(error),
         };
         let text = str::from_utf8(&buffer[..len]).map_err(|_| BundleError::InvalidUtf8)?;
@@ -257,6 +265,17 @@ mod tests {
             Some(BundleFormat::Zip)
         );
         assert_eq!(Bundle::detect(b"not an archive"), None);
+    }
+
+    #[test]
+    fn oversized_manifest_is_reported_as_such() {
+        let manifest = std::vec![b'#'; MANIFEST_LIMIT + 1];
+        let mut out = std::vec![0u8; MANIFEST_LIMIT + 1024];
+        let mut writer = feos_archive::ZipWriter::new(&mut out);
+        writer.write_stored("manifest.yaml", &manifest).unwrap();
+        let len = writer.finish().unwrap();
+        let bundle = Bundle::open(&out[..len]).unwrap();
+        assert_eq!(bundle.manifest().err(), Some(BundleError::ManifestTooLarge));
     }
 
     #[test]

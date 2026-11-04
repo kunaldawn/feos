@@ -1,10 +1,15 @@
-//! Read-only FAT32.
+//! FAT32, read and write.
 //!
 //! The driver understands the FAT32 BPB, long file names (LFN), the FAT
 //! cluster chain, and arbitrary directory trees. It intentionally rejects
 //! FAT12/FAT16 volumes: those use a fixed root-directory area and a different
 //! cluster-count threshold, and this crate targets the format that removable
 //! media uses today.
+//!
+//! Metadata is untrusted. A directory that loops, is cross-linked, runs past the
+//! specification's size limit or nests too deeply is skipped, and the volume is
+//! marked [damaged](FileSystem::is_damaged): what's intact stays readable, and
+//! writes are refused.
 //!
 //! Layout references: Microsoft's FAT specification, sections "Boot Sector and
 //! BPB" and "FAT 32", and the Linux `fs/fat` implementation for the LFN
@@ -14,9 +19,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::block::{BlockDevice, WritableBlockDevice};
-use crate::tree::{EntryLocation, NodeTable};
+use crate::tree::{sanitize_name, try_push, try_zeroed, ClusterSet, EntryLocation, NodeTable};
 use crate::volume::Volume;
-use crate::{EntryKind, FileSystem, FsError, NodeId, WritableFileSystem};
+use crate::{EntryKind, FileSystem, FsError, NodeId, WritableFileSystem, MAX_PATH_DEPTH};
 
 const FAT_MASK: u32 = 0x0fff_ffff;
 const FAT_EOC_MIN: u32 = 0x0fff_fff8;
@@ -24,6 +29,8 @@ const FAT_BAD: u32 = 0x0fff_fff7;
 const FAT_MIN_CLUSTERS: u64 = 65_525;
 const MAX_PATH_NAME_UNITS: usize = 260;
 const MAX_FILE_SIZE: u64 = u32::MAX as u64;
+/// The specification's limit on a directory: 2 MiB of 32-byte entries.
+const MAX_DIRECTORY_ENTRIES: usize = 65_536;
 
 /// A mounted FAT32 volume.
 pub struct Fat32<D: BlockDevice> {
@@ -32,21 +39,25 @@ pub struct Fat32<D: BlockDevice> {
     fat_start: u64,
     fat_size_bytes: u64,
     fat_count: u32,
+    /// The only FAT in use when `BPB_ExtFlags` turns mirroring off.
+    active_fat: Option<u32>,
     data_start: u64,
     cluster_size: usize,
     cluster_count: u32,
     fsinfo: [Option<u64>; 2],
     free_count: Option<u32>,
     next_free: u32,
+    damaged: bool,
 }
 
 impl<D: BlockDevice> Fat32<D> {
     /// Mounts a FAT32 image from `device`.
     ///
     /// Returns [`FsError::UnsupportedVolume`] for FAT12/FAT16 volumes and
-    /// [`FsError::Corrupt`] for malformed metadata.
+    /// [`FsError::Corrupt`] for malformed metadata in the boot sector or root.
+    /// Damage deeper in the tree is skipped; see [`FileSystem::is_damaged`].
     pub fn mount(device: D) -> Result<Self, FsError> {
-        let volume = Volume::new(device)?;
+        let volume = Volume::cached(device)?;
         let boot = volume.read_array::<512>(0)?;
 
         if boot[510] != 0x55 || boot[511] != 0xaa {
@@ -98,6 +109,18 @@ impl<D: BlockDevice> Fat32<D> {
         if root_entries != 0 {
             return Err(FsError::UnsupportedVolume);
         }
+
+        // Bit 7 clear: every FAT is a mirror. Set: only the numbered one is live.
+        let ext_flags = u16::from_le_bytes([boot[40], boot[41]]);
+        let active_fat = if ext_flags & 0x80 != 0 {
+            let active = (ext_flags & 0x0f) as u64;
+            if active >= fat_count {
+                return Err(FsError::InvalidBootSector);
+            }
+            Some(active as u32)
+        } else {
+            None
+        };
 
         let root_dir_sectors = 0u64;
         let metadata_sectors = reserved_sectors
@@ -184,27 +207,51 @@ impl<D: BlockDevice> Fat32<D> {
             fat_start,
             fat_size_bytes: fat_bytes,
             fat_count: fat_count as u32,
+            active_fat,
             data_start,
             cluster_size,
             cluster_count: cluster_count as u32,
             fsinfo,
             free_count,
             next_free,
+            damaged: false,
         };
 
         let mut queue: Vec<DirTask> = Vec::new();
-        queue.push(DirTask {
-            node: 0,
-            cluster: root_cluster,
-        });
-        let mut visited: Vec<u32> = Vec::new();
-        visited.push(root_cluster);
+        try_push(
+            &mut queue,
+            DirTask {
+                node: 0,
+                cluster: root_cluster,
+                depth: 0,
+            },
+        )?;
+        let mut visited = ClusterSet::new(fs.cluster_count)?;
+        let mut buffer = try_zeroed(fs.cluster_size)?;
 
         while let Some(task) = queue.pop() {
-            fs.scan_directory(task.node, task.cluster, &mut queue, &mut visited)?;
+            let is_root = task.node == 0;
+            match fs.scan_directory(task, &mut queue, &mut visited, &mut buffer) {
+                Ok(()) => {}
+                // Running out of memory says nothing about the volume.
+                Err(error @ (FsError::TooManyNodes | FsError::OutOfMemory)) => return Err(error),
+                Err(error) if is_root && fs.nodes.child_count(NodeId::ROOT) == 0 => {
+                    return Err(error)
+                }
+                Err(_) => fs.damaged = true,
+            }
         }
 
         Ok(fs)
+    }
+
+    /// Offset of `cluster`'s entry in the FAT that's being used.
+    fn fat_entry_offset(&self, cluster: u32) -> Result<u64, FsError> {
+        let live = self.active_fat.unwrap_or(0) as u64 * self.fat_size_bytes;
+        self.fat_start
+            .checked_add(live)
+            .and_then(|start| start.checked_add(cluster as u64 * 4))
+            .ok_or(FsError::Corrupt)
     }
 
     fn max_cluster(&self) -> u32 {
@@ -228,10 +275,7 @@ impl<D: BlockDevice> Fat32<D> {
     }
 
     fn next_cluster(&self, cluster: u32) -> Result<Option<u32>, FsError> {
-        let offset = self
-            .fat_start
-            .checked_add(cluster as u64 * 4)
-            .ok_or(FsError::Corrupt)?;
+        let offset = self.fat_entry_offset(cluster)?;
         let value = self.volume.read_u32_le(offset)? & FAT_MASK;
         if value >= FAT_EOC_MIN || value == 0 {
             Ok(None)
@@ -244,23 +288,33 @@ impl<D: BlockDevice> Fat32<D> {
 
     fn scan_directory(
         &mut self,
-        dir_node: u32,
-        start_cluster: u32,
+        task: DirTask,
         queue: &mut Vec<DirTask>,
-        visited: &mut Vec<u32>,
+        visited: &mut ClusterSet,
+        buffer: &mut [u8],
     ) -> Result<(), FsError> {
-        let mut buffer = alloc::vec![0u8; self.cluster_size];
         let mut lfn = LfnState::new();
-        let mut cluster = start_cluster;
-        let mut walked = 0usize;
+        let mut cluster = task.cluster;
+        let mut entries = 0usize;
 
         loop {
-            self.read_cluster(cluster, &mut buffer)?;
+            if !visited.insert(cluster) {
+                // A loop in this chain, or a cluster shared with a directory
+                // already walked. Either way, there's nothing new here.
+                self.damaged = true;
+                return Ok(());
+            }
+            self.read_cluster(cluster, buffer)?;
             let cluster_start = self.cluster_offset(cluster)?;
 
             for (index, entry) in buffer.chunks_exact(32).enumerate() {
                 let offset = cluster_start + index as u64 * 32;
                 if entry[0] == 0x00 {
+                    return Ok(());
+                }
+                entries += 1;
+                if entries > MAX_DIRECTORY_ENTRIES {
+                    self.damaged = true;
                     return Ok(());
                 }
                 if entry[0] == 0xe5 {
@@ -303,16 +357,24 @@ impl<D: BlockDevice> Fat32<D> {
                 let start = (high << 16) | low;
                 let size = u32::from_le_bytes([entry[28], entry[29], entry[30], entry[31]]) as u64;
 
-                if kind == EntryKind::Directory {
-                    if start < 2 || start >= self.max_cluster() {
-                        continue;
+                let usable = match kind {
+                    EntryKind::Directory => start >= 2 && start < self.max_cluster(),
+                    // Callers size buffers from this, so it has to be possible:
+                    // no file can be larger than the volume.
+                    EntryKind::File => {
+                        size == 0
+                            || (start >= 2
+                                && start < self.max_cluster()
+                                && size <= self.cluster_count as u64 * self.cluster_size as u64)
                     }
-                } else if size > 0 && start < 2 {
+                };
+                if !usable {
+                    self.damaged = true;
                     continue;
                 }
 
                 let node = self.nodes.add(
-                    dir_node,
+                    task.node,
                     name,
                     kind,
                     start,
@@ -322,19 +384,23 @@ impl<D: BlockDevice> Fat32<D> {
                     Some(location),
                 )?;
 
-                if kind == EntryKind::Directory && !visited.contains(&start) {
-                    visited.push(start);
-                    queue.push(DirTask {
-                        node,
-                        cluster: start,
-                    });
+                if kind == EntryKind::Directory {
+                    let depth = task.depth + 1;
+                    if depth >= MAX_PATH_DEPTH || visited.contains(start) {
+                        self.damaged = true;
+                    } else {
+                        try_push(
+                            queue,
+                            DirTask {
+                                node,
+                                cluster: start,
+                                depth,
+                            },
+                        )?;
+                    }
                 }
             }
 
-            walked += 1;
-            if walked > self.cluster_count as usize {
-                return Err(FsError::Corrupt);
-            }
             match self.next_cluster(cluster)? {
                 Some(next) => cluster = next,
                 None => return Ok(()),
@@ -342,75 +408,61 @@ impl<D: BlockDevice> Fat32<D> {
         }
     }
 
-    fn read_file(&self, node: NodeId, offset: usize, out: &mut [u8]) -> usize {
-        let Some(entry) = self.nodes.get(node) else {
-            return 0;
-        };
-        if entry.kind != EntryKind::File || out.is_empty() {
-            return 0;
+    fn read_file(&self, node: NodeId, offset: usize, out: &mut [u8]) -> Result<usize, FsError> {
+        let entry = self.nodes.get(node).ok_or(FsError::NotFound)?;
+        if entry.kind != EntryKind::File {
+            return Err(FsError::NotFile);
         }
-
         let offset = offset as u64;
-        if offset >= entry.size || entry.start_cluster < 2 {
-            return 0;
-        }
-        let available = entry.size - offset;
-        let wanted = (out.len() as u64).min(available) as usize;
-        if wanted == 0 {
-            return 0;
+        if out.is_empty() || offset >= entry.size {
+            return Ok(0);
         }
 
         let cluster_size = self.cluster_size as u64;
-        let mut cluster_index = offset / cluster_size;
-        let mut within = (offset % cluster_size) as usize;
-        let mut cluster = entry.start_cluster;
+        entry.check_chain(entry.size.div_ceil(cluster_size), |cluster| {
+            self.next_cluster(cluster)
+        })?;
 
-        while cluster_index > 0 {
-            let Some(next) = self.next_cluster(cluster).ok().flatten() else {
-                return 0;
-            };
-            cluster = next;
-            cluster_index -= 1;
+        let wanted = (out.len() as u64).min(entry.size - offset) as usize;
+        let target = (offset / cluster_size) as u32;
+        let mut within = (offset % cluster_size) as usize;
+        let (mut index, mut cluster) = entry.position_before(target);
+        while index < target {
+            cluster = self.next_cluster(cluster)?.ok_or(FsError::Corrupt)?;
+            index += 1;
         }
 
         let mut done = 0usize;
-        let mut walked = 0usize;
         while done < wanted {
-            let Some(cluster_offset) = self.cluster_offset(cluster).ok() else {
-                return done;
-            };
+            let cluster_offset = self.cluster_offset(cluster)?;
             let take = (self.cluster_size - within).min(wanted - done);
-            if self
-                .volume
-                .read_bytes(cluster_offset + within as u64, &mut out[done..done + take])
-                .is_err()
-            {
-                return done;
-            }
+            self.volume
+                .read_bytes(cluster_offset + within as u64, &mut out[done..done + take])?;
             done += take;
             within = 0;
 
             if done < wanted {
-                walked += 1;
-                if walked > self.cluster_count as usize {
-                    return done;
-                }
-                match self.next_cluster(cluster) {
-                    Ok(Some(next)) => cluster = next,
-                    _ => return done,
-                }
+                cluster = self.next_cluster(cluster)?.ok_or(FsError::Corrupt)?;
+                index += 1;
             }
         }
-        done
+        entry.remember_position(index, cluster);
+        Ok(done)
     }
 }
 
 impl<D: WritableBlockDevice> Fat32<D> {
+    /// Fails when mounting found damage. Writing to a tree that's only partly
+    /// understood could reuse clusters that hold skipped files.
+    fn ensure_writable(&self) -> Result<(), FsError> {
+        if self.damaged {
+            return Err(FsError::Corrupt);
+        }
+        Ok(())
+    }
+
     fn read_fat_entry(&self, cluster: u32) -> Result<u32, FsError> {
-        let offset = self
-            .fat_start
-            .checked_add(cluster as u64 * 4)
-            .ok_or(FsError::Corrupt)?;
+        let offset = self.fat_entry_offset(cluster)?;
         Ok(self.volume.read_u32_le(offset)? & FAT_MASK)
     }
 
@@ -420,8 +472,14 @@ impl<D: WritableBlockDevice> Fat32<D> {
             .checked_add(cluster as u64 * 4)
             .ok_or(FsError::Corrupt)?;
         for copy in 0..self.fat_count {
+            if self.active_fat.is_some_and(|active| active != copy) {
+                continue;
+            }
             let target = offset + copy as u64 * self.fat_size_bytes;
-            self.volume.write_u32_le(target, value)?;
+            // The top four bits of an entry are reserved and must be preserved.
+            let reserved = self.volume.read_u32_le(target)? & !FAT_MASK;
+            self.volume
+                .write_u32_le(target, reserved | (value & FAT_MASK))?;
         }
         Ok(())
     }
@@ -445,7 +503,7 @@ impl<D: WritableBlockDevice> Fat32<D> {
             if self.read_fat_entry(cluster)? == 0 {
                 self.write_fat_entry(cluster, FAT_EOC_MIN)?;
                 let offset = self.cluster_offset(cluster)?;
-                let zeros = alloc::vec![0u8; self.cluster_size];
+                let zeros = try_zeroed(self.cluster_size)?;
                 self.volume.write_bytes(offset, &zeros)?;
                 self.next_free = if cluster + 1 < max_cluster {
                     cluster + 1
@@ -540,11 +598,10 @@ impl<D: WritableBlockDevice> Fat32<D> {
         }
         if start < 2 {
             let first = self.alloc_cluster()?;
-            let mut last = first;
-            for _ in 1..needed {
-                let next = self.alloc_cluster()?;
-                self.write_fat_entry(last, next)?;
-                last = next;
+            if let Err(error) = self.extend_chain(first, needed - 1) {
+                // Nothing refers to the partial chain yet, so it would leak.
+                self.free_chain(first)?;
+                return Err(error);
             }
             self.update_fsinfo()?;
             return Ok(first);
@@ -554,14 +611,27 @@ impl<D: WritableBlockDevice> Fat32<D> {
         if length >= needed {
             return Ok(start);
         }
-        let mut last = self.chain_last(start)?;
-        for _ in length..needed {
+        let last = self.chain_last(start)?;
+        if let Err(error) = self.extend_chain(last, needed - length) {
+            // Give back what was added: the file's size still ends at `last`.
+            if let Some(tail) = self.next_cluster(last)? {
+                self.write_fat_entry(last, FAT_EOC_MIN)?;
+                self.free_chain(tail)?;
+            }
+            return Err(error);
+        }
+        self.update_fsinfo()?;
+        Ok(start)
+    }
+
+    /// Appends `count` clusters after `last`, linking each as it's allocated.
+    fn extend_chain(&mut self, mut last: u32, count: usize) -> Result<(), FsError> {
+        for _ in 0..count {
             let next = self.alloc_cluster()?;
             self.write_fat_entry(last, next)?;
             last = next;
         }
-        self.update_fsinfo()?;
-        Ok(start)
+        Ok(())
     }
 
     fn truncate_chain(&mut self, start: u32, needed: usize) -> Result<u32, FsError> {
@@ -657,7 +727,9 @@ impl<D: WritableBlockDevice> Fat32<D> {
         if let Some(entry) = self.nodes.get_mut(node) {
             entry.start_cluster = start;
             entry.size = size;
+            entry.valid_size = size;
             entry.data_length = size;
+            entry.chain_changed();
         }
         Ok(())
     }
@@ -665,6 +737,7 @@ impl<D: WritableBlockDevice> Fat32<D> {
     fn write_file(&mut self, node: NodeId, offset: usize, data: &[u8]) -> Result<usize, FsError> {
         let (old_size, start_cluster, kind) = {
             let entry = self.nodes.get(node).ok_or(FsError::NotFound)?;
+            entry.chain_changed();
             (entry.size, entry.start_cluster, entry.kind)
         };
         if kind != EntryKind::File {
@@ -693,6 +766,7 @@ impl<D: WritableBlockDevice> Fat32<D> {
     fn set_file_len(&mut self, node: NodeId, size: usize) -> Result<(), FsError> {
         let (old_size, start_cluster, kind) = {
             let entry = self.nodes.get(node).ok_or(FsError::NotFound)?;
+            entry.chain_changed();
             (entry.size, entry.start_cluster, entry.kind)
         };
         if kind != EntryKind::File {
@@ -723,7 +797,8 @@ impl<D: WritableBlockDevice> Fat32<D> {
         Ok(())
     }
 
-    fn validate_new_name(&self, parent: NodeId, name: &str) -> Result<(), FsError> {
+    /// Checks everything about a new name except whether it's taken.
+    fn validate_name_syntax(&self, parent: NodeId, name: &str) -> Result<(), FsError> {
         let directory = self.nodes.get(parent).ok_or(FsError::NotFound)?;
         if directory.kind != EntryKind::Directory {
             return Err(FsError::NotDirectory);
@@ -745,10 +820,17 @@ impl<D: WritableBlockDevice> Fat32<D> {
         {
             return Err(FsError::InvalidName);
         }
+        Ok(())
+    }
+
+    /// `levels` is how many levels the new node may need below `parent`.
+    fn validate_new_name(&self, parent: NodeId, name: &str, levels: usize) -> Result<(), FsError> {
+        self.validate_name_syntax(parent, name)?;
         if self.nodes.lookup(parent, name).is_some() {
             return Err(FsError::NameExists);
         }
-        Ok(())
+        self.nodes.ensure_room(name)?;
+        self.nodes.check_depth(parent, levels)
     }
 
     fn make_short_name(&self, parent: NodeId, name: &str) -> Result<[u8; 11], FsError> {
@@ -809,7 +891,7 @@ impl<D: WritableBlockDevice> Fat32<D> {
         if start < 2 {
             return Ok(false);
         }
-        let mut buffer = alloc::vec![0u8; self.cluster_size];
+        let mut buffer = try_zeroed(self.cluster_size)?;
         let mut cluster = start;
         let mut walked = 0usize;
         loop {
@@ -846,7 +928,7 @@ impl<D: WritableBlockDevice> Fat32<D> {
             return Err(FsError::Corrupt);
         }
 
-        let mut buffer = alloc::vec![0u8; self.cluster_size];
+        let mut buffer = try_zeroed(self.cluster_size)?;
         let mut cluster = start;
         let mut offsets: Vec<u64> = Vec::with_capacity(needed);
         let mut walked = 0usize;
@@ -888,6 +970,7 @@ impl<D: WritableBlockDevice> Fat32<D> {
         attributes: u8,
         start_cluster: u32,
         size: u64,
+        template: Option<[u8; 32]>,
     ) -> Result<EntryLocation, FsError> {
         let short = self.make_short_name(parent, name)?;
         let units: Vec<u16> = name.encode_utf16().collect();
@@ -914,7 +997,13 @@ impl<D: WritableBlockDevice> Fat32<D> {
         }
 
         let short_offset = offsets[lfn_count];
-        let entry = build_short_entry(&short, attributes, start_cluster, size);
+        let mut entry = build_short_entry(&short, attributes, start_cluster, size);
+        if let Some(template) = template {
+            // A rename changes the name and nothing else: attributes and
+            // timestamps survive. The case flags described the old short name.
+            entry[11..].copy_from_slice(&template[11..]);
+            entry[12] = 0;
+        }
         self.volume.write_bytes(short_offset, &entry)?;
 
         Ok(EntryLocation {
@@ -937,11 +1026,13 @@ impl<D: WritableBlockDevice> Fat32<D> {
             let base = self.cluster_offset(cluster)?;
             if location.first >= base && location.first < base + self.cluster_size as u64 {
                 let mut offset = location.first;
-                for _ in 0..location.count {
+                for remaining in (0..location.count).rev() {
                     self.volume.write_bytes(offset, &[0xe5])?;
                     offset += 32;
                     let base = self.cluster_offset(cluster)?;
-                    if offset >= base + self.cluster_size as u64 {
+                    // A set can end in the last slot of the last cluster, with
+                    // nothing to advance to.
+                    if remaining > 0 && offset >= base + self.cluster_size as u64 {
                         cluster = self.next_cluster(cluster)?.ok_or(FsError::Corrupt)?;
                         offset = self.cluster_offset(cluster)?;
                     }
@@ -957,8 +1048,8 @@ impl<D: WritableBlockDevice> Fat32<D> {
     }
 
     fn create_file_node(&mut self, parent: NodeId, name: &str) -> Result<NodeId, FsError> {
-        self.validate_new_name(parent, name)?;
-        let location = self.write_entry_set(parent, name, 0x20, 0, 0)?;
+        self.validate_new_name(parent, name, 0)?;
+        let location = self.write_entry_set(parent, name, 0x20, 0, 0, None)?;
         self.nodes
             .add(
                 parent.0,
@@ -974,7 +1065,9 @@ impl<D: WritableBlockDevice> Fat32<D> {
     }
 
     fn create_dir_node(&mut self, parent: NodeId, name: &str) -> Result<NodeId, FsError> {
-        self.validate_new_name(parent, name)?;
+        // A directory must leave room for its own children: one at the limit
+        // could not be walked on the next mount.
+        self.validate_new_name(parent, name, 1)?;
         let cluster = self.alloc_cluster()?;
         let parent_cluster = if parent == NodeId::ROOT {
             0
@@ -991,7 +1084,7 @@ impl<D: WritableBlockDevice> Fat32<D> {
         self.volume.write_bytes(base, &dot)?;
         self.volume.write_bytes(base + 32, &dotdot)?;
 
-        let location = match self.write_entry_set(parent, name, 0x10, cluster, 0) {
+        let location = match self.write_entry_set(parent, name, 0x10, cluster, 0, None) {
             Ok(location) => location,
             Err(error) => {
                 self.free_chain(cluster)?;
@@ -1019,7 +1112,7 @@ impl<D: WritableBlockDevice> Fat32<D> {
             return Ok(());
         }
         let base = self.cluster_offset(start)?;
-        let mut buffer = alloc::vec![0u8; self.cluster_size];
+        let mut buffer = try_zeroed(self.cluster_size)?;
         self.read_cluster(start, &mut buffer)?;
         for (index, entry) in buffer.chunks_exact(32).enumerate() {
             if entry[0] == b'.' && entry[1] == b'.' {
@@ -1050,11 +1143,13 @@ impl<D: WritableBlockDevice> Fat32<D> {
         if kind == EntryKind::Directory && self.nodes.child_count(node) > 0 {
             return Err(FsError::NotEmpty);
         }
+        // Entry first: if this stops partway, the worst left behind is a lost
+        // chain, not a name that points at freed clusters.
+        self.delete_entry_set(NodeId(parent), location.ok_or(FsError::Corrupt)?)?;
+        self.nodes.remove(node)?;
         if start_cluster >= 2 {
             self.free_chain(start_cluster)?;
         }
-        self.delete_entry_set(NodeId(parent), location.ok_or(FsError::Corrupt)?)?;
-        self.nodes.remove(node)?;
         self.update_fsinfo()
     }
 
@@ -1079,10 +1174,19 @@ impl<D: WritableBlockDevice> Fat32<D> {
         if kind == EntryKind::Directory && self.nodes.is_ancestor(node, new_parent) {
             return Err(FsError::Unsupported);
         }
-        if self.nodes.lookup(new_parent, new_name) == Some(node) {
-            return Ok(());
+        match self.nodes.lookup(new_parent, new_name) {
+            // The same name exactly. A case change still has to be written.
+            Some(found) if found == node && self.nodes.name(node) == Some(new_name) => {
+                return Ok(())
+            }
+            Some(found) if found == node => {}
+            Some(_) => return Err(FsError::NameExists),
+            None => {}
         }
-        self.validate_new_name(new_parent, new_name)?;
+        self.validate_name_syntax(new_parent, new_name)?;
+        let directory_level = usize::from(kind == EntryKind::Directory);
+        self.nodes
+            .check_depth(new_parent, self.nodes.height(node) + directory_level)?;
 
         let old_location = self
             .nodes
@@ -1095,8 +1199,15 @@ impl<D: WritableBlockDevice> Fat32<D> {
             0x20
         };
         let size_field = if kind == EntryKind::File { size } else { 0 };
-        let new_location =
-            self.write_entry_set(new_parent, new_name, attributes, start_cluster, size_field)?;
+        let template = self.volume.read_array::<32>(old_location.primary)?;
+        let new_location = self.write_entry_set(
+            new_parent,
+            new_name,
+            attributes,
+            start_cluster,
+            size_field,
+            Some(template),
+        )?;
         self.delete_entry_set(NodeId(old_parent), old_location)?;
 
         if kind == EntryKind::Directory {
@@ -1118,26 +1229,32 @@ impl<D: WritableBlockDevice> Fat32<D> {
 
 impl<D: WritableBlockDevice> WritableFileSystem for Fat32<D> {
     fn create_file(&mut self, parent: NodeId, name: &str) -> Result<NodeId, FsError> {
+        self.ensure_writable()?;
         self.create_file_node(parent, name)
     }
 
     fn create_dir(&mut self, parent: NodeId, name: &str) -> Result<NodeId, FsError> {
+        self.ensure_writable()?;
         self.create_dir_node(parent, name)
     }
 
     fn remove(&mut self, node: NodeId) -> Result<(), FsError> {
+        self.ensure_writable()?;
         self.remove_node(node)
     }
 
     fn rename(&mut self, node: NodeId, new_parent: NodeId, new_name: &str) -> Result<(), FsError> {
+        self.ensure_writable()?;
         self.rename_node(node, new_parent, new_name)
     }
 
     fn write(&mut self, node: NodeId, offset: usize, data: &[u8]) -> Result<usize, FsError> {
+        self.ensure_writable()?;
         self.write_file(node, offset, data)
     }
 
     fn set_len(&mut self, node: NodeId, size: usize) -> Result<(), FsError> {
+        self.ensure_writable()?;
         self.set_file_len(node, size)
     }
 
@@ -1149,6 +1266,14 @@ impl<D: WritableBlockDevice> WritableFileSystem for Fat32<D> {
 impl<D: BlockDevice> FileSystem for Fat32<D> {
     fn node_count(&self) -> usize {
         self.nodes.len()
+    }
+
+    fn node_id_limit(&self) -> usize {
+        self.nodes.id_limit()
+    }
+
+    fn is_damaged(&self) -> bool {
+        self.damaged
     }
 
     fn kind(&self, node: NodeId) -> Option<EntryKind> {
@@ -1168,6 +1293,10 @@ impl<D: BlockDevice> FileSystem for Fat32<D> {
     }
 
     fn read(&self, node: NodeId, offset: usize, out: &mut [u8]) -> usize {
+        self.read_file(node, offset, out).unwrap_or(0)
+    }
+
+    fn try_read(&self, node: NodeId, offset: usize, out: &mut [u8]) -> Result<usize, FsError> {
         self.read_file(node, offset, out)
     }
 
@@ -1187,6 +1316,8 @@ impl<D: BlockDevice> FileSystem for Fat32<D> {
 struct DirTask {
     node: u32,
     cluster: u32,
+    /// Parents between this directory and the root.
+    depth: usize,
 }
 
 struct LfnState {
@@ -1196,6 +1327,8 @@ struct LfnState {
     active: bool,
     first: Option<u64>,
     entries: u8,
+    /// Sequence number the next entry must carry. Entries count down to one.
+    expected: u8,
 }
 
 impl LfnState {
@@ -1207,6 +1340,7 @@ impl LfnState {
             active: false,
             first: None,
             entries: 0,
+            expected: 0,
         }
     }
 
@@ -1216,6 +1350,7 @@ impl LfnState {
         self.active = false;
         self.first = None;
         self.entries = 0;
+        self.expected = 0;
     }
 
     fn push(&mut self, entry: &[u8], offset: u64) {
@@ -1238,11 +1373,16 @@ impl LfnState {
             self.active = true;
             self.first = Some(offset);
             self.entries = 1;
-        } else if !self.active || self.checksum != Some(entry[13]) {
+            self.expected = order as u8 - 1;
+        } else if !self.active
+            || self.checksum != Some(entry[13])
+            || order != self.expected as usize
+        {
             self.active = false;
             return;
         } else {
             self.entries = self.entries.saturating_add(1);
+            self.expected -= 1;
         }
 
         let offset = (order - 1) * 13;
@@ -1271,7 +1411,10 @@ impl LfnState {
         short: &Option<String>,
         short_offset: u64,
     ) -> Option<(String, EntryLocation)> {
-        let valid_lfn = self.active && self.checksum == Some(short_checksum(short_entry));
+        // An incomplete run of sequence numbers is an orphan, not this file's
+        // name, even if the checksum matches.
+        let valid_lfn =
+            self.active && self.expected == 0 && self.checksum == Some(short_checksum(short_entry));
         let location = EntryLocation {
             first: if valid_lfn {
                 self.first.unwrap_or(short_offset)
@@ -1295,14 +1438,14 @@ impl LfnState {
             if end > 0 {
                 let name = String::from_utf16_lossy(&self.units[..end]);
                 if !name.is_empty() {
-                    return Some((sanitize(name), location));
+                    return Some((sanitize_name(name), location));
                 }
             }
         }
 
         short
             .as_ref()
-            .map(|name| (sanitize(name.clone()), location))
+            .map(|name| (sanitize_name(name.clone()), location))
             .filter(|(name, _)| !name.is_empty())
     }
 }
@@ -1366,14 +1509,6 @@ fn trimmed_end(bytes: &[u8]) -> usize {
         end = position;
     }
     end
-}
-
-fn sanitize(name: String) -> String {
-    if name.contains('/') || name.contains('\\') {
-        name.replace(['/', '\\'], "_")
-    } else {
-        name
-    }
 }
 
 fn valid_fsinfo<D: BlockDevice>(volume: &Volume<D>, offset: u64) -> bool {

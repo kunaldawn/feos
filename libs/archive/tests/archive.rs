@@ -199,3 +199,113 @@ fn rejects_corrupt_zip_crc() {
     let mut out = [0u8; 256];
     assert_eq!(entry.extract(&mut out), Err(ArchiveError::Checksum));
 }
+
+/// A ustar header with a valid checksum.
+fn tar_header(name: &str, flag: u8, size: u64) -> [u8; 512] {
+    let mut header = [0u8; 512];
+    header[..name.len()].copy_from_slice(name.as_bytes());
+    header[100..107].copy_from_slice(b"0000644");
+    header[124..135].copy_from_slice(format!("{size:011o}").as_bytes());
+    header[136..147].copy_from_slice(b"00000000000");
+    header[156] = flag;
+    header[257..263].copy_from_slice(b"ustar\0");
+    header[263..265].copy_from_slice(b"00");
+    header[148..156].fill(b' ');
+    let sum: u32 = header.iter().map(|&byte| byte as u32).sum();
+    header[148..155].copy_from_slice(format!("{sum:06o}\0").as_bytes());
+    header
+}
+
+fn pax_record(key: &str, value: &str) -> Vec<u8> {
+    let body = format!(" {key}={value}\n");
+    let mut length = body.len() + 1;
+    while format!("{length}{body}").len() != length {
+        length = format!("{length}{body}").len();
+    }
+    format!("{length}{body}").into_bytes()
+}
+
+fn pad(out: &mut Vec<u8>) {
+    while out.len() % 512 != 0 {
+        out.push(0);
+    }
+}
+
+#[test]
+fn tar_directory_with_nonzero_size_consumes_no_data() {
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&tar_header("dir/", b'5', 4096));
+    archive.extend_from_slice(&tar_header("dir/file.txt", b'0', 5));
+    archive.extend_from_slice(b"hello");
+    pad(&mut archive);
+    archive.extend_from_slice(&[0u8; 1024]);
+
+    let entries = tar_entries(&archive);
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].1, EntryType::Directory);
+    assert!(entries[0].2.is_empty());
+    assert_eq!(entries[1].0, "dir/file.txt");
+    assert_eq!(entries[1].2, b"hello");
+}
+
+#[test]
+fn tar_pax_size_does_not_apply_to_following_metadata_or_links() {
+    // The PAX size describes the real file, not the GNU long-name header
+    // between them, nor a symlink.
+    let records = pax_record("size", "5");
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&tar_header("PaxHeader", b'x', records.len() as u64));
+    archive.extend_from_slice(&records);
+    pad(&mut archive);
+    let long = b"a-long-name.txt\0";
+    archive.extend_from_slice(&tar_header("././@LongLink", b'L', long.len() as u64));
+    archive.extend_from_slice(long);
+    pad(&mut archive);
+    archive.extend_from_slice(&tar_header("x", b'0', 0));
+    archive.extend_from_slice(b"hello");
+    pad(&mut archive);
+
+    archive.extend_from_slice(&tar_header("PaxHeader", b'x', records.len() as u64));
+    archive.extend_from_slice(&records);
+    pad(&mut archive);
+    archive.extend_from_slice(&tar_header("link", b'2', 0));
+    archive.extend_from_slice(&tar_header("after.txt", b'0', 2));
+    archive.extend_from_slice(b"ok");
+    pad(&mut archive);
+    archive.extend_from_slice(&[0u8; 1024]);
+
+    let entries = tar_entries(&archive);
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0].0, "a-long-name.txt");
+    assert_eq!(entries[0].2, b"hello");
+    assert_eq!(entries[1].1, EntryType::Symlink);
+    assert!(entries[1].2.is_empty());
+    assert_eq!(entries[2].0, "after.txt");
+    assert_eq!(entries[2].2, b"ok");
+}
+
+#[test]
+fn zip_rejects_sizes_that_cannot_be_true() {
+    use feos_archive::{ArchiveError, ZipWriter};
+
+    let mut buffer = vec![0u8; 4096];
+    let mut writer = ZipWriter::new(&mut buffer);
+    writer.write_stored("a.bin", b"data").unwrap();
+    let len = writer.finish().unwrap();
+    let mut image = buffer[..len].to_vec();
+    let central = image
+        .windows(4)
+        .position(|window| window == [b'P', b'K', 1, 2])
+        .unwrap();
+
+    // A small ZIP declaring 4 GiB of stored data used to reach the consumer's
+    // allocation.
+    image[central + 24..central + 28].copy_from_slice(&0xfff0_0000u32.to_le_bytes());
+    let mut reader = ZipReader::open(&image).unwrap();
+    assert!(matches!(reader.next(), Err(ArchiveError::InvalidData(_))));
+
+    // The same claim on a deflated entry exceeds DEFLATE's maximum ratio.
+    image[central + 10..central + 12].copy_from_slice(&8u16.to_le_bytes());
+    let mut reader = ZipReader::open(&image).unwrap();
+    assert!(matches!(reader.next(), Err(ArchiveError::InvalidData(_))));
+}

@@ -1,8 +1,8 @@
 //! `files`: a graphical file explorer plus text-mode filesystem commands.
 //!
-//! `files` with no arguments opens a full-screen explorer. It is a foreground
-//! app (`App::foreground`), so launching it from the desktop hands over the
-//! framebuffer until the user closes the window or presses `Esc`.
+//! The desktop hosts it in a window. Run from the serial shell with no
+//! arguments, it takes over the framebuffer (`App::foreground`) until the user
+//! closes it or presses `Esc`, since there is no window chrome there.
 //!
 //! Text-mode forms are useful from the serial shell:
 //!
@@ -21,6 +21,7 @@ use feos_fs::{EntryKind, FileSystem, NodeId};
 use feos_text::Text;
 
 mod explorer;
+mod preview;
 
 /// Maximum absolute path length the explorer displays.
 const PATH_MAX: usize = 256;
@@ -42,7 +43,7 @@ impl App for Files {
     }
 
     fn description(&self) -> &'static str {
-        "browse the read-only filesystem with an XP-style explorer"
+        "browse the filesystem"
     }
 
     fn foreground(&self) -> bool {
@@ -69,6 +70,14 @@ impl App for Files {
 
     fn close_window(&self) {
         explorer::close_window();
+    }
+
+    fn animates(&self) -> bool {
+        explorer::needs_frames()
+    }
+
+    fn accept_drop(&self, payload: &str) -> bool {
+        explorer::accept_drop(payload)
     }
 
     fn run(&self, context: &mut Context<'_>) {

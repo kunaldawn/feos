@@ -2,14 +2,24 @@
 //! kernel.
 //!
 //! All decoding is done into a caller-provided interleaved signed 16-bit
-//! buffer and never allocates.
+//! buffer. The PCM containers and MP3 never allocate. FLAC, Vorbis and AAC need
+//! block-sized working memory and their tables, which they allocate fallibly and
+//! within fixed limits, so a hostile file gets [`AudioError::OutOfMemory`] or
+//! [`AudioError::InvalidData`] rather than a kernel abort.
+//!
+//! Decoder CPU is bounded by the sizes of the input and the output buffer. Size
+//! `out` from a trusted limit rather than from [`info`] alone: a file's stated
+//! length is only a claim.
 //!
 //! | Format | Decode | Encode |
 //! |--------|--------|--------|
 //! | WAVE (PCM, float, A-law, µ-law) | yes | PCM16 |
 //! | AIFF / AIFF-C | PCM 8/16/24/32-bit (big or little endian) | PCM16 |
 //! | AU / SND | µ-law, A-law, PCM, float | no |
-//! | MP3 (MPEG Layer III) | yes | no |
+//! | MP3 (MPEG Layer III only) | yes | no |
+//! | FLAC, native and in Ogg | yes, to 16 bits | no |
+//! | Ogg Vorbis (floor 1) | yes | no |
+//! | AAC-LC, in ADTS or raw frames | yes | no |
 //! | Ogg Opus | headers, pages and packet TOC only | no |
 //!
 //! ```
@@ -30,14 +40,22 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+extern crate alloc;
+
+pub mod aac;
+mod aac_tables;
 pub mod aiff;
 pub mod au;
+mod bits;
 mod error;
+pub mod flac;
+mod mdct;
 mod mp3;
 mod mp3_decode;
 pub mod ogg;
 pub mod opus;
 mod pcm;
+pub mod vorbis;
 pub mod wav;
 
 pub use error::{AudioError, Result};
@@ -54,8 +72,16 @@ pub enum AudioFormat {
     Au,
     /// MPEG-1/2/2.5 Layer III.
     Mp3,
-    /// Ogg container with an Opus stream.
+    /// Ogg container with an Opus stream. Headers only: packets do not decode.
     OggOpus,
+    /// Ogg container with a Vorbis stream.
+    OggVorbis,
+    /// Ogg container with a FLAC stream.
+    OggFlac,
+    /// Native FLAC.
+    Flac,
+    /// AAC-LC in ADTS framing.
+    Aac,
 }
 
 impl AudioFormat {
@@ -67,6 +93,10 @@ impl AudioFormat {
             Self::Au => "au",
             Self::Mp3 => "mp3",
             Self::OggOpus => "ogg-opus",
+            Self::OggVorbis => "ogg-vorbis",
+            Self::OggFlac => "ogg-flac",
+            Self::Flac => "flac",
+            Self::Aac => "aac",
         }
     }
 }
@@ -112,6 +142,10 @@ pub struct DecodedAudio {
 }
 
 /// Detects an audio format from its signature.
+///
+/// An Ogg file is identified by the codec of its first known logical stream;
+/// an Ogg file with damaged headers or another codec is `None`, and [`info`]
+/// says which.
 pub fn detect(input: &[u8]) -> Option<AudioFormat> {
     if input.len() >= 12 && &input[..4] == b"RIFF" && &input[8..12] == b"WAVE" {
         Some(AudioFormat::Wav)
@@ -123,14 +157,22 @@ pub fn detect(input: &[u8]) -> Option<AudioFormat> {
     } else if input.len() >= 4 && &input[..4] == b".snd" {
         Some(AudioFormat::Au)
     } else if input.len() >= 4 && &input[..4] == b"OggS" {
-        // Only Opus-in-Ogg is supported; check the first page payload.
-        let mut pages = ogg::Pages::new(input);
-        match pages.next() {
-            Some(Ok(page)) if page.data.starts_with(b"OpusHead") => Some(AudioFormat::OggOpus),
+        match ogg::find_stream(input) {
+            Ok(Some((format, _))) => Some(format),
             _ => None,
         }
+    } else if input.len() >= 4 && &input[..4] == b"fLaC" {
+        Some(AudioFormat::Flac)
     } else if input.len() >= 3 && &input[..3] == b"ID3" {
-        Some(AudioFormat::Mp3)
+        // Tagged files are nearly always MP3, but anything can follow a tag.
+        match input.get(flac::id3_len(input)..).and_then(|rest| rest.get(..4)) {
+            Some(b"fLaC") => Some(AudioFormat::Flac),
+            Some(rest) if rest[0] == 0xff && rest[1] & 0xf6 == 0xf0 => Some(AudioFormat::Aac),
+            _ => Some(AudioFormat::Mp3),
+        }
+    } else if input.len() >= 2 && input[0] == 0xff && input[1] & 0xf6 == 0xf0 {
+        // The layer bits are always 0 in ADTS and never in MPEG audio.
+        Some(AudioFormat::Aac)
     } else if input.len() >= 2
         && input[0] == 0xff
         && (input[1] & 0xe0) == 0xe0
@@ -142,40 +184,57 @@ pub fn detect(input: &[u8]) -> Option<AudioFormat> {
     }
 }
 
+/// [`detect`], with the reason when it finds nothing.
+fn detect_or_err(input: &[u8]) -> Result<AudioFormat> {
+    detect(input).ok_or_else(|| {
+        if input.starts_with(b"OggS") {
+            match ogg::find_stream(input) {
+                Err(error) => error,
+                // A valid Ogg file with no stream this crate knows.
+                Ok(_) => AudioError::UnsupportedFormat,
+            }
+        } else {
+            AudioError::UnknownFormat
+        }
+    })
+}
+
 /// Reads the properties of an encoded audio stream.
 pub fn info(input: &[u8]) -> Result<AudioInfo> {
-    match detect(input).ok_or(AudioError::UnknownFormat)? {
+    match detect_or_err(input)? {
         AudioFormat::Wav => wav::info(input),
         AudioFormat::Aiff => aiff::info(input),
         AudioFormat::Au => au::info(input),
         AudioFormat::Mp3 => mp3_decode::info(input),
-        AudioFormat::OggOpus => ogg::info(input),
+        AudioFormat::Flac => flac::info(input),
+        AudioFormat::Aac => aac::info(input),
+        AudioFormat::OggOpus | AudioFormat::OggVorbis | AudioFormat::OggFlac => ogg::info(input),
     }
 }
 
-/// Extra working memory needed by [`decode`].
+/// Extra working memory needed by [`decode`] from the caller.
 ///
-/// Currently every decoder works in place or on the stack, so this returns 0.
+/// This is always 0: every decoder works in place, on the stack, or on memory
+/// it allocates itself, fallibly.
 pub fn scratch_len(input: &[u8]) -> Result<usize> {
-    match detect(input).ok_or(AudioError::UnknownFormat)? {
-        AudioFormat::Wav => wav::scratch_len(input),
-        AudioFormat::Aiff => aiff::scratch_len(input),
-        AudioFormat::Au => au::scratch_len(input),
-        AudioFormat::Mp3 => mp3_decode::scratch_len(input),
-        AudioFormat::OggOpus => ogg::scratch_len(input),
-    }
+    detect_or_err(input)?;
+    Ok(0)
 }
 
 /// Decodes any supported stream into interleaved signed 16-bit samples.
 ///
 /// Ogg Opus is detected but its packets cannot be decoded yet; this returns
-/// [`AudioError::UnsupportedFeature`].
+/// [`AudioError::UnsupportedFeature`]. So do MP3 Layer I and II.
 pub fn decode(input: &[u8], out: &mut [i16], _scratch: &mut [u8]) -> Result<DecodedAudio> {
-    match detect(input).ok_or(AudioError::UnknownFormat)? {
+    match detect_or_err(input)? {
         AudioFormat::Wav => wav::decode(input, out),
         AudioFormat::Aiff => aiff::decode(input, out),
         AudioFormat::Au => au::decode(input, out),
         AudioFormat::Mp3 => mp3_decode::decode(input, out),
-        AudioFormat::OggOpus => ogg::decode(input, out),
+        AudioFormat::Flac => flac::decode(input, out),
+        AudioFormat::Aac => aac::decode(input, out),
+        AudioFormat::OggOpus | AudioFormat::OggVorbis | AudioFormat::OggFlac => {
+            ogg::decode(input, out)
+        }
     }
 }

@@ -3,7 +3,7 @@ name: Media Player
 version: 2.0.0
 entry: player
 category: Multimedia
-description: VLC-style video player with playlist and fullscreen mode
+description: Video player with playlist and fullscreen mode
 icon: icon.bmp
 window:
   width: 960

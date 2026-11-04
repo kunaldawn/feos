@@ -15,31 +15,32 @@ patents are separate matters. See `docs/LICENSE-MIT` and `docs/LICENSE-APACHE`.
 
 The decoder targets 8-bit progressive 4:2:0 Baseline, Main, and High-profile
 streams, including CAVLC/CABAC, P/B pictures, reference pictures, and
-display-order reordering. Unsupported H.264 features return an error.
+display-order reordering. High 10, 4:2:2, 4:4:4, monochrome, lossless, MBAFF,
+field pictures, FMO and SP/SI slices return an error.
+
+It uses `alloc` under `Limits`: a stream is refused with
+`DecodeError::OutOfMemory` if it can't fit, and picture allocation is fallible.
 
 ## Attribution
 
 - Original decoder: `z264` by p14c31355, MIT OR Apache-2.0
   (<https://github.com/p14c31355/z264>).
 - Upstream implementation: `rust_h264` 0.4.x, MIT OR Apache-2.0.
-- NEON motion-compensation kernels are retained from the vendored source and
-  are the only `unsafe` code in this crate.
+- NEON motion-compensation kernels are retained from the vendored source. They
+  and the lazy table cell in `src/once.rs` are the only `unsafe` code in this crate.
 
-The public crate name, documentation and package metadata were rebranded for
-feos; the decoding algorithms are unchanged. See `docs/UPSTREAM.md` for the
-provenance note copied from the upstream crate.
+See [`UPSTREAM.md`](UPSTREAM.md) for provenance and the local patches.
 
 ## Example
 
 ```rust,no_run
-use feos_h264::{Decoder, parse_annex_b};
+use feos_h264::{Decoder, annex_b_units};
 
 let bitstream = std::fs::read("input.h264").unwrap();
-let nals = parse_annex_b(&bitstream);
 let mut decoder = Decoder::new();
 
-for nal in &nals {
-    if let Ok(Some(frame)) = decoder.decode_nal(nal) {
+for nal in annex_b_units(&bitstream) {
+    if let Ok(Some(frame)) = decoder.decode_nal(&nal) {
         println!(
             "decoded {}x{} frame, POC={}",
             frame.width, frame.height, frame.pic_order_cnt
@@ -52,8 +53,8 @@ if let Some(frame) = decoder.flush() {
 ```
 
 Frames are returned in decode order; sort by `pic_order_cnt` within a GOP for
-display order. The Y plane is `width * height` bytes and the U/V planes are
-`(width / 2) * (height / 2)` bytes each.
+display order, or use `OrderedDecoder`. Planes hold the whole coded picture: read
+the visible part with `y_row`, `u_row` and `v_row`, or copy it with `append_i420`.
 
 ## Tests
 
@@ -61,5 +62,8 @@ display order. The Y plane is `width * height` bytes and the U/V planes are
 cargo test -p feos-h264 --target x86_64-unknown-linux-gnu
 ```
 
-The test corpus (`testdata/mini.h264`) is checked against the matching raw YUV
-output produced by FFmpeg.
+`tests/conformance.rs` checks clips made with libx264 (CABAC, CAVLC, B-frames and
+pyramids, High profile, custom scaling, multiple slices, crops) against FFmpeg's
+output, which is bit-exact. `testdata/generate.py` documents and regenerates them.
+`tests/malformed.rs` decodes mutated streams under a 64 MiB heap limit and a small
+stack.

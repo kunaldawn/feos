@@ -1,11 +1,10 @@
-//! `gui`: render the feos-gui dashboard and component gallery demo.
+//! `gui`: the feos-gui dashboard and component gallery.
 //!
-//! The current QEMU board has no mouse or keyboard device yet, so this app
-//! renders a complete frame from static demo state. The same widgets, layout
-//! engine, components, charts and windows are driven by real [`Input`] events
-//! as soon as a platform driver feeds them into the toolkit.
+//! On the desktop this is a windowed app driven by real input, which makes it
+//! a live test of every widget. From the shell it draws one frame from the same
+//! state on the framebuffer.
 
-use feos_app::{App, Context};
+use feos_app::{App, Context, WindowContext, WindowFrame};
 use feos_console::println;
 use feos_gfx::{Canvas, Rect};
 use feos_gui::prelude::*;
@@ -13,6 +12,8 @@ use feos_gui::{InteractionState, ScrollState, TextBuffer, WindowState};
 
 /// Demo state that must survive between invocations of the app.
 struct DemoState {
+    /// This window's events, in content coordinates.
+    input: Input,
     interaction: InteractionState<24>,
     name: TextBuffer<48>,
     volume: f32,
@@ -67,6 +68,7 @@ struct DemoState {
 impl DemoState {
     const fn new() -> Self {
         Self {
+            input: Input::new(),
             interaction: InteractionState::new(),
             name: TextBuffer::new(),
             volume: 0.62,
@@ -142,6 +144,26 @@ impl App for Gui {
         "draw the feos-gui dashboard and component gallery"
     }
 
+    fn windowed(&self) -> bool {
+        true
+    }
+
+    fn open_window(&self, _context: &WindowContext<'_, '_>) -> bool {
+        // SAFETY: the desktop runs hosted apps on its one thread, and a bundle
+        // has one window, so no other reference to the demo state exists.
+        let state = unsafe { &mut *core::ptr::addr_of_mut!(DEMO) };
+        *state = DemoState::new();
+        true
+    }
+
+    fn frame_window(&self, context: &mut WindowContext<'_, '_>) -> WindowFrame {
+        // SAFETY: as in `open_window`.
+        let state = unsafe { &mut *core::ptr::addr_of_mut!(DEMO) };
+        localise_input(context, &mut state.input);
+        render(context.canvas, state, context.platform.board.arch);
+        WindowFrame::Continue
+    }
+
     fn run(&self, context: &mut Context<'_>) {
         match context.display.as_mut() {
             Some(canvas) => {
@@ -160,10 +182,50 @@ impl App for Gui {
     }
 }
 
+/// Rebuilds this frame's events in content coordinates. Only events the desktop
+/// routed to this window are kept, and the button state persists between frames.
+fn localise_input(context: &WindowContext<'_, '_>, input: &mut Input) {
+    input.clear_events();
+    let origin = context.origin;
+    let local = |pos: Point| Point::new(pos.x - origin.x, pos.y - origin.y);
+    for event in context.input.events() {
+        let translated = match event {
+            Event::PointerMoved(pos) if context.pointer_active => {
+                Some(Event::PointerMoved(local(pos)))
+            }
+            Event::PointerDown { pos, button } if context.pointer_active => {
+                Some(Event::PointerDown {
+                    pos: local(pos),
+                    button,
+                })
+            }
+            Event::PointerUp { pos, button } if context.pointer_active => Some(Event::PointerUp {
+                pos: local(pos),
+                button,
+            }),
+            Event::PointerWheel(delta) if context.pointer_active => {
+                Some(Event::PointerWheel(delta))
+            }
+            Event::KeyDown(..) | Event::KeyUp(..) | Event::Text(_) | Event::ModifiersChanged(_)
+                if context.keyboard_active =>
+            {
+                Some(event)
+            }
+            _ => None,
+        };
+        if let Some(event) = translated {
+            input.push(event);
+        }
+    }
+    if context.pointer_active {
+        input.set_pointer(context.pointer());
+    }
+}
+
 fn render(canvas: &mut Canvas, state: &mut DemoState, arch: &str) {
     let theme = Theme::dark();
-    let input = Input::new();
     let DemoState {
+        input,
         interaction,
         name,
         volume,
@@ -300,7 +362,7 @@ fn render(canvas: &mut Canvas, state: &mut DemoState, arch: &str) {
             ui.heading(title);
             let (tag, subtitle) = match *tab {
                 2 => ("KIT", "reusable pieces"),
-                3 => ("FLUENT", "Windows-inspired controls"),
+                3 => ("DESKTOP", "Window-style controls"),
                 4 => ("PATTERNS", "advanced composition"),
                 _ => ("LIVE", "all systems nominal"),
             };
@@ -566,7 +628,7 @@ fn render(canvas: &mut Canvas, state: &mut DemoState, arch: &str) {
                 tags.push("components");
             }
             let title_rect = ui.allocate(0, 34);
-            ui.title_bar(title_rect, "Patterns", "Windows/Fluent composition");
+            ui.title_bar(title_rect, "Patterns", "Desktop composition");
             let selector = ui.allocate(0, metrics.control_height + 4);
             ui.row(selector, 12, |ui| {
                 ui.selector_bar(pattern_tab, &["Library", "Activity", "Settings"]);
@@ -897,4 +959,113 @@ fn render(canvas: &mut Canvas, state: &mut DemoState, arch: &str) {
     }
 
     let _ = (compact, notes);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use feos_gfx::{Canvas, Point};
+    use feos_gui::{Event, Key, Modifiers, MouseButton};
+
+    struct Random(u64);
+
+    impl Random {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, limit: u64) -> u64 {
+            self.next() % limit
+        }
+    }
+
+    fn random_event(random: &mut Random, width: i32, height: i32) -> Event {
+        let pos = Point::new(
+            random.below(width as u64 + 8) as i32 - 4,
+            random.below(height as u64 + 8) as i32 - 4,
+        );
+        match random.below(14) {
+            0..=4 => Event::PointerMoved(pos),
+            5 | 6 => Event::PointerDown {
+                pos,
+                button: MouseButton::Left,
+            },
+            7 | 8 => Event::PointerUp {
+                pos,
+                button: MouseButton::Left,
+            },
+            9 => Event::PointerWheel(random.below(9) as i32 - 4),
+            10 => Event::Text((b'a' + random.below(26) as u8) as char),
+            11 => Event::Text('\u{e9}'),
+            _ => {
+                const KEYS: [Key; 14] = [
+                    Key::Tab,
+                    Key::Enter,
+                    Key::Escape,
+                    Key::Space,
+                    Key::Backspace,
+                    Key::Delete,
+                    Key::Left,
+                    Key::Right,
+                    Key::Up,
+                    Key::Down,
+                    Key::Home,
+                    Key::End,
+                    Key::PageUp,
+                    Key::PageDown,
+                ];
+                const MODIFIERS: [Modifiers; 3] = [Modifiers::NONE, Modifiers::SHIFT, Modifiers::CTRL];
+                Event::KeyDown(
+                    KEYS[random.below(14) as usize],
+                    MODIFIERS[random.below(3) as usize],
+                )
+            }
+        }
+    }
+
+    /// Every widget in the toolkit, under random input, on canvases from one
+    /// pixel up to a normal window. The demo state is large and not shared, so
+    /// each run gets its own on a thread with a big enough stack.
+    #[test]
+    fn the_gallery_survives_random_input_on_any_canvas() {
+        const SIZES: [(usize, usize); 10] = [
+            (1, 1),
+            (2, 3),
+            (17, 9),
+            (40, 500),
+            (500, 30),
+            (120, 90),
+            (200, 150),
+            (320, 240),
+            (640, 480),
+            (900, 640),
+        ];
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                for (seed, (width, height)) in SIZES.iter().cycle().take(40).enumerate() {
+                    let mut pixels = std::vec![0u32; width * height];
+                    let mut state = std::boxed::Box::new(DemoState::new());
+                    let mut random =
+                        Random((seed as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+                    for _ in 0..300 {
+                        state.input.clear_events();
+                        for _ in 0..random.below(5) {
+                            let event =
+                                random_event(&mut random, *width as i32, *height as i32);
+                            state.input.push(event);
+                        }
+                        let mut canvas =
+                            Canvas::new(&mut pixels, *width, *height, *width).unwrap();
+                        render(&mut canvas, &mut state, "test");
+                    }
+                }
+            })
+            .unwrap()
+            .join()
+            .expect("the gallery panicked");
+    }
 }

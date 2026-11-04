@@ -16,6 +16,7 @@ default-members = ["kernel"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+rust-version = "1.99"
 
 [workspace.dependencies]
 feos-app = { path = "libs/app" }
@@ -50,10 +51,13 @@ feos-fs = { path = "libs/fs" }
 feos-gui = { path = "libs/gui" }
 feos-h264 = { path = "libs/h264" }
 feos-hal = { path = "libs/hal" }
+feos-heap = { path = "libs/heap" }
 feos-image = { path = "libs/image" }
 feos-init = { path = "libs/init" }
 feos-json = { path = "libs/json" }
 feos-keys = { path = "libs/keys" }
+feos-port-io = { path = "libs/port-io" }
+feos-sched = { path = "libs/sched" }
 feos-sh = { path = "libs/sh" }
 feos-shell = { path = "apps/shell" }
 feos-sync = { path = "libs/sync" }
@@ -70,3 +74,21 @@ panic = "abort"
 opt-level = "s"
 lto = true
 codegen-units = 1
+# Line tables make panics and faults easier to trace, and aren't loaded.
+debug = "line-tables-only"
+
+# The image is dominated by data, so speed matters more than size in hot code.
+[profile.release.package.feos-gfx]
+opt-level = 3
+
+[profile.release.package.feos-gui]
+opt-level = 3
+
+[profile.release.package.feos-desktop]
+opt-level = 3
+
+[profile.release.package.feos-dosbox]
+opt-level = 3
+
+[profile.release.package.feos-h264]
+opt-level = 3

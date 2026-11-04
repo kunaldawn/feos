@@ -1,13 +1,16 @@
-//! VLC-style video player for feos.
+//! FEOS Media Player.
 //!
 //! The player scans the read-only filesystem for supported media, decodes
-//! frames with `feos-video`, and provides a VLC-inspired interface: menus,
-//! transport controls, a seek bar, playlist, fullscreen mode, aspect modes,
-//! media information and keyboard/mouse control.
+//! frames with `feos-video`, and provides menus, transport controls, a seek
+//! bar, playlist, fullscreen mode, aspect modes, media information and
+//! keyboard/mouse control.
 //!
-//! H.264 containers use `feos-h264`, which needs `alloc`; the kernel's static
-//! first-fit heap makes that possible. GIF, MJPEG, uncompressed and RLE video
-//! decode without additional allocations.
+//! One [`VideoDecoder`] holds a file's sample table and codec state, so showing
+//! the next frame costs one frame. Decoding still runs on the compositor
+//! thread, so a tick decodes a bounded number of samples and a long seek is
+//! spread across ticks. The frame clock holds while the decoder catches up, so
+//! a slow machine plays slowly rather than dropping frames it must decode anyway.
+//! All buffers here are allocated fallibly: exhausting the heap would be fatal.
 
 use core::fmt::Write;
 
@@ -26,8 +29,8 @@ use feos_keys::SerialKeys;
 use feos_sync::SpinLock;
 use feos_text::Text;
 use feos_video::{
-    decode_frame as decode_video_frame, info as video_info, scratch_len, ContainerFormat,
-    VideoError, VideoInfo,
+    info as video_info, ContainerFormat, DecodedFrame, DecoderLimits, VideoDecoder, VideoError,
+    VideoInfo,
 };
 
 use crate::files::format_size;
@@ -35,8 +38,27 @@ use crate::files::format_size;
 const MAX_PLAYLIST: usize = 64;
 const MAX_OPEN: usize = 128;
 const MAX_PATH: usize = 256;
-const MAX_MEDIA_BYTES: usize = 4 * 1024 * 1024;
-const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
+/// Largest file the player reads into memory.
+const MAX_MEDIA_BYTES: usize = 16 * 1024 * 1024;
+/// Largest decoded frame: 1920x1088 in RGBA.
+const MAX_FRAME_BYTES: usize = 1920 * 1088 * 4;
+/// Limits for the decoder, within the 64 MiB kernel heap that also holds the
+/// file and frame above. Level-based reference counts for 1080p fit in this.
+const DECODER_LIMITS: DecoderLimits = DecoderLimits {
+    max_frames: 1 << 18,
+    max_width: 4096,
+    max_height: 4096,
+    max_memory: 40 * 1024 * 1024,
+};
+/// Samples decoded per tick while playing or catching up to a seek.
+const TICK_SAMPLES: u32 = 4;
+/// Longest time one tick advances the clock. A window that was hidden, or a
+/// slow frame, then doesn't jump the video forward.
+const MAX_TICK_MS: u64 = 250;
+/// How long a click on the video waits to see if it's a double-click.
+const DOUBLE_CLICK_MS: u64 = 420;
+/// Rate assumed for a video with no frame times.
+const DEFAULT_FPS: u32 = 25;
 const PLAYLIST_WIDTH: i32 = 300;
 const TITLE_HEIGHT: i32 = 30;
 const MENU_HEIGHT: i32 = 22;
@@ -60,6 +82,56 @@ const VIDEO_BG: Color = Color::BLACK;
 const HOVER: Color = Color::rgb(60, 60, 60);
 const ERROR: Color = Color::rgb(255, 112, 112);
 
+/// Details of a file for the information dialog, without opening it for play.
+struct Preview {
+    name: Text<96>,
+    path: Text<MAX_PATH>,
+    size: usize,
+    info: Option<VideoInfo>,
+}
+
+/// Reads a file's details for the information dialog.
+fn preview_of(fs: &dyn FileSystem, node: NodeId) -> Preview {
+    let mut name = Text::new();
+    name.set(fs.name(node).unwrap_or("?"));
+    let mut path = Text::new();
+    let mut path_buffer = [0u8; MAX_PATH];
+    path.set(fs.path(node, &mut path_buffer).unwrap_or("/"));
+    let size = fs.size(node);
+    let info = read_file(fs, node, size).and_then(|data| video_info(&data).ok());
+    Preview {
+        name,
+        path,
+        size,
+        info,
+    }
+}
+
+/// Reads a whole file, or returns `None` if it's too large or memory is short.
+fn read_file(fs: &dyn FileSystem, node: NodeId, size: usize) -> Option<Vec<u8>> {
+    if size == 0 || size > MAX_MEDIA_BYTES {
+        return None;
+    }
+    let mut data = zeroed(size)?;
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let read = fs.read(node, offset, &mut data[offset..]);
+        if read == 0 {
+            break;
+        }
+        offset += read;
+    }
+    data.truncate(offset);
+    Some(data)
+}
+
+fn zeroed(len: usize) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len).ok()?;
+    bytes.resize(len, 0);
+    Some(bytes)
+}
+
 /// The video player application.
 pub struct Player;
 
@@ -69,6 +141,7 @@ impl App for Player {
     }
 
     fn aliases(&self) -> &'static [&'static str] {
+        // `vlc` stays as a command alias for existing scripts.
         &["vlc", "video", "media", "media-player", "movies"]
     }
 
@@ -77,7 +150,7 @@ impl App for Player {
     }
 
     fn description(&self) -> &'static str {
-        "play video files with a VLC-style media player"
+        "play video files with FEOS Media Player"
     }
 
     fn foreground(&self) -> bool {
@@ -215,6 +288,10 @@ enum Action {
     Open,
     Quit,
     PlayPause,
+    /// Opens the playlist entry a context menu was opened on.
+    PlayItem,
+    /// Shows information for the playlist entry a context menu was opened on.
+    ItemInfo,
     PlayAll,
     Stop,
     Previous,
@@ -381,8 +458,8 @@ const CONTEXT_VIDEO: &[MenuItem] = &[
 ];
 
 const CONTEXT_PLAYLIST: &[MenuItem] = &[
-    item("Play", "Enter", Action::PlayPause),
-    item("Media Information", "I", Action::MediaInfo),
+    item("Play", "Enter", Action::PlayItem),
+    item("Media Information", "I", Action::ItemInfo),
     item("Remove from Playlist", "Del", Action::Remove),
 ];
 
@@ -454,7 +531,17 @@ struct PlayerState {
     frame_height: u32,
     frame_index: u32,
     frame_count: u32,
-    frame_delay: u32,
+    /// The open file and its decoding state.
+    decoder: Option<VideoDecoder<Vec<u8>>>,
+    /// A frame the display is waiting for. The clock holds until it arrives.
+    pending_frame: Option<u32>,
+    /// Whether any frame of this file has decoded yet.
+    has_frame: bool,
+    /// When a click on the video will take effect, unless a second click turns
+    /// it into a double-click.
+    pending_click: Option<u64>,
+    /// What the information dialog shows, if not the current file.
+    preview: Option<Preview>,
     fps_num: u32,
     fps_den: u32,
     duration_ms: u64,
@@ -490,7 +577,6 @@ struct PlayerState {
     resume_after_seek: bool,
     last_click_ms: u64,
     last_click_index: Option<usize>,
-    last_video_click_ms: u64,
     last_open_click_ms: u64,
     last_open_index: Option<usize>,
     osd: Text<96>,
@@ -520,9 +606,13 @@ impl PlayerState {
             frame_height: 0,
             frame_index: 0,
             frame_count: 0,
-            frame_delay: 0,
-            fps_num: 10,
+            fps_num: DEFAULT_FPS,
             fps_den: 1,
+            decoder: None,
+            pending_frame: None,
+            has_frame: false,
+            pending_click: None,
+            preview: None,
             duration_ms: 0,
             position_ms: 0,
             playing: false,
@@ -555,7 +645,6 @@ impl PlayerState {
             resume_after_seek: false,
             last_click_ms: 0,
             last_click_index: None,
-            last_video_click_ms: 0,
             last_open_click_ms: 0,
             last_open_index: None,
             osd: Text::new(),
@@ -633,64 +722,32 @@ impl PlayerState {
             .set(fs.path(node, &mut path_buffer).unwrap_or("/"));
         self.media_size = fs.size(node);
         self.error.clear();
-        self.info = None;
-        self.data.clear();
-        self.rgba.clear();
-        self.scratch.clear();
-        self.frame_width = 0;
-        self.frame_height = 0;
-        self.frame_index = 0;
-        self.frame_count = 0;
-        self.frame_delay = 0;
-        self.duration_ms = 0;
+        self.reset_media();
         self.position_ms = 0;
         self.ended = false;
         self.playing = false;
         self.last_tick = now;
 
         if self.media_size > MAX_MEDIA_BYTES {
-            self.fail_open("File is too large for the player buffer.", now);
+            self.fail_open("The file is larger than the player's 16 MiB limit.", now);
             return;
         }
         if self.media_size == 0 {
             self.fail_open("The file is empty.", now);
             return;
         }
-        let mut data = vec![0u8; self.media_size];
-        let mut offset = 0usize;
-        while offset < data.len() {
-            let read = fs.read(node, offset, &mut data[offset..]);
-            if read == 0 {
-                break;
-            }
-            offset += read;
-        }
-        data.truncate(offset);
-        if data.is_empty() {
+        let Some(data) = read_file(fs, node, self.media_size).filter(|data| !data.is_empty())
+        else {
             self.fail_open("The file could not be read.", now);
             return;
-        }
-        self.data = data;
+        };
 
-        match video_info(&self.data) {
+        match video_info(&data) {
             Ok(info) => {
                 self.info = Some(info);
                 self.frame_count = info.frame_count;
                 self.frame_width = info.width;
                 self.frame_height = info.height;
-                if let Some((num, den)) = info.frame_rate {
-                    if num > 0 && den > 0 {
-                        self.fps_num = num;
-                        self.fps_den = den;
-                    }
-                }
-                self.duration_ms = info.duration_ms().unwrap_or_else(|| {
-                    if info.frame_count > 0 {
-                        info.frame_count as u64 * 1000 * self.fps_den as u64 / self.fps_num as u64
-                    } else {
-                        0
-                    }
-                });
                 if !info.can_decode() {
                     self.fail_open("The codec is recognised but cannot be decoded here.", now);
                     return;
@@ -700,20 +757,41 @@ impl PlayerState {
                     return;
                 };
                 if rgba_len > MAX_FRAME_BYTES {
-                    self.fail_open("The decoded frame is too large for the video heap.", now);
+                    self.fail_open("The video is larger than the player's 1080p limit.", now);
                     return;
                 }
-                let Ok(scratch) = scratch_len(&self.data) else {
-                    self.fail_open("Invalid video data.", now);
+                let decoder = match VideoDecoder::with_limits(data, DECODER_LIMITS) {
+                    Ok(decoder) => decoder,
+                    Err(error) => {
+                        let mut text = Text::<160>::new();
+                        let _ = write!(text, "Unsupported media: {error}");
+                        self.fail_open(text.as_str(), now);
+                        return;
+                    }
+                };
+                let Some(rgba) = zeroed(rgba_len) else {
+                    self.fail_open("Not enough memory for the video frame.", now);
                     return;
                 };
-                self.rgba = vec![0u8; rgba_len];
-                self.scratch = vec![0u8; scratch];
+                self.rgba = rgba;
+                self.frame_count = decoder.frame_count();
+                self.duration_ms = decoder.duration_ms();
+                // Each file sets its own rate: the status line must not show the
+                // rate of whatever played before.
+                match (info.frame_rate, self.frame_count as u64 * 1000) {
+                    (Some((num, den)), _) if num > 0 && den > 0 => {
+                        self.fps_num = num;
+                        self.fps_den = den;
+                    }
+                    (_, frames) if frames > 0 && frames <= u32::MAX as u64 => {
+                        self.fps_num = frames as u32;
+                        self.fps_den = self.duration_ms.clamp(1, u32::MAX as u64) as u32;
+                    }
+                    _ => {}
+                }
+                self.decoder = Some(decoder);
                 self.playing = play;
                 if !self.decode_current() {
-                    self.playing = false;
-                }
-                if play && !self.error.is_empty() {
                     self.playing = false;
                 }
             }
@@ -731,72 +809,119 @@ impl PlayerState {
         }
     }
 
+    /// Forgets the open file and everything derived from it.
+    fn reset_media(&mut self) {
+        self.info = None;
+        self.decoder = None;
+        self.rgba = Vec::new();
+        self.frame_width = 0;
+        self.frame_height = 0;
+        self.frame_index = 0;
+        self.frame_count = 0;
+        self.fps_num = DEFAULT_FPS;
+        self.fps_den = 1;
+        self.duration_ms = 0;
+        self.pending_frame = None;
+        self.has_frame = false;
+    }
+
     fn fail_open(&mut self, message: &str, now: u64) {
         self.error.set(message);
         self.playing = false;
         self.set_notice("Playback Error", message, now);
     }
 
+    /// Decodes the frame at `frame_index`, however long that takes.
     fn decode_current(&mut self) -> bool {
-        if self.data.is_empty() || self.rgba.is_empty() {
+        self.pending_frame = Some(self.frame_index);
+        self.service_pending(u32::MAX)
+    }
+
+    /// Works towards the pending frame, decoding at most `budget` samples.
+    /// Returns true if a new frame is ready to show.
+    fn service_pending(&mut self, budget: u32) -> bool {
+        let Some(target) = self.pending_frame else {
             return false;
-        }
-        let result = decode_video_frame(
-            &self.data,
-            self.frame_index,
-            &mut self.rgba,
-            &mut self.scratch,
-        );
-        match result {
-            Ok(frame) => {
-                self.frame_width = frame.width;
-                self.frame_height = frame.height;
-                self.frame_delay = frame.delay_ms;
-                self.error.clear();
+        };
+        let Some(decoder) = self.decoder.as_mut() else {
+            self.pending_frame = None;
+            return false;
+        };
+        match decoder.advance(target, &mut self.rgba, budget) {
+            Ok(Some(frame)) => {
+                self.show_frame(frame);
                 true
             }
+            Ok(None) => false,
             Err(VideoError::FrameOutOfRange { .. }) => {
+                self.pending_frame = None;
                 self.ended = true;
                 self.playing = false;
-                if self.duration_ms == 0 {
-                    self.position_ms = 0;
-                } else {
-                    self.position_ms = self.duration_ms;
+                self.position_ms = self.duration_ms;
+                false
+            }
+            // A frame can be larger than the file's first one said. The decoder
+            // holds it, so ask again once the buffer fits.
+            Err(VideoError::BufferTooSmall { required, .. })
+                if required <= MAX_FRAME_BYTES && required > self.rgba.len() =>
+            {
+                match zeroed(required) {
+                    Some(rgba) => {
+                        self.rgba = rgba;
+                        self.service_pending(budget)
+                    }
+                    None => {
+                        self.stop_with_error(VideoError::OutOfMemory);
+                        false
+                    }
+                }
+            }
+            Err(error) if error.is_fatal() || matches!(error, VideoError::BufferTooSmall { .. }) => {
+                self.stop_with_error(error);
+                false
+            }
+            // One damaged frame: keep what's on screen and carry on.
+            Err(error) => {
+                self.pending_frame = None;
+                self.frame_index = target;
+                if !self.has_frame {
+                    let mut text = Text::<160>::new();
+                    let _ = write!(text, "Playback error: {error}");
+                    self.error = text;
                 }
                 false
             }
-            Err(error) => {
-                let mut text = Text::<160>::new();
-                let _ = write!(text, "Playback error: {error}");
-                self.error = text;
-                self.playing = false;
-                false
-            }
         }
+    }
+
+    fn show_frame(&mut self, frame: DecodedFrame) {
+        self.pending_frame = None;
+        self.has_frame = true;
+        self.frame_index = frame.index;
+        self.frame_width = frame.width;
+        self.frame_height = frame.height;
+        self.error.clear();
+    }
+
+    fn stop_with_error(&mut self, error: VideoError) {
+        let mut text = Text::<160>::new();
+        let _ = write!(text, "Playback error: {error}");
+        self.error = text;
+        self.pending_frame = None;
+        self.playing = false;
     }
 
     fn frame_for_position(&self) -> u32 {
-        let frames = if self.frame_count > 0 {
-            self.frame_count as u64
-        } else {
-            u64::MAX
-        };
-        let value = (self.position_ms as u128)
-            .saturating_mul(self.fps_num as u128)
-            .saturating_div((self.fps_den as u128).saturating_mul(1000));
-        let frame = value.min(u32::MAX as u128) as u32;
-        if self.frame_count > 0 {
-            frame.min(self.frame_count.saturating_sub(1).max(0))
-        } else {
-            (frame as u64).min(frames.saturating_sub(1)) as u32
-        }
+        self.decoder
+            .as_ref()
+            .map_or(0, |decoder| decoder.frame_at_time(self.position_ms))
     }
 
     fn position_for_frame(&self, frame: u32) -> u64 {
-        (frame as u64)
-            .saturating_mul(1000)
-            .saturating_mul(self.fps_den as u64)
-            / self.fps_num.max(1) as u64
+        self.decoder
+            .as_ref()
+            .and_then(|decoder| decoder.frame_time_ms(frame))
+            .unwrap_or(0)
     }
 
     fn tick(&mut self, fs: &dyn FileSystem, now: u64) -> bool {
@@ -806,24 +931,36 @@ impl PlayerState {
             self.osd_until = 0;
             changed = true;
         }
-        if !self.playing {
-            self.last_tick = now;
-            return changed;
+        if let Some(at) = self.pending_click {
+            if now >= at {
+                self.pending_click = None;
+                let _ = self.toggle_play(fs, now);
+                changed = true;
+            }
         }
+        changed |= self.service_pending(TICK_SAMPLES);
         let elapsed = now.saturating_sub(self.last_tick);
         self.last_tick = now;
-        if elapsed == 0 {
+        if !self.playing {
+            return changed;
+        }
+        // The decoder is behind: hold the clock, because it would have to decode
+        // the frames in between anyway.
+        if self.pending_frame.is_some() || elapsed == 0 {
             return changed;
         }
         self.position_ms = self
             .position_ms
-            .saturating_add((elapsed as f64 * self.speed as f64) as u64);
+            .saturating_add((elapsed.min(MAX_TICK_MS) as f64 * self.speed as f64) as u64);
         let target = self.frame_for_position();
         if target != self.frame_index {
-            self.frame_index = target;
-            changed |= self.decode_current();
+            self.pending_frame = Some(target);
+            changed |= self.service_pending(TICK_SAMPLES);
         }
-        if self.duration_ms > 0 && self.position_ms >= self.duration_ms {
+        if self.pending_frame.is_none()
+            && self.duration_ms > 0
+            && self.position_ms >= self.duration_ms
+        {
             changed |= self.handle_end(fs, now);
         }
         changed
@@ -862,6 +999,12 @@ impl PlayerState {
             self.playing = false;
             self.show_osd("Paused", now);
         } else {
+            // A file that didn't open has nothing to play: don't run the clock
+            // over a black picture.
+            if self.decoder.is_none() || (!self.has_frame && !self.error.is_empty()) {
+                self.show_osd("Cannot play this file", now);
+                return true;
+            }
             if self.ended || (self.duration_ms > 0 && self.position_ms >= self.duration_ms) {
                 self.seek_to(0, now);
             }
@@ -879,7 +1022,7 @@ impl PlayerState {
         self.ended = false;
         self.position_ms = 0;
         self.frame_index = 0;
-        if !self.rgba.is_empty() {
+        if self.decoder.is_some() {
             self.decode_current();
         }
         self.show_osd("Stopped", now);
@@ -887,13 +1030,14 @@ impl PlayerState {
     }
 
     fn seek_to(&mut self, position: u64, now: u64) {
-        if self.duration_ms == 0 || self.data.is_empty() {
+        if self.duration_ms == 0 || self.decoder.is_none() {
             return;
         }
         self.position_ms = position.min(self.duration_ms);
-        self.frame_index = self.frame_for_position();
+        // Frames arrive over the next ticks if this is far from a key frame.
+        self.pending_frame = Some(self.frame_for_position());
         self.ended = false;
-        self.decode_current();
+        self.service_pending(TICK_SAMPLES);
         self.last_tick = now;
         self.show_osd_time(self.position_ms, now);
     }
@@ -919,7 +1063,7 @@ impl PlayerState {
     }
 
     fn step_frame(&mut self, delta: i64, now: u64) {
-        if self.data.is_empty() {
+        if self.decoder.is_none() || self.frame_count == 0 {
             return;
         }
         self.playing = false;
@@ -928,12 +1072,11 @@ impl PlayerState {
         } else {
             self.frame_index.saturating_add(delta as u32)
         };
-        self.frame_index = frame;
-        self.position_ms = self.position_for_frame(frame).min(self.duration_ms);
-        if !self.decode_current() && self.frame_index > 0 {
-            self.frame_index = self.frame_index.saturating_sub(1);
-            self.decode_current();
-        }
+        self.frame_index = frame.min(self.frame_count - 1);
+        self.decode_current();
+        self.position_ms = self
+            .position_for_frame(self.frame_index)
+            .min(self.duration_ms);
         self.last_tick = now;
         self.show_osd("Frame step", now);
     }
@@ -1049,10 +1192,7 @@ impl PlayerState {
         self.playlist_scroll = 0;
         self.stop(now);
         self.current = None;
-        self.info = None;
-        self.data.clear();
-        self.rgba.clear();
-        self.scratch.clear();
+        self.reset_media();
         self.media_name.clear();
         self.media_path.clear();
         self.show_osd("Playlist cleared", now);
@@ -1149,6 +1289,7 @@ impl PlayerState {
             Action::None => false,
             Action::Open | Action::Quit | Action::TogglePlaylist | Action::Fullscreen => true,
             Action::PlayPause => self.current.is_some() || self.playlist_len > 0,
+            Action::PlayItem | Action::ItemInfo => true,
             Action::PlayAll => self.playlist_len > 0,
             Action::Stop | Action::SeekForward | Action::SeekBack | Action::MediaInfo => {
                 self.current.is_some()
@@ -1262,7 +1403,25 @@ impl PlayerState {
             Action::ToggleShuffle => self.toggle_shuffle(now),
             Action::MediaInfo => {
                 if self.current.is_some() {
+                    self.preview = None;
                     self.dialog = Dialog::Info;
+                }
+            }
+            Action::PlayItem => {
+                if let Some(ContextKind::Playlist(index)) = context {
+                    if index < self.playlist_len {
+                        let node = self.playlist[index];
+                        self.open_node(fs, node, now, true);
+                    }
+                }
+            }
+            Action::ItemInfo => {
+                if let Some(ContextKind::Playlist(index)) = context {
+                    if index < self.playlist_len {
+                        let node = self.playlist[index];
+                        self.preview = (self.current != Some(node)).then(|| preview_of(fs, node));
+                        self.dialog = Dialog::Info;
+                    }
                 }
             }
             Action::Remove => {
@@ -1563,15 +1722,19 @@ impl PlayerState {
 
         if layout.video.contains(point) {
             self.focus = Focus::Video;
-            let double = now.saturating_sub(self.last_video_click_ms) < 420;
-            self.last_video_click_ms = now;
-            if double {
-                self.toggle_fullscreen(now);
-            } else {
-                let _ = self.toggle_play(fs, now);
-            }
+            self.click_video(now);
         }
         false
+    }
+
+    /// A click on the video waits to take effect: a double-click is for
+    /// fullscreen only, and must not also pause.
+    fn click_video(&mut self, now: u64) {
+        if self.pending_click.take().is_some() {
+            self.toggle_fullscreen(now);
+        } else {
+            self.pending_click = Some(now + DOUBLE_CLICK_MS);
+        }
     }
 
     fn pause_for_seek(&mut self, now: u64) {
@@ -1775,8 +1938,9 @@ impl PlayerState {
         }
 
         if self.focus == Focus::Playlist {
-            self.playlist_key(fs, key, modifiers, now);
-            return false;
+            if self.playlist_key(fs, key, modifiers, now) {
+                return false;
+            }
         }
 
         match key {
@@ -1861,7 +2025,9 @@ impl PlayerState {
         false
     }
 
-    fn playlist_key(&mut self, fs: &dyn FileSystem, key: Key, modifiers: Modifiers, now: u64) {
+    /// Handles a key while the playlist has focus. Returns false for keys it
+    /// doesn't use, which then work as they do anywhere else.
+    fn playlist_key(&mut self, fs: &dyn FileSystem, key: Key, modifiers: Modifiers, now: u64) -> bool {
         let rows = Layout::compute(self, now)
             .playlist
             .map(playlist_visible_rows)
@@ -1905,8 +2071,9 @@ impl PlayerState {
                 }
             }
             Key::Escape => self.focus = Focus::Video,
-            _ => {}
+            _ => return false,
         }
+        true
     }
 
     fn ensure_playlist_visible(&mut self, rows: usize) {
@@ -2408,7 +2575,7 @@ fn open_row_at(state: &PlayerState, layout: DialogLayout, point: Point) -> Optio
     }
 }
 
-/// Runs the VLC-style player.
+/// Runs FEOS Media Player.
 /// State of a media player hosted inside a desktop window.
 static WINDOW: SpinLock<Option<PlayerState>> = SpinLock::new(None);
 
@@ -2655,15 +2822,15 @@ fn draw_title_bar(painter: &mut Painter<'_, '_>, state: &PlayerState, layout: La
         ),
         ORANGE,
     );
-    draw_cone(
+    draw_logo(
         painter,
         Rect::new(layout.title.x + 8, layout.title.y + 6, 18, 18),
     );
     let mut title = Text::<120>::new();
     if state.current.is_some() {
-        let _ = write!(title, "{} - VLC media player", state.media_name.as_str());
+        let _ = write!(title, "{} - FEOS Media Player", state.media_name.as_str());
     } else {
-        title.set("VLC media player - feos");
+        title.set("FEOS Media Player");
     }
     painter.draw_text_ellipsis(
         Rect::new(
@@ -2852,22 +3019,32 @@ fn draw_video(painter: &mut Painter<'_, '_>, state: &mut PlayerState, layout: La
         return;
     }
     if !state.rgba.is_empty() && state.frame_width > 0 && state.frame_height > 0 {
-        let (dest, sx, sy, sw, sh) = video_destination(
-            layout.video,
-            state.frame_width,
-            state.frame_height,
-            state.aspect,
+        let frame = FrameLayout {
+            width: state.frame_width,
+            height: state.frame_height,
+            rotation: state.info.map_or(0, |info| info.display.rotation),
+        };
+        let (rotated_width, rotated_height) = frame.rotated_size();
+        // The aspect ratio decides the shape on screen. The crop it returns is in
+        // those display units, and blitting needs it in rotated frame pixels.
+        let (display_width, display_height) = state.info.map_or(
+            (rotated_width, rotated_height),
+            |info| info.display_size(),
         );
+        let (dest, sx, sy, sw, sh) =
+            video_destination(layout.video, display_width, display_height, state.aspect);
+        let scale = |value: u32, full: u32, display: u32| -> u32 {
+            (value as u64 * full as u64 / display.max(1) as u64) as u32
+        };
         blit_rgba(
             painter.canvas_mut(),
             dest,
-            state.frame_width,
-            state.frame_height,
+            frame,
             &state.rgba,
-            sx,
-            sy,
-            sw,
-            sh,
+            scale(sx, rotated_width, display_width),
+            scale(sy, rotated_height, display_height),
+            scale(sw, rotated_width, display_width).max(1),
+            scale(sh, rotated_height, display_height).max(1),
         );
     }
     if !state.error.is_empty() {
@@ -2950,7 +3127,7 @@ fn draw_no_media(painter: &mut Painter<'_, '_>, rect: Rect) {
         96,
         96,
     );
-    draw_cone(painter, cone);
+    draw_logo(painter, cone);
     painter.draw_text_centered(
         Rect::new(rect.x, cone.bottom_i32() + 20, rect.width, 24),
         "No media loaded",
@@ -3097,7 +3274,7 @@ fn draw_status_bar(painter: &mut Painter<'_, '_>, state: &PlayerState, layout: L
         if fps.is_empty() {
             let _ = write!(
                 fps,
-                "{:.1} fps (default)",
+                "{:.1} fps (average)",
                 state.fps_num as f64 / state.fps_den.max(1) as f64
             );
         }
@@ -3489,7 +3666,7 @@ fn draw_dialog(
             title.set("Media Information");
         }
         Dialog::About => {
-            title.set("About VLC media player");
+            title.set("About FEOS Media Player");
         }
         Dialog::Help => {
             title.set("Keyboard Shortcuts");
@@ -3618,10 +3795,16 @@ fn draw_open_dialog(
 
 fn draw_info_dialog(painter: &mut Painter<'_, '_>, state: &PlayerState, layout: DialogLayout) {
     let body = layout.body;
-    draw_cone(painter, Rect::new(body.x + 8, body.y + 4, 42, 42));
+    // A playlist entry other than the current file, or the current file.
+    let preview = state.preview.as_ref();
+    let info = preview.map_or(state.info, |preview| preview.info);
+    let name = preview.map_or(state.media_name.as_str(), |preview| preview.name.as_str());
+    let path = preview.map_or(state.media_path.as_str(), |preview| preview.path.as_str());
+    let media_size = preview.map_or(state.media_size, |preview| preview.size);
+    draw_logo(painter, Rect::new(body.x + 8, body.y + 4, 42, 42));
     painter.draw_text_ellipsis(
         Rect::new(body.x + 62, body.y + 2, body.width.saturating_sub(68), 24),
-        state.media_name.as_str(),
+        name,
         TEXT,
         2,
         Align::Start,
@@ -3629,14 +3812,14 @@ fn draw_info_dialog(painter: &mut Painter<'_, '_>, state: &PlayerState, layout: 
     );
     painter.draw_text_ellipsis(
         Rect::new(body.x + 62, body.y + 27, body.width.saturating_sub(68), 16),
-        state.media_path.as_str(),
+        path,
         MUTED,
         1,
         Align::Start,
         VerticalAlign::Middle,
     );
     let mut y = body.y + 58;
-    if let Some(info) = state.info {
+    if let Some(info) = info {
         property(
             painter,
             body.x + 4,
@@ -3651,23 +3834,39 @@ fn draw_info_dialog(painter: &mut Painter<'_, '_>, state: &PlayerState, layout: 
         let _ = write!(dimensions, "{} x {}", info.width, info.height);
         property(painter, body.x + 4, y, "Dimensions", dimensions.as_str());
         y += 20;
+        let (shown_width, shown_height) = info.display_size();
+        if (shown_width, shown_height) != (info.width, info.height) {
+            let mut shown = Text::<48>::new();
+            let _ = write!(
+                shown,
+                "{} x {}, rotated {}",
+                shown_width, shown_height, info.display.rotation
+            );
+            property(painter, body.x + 4, y, "Display", shown.as_str());
+            y += 20;
+        }
         let mut frames = Text::<48>::new();
         let _ = write!(frames, "{}", info.frame_count);
         property(painter, body.x + 4, y, "Frames", frames.as_str());
         y += 20;
         let mut fps = format_fps(&info);
-        if fps.is_empty() {
+        if fps.is_empty() && preview.is_none() {
             let _ = write!(
                 fps,
-                "{:.1} fps (default)",
+                "{:.1} fps (average)",
                 state.fps_num as f64 / state.fps_den.max(1) as f64
             );
         }
         property(painter, body.x + 4, y, "Frame rate", fps.as_str());
         y += 20;
         let mut duration = Text::<24>::new();
-        if state.duration_ms > 0 {
-            format_time(state.duration_ms, &mut duration);
+        let duration_ms = if preview.is_some() {
+            info.duration_ms().unwrap_or(0)
+        } else {
+            state.duration_ms
+        };
+        if duration_ms > 0 {
+            format_time(duration_ms, &mut duration);
         } else {
             duration.set("unknown");
         }
@@ -3692,7 +3891,7 @@ fn draw_info_dialog(painter: &mut Painter<'_, '_>, state: &PlayerState, layout: 
         y += 20;
     }
     let mut size = Text::<48>::new();
-    let _ = write!(size, "{}", format_size(state.media_size).as_str());
+    let _ = write!(size, "{}", format_size(media_size).as_str());
     property(painter, body.x + 4, y, "File size", size.as_str());
     y += 20;
     property(painter, body.x + 4, y, "Aspect", state.aspect.label());
@@ -3729,8 +3928,8 @@ fn property(painter: &mut Painter<'_, '_>, x: i32, y: i32, label: &str, value: &
 
 fn draw_about_dialog(painter: &mut Painter<'_, '_>, layout: DialogLayout) {
     let body = layout.body;
-    draw_cone(painter, Rect::new(body.x + 10, body.y + 8, 62, 62));
-    painter.draw_text(body.x + 90, body.y + 8, "VLC media player", ORANGE, 2);
+    draw_logo(painter, Rect::new(body.x + 10, body.y + 8, 62, 62));
+    painter.draw_text(body.x + 90, body.y + 8, "FEOS Media Player", ORANGE, 2);
     painter.draw_text(body.x + 90, body.y + 32, "for feos", TEXT, 1);
     painter.draw_text(
         body.x + 8,
@@ -3959,11 +4158,43 @@ fn video_destination(
     }
 }
 
+/// How a frame maps onto the display: its pixel size and clockwise rotation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FrameLayout {
+    width: u32,
+    height: u32,
+    rotation: u16,
+}
+
+impl FrameLayout {
+    /// The frame's size once rotated, which is what crops are measured in.
+    fn rotated_size(self) -> (u32, u32) {
+        if self.rotation % 180 == 90 {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
+        }
+    }
+
+    /// For rotated-frame row `v`: byte offset of its column 0, and bytes to step
+    /// per column.
+    fn row(self, v: u32) -> (i64, i64) {
+        let w = self.width as i64;
+        let h = self.height as i64;
+        let v = v as i64;
+        match self.rotation {
+            90 => (((h - 1) * w + v) * 4, -w * 4),
+            180 => (((h - 1 - v) * w + w - 1) * 4, -4),
+            270 => ((w - 1 - v) * 4, w * 4),
+            _ => (v * w * 4, 4),
+        }
+    }
+}
+
 fn blit_rgba<'a>(
     canvas: &mut Canvas<'a>,
     dest: Rect,
-    frame_width: u32,
-    frame_height: u32,
+    frame: FrameLayout,
     rgba: &[u8],
     sx: u32,
     sy: u32,
@@ -3986,69 +4217,53 @@ fn blit_rgba<'a>(
     let pixels = canvas.pixels_mut();
     let dest_width = dest.width.max(1);
     let dest_height = dest.height.max(1);
+    // The source column advances by a whole step and a remainder per pixel, so
+    // the row loop needs no division.
+    let step = (sw / dest_width) as i64;
+    let remainder = (sw % dest_width) as u64;
+    let start = (x0 - dest.x) as u64;
+    let first_column = start * sw as u64 / dest_width as u64;
+    let first_error = start * sw as u64 % dest_width as u64;
     for py in y0..y1 {
         let dy = (py - dest.y) as u32;
         let source_y = sy
             + (dy as u64 * sh as u64 / dest_height as u64).min(sh.saturating_sub(1) as u64) as u32;
-        let row = source_y * frame_width;
-        for px in x0..x1 {
-            let dx = (px - dest.x) as u32;
-            let source_x = sx
-                + (dx as u64 * sw as u64 / dest_width as u64).min(sw.saturating_sub(1) as u64)
-                    as u32;
-            let index = ((row + source_x) * 4) as usize;
-            if index + 3 < rgba.len() {
-                let r = rgba[index] as u32;
-                let g = rgba[index + 1] as u32;
-                let b = rgba[index + 2] as u32;
-                pixels[py as usize * stride + px as usize] = (r << 16) | (g << 8) | b;
+        let (row_start, column_step) = frame.row(source_y);
+        let mut column = sx as i64 + first_column as i64;
+        let mut error = first_error;
+        let row = &mut pixels[py as usize * stride + x0 as usize..py as usize * stride + x1 as usize];
+        for pixel in row.iter_mut() {
+            let index = row_start + column * column_step;
+            if let Some(source) = usize::try_from(index)
+                .ok()
+                .and_then(|index| rgba.get(index..index + 3))
+            {
+                *pixel = ((source[0] as u32) << 16) | ((source[1] as u32) << 8) | source[2] as u32;
+            }
+            column += step;
+            error += remainder;
+            if error >= dest_width as u64 {
+                error -= dest_width as u64;
+                column += 1;
             }
         }
     }
-    let _ = frame_height;
 }
 
-fn draw_cone(painter: &mut Painter<'_, '_>, rect: Rect) {
+/// The player's logo: a screen with a play triangle.
+fn draw_logo(painter: &mut Painter<'_, '_>, rect: Rect) {
     if rect.width < 6 || rect.height < 6 {
         return;
     }
     let w = rect.width as i32;
     let h = rect.height as i32;
-    let base = Rect::new(
-        rect.x + w / 8,
-        rect.bottom_i32() - h / 5,
-        (w * 3 / 4) as u32,
-        (h / 5) as u32,
-    );
-    painter.fill_rounded_rect(base, 2, ORANGE_DARK);
-    let body = [
-        Point::new(rect.x + w / 3, rect.y + h / 8),
-        Point::new(rect.x + w * 2 / 3, rect.y + h / 8),
-        Point::new(rect.x + w * 7 / 8, base.y),
-        Point::new(rect.x + w / 8, base.y),
+    painter.fill_rounded_rect(rect, 3, ORANGE);
+    let triangle = [
+        Point::new(rect.x + w * 3 / 8, rect.y + h / 4),
+        Point::new(rect.x + w * 3 / 4, rect.y + h / 2),
+        Point::new(rect.x + w * 3 / 8, rect.y + h * 3 / 4),
     ];
-    painter.fill_polygon(&body, ORANGE);
-    for band in 0..2 {
-        let y = rect.y + h / 3 + band * (h / 6);
-        let t = (y - (rect.y + h / 8)) as f32 / (base.y - (rect.y + h / 8)).max(1) as f32;
-        let half = (w as f32 / 6.0) + (w as f32 / 3.0) * t;
-        let center = rect.x + w / 2;
-        painter.fill_rect(
-            Rect::new(
-                center - half as i32,
-                y,
-                (half * 2.0).max(1.0) as u32,
-                (h / 16).max(1) as u32,
-            ),
-            Color::rgb(255, 244, 220),
-        );
-    }
-    painter.fill_circle(
-        rect.x + w / 2,
-        rect.y + h / 8,
-        (w / 12).max(1) as u32,
-        ORANGE_LIGHT,
-    );
+    painter.fill_polygon(&triangle, Color::rgb(255, 244, 220));
 }
 
 fn draw_cursor(painter: &mut Painter<'_, '_>, x: i32, y: i32) {
@@ -4110,6 +4325,244 @@ mod tests {
         assert_eq!(text.as_str(), "01:05");
         format_time(3_723_000, &mut text);
         assert_eq!(text.as_str(), "1:02:03");
+    }
+
+    /// A flat filesystem of in-memory files. Node 0 is the root.
+    struct MockFs(&'static [(&'static str, &'static [u8])]);
+
+    impl FileSystem for MockFs {
+        fn node_count(&self) -> usize {
+            self.0.len() + 1
+        }
+        fn kind(&self, node: NodeId) -> Option<feos_fs::EntryKind> {
+            match node.0 as usize {
+                0 => Some(feos_fs::EntryKind::Directory),
+                n if n <= self.0.len() => Some(feos_fs::EntryKind::File),
+                _ => None,
+            }
+        }
+        fn name(&self, node: NodeId) -> Option<&str> {
+            match node.0 as usize {
+                0 => Some(""),
+                n => self.0.get(n - 1).map(|file| file.0),
+            }
+        }
+        fn parent(&self, node: NodeId) -> Option<NodeId> {
+            (node.0 != 0).then_some(NodeId::ROOT)
+        }
+        fn size(&self, node: NodeId) -> usize {
+            match node.0 as usize {
+                0 => 0,
+                n => self.0.get(n - 1).map_or(0, |file| file.1.len()),
+            }
+        }
+        fn read(&self, node: NodeId, offset: usize, out: &mut [u8]) -> usize {
+            let Some(file) = (node.0 as usize).checked_sub(1).and_then(|n| self.0.get(n)) else {
+                return 0;
+            };
+            let rest = file.1.get(offset..).unwrap_or(&[]);
+            let count = rest.len().min(out.len());
+            out[..count].copy_from_slice(&rest[..count]);
+            count
+        }
+        fn child_count(&self, node: NodeId) -> usize {
+            if node.0 == 0 {
+                self.0.len()
+            } else {
+                0
+            }
+        }
+        fn child_at(&self, node: NodeId, index: usize) -> Option<NodeId> {
+            (node.0 == 0 && index < self.0.len()).then(|| NodeId((index + 1) as u32))
+        }
+    }
+
+    static MEDIA: MockFs = MockFs(&[
+        (
+            "clip.mp4",
+            include_bytes!("../../../libs/video/tests/data/bframes.mp4"),
+        ),
+        (
+            "anim.gif",
+            include_bytes!("../../../libs/video/tests/data/anim.gif"),
+        ),
+        ("broken.mp4", b"\0\0\0\x08ftyp not a real file"),
+        (
+            "rotated.mp4",
+            include_bytes!("../../../libs/video/tests/data/rotated.mp4"),
+        ),
+    ]);
+
+    fn player() -> PlayerState {
+        PlayerState::new(&MEDIA, Rect::new(0, 0, 800, 600), "", 1000)
+    }
+
+    fn node(index: usize) -> NodeId {
+        NodeId((index + 1) as u32)
+    }
+
+    #[test]
+    fn opening_a_file_resets_the_frame_rate() {
+        // MED-16: a GIF played after a 30 fps MP4 ran at 30 fps.
+        let mut state = player();
+        state.open_node(&MEDIA, node(0), 1000, false);
+        assert_eq!((state.fps_num, state.fps_den), (10, 1));
+        state.open_node(&MEDIA, node(1), 1000, false);
+        assert_eq!(state.info.unwrap().frame_rate, None);
+        assert_ne!((state.fps_num, state.fps_den), (10, 1));
+    }
+
+    #[test]
+    fn frames_follow_their_presentation_times() {
+        let mut state = player();
+        state.open_node(&MEDIA, node(1), 1000, true);
+        let delay = state.decoder.as_ref().unwrap().frame_delay_ms(0) as u64;
+        assert!(delay > 0);
+        state.tick(&MEDIA, 1000 + delay - 1);
+        assert_eq!(state.frame_index, 0);
+        state.tick(&MEDIA, 1000 + delay);
+        assert_eq!(state.frame_index, 1);
+    }
+
+    #[test]
+    fn a_long_gap_between_ticks_does_not_jump_the_video() {
+        // MED-17: restoring a minimized window jumped forward.
+        let mut state = player();
+        state.open_node(&MEDIA, node(0), 1000, true);
+        state.tick(&MEDIA, 61_000);
+        assert!(state.position_ms <= MAX_TICK_MS);
+    }
+
+    #[test]
+    fn single_click_toggles_play_but_double_click_only_goes_fullscreen() {
+        // MED-25.
+        let mut state = player();
+        state.open_node(&MEDIA, node(0), 1000, true);
+        state.click_video(1000);
+        state.click_video(1100);
+        assert!(state.fullscreen);
+        assert!(state.playing);
+        state.tick(&MEDIA, 2000);
+        assert!(state.playing, "the first click must have been cancelled");
+
+        state.click_video(3000);
+        assert!(state.playing, "a click waits for a possible second one");
+        state.tick(&MEDIA, 3000 + DOUBLE_CLICK_MS);
+        assert!(!state.playing);
+    }
+
+    #[test]
+    fn playlist_context_menu_acts_on_the_clicked_entry() {
+        // MED-25.
+        let mut state = player();
+        let target = (0..state.playlist_len)
+            .find(|&index| state.playlist[index] == node(1))
+            .unwrap();
+        state.open_node(&MEDIA, node(0), 1000, false);
+
+        state.perform(&MEDIA, Action::ItemInfo, Some(ContextKind::Playlist(target)), 1000);
+        assert_eq!(state.current, Some(node(0)));
+        assert!(state.dialog == Dialog::Info);
+        let preview = state.preview.as_ref().unwrap();
+        assert_eq!(preview.name.as_str(), "anim.gif");
+        assert_eq!(preview.info.unwrap().codec, feos_video::Codec::Gif);
+        state.dialog = Dialog::None;
+
+        state.perform(&MEDIA, Action::PlayItem, Some(ContextKind::Playlist(target)), 1000);
+        assert_eq!(state.current, Some(node(1)));
+        assert!(state.playing);
+    }
+
+    #[test]
+    fn transport_keys_work_while_the_playlist_has_focus() {
+        // MED-25.
+        let mut state = player();
+        state.open_node(&MEDIA, node(0), 1000, false);
+        state.focus = Focus::Playlist;
+        let unused = state.playlist_key(&MEDIA, Key::Right, Modifiers::NONE, 1000);
+        assert!(!unused);
+        state.handle_key(&MEDIA, Key::Right, Modifiers::NONE, 1000);
+        assert_eq!(state.position_ms, state.duration_ms.min(5000));
+        assert!(state.playlist_key(&MEDIA, Key::Up, Modifiers::NONE, 1000));
+    }
+
+    #[test]
+    fn play_on_a_file_that_failed_to_open_does_nothing() {
+        // MED-25: it used to tick over black.
+        let mut state = player();
+        state.open_node(&MEDIA, node(2), 1000, false);
+        assert!(!state.error.is_empty());
+        state.toggle_play(&MEDIA, 1000);
+        assert!(!state.playing);
+        state.tick(&MEDIA, 2000);
+        assert_eq!(state.position_ms, 0);
+    }
+
+    #[test]
+    fn stepping_past_the_end_stays_on_the_last_frame() {
+        let mut state = player();
+        state.open_node(&MEDIA, node(0), 1000, false);
+        state.step_frame(100, 1000);
+        assert_eq!(state.frame_index, state.frame_count - 1);
+        assert!(state.error.is_empty());
+        state.step_frame(-3, 1000);
+        assert_eq!(state.frame_index, state.frame_count - 4);
+        assert_eq!(state.position_ms, 800);
+    }
+
+    #[test]
+    fn seeking_lands_on_the_frame_at_that_time() {
+        let mut state = player();
+        state.open_node(&MEDIA, node(0), 1000, false);
+        state.seek_to(650, 1000);
+        while state.pending_frame.is_some() {
+            state.service_pending(TICK_SAMPLES);
+        }
+        assert_eq!(state.frame_index, 6);
+        assert_eq!(state.position_ms, 650);
+    }
+
+    #[test]
+    fn rotated_frame_rows_map_to_the_right_pixels() {
+        // Each entry: rotation, then the source pixel of display (0, 0) and (1, 0)
+        // for a 3x2 frame.
+        for (rotation, first, second) in [
+            (0u16, (0i64, 0i64), (1i64, 0i64)),
+            (90, (0, 1), (0, 0)),
+            (180, (2, 1), (1, 1)),
+            (270, (2, 0), (2, 1)),
+        ] {
+            let frame = FrameLayout {
+                width: 3,
+                height: 2,
+                rotation,
+            };
+            let (start, step) = frame.row(0);
+            assert_eq!(start, (first.1 * 3 + first.0) * 4, "{rotation}");
+            assert_eq!(start + step, (second.1 * 3 + second.0) * 4, "{rotation}");
+        }
+        let turned = FrameLayout {
+            width: 3,
+            height: 2,
+            rotation: 90,
+        };
+        assert_eq!(turned.rotated_size(), (2, 3));
+    }
+
+    #[test]
+    fn opening_a_rotated_video_keeps_its_stored_size() {
+        // MED-12.
+        let mut state = player();
+        state.open_node(&MEDIA, node(3), 1000, false);
+        assert!(state.error.is_empty());
+        assert_eq!((state.frame_width, state.frame_height), (48, 32));
+        assert_eq!(state.info.unwrap().display_size(), (32, 48));
+    }
+
+    #[test]
+    fn name_is_neutral() {
+        // MED-30.
+        assert!(!Player.description().contains("VLC"));
     }
 
     #[test]

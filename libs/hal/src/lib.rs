@@ -8,7 +8,9 @@
 //!
 //! This crate is intentionally dependency-free.
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
+
+pub mod dma;
 
 /// A byte-oriented character device (UART, virtual console, ...).
 ///
@@ -55,23 +57,51 @@ pub trait Clock: Sync {
 
     /// Milliseconds elapsed since the counter started.
     fn uptime_ms(&self) -> u64 {
-        self.ticks()
-            .saturating_mul(1000)
-            .checked_div(self.frequency())
-            .unwrap_or(0)
+        ticks_to_ms(self.ticks(), self.frequency())
+    }
+
+    /// Human-readable name of the counter, shown by diagnostics.
+    fn name(&self) -> &'static str {
+        "timer"
     }
 
     /// Busy-waits for roughly `ms` milliseconds.
     fn spin_ms(&self, ms: u64);
 
-    /// Waits for roughly `ms` milliseconds without burning CPU time.
+    /// Waits for at least `ms` milliseconds without burning CPU time.
     ///
-    /// Architectures with a `WFI`-style instruction override this; the default
-    /// falls back to the busy-wait so a port still works without idle support.
-    /// The kernel uses the distinction to report real CPU utilisation in the
-    /// task manager: time spent here is accounted as idle.
+    /// The kernel's clock blocks the calling process, so other processes run
+    /// and the time is accounted as idle. The wake-up happens on a scheduler
+    /// tick. The default falls back to the busy-wait so a port still works
+    /// without idle support.
     fn idle_ms(&self, ms: u64) {
         self.spin_ms(ms);
+    }
+}
+
+/// Converts a counter value to milliseconds.
+///
+/// The product needs 128 bits: at 3 GHz, `ticks * 1000` overflows `u64` after
+/// about 71 days, and saturating there would freeze the clock. Returns 0 for a
+/// zero frequency.
+pub const fn ticks_to_ms(ticks: u64, frequency: u64) -> u64 {
+    if frequency == 0 {
+        return 0;
+    }
+    (ticks as u128 * 1000 / frequency as u128) as u64
+}
+
+/// The compare value after `previous` for a timer ticking every `period`.
+///
+/// Advancing by exactly one period keeps time spent reaching the handler from
+/// accumulating as drift. After a stall longer than a period, this skips the
+/// missed ticks rather than firing once per period until it has caught up.
+pub const fn next_deadline(previous: u64, period: u64, now: u64) -> u64 {
+    let next = previous.wrapping_add(period);
+    if next.wrapping_sub(now) as i64 > 0 {
+        next
+    } else {
+        now.wrapping_add(period)
     }
 }
 
@@ -114,12 +144,21 @@ pub trait Power: Sync {
 
 /// An audio output device.
 ///
-/// Drivers own the DMA buffers and present a simple "play this block" API.
-/// Samples are interleaved signed 16-bit PCM at [`sample_rate`] and
-/// [`channels`]; [`play`] blocks until the hardware has consumed the block.
+/// Drivers own the DMA buffers. Samples are interleaved signed 16-bit PCM at
+/// [`sample_rate`] and [`channels`]. There are two ways to play them:
+///
+/// - Streaming: call [`write`] whenever [`available`] has room. It never
+///   blocks, so a frame loop can keep running. Stop writing and the stream
+///   plays out what is queued, then goes quiet by itself.
+/// - Blocking: [`play`] does the same on behalf of the caller and returns once
+///   the block has been consumed.
+///
+/// Writes from several processes interleave, so callers serialize them.
 ///
 /// [`sample_rate`]: Audio::sample_rate
 /// [`channels`]: Audio::channels
+/// [`write`]: Audio::write
+/// [`available`]: Audio::available
 /// [`play`]: Audio::play
 pub trait Audio: Sync {
     /// Playback sample rate in Hz.
@@ -145,6 +184,30 @@ pub trait Audio: Sync {
     ///
     /// [`play`]: Audio::play
     fn max_samples(&self) -> usize;
+
+    /// Queues samples for playback without blocking.
+    ///
+    /// Returns how many interleaved samples were accepted, which may be fewer
+    /// than offered (or zero when the queue is full). Only whole frames are
+    /// accepted. Drivers without streaming support accept nothing.
+    fn write(&self, _samples: &[i16]) -> usize {
+        0
+    }
+
+    /// Number of interleaved samples [`write`](Audio::write) can accept now.
+    fn available(&self) -> usize {
+        0
+    }
+
+    /// Number of interleaved samples queued and not yet consumed.
+    fn queued(&self) -> usize {
+        0
+    }
+
+    /// Does periodic housekeeping for a stream nobody is writing to.
+    ///
+    /// The kernel calls this from its timer interrupt, so it must not block.
+    fn service(&self) {}
 }
 
 /// Errors reported by an [`Audio`] device.
@@ -221,6 +284,52 @@ pub trait InterruptController: Sync {
 
     /// Signals end-of-interrupt for a previously acknowledged ID.
     fn end(&self, irq: u32);
+
+    /// Acknowledges the highest-priority pending interrupt.
+    ///
+    /// Prefer this to [`acknowledge`](Self::acknowledge): the claim carries
+    /// whatever the controller needs back at end-of-interrupt, such as the
+    /// source CPU of a GIC SGI.
+    fn claim(&self) -> IrqClaim {
+        let id = self.acknowledge();
+        IrqClaim { id, raw: id }
+    }
+
+    /// Signals end-of-interrupt for a claim from [`claim`](Self::claim).
+    fn complete(&self, claim: IrqClaim) {
+        self.end(claim.id);
+    }
+
+    /// Returns `true` when `id` means no interrupt was actually pending.
+    ///
+    /// Such an ID must not be completed.
+    fn is_spurious(&self, id: u32) -> bool {
+        id == 1023
+    }
+
+    /// Sends an inter-processor interrupt.
+    ///
+    /// `id` is a controller-specific number, published by the board. The
+    /// default does nothing, which is correct for a single-CPU controller.
+    fn send_ipi(&self, _target: IpiTarget, _id: u32) {}
+}
+
+/// An acknowledged interrupt.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct IrqClaim {
+    /// Interrupt ID.
+    pub id: u32,
+    /// Controller-specific acknowledge value, handed back at end-of-interrupt.
+    pub raw: u32,
+}
+
+/// The CPUs an inter-processor interrupt goes to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IpiTarget {
+    /// One logical CPU.
+    Cpu(usize),
+    /// Every CPU except the sender.
+    AllOthers,
 }
 
 /// CPU identification and idle behaviour.
@@ -233,4 +342,166 @@ pub trait Cpu: Sync {
 
     /// Stops the CPU until an event occurs, forever.
     fn halt(&self) -> !;
+
+    /// Current privilege level, formatted as the architecture names it.
+    ///
+    /// `current_el` and `midr` keep their numeric values for diagnostics; these
+    /// labels stop AArch64 names from appearing on other ports.
+    fn privilege_prefix(&self) -> &'static str {
+        "PL"
+    }
+
+    /// Name of the identification value returned by [`midr`](Self::midr).
+    fn id_name(&self) -> &'static str {
+        "CPU ID"
+    }
+}
+
+/// The facts and devices one machine provides to the kernel.
+///
+/// Each board crate implements this once. The kernel only calls boards through
+/// this trait, so the compiler holds both ports to the same surface. Types the
+/// HAL can't name, such as the display canvas, are associated types.
+pub trait Board {
+    /// Human-readable board name, shown by the `info` app.
+    const NAME: &'static str;
+    /// Architecture reported by `uname -m`.
+    const ARCH: &'static str;
+    /// Name of the serial device, used by the boot log.
+    const CONSOLE_NAME: &'static str;
+    /// Address of the console device.
+    const CONSOLE_BASE: usize;
+    /// Name of the interrupt controller, used by the boot log.
+    const INTERRUPT_CONTROLLER_NAME: &'static str;
+    /// Name of the pointer device family, used by the boot log.
+    const POINTER_NAME: &'static str;
+    /// Hint shown when no pointer was found.
+    const POINTER_HINT: &'static str;
+    /// Name of the keyboard device family, used by the boot log.
+    const KEYBOARD_NAME: &'static str;
+    /// Hint shown when no keyboard was found.
+    const KEYBOARD_HINT: &'static str;
+    /// Interrupt ID of the scheduler tick.
+    const TIMER_IRQ: u32;
+    /// Interrupt ID that stops a CPU for good.
+    const IPI_STOP: u32;
+    /// Interrupt ID that asks a CPU to reschedule.
+    const IPI_RESCHEDULE: u32;
+    /// CPUs the board can bring up.
+    const MAX_CPUS: usize;
+
+    /// The framebuffer canvas.
+    type Display;
+    /// A discovered audio device and its details.
+    type AudioDevice;
+    /// What kind of pointer was found.
+    type PointerKind;
+    /// The filesystem apps browse.
+    type FileSystem: ?Sized + 'static;
+
+    /// Initializes the UART and registers it as the kernel console.
+    fn init_console();
+    /// Writes terminal text directly to the UART, for the fatal path.
+    ///
+    /// This must not depend on any lock or on mutable state, which a failure may
+    /// have corrupted.
+    fn write_emergency(bytes: &[u8]);
+    /// Initializes the interrupt controller and the timer on the boot CPU.
+    fn init_interrupts();
+    /// Initializes the calling secondary CPU's interrupt state.
+    fn init_cpu_interrupts();
+    /// Returns the interrupt controller.
+    fn interrupts() -> &'static dyn InterruptController;
+    /// Firmware affinity value for a logical CPU index.
+    fn cpu_mpidr(index: usize) -> u64;
+
+    /// Brings up the display, when the machine has one.
+    fn init_display() -> Option<Self::Display>;
+    /// Returns a canvas over the off-screen composition buffer.
+    fn back_buffer() -> Option<Self::Display>;
+    /// Physical address of the scanout buffer.
+    fn framebuffer_addr() -> usize;
+
+    /// Finds and initialises the audio device.
+    fn init_audio(clock: &'static dyn Clock) -> Option<Self::AudioDevice>;
+    /// Finds and initialises the pointer.
+    fn init_pointer() -> Option<Self::PointerKind>;
+    /// Returns the pointer shared with apps, when one was initialised.
+    fn pointer() -> Option<&'static dyn Pointer>;
+    /// Finds and initialises the keyboard.
+    fn init_keyboard() -> bool;
+    /// Returns the keyboard shared with apps, when one was initialised.
+    fn keyboard() -> Option<&'static dyn Keyboard>;
+    /// Returns the filesystem apps browse.
+    fn filesystem() -> &'static Self::FileSystem;
+
+    /// Address range `[start, end)` of the loaded kernel image.
+    fn kernel_range() -> (usize, usize);
+    /// Address range `[start, end)` of `.bss`.
+    fn bss_range() -> (usize, usize);
+    /// Address range `[start, end)` of the boot stack.
+    fn stack_range() -> (usize, usize);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uptime_is_exact_for_ordinary_values() {
+        assert_eq!(ticks_to_ms(0, 1_000), 0);
+        assert_eq!(ticks_to_ms(1_500, 1_000), 1_500);
+        assert_eq!(ticks_to_ms(62_500_000, 62_500_000), 1_000);
+        assert_eq!(ticks_to_ms(5, 0), 0);
+    }
+
+    #[test]
+    fn uptime_does_not_saturate_after_71_days() {
+        // KRN-19: `ticks * 1000` overflows u64 here, which froze the clock.
+        const FREQUENCY: u64 = 3_000_000_000;
+        let day_ms: u64 = 24 * 3600 * 1000;
+        for days in [71, 72, 100, 10_000] {
+            let ticks = days * day_ms * (FREQUENCY / 1000);
+            assert_eq!(ticks_to_ms(ticks, FREQUENCY), days * day_ms);
+        }
+    }
+
+    #[test]
+    fn deadlines_advance_by_exactly_one_period() {
+        // KRN-21: re-arming relative to "now" drifted by the handler latency.
+        assert_eq!(next_deadline(1_000, 100, 1_030), 1_100);
+    }
+
+    #[test]
+    fn deadlines_skip_missed_ticks_after_a_stall() {
+        assert_eq!(next_deadline(1_000, 100, 1_100), 1_200);
+        assert_eq!(next_deadline(1_000, 100, 5_000), 5_100);
+    }
+
+    #[test]
+    fn deadlines_survive_counter_wrap() {
+        assert_eq!(next_deadline(u64::MAX - 10, 100, u64::MAX - 5), 89);
+    }
+
+    struct Fake;
+
+    impl InterruptController for Fake {
+        fn enable(&self, _irq: u32) {}
+        fn disable(&self, _irq: u32) {}
+        fn acknowledge(&self) -> u32 {
+            30
+        }
+        fn end(&self, _irq: u32) {}
+    }
+
+    #[test]
+    fn controller_defaults_build_on_the_required_methods() {
+        let claim = Fake.claim();
+        assert_eq!(claim.id, 30);
+        assert_eq!(claim.raw, 30);
+        Fake.complete(claim);
+        assert!(Fake.is_spurious(1023));
+        assert!(!Fake.is_spurious(30));
+        Fake.send_ipi(IpiTarget::AllOthers, 1);
+    }
 }

@@ -18,16 +18,21 @@ Usage:
 from __future__ import annotations
 
 import pathlib
+import re
 import sys
 import zipfile
 
 FIXED_TIME = (2026, 1, 1, 0, 0, 0)
+BUNDLE_ID = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]*")
 
 
 def manifest_id(manifest: pathlib.Path) -> str:
     for line in manifest.read_text(encoding="utf-8").splitlines():
         if line.startswith("id:"):
-            return line.split(":", 1)[1].strip().strip("\"'")
+            value = line.split(":", 1)[1].split(" #", 1)[0].strip().strip("\"'")
+            if not BUNDLE_ID.fullmatch(value):
+                raise SystemExit(f"{manifest}: id {value!r} is not a valid bundle id")
+            return value
     raise SystemExit(f"{manifest}: no id field")
 
 
@@ -40,16 +45,24 @@ def pack(source: pathlib.Path, output: pathlib.Path) -> None:
         output = output.with_suffix(".fapp")
     output.parent.mkdir(parents=True, exist_ok=True)
 
+    target = output.resolve()
     files = sorted(
-        path for path in source.rglob("*") if path.is_file() and not path.name.startswith(".")
+        path
+        for path in source.rglob("*")
+        if path.is_file()
+        # Hidden directories are skipped too, not only hidden files.
+        and not any(part.startswith(".") for part in path.relative_to(source).parts)
+        # A previous run may have left the output inside the source tree.
+        and path.resolve() != target
     )
-    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in files:
             name = path.relative_to(source).as_posix()
             info = zipfile.ZipInfo(name, date_time=FIXED_TIME)
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = 0o644 << 16
-            archive.writestr(info, path.read_bytes())
+            # The archive-level level is not applied to an explicit ZipInfo.
+            archive.writestr(info, path.read_bytes(), compresslevel=9)
 
     size = output.stat().st_size
     print(f"packed {len(files)} file(s) into {output} ({size} bytes)")

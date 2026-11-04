@@ -10,6 +10,8 @@ dependencies = [
  "feos-gfx",
  "feos-gui",
  "feos-hal",
+ "feos-sync",
+ "feos-text",
 ]
 
 [[package]]
@@ -28,6 +30,7 @@ dependencies = [
  "feos-gfx",
  "feos-gui",
  "feos-hal",
+ "feos-image",
  "feos-keys",
  "feos-sh",
  "feos-sync",
@@ -40,6 +43,7 @@ name = "feos-arch-aarch64"
 version = "0.1.0"
 dependencies = [
  "feos-hal",
+ "feos-sync",
 ]
 
 [[package]]
@@ -47,6 +51,8 @@ name = "feos-arch-x86_64"
 version = "0.1.0"
 dependencies = [
  "feos-hal",
+ "feos-port-io",
+ "feos-sync",
 ]
 
 [[package]]
@@ -126,6 +132,8 @@ dependencies = [
 name = "feos-coreutils"
 version = "0.1.0"
 dependencies = [
+ "feos-archive",
+ "feos-compress",
  "feos-fs",
 ]
 
@@ -157,6 +165,7 @@ dependencies = [
  "feos-hal",
  "feos-keys",
  "feos-sync",
+ "feos-text",
 ]
 
 [[package]]
@@ -187,11 +196,16 @@ name = "feos-driver-apic"
 version = "0.1.0"
 dependencies = [
  "feos-hal",
+ "feos-port-io",
 ]
 
 [[package]]
 name = "feos-driver-fw-cfg"
 version = "0.1.0"
+dependencies = [
+ "feos-hal",
+ "feos-port-io",
+]
 
 [[package]]
 name = "feos-driver-gicv2"
@@ -205,6 +219,7 @@ name = "feos-driver-i8042"
 version = "0.1.0"
 dependencies = [
  "feos-hal",
+ "feos-port-io",
  "feos-sync",
 ]
 
@@ -219,6 +234,9 @@ dependencies = [
 [[package]]
 name = "feos-driver-pci"
 version = "0.1.0"
+dependencies = [
+ "feos-port-io",
+]
 
 [[package]]
 name = "feos-driver-pl011"
@@ -239,6 +257,7 @@ name = "feos-driver-uart16550"
 version = "0.1.0"
 dependencies = [
  "feos-hal",
+ "feos-port-io",
 ]
 
 [[package]]
@@ -269,6 +288,10 @@ version = "0.1.0"
 
 [[package]]
 name = "feos-hal"
+version = "0.1.0"
+
+[[package]]
+name = "feos-heap"
 version = "0.1.0"
 
 [[package]]
@@ -305,6 +328,8 @@ dependencies = [
  "feos-console",
  "feos-desktop-app",
  "feos-hal",
+ "feos-heap",
+ "feos-sched",
  "feos-shell",
  "feos-sync",
 ]
@@ -317,6 +342,14 @@ dependencies = [
  "feos-gui",
  "feos-hal",
 ]
+
+[[package]]
+name = "feos-port-io"
+version = "0.1.0"
+
+[[package]]
+name = "feos-sched"
+version = "0.1.0"
 
 [[package]]
 name = "feos-sh"
@@ -351,6 +384,7 @@ version = "0.1.0"
 name = "feos-video"
 version = "0.1.0"
 dependencies = [
+ "feos-compress",
  "feos-h264",
  "feos-image",
 ]

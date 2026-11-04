@@ -39,6 +39,31 @@ _start:
 
     cld
 
+    /* Without these checks, a CPU or machine that can't run the image would
+     * triple-fault with no output. Everything from here to the far jump below
+     * must not use the stack, which may be past the end of RAM. */
+    movl $0x80000000, %eax
+    cpuid
+    movl $message_no_long_mode, %edi
+    cmpl $0x80000001, %eax
+    jb .Lboot_fail
+    movl $0x80000001, %eax
+    cpuid
+    testl $(1 << 29), %edx
+    jz .Lboot_fail
+
+    /* The multiboot memory fields are valid when flag bit 0 is set. `mem_upper`
+     * is the KiB of RAM above 1 MiB, and the whole image must fit in it. */
+    testl $1, (%esi)
+    jz .Lram_ok
+    movl 8(%esi), %eax
+    shll $10, %eax
+    addl $0x100000, %eax
+    movl $message_no_ram, %edi
+    cmpl $__kernel_end, %eax
+    jb .Lboot_fail
+.Lram_ok:
+
     /* Zero .bss before using the page tables and stack that live there.
      * The region is 4-byte aligned and sized; `stosl` is four times fewer
      * iterations than `stosb` under emulation. */
@@ -56,15 +81,35 @@ _start:
     movl %eax, (%edi)
     movl $0, 4(%edi)
 
-    /* Four 1 GiB identity-mapped pages cover the first 4 GiB: all RAM,
-     * the framebuffer, PCI MMIO, the IOAPIC and the local APIC. */
+    /* PDPT[0..4] -> four page directories, present + writable. */
     movl $pdpt, %edi
-    movl $0x83, %eax
+    movl $page_directories, %eax
+    orl $0x3, %eax
     movl $4, %ecx
-.Lmap_pages:
+.Lmap_directories:
     movl %eax, (%edi)
     movl $0, 4(%edi)
-    addl $0x40000000, %eax
+    addl $4096, %eax
+    addl $8, %edi
+    loop .Lmap_directories
+
+    /* 2048 identity-mapped 2 MiB pages cover the first 4 GiB: all RAM, the
+     * framebuffer, PCI MMIO, the IOAPIC and the local APIC. 2 MiB pages work on
+     * every long-mode CPU, unlike 1 GiB pages. Everything from 2 GiB up is
+     * uncached (PCD | PWT), because that's where the device windows are. */
+    movl $page_directories, %edi
+    xorl %ebx, %ebx
+    movl $2048, %ecx
+.Lmap_pages:
+    movl %ebx, %eax
+    orl $0x83, %eax                  /* present + writable + page size */
+    testl $0x80000000, %ebx
+    jz 2f
+    orl $0x18, %eax                  /* PCD | PWT */
+2:
+    movl %eax, (%edi)
+    movl $0, 4(%edi)
+    addl $0x200000, %ebx
     addl $8, %edi
     loop .Lmap_pages
 
@@ -95,18 +140,29 @@ _start:
     wrmsr
 
     /* Point CR3 at the PML4 and turn on paging (which enters long mode once
-     * we load the 64-bit code segment below). Caches stay disabled, just as
-     * the AArch64 port runs with them off, so MMIO is uncached. */
+     * we load the 64-bit code segment below). Caches are on: the mapping above
+     * is what keeps device windows uncached. */
     movl $pml4, %eax
     movl %eax, %cr3
 
     movl %cr0, %eax
-    andl $0xFFFFFFFB, %eax           /* clear EM */
+    andl $0x9FFFFFFB, %eax           /* clear CD | NW | EM */
     orl $0x80010022, %eax            /* PG | WP | MP | NE */
-    orl $0x60000000, %eax            /* CD | NW */
     movl %eax, %cr0
 
     ljmp $0x08, $long_mode
+
+/* Writes the NUL-terminated string at edi to COM1 and stops. No stack needed. */
+.Lboot_fail:
+    movw $__early_uart, %dx
+1:  movb (%edi), %al
+    testb %al, %al
+    jz 2f
+    outb %al, %dx
+    incl %edi
+    jmp 1b
+2:  hlt
+    jmp 2b
 .size _start, . - _start
 
 .code64
@@ -153,6 +209,10 @@ gdt_end:
 gdt_ptr:
     .word gdt_end - gdt_start - 1
     .long gdt_start
+message_no_long_mode:
+    .asciz "\r\nfeos: this CPU has no long mode (use -cpu max or qemu64)\r\n"
+message_no_ram:
+    .asciz "\r\nfeos: not enough RAM for the kernel image\r\n"
 
 .section .bss
 .balign 4096
@@ -161,5 +221,8 @@ pml4:
 .balign 4096
 pdpt:
     .skip 4096
+.balign 4096
+page_directories:
+    .skip 4 * 4096
 
 .section .note.GNU-stack, "", @progbits

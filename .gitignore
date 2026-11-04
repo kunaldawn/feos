@@ -1,2 +1,2 @@
 target/
-boards/qemu-virt/disk-*.img
+boards/qemu-virt/disk*.img

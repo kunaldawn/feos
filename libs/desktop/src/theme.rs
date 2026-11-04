@@ -1,6 +1,6 @@
 //! Visual themes for the desktop shell.
 //!
-//! A [`DesktopTheme`] is the desktop's own palette: XP-style gradients for the
+//! A [`DesktopTheme`] is the desktop's own palette: classic-style gradients for the
 //! taskbar, title bars and Start menu, plus a [`feos_gui::Theme`] used by the
 //! widgets inside application windows.
 
@@ -12,12 +12,12 @@ use crate::config::DesktopConfig;
 /// A named desktop theme.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum ThemeName {
-    /// Windows XP Luna blue.
+    /// The XP-look blue scheme.
     #[default]
     XpBlue,
-    /// Windows XP Luna olive green.
+    /// The XP-look olive green scheme.
     XpOlive,
-    /// Windows XP Luna silver.
+    /// The XP-look silver scheme.
     XpSilver,
     /// A modern dark theme.
     Dark,
@@ -28,6 +28,28 @@ pub enum ThemeName {
 }
 
 impl ThemeName {
+    /// Every scheme, in the order the settings dialog lists them.
+    pub const ALL: [Self; 6] = [
+        Self::XpBlue,
+        Self::XpOlive,
+        Self::XpSilver,
+        Self::Dark,
+        Self::Light,
+        Self::HighContrast,
+    ];
+
+    /// The scheme's full palette.
+    pub const fn palette(self) -> DesktopTheme {
+        match self {
+            Self::XpBlue => DesktopTheme::xp_blue(),
+            Self::XpOlive => DesktopTheme::xp_olive(),
+            Self::XpSilver => DesktopTheme::xp_silver(),
+            Self::Dark => DesktopTheme::dark(),
+            Self::Light => DesktopTheme::light(),
+            Self::HighContrast => DesktopTheme::high_contrast(),
+        }
+    }
+
     /// Parses a theme name from configuration.
     pub fn parse(value: &str) -> Option<Self> {
         if value.eq_ignore_ascii_case("xp-blue")
@@ -195,7 +217,7 @@ impl DesktopTheme {
         theme
     }
 
-    /// Windows XP Luna blue.
+    /// The XP-look blue scheme.
     pub const fn xp_blue() -> Self {
         let mut palette = Palette::light();
         palette.surface = Color::rgb(244, 241, 232);
@@ -264,7 +286,7 @@ impl DesktopTheme {
         }
     }
 
-    /// Windows XP Luna olive green.
+    /// The XP-look olive green scheme.
     pub const fn xp_olive() -> Self {
         let mut theme = Self::xp_blue();
         theme.name = ThemeName::XpOlive;
@@ -302,7 +324,7 @@ impl DesktopTheme {
         theme
     }
 
-    /// Windows XP Luna silver.
+    /// The XP-look silver scheme.
     pub const fn xp_silver() -> Self {
         let mut theme = Self::xp_blue();
         theme.name = ThemeName::XpSilver;

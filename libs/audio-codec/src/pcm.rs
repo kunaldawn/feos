@@ -40,6 +40,8 @@ pub(crate) fn f32_from_be(bytes: [u8; 4]) -> f32 {
     f32::from_bits(u32::from_be_bytes(bytes))
 }
 
+/// Expands a G.711 µ-law code. After complementing the code a set top bit
+/// means a negative sample, so code 0x00 is -32124 and code 0x80 is +32124.
 pub(crate) fn mulaw_to_i16(value: u8) -> i16 {
     let value = !value;
     let sign = value & 0x80;
@@ -48,9 +50,9 @@ pub(crate) fn mulaw_to_i16(value: u8) -> i16 {
     let sample = (((mantissa as i32) << 3) + 0x84) << exponent;
     let sample = sample - 0x84;
     if sign != 0 {
-        sample as i16
-    } else {
         (-sample) as i16
+    } else {
+        sample as i16
     }
 }
 

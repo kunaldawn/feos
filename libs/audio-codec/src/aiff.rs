@@ -96,6 +96,9 @@ fn parse(input: &[u8]) -> Result<Format> {
                 if size < 22 {
                     return Err(AudioError::InvalidData("bad AIFC COMM chunk"));
                 }
+                // `size` is only what the file declares; a truncated file
+                // can end inside the compression type.
+                need(input.len(), start, 22)?;
                 let compression = &input[start + 18..start + 22];
                 match compression {
                     b"NONE" | b"twos" | b"in16" => endian = Endian::Big,

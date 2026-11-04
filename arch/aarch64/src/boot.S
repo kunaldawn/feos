@@ -25,10 +25,31 @@ _start:
     mov x0, #0
     msr tpidr_el1, x0
 
-    /* Install the stack from the linker script. */
+    /* Catch a fault from here until the kernel installs its own vectors. */
+    adrp x0, early_vector_table
+    add  x0, x0, :lo12:early_vector_table
+    msr  vbar_el1, x0
+    isb
+
+    /* Touch the last word of the image, including .bss and the stack. QEMU
+     * doesn't check the image against the RAM size, so without this a small
+     * -m would fault silently during the clear below. */
+    adrp x0, __kernel_end
+    add  x0, x0, :lo12:__kernel_end
+    ldr  x0, [x0, #-8]
+
+    /* SP_EL1 is this CPU's private exception stack. The boot thread, like every
+     * thread, runs on SP_EL0 (EL1t), so taking an exception switches stacks in
+     * hardware. See vectors.S. */
+    adrp x0, irq_stacks
+    add  x0, x0, :lo12:irq_stacks
+    mov  x1, #IRQ_STACK_SIZE
+    add  x0, x0, x1
+    mov  sp, x0
     adrp x0, __stack_top
     add  x0, x0, :lo12:__stack_top
-    mov  sp, x0
+    msr  sp_el0, x0
+    msr  spsel, #0
 
     /* Enable FP/SIMD at EL1 and EL0 (CPACR_EL1.FPEN = 0b11). Rust may use
      * NEON registers for memcpy and formatting, which otherwise trap. */
@@ -62,12 +83,13 @@ _start:
  *   x0 = context id chosen by the caller (the logical CPU index)
  *
  * Secondary CPUs arrive with the MMU, caches and interrupts off and no stack.
- * Give each one a private stack and the shared exception table, then hand it
- * to Rust. The Rust handler installs its CPU interface and joins the
+ * Give each one private stacks and the shared exception table, then hand it to
+ * Rust. As on the boot CPU, SP_EL1 is the exception stack and threads use SP_EL0. The Rust handler installs its CPU interface and joins the
  * scheduler; it does not return.
  */
 .equ SMP_MAX_CPUS, 8
-.equ SMP_STACK_SIZE, 0x20000          /* 128 KiB per secondary CPU */
+.equ SMP_STACK_SIZE, 0x8000           /* 32 KiB until the first tick */
+.equ IRQ_STACK_SIZE, 0x8000           /* 32 KiB per CPU */
 
 .section .text.boot, "ax"
 .global secondary_entry
@@ -76,13 +98,22 @@ secondary_entry:
     mov x19, x0
     msr tpidr_el1, x0
 
-    /* sp = secondary_stacks + (index + 1) * SMP_STACK_SIZE */
+    /* sp = irq_stacks + (index + 1) * IRQ_STACK_SIZE */
+    adrp x1, irq_stacks
+    add  x1, x1, :lo12:irq_stacks
+    mov  x2, #IRQ_STACK_SIZE
+    madd x1, x0, x2, x1
+    add  x1, x1, x2
+    mov  sp, x1
+
+    /* sp_el0 = secondary_stacks + (index + 1) * SMP_STACK_SIZE */
     adrp x1, secondary_stacks
     add  x1, x1, :lo12:secondary_stacks
     mov  x2, #SMP_STACK_SIZE
     madd x1, x0, x2, x1
     add  x1, x1, x2
-    mov  sp, x1
+    msr  sp_el0, x1
+    msr  spsel, #0
 
     /* Enable FP/SIMD at EL1, as the boot CPU did. */
     mrs x1, cpacr_el1
@@ -108,3 +139,6 @@ secondary_entry:
 .balign 16
 secondary_stacks:
     .skip SMP_MAX_CPUS * SMP_STACK_SIZE
+.balign 16
+irq_stacks:
+    .skip SMP_MAX_CPUS * IRQ_STACK_SIZE

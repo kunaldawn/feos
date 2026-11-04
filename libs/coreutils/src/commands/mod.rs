@@ -1,6 +1,12 @@
 //! Command registry and dispatch for [`crate::run`].
 
+mod archive;
+mod diff;
 mod files;
+mod find;
+mod more;
+mod opts;
+mod sed;
 mod system;
 mod text;
 
@@ -10,10 +16,19 @@ use core::fmt::{self, Write};
 
 use crate::env::Env;
 use crate::fs::{FsError, Vfs};
-use crate::io::{Input, Output};
+use crate::io::{Input, Output, MAX_STREAM_BYTES};
 use crate::system::System;
 
-/// A command name, its help text and aliases.
+/// Deepest directory tree the recursive utilities will walk.
+pub(super) const MAX_WALK_DEPTH: usize = 64;
+
+/// How deeply commands may run commands, as `xargs env xargs ...` does.
+const MAX_COMMAND_DEPTH: u32 = 8;
+
+/// The entry point of one command.
+pub type CommandFn = fn(&[String], &mut Ctx<'_>) -> i32;
+
+/// A command name, its help text, aliases and implementation.
 #[derive(Clone, Copy, Debug)]
 pub struct CommandSpec {
     /// Primary command name.
@@ -24,6 +39,8 @@ pub struct CommandSpec {
     pub usage: &'static str,
     /// One-line description.
     pub description: &'static str,
+    /// The implementation, so a listed command always dispatches.
+    pub run: CommandFn,
 }
 
 /// Everything a command may touch.
@@ -40,6 +57,16 @@ pub struct Ctx<'a> {
     pub stderr: &'a mut dyn Output,
     /// Platform facts.
     pub system: &'a dyn System,
+    /// How many commands are running this one. Start at zero.
+    pub depth: u32,
+}
+
+impl Ctx<'_> {
+    /// True when the command should stop: its output is gone because the sink
+    /// overflowed or the shell cancelled it.
+    pub fn cancelled(&self) -> bool {
+        self.stdout.is_broken()
+    }
 }
 
 /// Every command implemented by this crate, in help order.
@@ -49,306 +76,476 @@ pub static COMMANDS: &[CommandSpec] = &[
         aliases: &["dir"],
         usage: "ls [-la1hRFr] [path...]",
         description: "list directory contents",
+        run: files::ls,
     },
     CommandSpec {
         name: "cat",
         aliases: &[],
         usage: "cat [-nbsA] [file...]",
         description: "concatenate files",
+        run: files::cat,
     },
     CommandSpec {
         name: "echo",
         aliases: &[],
         usage: "echo [-neE] [text...]",
         description: "print text",
+        run: text::echo,
     },
     CommandSpec {
         name: "printf",
         aliases: &[],
         usage: "printf FORMAT [arg...]",
         description: "format and print data",
+        run: text::printf,
     },
     CommandSpec {
         name: "pwd",
         aliases: &[],
         usage: "pwd",
         description: "print the working directory",
+        run: system::pwd,
     },
     CommandSpec {
         name: "mkdir",
         aliases: &[],
         usage: "mkdir [-pv] DIR...",
         description: "create directories",
+        run: files::mkdir,
     },
     CommandSpec {
         name: "rmdir",
         aliases: &[],
         usage: "rmdir [-pv] DIR...",
         description: "remove empty directories",
+        run: files::rmdir,
     },
     CommandSpec {
         name: "rm",
         aliases: &[],
         usage: "rm [-rfdv] PATH...",
         description: "remove files and directories",
+        run: files::rm,
     },
     CommandSpec {
         name: "cp",
         aliases: &[],
         usage: "cp [-rRfvni] SRC... DEST",
         description: "copy files and directories",
+        run: files::cp,
     },
     CommandSpec {
         name: "mv",
         aliases: &[],
         usage: "mv [-fvn] SRC... DEST",
         description: "move or rename files",
+        run: files::mv,
     },
     CommandSpec {
         name: "touch",
         aliases: &[],
         usage: "touch [-c] FILE...",
         description: "create empty files",
+        run: files::touch,
     },
     CommandSpec {
         name: "head",
         aliases: &[],
         usage: "head [-n N|-c N] [file...]",
         description: "first lines of files",
+        run: text::head,
     },
     CommandSpec {
         name: "tail",
         aliases: &[],
         usage: "tail [-n N|-c N] [file...]",
         description: "last lines of files",
+        run: text::tail,
     },
     CommandSpec {
         name: "wc",
         aliases: &[],
         usage: "wc [-lwcm] [file...]",
         description: "count lines, words and bytes",
+        run: text::wc,
     },
     CommandSpec {
         name: "grep",
         aliases: &[],
         usage: "grep [-ivnclLqwxFr] PATTERN [file...]",
         description: "search text with a pattern",
+        run: text::grep,
     },
     CommandSpec {
         name: "sort",
         aliases: &[],
         usage: "sort [-rnufb] [-t C] [-k N] [file...]",
         description: "sort lines",
+        run: text::sort,
     },
     CommandSpec {
         name: "uniq",
         aliases: &[],
         usage: "uniq [-cdui] [file]",
         description: "filter repeated lines",
+        run: text::uniq,
     },
     CommandSpec {
         name: "cut",
         aliases: &[],
         usage: "cut [-d C] [-f LIST] [-c LIST] [file...]",
         description: "select fields or columns",
+        run: text::cut,
     },
     CommandSpec {
         name: "tr",
         aliases: &[],
         usage: "tr [-dsc] SET1 [SET2]",
         description: "translate or delete bytes",
+        run: text::tr,
     },
     CommandSpec {
         name: "seq",
         aliases: &[],
         usage: "seq [-w] [-s SEP] [first [step]] last",
         description: "print a sequence of numbers",
+        run: text::seq,
     },
     CommandSpec {
         name: "basename",
         aliases: &[],
         usage: "basename PATH [SUFFIX]",
         description: "strip the directory from a path",
+        run: more::basename,
     },
     CommandSpec {
         name: "dirname",
         aliases: &[],
         usage: "dirname PATH",
         description: "strip the last path component",
+        run: more::dirname,
     },
     CommandSpec {
         name: "nl",
         aliases: &[],
         usage: "nl [-b a|t] [-w N] [file...]",
         description: "number lines",
+        run: text::nl,
     },
     CommandSpec {
         name: "rev",
         aliases: &[],
         usage: "rev [file...]",
         description: "reverse each line",
+        run: text::rev,
     },
     CommandSpec {
         name: "tac",
         aliases: &[],
         usage: "tac [file...]",
         description: "print lines in reverse order",
+        run: text::tac,
     },
     CommandSpec {
         name: "paste",
         aliases: &[],
         usage: "paste [-d LIST] [-s] [file...]",
         description: "merge lines of files",
+        run: text::paste,
     },
     CommandSpec {
         name: "tee",
         aliases: &[],
         usage: "tee [-a] [file...]",
         description: "copy input to files and stdout",
+        run: text::tee,
     },
     CommandSpec {
         name: "cmp",
         aliases: &[],
         usage: "cmp [-sl] FILE1 FILE2",
         description: "compare two files byte by byte",
+        run: text::cmp,
     },
     CommandSpec {
         name: "find",
         aliases: &[],
         usage: "find [path...] [-name PAT] [-type f|d] [-maxdepth N]",
         description: "walk a directory tree",
+        run: find::find,
     },
     CommandSpec {
         name: "stat",
         aliases: &[],
         usage: "stat PATH...",
         description: "show file metadata",
+        run: files::stat,
     },
     CommandSpec {
         name: "tree",
         aliases: &[],
         usage: "tree [-a] [-L N] [path]",
         description: "display a directory tree",
+        run: files::tree,
     },
     CommandSpec {
         name: "du",
         aliases: &[],
         usage: "du [-sah] [path...]",
         description: "estimate file space usage",
+        run: files::du,
     },
     CommandSpec {
         name: "df",
         aliases: &[],
         usage: "df [-h]",
         description: "show filesystem space",
+        run: files::df,
     },
     CommandSpec {
         name: "env",
         aliases: &[],
         usage: "env",
         description: "print the environment",
+        run: system::env,
     },
     CommandSpec {
         name: "printenv",
         aliases: &[],
         usage: "printenv [NAME...]",
         description: "print environment variables",
+        run: system::printenv,
     },
     CommandSpec {
         name: "uname",
         aliases: &[],
         usage: "uname [-asnrvm]",
         description: "print system information",
+        run: system::uname,
     },
     CommandSpec {
         name: "whoami",
         aliases: &[],
         usage: "whoami",
         description: "print the current user",
+        run: system::whoami,
     },
     CommandSpec {
         name: "id",
         aliases: &[],
         usage: "id",
         description: "print user and group ids",
+        run: system::id,
     },
     CommandSpec {
         name: "hostname",
         aliases: &[],
         usage: "hostname",
         description: "print the host name",
+        run: system::hostname,
     },
     CommandSpec {
         name: "nproc",
         aliases: &[],
         usage: "nproc",
         description: "print the number of CPUs",
+        run: system::nproc,
     },
     CommandSpec {
         name: "arch",
         aliases: &[],
         usage: "arch",
         description: "print the machine architecture",
+        run: system::arch,
     },
     CommandSpec {
         name: "uptime",
         aliases: &[],
         usage: "uptime",
         description: "show how long the system has been up",
+        run: system::uptime,
     },
     CommandSpec {
         name: "free",
         aliases: &[],
         usage: "free [-h]",
         description: "show memory usage",
+        run: system::free,
     },
     CommandSpec {
         name: "hexdump",
         aliases: &["xxd"],
         usage: "hexdump [-C] [-n N] [file...]",
         description: "dump bytes as hexadecimal",
+        run: text::hexdump,
     },
     CommandSpec {
         name: "base64",
         aliases: &[],
         usage: "base64 [-d] [-w N] [file...]",
         description: "encode or decode base64",
+        run: text::base64,
     },
     CommandSpec {
         name: "sha256sum",
         aliases: &[],
         usage: "sha256sum [file...]",
         description: "print SHA-256 checksums",
+        run: text::sha256sum,
     },
     CommandSpec {
         name: "test",
-        aliases: &["["],
+        aliases: &[],
         usage: "test EXPRESSION",
         description: "evaluate a conditional expression",
+        run: system::test,
+    },
+    CommandSpec {
+        name: "[",
+        aliases: &[],
+        usage: "[ EXPRESSION ]",
+        description: "evaluate a conditional expression",
+        run: system::bracket,
     },
     CommandSpec {
         name: "expr",
         aliases: &[],
         usage: "expr ARG...",
         description: "evaluate an integer expression",
+        run: system::expr,
     },
     CommandSpec {
         name: "true",
         aliases: &[":"],
         usage: "true",
         description: "do nothing successfully",
+        run: system::run_true,
     },
     CommandSpec {
         name: "false",
         aliases: &[],
         usage: "false",
         description: "do nothing unsuccessfully",
+        run: system::run_false,
     },
     CommandSpec {
         name: "yes",
         aliases: &[],
         usage: "yes [text]",
         description: "repeat a line (capped for safety)",
+        run: text::yes,
+    },
+    CommandSpec {
+        name: "sed",
+        aliases: &[],
+        usage: "sed [-nEi] [-e SCRIPT] [-f FILE] [SCRIPT] [file...]",
+        description: "stream editor",
+        run: sed::sed,
+    },
+    CommandSpec {
+        name: "diff",
+        aliases: &[],
+        usage: "diff [-uq] [-U N] FILE1 FILE2",
+        description: "compare files line by line",
+        run: diff::diff,
+    },
+    CommandSpec {
+        name: "xargs",
+        aliases: &[],
+        usage: "xargs [-0t] [-n N] [-I STR] [-d C] [command [arg...]]",
+        description: "build commands from standard input",
+        run: more::xargs,
+    },
+    CommandSpec {
+        name: "tar",
+        aliases: &[],
+        usage: "tar [-ctxvzf] [-C DIR] [-f FILE] [path...]",
+        description: "create, list and extract archives",
+        run: archive::tar,
+    },
+    CommandSpec {
+        name: "gzip",
+        aliases: &[],
+        usage: "gzip [-dkcf] [file...]",
+        description: "compress files",
+        run: archive::gzip,
+    },
+    CommandSpec {
+        name: "gunzip",
+        aliases: &["zcat"],
+        usage: "gunzip [-kcf] [file...]",
+        description: "decompress files",
+        run: archive::gunzip,
+    },
+    CommandSpec {
+        name: "od",
+        aliases: &[],
+        usage: "od [-A d|o|x|n] [-t x1|o1|d1|c] [-c] [-x] [-N N] [-j N] [file...]",
+        description: "dump bytes in octal and other formats",
+        run: more::od,
+    },
+    CommandSpec {
+        name: "fold",
+        aliases: &[],
+        usage: "fold [-bs] [-w N] [file...]",
+        description: "wrap long lines",
+        run: more::fold,
+    },
+    CommandSpec {
+        name: "comm",
+        aliases: &[],
+        usage: "comm [-123] FILE1 FILE2",
+        description: "compare two sorted files",
+        run: more::comm,
+    },
+    CommandSpec {
+        name: "split",
+        aliases: &[],
+        usage: "split [-l N] [-b N] [-a N] [-d] [file [prefix]]",
+        description: "split a file into pieces",
+        run: more::split,
+    },
+    CommandSpec {
+        name: "dd",
+        aliases: &[],
+        usage: "dd [if=F] [of=F] [bs=N] [count=N] [skip=N] [seek=N] [status=none]",
+        description: "copy and convert blocks",
+        run: more::dd,
+    },
+    CommandSpec {
+        name: "strings",
+        aliases: &[],
+        usage: "strings [-n N] [file...]",
+        description: "print printable character runs",
+        run: more::strings,
+    },
+    CommandSpec {
+        name: "realpath",
+        aliases: &[],
+        usage: "realpath [-me] PATH...",
+        description: "print the resolved path",
+        run: more::realpath,
+    },
+    CommandSpec {
+        name: "mktemp",
+        aliases: &[],
+        usage: "mktemp [-d] [-p DIR] [TEMPLATE]",
+        description: "create a unique temporary file",
+        run: more::mktemp,
+    },
+    CommandSpec {
+        name: "file",
+        aliases: &[],
+        usage: "file [-b] PATH...",
+        description: "identify file types",
+        run: more::file,
+    },
+    CommandSpec {
+        name: "date",
+        aliases: &[],
+        usage: "date [-u] [-d @SECONDS] [+FORMAT]",
+        description: "print the date and time",
+        run: more::date,
     },
 ];
 
@@ -366,60 +563,25 @@ pub fn is_command(name: &str) -> bool {
 
 /// Runs the command `name` with `args`, returning its exit status.
 pub fn run(name: &str, args: &[String], ctx: &mut Ctx<'_>) -> i32 {
-    match name {
-        "ls" | "dir" => files::ls(args, ctx),
-        "cat" => files::cat(args, ctx),
-        "mkdir" => files::mkdir(args, ctx),
-        "rmdir" => files::rmdir(args, ctx),
-        "rm" => files::rm(args, ctx),
-        "cp" => files::cp(args, ctx),
-        "mv" => files::mv(args, ctx),
-        "touch" => files::touch(args, ctx),
-        "find" => files::find(args, ctx),
-        "stat" => files::stat(args, ctx),
-        "tree" => files::tree(args, ctx),
-        "du" => files::du(args, ctx),
-        "df" => files::df(args, ctx),
-        "echo" => text::echo(args, ctx),
-        "printf" => text::printf(args, ctx),
-        "head" => text::head(args, ctx),
-        "tail" => text::tail(args, ctx),
-        "wc" => text::wc(args, ctx),
-        "grep" => text::grep(args, ctx),
-        "sort" => text::sort(args, ctx),
-        "uniq" => text::uniq(args, ctx),
-        "cut" => text::cut(args, ctx),
-        "tr" => text::tr(args, ctx),
-        "seq" => text::seq(args, ctx),
-        "nl" => text::nl(args, ctx),
-        "rev" => text::rev(args, ctx),
-        "tac" => text::tac(args, ctx),
-        "paste" => text::paste(args, ctx),
-        "tee" => text::tee(args, ctx),
-        "cmp" => text::cmp(args, ctx),
-        "base64" => text::base64(args, ctx),
-        "hexdump" | "xxd" => text::hexdump(args, ctx),
-        "sha256sum" => text::sha256sum(args, ctx),
-        "env" => system::env(args, ctx),
-        "printenv" => system::printenv(args, ctx),
-        "uname" => system::uname(args, ctx),
-        "whoami" => system::whoami(args, ctx),
-        "id" => system::id(args, ctx),
-        "hostname" => system::hostname(args, ctx),
-        "nproc" => system::nproc(args, ctx),
-        "arch" => system::arch(args, ctx),
-        "uptime" => system::uptime(args, ctx),
-        "free" => system::free(args, ctx),
-        "test" | "[" => system::test(args, ctx),
-        "expr" => system::expr(args, ctx),
-        "true" | ":" => 0,
-        "false" => 1,
-        "yes" => text::yes(args, ctx),
-        _ => {
+    match command(name) {
+        Some(spec) => (spec.run)(args, ctx),
+        None => {
             error(ctx.stderr, name, "command not found");
             127
         }
     }
+}
+
+/// Runs a command on behalf of another command, bounding the nesting.
+pub(super) fn run_nested(name: &str, args: &[String], ctx: &mut Ctx<'_>) -> i32 {
+    if ctx.depth >= MAX_COMMAND_DEPTH {
+        error(ctx.stderr, name, "commands are nested too deeply");
+        return 126;
+    }
+    ctx.depth += 1;
+    let status = run(name, args, ctx);
+    ctx.depth -= 1;
+    status
 }
 
 /// A [`fmt::Write`] adapter over an output sink.
@@ -469,11 +631,6 @@ pub(super) fn format_size(bytes: usize) -> String {
     }
 }
 
-/// Returns `true` when `arg` is a short/long option and not a bare `-`.
-pub(super) fn is_option(arg: &str) -> bool {
-    arg.len() > 1 && arg.starts_with('-')
-}
-
 /// Parses an integer option value.
 pub(super) fn parse_usize(text: &str) -> Option<usize> {
     text.parse().ok()
@@ -488,7 +645,7 @@ pub(super) fn parse_i64(text: &str) -> Option<i64> {
 /// Reads all of a file, or standard input for `-`.
 pub(super) fn read_path(ctx: &mut Ctx<'_>, path: &str) -> Result<Vec<u8>, FsError> {
     if path == "-" {
-        Ok(ctx.stdin.read_to_end())
+        ctx.stdin.try_read_to_end(MAX_STREAM_BYTES)
     } else {
         ctx.fs.read_file(path)
     }
@@ -577,6 +734,7 @@ mod tests {
                 stdout: &mut stdout,
                 stderr: &mut stderr,
                 system: &NoSystem,
+                depth: 0,
             };
             let status = run(name, &args, &mut ctx);
             (
@@ -679,6 +837,28 @@ mod tests {
         assert_eq!(h.run("test", &["-f", "file"]).0, 0);
         assert_eq!(h.run("test", &["-d", "file"]).0, 1);
         assert_eq!(h.run("test", &["3", "-gt", "2"]).0, 0);
-        assert_eq!(h.run("expr", &["2", "+", "3", "*", "4"]).1, "20\n");
+        assert_eq!(h.run("expr", &["2", "+", "3", "*", "4"]).1, "14\n");
+    }
+
+    #[test]
+    fn every_listed_command_dispatches() {
+        for spec in COMMANDS {
+            for name in core::iter::once(&spec.name).chain(spec.aliases) {
+                let mut h = Harness::new();
+                let (status, _, err) = h.run(name, &[]);
+                assert_ne!(status, 127, "{name} does not dispatch: {err}");
+                assert!(!err.contains("command not found"), "{name}: {err}");
+                assert!(is_command(name));
+            }
+        }
+    }
+
+    #[test]
+    fn nested_commands_are_bounded() {
+        let mut h = Harness::new();
+        let args = alloc::vec!["xargs"; 100];
+        let (status, _, err) = h.run_stdin("xargs", &args, b"a\n");
+        assert_ne!(status, 0);
+        assert!(err.contains("nested too deeply"), "{err}");
     }
 }

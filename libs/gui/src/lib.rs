@@ -46,8 +46,7 @@
 //! A platform driver feeds [`Event`]s into [`Input`], calls
 //! [`Input::clear_events`] once per frame, and keeps the pointer state that
 //! [`Input`] tracks. [`Ui`] derives hover, press, click, drag, wheel and
-//! keyboard focus from those events. The current feos board has no mouse or
-//! keyboard driver yet; the API is ready for one, and apps can still render.
+//! keyboard focus from those events.
 //!
 //! # State
 //!
@@ -78,7 +77,7 @@ mod math;
 
 pub use chart::{Chart, ChartPoint, Series, SeriesKind};
 pub use components::*;
-pub use cursor::{draw_cursor, draw_cursor_shape, CursorShape};
+pub use cursor::{cursor_bounds, draw_cursor, draw_cursor_shape, CursorShape};
 pub use geometry::{Align, Padding, RectExt, VerticalAlign};
 pub use id::Id;
 pub use input::{Event, Input, Key, Modifiers, MouseButton};

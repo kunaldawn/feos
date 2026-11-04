@@ -30,6 +30,18 @@ pub enum Codec {
     RawYuv422,
     /// Planar YUV 4:4:4.
     RawYuv444,
+    /// Planar YVU 4:2:0 (YV12).
+    RawYv12,
+    /// Planar YVU 4:2:2 (YV16).
+    RawYv16,
+    /// Planar YVU 4:4:4 (YV24).
+    RawYv24,
+    /// 8-bit palette indices with a BGRA palette in the container.
+    RawPal8,
+    /// 16-bit RGB 5:5:5.
+    RawBgr555,
+    /// 16-bit RGB 5:6:5.
+    RawBgr565,
     /// Packed YUY2.
     RawYuy2,
     /// Packed UYVY.
@@ -90,6 +102,12 @@ impl Codec {
             Self::RawYuv420 => "raw-yuv420",
             Self::RawYuv422 => "raw-yuv422",
             Self::RawYuv444 => "raw-yuv444",
+            Self::RawYv12 => "raw-yv12",
+            Self::RawYv16 => "raw-yv16",
+            Self::RawYv24 => "raw-yv24",
+            Self::RawPal8 => "raw-pal8",
+            Self::RawBgr555 => "raw-bgr555",
+            Self::RawBgr565 => "raw-bgr565",
             Self::RawYuy2 => "raw-yuy2",
             Self::RawUyvy => "raw-uyvy",
             Self::Rle8 => "rle8",
@@ -129,6 +147,12 @@ impl Codec {
                 | Self::RawYuv420
                 | Self::RawYuv422
                 | Self::RawYuv444
+                | Self::RawYv12
+                | Self::RawYv16
+                | Self::RawYv24
+                | Self::RawPal8
+                | Self::RawBgr555
+                | Self::RawBgr565
                 | Self::RawYuy2
                 | Self::RawUyvy
                 | Self::Rle8
@@ -148,6 +172,12 @@ impl Codec {
             Self::RawYuv420 => Some(PixelFormat::Yuv420p),
             Self::RawYuv422 => Some(PixelFormat::Yuv422p),
             Self::RawYuv444 => Some(PixelFormat::Yuv444p),
+            Self::RawYv12 => Some(PixelFormat::Yvu420p),
+            Self::RawYv16 => Some(PixelFormat::Yvu422p),
+            Self::RawYv24 => Some(PixelFormat::Yvu444p),
+            Self::RawPal8 => Some(PixelFormat::Pal8),
+            Self::RawBgr555 => Some(PixelFormat::Bgr555),
+            Self::RawBgr565 => Some(PixelFormat::Bgr565),
             Self::RawYuy2 => Some(PixelFormat::Yuy2),
             Self::RawUyvy => Some(PixelFormat::Uyvy),
             _ => None,
@@ -179,9 +209,12 @@ impl Codec {
             b"CVID" | b"cvid" => Self::Cinepak,
             b"YUY2" | b"yuy2" => Self::RawYuy2,
             b"UYVY" | b"uyvy" => Self::RawUyvy,
-            b"YV12" | b"yv12" | b"I420" | b"i420" | b"IYUV" => Self::RawYuv420,
-            b"YV16" | b"yv16" => Self::RawYuv422,
-            b"YV24" | b"yv24" => Self::RawYuv444,
+            b"I420" | b"i420" | b"IYUV" => Self::RawYuv420,
+            b"YV12" | b"yv12" => Self::RawYv12,
+            b"Y42B" => Self::RawYuv422,
+            b"YV16" | b"yv16" => Self::RawYv16,
+            b"444P" => Self::RawYuv444,
+            b"YV24" | b"yv24" => Self::RawYv24,
             b"RGB " | b"rgb " => Self::RawBgr,
             b"BGR " | b"bgr " => Self::RawBgr,
             b"RGBA" | b"rgba" => Self::RawRgba,
@@ -235,8 +268,22 @@ impl Codec {
             b"V_PRORES" => Self::ProRes,
             b"V_MJPEG" | b"V_JPEG" => Self::Mjpeg,
             b"V_MS/VFW/FOURCC" => Self::Unknown(0),
-            b"V_UNCOMPRESSED" => Self::RawBgr,
+            // The pixel layout is in Video/ColourSpace: see `from_colour_space`.
+            b"V_UNCOMPRESSED" => Self::Unknown(0),
             _ => Self::Unknown(0),
+        }
+    }
+
+    /// Maps a Matroska `ColourSpace` fourcc for `V_UNCOMPRESSED` to a codec.
+    pub fn from_colour_space(fourcc: [u8; 4]) -> Self {
+        match &fourcc {
+            b"RGB\x18" | b"RGB2" => Self::RawRgb,
+            b"BGR\x18" | b"\x18BGR" => Self::RawBgr,
+            b"RGBA" | b"RGB\x20" => Self::RawRgba,
+            b"BGRA" | b"BGR\x20" => Self::RawBgra,
+            b"Y800" | b"Y8  " | b"GREY" | b"Y1\0\x08" => Self::RawGray,
+            b"Y41B" => Self::Unknown(u32::from_be_bytes(fourcc)),
+            other => Self::from_avi(*other),
         }
     }
 

@@ -15,7 +15,9 @@
 //! 2. Register it in the `REGISTRY` of `feos-apps` (or your own app crate).
 //! 3. Add the crate to the kernel's dependencies if it is a separate crate.
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
+
+pub mod shell;
 
 use core::cell::Cell;
 
@@ -61,7 +63,8 @@ pub const PROCESS_ARGS_MAX: usize = 96;
 /// Lifecycle state of a process.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ProcessState {
-    /// Runnable, waiting for the scheduler.
+    /// Runnable, waiting for the scheduler. Also reported for a blocked process;
+    /// [`Processes::detail`] distinguishes the two.
     Ready,
     /// Currently executing.
     Running,
@@ -163,6 +166,44 @@ impl SystemInfo {
     }
 }
 
+/// The outcome of asking for a process to stop.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KillResult {
+    /// The process is gone.
+    Killed,
+    /// The process is flagged and goes at its next safe point: its owner's next
+    /// tick once it holds no locks. See [`Processes::kill_requested`].
+    Pending,
+    /// A kill was already pending for this process.
+    AlreadyPending,
+    /// No process has this PID.
+    NotFound,
+    /// This process may not be killed: it is the main shell.
+    Protected,
+}
+
+impl KillResult {
+    /// Returns `true` when the process has stopped or is going to.
+    pub const fn accepted(self) -> bool {
+        matches!(self, Self::Killed | Self::Pending | Self::AlreadyPending)
+    }
+}
+
+/// More about one process than [`ProcessInfo`] carries.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ProcessDetail {
+    /// The process is blocked, sleeping or waiting for a lock.
+    pub blocked: bool,
+    /// A kill is waiting for the process's next safe point.
+    pub kill_pending: bool,
+    /// Size of the process's stack, in bytes.
+    pub stack_size: usize,
+    /// The most stack the process has used so far, in bytes.
+    pub stack_used: usize,
+    /// Heap bytes the process currently owns.
+    pub heap_bytes: usize,
+}
+
 /// Reasons a process could not be started.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SpawnError {
@@ -187,7 +228,48 @@ pub trait Processes: Sync {
 
     /// Stops the process with `pid`. Returns `false` when it does not exist or
     /// is the main shell process.
+    ///
+    /// `true` doesn't mean it has stopped yet; [`try_kill`](Self::try_kill)
+    /// tells the two cases apart.
     fn kill(&self, pid: u32) -> bool;
+
+    /// Stops the process with `pid` and reports exactly what happened.
+    ///
+    /// The default keeps simple test doubles working.
+    fn try_kill(&self, pid: u32) -> KillResult {
+        if self.kill(pid) {
+            KillResult::Killed
+        } else {
+            KillResult::NotFound
+        }
+    }
+
+    /// Returns `true` when someone has asked the calling process to stop.
+    ///
+    /// A process holding heap memory gets a short grace period before it is
+    /// reaped. A long-running app that polls this and returns frees its memory
+    /// normally; one that doesn't has its allocations written off as leaked.
+    fn kill_requested(&self) -> bool {
+        false
+    }
+
+    /// Offers the CPU to another runnable process.
+    fn yield_now(&self) {}
+
+    /// Blocks the calling process for at least `ms` milliseconds.
+    ///
+    /// The default returns at once, for test doubles.
+    fn sleep_ms(&self, _ms: u64) {}
+
+    /// Details of the process with `pid`, when it exists.
+    fn detail(&self, _pid: u32) -> Option<ProcessDetail> {
+        None
+    }
+
+    /// Heap bytes lost so far to processes killed while they owned them.
+    fn leaked_heap_bytes(&self) -> usize {
+        0
+    }
 
     /// PID of the process calling this method.
     fn current(&self) -> u32;
@@ -451,11 +533,66 @@ pub trait App: Sync {
     /// Releases any state owned by a windowed session.
     fn close_window(&self) {}
 
+    /// Advances a minimized window, which receives no frames.
+    ///
+    /// The desktop calls this about ten times a second while the window is
+    /// minimized, with no canvas and no input. Use it to keep sampling or
+    /// playback state moving.
+    fn background_tick(&self, _platform: &Platform, _now_ms: u64) {}
+
+    /// Offers a dragged path to an open window. Returns `true` when the app
+    /// took it.
+    fn accept_drop(&self, _payload: &str) -> bool {
+        false
+    }
+
     /// Executes the app.
     fn run(&self, context: &mut Context<'_>);
 
     /// Returns `true` if `name` is the primary name or an alias.
     fn matches(&self, name: &str) -> bool {
         self.name() == name || self.aliases().contains(&name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Double;
+
+    impl Processes for Double {
+        fn spawn(&self, _app: &'static dyn App, _args: &str) -> Result<u32, SpawnError> {
+            Err(SpawnError::NoFreeSlot)
+        }
+
+        fn kill(&self, pid: u32) -> bool {
+            pid == 2
+        }
+
+        fn current(&self) -> u32 {
+            1
+        }
+
+        fn snapshot(&self, _out: &mut [ProcessInfo]) -> usize {
+            0
+        }
+    }
+
+    #[test]
+    fn try_kill_defaults_to_the_bool_answer() {
+        assert_eq!(Double.try_kill(2), KillResult::Killed);
+        assert_eq!(Double.try_kill(3), KillResult::NotFound);
+        assert!(!Double.kill_requested());
+        assert_eq!(Double.detail(2), None);
+    }
+
+    #[test]
+    fn only_some_kill_results_count_as_accepted() {
+        assert!(KillResult::Killed.accepted());
+        assert!(KillResult::Pending.accepted());
+        assert!(KillResult::AlreadyPending.accepted());
+        assert!(!KillResult::NotFound.accepted());
+        assert!(!KillResult::Protected.accepted());
     }
 }

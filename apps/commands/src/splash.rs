@@ -1,9 +1,10 @@
 //! `splash`: redraw the boot splash.
 
-use feos_app::{App, Context};
+use feos_app::{App, Context, WindowContext, WindowFrame};
 use feos_console::println;
 
-/// Re-renders the boot splash.
+/// Re-renders the boot splash, on the framebuffer from the shell and in a
+/// window from the desktop.
 pub struct Splash;
 
 impl App for Splash {
@@ -17,6 +18,19 @@ impl App for Splash {
 
     fn description(&self) -> &'static str {
         "redraw the boot splash"
+    }
+
+    fn windowed(&self) -> bool {
+        true
+    }
+
+    fn open_window(&self, _context: &WindowContext<'_, '_>) -> bool {
+        true
+    }
+
+    fn frame_window(&self, context: &mut WindowContext<'_, '_>) -> WindowFrame {
+        crate::ui::splash(context.canvas, context.platform.board.arch);
+        WindowFrame::Continue
     }
 
     fn run(&self, context: &mut Context<'_>) {

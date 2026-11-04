@@ -4,17 +4,17 @@
 //! the wallpaper selection), `Enter` launches the highlighted item, `Space`
 //! opens the Start menu, and `Escape` closes it. A virtio tablet supplies the
 //! pointer, so Start-menu items, taskbar buttons, desktop icons and window
-//! controls behave like their Windows XP counterparts. `Ctrl-\` (or the Start
-//! menu's "Log Off" button) returns to the shell.
+//! controls work as they look. `Ctrl-\` (or the Start menu's "Log Off" button)
+//! returns to the shell.
 //!
 //! The console and pointer are polled, so this loop never blocks: the
 //! scheduler keeps running background applications while the desktop redraws.
 
-use feos_app::Platform;
+use feos_app::{shell, Platform};
 use feos_console::println;
-use feos_desktop::StartMenuCommand;
-use feos_gfx::{Canvas, Point};
-use feos_gui::{Event, Input, MouseButton};
+use feos_desktop::{paint, CursorShape, DesktopResponse, StartMenuCommand};
+use feos_gfx::{Canvas, Point, Rect};
+use feos_gui::{Event, Input, Key, Modifiers, MouseButton, Painter};
 use feos_hal::PointerEvent;
 use feos_keys::{EvdevKeys, SerialKeys};
 
@@ -35,6 +35,9 @@ const MINUTE_MS: u64 = 60_000;
 const TICK_MS: u64 = 100;
 /// Idle sleep between polls.
 const FRAME_MS: u64 = 8;
+/// Keyboard bytes or reports read per poll. A burst stays in the device's ring and is
+/// read on the following frames, instead of overflowing the frame's queue.
+const KEYBOARD_BUDGET: usize = 32;
 
 /// Runs the desktop until the user logs off.
 ///
@@ -69,6 +72,13 @@ pub fn run_session(
         "[desktop] click Start, double-click desktop icons, drag windows; Ctrl-\\ returns to the shell"
     );
     super::prepare(&mut session, config, platform, true);
+    if let Some(front) = display.as_ref() {
+        super::provide_buffers(&mut session, front.width(), front.height());
+    }
+    // A retained session keeps the last frame in `back` and leaves the pointer
+    // out of it. Drawing straight to the scanout has nowhere to keep a frame.
+    session.set_retained(back.is_some());
+    shell::set_session_active(true);
 
     let mut last_tick = platform.clock.uptime_ms();
     let mut last_minute = u64::MAX;
@@ -79,21 +89,50 @@ pub fn run_session(
     if let Some((x, y)) = pointer_position {
         input.set_pointer(Point::new(x as i32, y as i32));
     }
+    let mut cursor = SoftCursor::new();
+    let mut scratch = Input::new();
 
     loop {
         let now = platform.clock.uptime_ms();
-        if keys.poll(now, &mut input) {
+        if keys.poll_limited(now, &mut input, KEYBOARD_BUDGET) {
             println!();
             println!("[desktop] log off - returning to the serial shell");
+            shell::set_session_active(false);
             return SessionExit::LogOff;
         }
 
         // A virtio keyboard (when QEMU exposes one) feeds the same GUI event
         // queue as the serial console, so windows work with either input.
         if let Some(keyboard) = platform.keyboard {
-            while let Some(event) = keyboard.poll() {
-                evdev.feed(event, &mut input);
+            let layout = session.config().keyboard_layout;
+            let mut budget = KEYBOARD_BUDGET;
+            // One report can decode to a key and its text, so stop while both
+            // still fit.
+            while budget > 0 && input.keyboard_capacity() >= 2 {
+                let Some(event) = keyboard.poll() else {
+                    break;
+                };
+                evdev.feed(event, &mut scratch);
+                for decoded in scratch.events() {
+                    input.push(layout.map_event(decoded));
+                }
+                scratch.clear_events();
+                budget -= 1;
             }
+        }
+
+        // The serial console's exit bytes have a keyboard equivalent. Ctrl-\
+        // always leaves. Ctrl-D is a terminal's end of input, so it only
+        // leaves when no hosted app has the keyboard.
+        let app_has_keyboard = session
+            .windows()
+            .focused_window()
+            .is_some_and(|window| window.runtime.is_some());
+        if wants_exit(&input, app_has_keyboard) {
+            println!();
+            println!("[desktop] log off - returning to the serial shell");
+            shell::set_session_active(false);
+            return SessionExit::LogOff;
         }
 
         // Drain the pointer device into this frame's GUI event queue. A
@@ -114,8 +153,18 @@ pub fn run_session(
             }
         }
 
-        let had_input = !input.is_empty();
-        if had_input {
+        // Requests apps posted during the last frame.
+        while let Some(notification) = shell::take_notification() {
+            session.notify(notification, now);
+            dirty = true;
+        }
+        let mut ran_foreground = false;
+        while let Some(request) = shell::take_request() {
+            ran_foreground |= super::apply_request(&mut session, request, platform, display);
+            dirty = true;
+        }
+
+        if !input.is_empty() {
             dirty = true;
         }
 
@@ -131,7 +180,16 @@ pub fn run_session(
             if session.tick_session(platform.processes) > 0 {
                 dirty = true;
             }
+            if session.expire_toasts(now) {
+                dirty = true;
+            }
+            session.tick_background(platform, now);
             last_tick = now;
+        }
+
+        if ran_foreground {
+            session.invalidate();
+            cursor.forget();
         }
 
         if dirty {
@@ -150,7 +208,7 @@ pub fn run_session(
                 || response.run.is_some()
                 || response.command != StartMenuCommand::None;
             if may_run_foreground {
-                present(display, back);
+                present(display, back, &response, input.pointer(), &mut cursor);
             }
 
             let ran_foreground = super::apply_response(&mut session, &response, platform, display);
@@ -164,23 +222,28 @@ pub fn run_session(
                     pointer_position = Some((x, y));
                     input.set_pointer(Point::new(x as i32, y as i32));
                 }
+                session.invalidate();
+                cursor.forget();
             }
 
             // A foreground app drew directly to the scanout buffer. Leave it
-            // alone and compose a fresh desktop frame on the next pass. A
-            // background launch also needs one more frame so its new window
-            // becomes visible.
+            // alone and compose a fresh desktop frame on the next pass.
             if !ran_foreground {
-                present(display, back);
+                present(display, back, &response, input.pointer(), &mut cursor);
             }
-            // Some interactions mutate state after the frame has already been
-            // painted (closing or minimising a window, for example). Compose
-            // one more frame so that result becomes visible.
-            dirty = ran_foreground || response.launch.is_some() || had_input;
+            // Some interactions change state after the frame was painted
+            // (closing a window, say), and a launch opens one. Only those need
+            // a second frame; a key typed into an open app does not.
+            dirty = ran_foreground
+                || response.launch.is_some()
+                || response.run.is_some()
+                || response.command != StartMenuCommand::None
+                || response.state_changed;
             animation_period = response.animation_period_ms;
 
             if response.command == StartMenuCommand::LogOff {
                 println!("[desktop] log off - returning to the serial shell");
+                shell::set_session_active(false);
                 return SessionExit::LogOff;
             }
         }
@@ -197,6 +260,71 @@ pub fn run_session(
 
         input.clear_events();
         platform.clock.idle_ms(FRAME_MS);
+    }
+}
+
+/// Whether this frame's keys ask to leave the desktop.
+fn wants_exit(input: &Input, app_has_keyboard: bool) -> bool {
+    input.keys().any(|(key, modifiers)| {
+        modifiers.contains(Modifiers::CTRL)
+            && match key {
+                Key::Character('\\') => true,
+                Key::Character('d' | 'D') => !app_has_keyboard,
+                _ => false,
+            }
+    })
+}
+
+/// The pointer, drawn on the scanout over the composed frame.
+///
+/// The composed frame stays free of cursor pixels, so moving the pointer only
+/// has to restore the old cursor's rectangle from it and draw the new one. The
+/// back buffer is the save-under.
+struct SoftCursor {
+    drawn: Option<Rect>,
+    position: Point,
+    shape: CursorShape,
+}
+
+impl SoftCursor {
+    const fn new() -> Self {
+        Self {
+            drawn: None,
+            position: Point::new(0, 0),
+            shape: CursorShape::Arrow,
+        }
+    }
+
+    /// Forgets the drawn cursor, because something else repainted the scanout.
+    fn forget(&mut self) {
+        self.drawn = None;
+    }
+
+    /// Restores what the cursor covered, if it needs to move or was erased, and
+    /// draws it.
+    fn update(
+        &mut self,
+        front: &mut Canvas<'static>,
+        back: &Canvas<'static>,
+        position: Point,
+        shape: CursorShape,
+        damage: Option<Rect>,
+    ) {
+        let overwritten = match (self.drawn, damage) {
+            (Some(drawn), Some(damage)) => drawn.intersect(damage).is_some(),
+            (None, _) => true,
+            _ => false,
+        };
+        if !overwritten && position == self.position && shape == self.shape {
+            return;
+        }
+        if let Some(drawn) = self.drawn {
+            front.copy_rect_from(back, drawn);
+        }
+        paint::draw_cursor_shape(&mut Painter::new(front), position.x, position.y, shape);
+        self.drawn = Some(paint::cursor_bounds(position.x, position.y, shape));
+        self.position = position;
+        self.shape = shape;
     }
 }
 
@@ -246,21 +374,96 @@ fn push_pointer(input: &mut Input, report: PointerEvent, last: &mut (u16, u16)) 
     changed
 }
 
-/// Copies the composed frame to the scanout buffer.
-fn present(display: &mut Option<Canvas<'static>>, back: &Option<Canvas<'static>>) {
+/// Copies what the frame changed to the scanout buffer, then the pointer.
+fn present(
+    display: &mut Option<Canvas<'static>>,
+    back: &Option<Canvas<'static>>,
+    response: &DesktopResponse,
+    pointer: Point,
+    cursor: &mut SoftCursor,
+) {
     let (Some(front), Some(back)) = (display.as_mut(), back.as_ref()) else {
         return;
     };
 
-    if front.stride() == back.stride() && front.pixels().len() == back.pixels().len() {
-        front.pixels_mut().copy_from_slice(back.pixels());
-    } else {
-        front.blit(
-            0,
-            0,
-            back.width() as u32,
-            back.height() as u32,
-            back.pixels(),
-        );
+    if let Some(damage) = response.damage {
+        front.copy_rect_from(back, damage);
+    }
+    cursor.update(front, back, pointer, response.cursor, response.damage);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys(key: Key, modifiers: Modifiers) -> Input {
+        let mut input = Input::new();
+        input.push(Event::KeyDown(key, modifiers));
+        input
+    }
+
+    #[test]
+    fn ctrl_backslash_always_leaves() {
+        let input = keys(Key::Character('\\'), Modifiers::CTRL);
+        assert!(wants_exit(&input, false));
+        assert!(wants_exit(&input, true));
+    }
+
+    #[test]
+    fn ctrl_d_belongs_to_a_focused_app() {
+        let input = keys(Key::Character('d'), Modifiers::CTRL);
+        assert!(wants_exit(&input, false));
+        assert!(!wants_exit(&input, true));
+    }
+
+    #[test]
+    fn plain_keys_do_not_leave() {
+        assert!(!wants_exit(&keys(Key::Character('d'), Modifiers::NONE), false));
+    }
+
+    fn solid(pixels: &'static mut [u32], width: usize, height: usize, color: u32) -> Canvas<'static> {
+        pixels.fill(color);
+        Canvas::new(pixels, width, height, width).unwrap()
+    }
+
+    fn leaked(width: usize, height: usize) -> &'static mut [u32] {
+        std::vec![0u32; width * height].leak()
+    }
+
+    #[test]
+    fn moving_the_soft_cursor_restores_what_it_covered() {
+        let mut front = solid(leaked(64, 64), 64, 64, 0x0011_2233);
+        let back = solid(leaked(64, 64), 64, 64, 0x0011_2233);
+        let mut cursor = SoftCursor::new();
+        cursor.update(&mut front, &back, Point::new(4, 4), CursorShape::Arrow, None);
+        assert_ne!(front.pixels(), back.pixels());
+
+        cursor.update(&mut front, &back, Point::new(40, 40), CursorShape::Arrow, None);
+        // Nothing is left of the old cursor.
+        for y in 0..30usize {
+            for x in 0..30usize {
+                assert_eq!(front.pixels()[y * 64 + x], 0x0011_2233, "{x},{y}");
+            }
+        }
+        assert_ne!(front.pixels()[42 * 64 + 41], 0x0011_2233);
+    }
+
+    #[test]
+    fn an_idle_cursor_costs_nothing_until_damage_reaches_it() {
+        let mut front = solid(leaked(64, 64), 64, 64, 1);
+        let back = solid(leaked(64, 64), 64, 64, 1);
+        let mut cursor = SoftCursor::new();
+        cursor.update(&mut front, &back, Point::new(4, 4), CursorShape::Arrow, None);
+        // A marker where the cursor is not; a redraw would not touch it either,
+        // so check the cursor survives damage that erases its pixels.
+        let far = Some(Rect::new(40, 40, 8, 8));
+        let tip = front.pixels()[4 * 64 + 4];
+        cursor.update(&mut front, &back, Point::new(4, 4), CursorShape::Arrow, far);
+        assert_eq!(front.pixels()[4 * 64 + 4], tip);
+
+        front.copy_rect_from(&back, Rect::new(0, 0, 32, 32));
+        let near = Some(Rect::new(0, 0, 32, 32));
+        cursor.update(&mut front, &back, Point::new(4, 4), CursorShape::Arrow, near);
+        assert_eq!(front.pixels()[4 * 64 + 4], tip);
     }
 }

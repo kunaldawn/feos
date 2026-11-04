@@ -9,16 +9,29 @@ use feos_gfx::{font, Canvas, Color, Point, Rect};
 use crate::geometry::{Align, RectExt, VerticalAlign};
 
 /// A clipped 2D drawing surface.
+///
+/// Two rectangles limit drawing. The *logical* clip is what widgets push and
+/// pop, and it also decides what the pointer can hit. The *paint mask* limits
+/// only pixels: the desktop sets it to the damaged part of the screen, so a
+/// frame runs all of its hit testing while repainting a small region.
 pub struct Painter<'a, 'buf> {
     canvas: &'a mut Canvas<'buf>,
+    /// `logical` intersected with `mask`: what drawing actually honours.
     clip: Rect,
+    logical: Rect,
+    mask: Rect,
 }
 
 impl<'a, 'buf> Painter<'a, 'buf> {
     /// Creates a painter covering the whole canvas.
     pub fn new(canvas: &'a mut Canvas<'buf>) -> Self {
         let clip = Rect::new(0, 0, canvas.width() as u32, canvas.height() as u32);
-        Self { canvas, clip }
+        Self {
+            canvas,
+            clip,
+            logical: clip,
+            mask: clip,
+        }
     }
 
     /// The underlying canvas.
@@ -51,31 +64,46 @@ impl<'a, 'buf> Painter<'a, 'buf> {
 
     /// The current clip rectangle.
     pub const fn clip(&self) -> Rect {
-        self.clip
+        self.logical
+    }
+
+    /// Limits pixel output to `rect` without changing the logical clip, so
+    /// [`clip_contains`](Self::clip_contains) and hit testing are unaffected.
+    pub fn set_paint_mask(&mut self, rect: Rect) {
+        self.mask = rect;
+        self.clip = self.logical.clipped_to(rect);
+    }
+
+    /// The current paint mask.
+    pub const fn paint_mask(&self) -> Rect {
+        self.mask
     }
 
     /// Intersects the current clip with `rect` and returns the previous clip.
     ///
     /// Pair every call with [`restore_clip`](Painter::restore_clip).
     pub fn push_clip(&mut self, rect: Rect) -> Rect {
-        let previous = self.clip;
-        self.clip = self.clip.clipped_to(rect);
+        let previous = self.logical;
+        self.logical = self.logical.clipped_to(rect);
+        self.clip = self.logical.clipped_to(self.mask);
         previous
     }
 
     /// Restores a clip returned by [`push_clip`](Painter::push_clip).
     pub fn restore_clip(&mut self, clip: Rect) {
-        self.clip = clip;
+        self.logical = clip;
+        self.clip = self.logical.clipped_to(self.mask);
     }
 
     /// Resets the clip to the whole canvas.
     pub fn reset_clip(&mut self) {
-        self.clip = self.canvas_rect();
+        self.logical = self.canvas_rect();
+        self.clip = self.logical.clipped_to(self.mask);
     }
 
     /// Returns `true` when `point` is inside the current clip.
     pub fn clip_contains(&self, point: Point) -> bool {
-        self.clip.contains(point)
+        self.logical.contains(point)
     }
 
     /// Returns `true` when `rect` overlaps the clip.
@@ -305,15 +333,27 @@ impl<'a, 'buf> Painter<'a, 'buf> {
         if clipped.is_empty() {
             return;
         }
-        if alpha == 255 {
-            self.canvas.fill_rect(clipped, color);
-            return;
-        }
+        self.canvas.blend_rect(clipped, color, alpha);
+    }
 
-        for y in clipped.y..clipped.bottom_i32() {
-            for x in clipped.x..clipped.right_i32() {
-                self.blend_pixel(x, y, color, alpha);
-            }
+    /// Fills `rect` with a vertical gradient, clipped to the painter's clip.
+    pub fn fill_vertical_gradient(&mut self, rect: Rect, top: Color, bottom: Color) {
+        self.canvas
+            .fill_vertical_gradient_clipped(rect, self.clip, top, bottom);
+    }
+
+    /// Copies a packed `width * height` image to `(x, y)`, clipped.
+    pub fn blit(&mut self, x: i32, y: i32, width: u32, height: u32, pixels: &[u32]) {
+        self.canvas
+            .blit_clipped(x, y, width, height, pixels, self.clip);
+    }
+
+    /// Copies the clipped part of `rect` from a canvas-sized cached layer.
+    pub fn restore_layer(&mut self, rect: Rect, pixels: &[u32], width: usize, height: usize) {
+        let clipped = rect.clipped_to(self.clip);
+        if !clipped.is_empty() {
+            self.canvas
+                .copy_rect_from_pixels(pixels, width, height, width, clipped);
         }
     }
 
@@ -430,34 +470,8 @@ impl<'a, 'buf> Painter<'a, 'buf> {
     }
 
     /// Draws a Bresenham line, clipped.
-    pub fn line(&mut self, mut x0: i32, mut y0: i32, x1: i32, y1: i32, color: Color) {
-        let dx = (x1 - x0).abs();
-        let sx = if x0 < x1 { 1 } else { -1 };
-        let dy = -(y1 - y0).abs();
-        let sy = if y0 < y1 { 1 } else { -1 };
-        let mut err = dx + dy;
-
-        loop {
-            self.put_pixel(x0, y0, color);
-            if x0 == x1 && y0 == y1 {
-                break;
-            }
-            let e2 = 2 * err;
-            if e2 >= dy {
-                if x0 == x1 {
-                    break;
-                }
-                err += dy;
-                x0 += sx;
-            }
-            if e2 <= dx {
-                if y0 == y1 {
-                    break;
-                }
-                err += dx;
-                y0 += sy;
-            }
-        }
+    pub fn line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, color: Color) {
+        self.canvas.line_clipped(x0, y0, x1, y1, self.clip, color);
     }
 
     /// Draws a one-pixel circle outline.
@@ -515,23 +529,8 @@ impl<'a, 'buf> Painter<'a, 'buf> {
 
     /// Draws one bitmap character. `scale` is clamped to 1..=16.
     pub fn draw_char(&mut self, x: i32, y: i32, ch: char, color: Color, scale: u32) {
-        let scale = scale.clamp(1, 16) as i32;
-        let glyph = font::glyph(ch);
-        for (row, bits) in glyph.iter().enumerate() {
-            for col in 0..font::GLYPH_WIDTH {
-                if bits & (1 << col) != 0 {
-                    self.fill_rect(
-                        Rect::new(
-                            x.saturating_add(col as i32 * scale),
-                            y.saturating_add(row as i32 * scale),
-                            scale as u32,
-                            scale as u32,
-                        ),
-                        color,
-                    );
-                }
-            }
-        }
+        self.canvas
+            .draw_char_clipped(x, y, ch, color, scale.clamp(1, 16), self.clip);
     }
 
     /// Draws text with newline, carriage-return and tab support.

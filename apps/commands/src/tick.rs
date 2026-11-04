@@ -1,7 +1,7 @@
 //! `tick`: print periodic progress, useful for demonstrating scheduling.
 //!
 //! Run it in the background with `spawn tick 10 250`, then keep using the
-//! shell: the timer preempts the busy loop and both processes make progress.
+//! shell: it sleeps between ticks, so both processes make progress.
 
 use feos_app::{App, Context};
 use feos_console::println;
@@ -41,7 +41,7 @@ impl App for Tick {
         let pid = context.platform.processes.current();
         for tick in 1..=count {
             println!("[pid {pid}] tick {tick}/{count}");
-            context.platform.clock.spin_ms(delay);
+            context.platform.clock.idle_ms(delay);
         }
         println!("[pid {pid}] done");
     }

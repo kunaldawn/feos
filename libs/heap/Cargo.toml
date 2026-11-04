@@ -1,0 +1,9 @@
+[package]
+name = "feos-heap"
+description = "First-fit heap with boundary tags, split from the kernel so it can be tested on the host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false

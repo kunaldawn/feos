@@ -6,4 +6,6 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+feos-archive = { workspace = true }
+feos-compress = { workspace = true }
 feos-fs = { workspace = true }

@@ -28,13 +28,23 @@ impl App for Ps {
         let count = context.platform.processes.snapshot(&mut processes);
         let current = context.platform.processes.current();
 
-        println!("  PID  STATE    NAME");
+        println!("  PID  STATE     STACK KiB  HEAP KiB  NAME");
         for process in &processes[..count] {
             let marker = if process.pid == current { '*' } else { ' ' };
+            let detail = context.platform.processes.detail(process.pid);
+            let state = match detail {
+                Some(detail) if detail.kill_pending => "killing",
+                Some(detail) if detail.blocked => "sleeping",
+                _ => state_name(process.state),
+            };
+            let detail = detail.unwrap_or_default();
             println!(
-                "{marker} {:>4}  {:<7}  {}",
+                "{marker} {:>4}  {:<8}  {:>4}/{:<4}  {:>8}  {}",
                 process.pid,
-                state_name(process.state),
+                state,
+                detail.stack_used / 1024,
+                detail.stack_size / 1024,
+                detail.heap_bytes / 1024,
                 process.name()
             );
         }

@@ -33,13 +33,30 @@ pub static ARCH: Aarch64 = Aarch64;
 
 /// One-time architecture initialization.
 ///
-/// The AArch64 boot stub already set up the CPU and stack; exception vectors
-/// are installed by the kernel after the console is available.
-pub fn init() {}
+/// The AArch64 boot stub already set up the CPU and stacks. This installs the
+/// exception vectors, so install the fault handler first.
+pub fn init() {
+    exceptions::init();
+}
+
+/// Describes the boot information pointer for the boot log.
+pub fn boot_info_label(boot_info: usize) -> &'static str {
+    // SAFETY: QEMU passes the address of the device tree in RAM, or zero.
+    if boot_info != 0 && unsafe { core::ptr::read_volatile(boot_info as *const u32) } == 0xedfe_0dd0
+    {
+        "device tree blob"
+    } else {
+        "no device tree blob"
+    }
+}
 
 impl Clock for Aarch64 {
     fn frequency(&self) -> u64 {
         timer::frequency()
+    }
+
+    fn name(&self) -> &'static str {
+        "generic timer"
     }
 
     fn ticks(&self) -> u64 {
@@ -76,5 +93,13 @@ impl Cpu for Aarch64 {
 
     fn halt(&self) -> ! {
         cpu::halt()
+    }
+
+    fn privilege_prefix(&self) -> &'static str {
+        "EL"
+    }
+
+    fn id_name(&self) -> &'static str {
+        "MIDR_EL1"
     }
 }

@@ -18,12 +18,13 @@ struct EntryInfo {
 }
 
 fn main() {
-    println!("cargo:rerun-if-changed=fs");
-    println!("cargo:rerun-if-changed=disk.img");
-    println!("cargo:rerun-if-changed=disk-fat32.img");
-    println!("cargo:rerun-if-changed=disk-exfat.img");
-
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
+
+    // Naming a file that doesn't exist makes Cargo treat this build as stale on
+    // every run, which relinks the kernel. Watching the directory notices the
+    // optional disk images appearing, whichever of them do exist.
+    println!("cargo:rerun-if-changed=.");
+
     let root = manifest_dir.join("fs");
 
     let mut found = Vec::new();

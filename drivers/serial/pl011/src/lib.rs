@@ -17,6 +17,7 @@ use core::ptr::{read_volatile, write_volatile};
 use feos_hal::Serial;
 
 const DR: usize = 0x00;
+const RSRECR: usize = 0x04;
 const FR: usize = 0x18;
 const IBRD: usize = 0x24;
 const FBRD: usize = 0x28;
@@ -28,6 +29,10 @@ const ICR: usize = 0x44;
 
 const FR_RXFE: u32 = 1 << 4; // receive FIFO empty
 const FR_TXFF: u32 = 1 << 5; // transmit FIFO full
+const DR_ERRORS: u32 = 0xf00; // overrun, break, parity and framing
+
+/// Transmit polls before giving up on a stuck UART.
+const TX_POLLS: usize = 100_000;
 
 const CR_UARTEN: u32 = 1 << 0;
 const CR_TXE: u32 = 1 << 8;
@@ -97,17 +102,29 @@ impl Serial for Pl011 {
     }
 
     fn write_byte(&self, byte: u8) {
-        while self.read(FR) & FR_TXFF != 0 {
+        // Bounded so a stuck UART costs characters, not the whole system.
+        for _ in 0..TX_POLLS {
+            if self.read(FR) & FR_TXFF == 0 {
+                break;
+            }
             core::hint::spin_loop();
         }
         self.write(DR, u32::from(byte));
     }
 
     fn read_byte(&self) -> Option<u8> {
-        if self.read(FR) & FR_RXFE != 0 {
-            None
-        } else {
-            Some((self.read(DR) & 0xff) as u8)
+        // Reading DR pops the byte, so bad ones are consumed. The bound keeps
+        // this a poll even if the FIFO never drains.
+        for _ in 0..32 {
+            if self.read(FR) & FR_RXFE != 0 {
+                return None;
+            }
+            let data = self.read(DR);
+            if data & DR_ERRORS == 0 {
+                return Some((data & 0xff) as u8);
+            }
+            self.write(RSRECR, 0);
         }
+        None
     }
 }

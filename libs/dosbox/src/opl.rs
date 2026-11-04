@@ -47,6 +47,13 @@ impl Opl {
         self.device.read_status()
     }
 
+    /// Runs the chip's timers for `usec` microseconds of guest time.
+    pub fn advance(&mut self, usec: u64) {
+        // Both timers overflow within a fifth of a second at their slowest, and
+        // their flags stay set until cleared, so longer gaps needn't be counted.
+        self.device.run(usec.min(1_000_000) as f64);
+    }
+
     /// Fills an interleaved stereo buffer.
     pub fn generate(&mut self, buffer: &mut [i16]) {
         let _ = self.device.generate_samples(buffer);
@@ -56,6 +63,28 @@ impl Opl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write(opl: &mut Opl, register: u8, value: u8) {
+        opl.write_address(0x388, register);
+        opl.write_data(0x389, value);
+    }
+
+    /// The standard AdLib detection sequence.
+    #[test]
+    fn adlib_detection_sees_the_timer_expire() {
+        let mut opl = Opl::new(48_000);
+        write(&mut opl, 4, 0x60);
+        write(&mut opl, 4, 0x80);
+        assert_eq!(opl.read_status() & 0xE0, 0);
+        write(&mut opl, 2, 0xFF);
+        write(&mut opl, 4, 0x21);
+        assert_eq!(opl.read_status() & 0xE0, 0, "just started");
+        opl.advance(100);
+        assert_eq!(opl.read_status() & 0xE0, 0xC0, "timer 1 expired");
+        write(&mut opl, 4, 0x60);
+        write(&mut opl, 4, 0x80);
+        assert_eq!(opl.read_status() & 0xE0, 0);
+    }
 
     #[test]
     fn opl_produces_samples_after_a_key_on() {

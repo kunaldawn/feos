@@ -251,6 +251,9 @@ impl<'a, 'b, 's, const N: usize> Ui<'a, 'b, 's, N> {
             popup_width.max(0) as u32,
             popup_height.max(0) as u32,
         );
+        if state.open {
+            self.float(popup);
+        }
 
         if state.open
             && self.pointer_pressed()
@@ -489,6 +492,9 @@ impl<'a, 'b, 's, const N: usize> Ui<'a, 'b, 's, N> {
             popup_width.max(0) as u32,
             popup_height.max(0) as u32,
         );
+        if state.open {
+            self.float(popup);
+        }
         if state.open
             && self.pointer_pressed()
             && !self.pointer_over(rect)
@@ -1841,6 +1847,7 @@ impl<'a, 'b, 's, const N: usize> Ui<'a, 'b, 's, N> {
                 .x
                 .clamp(canvas.x, (canvas.right_i32() - width).max(canvas.x));
             let popup = Rect::new(x, y, width as u32, height as u32);
+            self.float(popup);
             if self.pointer_pressed() && !self.pointer_over(rect) && !self.pointer_over(popup) {
                 state.open = false;
             }

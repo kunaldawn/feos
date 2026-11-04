@@ -6,6 +6,10 @@
 //! number, then falls into `interrupt_common`, which saves all general-purpose
 //! and XMM registers and calls [`x86_interrupt_dispatch`].
 //!
+//! The frame lives on a per-CPU stack the IDT switches to through the TSS (see
+//! [`crate::gdt`]), not on the interrupted task's stack. Once the scheduler has
+//! offered a task to other CPUs, this CPU no longer touches that task's stack.
+//!
 //! As on AArch64, the handler may replace the frame it receives. The return
 //! path restores whatever frame is on the stack, so the kernel scheduler can
 //! switch processes by copying a different saved frame into place.
@@ -16,6 +20,9 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::cpu;
 
+/// Vector of the software switch used by [`request_switch`].
+pub const SWITCH_VECTOR: u64 = 48;
+
 global_asm!(include_str!("interrupts.S"), options(att_syntax));
 
 /// Saved CPU state at the moment an interrupt was taken.
@@ -23,8 +30,8 @@ global_asm!(include_str!("interrupts.S"), options(att_syntax));
 /// The layout is part of the contract with `interrupt_common` in
 /// `interrupts.S`. The first 256 bytes hold XMM0..XMM15 (16 bytes each),
 /// followed by the general-purpose registers in push order. The frame is
-/// 8-byte aligned, not 16-byte aligned, because an interrupt can arrive in the
-/// middle of a function prologue.
+/// 8-byte aligned, not 16-byte aligned, because the CPU's push of five words
+/// leaves it that way.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct TrapFrame {
@@ -66,6 +73,9 @@ pub struct TrapFrame {
 // SS:RSP with the interrupt frame, even for a same-privilege interrupt.
 const _: () = assert!(core::mem::size_of::<TrapFrame>() == 432);
 const _: () = assert!(core::mem::align_of::<TrapFrame>() == 8);
+const _: () = assert!(core::mem::offset_of!(TrapFrame, xmm) == 0);
+const _: () = assert!(core::mem::offset_of!(TrapFrame, r15) == 256);
+const _: () = assert!(core::mem::offset_of!(TrapFrame, rax) == 368);
 const _: () = assert!(core::mem::offset_of!(TrapFrame, vector) == 376);
 const _: () = assert!(core::mem::offset_of!(TrapFrame, error) == 384);
 const _: () = assert!(core::mem::offset_of!(TrapFrame, rip) == 392);
@@ -123,6 +133,11 @@ impl TrapFrame {
         unsafe { core::ptr::write(stack as *mut u64, lr as u64) };
         frame
     }
+
+    /// Stack pointer of the interrupted context.
+    pub fn stack_pointer(&self) -> usize {
+        self.rsp as usize
+    }
 }
 
 /// Callback invoked with the frame of the interrupted process.
@@ -131,18 +146,24 @@ impl TrapFrame {
 pub type IrqHandler = fn(&mut TrapFrame);
 
 static HANDLER: AtomicUsize = AtomicUsize::new(0);
+static SWITCH_HANDLER: AtomicUsize = AtomicUsize::new(0);
 
 /// Installs the function called for every hardware interrupt.
 pub fn set_handler(handler: IrqHandler) {
     HANDLER.store(handler as usize, Ordering::Release);
 }
 
-fn handler() -> Option<IrqHandler> {
-    let address = HANDLER.load(Ordering::Acquire);
+/// Installs the function called when a thread uses [`request_switch`].
+pub fn set_switch_handler(handler: IrqHandler) {
+    SWITCH_HANDLER.store(handler as usize, Ordering::Release);
+}
+
+fn load_handler(slot: &AtomicUsize) -> Option<IrqHandler> {
+    let address = slot.load(Ordering::Acquire);
     if address == 0 {
         None
     } else {
-        // SAFETY: only `set_handler` writes this atomic, and a function
+        // SAFETY: only the setters above write these atomics, and a function
         // pointer is `usize`-sized on this target.
         Some(unsafe { transmute::<usize, IrqHandler>(address) })
     }
@@ -161,38 +182,52 @@ pub unsafe extern "C" fn x86_interrupt_dispatch(frame: *mut TrapFrame) {
         cpu::halt();
     }
 
-    if let Some(handler) = handler() {
+    let slot = if vector == SWITCH_VECTOR {
+        &SWITCH_HANDLER
+    } else {
+        &HANDLER
+    };
+    if let Some(handler) = load_handler(slot) {
         handler(&mut *frame);
     }
 }
 
+/// Traps into the switch handler registered with [`set_switch_handler`].
+///
+/// The trap saves this thread's full state like an interrupt does, even with
+/// interrupts masked, and the thread resumes after this call when it is next
+/// chosen.
+pub fn request_switch() {
+    // SAFETY: the handler restores every register before resuming this thread,
+    // and the interrupt gate moves to the per-CPU stack before pushing anything.
+    unsafe { asm!("int {vector}", vector = const SWITCH_VECTOR, options(nostack)) }
+}
+
 /// Enables maskable interrupts (`RFLAGS.IF = 1`).
 pub fn enable() {
-    // SAFETY: changing the interrupt mask has no memory side effects.
-    unsafe { asm!("sti", options(nomem, nostack)) }
+    // SAFETY: the handler preserves this thread's state.
+    unsafe { asm!("sti", options(nostack)) }
 }
 
 /// Disables maskable interrupts (`RFLAGS.IF = 0`).
 pub fn disable() {
-    // SAFETY: changing the interrupt mask has no memory side effects.
-    unsafe { asm!("cli", options(nomem, nostack)) }
+    // SAFETY: masking interrupts has no other effect.
+    unsafe { asm!("cli", options(nostack)) }
 }
 
 /// Disables interrupts and returns the previous `RFLAGS` value.
 pub fn save_and_disable() -> u64 {
-    let flags: u64;
-    // SAFETY: the stack has room for the flags word and the caller restores
-    // them through `restore`.
-    unsafe {
-        asm!("pushfq", "pop {}", "cli", out(reg) flags)
-    };
-    flags
+    feos_sync::irq::save_and_disable()
 }
 
 /// Restores an `RFLAGS` value captured by [`save_and_disable`].
 pub fn restore(flags: u64) {
-    // SAFETY: `flags` comes from `save_and_disable`, which read RFLAGS.
-    unsafe { asm!("push {}", "popfq", in(reg) flags) };
+    feos_sync::irq::restore(flags);
+}
+
+/// Returns `true` when interrupts are unmasked on this CPU.
+pub fn is_enabled() -> bool {
+    feos_sync::irq::is_enabled()
 }
 
 /// Waits for an interrupt.
@@ -202,5 +237,5 @@ pub fn restore(flags: u64) {
 /// explicit `sti` also makes it safe from a critical section.
 pub fn wait_for_interrupt() {
     // SAFETY: `sti`/`hlt` are available at ring 0.
-    unsafe { asm!("sti", "hlt", options(nomem, nostack)) }
+    unsafe { asm!("sti", "hlt", options(nostack)) }
 }

@@ -3,15 +3,15 @@
  *
  * VBAR_EL1 points at a 2 KiB aligned table with 16 entries of 128 bytes:
  * four groups of four (synchronous, IRQ, FIQ, SError):
- *   0-3   current EL, SP_EL0
- *   4-7   current EL, SP_ELx
+ *   0-3   current EL, SP_EL0   the kernel's threads run here (EL1t)
+ *   4-7   current EL, SP_ELx   the exception handlers themselves (EL1h)
  *   8-11  lower EL, AArch64
  *   12-15 lower EL, AArch32
  *
- * Synchronous faults and unexpected exceptions report the fault and halt.
- * IRQs taken from EL1 with SP_EL1 (slot 5, the only context the kernel runs
- * in) go through irq_entry, which saves a TrapFrame and lets the kernel
- * scheduler choose the next process.
+ * Every entry switches to SP_EL1 in hardware, which is a private stack for this
+ * CPU, and saves a full TrapFrame on it. A task's stack therefore holds none of
+ * its saved state once it has been offered to another CPU, and a task whose
+ * stack pointer is bad can still fault cleanly.
  */
 
 .section .text.vectors, "ax"
@@ -20,16 +20,11 @@
 exception_vector_table:
 .macro ventry index
     .balign 128
+    /* x0 and x1 are saved before the vector index overwrites x0. */
+    sub sp, sp, #800
+    stp x0, x1, [sp, #0]
     mov x0, #\index
-    b   exception_common
-.endm
-
-.macro irq_ventry index
-    .balign 128
-    /* Do not touch x0 here: irq_entry saves the interrupted registers, and
-     * overwriting an argument register before the save would corrupt the
-     * interrupted context. */
-    b   irq_entry
+    b   trap_common
 .endm
 
     ventry 0          /* current EL with SP0: synchronous */
@@ -38,7 +33,7 @@ exception_vector_table:
     ventry 3          /* current EL with SP0: SError */
 
     ventry 4          /* current EL with SPx: synchronous */
-    irq_ventry 5      /* current EL with SPx: IRQ */
+    ventry 5          /* current EL with SPx: IRQ */
     ventry 6          /* current EL with SPx: FIQ */
     ventry 7          /* current EL with SPx: SError */
 
@@ -53,41 +48,24 @@ exception_vector_table:
     ventry 15         /* lower EL, AArch32: SError */
 .size exception_vector_table, . - exception_vector_table
 
-.type exception_common, %function
-exception_common:
-    /* Arguments for exception_handler(): index, ESR, ELR, FAR, SPSR, SP. */
-    mrs x1, esr_el1
-    mrs x2, elr_el1
-    mrs x3, far_el1
-    mrs x4, spsr_el1
-    mov x5, sp
-    bl  exception_handler
-
-.Lhang:
-    wfe
-    b .Lhang
-.size exception_common, . - exception_common
-
 /*
- * Recoverable IRQ entry.
+ * Common trap entry. x0 holds the vector index; x0 and x1 are already saved.
  *
  * Save a TrapFrame (800 bytes, matching arch/aarch64/src/irq.rs):
  *   [   0, 248)  x0..x30
- *   [ 248, 256)  padding
+ *   [ 248, 256)  FPCR
  *   [ 256, 768)  q0..q31
  *   [ 768, 776)  interrupted SP
  *   [ 776, 784)  ELR_EL1
  *   [ 784, 792)  SPSR_EL1
- *   [ 792, 800)  padding
+ *   [ 792, 800)  FPSR
  *
- * irq_dispatch() may replace the frame in place with another process's saved
- * state. We then restore that state and eret into it.
+ * trap_dispatch() may replace the frame in place with another process's saved
+ * state. If it returns, we restore that state and eret into it. It only returns
+ * for traps taken from a thread on SP_EL0, so the restore targets SP_EL0.
  */
-.type irq_entry, %function
-irq_entry:
-    sub sp, sp, #800
-
-    stp x0, x1, [sp, #0]
+.type trap_common, %function
+trap_common:
     stp x2, x3, [sp, #16]
     stp x4, x5, [sp, #32]
     stp x6, x7, [sp, #48]
@@ -121,62 +99,108 @@ irq_entry:
     stp q28, q29, [sp, #704]
     stp q30, q31, [sp, #736]
 
-    add x9, sp, #800
+    /* Groups 0-3 interrupted SP_EL0; the others interrupted this stack. */
+    mrs x9, sp_el0
+    add x10, sp, #800
+    cmp x0, #4
+    csel x9, x9, x10, lo
     str x9, [sp, #768]
+
     mrs x9, elr_el1
     str x9, [sp, #776]
     mrs x9, spsr_el1
     str x9, [sp, #784]
+    mrs x9, fpcr
+    str x9, [sp, #248]
+    mrs x9, fpsr
+    str x9, [sp, #792]
 
-    mov x0, sp
-    bl  irq_dispatch
+    mov x1, sp
+    bl  trap_dispatch
 
-    /* Restore from the (possibly replaced) frame. x9 is the base until the
-     * very end, because x9 itself is one of the registers being restored. */
-    mov x9, sp
+    ldr x9, [sp, #768]
+    msr sp_el0, x9
+    ldr x9, [sp, #776]
+    msr elr_el1, x9
+    ldr x9, [sp, #784]
+    msr spsr_el1, x9
+    ldr x9, [sp, #248]
+    msr fpcr, x9
+    ldr x9, [sp, #792]
+    msr fpsr, x9
 
-    ldp q0, q1, [x9, #256]
-    ldp q2, q3, [x9, #288]
-    ldp q4, q5, [x9, #320]
-    ldp q6, q7, [x9, #352]
-    ldp q8, q9, [x9, #384]
-    ldp q10, q11, [x9, #416]
-    ldp q12, q13, [x9, #448]
-    ldp q14, q15, [x9, #480]
-    ldp q16, q17, [x9, #512]
-    ldp q18, q19, [x9, #544]
-    ldp q20, q21, [x9, #576]
-    ldp q22, q23, [x9, #608]
-    ldp q24, q25, [x9, #640]
-    ldp q26, q27, [x9, #672]
-    ldp q28, q29, [x9, #704]
-    ldp q30, q31, [x9, #736]
+    ldp q0, q1, [sp, #256]
+    ldp q2, q3, [sp, #288]
+    ldp q4, q5, [sp, #320]
+    ldp q6, q7, [sp, #352]
+    ldp q8, q9, [sp, #384]
+    ldp q10, q11, [sp, #416]
+    ldp q12, q13, [sp, #448]
+    ldp q14, q15, [sp, #480]
+    ldp q16, q17, [sp, #512]
+    ldp q18, q19, [sp, #544]
+    ldp q20, q21, [sp, #576]
+    ldp q22, q23, [sp, #608]
+    ldp q24, q25, [sp, #640]
+    ldp q26, q27, [sp, #672]
+    ldp q28, q29, [sp, #704]
+    ldp q30, q31, [sp, #736]
 
-    ldr x10, [x9, #768]
-    ldr x11, [x9, #776]
-    ldr x12, [x9, #784]
-    msr elr_el1, x11
-    msr spsr_el1, x12
-    mov sp, x10
-
-    ldp x0, x1, [x9, #0]
-    ldp x2, x3, [x9, #16]
-    ldp x4, x5, [x9, #32]
-    ldp x6, x7, [x9, #48]
-    ldr x8, [x9, #64]
-    ldr x10, [x9, #80]
-    ldp x11, x12, [x9, #88]
-    ldp x13, x14, [x9, #104]
-    ldp x15, x16, [x9, #120]
-    ldp x17, x18, [x9, #136]
-    ldp x19, x20, [x9, #152]
-    ldp x21, x22, [x9, #168]
-    ldp x23, x24, [x9, #184]
-    ldp x25, x26, [x9, #200]
-    ldp x27, x28, [x9, #216]
-    ldr x29, [x9, #232]
-    ldr x30, [x9, #240]
-    ldr x9, [x9, #72]
+    ldp x2, x3, [sp, #16]
+    ldp x4, x5, [sp, #32]
+    ldp x6, x7, [sp, #48]
+    ldp x8, x9, [sp, #64]
+    ldp x10, x11, [sp, #80]
+    ldp x12, x13, [sp, #96]
+    ldp x14, x15, [sp, #112]
+    ldp x16, x17, [sp, #128]
+    ldp x18, x19, [sp, #144]
+    ldp x20, x21, [sp, #160]
+    ldp x22, x23, [sp, #176]
+    ldp x24, x25, [sp, #192]
+    ldp x26, x27, [sp, #208]
+    ldp x28, x29, [sp, #224]
+    ldr x30, [sp, #240]
+    ldp x0, x1, [sp, #0]
+    add sp, sp, #800
 
     eret
-.size irq_entry, . - irq_entry
+.size trap_common, . - trap_common
+
+/*
+ * Vectors used until the kernel installs the table above. Nothing can recover
+ * this early, and the likely cause is the image not fitting in RAM.
+ */
+.balign 2048
+.global early_vector_table
+early_vector_table:
+.rept 16
+    .balign 128
+    b   early_fault
+.endr
+
+.type early_fault, %function
+early_fault:
+    adrp x0, early_fault_message
+    add  x0, x0, :lo12:early_fault_message
+    b    early_print
+.size early_fault, . - early_fault
+
+/* Writes the NUL-terminated string at x0 to the board's UART, then parks. */
+.global early_print
+.type early_print, %function
+early_print:
+    ldr  x1, =__early_uart
+1:  ldrb w2, [x0], #1
+    cbz  w2, 2f
+    str  w2, [x1]
+    b    1b
+2:  msr  daifset, #0xf
+3:  wfe
+    b    3b
+.size early_print, . - early_print
+.ltorg
+
+.section .rodata
+early_fault_message:
+    .asciz "\r\nfeos: fault before the kernel started; does the machine have enough RAM for the image?\r\n"

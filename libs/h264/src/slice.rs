@@ -6,6 +6,14 @@ use crate::nal::NalUnitType;
 use crate::pps::Pps;
 use crate::sps::Sps;
 
+/// Upper bound on MMCO commands per picture: each of up to 32 fields' worth of
+/// references can be marked twice, plus the two commands that act on all.
+const MAX_MMCO_OPS: usize = 66;
+/// `difference_of_pic_nums_minus1` is below MaxPicNum, at most 2^16.
+const MAX_PIC_NUM: u32 = 1 << 16;
+/// Long-term frame indices are below MaxLongTermFrameIdx, at most 16 for frames.
+const MAX_LONG_TERM_IDX: u32 = 16;
+
 /// Slice types per H.264 Table 7-6.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SliceType {
@@ -99,13 +107,13 @@ impl SliceHeader {
 
 /// Parse a slice header from RBSP data. Returns the header and a reader
 /// positioned at the start of slice data (macroblock layer).
-pub fn parse_slice_header(
-    rbsp: &[u8],
+pub fn parse_slice_header<'a>(
+    rbsp: &'a [u8],
     sps: &Sps,
     pps: &Pps,
     nal_unit_type: NalUnitType,
     nal_ref_idc: u8,
-) -> Result<(SliceHeader, BitstreamReader), DecodeError> {
+) -> Result<(SliceHeader, BitstreamReader<'a>), DecodeError> {
     let mut r = BitstreamReader::new(rbsp);
 
     let first_mb_in_slice = r.read_ue()?;
@@ -198,29 +206,9 @@ pub fn parse_slice_header(
     let mut ref_list_mod_l0 = Vec::new();
     let mut ref_list_mod_l1 = Vec::new();
     if slice_type != SliceType::I && slice_type != SliceType::Si {
-        let ref_pic_list_modification_flag_l0 = r.read_bit()? != 0;
-        if ref_pic_list_modification_flag_l0 {
-            loop {
-                let idc = r.read_ue()?;
-                if idc == 3 {
-                    break;
-                }
-                let val = r.read_ue()?;
-                ref_list_mod_l0.push((idc, val));
-            }
-        }
+        ref_list_mod_l0 = read_ref_list_modification(&mut r, num_ref_idx_l0_active)?;
         if slice_type == SliceType::B {
-            let ref_pic_list_modification_flag_l1 = r.read_bit()? != 0;
-            if ref_pic_list_modification_flag_l1 {
-                loop {
-                    let idc = r.read_ue()?;
-                    if idc == 3 {
-                        break;
-                    }
-                    let val = r.read_ue()?;
-                    ref_list_mod_l1.push((idc, val));
-                }
-            }
+            ref_list_mod_l1 = read_ref_list_modification(&mut r, num_ref_idx_l1_active)?;
         }
     }
 
@@ -269,9 +257,15 @@ pub fn parse_slice_header(
                 if op == 0 {
                     break;
                 }
+                if mmco_ops.len() >= MAX_MMCO_OPS {
+                    return Err(DecodeError::InvalidSyntax("too many MMCO commands"));
+                }
                 match op {
                     1 => {
                         let diff = r.read_ue()?;
+                        if diff >= MAX_PIC_NUM {
+                            return Err(DecodeError::InvalidSyntax("MMCO picNum out of range"));
+                        }
                         mmco_ops.push((1, diff));
                     }
                     2 => {
@@ -281,10 +275,16 @@ pub fn parse_slice_header(
                     3 => {
                         let diff = r.read_ue()?;
                         let long_term_frame_idx = r.read_ue()?;
+                        if diff >= MAX_PIC_NUM || long_term_frame_idx >= MAX_LONG_TERM_IDX {
+                            return Err(DecodeError::InvalidSyntax("MMCO long-term out of range"));
+                        }
                         mmco_ops.push((3, diff | (long_term_frame_idx << 16)));
                     }
                     4 => {
                         let max_long_term_frame_idx_plus1 = r.read_ue()?;
+                        if max_long_term_frame_idx_plus1 > MAX_LONG_TERM_IDX {
+                            return Err(DecodeError::InvalidSyntax("MMCO long-term out of range"));
+                        }
                         mmco_ops.push((4, max_long_term_frame_idx_plus1));
                     }
                     5 => {
@@ -292,9 +292,12 @@ pub fn parse_slice_header(
                     }
                     6 => {
                         let long_term_frame_idx = r.read_ue()?;
+                        if long_term_frame_idx >= MAX_LONG_TERM_IDX {
+                            return Err(DecodeError::InvalidSyntax("MMCO long-term out of range"));
+                        }
                         mmco_ops.push((6, long_term_frame_idx));
                     }
-                    _ => break,
+                    _ => return Err(DecodeError::InvalidSyntax("invalid MMCO command")),
                 }
             }
         }
@@ -317,15 +320,33 @@ pub fn parse_slice_header(
     };
 
     let slice_qp_delta = r.read_se()?;
+    let slice_qp = (pps.pic_init_qp_minus26 + 26).saturating_add(slice_qp_delta);
+    if !(0..=51).contains(&slice_qp) {
+        return Err(DecodeError::InvalidSyntax("slice QP out of range"));
+    }
+    if slice_type == SliceType::Sp || slice_type == SliceType::Si {
+        // Rejected by the decoder before use; the fields below aren't read.
+        return Err(DecodeError::Unsupported("SP and SI slices not supported"));
+    }
 
     let mut disable_deblocking_filter_idc = 0;
     let mut slice_alpha_c0_offset_div2 = 0;
     let mut slice_beta_offset_div2 = 0;
     if pps.deblocking_filter_control_present_flag {
         disable_deblocking_filter_idc = r.read_ue()?;
+        if disable_deblocking_filter_idc > 2 {
+            return Err(DecodeError::InvalidSyntax(
+                "disable_deblocking_filter_idc out of range",
+            ));
+        }
         if disable_deblocking_filter_idc != 1 {
             slice_alpha_c0_offset_div2 = r.read_se()?;
             slice_beta_offset_div2 = r.read_se()?;
+            if !(-6..=6).contains(&slice_alpha_c0_offset_div2)
+                || !(-6..=6).contains(&slice_beta_offset_div2)
+            {
+                return Err(DecodeError::InvalidSyntax("deblocking offset out of range"));
+            }
         }
     }
 
@@ -360,6 +381,45 @@ pub fn parse_slice_header(
     Ok((header, r))
 }
 
+/// Reads ref_pic_list_modification() for one list (spec 7.3.3.1). The spec
+/// allows at most `num_active` commands before the terminator, which also
+/// bounds the allocation however long the input is.
+fn read_ref_list_modification(
+    r: &mut BitstreamReader,
+    num_active: u32,
+) -> Result<Vec<(u32, u32)>, DecodeError> {
+    let mut ops = Vec::new();
+    if r.read_bit()? == 0 {
+        return Ok(ops);
+    }
+    loop {
+        let idc = r.read_ue()?;
+        if idc == 3 {
+            return Ok(ops);
+        }
+        if idc > 2 {
+            return Err(DecodeError::InvalidSyntax(
+                "modification_of_pic_nums_idc out of range",
+            ));
+        }
+        if ops.len() >= num_active as usize {
+            return Err(DecodeError::InvalidSyntax(
+                "too many reference list modifications",
+            ));
+        }
+        ops.push((idc, r.read_ue()?));
+    }
+}
+
+/// Explicit weights and offsets are constrained to -128..=127 (spec 7.4.3.2).
+fn check_weight(weight: i32, offset: i32) -> Result<(), &'static str> {
+    if (-128..=127).contains(&weight) && (-128..=127).contains(&offset) {
+        Ok(())
+    } else {
+        Err("prediction weight out of range")
+    }
+}
+
 fn read_weight_list(
     r: &mut BitstreamReader,
     count: u32,
@@ -377,11 +437,13 @@ fn read_weight_list(
         if r.read_bit()? != 0 {
             weight.luma_weight = r.read_se()?;
             weight.luma_offset = r.read_se()?;
+            check_weight(weight.luma_weight, weight.luma_offset)?;
         }
         if r.read_bit()? != 0 {
             for component in 0..2 {
                 weight.chroma_weight[component] = r.read_se()?;
                 weight.chroma_offset[component] = r.read_se()?;
+                check_weight(weight.chroma_weight[component], weight.chroma_offset[component])?;
             }
         }
         weights.push(weight);

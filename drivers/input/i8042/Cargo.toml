@@ -8,3 +8,4 @@ license.workspace = true
 [dependencies]
 feos-hal = { workspace = true }
 feos-sync = { workspace = true }
+feos-port-io = { workspace = true }

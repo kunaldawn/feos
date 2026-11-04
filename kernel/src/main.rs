@@ -9,10 +9,9 @@
 #![no_main]
 
 mod allocator;
+mod fatal;
 mod sched;
 mod smp;
-
-use core::panic::PanicInfo;
 
 use feos_app::{BoardInfo, Platform};
 use feos_console::println;
@@ -27,7 +26,14 @@ use feos_board_qemu_virt as board;
 use feos_board_qemu_x86_64 as board;
 
 use arch::{cpu, exceptions, irq, timer};
-use feos_hal::{Memory, MemoryInfo};
+use feos_hal::{Board, Memory, MemoryInfo};
+
+/// The board this kernel was built for. Going through the [`Board`] trait holds
+/// every port to the same surface.
+#[cfg(target_arch = "aarch64")]
+pub(crate) type Machine = board::QemuVirt;
+#[cfg(target_arch = "x86_64")]
+pub(crate) type Machine = board::QemuX86_64;
 
 /// Kernel memory accounting for the task manager.
 struct KernelMemory;
@@ -35,8 +41,8 @@ struct KernelMemory;
 impl Memory for KernelMemory {
     fn info(&self) -> MemoryInfo {
         let heap = allocator::stats();
-        let (kernel_start, _) = board::kernel_range();
-        let (_, bss_end) = board::bss_range();
+        let (kernel_start, _) = Machine::kernel_range();
+        let (_, bss_end) = Machine::bss_range();
         let total_bytes = bss_end.saturating_sub(kernel_start);
         MemoryInfo {
             total_bytes,
@@ -58,61 +64,40 @@ static KERNEL_MEMORY: KernelMemory = KernelMemory;
 /// passes the multiboot information pointer in `rdi`.
 #[no_mangle]
 pub extern "C" fn kmain(boot_info: usize) -> ! {
-    board::init_console();
+    Machine::init_console();
     feos_console::set_waiter(wait_for_console);
 
     println!();
-    println!("feos {} - a tiny {} kernel", env!("CARGO_PKG_VERSION"), board::ARCH);
+    println!("feos {} - a tiny {} kernel", env!("CARGO_PKG_VERSION"), Machine::ARCH);
     println!("----------------------------------------");
 
     // Install IDT/vectors and calibrate the architecture clock before any
     // interrupt can arrive.
+    exceptions::set_handler(fatal::on_exception);
     arch::init();
-
-    exceptions::set_handler(report_exception);
-    exceptions::init();
     println!("[boot] exception vectors installed");
     println!(
         "[boot] UART ready at {:#x} ({})",
-        board::CONSOLE_BASE,
-        board::CONSOLE_NAME
+        Machine::CONSOLE_BASE,
+        Machine::CONSOLE_NAME
     );
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        if boot_info != 0
-            && unsafe { core::ptr::read_volatile(boot_info as *const u32) } == 0xd00d_feed
-        {
-            println!("[boot] device tree blob at {boot_info:#x}");
-        } else {
-            println!("[boot] no DTB passed by QEMU (x0 = {boot_info:#x})");
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if boot_info != 0 {
-            println!("[boot] multiboot information at {boot_info:#x}");
-        } else {
-            println!("[boot] no multiboot information pointer");
-        }
-    }
+    println!("[boot] {} at {boot_info:#x}", arch::boot_info_label(boot_info));
 
     // Bring up the ramfb framebuffer if QEMU provides one.
-    let mut display = board::init_display();
+    let mut display = Machine::init_display();
     let mut back = if display.is_some() {
-        board::back_buffer()
+        Machine::back_buffer()
     } else {
         None
     };
     match display.as_mut() {
         Some(canvas) => {
-            feos_apps::ui::splash(canvas, board::ARCH);
+            feos_apps::ui::splash(canvas, Machine::ARCH);
             println!(
                 "[gfx] ramfb {}x{} XRGB8888 at {:#x}",
                 canvas.width(),
                 canvas.height(),
-                board::framebuffer_addr()
+                Machine::framebuffer_addr()
             );
         }
         None => println!("[gfx] no framebuffer (start QEMU with -device ramfb)"),
@@ -121,7 +106,7 @@ pub extern "C" fn kmain(boot_info: usize) -> ! {
     println!();
     let services = &arch::ARCH;
 
-    let audio = board::init_audio(services);
+    let audio = Machine::init_audio(&sched::CLOCK);
     match audio.as_ref() {
         Some(audio) => println!(
             "[audio] Intel HDA ready: {} Hz, {} channel(s), codec {:#x} (DAC {}, pin {})",
@@ -136,45 +121,45 @@ pub extern "C" fn kmain(boot_info: usize) -> ! {
         ),
     }
 
-    let pointer = board::init_pointer();
+    let pointer = Machine::init_pointer();
     match pointer {
-        Some(kind) => println!("[input] {} pointer ready ({kind:?})", board::POINTER_NAME),
+        Some(kind) => println!("[input] {} pointer ready ({kind:?})", Machine::POINTER_NAME),
         None => println!(
             "[input] no {} pointer ({})",
-            board::POINTER_NAME,
-            board::POINTER_HINT
+            Machine::POINTER_NAME,
+            Machine::POINTER_HINT
         ),
     }
 
-    if board::init_keyboard() {
-        println!("[input] {} keyboard ready", board::KEYBOARD_NAME);
+    if Machine::init_keyboard() {
+        println!("[input] {} keyboard ready", Machine::KEYBOARD_NAME);
     } else {
         println!(
             "[input] no {} keyboard ({})",
-            board::KEYBOARD_NAME,
-            board::KEYBOARD_HINT
+            Machine::KEYBOARD_NAME,
+            Machine::KEYBOARD_HINT
         );
     }
 
     let platform = Platform {
         board: BoardInfo {
-            name: board::NAME,
-            arch: board::ARCH,
-            console_base: board::CONSOLE_BASE,
-            framebuffer_addr: board::framebuffer_addr(),
-            kernel_range: board::kernel_range(),
-            bss_range: board::bss_range(),
+            name: Machine::NAME,
+            arch: Machine::ARCH,
+            console_base: Machine::CONSOLE_BASE,
+            framebuffer_addr: Machine::framebuffer_addr(),
+            kernel_range: Machine::kernel_range(),
+            bss_range: Machine::bss_range(),
         },
-        clock: services,
+        clock: &sched::CLOCK,
         power: services,
         cpu: services,
         audio: audio.as_ref().map(|audio| audio.device),
-        pointer: board::pointer(),
-        keyboard: board::keyboard(),
+        pointer: Machine::pointer(),
+        keyboard: Machine::keyboard(),
         processes: &sched::PROCESSES,
         memory: Some(&KERNEL_MEMORY),
         apps: &feos_apps::APP_REGISTRY,
-        filesystem: Some(board::filesystem()),
+        filesystem: Some(Machine::filesystem()),
     };
 
     // Background processes read the platform through this static.
@@ -182,11 +167,12 @@ pub extern "C" fn kmain(boot_info: usize) -> ! {
     sched::init();
 
     irq::set_handler(on_irq);
-    board::init_interrupts();
+    irq::set_switch_handler(sched::on_switch_request);
+    Machine::init_interrupts();
     println!(
         "[sched] {} interrupt controller, timer IRQ {}",
-        board::INTERRUPT_CONTROLLER_NAME,
-        board::TIMER_IRQ
+        Machine::INTERRUPT_CONTROLLER_NAME,
+        Machine::TIMER_IRQ
     );
     println!(
         "[sched] preemptive round-robin at {} Hz, {} process slots",
@@ -224,59 +210,45 @@ pub extern "C" fn kmain(boot_info: usize) -> ! {
     feos_shell::run(display, sched::platform())
 }
 
-/// Blocks the serial shell in the architecture's idle instruction between
-/// input polls.
+/// Blocks the serial shell between input polls.
 ///
-/// Using the timer's idle helper also marks the tick as idle, so a shell
-/// waiting for a keypress no longer appears as a busy core in the task
-/// manager's per-core graphs.
+/// The scheduler runs something else in the meantime, so a shell waiting for a
+/// keypress doesn't appear as a busy core in the task manager's per-core graphs.
 fn wait_for_console() {
-    timer::idle_ms(1);
+    sched::sleep_ms(1);
 }
 
-/// Handles the periodic timer interrupt and lets the scheduler choose a
-/// process.
+/// Handles every hardware interrupt, including IPIs.
 fn on_irq(frame: &mut irq::TrapFrame) {
-    let controller = board::interrupts();
-    let id = controller.acknowledge();
+    let controller = Machine::interrupts();
+    let claim = controller.claim();
+    let id = claim.id;
 
-    if id == board::TIMER_IRQ {
+    if controller.is_spurious(id) {
+        return;
+    }
+
+    let is_tick = id == Machine::TIMER_IRQ;
+    if is_tick {
         timer::tick();
+        if cpu::index() == 0 {
+            if let Some(audio) = sched::platform().audio {
+                audio.service();
+            }
+        }
+    } else if id == Machine::IPI_STOP {
+        fatal::stop_this_cpu();
     }
 
     // Acknowledge before switching stacks so the controller can deliver the
     // next interrupt to whichever process runs next.
-    if id < 1020 {
-        controller.end(id);
+    controller.complete(claim);
+
+    // Only the tick and an explicit request reschedule. Anything else, such as
+    // a device, has no business rotating the current task or counting as a tick.
+    if is_tick {
+        sched::on_tick(frame);
+    } else if id == Machine::IPI_RESCHEDULE {
+        sched::on_reschedule(frame);
     }
-
-    sched::preempt(frame);
-}
-
-/// Reports a synchronous exception or interrupt and lets the arch crate halt.
-fn report_exception(info: &exceptions::FaultInfo) {
-    feos_console::_print_unlocked(format_args!(
-        "\n[exception] {} / {} (vector {})\n\
-         [exception] error={:#018x} class={:#04x} ({})\n\
-         [exception] ip={:#018x} fault address={:#018x}\n\
-         [exception] flags={:#018x} sp={:#018x}\n\
-         [exception] system halted\n",
-        info.vector_group(),
-        info.vector_type(),
-        info.index,
-        info.esr,
-        info.exception_class(),
-        info.syndrome_name(),
-        info.elr,
-        info.far,
-        info.spsr,
-        info.sp,
-    ));
-}
-
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    // Bypass the console lock: a panic may have happened while it was held.
-    feos_console::_print_unlocked(format_args!("\n[panic] {info}\n"));
-    cpu::halt()
 }

@@ -11,17 +11,22 @@
 //!
 //! # Locking
 //!
-//! [`_print`] serializes whole formatting operations with a [`SpinLock`].
+//! [`_print`] formats into a small stack buffer first and only then takes
+//! [`PRINT_LOCK`], an [`IrqSpinLock`], to write it out. A holder can't be
+//! preempted, so other tasks never spin waiting for a descheduled printer, and
+//! a killed task can't take the console with it. Lines longer than the buffer
+//! are written in pieces and can interleave with other output.
+//!
 //! Panic and exception handlers use [`_print_unlocked`], which bypasses the
 //! lock so a fault taken while the console is held can still be reported.
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 use core::fmt::{self, Write};
 use core::mem::transmute;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use feos_sync::SpinLock;
+use feos_sync::IrqSpinLock;
 
 /// Receives a chunk of text from the console.
 pub type WriteFn = fn(&str);
@@ -39,7 +44,11 @@ static WRITER: AtomicUsize = AtomicUsize::new(0);
 static BYTE_WRITER: AtomicUsize = AtomicUsize::new(0);
 static READER: AtomicUsize = AtomicUsize::new(0);
 static WAITER: AtomicUsize = AtomicUsize::new(0);
-static PRINT_LOCK: SpinLock<()> = SpinLock::new(());
+static PRINT_LOCK: IrqSpinLock<()> = IrqSpinLock::new(());
+
+/// Bytes formatted before each write. This bounds how long one print keeps
+/// interrupts masked: about 22 ms at a real 115200 baud, none under QEMU.
+const PRINT_BUFFER: usize = 256;
 
 /// Installs the text sink used by `print!` and `println!`.
 ///
@@ -50,10 +59,11 @@ pub fn set_writer(writer: WriteFn) {
     WRITER.store(writer as usize, Ordering::Release);
 }
 
-/// Installs a raw-byte sink used by [`write_bytes`].
+/// Installs a raw-byte sink used by [`write_raw`] and [`write_bytes`].
 ///
-/// A board that installs this keeps binary output intact; otherwise
-/// [`write_bytes`] falls back to the text writer for valid UTF-8.
+/// The sink must pass bytes through untouched, which keeps binary output
+/// intact. Without one, those functions fall back to the text writer for valid
+/// UTF-8.
 pub fn set_byte_writer(writer: ByteWriteFn) {
     BYTE_WRITER.store(writer as usize, Ordering::Release);
 }
@@ -126,14 +136,40 @@ fn byte_writer() -> Option<ByteWriteFn> {
     Some(unsafe { transmute::<usize, ByteWriteFn>(address) })
 }
 
-/// Writes raw bytes to the registered console.
+/// Writes bytes to the registered console, unchanged.
 ///
-/// This is the byte-level counterpart to [`print!`]. It is used by the shell
-/// so utilities such as `cat` and `hexdump` can emit arbitrary data. When the
-/// board did not install a byte writer, valid UTF-8 is forwarded to the text
-/// writer and invalid bytes are replaced with `?`.
+/// Use this for binary data. When the board did not install a byte writer,
+/// valid UTF-8 is forwarded to the text writer and invalid bytes are replaced
+/// with `?`.
+pub fn write_raw(bytes: &[u8]) {
+    let _guard = PRINT_LOCK.lock();
+    emit(bytes);
+}
+
+/// Writes terminal output: bytes are unchanged except that `\n` becomes
+/// `\r\n`, the job a tty's line discipline would do.
+///
+/// This is the byte-level counterpart to [`print!`], used by the shell for
+/// command output. Use [`write_raw`] for data that must arrive unchanged.
 pub fn write_bytes(bytes: &[u8]) {
     let _guard = PRINT_LOCK.lock();
+    for_each_terminal_chunk(bytes, emit);
+}
+
+/// Splits `bytes` around each `\n`, inserting the `\r` a terminal needs.
+fn for_each_terminal_chunk(bytes: &[u8], mut chunk: impl FnMut(&[u8])) {
+    for line in bytes.split_inclusive(|&byte| byte == b'\n') {
+        match line.split_last() {
+            Some((b'\n', text)) => {
+                chunk(text);
+                chunk(b"\r\n");
+            }
+            _ => chunk(line),
+        }
+    }
+}
+
+fn emit(bytes: &[u8]) {
     if let Some(writer) = byte_writer() {
         writer(bytes);
         return;
@@ -174,13 +210,55 @@ impl Write for Sink {
     }
 }
 
+/// Formats into a stack buffer, writing it out under the lock when it fills.
+struct BufferedSink {
+    buffer: [u8; PRINT_BUFFER],
+    len: usize,
+}
+
+impl BufferedSink {
+    const fn new() -> Self {
+        Self {
+            buffer: [0; PRINT_BUFFER],
+            len: 0,
+        }
+    }
+
+    fn flush(&mut self) {
+        // The buffer only ever holds whole characters: see `write_str`.
+        if let Ok(text) = core::str::from_utf8(&self.buffer[..self.len]) {
+            if !text.is_empty() {
+                // A panic while the lock is held is handled by
+                // `_print_unlocked`, so this cannot deadlock the panic path.
+                let _guard = PRINT_LOCK.lock();
+                if let Some(writer) = writer() {
+                    writer(text);
+                }
+            }
+        }
+        self.len = 0;
+    }
+}
+
+impl Write for BufferedSink {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        for character in text.chars() {
+            if self.len + character.len_utf8() > PRINT_BUFFER {
+                self.flush();
+            }
+            let room = &mut self.buffer[self.len..];
+            self.len += character.encode_utf8(room).len();
+        }
+        Ok(())
+    }
+}
+
 /// Serialized console output used by the print macros.
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
-    // A panic while the lock is held is handled by `_print_unlocked`, so this
-    // guard cannot deadlock the panic path.
-    let _guard = PRINT_LOCK.lock();
-    let _ = Sink.write_fmt(args);
+    let mut sink = BufferedSink::new();
+    let _ = sink.write_fmt(args);
+    sink.flush();
 }
 
 /// Lock-free console output for panic and exception handlers.
@@ -213,4 +291,34 @@ macro_rules! println {
     ($($arg:tt)*) => {
         $crate::print!("{}\n", format_args!($($arg)*))
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn collect(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for_each_terminal_chunk(bytes, |chunk| out.extend_from_slice(chunk));
+        out
+    }
+
+    #[test]
+    fn terminal_output_translates_only_newlines() {
+        assert_eq!(collect(b"a\nb"), b"a\r\nb");
+        assert_eq!(collect(b"\n\n"), b"\r\n\r\n");
+        assert_eq!(collect(b"\x00\xff\r"), b"\x00\xff\r");
+        assert_eq!(collect(b""), b"");
+    }
+
+    #[test]
+    fn long_text_stays_whole_across_buffer_flushes() {
+        let mut sink = BufferedSink::new();
+        // Multi-byte characters that straddle the buffer end must not split.
+        for _ in 0..PRINT_BUFFER {
+            sink.write_str("é").unwrap();
+        }
+        assert!(sink.len <= PRINT_BUFFER);
+        assert!(core::str::from_utf8(&sink.buffer[..sink.len]).is_ok());
+    }
 }

@@ -8,12 +8,13 @@
 //! the pieces a future SMP port needs (LAPIC ID, EOI, ISR scan) separate from
 //! the routing policy.
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
 
-use feos_hal::InterruptController;
+use feos_hal::{InterruptController, IpiTarget};
+use feos_port_io::outb;
 
 /// `IA32_APIC_BASE`.
 const MSR_APIC_BASE: u32 = 0x1b;
@@ -29,6 +30,17 @@ const LAPIC_LVT_LINT0: usize = 0x350;
 const LAPIC_LVT_LINT1: usize = 0x360;
 const LAPIC_LVT_ERROR: usize = 0x370;
 const LAPIC_ISR: usize = 0x100;
+const LAPIC_ICR_LOW: usize = 0x300;
+const LAPIC_ICR_HIGH: usize = 0x310;
+
+/// ICR: a previous IPI is still being delivered.
+const ICR_PENDING: u32 = 1 << 12;
+/// ICR: level assert. Required for anything other than an INIT de-assert.
+const ICR_ASSERT: u32 = 1 << 14;
+/// ICR destination shorthand: all CPUs excluding this one.
+const ICR_ALL_OTHERS: u32 = 0b11 << 18;
+/// Polls of the delivery-status bit before sending anyway.
+const ICR_POLLS: usize = 100_000;
 
 /// IOAPIC register window.
 const IOAPIC_IOREGSEL: usize = 0x00;
@@ -94,6 +106,21 @@ impl LocalApic {
         self.write(LAPIC_EOI, 0);
     }
 
+    /// Sends a fixed-delivery IPI with `vector` to `target`.
+    pub fn send_ipi(&self, target: IpiTarget, vector: u8) {
+        for _ in 0..ICR_POLLS {
+            if self.read(LAPIC_ICR_LOW) & ICR_PENDING == 0 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
+        let (destination, low) = icr_value(target, vector);
+        // The write to the low half is what sends it.
+        self.write(LAPIC_ICR_HIGH, destination);
+        self.write(LAPIC_ICR_LOW, low);
+    }
+
     /// Returns the highest in-service vector, if any.
     pub fn isr_vector(&self) -> Option<u32> {
         // The ISR is 256 bits wide, one 32-bit register per 32 vectors.
@@ -105,6 +132,15 @@ impl LocalApic {
             }
         }
         None
+    }
+}
+
+/// Encodes an ICR write as its high and low halves.
+fn icr_value(target: IpiTarget, vector: u8) -> (u32, u32) {
+    let low = vector as u32 | ICR_ASSERT;
+    match target {
+        IpiTarget::Cpu(cpu) => ((cpu as u32) << 24, low),
+        IpiTarget::AllOthers => (0, low | ICR_ALL_OTHERS),
     }
 }
 
@@ -243,6 +279,14 @@ impl InterruptController for ApicController {
     fn end(&self, _irq: u32) {
         self.lapic.eoi();
     }
+
+    fn is_spurious(&self, id: u32) -> bool {
+        id == SPURIOUS
+    }
+
+    fn send_ipi(&self, target: IpiTarget, id: u32) {
+        self.lapic.send_ipi(target, id as u8);
+    }
 }
 
 fn read_msr(msr: u32) -> u64 {
@@ -268,8 +312,25 @@ fn write_msr(msr: u32, value: u64) {
     };
 }
 
-#[inline]
-unsafe fn outb(port: u16, value: u8) {
-    // SAFETY: callers pass a valid x86 I/O port.
-    unsafe { asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack)) };
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn icr_encodes_destination_and_shorthand() {
+        assert_eq!(icr_value(IpiTarget::Cpu(2), 50), (2 << 24, 50 | ICR_ASSERT));
+        assert_eq!(
+            icr_value(IpiTarget::AllOthers, 49),
+            (0, 49 | ICR_ASSERT | ICR_ALL_OTHERS)
+        );
+    }
+
+    #[test]
+    fn only_the_spurious_vector_is_spurious() {
+        // DRV-11: the HAL's 1023 means nothing on this controller.
+        let controller = ApicController::new(0, 0);
+        assert!(controller.is_spurious(SPURIOUS));
+        assert!(!controller.is_spurious(34));
+        assert!(!controller.is_spurious(1023));
+    }
 }

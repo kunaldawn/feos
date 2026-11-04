@@ -9,7 +9,7 @@ use feos_gfx::Canvas;
 fn main() {
     let mut dos = DosBox::new(None);
     for _ in 0..16 {
-        if dos.shell.batch.is_empty() {
+        if !dos.shell.in_batch() {
             break;
         }
         dos.frame(0, 10_000);

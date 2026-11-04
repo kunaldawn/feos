@@ -14,7 +14,7 @@ struct Mount<'a> {
     fs: Box<dyn FileSystem + 'a>,
     /// Global ID assigned to the mounted filesystem's root node.
     first: u32,
-    /// Number of nodes reported by the mounted filesystem.
+    /// Number of node IDs reported by the mounted filesystem.
     count: u32,
 }
 
@@ -56,7 +56,8 @@ impl<'a> MountTable<'a> {
         {
             return Err(FsError::InvalidName);
         }
-        let count = u32::try_from(fs.node_count()).map_err(|_| FsError::TooManyNodes)?;
+        // IDs index slots, which can outnumber live nodes after a removal.
+        let count = u32::try_from(fs.node_id_limit()).map_err(|_| FsError::TooManyNodes)?;
         if count == 0 {
             return Err(FsError::Corrupt);
         }
@@ -120,7 +121,16 @@ impl Default for MountTable<'_> {
 
 impl FileSystem for MountTable<'_> {
     fn node_count(&self) -> usize {
+        let live: usize = self.mounts.iter().map(|mount| mount.fs.node_count()).sum();
+        1 + live + self.mounts.len()
+    }
+
+    fn node_id_limit(&self) -> usize {
         1 + self.children as usize + self.mounts.len()
+    }
+
+    fn is_damaged(&self) -> bool {
+        self.mounts.iter().any(|mount| mount.fs.is_damaged())
     }
 
     fn kind(&self, node: NodeId) -> Option<EntryKind> {
@@ -171,6 +181,19 @@ impl FileSystem for MountTable<'_> {
                 .get(index)
                 .map_or(0, |mount| mount.fs.read(child, offset, out)),
             _ => 0,
+        }
+    }
+
+    fn try_read(&self, node: NodeId, offset: usize, out: &mut [u8]) -> Result<usize, FsError> {
+        match self.locate(node) {
+            Some(Location::Child(index, child)) => self
+                .mounts
+                .get(index)
+                .ok_or(FsError::NotFound)?
+                .fs
+                .try_read(child, offset, out),
+            Some(_) => Err(FsError::NotFile),
+            None => Err(FsError::NotFound),
         }
     }
 
