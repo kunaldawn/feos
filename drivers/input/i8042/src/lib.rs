@@ -273,12 +273,20 @@ impl I8042 {
 
     fn drain(&self, state: &mut State) {
         // Bounded so a stuck controller cannot lock the desktop forever.
+        //
+        // The controller's AUX bit describes the byte currently sitting in
+        // the output buffer. Sample the status *before* reading the data:
+        // reading clears the buffer, so a second status read would describe
+        // the next byte (or an empty buffer) and misclassify the byte we just
+        // consumed. That turns the last byte of a PS/2 mouse packet into a
+        // keyboard scancode and makes the pointer drift or jump.
         for _ in 0..256 {
-            if status() & STATUS_OUTPUT_FULL == 0 {
+            let status = status();
+            if status & STATUS_OUTPUT_FULL == 0 {
                 break;
             }
             let byte = read_data();
-            if status() & STATUS_AUX_DATA != 0 {
+            if status & STATUS_AUX_DATA != 0 {
                 state.push_mouse(byte);
             } else {
                 decode_keyboard(state, byte);
