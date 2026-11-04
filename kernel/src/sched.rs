@@ -1,7 +1,7 @@
 //! Preemptive round-robin process scheduler.
 //!
 //! `feos` processes are kernel threads: they share the address space and all
-//! run at EL1, but each has its own 16 KiB stack and a saved register frame.
+//! run at EL1, but each has its own 128 KiB stack and a saved register frame.
 //! The generic timer raises an IRQ every 10 ms; the architecture IRQ stub
 //! saves the interrupted frame, this module picks the next runnable process,
 //! and the stub returns to that process instead.
@@ -27,7 +27,7 @@ const MAX_TASKS: usize = MAX_PROCESSES;
 ///
 /// The shell keeps using the linker-provided kernel stack, so this is only
 /// allocated for the remaining slots.
-const STACK_SIZE: usize = 16 * 1024;
+const STACK_SIZE: usize = 128 * 1024;
 
 /// Maximum argument string length copied into the process table.
 const ARG_MAX: usize = PROCESS_ARGS_MAX;

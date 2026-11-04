@@ -159,7 +159,7 @@ The process model is deliberately minimal:
 
 - Eight slots in a static `.bss` table. Slot 0 is the shell (PID 1) and keeps
   the linker-provided kernel stack; slots 1..7 are background processes with
-  16 KiB stacks and start with an otherwise zero context: `ELR` is the app
+  128 KiB stacks and start with an otherwise zero context: `ELR` is the app
   entry, `SP` the stack top, `SPSR` EL1h with IRQs unmasked, `x0` the slot
   index, and `LR` a task-exit trampoline.
 - States are `Free`, `Ready`, `Running`, and `Exited`. A returning app marks

@@ -115,6 +115,10 @@ impl App for TaskManager {
         true
     }
 
+    fn animation_period_ms(&self) -> u32 {
+        500
+    }
+
     fn open_window(&self, context: &WindowContext<'_, '_>) -> bool {
         open_task_manager(context)
     }
@@ -3559,10 +3563,18 @@ fn draw_performance(painter: &mut Painter<'_, '_>, state: &State, layout: Layout
     if graphs {
         let inner = graph_area.inset_each(2, 2, 2, 4);
         if state.show_cpu_graph && state.show_mem_graph {
-            let (left, right) = inner.split_left(inner.width as i32 / 2);
+            // Side by side when there is room; stack them in a narrow window
+            // so the memory graph is never squeezed out of the right edge.
+            let (cpu_rect, mem_rect) = if inner.width >= 520 {
+                let (left, right) = inner.split_left(inner.width as i32 / 2);
+                (left.inset_each(0, 0, 4, 0), right.inset_each(4, 0, 0, 0))
+            } else {
+                let (top, bottom) = inner.split_top(inner.height as i32 / 2);
+                (top.inset_each(0, 0, 0, 4), bottom.inset_each(0, 4, 0, 0))
+            };
             draw_graph_panel(
                 painter,
-                left.inset_each(0, 0, 4, 0),
+                cpu_rect,
                 "CPU Usage History",
                 state.cpu_percent,
                 &state.cpu_history,
@@ -3573,7 +3585,7 @@ fn draw_performance(painter: &mut Painter<'_, '_>, state: &State, layout: Layout
             );
             draw_graph_panel(
                 painter,
-                right.inset_each(4, 0, 0, 0),
+                mem_rect,
                 "Memory Usage History",
                 state.memory_percent,
                 &state.mem_history,
@@ -4859,6 +4871,55 @@ mod render_tests {
         state.cpu_history = [55; HISTORY];
         state.mem_history = [19; HISTORY];
         state
+    }
+
+    #[test]
+    fn performance_shows_both_graphs() {
+        let screen = Rect::new(0, 0, 1024, 768);
+        let mut state = test_state(screen);
+        state.tab = Tab::Performance;
+        let platform = platform();
+        let mut pixels = vec![0u32; 1024 * 768];
+        let mut canvas = Canvas::new(&mut pixels, 1024, 768, 1024).unwrap();
+        let mut painter = Painter::new(&mut canvas);
+        let layout = Layout::compute(screen, &state);
+        draw_backdrop(&mut painter, &state);
+        draw_window(&mut painter, &state, layout, 1_000);
+        draw_tabs(&mut painter, &state, layout);
+        draw_content(&mut painter, &platform, &mut state, layout, 1_000);
+
+        let mut cpu_pixels = 0;
+        let mut memory_pixels = 0;
+        for pixel in &pixels {
+            if *pixel == GRAPH_CPU.raw() {
+                cpu_pixels += 1;
+            }
+            if *pixel == GRAPH_MEM.raw() {
+                memory_pixels += 1;
+            }
+        }
+        assert!(cpu_pixels > 0, "CPU graph was not drawn");
+        assert!(memory_pixels > 0, "memory graph was not drawn");
+    }
+
+    #[test]
+    fn performance_keeps_memory_graph_in_a_narrow_window() {
+        let screen = Rect::new(0, 0, 420, 420);
+        let mut state = test_state(screen);
+        state.tab = Tab::Performance;
+        let platform = platform();
+        let mut pixels = vec![0u32; 420 * 420];
+        let mut canvas = Canvas::new(&mut pixels, 420, 420, 420).unwrap();
+        let mut painter = Painter::new(&mut canvas);
+        let layout = Layout::compute(screen, &state);
+        draw_backdrop(&mut painter, &state);
+        draw_window(&mut painter, &state, layout, 1_000);
+        draw_tabs(&mut painter, &state, layout);
+        draw_content(&mut painter, &platform, &mut state, layout, 1_000);
+        assert!(
+            pixels.iter().any(|pixel| *pixel == GRAPH_MEM.raw()),
+            "memory graph was squeezed out of a narrow window"
+        );
     }
 
     #[test]

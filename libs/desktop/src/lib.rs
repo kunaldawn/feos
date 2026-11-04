@@ -147,6 +147,9 @@ pub struct DesktopResponse {
     pub window_count: usize,
     /// A windowed app is animating and the caller should render another frame.
     pub redraw: bool,
+    /// Minimum interval between animated frames, in milliseconds (0 when no
+    /// window is animating).
+    pub animation_period_ms: u32,
 }
 
 impl DesktopResponse {
@@ -1243,7 +1246,14 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
                     && window.runtime.is_some_and(|app| app.animates())
                 {
                     response.redraw = true;
-                    break;
+                    if let Some(app) = window.runtime {
+                        let period = app.animation_period_ms().max(1);
+                        if response.animation_period_ms == 0
+                            || period < response.animation_period_ms
+                        {
+                            response.animation_period_ms = period;
+                        }
+                    }
                 }
             }
         }

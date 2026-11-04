@@ -7,6 +7,8 @@
 
 #![cfg_attr(not(test), no_std)]
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use feos_app::{App, Context, WindowContext, WindowFrame};
 use feos_console::println;
 use feos_dosbox::keyboard::Key as DosKey;
@@ -17,6 +19,12 @@ use feos_sync::SpinLock;
 
 /// The machine hosted by the desktop window.
 static MACHINE: SpinLock<Option<DosBox>> = SpinLock::new(None);
+/// Set when the audio device rejects or times out a block. A blocking HAL
+/// must not be allowed to stall the desktop every frame.
+static AUDIO_FAILED: AtomicBool = AtomicBool::new(false);
+/// Whether a guest program is running. The prompt does not need 30 fps
+/// compositing; only a running program does.
+static RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// The FEOS-DOS application.
 pub struct DosBoxApp;
@@ -47,7 +55,7 @@ impl App for DosBoxApp {
     }
 
     fn animates(&self) -> bool {
-        true
+        RUNNING.load(Ordering::Relaxed)
     }
 
     fn open_window(&self, context: &WindowContext<'_, '_>) -> bool {
@@ -58,6 +66,8 @@ impl App for DosBoxApp {
             }
         }
         *MACHINE.lock() = Some(machine);
+        // Run frames until AUTOEXEC.BAT has finished and the prompt is shown.
+        RUNNING.store(true, Ordering::Relaxed);
         true
     }
 
@@ -85,15 +95,21 @@ impl App for DosBoxApp {
             });
         }
         machine.frame(context.now_ms, 50_000);
+        RUNNING.store(
+            machine.is_running() || !machine.shell.batch.is_empty(),
+            Ordering::Relaxed,
+        );
         play_audio(machine, context.platform.audio);
         machine.render(context.canvas);
         if machine.exit {
+            RUNNING.store(false, Ordering::Relaxed);
             return WindowFrame::Close;
         }
         WindowFrame::Continue
     }
 
     fn close_window(&self) {
+        RUNNING.store(false, Ordering::Relaxed);
         *MACHINE.lock() = None;
     }
 
@@ -136,13 +152,18 @@ fn play_audio(machine: &mut DosBox, audio: Option<&dyn feos_hal::Audio>) {
     if !audio.is_ready() {
         return;
     }
+    if AUDIO_FAILED.load(Ordering::Relaxed) {
+        return;
+    }
     let samples = machine.take_audio();
-    if samples.is_empty() {
+    if samples.is_empty() || samples.iter().all(|sample| *sample == 0) {
         return;
     }
     let max = audio.max_samples().max(2);
     let len = samples.len().min(max) & !1;
-    let _ = audio.play(&samples[..len]);
+    if audio.play(&samples[..len]).is_err() {
+        AUDIO_FAILED.store(true, Ordering::Relaxed);
+    }
 }
 
 fn feed_events(machine: &mut DosBox, input: &Input) {

@@ -197,7 +197,7 @@ change.
   recoverable IRQ entry that saves and restores a full 800-byte `TrapFrame`
 - GICv2 driver behind an `InterruptController` HAL trait, with Group 0 and the
   timer PPI wired up by the board
-- Preemptive round-robin scheduler: sixteen process slots, 16 KiB stacks, and a
+- Preemptive round-robin scheduler: sixteen process slots, 128 KiB stacks, and a
   100 Hz generic-timer tick; the shell is PID 1
 - `spawn`, `ps`, `kill`, and `tick` commands for running and inspecting
   background processes
@@ -478,7 +478,7 @@ registry.
 ## Processes and scheduling
 
 Processes in feos are **kernel threads**, not isolated user processes: they
-share the kernel address space, all run at EL1, and each has its own 16 KiB
+share the kernel address space, all run at EL1, and each has its own 128 KiB
 stack and saved register frame. The process table has sixteen slots in `.bss`;
 slot 0 is the shell, which is always PID 1 and is never reused.
 
@@ -1349,7 +1349,7 @@ its peak level, so a non-zero peak confirms the DSP path ran.
 - Single core. All processes share one address space and run at EL1, so there
   is no memory protection or privilege boundary between them; a fault in any
   process halts the machine.
-- Eight process slots including the shell, 16 KiB per spawned stack, and no
+- Eight process slots including the shell, 128 KiB per spawned stack, and no
   heap. `spawn` copies at most 96 bytes of arguments into the process table.
 - Round-robin has no priorities, blocking sleep, or wait/join. `sleep` and
   `tick` busy-wait and rely on preemption, and a process cannot wait for

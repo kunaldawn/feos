@@ -410,6 +410,13 @@ pub trait App: Sync {
         false
     }
 
+    /// Minimum interval between automatic frames for an animating window, in
+    /// milliseconds. The media player wants ~30 fps; a task manager's graphs
+    /// are fine at 2 fps and should not force a full desktop repaint at 30 fps.
+    fn animation_period_ms(&self) -> u32 {
+        33
+    }
+
     /// Opens a windowed session. Returns `false` when the app cannot start.
     fn open_window(&self, _context: &WindowContext<'_, '_>) -> bool {
         false

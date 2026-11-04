@@ -18,7 +18,7 @@ pub struct SystemBus {
     pub vga: Vga,
     pub keyboard: Keyboard,
     pub mouse: crate::mouse::Mouse,
-    pub opl: crate::opl::Opl,
+    pub opl: alloc::boxed::Box<crate::opl::Opl>,
     pub bios: Bios,
     pub dos: Dos,
     pub exit_requested: bool,
@@ -40,7 +40,7 @@ impl SystemBus {
             vga: Vga::new(),
             keyboard: Keyboard::new(),
             mouse: crate::mouse::Mouse::new(),
-            opl: crate::opl::Opl::new(48_000),
+            opl: alloc::boxed::Box::new(crate::opl::Opl::new(48_000)),
             bios: Bios::new(),
             dos,
             exit_requested: false,
@@ -473,7 +473,11 @@ impl DosBox {
                 samples[frame * 2 + 1] = right.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
             }
         }
-        self.pending_audio = samples;
+        if samples.iter().all(|sample| *sample == 0) {
+            self.pending_audio.clear();
+        } else {
+            self.pending_audio = samples;
+        }
     }
 
     fn execute_line(&mut self, line: &str, now_ms: u64) {

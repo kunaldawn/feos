@@ -179,7 +179,10 @@ pub fn run_session(
             // Windowed apps can animate (the media player, live task-manager
             // graphs). Repaint at a modest rate while one is open without
             // spinning the compositor at the full poll rate.
-            if response.redraw && now.wrapping_sub(last_animated_frame) >= 33 {
+            if response.redraw
+                && now.wrapping_sub(last_animated_frame)
+                    >= response.animation_period_ms.max(1) as u64
+            {
                 last_animated_frame = now;
                 dirty = true;
             }
