@@ -43,6 +43,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "feos-arch-x86_64"
+version = "0.1.0"
+dependencies = [
+ "feos-hal",
+]
+
+[[package]]
 name = "feos-archive"
 version = "0.1.0"
 dependencies = [
@@ -69,6 +76,24 @@ dependencies = [
  "feos-driver-pl011",
  "feos-driver-ramfb",
  "feos-driver-virtio-input",
+ "feos-fs",
+ "feos-gfx",
+ "feos-hal",
+ "feos-sync",
+]
+
+[[package]]
+name = "feos-board-qemu-x86_64"
+version = "0.1.0"
+dependencies = [
+ "feos-console",
+ "feos-driver-apic",
+ "feos-driver-fw-cfg",
+ "feos-driver-i8042",
+ "feos-driver-intel-hda",
+ "feos-driver-pci",
+ "feos-driver-ramfb",
+ "feos-driver-uart16550",
  "feos-fs",
  "feos-gfx",
  "feos-hal",
@@ -158,6 +183,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "feos-driver-apic"
+version = "0.1.0"
+dependencies = [
+ "feos-hal",
+]
+
+[[package]]
 name = "feos-driver-fw-cfg"
 version = "0.1.0"
 
@@ -166,6 +198,14 @@ name = "feos-driver-gicv2"
 version = "0.1.0"
 dependencies = [
  "feos-hal",
+]
+
+[[package]]
+name = "feos-driver-i8042"
+version = "0.1.0"
+dependencies = [
+ "feos-hal",
+ "feos-sync",
 ]
 
 [[package]]
@@ -192,6 +232,13 @@ name = "feos-driver-ramfb"
 version = "0.1.0"
 dependencies = [
  "feos-driver-fw-cfg",
+]
+
+[[package]]
+name = "feos-driver-uart16550"
+version = "0.1.0"
+dependencies = [
+ "feos-hal",
 ]
 
 [[package]]
@@ -252,7 +299,9 @@ dependencies = [
  "feos-app",
  "feos-apps",
  "feos-arch-aarch64",
+ "feos-arch-x86_64",
  "feos-board-qemu-virt",
+ "feos-board-qemu-x86_64",
  "feos-console",
  "feos-desktop-app",
  "feos-hal",

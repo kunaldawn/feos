@@ -6,16 +6,17 @@ wire one dependency edge, and register it at the layer above. There are no
 `mod` declarations in a central `main.rs` that need editing for every new
 device.
 
-The kernel is also a small multiprocess, multi-core system: every online CPU
-runs a GICv2 timer tick that preempts apps, and a fixed-size round-robin
-scheduler in `kernel/src/sched.rs` switches between kernel threads that share
-the address space.
+The kernel is also a small multiprocess system: on AArch64 every online CPU
+runs a GICv2 timer tick, while the x86_64 port currently ticks the boot CPU
+through the PIT and IOAPIC. Either way a fixed-size round-robin scheduler in
+`kernel/src/sched.rs` switches between kernel threads that share the address
+space.
 
 ## Layers
 
 | Layer | Location | Depends on | Responsibility |
 |-------|----------|------------|----------------|
-| Architecture | `arch/<arch>` | `libs/hal` | Boot entry, exception vectors, recoverable IRQ entry, CPU registers, PSCI, timers, HAL service impls |
+| Architecture | `arch/<arch>` | `libs/hal` | Boot entry, exception vectors, recoverable IRQ entry, CPU registers, firmware/power calls, timers, HAL service impls |
 | HAL | `libs/hal` | nothing | Device and system-service traits shared by drivers, architectures and apps |
 | Drivers | `drivers/<class>/<name>` | `libs/hal`, other drivers | One device per crate; MMIO base comes from the constructor |
 | Libraries | `libs/<name>` | other `libs/*` only | Reusable, hardware-independent code |
@@ -36,10 +37,12 @@ installed by the kernel, while the scheduler and all process policy stay in
 Every workspace crate uses the `feos-` prefix. Crates that fill a role use
 `feos-<role>-<thing>`:
 
-- `feos-arch-aarch64`
-- `feos-board-qemu-virt`
-- `feos-driver-pl011`, `feos-driver-fw-cfg`, `feos-driver-ramfb`
-- `feos-driver-pci`, `feos-driver-intel-hda`, `feos-driver-gicv2`
+- `feos-arch-aarch64`, `feos-arch-x86_64`
+- `feos-board-qemu-virt`, `feos-board-qemu-x86_64`
+- `feos-driver-pl011`, `feos-driver-uart16550`, `feos-driver-fw-cfg`,
+  `feos-driver-ramfb`
+- `feos-driver-pci`, `feos-driver-intel-hda`, `feos-driver-gicv2`,
+  `feos-driver-apic`, `feos-driver-i8042`
 - `feos-hal`, `feos-sync`, `feos-console`, `feos-gfx`, `feos-gui`,
   `feos-audio`, `feos-image`, `feos-audio-codec`, `feos-video`, `feos-h264`,
   `feos-compress`, `feos-archive`, `feos-fs`, `feos-keys`, `feos-app`
@@ -125,14 +128,33 @@ crate-level statics.
 Copy `boards/qemu-virt`, change the constants, and update:
 
 1. `kernel/Cargo.toml` to depend on the new board crate (and the matching
-   architecture crate).
-2. The kernel's `use ... as board` line.
-3. The linker script path in `.cargo/config.toml` (or pass it per build).
+   architecture crate) under `[target.'cfg(target_arch = "...")'.dependencies]`.
+2. The kernel's `#[cfg(target_arch = "...")] use ... as board` line.
+3. The linker script path (and runner) in `.cargo/config.toml` for that target.
 
 The kernel's `main.rs` should not need any other changes; it only calls board
 functions such as `init_console`, `init_display`, `init_audio`,
 `init_interrupts`, `init_cpu_interrupts`, `interrupts`, `cpu_mpidr`,
 `MAX_CPUS`, `framebuffer_addr`, `kernel_range`, and `bss_range`.
+
+## The x86_64 port
+
+`arch/x86_64` mirrors the AArch64 surface. QEMU loads a flat multiboot image at
+1 MiB; `boot.S` keeps the boot CPU, zeroes `.bss`, builds four identity-mapped
+1 GiB pages covering the first 4 GiB, enables PAE/long mode and jumps to
+`kmain(multiboot_info)`. `interrupts.S` owns an IDT and saves a `TrapFrame`
+(GPRs, XMM0..XMM15, vector, error code, RIP/CS/RFLAGS/RSP) before calling the
+kernel handler. The return path can therefore replace the frame and switch
+processes exactly like the AArch64 `eret` path.
+
+`boards/qemu-x86_64` uses COM1 (`uart16550`), the LAPIC/IOAPIC (`feos-driver-apic`),
+legacy PCI config ports (`PciPort`), I/O-port fw_cfg and ramfb, Intel HDA and
+the i8042 PS/2 controller. The scheduler tick is PIT channel 0 routed through
+IOAPIC GSI 2 to vector 34; the monotonic clock is the TSC, calibrated once
+against PIT channel 0. ACPI PM1a control and the PCI reset register implement
+`poweroff`/`reboot`. This port currently runs the scheduler on the boot CPU
+(`MAX_CPUS = 1`); the architecture interface leaves room for an ACPI MADT +
+INIT/SIPI SMP implementation later.
 
 ## Interrupts and scheduling
 

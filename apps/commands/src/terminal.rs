@@ -29,10 +29,14 @@ static MEMORY_USED: AtomicUsize = AtomicUsize::new(0);
 static MEMORY_FREE: AtomicUsize = AtomicUsize::new(0);
 static CPU_COUNT: AtomicUsize = AtomicUsize::new(1);
 static PID: AtomicU32 = AtomicU32::new(1);
+static MACHINE: SpinLock<&'static str> = SpinLock::new("unknown");
 
 struct WindowSystem;
 
 impl System for WindowSystem {
+    // WindowSystem has no per-context state; `update_system` copies the
+    // board architecture into MACHINE each frame.
+
     fn sysname(&self) -> &'static str {
         "FEOS"
     }
@@ -50,7 +54,7 @@ impl System for WindowSystem {
     }
 
     fn machine(&self) -> &'static str {
-        "aarch64"
+        *MACHINE.lock()
     }
 
     fn username(&self) -> &'static str {
@@ -381,6 +385,7 @@ impl App for Terminal {
 }
 
 fn update_system(context: &WindowContext<'_, '_>) {
+    *MACHINE.lock() = context.platform.board.arch;
     UPTIME_MS.store(context.platform.clock.uptime_ms(), Ordering::Relaxed);
     PID.store(context.platform.processes.current(), Ordering::Relaxed);
     CPU_COUNT.store(
@@ -726,6 +731,7 @@ mod tests {
         Platform {
             board: BoardInfo {
                 name: "test",
+                arch: "test",
                 console_base: 0,
                 framebuffer_addr: 0,
                 kernel_range: (0, 0),
@@ -764,6 +770,7 @@ mod tests {
         let platform = Platform {
             board: BoardInfo {
                 name: "test",
+                arch: "test",
                 console_base: 0,
                 framebuffer_addr: 0,
                 kernel_range: (0, 0),

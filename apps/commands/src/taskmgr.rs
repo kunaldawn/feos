@@ -4930,6 +4930,7 @@ mod render_tests {
         Platform {
             board: BoardInfo {
                 name: "qemu-virt",
+                arch: "aarch64",
                 console_base: 0x0900_0000,
                 framebuffer_addr: 0x4000_0000,
                 kernel_range: (0x4008_0000, 0x4020_0000),

@@ -1,4 +1,4 @@
-//! feos - a tiny bare-metal AArch64 kernel skeleton.
+//! feos - a tiny bare-metal multi-architecture kernel skeleton.
 //!
 //! This binary contains only the boot sequence and the wiring between the
 //! board, the architecture crate, shared libraries and the shell. Hardware
@@ -15,9 +15,18 @@ mod smp;
 use core::panic::PanicInfo;
 
 use feos_app::{BoardInfo, Platform};
-use feos_arch_aarch64::{cpu, exceptions, irq, timer};
-use feos_board_qemu_virt as board;
 use feos_console::println;
+
+#[cfg(target_arch = "aarch64")]
+use feos_arch_aarch64 as arch;
+#[cfg(target_arch = "x86_64")]
+use feos_arch_x86_64 as arch;
+#[cfg(target_arch = "aarch64")]
+use feos_board_qemu_virt as board;
+#[cfg(target_arch = "x86_64")]
+use feos_board_qemu_x86_64 as board;
+
+use arch::{cpu, exceptions, irq, timer};
 use feos_hal::{Memory, MemoryInfo};
 
 /// Kernel memory accounting for the task manager.
@@ -44,27 +53,49 @@ static KERNEL_MEMORY: KernelMemory = KernelMemory;
 
 /// Kernel entry point.
 ///
-/// Called from `_start` in `arch/aarch64/src/boot.S` once a stack exists and
-/// `.bss` has been zeroed. `dtb` is the device tree address QEMU passes in
-/// `x0`.
+/// On AArch64 this is called from `_start` in `arch/aarch64/src/boot.S` with
+/// the device tree address QEMU passes in `x0`. On x86_64 the long-mode entry
+/// passes the multiboot information pointer in `rdi`.
 #[no_mangle]
-pub extern "C" fn kmain(dtb: usize) -> ! {
+pub extern "C" fn kmain(boot_info: usize) -> ! {
     board::init_console();
     feos_console::set_waiter(wait_for_console);
 
     println!();
-    println!("feos {} - a tiny aarch64 kernel", env!("CARGO_PKG_VERSION"));
+    println!("feos {} - a tiny {} kernel", env!("CARGO_PKG_VERSION"), board::ARCH);
     println!("----------------------------------------");
+
+    // Install IDT/vectors and calibrate the architecture clock before any
+    // interrupt can arrive.
+    arch::init();
 
     exceptions::set_handler(report_exception);
     exceptions::init();
-    println!("[boot] exception vectors installed (VBAR_EL1)");
-    println!("[boot] UART ready at {:#x} (PL011)", board::CONSOLE_BASE);
+    println!("[boot] exception vectors installed");
+    println!(
+        "[boot] UART ready at {:#x} ({})",
+        board::CONSOLE_BASE,
+        board::CONSOLE_NAME
+    );
 
-    if dtb != 0 && unsafe { core::ptr::read_volatile(dtb as *const u32) } == 0xd00d_feed {
-        println!("[boot] device tree blob at {dtb:#x}");
-    } else {
-        println!("[boot] no DTB passed by QEMU (x0 = {dtb:#x})");
+    #[cfg(target_arch = "aarch64")]
+    {
+        if boot_info != 0
+            && unsafe { core::ptr::read_volatile(boot_info as *const u32) } == 0xd00d_feed
+        {
+            println!("[boot] device tree blob at {boot_info:#x}");
+        } else {
+            println!("[boot] no DTB passed by QEMU (x0 = {boot_info:#x})");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if boot_info != 0 {
+            println!("[boot] multiboot information at {boot_info:#x}");
+        } else {
+            println!("[boot] no multiboot information pointer");
+        }
     }
 
     // Bring up the ramfb framebuffer if QEMU provides one.
@@ -76,7 +107,7 @@ pub extern "C" fn kmain(dtb: usize) -> ! {
     };
     match display.as_mut() {
         Some(canvas) => {
-            feos_apps::ui::splash(canvas);
+            feos_apps::ui::splash(canvas, board::ARCH);
             println!(
                 "[gfx] ramfb {}x{} XRGB8888 at {:#x}",
                 canvas.width(),
@@ -88,7 +119,7 @@ pub extern "C" fn kmain(dtb: usize) -> ! {
     }
 
     println!();
-    let services = &feos_arch_aarch64::AARCH64;
+    let services = &arch::ARCH;
 
     let audio = board::init_audio(services);
     match audio.as_ref() {
@@ -107,19 +138,28 @@ pub extern "C" fn kmain(dtb: usize) -> ! {
 
     let pointer = board::init_pointer();
     match pointer {
-        Some(kind) => println!("[input] virtio pointer ready ({kind:?})"),
-        None => println!("[input] no pointer (start QEMU with -device virtio-tablet-device)"),
+        Some(kind) => println!("[input] {} pointer ready ({kind:?})", board::POINTER_NAME),
+        None => println!(
+            "[input] no {} pointer ({})",
+            board::POINTER_NAME,
+            board::POINTER_HINT
+        ),
     }
 
     if board::init_keyboard() {
-        println!("[input] virtio keyboard ready");
+        println!("[input] {} keyboard ready", board::KEYBOARD_NAME);
     } else {
-        println!("[input] no virtio keyboard (serial console is the keyboard)");
+        println!(
+            "[input] no {} keyboard ({})",
+            board::KEYBOARD_NAME,
+            board::KEYBOARD_HINT
+        );
     }
 
     let platform = Platform {
         board: BoardInfo {
             name: board::NAME,
+            arch: board::ARCH,
             console_base: board::CONSOLE_BASE,
             framebuffer_addr: board::framebuffer_addr(),
             kernel_range: board::kernel_range(),
@@ -144,9 +184,8 @@ pub extern "C" fn kmain(dtb: usize) -> ! {
     irq::set_handler(on_irq);
     board::init_interrupts();
     println!(
-        "[sched] GICv2 distributor {:#x}, CPU interface {:#x}, timer IRQ {}",
-        board::GIC_DIST_BASE,
-        board::GIC_CPU_BASE,
+        "[sched] {} interrupt controller, timer IRQ {}",
+        board::INTERRUPT_CONTROLLER_NAME,
         board::TIMER_IRQ
     );
     println!(
@@ -156,12 +195,14 @@ pub extern "C" fn kmain(dtb: usize) -> ! {
     );
 
     // Bring up the remaining CPUs before the boot CPU starts ticking. Each
-    // secondary configures its own GIC interface and timer, then joins the
-    // shared run queue.
+    // secondary configures its own interrupt-controller interface and timer,
+    // then joins the shared run queue.
     let (started, error) = smp::start_secondaries();
     match error {
         Some(code) => {
-            println!("[smp] started {started} secondary CPU(s); no more CPUs (PSCI status {code})")
+            println!(
+                "[smp] started {started} secondary CPU(s); no more CPUs (firmware status {code})"
+            )
         }
         None => println!("[smp] started {started} secondary CPU(s)"),
     }
@@ -174,7 +215,7 @@ pub extern "C" fn kmain(dtb: usize) -> ! {
     // the desktop. Logging off (or Ctrl-\ in the serial terminal) returns to
     // the shell.
     if display.is_some() {
-        feos_arch_aarch64::timer::spin_ms(1_500);
+        arch::timer::spin_ms(1_500);
         println!("[boot] starting the desktop session (Ctrl-\\ returns to the shell)");
         feos_desktop_app::run_session(&mut display, &mut back, sched::platform());
         println!("[boot] desktop session ended, entering the serial shell");
@@ -183,7 +224,8 @@ pub extern "C" fn kmain(dtb: usize) -> ! {
     feos_shell::run(display, sched::platform())
 }
 
-/// Blocks the serial shell in `WFI` between input polls.
+/// Blocks the serial shell in the architecture's idle instruction between
+/// input polls.
 ///
 /// Using the timer's idle helper also marks the tick as idle, so a shell
 /// waiting for a keypress no longer appears as a busy core in the task
@@ -215,9 +257,9 @@ fn on_irq(frame: &mut irq::TrapFrame) {
 fn report_exception(info: &exceptions::FaultInfo) {
     feos_console::_print_unlocked(format_args!(
         "\n[exception] {} / {} (vector {})\n\
-         [exception] ESR_EL1={:#018x} EC={:#04x} ({})\n\
-         [exception] ELR_EL1={:#018x} FAR_EL1={:#018x}\n\
-         [exception] SPSR_EL1={:#018x} SP={:#018x}\n\
+         [exception] error={:#018x} class={:#04x} ({})\n\
+         [exception] ip={:#018x} fault address={:#018x}\n\
+         [exception] flags={:#018x} sp={:#018x}\n\
          [exception] system halted\n",
         info.vector_group(),
         info.vector_type(),

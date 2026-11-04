@@ -148,7 +148,7 @@ impl App for Gui {
                 // SAFETY: foreground graphics apps run one at a time in the
                 // shell; no other process touches the demo state.
                 let state = unsafe { &mut *core::ptr::addr_of_mut!(DEMO) };
-                render(canvas, state);
+                render(canvas, state, context.platform.board.arch);
                 println!(
                     "drew the feos-gui dashboard on a {}x{} ramfb framebuffer",
                     canvas.width(),
@@ -160,7 +160,7 @@ impl App for Gui {
     }
 }
 
-fn render(canvas: &mut Canvas, state: &mut DemoState) {
+fn render(canvas: &mut Canvas, state: &mut DemoState, arch: &str) {
     let theme = Theme::dark();
     let input = Input::new();
     let DemoState {
@@ -232,7 +232,7 @@ fn render(canvas: &mut Canvas, state: &mut DemoState) {
     ui.row(Rect::new(20, 9, (width - 40).max(0) as u32, 36), 12, |ui| {
         ui.badge("FEOS", palette.accent);
         ui.heading("Control Center");
-        ui.label_muted("QEMU aarch64 / ramfb / XRGB8888");
+        ui.label_muted(&alloc::format!("QEMU {arch} / ramfb / XRGB8888"));
         ui.avatar("KD", palette.accent, 28);
     });
 
@@ -588,7 +588,7 @@ fn render(canvas: &mut Canvas, state: &mut DemoState) {
                     properties,
                     &[
                         ("Build", "release"),
-                        ("Target", "aarch64"),
+                        ("Target", arch),
                         ("Allocator", "none"),
                     ],
                 );

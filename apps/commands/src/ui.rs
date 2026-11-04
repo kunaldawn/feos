@@ -7,7 +7,7 @@ const ACCENT_DIM: Color = Color::rgb(40, 88, 150);
 const TEXT_DIM: Color = Color::rgb(150, 168, 205);
 
 /// Draws the boot splash: a gradient background, a logo mark and the title.
-pub fn splash(canvas: &mut Canvas) {
+pub fn splash(canvas: &mut Canvas, arch: &str) {
     let width = canvas.width() as i32;
     let height = canvas.height() as i32;
 
@@ -34,10 +34,11 @@ pub fn splash(canvas: &mut Canvas) {
     canvas.fill_rect(Rect::new(cx - 12, cy - 12, 24, 24), ACCENT);
 
     centered_text(canvas, cy + 168, "feos", Color::WHITE, 10);
+    let subtitle = alloc::format!("{arch} graphics on QEMU ramfb");
     centered_text(
         canvas,
         cy + 278,
-        "aarch64 graphics on QEMU ramfb",
+        &subtitle,
         Color::rgb(174, 192, 232),
         2,
     );

@@ -15,10 +15,20 @@ bench = false
 [dependencies]
 feos-app = { workspace = true }
 feos-apps = { workspace = true }
-feos-arch-aarch64 = { workspace = true }
-feos-board-qemu-virt = { workspace = true }
 feos-console = { workspace = true }
 feos-desktop-app = { workspace = true }
 feos-hal = { workspace = true }
 feos-shell = { workspace = true }
 feos-sync = { workspace = true }
+
+# The kernel selects the architecture and board crate for the target. Building
+# for `aarch64-unknown-none` wires in the `virt` board; building for
+# `x86_64-unknown-none` wires in the q35 board. No source-level board switch is
+# needed.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+feos-arch-aarch64 = { workspace = true }
+feos-board-qemu-virt = { workspace = true }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+feos-arch-x86_64 = { workspace = true }
+feos-board-qemu-x86_64 = { workspace = true }

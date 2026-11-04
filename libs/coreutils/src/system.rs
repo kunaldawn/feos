@@ -37,7 +37,7 @@ pub trait System: Sync {
 
     /// Machine hardware name (`uname -m`).
     fn machine(&self) -> &'static str {
-        "aarch64"
+        "unknown"
     }
 
     /// Effective user name (`whoami`).

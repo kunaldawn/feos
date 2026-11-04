@@ -22,7 +22,7 @@ impl App for Splash {
     fn run(&self, context: &mut Context<'_>) {
         match context.display.as_mut() {
             Some(canvas) => {
-                crate::ui::splash(canvas);
+                crate::ui::splash(canvas, context.platform.board.arch);
                 println!("redrew the boot splash");
             }
             None => println!("no framebuffer; restart QEMU with -device ramfb"),

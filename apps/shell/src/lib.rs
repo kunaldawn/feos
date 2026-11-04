@@ -39,7 +39,7 @@ impl CoreSystem for PlatformSystem<'_> {
     }
 
     fn machine(&self) -> &'static str {
-        "aarch64"
+        self.platform.board.arch
     }
 
     fn username(&self) -> &'static str {

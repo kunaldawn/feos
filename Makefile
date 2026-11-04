@@ -1,11 +1,19 @@
 IMAGE        ?= feos
-TARGET       ?= aarch64-unknown-none
+TARGET_ARM   ?= aarch64-unknown-none
+TARGET_X64   ?= x86_64-unknown-none
+TARGET       ?= $(TARGET_ARM)
 PROFILE      ?= release
-KERNEL       := target/$(TARGET)/$(PROFILE)/feos
-QEMU         ?= qemu-system-aarch64
+KERNEL_ARM   := target/$(TARGET_ARM)/$(PROFILE)/feos
+KERNEL_X64   := target/$(TARGET_X64)/$(PROFILE)/feos
+KERNEL       := $(KERNEL_ARM)
+QEMU_ARM     ?= qemu-system-aarch64
+QEMU_X64     ?= qemu-system-x86_64
+QEMU         ?= $(QEMU_ARM)
 QEMU_DISPLAY ?= vnc=127.0.0.1:0
 QEMU_MEM     ?= 512M
 QEMU_SMP     ?= 4
+# The x86_64 port currently runs the scheduler on the boot CPU.
+QEMU_SMP_X64 ?= 1
 
 # PulseAudio/PipeWire socket, used for live sound when it exists.
 PULSE_SOCKET ?= /run/user/$(shell id -u)/pulse/native
@@ -32,26 +40,58 @@ QEMU_FLAGS   ?= -machine virt -cpu cortex-a53 -smp $(QEMU_SMP) -m $(QEMU_MEM) -n
 # host through X11/XWayland; "vnc=0.0.0.0:0" serves the display over VNC.
 FEOS_DISPLAY ?= gtk
 
-.PHONY: all build check run clean test test-gfx test-gui test-audio test-sync \
+.PHONY: all build build-arm build-x64 check check-arm check-x64 run run-arm run-x64 clean \
+        test test-gfx test-gui test-audio test-sync \
         test-json test-yaml test-image test-audio-codec test-compress test-archive \
         test-h264 test-video test-text test-bundle test-init test-fs test-keys \
         test-coreutils test-sh \
         test-desktop test-desktop-app test-virtio-input test-dosbox \
-        bundles games-image games-check run-games audio-demo docker-build docker-run docker-run-vnc docker-audio docker-shell
+        bundles games-image games-check run-games run-games-x64 audio-demo \
+        docker-build docker-run docker-run-arm docker-run-x64 \
+        docker-run-vnc docker-run-vnc-arm docker-run-vnc-x64 docker-audio docker-shell
 
 all: build
 
 # `default-members = ["kernel"]` in the workspace manifest means this builds
-# the bootable kernel and everything it pulls in.
-build:
-	cargo build --$(PROFILE)
+# the bootable kernel and everything it pulls in. `build` remains the AArch64
+# default; use `build-x64` for the QEMU q35 port.
+build: build-arm
 
-check:
-	cargo check --workspace
+build-arm:
+	cargo build --$(PROFILE) --target $(TARGET_ARM)
 
-run: build
+build-x64:
+	cargo build --$(PROFILE) --target $(TARGET_X64)
+
+# `--workspace` cannot build both architecture crates in one pass: each
+# contains target-specific assembly. Check the port that matches the target.
+check: check-arm
+
+check-arm:
+	cargo check --workspace --target $(TARGET_ARM) \
+		--exclude feos-arch-x86_64 \
+		--exclude feos-board-qemu-x86_64 \
+		--exclude feos-driver-apic \
+		--exclude feos-driver-i8042 \
+		--exclude feos-driver-uart16550
+
+check-x64:
+	cargo check --workspace --target $(TARGET_X64) \
+		--exclude feos-arch-aarch64 \
+		--exclude feos-board-qemu-virt \
+		--exclude feos-driver-gicv2
+
+run: run-arm
+
+run-arm: build-arm
 	mkdir -p target/audio
-	$(QEMU) $(QEMU_FLAGS) -display $(QEMU_DISPLAY) -kernel $(KERNEL)
+	$(QEMU) $(QEMU_FLAGS) -display $(QEMU_DISPLAY) -kernel $(KERNEL_ARM)
+
+run-x64: build-x64
+	mkdir -p target/audio
+	FEOS_DISPLAY="$(QEMU_DISPLAY)" FEOS_SMP="$(QEMU_SMP_X64)" \
+		FEOS_MEM="$(QEMU_MEM)" FEOS_AUDIODEV="$(AUDIODEV)" \
+		./scripts/qemu-x64.sh $(KERNEL_X64)
 
 test: test-gfx test-gui test-audio test-sync test-json test-yaml test-image test-audio-codec test-compress test-archive test-h264 test-video test-text test-bundle test-init test-fs test-keys test-coreutils test-sh test-desktop test-desktop-app test-virtio-input test-dosbox
 
@@ -140,9 +180,16 @@ games-check:
 # The 256 MiB image is linked into the kernel, so the guest needs more than
 # the default 128 MiB of RAM. This target builds and boots with 512 MiB.
 run-games: QEMU_MEM = 512M
-run-games: games-image build
+run-games: games-image build-arm
 	mkdir -p target/audio
-	$(QEMU) $(QEMU_FLAGS) -display $(QEMU_DISPLAY) -kernel $(KERNEL)
+	$(QEMU) $(QEMU_FLAGS) -display $(QEMU_DISPLAY) -kernel $(KERNEL_ARM)
+
+run-games-x64: QEMU_MEM = 512M
+run-games-x64: games-image build-x64
+	mkdir -p target/audio
+	FEOS_DISPLAY="$(QEMU_DISPLAY)" FEOS_SMP="$(QEMU_SMP_X64)" \
+		FEOS_MEM="$(QEMU_MEM)" FEOS_AUDIODEV="$(AUDIODEV)" \
+		./scripts/qemu-x64.sh $(KERNEL_X64)
 
 # Repacks every bundle source directory into apps/desktop/apps. The desktop's
 # build script picks up whatever is in that folder, so adding an app is:
@@ -188,7 +235,10 @@ docker-build:
 	docker build -t $(IMAGE) .
 
 # Opens a real QEMU window. The serial shell stays in this terminal.
-docker-run: docker-build
+#
+# `docker-run` is an alias for the AArch64 target. Both targets use the same
+# image; the entrypoint selects the architecture from FEOS_ARCH.
+define DOCKER_RUN_BODY
 	@set -e; \
 	if [ "$(FEOS_DISPLAY)" = "gtk" ] && [ -z "$$DISPLAY" ]; then \
 		echo "DISPLAY is not set. Use 'make docker-run-vnc' for a VNC display."; \
@@ -211,6 +261,7 @@ docker-run: docker-build
 		-e DISPLAY \
 		-e GDK_BACKEND=x11 \
 		-e NO_AT_BRIDGE=1 \
+		-e FEOS_ARCH=$(1) \
 		-e FEOS_DISPLAY="$(FEOS_DISPLAY)" \
 		-e FEOS_AUDIODEV="$$audiod" \
 		-e FEOS_SMP="$(QEMU_SMP)" \
@@ -220,11 +271,21 @@ docker-run: docker-build
 		-v /tmp/.X11-unix:/tmp/.X11-unix \
 		-p 5900:5900 \
 		$(IMAGE)
+endef
+
+docker-run: docker-run-arm
+
+docker-run-arm: docker-build
+	$(call DOCKER_RUN_BODY,arm)
+
+docker-run-x64: QEMU_SMP = 1
+docker-run-x64: docker-build
+	$(call DOCKER_RUN_BODY,x64)
 
 # Headless / remote: serve the display over VNC on localhost:5900. Audio follows
 # the same AUDIODEV rules as `make docker-run`, so WAV output lands in
 # target/audio and ALSA/PulseAudio play live.
-docker-run-vnc: docker-build
+define DOCKER_RUN_VNC_BODY
 	@set -e; \
 	audiod="$(AUDIODEV)"; \
 	audiod="$$(printf '%s' "$$audiod" | sed 's#target/audio#/out#')"; \
@@ -235,6 +296,7 @@ docker-run-vnc: docker-build
 		wav*) mkdir -p target/audio; audio_args="-v $(CURDIR)/target/audio:/out";; \
 	esac; \
 	docker run --rm -it -p 5900:5900 \
+		-e FEOS_ARCH=$(1) \
 		-e FEOS_DISPLAY=vnc=0.0.0.0:0 \
 		-e FEOS_AUDIODEV="$$audiod" \
 		-e FEOS_SMP="$(QEMU_SMP)" \
@@ -242,6 +304,16 @@ docker-run-vnc: docker-build
 		-e FEOS_TEST_DISKS=1 \
 		$$audio_args \
 		$(IMAGE)
+endef
+
+docker-run-vnc: docker-run-vnc-arm
+
+docker-run-vnc-arm: docker-build
+	$(call DOCKER_RUN_VNC_BODY,arm)
+
+docker-run-vnc-x64: QEMU_SMP = 1
+docker-run-vnc-x64: docker-build
+	$(call DOCKER_RUN_VNC_BODY,x64)
 
 docker-shell:
 	docker run --rm -it -v "$(CURDIR)":/src -v feos-target:/src/target -w /src $(IMAGE) bash

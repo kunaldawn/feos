@@ -12,3 +12,17 @@ rustflags = [
     "-C", "relocation-model=static",
     "-C", "link-arg=-z", "-C", "link-arg=max-page-size=4096",
 ]
+
+[target.x86_64-unknown-none]
+# `cargo run --target x86_64-unknown-none` hands the linked ELF to
+# scripts/qemu-x64.sh, which turns it into the flat multiboot image QEMU
+# expects and boots the q35 machine. The red zone is disabled because timer
+# IRQs use the interrupted stack directly.
+runner = "scripts/qemu-x64.sh"
+rustflags = [
+    "-C", "linker=rust-lld",
+    "-C", "link-arg=-Tboards/qemu-x86_64/linker.ld",
+    "-C", "relocation-model=static",
+    "-C", "no-redzone=yes",
+    "-C", "link-arg=-z", "-C", "link-arg=max-page-size=4096",
+]

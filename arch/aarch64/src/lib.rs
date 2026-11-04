@@ -4,7 +4,7 @@
 //! early boot entry point, exception vectors, PSCI calls and the generic
 //! timer. It knows nothing about boards, drivers, apps or the console.
 //!
-//! [`AARCH64`] implements the system-service traits from `feos-hal`, so the
+//! [`ARCH`] implements the system-service traits from `feos-hal`, so the
 //! kernel can hand one static implementation to every app without apps
 //! depending on this crate.
 //!
@@ -29,7 +29,13 @@ pub mod timer;
 pub struct Aarch64;
 
 /// Shared instance of the AArch64 system services.
-pub static AARCH64: Aarch64 = Aarch64;
+pub static ARCH: Aarch64 = Aarch64;
+
+/// One-time architecture initialization.
+///
+/// The AArch64 boot stub already set up the CPU and stack; exception vectors
+/// are installed by the kernel after the console is available.
+pub fn init() {}
 
 impl Clock for Aarch64 {
     fn frequency(&self) -> u64 {

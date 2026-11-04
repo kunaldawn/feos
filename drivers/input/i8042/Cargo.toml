@@ -1,0 +1,10 @@
+[package]
+name = "feos-driver-i8042"
+description = "Polled PS/2 keyboard and mouse (i8042 controller)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+feos-hal = { workspace = true }
+feos-sync = { workspace = true }

@@ -2958,6 +2958,7 @@ mod tests {
         let platform = Platform {
             board: BoardInfo {
                 name: "test",
+                arch: "test",
                 console_base: 0,
                 framebuffer_addr: 0,
                 kernel_range: (0, 0),

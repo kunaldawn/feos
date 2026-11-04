@@ -1,6 +1,7 @@
-//! QEMU fw_cfg driver (MMIO + DMA), limited to what the framebuffer needs.
+//! QEMU fw_cfg driver (MMIO + I/O port, DMA), limited to what the
+//! framebuffer needs.
 //!
-//! On the `virt` machine fw_cfg is mapped at `0x0902_0000`:
+//! AArch64's `virt` machine maps fw_cfg in MMIO at `0x0902_0000`:
 //!
 //! | offset | register                                  |
 //! |--------|-------------------------------------------|
@@ -8,14 +9,17 @@
 //! | 0x08   | selector (16-bit, big-endian)             |
 //! | 0x10   | DMA address (64-bit, big-endian)          |
 //!
-//! The DMA transfer descriptor is also big-endian. See the QEMU fw_cfg
-//! specification for details.
+//! x86 PCs expose the same device through I/O ports `0x510` (selector),
+//! `0x511` (data) and `0x514`/`0x518` (DMA address high/low). Construction
+//! chooses the backend, so `feos-driver-ramfb` stays transport-agnostic.
 //!
-//! The driver is stateless apart from its MMIO base address; other drivers
-//! (such as `feos-driver-ramfb`) take an [`FwCfg`] value and use it.
+//! The DMA transfer descriptor is big-endian in both cases. See the QEMU
+//! fw_cfg specification for details.
 
 #![no_std]
 
+#[cfg(target_arch = "x86_64")]
+use core::arch::asm;
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 
 const DATA: usize = 0x00;
@@ -30,6 +34,19 @@ const CONTROL_ERROR: u32 = 1 << 0;
 const CONTROL_SELECT: u32 = 1 << 3;
 const CONTROL_WRITE: u32 = 1 << 4;
 
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Debug)]
+enum Backend {
+    Mmio(usize),
+    Io(u16),
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug)]
+enum Backend {
+    Mmio(usize),
+}
+
 /// An entry in the fw_cfg file directory.
 #[derive(Clone, Copy, Debug)]
 pub struct FileEntry {
@@ -39,32 +56,68 @@ pub struct FileEntry {
     pub selector: u16,
 }
 
-/// A QEMU fw_cfg device at a given MMIO base address.
+/// A QEMU fw_cfg device.
 #[derive(Clone, Copy, Debug)]
 pub struct FwCfg {
-    base: usize,
+    backend: Backend,
 }
 
 impl FwCfg {
-    /// Creates a driver for the device mapped at `base`.
+    /// Creates a driver for a device mapped in MMIO at `base`.
     pub const fn new(base: usize) -> Self {
-        Self { base }
+        Self {
+            backend: Backend::Mmio(base),
+        }
     }
 
-    /// Base address of the device.
+    /// Creates a driver for a device behind I/O ports starting at `base`.
+    ///
+    /// On a PC `base` is `0x510` (the selector port); data and DMA ports are
+    /// at fixed offsets, matching QEMU's `fw_cfg_init_io_dma`.
+    #[cfg(target_arch = "x86_64")]
+    pub const fn new_io(base: u16) -> Self {
+        Self {
+            backend: Backend::Io(base),
+        }
+    }
+
+    /// Base address or I/O port of the device.
     pub const fn base(&self) -> usize {
-        self.base
+        match self.backend {
+            Backend::Mmio(base) => base,
+            #[cfg(target_arch = "x86_64")]
+            Backend::Io(base) => base as usize,
+        }
     }
 
     fn select(&self, key: u16) {
-        // The MMIO selector register is big-endian.
-        // SAFETY: `base` is an MMIO address supplied by the board.
-        unsafe { write_volatile((self.base + SELECTOR) as *mut u16, key.to_be()) };
+        match self.backend {
+            Backend::Mmio(base) => {
+                // SAFETY: `base` is an MMIO address supplied by the board.
+                unsafe { write_volatile((base + SELECTOR) as *mut u16, key.to_be()) };
+            }
+            #[cfg(target_arch = "x86_64")]
+            Backend::Io(base) => {
+                // The combined selector/data I/O region is little-endian.
+                // SAFETY: `base` is a valid fw_cfg selector port.
+                unsafe { outw(base, key) };
+            }
+        }
     }
 
     fn read_u8(&self) -> u8 {
-        // SAFETY: `base` is an MMIO address supplied by the board.
-        unsafe { read_volatile((self.base + DATA) as *const u8) }
+        match self.backend {
+            Backend::Mmio(base) => {
+                // SAFETY: `base` is an MMIO address supplied by the board.
+                unsafe { read_volatile((base + DATA) as *const u8) }
+            }
+            #[cfg(target_arch = "x86_64")]
+            Backend::Io(base) => {
+                // Data is one byte above the selector.
+                // SAFETY: `base + 1` is the fw_cfg data port.
+                unsafe { inb(base + 1) }
+            }
+        }
     }
 
     fn read_be_u16(&self) -> u16 {
@@ -139,18 +192,25 @@ impl FwCfg {
             address: (data.as_ptr() as u64).to_be(),
         };
 
-        // SAFETY: the descriptor is a live local, and `base` is MMIO.
+        // SAFETY: the descriptor is a live local, and the device is either
+        // MMIO or a fixed I/O port range supplied by the board.
         unsafe {
             let descriptor = addr_of_mut!(access) as u64;
-            // High half first, then the low half, which starts the transfer.
-            write_volatile(
-                (self.base + DMA_ADDRESS_HIGH) as *mut u32,
-                ((descriptor >> 32) as u32).to_be(),
-            );
-            write_volatile(
-                (self.base + DMA_ADDRESS_LOW) as *mut u32,
-                (descriptor as u32).to_be(),
-            );
+            let high = ((descriptor >> 32) as u32).to_be();
+            let low = (descriptor as u32).to_be();
+
+            match self.backend {
+                Backend::Mmio(base) => {
+                    // High half first, then the low half, which starts it.
+                    write_volatile((base + DMA_ADDRESS_HIGH) as *mut u32, high);
+                    write_volatile((base + DMA_ADDRESS_LOW) as *mut u32, low);
+                }
+                #[cfg(target_arch = "x86_64")]
+                Backend::Io(base) => {
+                    outl(base + 4, high);
+                    outl(base + 8, low);
+                }
+            }
 
             loop {
                 let control = u32::from_be(read_volatile(addr_of!(access.control)));
@@ -164,4 +224,27 @@ impl FwCfg {
             }
         }
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn outw(port: u16, value: u16) {
+    // SAFETY: callers pass a valid x86 I/O port.
+    unsafe { asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack)) };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn outl(port: u16, value: u32) {
+    // SAFETY: callers pass a valid x86 I/O port.
+    unsafe { asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack)) };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn inb(port: u16) -> u8 {
+    let value: u8;
+    // SAFETY: callers pass a valid x86 I/O port.
+    unsafe { asm!("in al, dx", out("al") value, in("dx") port, options(nomem, nostack)) };
+    value
 }

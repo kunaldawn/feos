@@ -29,6 +29,25 @@ use feos_sync::SpinLock;
 /// Human-readable board name, shown by the `info` app.
 pub const NAME: &str = "QEMU aarch64 virt";
 
+/// Architecture reported by `uname -m`.
+pub const ARCH: &str = "aarch64";
+
+/// Name of the serial device, used by the boot log.
+pub const CONSOLE_NAME: &str = "PL011";
+
+/// Name of the interrupt controller, used by the boot log.
+pub const INTERRUPT_CONTROLLER_NAME: &str = "GICv2";
+
+/// Name of the pointer device family, used by the boot log.
+pub const POINTER_NAME: &str = "virtio";
+/// Hint shown when no pointer was found.
+pub const POINTER_HINT: &str = "start QEMU with -device virtio-tablet-device";
+
+/// Name of the keyboard device family, used by the boot log.
+pub const KEYBOARD_NAME: &str = "virtio";
+/// Hint shown when no keyboard was found.
+pub const KEYBOARD_HINT: &str = "serial console is the keyboard";
+
 /// PL011 UART0 on the `virt` machine.
 pub const CONSOLE_BASE: usize = 0x0900_0000;
 

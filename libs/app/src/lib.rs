@@ -31,6 +31,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct BoardInfo {
     /// Human-readable board name.
     pub name: &'static str,
+    /// Architecture name (`uname -m`), for example `aarch64` or `x86_64`.
+    pub arch: &'static str,
     /// Base address of the console UART.
     pub console_base: usize,
     /// Physical address of the scanout buffer (0 when there is no display).

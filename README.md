@@ -1,11 +1,13 @@
 # feos
 
 A tiny bare-metal **Rust** operating-system skeleton for the **aarch64** QEMU
-`virt` machine, organised as a multi-crate workspace. It boots at EL1, installs
-exception vectors, talks to the PL011 serial port, brings up a **ramfb**
-framebuffer, draws a splash screen, starts a multi-core preemptive round-robin
-scheduler, and opens an interactive **desktop session** where applications can
-be launched with the keyboard. Logging off (or `Ctrl-\` on the serial console)
+`virt` machine and the **x86_64** QEMU `q35` machine, organised as a multi-crate
+workspace. On AArch64 it boots at EL1 with PL011 serial; on x86_64 it boots
+through a multiboot long-mode entry with COM1, the LAPIC/IOAPIC and PS/2 input.
+Both ports install exception vectors, bring up a **ramfb** framebuffer, draw a
+splash screen, start a preemptive round-robin scheduler, and open an
+interactive **desktop session** where applications can be launched with the
+keyboard. Logging off (or `Ctrl-\` on the serial console)
 drops into a **Bash-compatible terminal** with a writable overlay filesystem,
 pipelines, redirection, job-style background launches and a built-in POSIX
 coreutils library.
@@ -21,6 +23,7 @@ Docker.
 
 The project is designed to grow along four independent axes:
 
+- **architectures** — every CPU port gets a crate in `arch/<arch>` (`aarch64`, `x86_64`)
 - **boards** — every machine gets a board support package in `boards/<name>`
 - **drivers** — every device gets its own crate in `drivers/<class>/<name>`
 - **libraries** — reusable, hardware-independent code lives in `libs/<name>`
@@ -61,12 +64,13 @@ app registry).
 ```
 .
 ├── Cargo.toml                  # virtual workspace manifest (no kernel code)
-├── rust-toolchain.toml         # stable + aarch64-unknown-none target
+├── rust-toolchain.toml         # stable + aarch64/x86_64 bare-metal targets
 ├── .cargo/config.toml          # default target, rust-lld flags, cargo runner
-├── Dockerfile                  # rust:1-slim-bookworm + qemu-system-arm
+├── Dockerfile                  # rust:1-slim-bookworm + QEMU arm/x86
 ├── Makefile                    # build, run, test, Docker targets
 ├── scripts/
-│   ├── qemu.sh                 # shared QEMU launch (ramfb + Intel HDA + display)
+│   ├── qemu.sh                 # AArch64 QEMU launch (ramfb + HDA + display)
+│   ├── qemu-x64.sh             # x86_64 QEMU launch (flat image + q35 + ramfb)
 │   ├── pack-app.py             # pack a directory into a single-file .fapp bundle
 │   └── docker-run.sh           # container entry point: build, then boot
 ├── docs/                       # screenshots and architecture notes
@@ -79,33 +83,50 @@ app registry).
 │       └── sched.rs            # shared process table + per-CPU round-robin
 │
 ├── arch/
-│   └── aarch64/                # feos-arch-aarch64
+│   ├── aarch64/                # feos-arch-aarch64
+│   │   └── src/
+│   │       ├── boot.S          # _start: CPU setup, BSS, jump to kmain
+│   │       ├── vectors.S       # exception table + recoverable IRQ entry
+│   │       ├── exceptions.rs   # vector install, FaultInfo, handler hook
+│   │       ├── irq.rs          # TrapFrame, IRQ dispatch, mask helpers
+│   │       ├── cpu.rs          # halt, current EL, MIDR, per-CPU index
+│   │       ├── psci.rs         # CPU_ON, poweroff / reboot
+│   │       ├── smp.rs          # secondary entry + handler hook
+│   │       └── timer.rs        # generic timer helpers, per-CPU idle hints
+│   └── x86_64/                 # feos-arch-x86_64
 │       └── src/
-│           ├── boot.S          # _start: CPU setup, BSS, jump to kmain
-│           ├── vectors.S       # exception table + recoverable IRQ entry
-│           ├── exceptions.rs   # vector install, FaultInfo, handler hook
+│           ├── boot.S          # multiboot entry, page tables, long mode
+│           ├── interrupts.S    # 64-bit IDT stubs + recoverable IRQ frame
+│           ├── exceptions.rs   # IDT install, FaultInfo, handler hook
 │           ├── irq.rs          # TrapFrame, IRQ dispatch, mask helpers
-│           ├── cpu.rs          # halt, current EL, MIDR, per-CPU index
-│           ├── psci.rs         # CPU_ON, poweroff / reboot
-│           ├── smp.rs          # secondary entry + handler hook
-│           └── timer.rs        # generic timer helpers, per-CPU idle hints
+│           ├── cpu.rs          # halt, CPUID, per-CPU index
+│           ├── power.rs        # ACPI poweroff / PCI reset
+│           ├── smp.rs          # single-CPU scheduler interface
+│           └── timer.rs        # TSC clock + PIT scheduler tick
 │
 ├── boards/
-│   └── qemu-virt/              # feos-board-qemu-virt
-│       ├── build.rs            # generates the embedded filesystem image
-│       ├── fs/                 # files and directories compiled into the kernel
-│       │   └── media/          # sample GIF, MJPEG, AVI, MP4, MKV, FLV clips
-│       ├── linker.ld           # 0x40080000 load address, BSS, 256 KiB stack
-│       └── src/lib.rs          # MMIO map, UART/framebuffer/audio/pointer wiring, symbols
+│   ├── qemu-virt/              # feos-board-qemu-virt (aarch64)
+│   │   ├── build.rs            # generates the embedded filesystem image
+│   │   ├── fs/                 # files and directories compiled into the kernel
+│   │   │   └── media/          # sample GIF, MJPEG, AVI, MP4, MKV, FLV clips
+│   │   ├── linker.ld           # 0x40080000 load address, BSS, 256 KiB stack
+│   │   └── src/lib.rs          # MMIO map, UART/framebuffer/audio/pointer wiring
+│   └── qemu-x86_64/            # feos-board-qemu-x86_64 (x86_64 q35)
+│       ├── build.rs            # shares the virt board's fs tree and disk images
+│       ├── linker.ld           # 0x100000 load address, multiboot header
+│       └── src/lib.rs          # COM1, APIC/IOAPIC, PCI ports, ramfb, HDA, PS/2
 │
 ├── drivers/
 │   ├── serial/pl011/           # feos-driver-pl011
-│   ├── firmware/fw-cfg/        # feos-driver-fw-cfg
+│   ├── serial/uart16550/       # feos-driver-uart16550 (x86 COM1)
+│   ├── firmware/fw-cfg/        # feos-driver-fw-cfg (MMIO and I/O port)
 │   ├── display/ramfb/          # feos-driver-ramfb
-│   ├── bus/pci/                # feos-driver-pci: PCIe ECAM + BAR assignment
+│   ├── bus/pci/                # feos-driver-pci: ECAM or legacy port config
 │   ├── audio/intel-hda/        # feos-driver-intel-hda: Intel HDA playback
 │   ├── input/virtio/           # feos-driver-virtio-input: tablet/mouse/keyboard
-│   └── interrupt/gicv2/        # feos-driver-gicv2: GICv2 distributor + CPU interface
+│   ├── input/i8042/            # feos-driver-i8042: PS/2 keyboard + mouse
+│   ├── interrupt/gicv2/        # feos-driver-gicv2
+│   └── interrupt/apic/         # feos-driver-apic: LAPIC + IOAPIC
 │
 ├── libs/
 │   ├── hal/                    # feos-hal: device + system-service traits
@@ -313,10 +334,13 @@ change.
 
 ```sh
 make docker-build
-make docker-run
+make docker-run-arm     # or: make docker-run
+make docker-run-x64
 ```
 
-`make docker-run` opens a **real QEMU window** on your desktop while the serial
+`make docker-run-arm` (aliased as `make docker-run`) boots the AArch64 `virt`
+machine; `make docker-run-x64` boots the x86_64 `q35` machine from the same
+image. Both open a **real QEMU window** on your desktop while the serial
 shell stays in your terminal. It grants QEMU temporary access to your X11 /
 XWayland display (`xhost +si:localuser:<you>`), binds it in with
 `-v /tmp/.X11-unix`, and revokes the access again when QEMU exits.
@@ -342,7 +366,8 @@ host to hear the same samples. See
 For headless machines, SSH sessions, or a remote desktop, use:
 
 ```sh
-make docker-run-vnc
+make docker-run-vnc          # AArch64
+make docker-run-vnc-x64      # x86_64
 ```
 
 This publishes QEMU's display over **VNC on port 5900**, using the same audio
@@ -357,9 +382,11 @@ Or run the image directly with an explicit backend:
 
 ```sh
 docker build -t feos .
-docker run --rm -it -p 5900:5900 -e FEOS_DISPLAY=vnc=0.0.0.0:0 feos
+docker run --rm -it -p 5900:5900 -e FEOS_ARCH=arm -e FEOS_DISPLAY=vnc=0.0.0.0:0 feos
+docker run --rm -it -p 5900:5900 -e FEOS_ARCH=x64 -e FEOS_DISPLAY=vnc=0.0.0.0:0 feos
 ```
 
+`FEOS_ARCH` selects the architecture (`arm`, the default, or `x64`).
 `FEOS_DISPLAY` selects the QEMU backend: `gtk` (window through the host X
 server), `vnc=...` (VNC server), or `none` (serial only). The GTK backend needs
 the X socket mount and `DISPLAY`; the Makefile handles both for you.
@@ -370,36 +397,53 @@ for `target/`, so build artifacts are not written as root on the host:
 ```sh
 make docker-shell
 # inside:
-cargo build --release
+cargo build --release --target aarch64-unknown-none
 ./scripts/qemu.sh
+# or:
+cargo build --release --target x86_64-unknown-none
+./scripts/qemu-x64.sh
 ```
 
 ## Native build and run
 
-Requirements: Rust (rustup) and `qemu-system-aarch64`.
+Requirements: Rust (rustup), `qemu-system-aarch64`, `qemu-system-x86_64` and
+`objcopy` (GNU binutils; only needed for the x86_64 flat image).
 
 ```sh
-rustup target add aarch64-unknown-none   # also declared in rust-toolchain.toml
-cargo build --release
-make run                                 # VNC on localhost:5900
+rustup target add aarch64-unknown-none x86_64-unknown-none
+# also declared in rust-toolchain.toml
+
+make build-arm                           # or: cargo build --release
+make run                                 # AArch64, VNC on localhost:5900
+
+make build-x64
+make run-x64                             # x86_64 q35, VNC on localhost:5900
 ```
 
-`cargo build` builds the kernel because the workspace sets
-`default-members = ["kernel"]`. Use `cargo build --workspace` to build every
-crate. The run targets boot with four CPUs and 512 MiB of RAM by default;
-override them with `QEMU_SMP` and `QEMU_MEM` (up to eight CPUs are supported).
+`make build` is an alias for `make build-arm`; `make run` is an alias for
+`make run-arm`. The workspace sets `default-members = ["kernel"]`, so a plain
+`cargo build` builds whichever kernel target `.cargo/config.toml` selects
+(AArch64 by default). Pass `--target x86_64-unknown-none` to build the x86_64
+kernel. The run targets boot with four CPUs and 512 MiB of RAM by default;
+override them with `QEMU_SMP` and `QEMU_MEM` (up to eight CPUs are supported on
+AArch64; the current x86_64 port runs the scheduler on the boot CPU).
 
-On Debian/Ubuntu, QEMU comes from `qemu-system-arm`:
+`make check-arm` and `make check-x64` check the workspace for each port. A
+single `cargo check --workspace` cannot compile both architecture crates in
+one pass because each contains target-specific assembly.
+
+On Debian/Ubuntu, QEMU comes from `qemu-system-arm` and `qemu-system-x86`:
 
 ```sh
-sudo apt install qemu-system-arm
+sudo apt install qemu-system-arm qemu-system-x86 binutils
 ```
 
 Useful overrides:
 
 | Command                              | Result                                    |
 |--------------------------------------|-------------------------------------------|
-| `make run`                           | VNC display on `127.0.0.1:5900`           |
+| `make run`                           | AArch64 VNC display on `127.0.0.1:5900`   |
+| `make run-x64`                       | x86_64 VNC display on `127.0.0.1:5900`    |
 | `FEOS_DISPLAY=gtk make run`          | Native GTK window (if QEMU has GTK)       |
 | `FEOS_DISPLAY=none make run`         | Headless: serial console only             |
 | `make run QEMU_DISPLAY=vnc=0.0.0.0:0`| VNC reachable from other machines         |

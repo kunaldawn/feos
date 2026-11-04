@@ -1,10 +1,10 @@
 //! Preemptive round-robin process scheduler.
 //!
 //! `feos` processes are kernel threads: they share the address space and all
-//! run at EL1, but each has its own 128 KiB stack and a saved register frame.
-//! Every online CPU runs the generic timer at 100 Hz; an IRQ saves the
-//! interrupted frame, this module chooses the next runnable process, and the
-//! stub returns to that process instead.
+//! run at the kernel's privilege level, but each has its own 128 KiB stack and
+//! a saved register frame. Every online CPU runs its architecture timer at
+//! 100 Hz; an IRQ saves the interrupted frame, this module chooses the next
+//! runnable process, and the stub returns to that process instead.
 //!
 //! The process table is shared by every core and lives in `.bss`. Each CPU
 //! remembers which slot it is currently running, so a process is never
@@ -20,14 +20,14 @@ use feos_app::{
     App, Context, Platform, ProcessInfo, ProcessState, Processes, SpawnError, SystemInfo,
     MAX_PROCESSES, PROCESS_ARGS_MAX, PROCESS_NAME_MAX,
 };
-use feos_arch_aarch64::{cpu, irq, timer};
+use crate::arch::{cpu, irq, timer};
 use feos_sync::SpinLock;
 
 /// Number of process slots, including the shell.
 const MAX_TASKS: usize = MAX_PROCESSES;
 
 /// Number of CPUs the scheduler can run on.
-const MAX_CPUS: usize = feos_arch_aarch64::smp::MAX_CPUS;
+const MAX_CPUS: usize = crate::arch::smp::MAX_CPUS;
 
 // `SystemInfo` fixes the public array size; a port with more private CPUs
 // would need to widen `feos_app::MAX_CPUS` as well.
