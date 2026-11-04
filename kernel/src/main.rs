@@ -10,6 +10,7 @@
 
 mod allocator;
 mod sched;
+mod smp;
 
 use core::panic::PanicInfo;
 
@@ -148,13 +149,25 @@ pub extern "C" fn kmain(dtb: usize) -> ! {
         board::TIMER_IRQ
     );
     println!(
-        "[sched] preemptive round-robin at 100 Hz, {} process slots",
+        "[sched] preemptive round-robin at {} Hz, {} process slots",
+        smp::TICK_HZ,
         feos_app::MAX_PROCESSES
     );
 
+    // Bring up the remaining CPUs before the boot CPU starts ticking. Each
+    // secondary configures its own GIC interface and timer, then joins the
+    // shared run queue.
+    let (started, error) = smp::start_secondaries();
+    match error {
+        Some(code) => {
+            println!("[smp] started {started} secondary CPU(s); no more CPUs (PSCI status {code})")
+        }
+        None => println!("[smp] started {started} secondary CPU(s)"),
+    }
+
     // Timer ticks and IRQ delivery begin here; the shell is PID 1 and the
-    // currently running process.
-    sched::start(100);
+    // boot CPU's currently running process.
+    sched::start(smp::TICK_HZ);
 
     // Leave the splash on screen for a moment, then hand the framebuffer to
     // the desktop. Logging off (or Ctrl-\ in the serial terminal) returns to

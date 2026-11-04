@@ -1,6 +1,6 @@
 [package]
 name = "feos-sync"
-description = "Synchronization primitives for a single-core bare-metal kernel"
+description = "Synchronization primitives for a bare-metal multi-core kernel"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

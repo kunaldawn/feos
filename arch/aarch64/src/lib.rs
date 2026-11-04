@@ -21,6 +21,7 @@ pub mod cpu;
 pub mod exceptions;
 pub mod irq;
 pub mod psci;
+pub mod smp;
 pub mod timer;
 
 /// The AArch64 implementation of the kernel's system services.

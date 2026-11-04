@@ -44,6 +44,12 @@ pub const GIC_CPU_BASE: usize = 0x0801_0000;
 /// physical timer is PPI 30 and is acknowledged as a Group 0 interrupt.
 pub const TIMER_IRQ: u32 = 30;
 
+/// CPUs the board can bring up.
+///
+/// QEMU's GICv2 `virt` machine supports up to eight CPUs; pass `-smp N` to
+/// boot fewer. The architecture port's secondary-entry stacks match this.
+pub const MAX_CPUS: usize = 8;
+
 /// fw_cfg MMIO window on the `virt` machine.
 pub const FW_CFG_BASE: usize = 0x0902_0000;
 
@@ -91,15 +97,30 @@ pub static UART0: Pl011 = Pl011::new(CONSOLE_BASE);
 /// The GICv2 controller used by the timer tick.
 pub static INTERRUPT_CONTROLLER: GicV2 = GicV2::new(GIC_DIST_BASE, GIC_CPU_BASE);
 
-/// Initializes the GIC and enables the timer interrupt.
+/// Initializes the GIC and enables the timer interrupt on the boot CPU.
 pub fn init_interrupts() {
     INTERRUPT_CONTROLLER.init();
+    INTERRUPT_CONTROLLER.enable(TIMER_IRQ);
+}
+
+/// Initializes the calling CPU's GIC interface and timer PPI.
+pub fn init_cpu_interrupts() {
+    INTERRUPT_CONTROLLER.init_cpu();
     INTERRUPT_CONTROLLER.enable(TIMER_IRQ);
 }
 
 /// Returns the interrupt controller shared with the kernel IRQ handler.
 pub fn interrupts() -> &'static dyn InterruptController {
     &INTERRUPT_CONTROLLER
+}
+
+/// PSCI target affinity for a logical CPU index.
+///
+/// QEMU's GICv2 `virt` machine places all CPUs in affinity level 0, so the
+/// MPIDR value is simply the index. A board with clustered CPUs would encode
+/// its cluster/core split here instead.
+pub fn cpu_mpidr(index: usize) -> u64 {
+    index as u64
 }
 
 /// The virtio-input pointer discovered at boot.
@@ -203,8 +224,8 @@ pub fn framebuffer_addr() -> usize {
 /// buffer in one pass, which avoids showing a half-drawn frame.
 pub fn back_buffer() -> Option<Canvas<'static>> {
     // SAFETY: `BACK` is a static, page-aligned buffer that is only handed out
-    // here. The kernel is single-core and the returned canvas owns the only
-    // reference for the rest of the program.
+    // here. The returned canvas owns the only reference for the rest of the
+    // program; the desktop is the sole foreground consumer.
     let ptr = unsafe { core::ptr::addr_of_mut!(BACK.0).cast::<u32>() };
     let pixels: &'static mut [u32] =
         unsafe { core::slice::from_raw_parts_mut(ptr, DISPLAY_WIDTH * DISPLAY_HEIGHT) };
@@ -255,8 +276,8 @@ pub fn init_display() -> Option<Canvas<'static>> {
     // reference; the buffer is only exposed once, here.
     let ptr = unsafe { core::ptr::addr_of_mut!(SCANOUT.0).cast::<u32>() };
     // SAFETY: `SCANOUT` is a static, page-aligned buffer that is only handed
-    // out here. The kernel is single-core and the returned canvas owns the
-    // only reference for the rest of the program.
+    // out here. The returned canvas owns the only reference for the rest of
+    // the program; only the foreground session draws to it.
     let pixels: &'static mut [u32] =
         unsafe { core::slice::from_raw_parts_mut(ptr, DISPLAY_WIDTH * DISPLAY_HEIGHT) };
 

@@ -123,6 +123,8 @@ pub struct SystemInfo {
     pub processes: usize,
     /// Number of live threads.
     pub threads: usize,
+    /// Number of CPUs that have joined the scheduler.
+    pub cpus: usize,
 }
 
 impl SystemInfo {
@@ -134,6 +136,7 @@ impl SystemInfo {
         ticks_per_second: 0,
         processes: 0,
         threads: 0,
+        cpus: 0,
     };
 
     /// Returns the busy (non-idle) tick count.

@@ -905,7 +905,7 @@ impl State {
         self.commit_total = memory.heap_used_bytes.saturating_add(process_memory);
         self.commit_limit = memory.heap_total_bytes.saturating_add(process_memory);
         // "Memory Usage" is physical memory in use, not just the kernel heap:
-        // the heap alone is usually a few hundred KiB against a 16 MiB arena,
+        // the heap alone is usually a few hundred KiB against a 64 MiB arena,
         // which rounded to 0% and left the graph flat.
         self.memory_percent = percentage(memory.used_bytes as u64, memory.total_bytes as u64);
         if self.commit_total > self.commit_peak {
@@ -3741,7 +3741,7 @@ fn draw_performance_stats(painter: &mut Painter<'_, '_>, area: Rect, state: &Sta
     let (totals, commit) = left.split_top(left.height as i32 / 2);
     let (physical, kernel) = right.split_top(right.height as i32 / 2);
 
-    let handles = format_count(0);
+    let cores = format_count(state.system.cpus.max(1));
     let threads = format_count(state.system.threads);
     let processes = format_count(state.system.processes);
     draw_stat_panel(
@@ -3749,7 +3749,7 @@ fn draw_performance_stats(painter: &mut Painter<'_, '_>, area: Rect, state: &Sta
         totals.inset_each(0, 0, 4, 3),
         "Totals",
         &[
-            ("Handles", handles),
+            ("CPU cores", cores),
             ("Threads", threads),
             ("Processes", processes),
         ],
@@ -4793,6 +4793,7 @@ mod render_tests {
                 ticks_per_second: 100,
                 processes: 2,
                 threads: 2,
+                cpus: 2,
             }
         }
     }
@@ -4862,6 +4863,7 @@ mod render_tests {
             ticks_per_second: 100,
             processes: 2,
             threads: 2,
+            cpus: 2,
         };
         state.memory = MEMORY.info();
         state.commit_total = 3 * 1024 * 1024;

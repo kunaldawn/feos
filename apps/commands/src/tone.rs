@@ -1,10 +1,9 @@
 //! `tone`: synthesize a chord and play it through the board's audio device.
 
-use core::ptr::addr_of_mut;
-
 use feos_app::{App, Context};
 use feos_audio::{AudioBuffer, AudioFormat, Oscillator, Sample, Waveform};
 use feos_console::println;
+use feos_sync::SpinLock;
 
 /// Longest playable clip, matching the driver's DMA buffer.
 const MAX_MS: usize = 3_000;
@@ -19,7 +18,7 @@ const MAX_SAMPLES: usize = SAMPLE_RATE as usize * CHANNELS as usize * MAX_MS / 1
 #[repr(align(128))]
 struct Buffer([i16; MAX_SAMPLES]);
 
-static mut BUFFER: Buffer = Buffer([0; MAX_SAMPLES]);
+static BUFFER: SpinLock<Buffer> = SpinLock::new(Buffer([0; MAX_SAMPLES]));
 
 /// Plays a short A-major chord.
 pub struct Tone;
@@ -61,13 +60,12 @@ impl App for Tone {
         let frames = SAMPLE_RATE as usize * milliseconds / 1000;
         let samples = frames * CHANNELS as usize;
 
-        // SAFETY: the shell runs on one core with interrupts disabled and only
-        // one app at a time, so there is exactly one mutable borrow of the
-        // static buffer here.
-        let buffer =
-            unsafe { core::slice::from_raw_parts_mut(addr_of_mut!(BUFFER.0) as *mut i16, samples) };
+        // The host audio device is a single stream. Serialize synthesis and
+        // playback so two `tone` processes cannot overwrite each other's
+        // samples or interleave DMA blocks.
+        let mut buffer = BUFFER.lock();
         let format = AudioFormat::new(SAMPLE_RATE, CHANNELS).expect("valid format");
-        let mut audio = AudioBuffer::new(buffer, format).expect("whole frames");
+        let mut audio = AudioBuffer::new(&mut buffer.0[..samples], format).expect("whole frames");
 
         audio.clear(Sample::SILENCE);
         for (frequency, amplitude) in [(440, 9_000), (554, 7_000), (659, 6_000)] {

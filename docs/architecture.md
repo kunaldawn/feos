@@ -6,9 +6,10 @@ wire one dependency edge, and register it at the layer above. There are no
 `mod` declarations in a central `main.rs` that need editing for every new
 device.
 
-The kernel is also a small multiprocess system: a GICv2 timer tick preempts
-apps, and a fixed-size round-robin scheduler in `kernel/src/sched.rs` switches
-between kernel threads that share the address space.
+The kernel is also a small multiprocess, multi-core system: every online CPU
+runs a GICv2 timer tick that preempts apps, and a fixed-size round-robin
+scheduler in `kernel/src/sched.rs` switches between kernel threads that share
+the address space.
 
 ## Layers
 
@@ -130,19 +131,21 @@ Copy `boards/qemu-virt`, change the constants, and update:
 
 The kernel's `main.rs` should not need any other changes; it only calls board
 functions such as `init_console`, `init_display`, `init_audio`,
-`init_interrupts`, `interrupts`, `framebuffer_addr`, `kernel_range`, and
-`bss_range`.
+`init_interrupts`, `init_cpu_interrupts`, `interrupts`, `cpu_mpidr`,
+`MAX_CPUS`, `framebuffer_addr`, `kernel_range`, and `bss_range`.
 
 ## Interrupts and scheduling
 
-The interrupt path crosses four layers:
+The interrupt path crosses four layers; secondary CPU startup adds a fifth:
 
 1. `feos-driver-gicv2` owns the distributor and CPU interface. The board passes
-   the `virt` addresses (`0x0800_0000`, `0x0801_0000`), calls `init()`, and
-   enables the timer PPI with `enable(TIMER_IRQ)`. QEMU's default machine has
-   no GIC security extensions, so the driver configures Group 0 and uses
-   `GICC_IAR`/`GICC_EOIR`; the secure Group 1 aliases would be needed with
-   `secure=on`.
+   the `virt` addresses (`0x0800_0000`, `0x0801_0000`), initializes the
+   distributor once, and enables the timer PPI with `enable(TIMER_IRQ)`. QEMU's
+   default machine has no GIC security extensions, so the driver configures
+   Group 0 and uses `GICC_IAR`/`GICC_EOIR`; the secure Group 1 aliases would be
+   needed with `secure=on`. The CPU interface and the PPI configuration
+   registers are banked per core, so every core calls `init_cpu()` and enables
+   its own timer line.
 2. The board exposes the initialized controller as `&dyn InterruptController`
    from the HAL. The kernel's IRQ handler acknowledges, services, and ends each
    interrupt without naming a concrete driver.
@@ -154,21 +157,36 @@ The interrupt path crosses four layers:
    `CNTP_TVAL_EL0`, saves the interrupted process's frame, picks the next
    `Ready` slot round-robin, and writes that slot's saved frame over the entry
    frame. The assembly returns to whichever process now owns the frame.
+5. Secondary CPUs join through PSCI. `kernel/src/smp.rs` calls `CPU_ON` for
+   each index the board reports, passing `arch/aarch64`'s secondary entry point
+   and the logical CPU index as the context. The entry stub gives the core a
+   private 128 KiB stack, writes the index into `TPIDR_EL1` (read by
+   `cpu::index()`), and installs the shared vector table. The kernel handler
+   then configures that core's GIC interface and starts its timer.
 
 The process model is deliberately minimal:
 
-- Eight slots in a static `.bss` table. Slot 0 is the shell (PID 1) and keeps
-  the linker-provided kernel stack; slots 1..7 are background processes with
+- Sixteen slots in a static `.bss` table. Slot 0 is the shell (PID 1) and keeps
+  the linker-provided kernel stack; slots 1..15 are background processes with
   128 KiB stacks and start with an otherwise zero context: `ELR` is the app
   entry, `SP` the stack top, `SPSR` EL1h with IRQs unmasked, `x0` the slot
   index, and `LR` a task-exit trampoline.
 - States are `Free`, `Ready`, `Running`, and `Exited`. A returning app marks
-  itself `Exited` and waits in `wfi`; the next tick frees the slot. `kill()`
-  frees a non-shell, non-current slot immediately.
+  itself `Exited` and waits in `wfi`; the tick on the CPU that owns the slot
+  frees it. `kill()` frees a non-shell slot immediately only when no CPU is
+  currently running or exiting on it.
+- The scheduler has one shared, spin-locked table and a per-CPU `current`
+  array. A task is `Running` on at most one core at a time, so the same process
+  cannot execute twice in parallel and can migrate between cores between ticks.
+  A core with no runnable task runs a small idle loop on a private stack and
+  counts those ticks as idle.
 - Scheduling is preemptive and has no priorities: every ready process gets one
-  tick. `sleep` and other delays spin, but they are still preempted.
-- Critical sections disable IRQs with `irq::save_and_disable`/`restore` and do
-  not allocate, so they are safe against a tick arriving at any instruction.
+  tick on whichever CPU picks it. `sleep` and other delays spin, but they are
+  still preempted.
+- Critical sections disable local IRQs with
+  `irq::save_and_disable`/`restore` before taking the scheduler lock and do not
+  allocate, so they are safe against a tick arriving at any instruction on the
+  same core.
 - The process service (`Processes` in `libs/app`) is the only interface apps
   use. `spawn` copies the argument string into the process table, and
   `app_entry` copies it again onto the process stack before running the app so
@@ -236,9 +254,11 @@ layer is already complete.
 ## The kernel heap and video path
 
 Most of feos is allocation-free, but the vendored H.264 decoder keeps reference
-pictures in `alloc` collections. `kernel/src/allocator.rs` provides one 16 MiB
+pictures in `alloc` collections. `kernel/src/allocator.rs` provides one 64 MiB
 static arena with a sorted free list, boundary tags and a spin lock for the
-preemptive scheduler. `Allocator` implements `GlobalAlloc`; the player reads a
+multi-core preemptive scheduler. The default QEMU launch boots with 512 MiB of
+RAM, leaving room for the arena, process stacks, scanout buffers, and the
+optional disk images. `Allocator` implements `GlobalAlloc`; the player reads a
 media file into a `Vec`, allocates the RGBA frame and decoder scratch, and
 releases them when the clip changes. GIF, MJPEG and raw/RLE decoders do not
 allocate themselves.
@@ -320,9 +340,11 @@ instructions or touches MMIO. The split makes most logic host-testable:
 - Drivers are intentionally thin register accessors; they can be exercised in
   QEMU.
 - The kernel is tested by booting `make run` (or `make docker-run`). The
-  scheduler smoke test is to run `spawn tick 8 200` twice, confirm with `ps`
-  that both PIDs report `ready`/`running`, and watch their output interleave
-  while the shell stays responsive. `kill <pid>` should remove one, and an
-  exited process should disappear from the next `ps`.
+  scheduler smoke test is to run `spawn tick 8 200` several times, confirm with
+  `ps` that the PIDs report `ready`/`running`, and watch their output interleave
+  while the shell stays responsive. With the default `QEMU_SMP=4`, several of
+  them run simultaneously on different cores; `info` reports the online CPU
+  count. `kill <pid>` should remove one, and an exited process should disappear
+  from the next `ps`.
 
 `make check` type-checks every crate for the AArch64 target.

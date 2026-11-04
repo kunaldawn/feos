@@ -63,7 +63,7 @@ impl CoreSystem for PlatformSystem<'_> {
     }
 
     fn cpu_count(&self) -> usize {
-        1
+        self.platform.processes.system().cpus.max(1)
     }
 
     fn pid(&self) -> u32 {

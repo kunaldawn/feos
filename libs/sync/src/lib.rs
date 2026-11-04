@@ -1,14 +1,13 @@
-//! Small synchronization primitives for a single-core bare-metal kernel.
+//! Small synchronization primitives for a bare-metal multi-core kernel.
 //!
-//! `feos` currently runs with interrupts disabled and on one CPU, but the
-//! kernel still needs to exclude re-entrant use of shared state (for example a
-//! console used by both normal code and a panic path). [`SpinLock`] is the
-//! building block for that.
+//! The kernel runs on several CPUs and with preemption enabled, so shared state
+//! such as the process table, console and heap needs real mutual exclusion.
+//! [`SpinLock`] is the building block for that.
 //!
 //! The types here deliberately do not implement any interrupt masking: an
 //! interrupt handler that takes the same lock as the code it interrupted will
-//! deadlock. Once the kernel grows interrupts, the lock should be combined
-//! with an interrupt-disable guard at the call site.
+//! deadlock on that CPU. Callers that may run with interrupts enabled combine
+//! the lock with `irq::save_and_disable`/`restore` at the call site.
 
 #![no_std]
 

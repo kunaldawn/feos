@@ -5,17 +5,23 @@
 //! collections. A real allocator is therefore needed before video playback or a
 //! writable disk mount can work.
 //!
-//! This allocator is intentionally simple: one 4 MiB static arena, a sorted
+//! This allocator is intentionally simple: one 64 MiB static arena, a sorted
 //! free list with boundary tags in front of each block, and a spin lock for the
-//! preemptive scheduler. Allocation and deallocation are O(n) in the number of
-//! free blocks, which is fine for the decoder's short-lived picture buffers.
+//! preemptive multi-core scheduler. Allocation and deallocation are O(n) in the
+//! number of free blocks, which is fine for the decoder's short-lived picture
+//! buffers.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
 use feos_sync::SpinLock;
 
 /// Size of the static heap in bytes.
-const HEAP_SIZE: usize = 16 * 1024 * 1024;
+///
+/// The default QEMU configuration boots with 512 MiB of RAM; the arena sits in
+/// `.bss`, so the boot CPU's BSS clear and the linker script bound its size.
+/// 64 MiB leaves room for several H.264 reference-picture sets while keeping
+/// boot fast and leaving the rest of guest RAM unused for now.
+const HEAP_SIZE: usize = 64 * 1024 * 1024;
 /// Header stored immediately before every allocated payload.
 const HEADER: usize = 16;
 /// Sentinel for "no block".

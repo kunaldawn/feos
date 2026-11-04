@@ -3,12 +3,12 @@
 A tiny bare-metal **Rust** operating-system skeleton for the **aarch64** QEMU
 `virt` machine, organised as a multi-crate workspace. It boots at EL1, installs
 exception vectors, talks to the PL011 serial port, brings up a **ramfb**
-framebuffer, draws a splash screen, starts a preemptive round-robin scheduler,
-and opens an interactive **desktop session** where applications can be launched
-with the keyboard. Logging off (or `Ctrl-\` on the serial console) drops into a
-**Bash-compatible terminal** with a writable overlay filesystem, pipelines,
-redirection, job-style background launches and a built-in POSIX coreutils
-library.
+framebuffer, draws a splash screen, starts a multi-core preemptive round-robin
+scheduler, and opens an interactive **desktop session** where applications can
+be launched with the keyboard. Logging off (or `Ctrl-\` on the serial console)
+drops into a **Bash-compatible terminal** with a writable overlay filesystem,
+pipelines, redirection, job-style background launches and a built-in POSIX
+coreutils library.
 
 Everything can be built and run inside Docker, so the only host requirement is
 Docker.
@@ -74,8 +74,9 @@ app registry).
 ├── kernel/                     # feos-kernel: the bootable binary (bin: feos)
 │   └── src/
 │       ├── main.rs             # kmain, IRQ handler, panic handler, wiring
-│       ├── allocator.rs        # 16 MiB static first-fit heap for H.264
-│       └── sched.rs            # process table and round-robin scheduler
+│       ├── smp.rs              # PSCI secondary-CPU startup
+│       ├── allocator.rs        # 64 MiB static first-fit heap for H.264
+│       └── sched.rs            # shared process table + per-CPU round-robin
 │
 ├── arch/
 │   └── aarch64/                # feos-arch-aarch64
@@ -84,9 +85,10 @@ app registry).
 │           ├── vectors.S       # exception table + recoverable IRQ entry
 │           ├── exceptions.rs   # vector install, FaultInfo, handler hook
 │           ├── irq.rs          # TrapFrame, IRQ dispatch, mask helpers
-│           ├── cpu.rs          # halt, current EL, MIDR
-│           ├── psci.rs         # poweroff / reboot
-│           └── timer.rs        # generic timer helpers
+│           ├── cpu.rs          # halt, current EL, MIDR, per-CPU index
+│           ├── psci.rs         # CPU_ON, poweroff / reboot
+│           ├── smp.rs          # secondary entry + handler hook
+│           └── timer.rs        # generic timer helpers, per-CPU idle hints
 │
 ├── boards/
 │   └── qemu-virt/              # feos-board-qemu-virt
@@ -184,7 +186,8 @@ change.
 
 - `#![no_std]`, `#![no_main]` kernel with zero external dependencies
 - Layered Cargo workspace: kernel, arch, board, drivers, libraries, apps
-- Boot assembly: stack setup, BSS zeroing, FP/SIMD enable, secondary CPU parking
+- Boot assembly: stack setup, BSS zeroing, FP/SIMD enable, and PSCI secondary
+  CPU entry with a private stack and shared exception vectors
 - PL011 UART driver behind a `Serial` HAL trait
 - PCIe ECAM enumeration and BAR assignment, enough to bring up firmware-less
   PCI devices
@@ -195,10 +198,13 @@ change.
 - Registered console with `print!` / `println!` and panic-safe output
 - AArch64 exception vector table with an ESR/ELR/FAR diagnostic dump, plus a
   recoverable IRQ entry that saves and restores a full 800-byte `TrapFrame`
-- GICv2 driver behind an `InterruptController` HAL trait, with Group 0 and the
-  timer PPI wired up by the board
-- Preemptive round-robin scheduler: sixteen process slots, 128 KiB stacks, and a
-  100 Hz generic-timer tick; the shell is PID 1
+- GICv2 driver behind an `InterruptController` HAL trait, with Group 0 and a
+  per-CPU timer PPI initialized by each core
+- **Multi-core** preemptive round-robin scheduler: up to eight CPUs share one
+  process table, each CPU has its own current-task slot and idle stack, and a
+  spin-locked scheduler prevents a process running on two cores at once
+- Sixteen process slots, 128 KiB stacks, and a 100 Hz generic-timer tick on
+  every CPU; the shell is PID 1
 - `spawn`, `ps`, `kill`, and `tick` commands for running and inspecting
   background processes
 - **Bash-compatible terminal** (`feos-sh`): quoting and escapes, parameter and
@@ -260,9 +266,10 @@ change.
   graphs; sortable process columns; per-process CPU time, memory, threads and
   priority; Run, Select Columns, Properties, About, Help and confirmation
   dialogs; context menus; configurable update speed; and mouse/keyboard control
-- Real scheduler and memory accounting: per-process CPU ticks, idle-tick
-  detection through `WFI`, and a HAL `Memory` service backed by the kernel heap
-  for commit charge, physical memory and kernel-memory panels
+- Real multi-core scheduler and memory accounting: per-process CPU ticks summed
+  across cores, per-CPU idle-tick detection through `WFI`, online-CPU counts,
+  and a HAL `Memory` service backed by the 64 MiB kernel heap for commit charge,
+  physical memory and kernel-memory panels
 - Foreground app launching: an app can request the full framebuffer from the
   desktop and return to it with Esc
 - `feos-bundle`: single-file `.fapp` applications (ZIP/TAR with manifest and
@@ -378,7 +385,8 @@ make run                                 # VNC on localhost:5900
 
 `cargo build` builds the kernel because the workspace sets
 `default-members = ["kernel"]`. Use `cargo build --workspace` to build every
-crate.
+crate. The run targets boot with four CPUs and 512 MiB of RAM by default;
+override them with `QEMU_SMP` and `QEMU_MEM` (up to eight CPUs are supported).
 
 On Debian/Ubuntu, QEMU comes from `qemu-system-arm`:
 
@@ -397,6 +405,7 @@ Useful overrides:
 | `make run AUDIODEV=alsa,id=snd0`      | Live ALSA output (needs `/dev/snd`)       |
 | `make run AUDIODEV=pa,id=snd0`        | Live PulseAudio/PipeWire output           |
 | `make run AUDIODEV=wav,id=snd0,path=/tmp/qemu.wav` | Capture playback to WAV     |
+| `make run QEMU_SMP=8 QEMU_MEM=1G`    | Boot eight CPUs with 1 GiB of RAM          |
 | `make audio-demo`                    | Render the audio example WAV natively      |
 | `make docker-audio`                  | Render the audio example WAV in Docker     |
 
@@ -1091,7 +1100,7 @@ API summary:
 These libraries follow the same rules as `feos-gfx` where practical: `no_std`,
 dependency-light, and caller-provided buffers. `feos-video` builds on
 `feos-image` and `feos-h264`; `feos-h264` is the one media crate that uses
-`alloc` and contains the vendored unsafe NEON kernels. The kernel's 16 MiB
+`alloc` and contains the vendored unsafe NEON kernels. The kernel's 64 MiB
 static heap exists to serve it.
 
 | Crate | Formats | Notes |

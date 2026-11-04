@@ -26,6 +26,10 @@ impl App for Info {
 
         println!("feos {VERSION}");
         println!("  board           : {}", platform.board.name);
+        println!(
+            "  cpus            : {} online",
+            platform.processes.system().cpus.max(1)
+        );
         println!("  exception level : EL{}", platform.cpu.current_el());
         println!("  MIDR_EL1        : {:#018x}", platform.cpu.midr());
         println!(

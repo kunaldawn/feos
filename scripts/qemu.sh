@@ -19,6 +19,8 @@ set -eu
 KERNEL="${1:-target/aarch64-unknown-none/release/feos}"
 DISPLAY_BACKEND="${FEOS_DISPLAY:-vnc=127.0.0.1:0}"
 AUDIODEV="${FEOS_AUDIODEV:-wav,id=snd0,path=target/audio/qemu.wav,out.frequency=48000,out.channels=2,out.format=s16}"
+SMP="${FEOS_SMP:-4}"
+MEM="${FEOS_MEM:-512M}"
 
 if [ ! -f "$KERNEL" ]; then
     echo "kernel not found: $KERNEL" >&2
@@ -31,8 +33,8 @@ mkdir -p target/audio
 exec qemu-system-aarch64 \
     -machine virt \
     -cpu cortex-a53 \
-    -smp 1 \
-    -m 128M \
+    -smp "$SMP" \
+    -m "$MEM" \
     -net none \
     -device ramfb \
     -device virtio-tablet-device \

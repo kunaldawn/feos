@@ -27,6 +27,7 @@ static UPTIME_MS: AtomicU64 = AtomicU64::new(0);
 static MEMORY_TOTAL: AtomicUsize = AtomicUsize::new(0);
 static MEMORY_USED: AtomicUsize = AtomicUsize::new(0);
 static MEMORY_FREE: AtomicUsize = AtomicUsize::new(0);
+static CPU_COUNT: AtomicUsize = AtomicUsize::new(1);
 static PID: AtomicU32 = AtomicU32::new(1);
 
 struct WindowSystem;
@@ -69,7 +70,7 @@ impl System for WindowSystem {
     }
 
     fn cpu_count(&self) -> usize {
-        1
+        CPU_COUNT.load(Ordering::Relaxed).max(1)
     }
 
     fn pid(&self) -> u32 {
@@ -382,6 +383,10 @@ impl App for Terminal {
 fn update_system(context: &WindowContext<'_, '_>) {
     UPTIME_MS.store(context.platform.clock.uptime_ms(), Ordering::Relaxed);
     PID.store(context.platform.processes.current(), Ordering::Relaxed);
+    CPU_COUNT.store(
+        context.platform.processes.system().cpus.max(1),
+        Ordering::Relaxed,
+    );
     if let Some(memory) = context.platform.memory {
         let info = memory.info();
         MEMORY_TOTAL.store(info.total_bytes, Ordering::Relaxed);

@@ -5,9 +5,9 @@
 //! [`GicV2::init`]; the kernel then enables the timer interrupt and uses the
 //! HAL [`InterruptController`] trait to acknowledge and end interrupts.
 //!
-//! Only the CPU interface for the boot CPU is configured. The kernel is
-//! single-core, so private peripheral interrupts (PPIs) are banked by hardware
-//! and no target list has to be programmed.
+//! The distributor is initialized once by the boot CPU. Every core then calls
+//! [`GicV2::init_cpu`] and enables the timer PPI for itself; GICv2 banks the
+//! CPU interface and the PPI configuration registers per core.
 
 #![no_std]
 
@@ -63,12 +63,22 @@ impl GicV2 {
         write32(self.distributor + GICD_CTLR, 0);
         barrier();
 
+        self.init_cpu();
+
+        write32(self.distributor + GICD_CTLR, 0b01);
+        barrier();
+    }
+
+    /// Configures the calling CPU's interface.
+    ///
+    /// GICC_* registers are banked per CPU. The boot CPU reaches this through
+    /// [`init`](Self::init), and every secondary core calls it directly before
+    /// enabling its timer PPI.
+    pub fn init_cpu(&self) {
         // Priority mask: allow every priority. Binary point: group split at 0.
         write32(self.cpu_interface + GICC_PMR, 0xff);
         write32(self.cpu_interface + GICC_BPR, 0);
-
         barrier();
-        write32(self.distributor + GICD_CTLR, 0b01);
         write32(self.cpu_interface + GICC_CTLR, 0b01);
         barrier();
     }

@@ -3,6 +3,9 @@
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use crate::cpu;
+use crate::smp::MAX_CPUS;
+
 /// Frequency of the system counter in Hz (from CNTFRQ_EL0).
 pub fn frequency() -> u64 {
     let value: u64;
@@ -41,7 +44,10 @@ pub fn spin_ms(ms: u64) {
 }
 
 /// Set before `WFI` so the scheduler can classify the tick as idle.
-static IDLE_HINT: AtomicBool = AtomicBool::new(false);
+///
+/// This is per-CPU: two cores can be in different states, and the scheduler
+/// must only credit the core that actually waited.
+static IDLE_HINTS: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 
 /// Waits for roughly `ms` milliseconds in a low-power state.
 ///
@@ -56,18 +62,20 @@ pub fn idle_ms(ms: u64) {
 
     let start = ticks();
     let delta = freq.saturating_mul(ms) / 1000;
+    let cpu = cpu::index().min(MAX_CPUS - 1);
 
     while ticks().wrapping_sub(start) < delta {
-        IDLE_HINT.store(true, Ordering::Relaxed);
+        IDLE_HINTS[cpu].store(true, Ordering::Relaxed);
         // SAFETY: `WFI` only suspends execution until an interrupt. The
         // scheduler's 100 Hz timer guarantees that one arrives promptly.
         unsafe { asm!("wfi", options(nomem, nostack)) };
     }
 }
 
-/// Returns and clears the idle hint recorded by [`idle_ms`].
+/// Returns and clears the idle hint recorded by [`idle_ms`] on this CPU.
 pub fn take_idle_hint() -> bool {
-    IDLE_HINT.swap(false, Ordering::Relaxed)
+    let cpu = cpu::index().min(MAX_CPUS - 1);
+    IDLE_HINTS[cpu].swap(false, Ordering::Relaxed)
 }
 
 /// Period between scheduler ticks, in counter ticks (0 when stopped).

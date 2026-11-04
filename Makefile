@@ -4,7 +4,8 @@ PROFILE      ?= release
 KERNEL       := target/$(TARGET)/$(PROFILE)/feos
 QEMU         ?= qemu-system-aarch64
 QEMU_DISPLAY ?= vnc=127.0.0.1:0
-QEMU_MEM     ?= 128M
+QEMU_MEM     ?= 512M
+QEMU_SMP     ?= 4
 
 # PulseAudio/PipeWire socket, used for live sound when it exists.
 PULSE_SOCKET ?= /run/user/$(shell id -u)/pulse/native
@@ -25,7 +26,7 @@ endif
 AUDIO_FLAGS  ?= -audiodev $(AUDIODEV) -device intel-hda -device hda-output,audiodev=snd0
 POINTER_FLAGS ?= -device virtio-tablet-device
 KEYBOARD_FLAGS ?= -device virtio-keyboard-device
-QEMU_FLAGS   ?= -machine virt -cpu cortex-a53 -smp 1 -m $(QEMU_MEM) -net none -device ramfb $(POINTER_FLAGS) $(KEYBOARD_FLAGS) $(AUDIO_FLAGS) -serial mon:stdio
+QEMU_FLAGS   ?= -machine virt -cpu cortex-a53 -smp $(QEMU_SMP) -m $(QEMU_MEM) -net none -device ramfb $(POINTER_FLAGS) $(KEYBOARD_FLAGS) $(AUDIO_FLAGS) -serial mon:stdio
 
 # Display backend used by `make docker-run`. "gtk" opens a QEMU window on the
 # host through X11/XWayland; "vnc=0.0.0.0:0" serves the display over VNC.
@@ -212,6 +213,8 @@ docker-run: docker-build
 		-e NO_AT_BRIDGE=1 \
 		-e FEOS_DISPLAY="$(FEOS_DISPLAY)" \
 		-e FEOS_AUDIODEV="$$audiod" \
+		-e FEOS_SMP="$(QEMU_SMP)" \
+		-e FEOS_MEM="$(QEMU_MEM)" \
 		-e FEOS_TEST_DISKS=1 \
 		$$audio_args \
 		-v /tmp/.X11-unix:/tmp/.X11-unix \
@@ -234,6 +237,8 @@ docker-run-vnc: docker-build
 	docker run --rm -it -p 5900:5900 \
 		-e FEOS_DISPLAY=vnc=0.0.0.0:0 \
 		-e FEOS_AUDIODEV="$$audiod" \
+		-e FEOS_SMP="$(QEMU_SMP)" \
+		-e FEOS_MEM="$(QEMU_MEM)" \
 		-e FEOS_TEST_DISKS=1 \
 		$$audio_args \
 		$(IMAGE)
