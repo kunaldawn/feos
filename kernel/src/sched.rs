@@ -29,6 +29,10 @@ const MAX_TASKS: usize = MAX_PROCESSES;
 /// Number of CPUs the scheduler can run on.
 const MAX_CPUS: usize = feos_arch_aarch64::smp::MAX_CPUS;
 
+// `SystemInfo` fixes the public array size; a port with more private CPUs
+// would need to widen `feos_app::MAX_CPUS` as well.
+const _: () = assert!(MAX_CPUS <= feos_app::MAX_CPUS);
+
 /// Sentinel stored in [`Scheduler::current`] when a CPU has no task.
 const NO_TASK: usize = usize::MAX;
 
@@ -119,6 +123,10 @@ struct Scheduler {
     total_ticks: u64,
     /// Ticks a CPU spent waiting in an idle instruction.
     idle_ticks: u64,
+    /// Timer ticks accounted per CPU, for per-core graphs.
+    cpu_total_ticks: [u64; MAX_CPUS],
+    /// Idle ticks accounted per CPU.
+    cpu_idle_ticks: [u64; MAX_CPUS],
     /// Scheduler frequency in Hz (the same on every CPU).
     ticks_per_second: u64,
     /// CPUs that have joined the scheduler.
@@ -133,6 +141,8 @@ impl Scheduler {
             next_pid: 0,
             total_ticks: 0,
             idle_ticks: 0,
+            cpu_total_ticks: [0; MAX_CPUS],
+            cpu_idle_ticks: [0; MAX_CPUS],
             ticks_per_second: 100,
             online_cpus: 1,
         }
@@ -238,6 +248,7 @@ pub fn preempt(frame: &mut irq::TrapFrame) {
 
     // A tick spent inside `WFI` is idle, not CPU time for the current task.
     scheduler.total_ticks = scheduler.total_ticks.wrapping_add(1);
+    scheduler.cpu_total_ticks[cpu] = scheduler.cpu_total_ticks[cpu].wrapping_add(1);
     let idle_hint = timer::take_idle_hint();
 
     if current < MAX_TASKS {
@@ -251,11 +262,13 @@ pub fn preempt(frame: &mut irq::TrapFrame) {
 
         if idle_hint {
             scheduler.idle_ticks = scheduler.idle_ticks.wrapping_add(1);
+            scheduler.cpu_idle_ticks[cpu] = scheduler.cpu_idle_ticks[cpu].wrapping_add(1);
         } else {
             task.cpu_ticks = task.cpu_ticks.wrapping_add(1);
         }
     } else {
         scheduler.idle_ticks = scheduler.idle_ticks.wrapping_add(1);
+        scheduler.cpu_idle_ticks[cpu] = scheduler.cpu_idle_ticks[cpu].wrapping_add(1);
     }
 
     match scheduler.next_runnable(current) {
@@ -462,6 +475,13 @@ fn system_info() -> SystemInfo {
                 threads += 1;
             }
         }
+        let mut cpu_ticks = [0u64; feos_app::MAX_CPUS];
+        let mut cpu_idle_ticks = [0u64; feos_app::MAX_CPUS];
+        for cpu in 0..MAX_CPUS.min(feos_app::MAX_CPUS) {
+            cpu_ticks[cpu] = scheduler.cpu_total_ticks[cpu];
+            cpu_idle_ticks[cpu] = scheduler.cpu_idle_ticks[cpu];
+        }
+
         SystemInfo {
             uptime_ms: platform().clock.uptime_ms(),
             total_ticks: scheduler.total_ticks,
@@ -470,6 +490,8 @@ fn system_info() -> SystemInfo {
             processes,
             threads,
             cpus: scheduler.online_cpus,
+            cpu_ticks,
+            cpu_idle_ticks,
         }
     };
     irq::restore(flags);

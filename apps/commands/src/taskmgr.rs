@@ -7,8 +7,8 @@
 //! * **Applications** - the running tasks, with End Task / Switch To.
 //! * **Processes** - sortable PID/CPU/CPU-time/memory/threads/priority columns,
 //!   End Process, Properties and a context menu.
-//! * **Performance** - CPU and memory history graphs, totals, commit charge,
-//!   physical memory and kernel memory.
+//! * **Performance** - combined or per-core CPU history graphs, a memory
+//!   graph, totals, commit charge, physical memory and kernel memory.
 //! * **Networking** - the adapter view, with an honest "no adapter" state on
 //!   boards that have no network driver.
 //! * **Users** - the console user session.
@@ -26,7 +26,7 @@ use alloc::vec;
 
 use feos_app::{
     App, Context, Platform, ProcessInfo, ProcessState, SystemInfo, WindowContext, WindowFrame,
-    MAX_PROCESSES,
+    MAX_CPUS, MAX_PROCESSES,
 };
 use feos_console::println;
 use feos_gfx::{Canvas, Color, Point, Rect};
@@ -200,6 +200,15 @@ impl UpdateSpeed {
             Self::Paused => u64::MAX,
         }
     }
+}
+
+/// How the Performance tab presents CPU usage.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CpuView {
+    /// One aggregate graph for the whole machine.
+    Combined,
+    /// One graph per online CPU.
+    PerCore,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -470,6 +479,8 @@ enum Action {
     ToggleStatusBar,
     ToggleCpuGraph,
     ToggleMemGraph,
+    CpuGraphCombined,
+    CpuGraphPerCore,
     HelpTopics,
     About,
     SwitchTo,
@@ -568,6 +579,12 @@ struct State {
     cpu_history: [u8; HISTORY],
     cpu_len: usize,
     cpu_head: usize,
+    cpu_core_percent: [u8; MAX_CPUS],
+    cpu_core_history: [[u8; HISTORY]; MAX_CPUS],
+    cpu_core_len: [usize; MAX_CPUS],
+    cpu_core_head: [usize; MAX_CPUS],
+    last_core_total_ticks: [u64; MAX_CPUS],
+    last_core_idle_ticks: [u64; MAX_CPUS],
     mem_history: [u8; HISTORY],
     mem_len: usize,
     mem_head: usize,
@@ -579,6 +596,7 @@ struct State {
     show_status: bool,
     show_cpu_graph: bool,
     show_mem_graph: bool,
+    cpu_view: CpuView,
 
     column_visible: [bool; COLUMN_COUNT],
     column_backup: [bool; COLUMN_COUNT],
@@ -641,6 +659,12 @@ impl State {
             cpu_history: [0; HISTORY],
             cpu_len: 0,
             cpu_head: 0,
+            cpu_core_percent: [0; MAX_CPUS],
+            cpu_core_history: [[0; HISTORY]; MAX_CPUS],
+            cpu_core_len: [0; MAX_CPUS],
+            cpu_core_head: [0; MAX_CPUS],
+            last_core_total_ticks: [0; MAX_CPUS],
+            last_core_idle_ticks: [0; MAX_CPUS],
             mem_history: [0; HISTORY],
             mem_len: 0,
             mem_head: 0,
@@ -651,6 +675,7 @@ impl State {
             show_status: true,
             show_cpu_graph: true,
             show_mem_graph: true,
+            cpu_view: CpuView::Combined,
             column_visible: [true; COLUMN_COUNT],
             column_backup: [true; COLUMN_COUNT],
             run_text: TextBuffer::new(),
@@ -926,6 +951,30 @@ impl State {
             &mut self.mem_head,
             self.memory_percent,
         );
+
+        let online = system.cpus.clamp(1, MAX_CPUS);
+        for cpu in 0..MAX_CPUS {
+            let total = system.cpu_ticks[cpu];
+            let idle = system.cpu_idle_ticks[cpu];
+            let total_delta = total.saturating_sub(self.last_core_total_ticks[cpu]);
+            let idle_delta = idle.saturating_sub(self.last_core_idle_ticks[cpu]);
+            let percent = if cpu < online {
+                percentage(total_delta.saturating_sub(idle_delta), total_delta)
+            } else {
+                0
+            };
+
+            self.last_core_total_ticks[cpu] = total;
+            self.last_core_idle_ticks[cpu] = idle;
+            self.cpu_core_percent[cpu] = percent;
+            push_history(
+                &mut self.cpu_core_history[cpu],
+                &mut self.cpu_core_len[cpu],
+                &mut self.cpu_core_head[cpu],
+                percent,
+            );
+        }
+
         self.last_sample_ms = now;
     }
 
@@ -2499,6 +2548,20 @@ impl State {
                     self.show_mem_graph,
                 );
                 count += 1;
+                out[count] = MenuItem::separator();
+                count += 1;
+                out[count] = MenuItem::checked(
+                    "CPU Graph: Combined",
+                    Action::CpuGraphCombined,
+                    self.cpu_view == CpuView::Combined,
+                );
+                count += 1;
+                out[count] = MenuItem::checked(
+                    "CPU Graph: Per Core",
+                    Action::CpuGraphPerCore,
+                    self.cpu_view == CpuView::PerCore,
+                );
+                count += 1;
             }
             Menu::Help => {
                 out[count] = MenuItem::new("Task Manager Help Topics", Action::HelpTopics, true);
@@ -2539,6 +2602,8 @@ impl State {
             Action::ToggleStatusBar => self.show_status = !self.show_status,
             Action::ToggleCpuGraph => self.show_cpu_graph = !self.show_cpu_graph,
             Action::ToggleMemGraph => self.show_mem_graph = !self.show_mem_graph,
+            Action::CpuGraphCombined => self.cpu_view = CpuView::Combined,
+            Action::CpuGraphPerCore => self.cpu_view = CpuView::PerCore,
             Action::HelpTopics => {
                 self.dialog = Dialog::Help;
                 self.dialog_scroll = 0;
@@ -3556,8 +3621,15 @@ fn draw_resize_grip(painter: &mut Painter<'_, '_>, window: Rect) {
 fn draw_performance(painter: &mut Painter<'_, '_>, state: &State, layout: Layout) {
     let area = content_area(layout);
     let graphs = state.show_cpu_graph || state.show_mem_graph;
+    let per_core = state.show_cpu_graph && state.cpu_view == CpuView::PerCore;
     let (graph_area, stats_area) = if graphs {
-        let height = ((area.height as i32 * 52) / 100).clamp(160, 320);
+        let height = if per_core && state.show_mem_graph {
+            // The per-core strip needs a little more room than one combined
+            // line, but memory still keeps its own panel underneath.
+            ((area.height as i32 * 70) / 100).clamp(220, 360)
+        } else {
+            ((area.height as i32 * 52) / 100).clamp(160, 320)
+        };
         area.split_top(height)
     } else {
         (Rect::new(area.x, area.y, area.width, 0), area)
@@ -3566,49 +3638,47 @@ fn draw_performance(painter: &mut Painter<'_, '_>, state: &State, layout: Layout
     if graphs {
         let inner = graph_area.inset_each(2, 2, 2, 4);
         if state.show_cpu_graph && state.show_mem_graph {
-            // Side by side when there is room; stack them in a narrow window
-            // so the memory graph is never squeezed out of the right edge.
-            let (cpu_rect, mem_rect) = if inner.width >= 520 {
-                let (left, right) = inner.split_left(inner.width as i32 / 2);
-                (left.inset_each(0, 0, 4, 0), right.inset_each(4, 0, 0, 0))
+            if per_core {
+                // Give every CPU a full-width slice; memory moves below.
+                let core_height = (inner.height as i32 * 72 / 100).max(120);
+                let (cpu_rect, mem_rect) = inner.split_top(core_height);
+                draw_cpu_graphs(painter, cpu_rect.inset_each(0, 0, 0, 4), state);
+                draw_graph_panel(
+                    painter,
+                    mem_rect.inset_each(0, 4, 0, 0),
+                    "Memory Usage History",
+                    state.memory_percent,
+                    &state.mem_history,
+                    state.mem_len,
+                    state.mem_head,
+                    GRAPH_MEM,
+                    GRAPH_MEM_LABEL,
+                );
             } else {
-                let (top, bottom) = inner.split_top(inner.height as i32 / 2);
-                (top.inset_each(0, 0, 0, 4), bottom.inset_each(0, 4, 0, 0))
-            };
-            draw_graph_panel(
-                painter,
-                cpu_rect,
-                "CPU Usage History",
-                state.cpu_percent,
-                &state.cpu_history,
-                state.cpu_len,
-                state.cpu_head,
-                GRAPH_CPU,
-                GRAPH_LABEL,
-            );
-            draw_graph_panel(
-                painter,
-                mem_rect,
-                "Memory Usage History",
-                state.memory_percent,
-                &state.mem_history,
-                state.mem_len,
-                state.mem_head,
-                GRAPH_MEM,
-                GRAPH_MEM_LABEL,
-            );
+                // Side by side when there is room; stack them in a narrow
+                // window so the memory graph is never squeezed out.
+                let (cpu_rect, mem_rect) = if inner.width >= 520 {
+                    let (left, right) = inner.split_left(inner.width as i32 / 2);
+                    (left.inset_each(0, 0, 4, 0), right.inset_each(4, 0, 0, 0))
+                } else {
+                    let (top, bottom) = inner.split_top(inner.height as i32 / 2);
+                    (top.inset_each(0, 0, 0, 4), bottom.inset_each(0, 4, 0, 0))
+                };
+                draw_cpu_graphs(painter, cpu_rect, state);
+                draw_graph_panel(
+                    painter,
+                    mem_rect,
+                    "Memory Usage History",
+                    state.memory_percent,
+                    &state.mem_history,
+                    state.mem_len,
+                    state.mem_head,
+                    GRAPH_MEM,
+                    GRAPH_MEM_LABEL,
+                );
+            }
         } else if state.show_cpu_graph {
-            draw_graph_panel(
-                painter,
-                inner,
-                "CPU Usage History",
-                state.cpu_percent,
-                &state.cpu_history,
-                state.cpu_len,
-                state.cpu_head,
-                GRAPH_CPU,
-                GRAPH_LABEL,
-            );
+            draw_cpu_graphs(painter, inner, state);
         } else {
             draw_graph_panel(
                 painter,
@@ -3625,6 +3695,51 @@ fn draw_performance(painter: &mut Painter<'_, '_>, state: &State, layout: Layout
     }
 
     draw_performance_stats(painter, stats_area.inset_each(2, 6, 2, 2), state);
+}
+
+/// Draws either the aggregate CPU line or one mini-graph per online core.
+fn draw_cpu_graphs(painter: &mut Painter<'_, '_>, rect: Rect, state: &State) {
+    if state.cpu_view == CpuView::Combined {
+        draw_graph_panel(
+            painter,
+            rect,
+            "CPU Usage History",
+            state.cpu_percent,
+            &state.cpu_history,
+            state.cpu_len,
+            state.cpu_head,
+            GRAPH_CPU,
+            GRAPH_LABEL,
+        );
+        return;
+    }
+
+    let online = state.system.cpus.clamp(1, MAX_CPUS);
+    let gap = 3;
+    let available = (rect.width as i32 - gap * (online as i32 - 1)).max(online as i32);
+    let cell_width = available / online as i32;
+    for cpu in 0..online {
+        let x = rect.x + cpu as i32 * (cell_width + gap);
+        let right = if cpu + 1 == online {
+            rect.right_i32()
+        } else {
+            x + cell_width
+        };
+        let cell = Rect::new(x, rect.y, (right - x).max(1) as u32, rect.height);
+        let mut title = Text::<16>::new();
+        let _ = write!(title, "CPU {cpu}");
+        draw_graph_panel(
+            painter,
+            cell,
+            title.as_str(),
+            state.cpu_core_percent[cpu],
+            &state.cpu_core_history[cpu],
+            state.cpu_core_len[cpu],
+            state.cpu_core_head[cpu],
+            GRAPH_CPU,
+            GRAPH_LABEL,
+        );
+    }
 }
 
 fn draw_graph_panel(
@@ -4409,6 +4524,10 @@ const HELP_LINES: &[&str] = &[
     "Performance",
     "  The CPU graph shows busy scheduler ticks as a percentage. Time",
     "  spent in an idle wait is excluded, so an idle desktop is quiet.",
+    "  View > CPU Graph switches between one combined line and a graph",
+    "  for each online core. Each core needs its own runnable thread; one",
+    "  desktop task can only occupy one core. Spawn background tasks to",
+    "  exercise the other cores.",
     "  The memory graph shows commit charge against the heap limit.",
     "  Totals, commit charge, physical memory and kernel memory are",
     "  sampled from the live kernel and the static heap.",
@@ -4794,6 +4913,8 @@ mod render_tests {
                 processes: 2,
                 threads: 2,
                 cpus: 2,
+                cpu_ticks: [600, 400, 0, 0, 0, 0, 0, 0],
+                cpu_idle_ticks: [150, 100, 0, 0, 0, 0, 0, 0],
             }
         }
     }
@@ -4864,6 +4985,8 @@ mod render_tests {
             processes: 2,
             threads: 2,
             cpus: 2,
+            cpu_ticks: [600, 400, 0, 0, 0, 0, 0, 0],
+            cpu_idle_ticks: [150, 100, 0, 0, 0, 0, 0, 0],
         };
         state.memory = MEMORY.info();
         state.commit_total = 3 * 1024 * 1024;
@@ -4887,6 +5010,23 @@ mod render_tests {
         assert_eq!(state.memory_percent, 75);
         assert_eq!(
             state.mem_history[state.mem_head.saturating_sub(1) % HISTORY],
+            75
+        );
+    }
+
+    #[test]
+    fn sampling_tracks_usage_for_each_core() {
+        let screen = Rect::new(0, 0, 1024, 768);
+        let mut state = test_state(screen);
+        state.sample(&platform(), 1_000);
+        // TestProcesses reports 600/150 ticks for CPU 0 and 400/100 for CPU 1.
+        assert_eq!(state.cpu_core_percent[0], 75);
+        assert_eq!(state.cpu_core_percent[1], 75);
+        assert_eq!(state.cpu_core_percent[2], 0);
+        assert_eq!(state.cpu_core_len[0], 1);
+        assert_eq!(state.cpu_core_len[1], 1);
+        assert_eq!(
+            state.cpu_core_history[0][state.cpu_core_head[0].saturating_sub(1) % HISTORY],
             75
         );
     }
@@ -4918,6 +5058,39 @@ mod render_tests {
         }
         assert!(cpu_pixels > 0, "CPU graph was not drawn");
         assert!(memory_pixels > 0, "memory graph was not drawn");
+    }
+
+    #[test]
+    fn performance_can_show_per_core_graphs() {
+        let screen = Rect::new(0, 0, 1024, 768);
+        let mut state = test_state(screen);
+        state.tab = Tab::Performance;
+        state.cpu_view = CpuView::PerCore;
+        state.cpu_percent = 0;
+        state.cpu_len = 0;
+        state.system.cpus = 2;
+        for cpu in 0..2 {
+            state.cpu_core_percent[cpu] = 40 + cpu as u8 * 20;
+            state.cpu_core_len[cpu] = HISTORY;
+            for index in 0..HISTORY {
+                state.cpu_core_history[cpu][index] = ((index * 5 + cpu * 17) % 80) as u8;
+            }
+        }
+
+        let platform = platform();
+        let mut pixels = vec![0u32; 1024 * 768];
+        let mut canvas = Canvas::new(&mut pixels, 1024, 768, 1024).unwrap();
+        let mut painter = Painter::new(&mut canvas);
+        let layout = Layout::compute(screen, &state);
+        draw_backdrop(&mut painter, &state);
+        draw_window(&mut painter, &state, layout, 1_000);
+        draw_tabs(&mut painter, &state, layout);
+        draw_content(&mut painter, &platform, &mut state, layout, 1_000);
+
+        assert!(
+            pixels.iter().any(|pixel| *pixel == GRAPH_CPU.raw()),
+            "per-core CPU graphs were not drawn"
+        );
     }
 
     #[test]
@@ -5094,6 +5267,25 @@ mod preview_tests {
                 768,
             );
         }
+
+        let mut state = preview_state(screen);
+        state.tab = Tab::Performance;
+        state.cpu_view = CpuView::PerCore;
+        state.system.cpus = 4;
+        for cpu in 0..4 {
+            state.cpu_core_percent[cpu] = 34 + cpu as u8 * 9;
+            state.cpu_core_len[cpu] = HISTORY;
+            for index in 0..HISTORY {
+                state.cpu_core_history[cpu][index] = ((index * (cpu + 3) + cpu * 17) % 82) as u8;
+            }
+        }
+        render(&mut canvas, &platform, &mut state, 12_345);
+        write_ppm(
+            "/tmp/opencode/feos-taskmgr-performance-per-core.ppm",
+            canvas.pixels(),
+            1024,
+            768,
+        );
 
         let mut state = preview_state(screen);
         state.tab = Tab::Processes;

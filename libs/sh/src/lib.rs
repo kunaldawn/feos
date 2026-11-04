@@ -90,7 +90,7 @@ impl Input for ConsoleInput {
                 out[0] = byte;
                 return 1;
             }
-            core::hint::spin_loop();
+            feos_console::wait_for_input();
         }
     }
 

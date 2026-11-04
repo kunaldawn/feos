@@ -44,6 +44,12 @@ pub struct BoardInfo {
 /// Maximum number of processes the kernel can track at once.
 pub const MAX_PROCESSES: usize = 16;
 
+/// Maximum number of CPUs the scheduler can report in [`SystemInfo`].
+///
+/// The public figure matches the AArch64 port and QEMU's GICv2 limit of eight
+/// cores. Ports with more CPUs can still report aggregate figures.
+pub const MAX_CPUS: usize = 8;
+
 /// Maximum length of a process name, in bytes.
 pub const PROCESS_NAME_MAX: usize = 24;
 
@@ -125,6 +131,14 @@ pub struct SystemInfo {
     pub threads: usize,
     /// Number of CPUs that have joined the scheduler.
     pub cpus: usize,
+    /// Timer ticks accounted on each CPU, indexed by logical CPU.
+    ///
+    /// Only the first [`cpus`](Self::cpus) entries are meaningful. Summing
+    /// these arrays on successive samples gives per-core CPU percentages
+    /// without relying on the aggregate totals.
+    pub cpu_ticks: [u64; MAX_CPUS],
+    /// Idle ticks accounted on each CPU, indexed by logical CPU.
+    pub cpu_idle_ticks: [u64; MAX_CPUS],
 }
 
 impl SystemInfo {
@@ -137,6 +151,8 @@ impl SystemInfo {
         processes: 0,
         threads: 0,
         cpus: 0,
+        cpu_ticks: [0; MAX_CPUS],
+        cpu_idle_ticks: [0; MAX_CPUS],
     };
 
     /// Returns the busy (non-idle) tick count.

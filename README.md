@@ -263,9 +263,10 @@ change.
   playback
 - A Windows XP-style **Task Manager** (`taskmgr`) with Applications,
   Processes, Performance, Networking and Users tabs; live CPU/memory history
-  graphs; sortable process columns; per-process CPU time, memory, threads and
-  priority; Run, Select Columns, Properties, About, Help and confirmation
-  dialogs; context menus; configurable update speed; and mouse/keyboard control
+  graphs with a combined or per-core CPU view; sortable process columns;
+  per-process CPU time, memory, threads and priority; Run, Select Columns,
+  Properties, About, Help and confirmation dialogs; context menus; configurable
+  update speed; and mouse/keyboard control
 - Real multi-core scheduler and memory accounting: per-process CPU ticks summed
   across cores, per-CPU idle-tick detection through `WFI`, online-CPU counts,
   and a HAL `Memory` service backed by the 64 MiB kernel heap for commit charge,
@@ -848,13 +849,15 @@ the kernel scheduler and heap:
   selected task.
 - **Performance** draws CPU and memory history graphs on the classic black
   grid, alongside Totals, Commit Charge, Physical Memory and Kernel Memory
-  panels.
+  panels. View > CPU Graph switches between one combined CPU line and a
+  separate graph for every online core.
 - **Networking** presents the adapter view; on a board without a network driver
   it reports a disconnected adapter and a flat graph rather than pretending.
 - **Users** shows the console session.
 
 The File, Options, View and Help menus expose Run, Select Columns, update
-speed (High/Normal/Low/Paused), status-bar and graph toggles, Help and About.
+speed (High/Normal/Low/Paused), status-bar and graph toggles, the combined or
+per-core CPU graph mode, Help and About.
 Dialogs use the Luna title bar and include Run, Select Columns, Process
 Properties, About, Help, End Process and Log Off. The window can be dragged,
 resized, maximised or closed with the mouse.

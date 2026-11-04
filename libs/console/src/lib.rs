@@ -3,7 +3,8 @@
 //! The kernel does not assume a particular UART. A board (or any other piece
 //! of early boot code) installs a byte sink and an optional byte source with
 //! [`set_writer`] and [`set_reader`]; everything else prints through the
-//! macros and reads input with [`read_byte`].
+//! macros and reads input with [`read_byte`]. A kernel can install an idle hook
+//! with [`set_waiter`] so a shell waiting for input does not busy-spin.
 //!
 //! This keeps console plumbing out of drivers and lets the same kernel run on
 //! a board with a PL011, an SBI console, or a memory-backed test console.
@@ -31,9 +32,13 @@ pub type ByteWriteFn = fn(&[u8]);
 /// Returns the next input byte, or `None` if the device has no data.
 pub type ReadFn = fn() -> Option<u8>;
 
+/// Waits for input or the next timer tick without busy-spinning.
+pub type WaitFn = fn();
+
 static WRITER: AtomicUsize = AtomicUsize::new(0);
 static BYTE_WRITER: AtomicUsize = AtomicUsize::new(0);
 static READER: AtomicUsize = AtomicUsize::new(0);
+static WAITER: AtomicUsize = AtomicUsize::new(0);
 static PRINT_LOCK: SpinLock<()> = SpinLock::new(());
 
 /// Installs the text sink used by `print!` and `println!`.
@@ -58,6 +63,15 @@ pub fn set_reader(reader: ReadFn) {
     READER.store(reader as usize, Ordering::Release);
 }
 
+/// Installs the idle hook used by [`wait_for_input`].
+///
+/// The kernel sets this to an architecture idle wait (for example `WFI`), so a
+/// shell blocked on the serial console does not consume a CPU. Without a hook,
+/// waiting falls back to a spin loop for host tests and minimal ports.
+pub fn set_waiter(waiter: WaitFn) {
+    WAITER.store(waiter as usize, Ordering::Release);
+}
+
 /// Reads one byte from the registered console, if any is available.
 pub fn read_byte() -> Option<u8> {
     let address = READER.load(Ordering::Acquire);
@@ -69,6 +83,25 @@ pub fn read_byte() -> Option<u8> {
     // `ReadFn` (a plain function pointer is `usize`-sized).
     let reader: ReadFn = unsafe { transmute::<usize, ReadFn>(address) };
     reader()
+}
+
+/// Waits until input may be available or the next timer tick fires.
+///
+/// The shell calls this between [`read_byte`] polls. The installed hook is
+/// expected to enter an architectural idle state and mark the tick as idle for
+/// scheduler accounting; it must eventually return so the caller can poll
+/// again.
+pub fn wait_for_input() {
+    let address = WAITER.load(Ordering::Acquire);
+    if address == 0 {
+        core::hint::spin_loop();
+        return;
+    }
+
+    // SAFETY: only `set_waiter` writes this atomic, and it stores a valid
+    // `WaitFn` (a plain function pointer is `usize`-sized).
+    let waiter: WaitFn = unsafe { transmute::<usize, WaitFn>(address) };
+    waiter()
 }
 
 fn writer() -> Option<WriteFn> {

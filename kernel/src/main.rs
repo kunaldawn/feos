@@ -50,6 +50,7 @@ static KERNEL_MEMORY: KernelMemory = KernelMemory;
 #[no_mangle]
 pub extern "C" fn kmain(dtb: usize) -> ! {
     board::init_console();
+    feos_console::set_waiter(wait_for_console);
 
     println!();
     println!("feos {} - a tiny aarch64 kernel", env!("CARGO_PKG_VERSION"));
@@ -180,6 +181,15 @@ pub extern "C" fn kmain(dtb: usize) -> ! {
     }
 
     feos_shell::run(display, sched::platform())
+}
+
+/// Blocks the serial shell in `WFI` between input polls.
+///
+/// Using the timer's idle helper also marks the tick as idle, so a shell
+/// waiting for a keypress no longer appears as a busy core in the task
+/// manager's per-core graphs.
+fn wait_for_console() {
+    timer::idle_ms(1);
 }
 
 /// Handles the periodic timer interrupt and lets the scheduler choose a
