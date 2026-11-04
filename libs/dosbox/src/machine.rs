@@ -1329,9 +1329,27 @@ mod tests {
     fn audio_mix_produces_stereo_samples() {
         let mut dos = DosBox::new(None);
         dos.set_audio_rate(48_000);
+        // Key on a simple OPL patch so the buffer is not silence.
+        for (register, value) in [
+            (0x20u8, 0x01u8),
+            (0x23, 0x01),
+            (0x40, 0x10),
+            (0x43, 0x00),
+            (0x60, 0xF0),
+            (0x63, 0xF0),
+            (0x80, 0x77),
+            (0x83, 0x77),
+            (0xA0, 0x98),
+            (0xB0, 0x31),
+            (0xC0, 0x30),
+        ] {
+            dos.bus.opl.write_address(0x388, register);
+            dos.bus.opl.write_data(0x389, value);
+        }
         dos.frame(16, 10_000);
         let samples = dos.take_audio();
         assert_eq!(samples.len(), (48_000 * 16 / 1000) * 2);
+        assert!(samples.iter().any(|sample| *sample != 0));
         assert!(dos.take_audio().is_empty());
     }
 
