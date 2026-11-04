@@ -143,9 +143,10 @@ functions such as `init_console`, `init_display`, `init_audio`,
 1 MiB; `boot.S` keeps the boot CPU, zeroes `.bss`, builds four identity-mapped
 1 GiB pages covering the first 4 GiB, enables PAE/long mode and jumps to
 `kmain(multiboot_info)`. `interrupts.S` owns an IDT and saves a `TrapFrame`
-(GPRs, XMM0..XMM15, vector, error code, RIP/CS/RFLAGS/RSP) before calling the
-kernel handler. The return path can therefore replace the frame and switch
-processes exactly like the AArch64 `eret` path.
+(GPRs, XMM0..XMM15, vector, error code, RIP/CS/RFLAGS/RSP/SS) before calling
+the kernel handler. Long mode always pushes `SS:RSP` and `IRETQ` always pops
+them, even for a same-privilege interrupt. The return path can therefore
+replace the frame and switch processes exactly like the AArch64 `eret` path.
 
 `boards/qemu-x86_64` uses COM1 (`uart16550`), the LAPIC/IOAPIC (`feos-driver-apic`),
 legacy PCI config ports (`PciPort`), I/O-port fw_cfg and ramfb, Intel HDA and

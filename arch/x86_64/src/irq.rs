@@ -58,11 +58,21 @@ pub struct TrapFrame {
     pub rflags: u64,
     /// Interrupted stack pointer (offset 416).
     pub rsp: u64,
+    /// Interrupted stack segment (offset 424).
+    pub ss: u64,
 }
 
-// The layout is a hard contract with `interrupts.S`.
-const _: () = assert!(core::mem::size_of::<TrapFrame>() == 424);
+// The layout is a hard contract with `interrupts.S`. Long mode always pushes
+// SS:RSP with the interrupt frame, even for a same-privilege interrupt.
+const _: () = assert!(core::mem::size_of::<TrapFrame>() == 432);
 const _: () = assert!(core::mem::align_of::<TrapFrame>() == 8);
+const _: () = assert!(core::mem::offset_of!(TrapFrame, vector) == 376);
+const _: () = assert!(core::mem::offset_of!(TrapFrame, error) == 384);
+const _: () = assert!(core::mem::offset_of!(TrapFrame, rip) == 392);
+const _: () = assert!(core::mem::offset_of!(TrapFrame, cs) == 400);
+const _: () = assert!(core::mem::offset_of!(TrapFrame, rflags) == 408);
+const _: () = assert!(core::mem::offset_of!(TrapFrame, rsp) == 416);
+const _: () = assert!(core::mem::offset_of!(TrapFrame, ss) == 424);
 
 impl TrapFrame {
     /// A frame with every register cleared.
@@ -89,6 +99,7 @@ impl TrapFrame {
         cs: 0,
         rflags: 0,
         rsp: 0,
+        ss: 0,
     };
 
     /// Builds the initial frame for a process that has never run.
@@ -105,6 +116,7 @@ impl TrapFrame {
         // IF set, reserved bit 1 set.
         frame.rflags = 0x202;
         frame.rsp = stack as u64;
+        frame.ss = 0x10;
 
         // SAFETY: `stack` is inside the process's private .bss stack and is
         // the word just below the initial stack pointer.

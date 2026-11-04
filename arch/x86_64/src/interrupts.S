@@ -7,9 +7,11 @@
  *
  *     vector
  *     error code
- *     rip, cs, rflags
+ *     rip, cs, rflags, rsp, ss
  *
- * and `interrupt_common` then saves the general-purpose and XMM registers.
+ * Long mode pushes SS:RSP even for same-privilege interrupts. The kernel's
+ * `TrapFrame` mirrors that exact layout. `interrupt_common` then saves the
+ * general-purpose and XMM registers.
  */
 
 .section .text
@@ -123,11 +125,6 @@ interrupt_common:
     movups %xmm14, 224(%rsp)
     movups %xmm15, 240(%rsp)
 
-    /* Original interrupted RSP: skip the XMM area, GPRs, vector/error and
-     * the CPU's RIP/CS/RFLAGS frame. */
-    leaq 416(%rsp), %rax
-    movq %rax, 416(%rsp)
-
     /* Keep the frame pointer in a callee-saved register and give the Rust
      * helper a 16-byte aligned stack. */
     movq %rsp, %r15
@@ -136,17 +133,14 @@ interrupt_common:
     call x86_interrupt_dispatch
     movq %r15, %rsp
 
-    /* Return to whichever frame is now on the stack. Build the IRET frame
-     * below the target stack pointer so the final RSP matches the saved one. */
+    /* The CPU frame at frame_base + 392 is already a complete long-mode
+     * IRET frame: RIP, CS, RFLAGS, RSP, SS. The scheduler may have replaced
+     * it with another task's saved frame, but it is still in the required
+     * layout. Point RSP at it and return directly; copying the frame to the
+     * target task's stack would overlap the source when the interrupted RSP
+     * was not 16-byte aligned (the CPU aligns the frame when pushing it). */
     movq %rsp, %r15
-    movq 416(%r15), %rsp
-    subq $24, %rsp
-    movq 392(%r15), %rax
-    movq %rax, 0(%rsp)               /* RIP */
-    movq 400(%r15), %rax
-    movq %rax, 8(%rsp)               /* CS */
-    movq 408(%r15), %rax
-    movq %rax, 16(%rsp)              /* RFLAGS */
+    leaq 392(%r15), %rsp
 
     movups   0(%r15), %xmm0
     movups  16(%r15), %xmm1
