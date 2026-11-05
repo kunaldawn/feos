@@ -1,0 +1,12 @@
+id: user-demo
+name: User Program Demo
+version: 1.0.0
+entry: wdemo
+category: System
+description: A program running in user mode, in its own address space
+icon: icon.ico
+icon_medium: icon-32.ico
+icon_small: icon-16.ico
+window:
+  width: 332
+  height: 280

@@ -99,6 +99,12 @@ impl Shell<'_> {
             "getopts" => self.builtin_getopts(args, io),
             "let" => self.builtin_let(args, io, host),
             "timeout" => self.builtin_timeout(args, io, host),
+            "jobs" => self.builtin_jobs(args, io, host),
+            "fg" => self.builtin_fg(args, io, host),
+            "bg" => self.builtin_bg(args, io, host),
+            "wait" => self.builtin_wait(args, io, host),
+            "trap" => self.builtin_trap(args, io),
+            "kill" => return self.builtin_kill(args, io, host),
             "clear" => {
                 self.write_out(io, "\x1b[2J\x1b[H");
                 0

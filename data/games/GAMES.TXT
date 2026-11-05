@@ -1,35 +1,36 @@
 FEOS-DOS GAME LIBRARY
 =====================
 
-All titles are Shareware, Demo or Freeware (DOSGames.com).
+The DOSGames.com site labels these Shareware, Demo or Freeware. Each
+title's own terms are in its ZIP: see data/games/README.md.
 Use MOUNT <name> to extract a ZIP into C:\<name>.
 
 doom.zip
-  DOOM - id Software - needs DOS/4GW protected mode
+  DOOM - id Software - DOS/4GW
 duke-nukem-3d.zip
-  Duke Nukem 3D - 3D Realms - needs DOS/4GW protected mode
+  Duke Nukem 3D - 3D Realms - DOS/4GW
 wolfenstein-3d.zip
-  Wolfenstein 3D - id Software - 16-bit, VGA mode 13h
+  Wolfenstein 3D - id Software - real mode, VGA, EMS
 quake.zip
-  Quake - id Software - needs DJGPP/go32 extender
+  Quake - id Software - DJGPP, the DPMI host
 super-street-fighter-ii-turbo.zip
-  Super Street Fighter II Turbo demo - needs 32RTM extender
+  Super Street Fighter II Turbo demo - 32RTM, needs the SB16
 tank-wars.zip
-  Tank Wars - 16-bit, VGA mode 13h
+  Tank Wars - real mode, VGA
 warcraft-2-tides-of-darkness.zip
-  Warcraft II demo - Blizzard - needs DOS/4GW protected mode
+  Warcraft II demo - Blizzard - DOS/4GW, needs the SB16
 champ-kong.zip
-  Champ Kong - 16-bit
+  Champ Kong - real mode, VGA
 galacta-the-battle-for-saturn.zip
-  Galacta - 16-bit, CGA/EGA
+  Galacta - real mode, VGA
 mario-bros-vga.zip
-  Mario Bros VGA - 16-bit, VGA
+  Mario Bros VGA - real mode, VGA
 simcity-2000.zip
-  SimCity 2000 demo - Maxis - needs DOS/4G protected mode
+  SimCity 2000 demo - Maxis - DOS/4G, VESA
 snood.zip
-  Snood - needs CWSDPMI protected mode
+  Snood - DJGPP, the DPMI host, VESA
 digger-remastered.zip
-  Digger Remastered - freeware - 16-bit, CGA
+  Digger Remastered - freeware - real mode, VGA
 
-The DOS/4GW, DOS/4G, DJGPP and CWSDPMI titles need 386 protected
-mode and DOS extenders, which are not implemented yet.
+All of them run. SBTYPE, DPMI and EMM386 change the machine:
+type HELP. See docs/dosbox.md for what each title reached.

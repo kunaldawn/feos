@@ -4,6 +4,9 @@
 //! by [`build_index`], from `stbl` or from the `moof` fragments of a fragmented
 //! file.
 
+use alloc::vec::Vec;
+
+use crate::audio::{push_packet, AudioCodec, AudioPacket, AudioTrack};
 use crate::bitstream::{fourcc_at, u16_at, u32_at, u64_at};
 use crate::codec::Codec;
 use crate::error::{Result, VideoError};
@@ -940,4 +943,239 @@ where
         }
     }
     Ok(())
+}
+
+/// Reads a descriptor's tag and length, MPEG-4 style. Returns the tag, where its
+/// payload starts, and where it ends.
+fn read_descriptor(data: &[u8], pos: usize, end: usize) -> Option<(u8, usize, usize)> {
+    let tag = *data.get(pos)?;
+    let mut at = pos + 1;
+    let mut len = 0usize;
+    for _ in 0..4 {
+        if at >= end {
+            return None;
+        }
+        let byte = *data.get(at)?;
+        at += 1;
+        len = (len << 7) | (byte & 0x7f) as usize;
+        if byte & 0x80 == 0 {
+            break;
+        }
+    }
+    let stop = at.checked_add(len)?;
+    (stop <= end).then_some((tag, at, stop))
+}
+
+/// Finds the object type and decoder configuration in an `esds` box.
+fn parse_esds(data: &[u8], esds: BoxHeader) -> Option<(u8, core::ops::Range<usize>)> {
+    let (tag, mut pos, end) = read_descriptor(data, esds.payload + 4, esds.end)?;
+    if tag != 3 {
+        return None;
+    }
+    let flags = *data.get(pos + 2)?;
+    pos += 3;
+    if flags & 0x80 != 0 {
+        pos += 2;
+    }
+    if flags & 0x40 != 0 {
+        pos += 1 + *data.get(pos)? as usize;
+    }
+    if flags & 0x20 != 0 {
+        pos += 2;
+    }
+    let (tag, config, end) = read_descriptor(data, pos, end)?;
+    if tag != 4 {
+        return None;
+    }
+    let object = *data.get(config)?;
+    let mut config_range = 0..0;
+    if config + 13 < end {
+        if let Some((5, start, stop)) = read_descriptor(data, config + 13, end) {
+            config_range = start..stop;
+        }
+    }
+    Some((object, config_range))
+}
+
+/// The packets of a sample table, sample by sample, or chunk by chunk when
+/// `chunk_frame_bytes` says each sample is one PCM frame.
+fn audio_packets(
+    input: &[u8],
+    stbl: BoxHeader,
+    timescale: u32,
+    start_ticks: i64,
+    chunk_frame_bytes: Option<usize>,
+) -> Option<Vec<AudioPacket>> {
+    let stsz = children(input, stbl, b"stsz").ok()??;
+    let stsc = children(input, stbl, b"stsc").ok()??;
+    let stts = children(input, stbl, b"stts").ok()?;
+    let (stco, wide) = match children(input, stbl, b"stco").ok()? {
+        Some(stco) => (stco, false),
+        None => (children(input, stbl, b"co64").ok()??, true),
+    };
+    let fixed = u32_at(input, stsz.payload + 4).ok()? as usize;
+    let samples = u32_at(input, stsz.payload + 8).ok()? as usize;
+    let chunks = u32_at(input, stco.payload + 4).ok()? as usize;
+    let stsc_count = u32_at(input, stsc.payload + 4).ok()? as usize;
+    let mut packets = Vec::new();
+    let mut times = RunCursor::new(stts);
+    let mut ticks = 0i64;
+    let mut sample = 0usize;
+    let mut stsc_at = 0usize;
+    let (_, mut per_chunk) = stsc_entry(input, stsc, 0).ok()?;
+    let mut next_first = if stsc_count > 1 {
+        stsc_entry(input, stsc, 1).ok()?.0 as usize
+    } else {
+        usize::MAX
+    };
+    for chunk in 0..chunks {
+        if chunk + 1 >= next_first {
+            stsc_at += 1;
+            per_chunk = stsc_entry(input, stsc, stsc_at).ok()?.1;
+            next_first = if stsc_at + 1 < stsc_count {
+                stsc_entry(input, stsc, stsc_at + 1).ok()?.0 as usize
+            } else {
+                usize::MAX
+            };
+        }
+        let mut offset = if wide {
+            usize::try_from(u64_at(input, stco.payload + 8 + chunk * 8).ok()?).ok()?
+        } else {
+            u32_at(input, stco.payload + 8 + chunk * 4).ok()? as usize
+        };
+        let pts = |ticks: i64| ticks_to_ms(ticks - start_ticks, timescale).max(0) as u64;
+        if let Some(frame_bytes) = chunk_frame_bytes {
+            let count = (per_chunk as usize).min(samples.saturating_sub(sample));
+            if count == 0 {
+                break;
+            }
+            let size = count.checked_mul(frame_bytes)?;
+            push_packet(&mut packets, input.len(), offset, size, pts(ticks))?;
+            for _ in 0..count {
+                ticks = ticks.saturating_add(times.next(input) as i64);
+            }
+            sample += count;
+            continue;
+        }
+        for _ in 0..per_chunk {
+            if sample >= samples {
+                break;
+            }
+            let size = if fixed != 0 {
+                fixed
+            } else {
+                u32_at(input, stsz.payload + 12 + sample * 4).ok()? as usize
+            };
+            push_packet(&mut packets, input.len(), offset, size, pts(ticks))?;
+            offset = offset.checked_add(size)?;
+            ticks = ticks.saturating_add(times.next(input) as i64);
+            sample += 1;
+        }
+    }
+    Some(packets)
+}
+
+/// Finds the first audio track.
+pub(crate) fn audio_track(input: &[u8]) -> Option<AudioTrack> {
+    let mut moov = None;
+    let mut pos = 0;
+    while let Some(header) = read_top_box(input, pos) {
+        if &header.kind == b"moov" {
+            moov = Some(header);
+            break;
+        }
+        pos = header.next;
+    }
+    let moov = moov?;
+    let mut pos = moov.payload;
+    while let Some(trak) = read_box(input, pos, moov.end).ok()? {
+        pos = trak.next;
+        if &trak.kind != b"trak" {
+            continue;
+        }
+        let Some(mdia) = children(input, trak, b"mdia").ok()? else {
+            continue;
+        };
+        let Some(hdlr) = children(input, mdia, b"hdlr").ok()? else {
+            continue;
+        };
+        if input.get(hdlr.payload + 8..hdlr.payload + 12) != Some(b"soun") {
+            continue;
+        }
+        let mdhd = children(input, mdia, b"mdhd").ok()??;
+        let (timescale, _) = mdhd_timescale(input, mdhd).ok()?;
+        let minf = children(input, mdia, b"minf").ok()??;
+        let stbl = children(input, minf, b"stbl").ok()??;
+        let stsd = children(input, stbl, b"stsd").ok()??;
+        let entry = read_box(input, stsd.payload + 8, stsd.end).ok()??;
+        let at = entry.payload;
+        let version = u16::from_be_bytes(input.get(at + 8..at + 10)?.try_into().ok()?);
+        let channels = u16::from_be_bytes(input.get(at + 16..at + 18)?.try_into().ok()?);
+        let bits = u16::from_be_bytes(input.get(at + 18..at + 20)?.try_into().ok()?);
+        let rate = u16::from_be_bytes(input.get(at + 24..at + 26)?.try_into().ok()?) as u32;
+        // QuickTime versions 1 and 2 add fields before any child boxes.
+        let first_child = at
+            + match version {
+                1 => 28 + 16,
+                2 => 28 + 36,
+                _ => 28,
+            };
+        let esds = find_box(input, first_child, entry.end, b"esds").ok().flatten();
+        let mut config = 0..0;
+        let pcm = |bytes: u8, big_endian: bool, float: bool| AudioCodec::Pcm {
+            bytes,
+            big_endian,
+            float,
+        };
+        let codec = match &entry.kind {
+            b"mp4a" => match esds.and_then(|esds| parse_esds(input, esds)) {
+                Some((0x40 | 0x66 | 0x67 | 0x68, range)) => {
+                    config = range;
+                    AudioCodec::Aac
+                }
+                Some((0x69 | 0x6b, _)) => AudioCodec::Mp3,
+                _ => AudioCodec::Other,
+            },
+            b".mp3" => AudioCodec::Mp3,
+            b"sowt" => pcm(2, false, false),
+            b"twos" if bits <= 8 => pcm(1, true, false),
+            b"twos" => pcm(2, true, false),
+            b"in24" => pcm(3, true, false),
+            b"in32" => pcm(4, true, false),
+            b"fl32" => pcm(4, true, true),
+            b"fl64" => pcm(8, true, true),
+            b"ulaw" => AudioCodec::MuLaw,
+            b"alaw" => AudioCodec::ALaw,
+            b"Opus" => AudioCodec::Opus,
+            _ => AudioCodec::Other,
+        };
+        // Edit lists delay or trim: an AAC encoder's priming is usually in there.
+        let start_ticks = children(input, trak, b"edts")
+            .ok()
+            .flatten()
+            .and_then(|edts| children(input, edts, b"elst").ok().flatten())
+            .and_then(|elst| {
+                if *input.get(elst.payload)? == 1 {
+                    u64_at(input, elst.payload + 16).ok().map(|ticks| ticks as i64)
+                } else {
+                    u32_at(input, elst.payload + 12).ok().map(|ticks| ticks as i32 as i64)
+                }
+            })
+            .unwrap_or(0)
+            .max(0);
+        let frame_bytes = match codec {
+            AudioCodec::Pcm { bytes, .. } => Some(bytes as usize * channels as usize),
+            AudioCodec::MuLaw | AudioCodec::ALaw => Some(channels as usize),
+            _ => None,
+        };
+        let packets = audio_packets(input, stbl, timescale, start_ticks, frame_bytes)?;
+        return Some(AudioTrack {
+            codec,
+            sample_rate: rate,
+            channels,
+            config,
+            packets,
+        });
+    }
+    None
 }

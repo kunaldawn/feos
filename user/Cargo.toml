@@ -1,0 +1,28 @@
+# User programs: separate binaries, for each architecture, that run at EL0 or ring 3
+# and end up in the filesystem image under /bin. `make user-arm` and `make user-x64`
+# build them. A workspace of its own: the kernel's rustflags, linker script and
+# profile are nothing to do with these.
+[package]
+name = "feos-user"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+feos-abi = { path = "../libs/abi" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+panic = "abort"
+
+[workspace]

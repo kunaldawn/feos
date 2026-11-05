@@ -30,12 +30,14 @@ pub enum SessionExit {
 }
 
 /// Redraw the taskbar clock when the displayed minute changes.
+/// How often to look for changes to the application folder.
+const APPS_CHECK_MS: u64 = 1000;
 const MINUTE_MS: u64 = 60_000;
 /// How often supervised services and launched windows are polled.
 const TICK_MS: u64 = 100;
 /// Idle sleep between polls.
 const FRAME_MS: u64 = 8;
-/// Keyboard bytes or reports read per poll. A burst stays in the device's ring and is
+/// Keyboard reports read per poll. A burst stays in the device's ring and is
 /// read on the following frames, instead of overflowing the frame's queue.
 const KEYBOARD_BUDGET: usize = 32;
 
@@ -57,10 +59,11 @@ pub fn run_session(
         return SessionExit::NoDisplay;
     }
 
-    let config = super::load_config();
+    let mut config = super::load_config();
+    super::restore_settings(&mut config, platform);
 
     let mut input = Input::new();
-    let mut keys = SerialKeys::new();
+    let mut keys = SerialKeys::new().with_ctrl_d_passthrough();
     let mut evdev = EvdevKeys::new();
     let Some(mut session) = super::SESSION.try_lock() else {
         println!("[desktop] a desktop session is already running");
@@ -80,6 +83,10 @@ pub fn run_session(
     session.set_retained(back.is_some());
     shell::set_session_active(true);
 
+    let tree = platform.filesystem.and_then(|fs| fs.tree());
+    let mut seen_tree = tree.map_or(0, |tree| tree.generation());
+    let mut apps = tree.map_or(super::AppsSignature::default(), super::apps_signature);
+    let mut last_tree_check = 0u64;
     let mut last_tick = platform.clock.uptime_ms();
     let mut last_minute = u64::MAX;
     let mut last_animated_frame = 0u64;
@@ -94,7 +101,7 @@ pub fn run_session(
 
     loop {
         let now = platform.clock.uptime_ms();
-        if keys.poll_limited(now, &mut input, KEYBOARD_BUDGET) {
+        if keys.poll(now, &mut input) {
             println!();
             println!("[desktop] log off - returning to the serial shell");
             shell::set_session_active(false);
@@ -168,22 +175,47 @@ pub fn run_session(
             dirty = true;
         }
 
+        // A package installed from a terminal shows up without logging off. The
+        // generation check is one load, so an idle system doesn't touch `/apps`.
+        if let Some(tree) = tree {
+            if now.saturating_sub(last_tree_check) >= APPS_CHECK_MS
+                && tree.generation() != seen_tree
+            {
+                last_tree_check = now;
+                seen_tree = tree.generation();
+                let signature = super::apps_signature(tree);
+                if signature != apps {
+                    apps = signature;
+                    let report = super::scan_all(&mut session, platform, true);
+                    println!(
+                        "[desktop] {} application(s) after a change to the application folder",
+                        report.installed
+                    );
+                    dirty = true;
+                }
+            }
+        }
+
         // The taskbar clock only shows hours and minutes; redrawing for every
         // second would repaint the whole screen for no visible change.
-        let minute = now / MINUTE_MS;
+        let minute = platform
+            .clock
+            .unix_time()
+            .map_or(now / MINUTE_MS, |seconds| seconds * 1000 / MINUTE_MS);
         if minute != last_minute {
             last_minute = minute;
             dirty = true;
         }
 
         if now.wrapping_sub(last_tick) >= TICK_MS {
-            if session.tick_session(platform.processes) > 0 {
+            if session.tick_session_at(platform.processes, platform.clock.uptime_ms()) > 0 {
                 dirty = true;
             }
             if session.expire_toasts(now) {
                 dirty = true;
             }
             session.tick_background(platform, now);
+            session.publish_windows();
             last_tick = now;
         }
 
@@ -199,6 +231,9 @@ pub fn run_session(
                 let front = display.as_mut().expect("display checked at session start");
                 session.render_with_platform(front, &input, now, Some(platform))
             };
+            if session.take_settings_changed() {
+                super::save_settings(session.config(), platform);
+            }
 
             // A foreground app paints directly into the scanout and only the
             // work area. Present the freshly composed desktop first so the
@@ -256,6 +291,11 @@ pub fn run_session(
         {
             last_animated_frame = now;
             dirty = true;
+        }
+        // An app can start animating on its own: a terminal's background job has
+        // just printed something, say. No frame has reported that yet.
+        if animation_period == 0 {
+            animation_period = session.animation_period();
         }
 
         input.clear_events();
@@ -390,7 +430,35 @@ fn present(
         front.copy_rect_from(back, damage);
     }
     cursor.update(front, back, pointer, response.cursor, response.damage);
+    report_damage(response.damage, pointer);
 }
+
+/// Tells a display that needs telling what changed: the frame's damage, and where
+/// the pointer is and was, which the soft cursor drew over outside the damage.
+fn report_damage(damage: Option<Rect>, pointer: Point) {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static LAST_POINTER: AtomicU64 = AtomicU64::new(0);
+    if !feos_hal::display::needs_refresh() {
+        return;
+    }
+    if let Some(damage) = damage {
+        feos_hal::display::flush(
+            damage.x.max(0) as u32,
+            damage.y.max(0) as u32,
+            damage.width,
+            damage.height,
+        );
+    }
+    let packed = (pointer.x.max(0) as u64) << 32 | pointer.y.max(0) as u64;
+    let last = LAST_POINTER.swap(packed, Ordering::AcqRel);
+    for spot in [last, packed] {
+        let (x, y) = ((spot >> 32) as u32, spot as u32);
+        feos_hal::display::flush(x, y, CURSOR_REACH, CURSOR_REACH);
+    }
+}
+
+/// A square that holds the soft cursor, from its hot spot.
+const CURSOR_REACH: u32 = 32;
 
 #[cfg(test)]
 mod tests {

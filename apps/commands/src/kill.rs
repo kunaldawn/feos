@@ -1,7 +1,7 @@
 //! `kill`: stop a background process.
 
 use feos_app::{App, Context, KillResult, Processes};
-use feos_console::println;
+use feos_console::{eprintln, println};
 
 /// How long to wait for a flagged process to reach its next safe point before
 /// reporting that it's still going.
@@ -17,32 +17,78 @@ impl App for Kill {
     }
 
     fn usage(&self) -> &'static str {
-        "kill <pid>"
+        "kill [-STOP|-CONT] <pid>..."
     }
 
     fn description(&self) -> &'static str {
         "stop a background process"
     }
 
-    fn run(&self, context: &mut Context<'_>) {
-        let Ok(pid) = context.args.trim().parse::<u32>() else {
-            println!("usage: {}", self.usage());
-            return;
-        };
-
+    fn run(&self, context: &mut Context<'_>) -> i32 {
         let processes = context.platform.processes;
-        let leaked_before = processes.leaked_heap_bytes();
-        match processes.try_kill(pid) {
-            KillResult::Killed => report_killed(processes, pid, leaked_before),
-            KillResult::Pending | KillResult::AlreadyPending => {
-                if wait_for_exit(processes, pid) {
-                    report_killed(processes, pid, leaked_before);
-                } else {
-                    println!("pid {pid} will exit when it releases its locks");
+        // `-STOP` and `-CONT` hold a job off the CPU and let it run again.
+        let (signal, targets) = match context.argv.split_first() {
+            Some((first, rest)) if first.starts_with('-') => (*first, rest),
+            _ => ("-KILL", context.argv),
+        };
+        if targets.is_empty() {
+            eprintln!("usage: {}", self.usage());
+            return 2;
+        }
+        let mut status = 0;
+        for target in targets {
+            let Ok(pid) = target.parse::<u32>() else {
+                eprintln!("kill: {target}: not a process id");
+                status = 2;
+                continue;
+            };
+            let done = match signal.trim_start_matches('-') {
+                "9" | "15" | "KILL" | "TERM" | "SIGKILL" | "SIGTERM" => kill(processes, pid),
+                "19" | "STOP" | "SIGSTOP" => change(processes, pid, true),
+                "18" | "CONT" | "SIGCONT" => change(processes, pid, false),
+                _ => {
+                    eprintln!("kill: {signal}: unknown signal");
+                    return 2;
                 }
+            };
+            if !done {
+                status = 1;
             }
-            KillResult::NotFound => println!("cannot kill pid {pid}: no such process"),
-            KillResult::Protected => println!("cannot kill pid {pid}: it is the shell"),
+        }
+        status
+    }
+}
+
+fn change(processes: &dyn Processes, pid: u32, stopped: bool) -> bool {
+    let done = processes.set_stopped(pid, stopped);
+    if !done {
+        eprintln!("cannot signal pid {pid}: no such process, or it is the shell");
+    }
+    done
+}
+
+fn kill(processes: &dyn Processes, pid: u32) -> bool {
+    let leaked_before = processes.leaked_heap_bytes();
+    match processes.try_kill(pid) {
+        KillResult::Killed => {
+            report_killed(processes, pid, leaked_before);
+            true
+        }
+        KillResult::Pending | KillResult::AlreadyPending => {
+            if wait_for_exit(processes, pid) {
+                report_killed(processes, pid, leaked_before);
+            } else {
+                println!("pid {pid} will exit when it releases its locks");
+            }
+            true
+        }
+        KillResult::NotFound => {
+            eprintln!("cannot kill pid {pid}: no such process");
+            false
+        }
+        KillResult::Protected => {
+            eprintln!("cannot kill pid {pid}: it is the shell");
+            false
         }
     }
 }

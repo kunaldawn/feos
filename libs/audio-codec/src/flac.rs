@@ -724,6 +724,109 @@ pub(crate) fn ogg_info(input: &[u8], page: &Page<'_>) -> Result<AudioInfo> {
     Ok(audio_info(&stream, frames, AudioFormat::OggFlac))
 }
 
+/// Decodes FLAC frames that arrive as packets, as in Matroska.
+pub struct FlacPacketDecoder {
+    frames: FrameDecoder,
+}
+
+impl FlacPacketDecoder {
+    /// Takes the stream's metadata: `fLaC` and its blocks, or a bare STREAMINFO.
+    pub fn new(private: &[u8]) -> Result<Self> {
+        let info = match private.strip_prefix(b"fLaC") {
+            Some(rest) => rest.get(4..).ok_or(AudioError::UnexpectedEnd)?,
+            None => private,
+        };
+        Ok(Self {
+            frames: FrameDecoder::new(parse_stream_info(info)?),
+        })
+    }
+
+    /// The stream's `STREAMINFO`.
+    pub fn stream_info(&self) -> StreamInfo {
+        self.frames.stream
+    }
+
+    /// Decodes one frame to `out`, and returns the sample frames written.
+    pub fn decode(&mut self, packet: &[u8], out: &mut [i16]) -> Result<usize> {
+        let stream = self.frames.stream;
+        let header = match parse_frame_header(packet, &stream) {
+            Ok(Some(header)) => header,
+            Ok(None) | Err(AudioError::UnexpectedEnd) => {
+                return Err(AudioError::InvalidData("bad FLAC frame header"));
+            }
+            Err(error) => return Err(error),
+        };
+        let required = header.block * stream.channels as usize;
+        if out.len() < required {
+            return Err(AudioError::BufferTooSmall {
+                required,
+                available: out.len(),
+            });
+        }
+        self.frames.decode(packet, &header, Some(&mut out[..required]))?;
+        Ok(header.block)
+    }
+}
+
+/// A stateful decoder for FLAC in Ogg, one frame at a time.
+pub struct OggFlacDecoder<'a> {
+    reader: PacketReader<'a>,
+    frames: FrameDecoder,
+}
+
+impl<'a> OggFlacDecoder<'a> {
+    /// Finds the Ogg FLAC stream in `input`.
+    pub fn new(input: &'a [u8]) -> Result<Self> {
+        let page = match crate::ogg::find_stream(input)? {
+            Some((AudioFormat::OggFlac, page)) => page,
+            _ => return Err(AudioError::InvalidData("not an Ogg FLAC stream")),
+        };
+        let stream = parse_ogg_header(page.data)?;
+        let mut reader = PacketReader::new(input, page.serial);
+        // The mapping header, already parsed.
+        let _ = reader.next_packet()?;
+        Ok(Self {
+            reader,
+            frames: FrameDecoder::new(stream),
+        })
+    }
+
+    /// The stream's `STREAMINFO`.
+    pub fn stream_info(&self) -> StreamInfo {
+        self.frames.stream
+    }
+
+    /// Decodes the next frame to `out`. Returns the sample frames written, or
+    /// `None` at the end of the stream.
+    pub fn next_frame(&mut self, out: &mut [i16]) -> Result<Option<usize>> {
+        let stream = self.frames.stream;
+        let Self { reader, frames } = self;
+        while let Some(packet) = reader.next_packet()? {
+            // Each further packet is a metadata block or exactly one frame.
+            if packet.first().is_none_or(|&byte| byte != 0xff) {
+                continue;
+            }
+            let header = match parse_frame_header(packet, &stream) {
+                Ok(Some(header)) => header,
+                Ok(None) | Err(AudioError::UnexpectedEnd) => {
+                    return Err(AudioError::InvalidData("bad FLAC frame header"));
+                }
+                Err(error) => return Err(error),
+            };
+            let required = header.block * stream.channels as usize;
+            if out.len() < required {
+                return Err(AudioError::BufferTooSmall {
+                    required,
+                    available: out.len(),
+                });
+            }
+            frames.decode(packet, &header, Some(&mut out[..required]))?;
+            return Ok(Some(header.block));
+        }
+        Ok(None)
+    }
+}
+
 /// Decodes an Ogg FLAC stream, given its first page.
 pub(crate) fn ogg_decode(input: &[u8], page: &Page<'_>, out: &mut [i16]) -> Result<DecodedAudio> {
     let stream = parse_ogg_header(page.data)?;

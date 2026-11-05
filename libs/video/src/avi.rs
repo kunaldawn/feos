@@ -1,5 +1,8 @@
 //! AVI (RIFF) demuxing, including OpenDML files and `rec ` lists.
 
+use alloc::vec::Vec;
+
+use crate::audio::{push_packet, AudioCodec, AudioTrack};
 use crate::bitstream::{fourcc_at, u16_le_at, u32_le_at};
 use crate::codec::Codec;
 use crate::error::{Result, VideoError};
@@ -393,4 +396,122 @@ pub(crate) fn build_index(input: &[u8], limits: &DecoderLimits) -> Result<AviInd
         extra: stream.extra,
         dib: stream.dib.then_some(stream.bottom_up),
     })
+}
+
+/// Whether `id` is an audio chunk of stream `number`: `##wb`.
+fn is_audio_chunk(id: &[u8; 4], number: u8) -> bool {
+    &id[2..] == b"wb"
+        && id[0].is_ascii_digit()
+        && id[1].is_ascii_digit()
+        && (id[0] - b'0') * 10 + (id[1] - b'0') == number
+}
+
+/// Finds the first audio stream of a file.
+pub(crate) fn audio_track(input: &[u8]) -> Option<AudioTrack> {
+    let end = riff_end(input).ok()?;
+    let (hdrl_start, hdrl_len) = find_list(input, 12, end, b"hdrl")?;
+    let hdrl_end = hdrl_start + hdrl_len;
+    let mut pos = hdrl_start;
+    let mut number = 0u8;
+    while let Some((id, payload, size, next)) = scan(input, pos, hdrl_end) {
+        pos = next;
+        if &id != b"LIST" || size < 4 || &input[payload..payload + 4] != b"strl" {
+            continue;
+        }
+        let this = number;
+        number = number.saturating_add(1);
+        let (s_start, s_end) = (payload + 4, payload + size);
+        let (strh, strh_len) = find_chunk(input, s_start, s_end, b"strh")?;
+        if strh_len < 4 || &input[strh..strh + 4] != b"auds" {
+            continue;
+        }
+        let (strf, strf_len) = find_chunk(input, s_start, s_end, b"strf")?;
+        if strf_len < 14 {
+            return None;
+        }
+        let tag = u16_le_at(input, strf).ok()?;
+        let channels = u16_le_at(input, strf + 2).ok()?;
+        let rate = u32_le_at(input, strf + 4).ok()?;
+        let bytes_per_second = u32_le_at(input, strf + 8).ok()?;
+        let bits = if strf_len >= 16 {
+            u16_le_at(input, strf + 14).ok()?
+        } else {
+            8
+        };
+        let scale = u32_le_at(input, strh + 20).unwrap_or(0) as u64;
+        let stream_rate = u32_le_at(input, strh + 24).unwrap_or(0) as u64;
+        let sample_size = u32_le_at(input, strh + 44).unwrap_or(0);
+        let mut config = 0..0;
+        let codec = match tag {
+            1 => AudioCodec::Pcm {
+                bytes: (bits as u8).div_ceil(8),
+                big_endian: false,
+                float: false,
+            },
+            3 => AudioCodec::Pcm {
+                bytes: (bits as u8).div_ceil(8),
+                big_endian: false,
+                float: true,
+            },
+            6 => AudioCodec::ALaw,
+            7 => AudioCodec::MuLaw,
+            0x50 | 0x55 => AudioCodec::Mp3,
+            0xff | 0x1600 | 0x706d => {
+                if strf_len >= 18 {
+                    let extra = u16_le_at(input, strf + 16).ok()? as usize;
+                    if extra > 0 && 18 + extra <= strf_len {
+                        config = strf + 18..strf + 18 + extra;
+                    }
+                }
+                AudioCodec::Aac
+            }
+            _ => AudioCodec::Other,
+        };
+        let mut packets = Vec::new();
+        let mut bytes = 0u64;
+        let mut count = 0u64;
+        let mut full = false;
+        let (movi, movi_len) = find_list(input, 12, end, b"movi")?;
+        let mut visit = |offset: usize, size: usize| {
+            // Constant bit rates count bytes; anything else counts chunks.
+            let ms = if sample_size != 0 && bytes_per_second != 0 {
+                bytes * 1000 / bytes_per_second as u64
+            } else if stream_rate != 0 {
+                count * scale * 1000 / stream_rate
+            } else {
+                0
+            };
+            bytes += size as u64;
+            count += 1;
+            if push_packet(&mut packets, input.len(), offset, size, ms).is_none() {
+                full = true;
+            }
+        };
+        let mut pos = movi;
+        while let Some((id, payload, size, next)) = scan(input, pos, movi + movi_len) {
+            pos = next;
+            if &id == b"LIST" && size >= 4 && &input[payload..payload + 4] == b"rec " {
+                let mut inner = payload + 4;
+                while let Some((id, payload, size, next)) = scan(input, inner, payload + size) {
+                    inner = next;
+                    if is_audio_chunk(&id, this) {
+                        visit(payload, size);
+                    }
+                }
+            } else if is_audio_chunk(&id, this) {
+                visit(payload, size);
+            }
+        }
+        if full {
+            return None;
+        }
+        return Some(AudioTrack {
+            codec,
+            sample_rate: rate,
+            channels,
+            config,
+            packets,
+        });
+    }
+    None
 }

@@ -1,6 +1,6 @@
 //! Built-in programs and text that seed the RAM drive.
 //!
-//! These are real 8086 `.COM` images, assembled by hand, so `DEMO` exercises
+//! These are real `.COM` images, assembled by hand, so `DEMO` exercises
 //! the CPU, the DOS interrupt path and the text adapter end to end.
 
 /// A `.COM` program that prints a banner and returns to the prompt.
@@ -30,7 +30,7 @@ pub const BOX_COM: &[u8] = &[
 /// `README.TXT` contents.
 pub const README: &[u8] = b"FEOS-DOS 1.0\r\n\
 \r\n\
-This is a small 8086 virtual machine and DOS prompt built into feos.\r\n\
+This is an x86 virtual machine and DOS prompt built into feos.\r\n\
 It has its own writable C: RAM drive, so files you create here last until\r\n\
 the DOS window closes.\r\n\
 \r\n\

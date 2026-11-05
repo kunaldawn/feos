@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
-use crate::{EntryKind, FsError, NodeId, MAX_PATH_DEPTH};
+use crate::{EntryKind, FsError, NodeId, NodeTimes, MAX_PATH_DEPTH};
 
 /// Heap budget for one mounted volume's node table: names, nodes and child
 /// lists. It leaves room in the 64 MiB kernel arena for the table's own growth
@@ -76,6 +76,14 @@ pub(crate) struct Node {
     cursor: AtomicU64,
     /// Result of the first read's check of the chain.
     chain: AtomicU8,
+    /// Attribute bits; see [`attr`](crate::attr).
+    pub(crate) attributes: u8,
+    /// Seconds since the Unix epoch, or `None` where the disk has nothing.
+    pub(crate) times: NodeTimes,
+    /// The chain's last cluster and its index, once a write has found them.
+    /// Writers hold `&mut`, so this needs no atomics. Without it, appending in
+    /// chunks walks the whole chain per chunk.
+    pub(crate) tail: Option<(u32, u32)>,
 }
 
 impl Node {
@@ -103,6 +111,9 @@ impl Node {
             alive: true,
             cursor: AtomicU64::new(0),
             chain: AtomicU8::new(CHAIN_UNCHECKED),
+            attributes: 0,
+            times: NodeTimes::NONE,
+            tail: None,
         }
     }
 

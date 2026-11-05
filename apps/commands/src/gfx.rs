@@ -23,7 +23,11 @@ impl App for Gfx {
         "draw the graphics test card"
     }
 
-    fn run(&self, context: &mut Context<'_>) {
+    fn needs_display(&self) -> bool {
+        true
+    }
+
+    fn run(&self, context: &mut Context<'_>) -> i32 {
         match context.display.as_mut() {
             Some(canvas) => {
                 crate::ui::demo(canvas);
@@ -33,7 +37,11 @@ impl App for Gfx {
                     canvas.height()
                 );
             }
-            None => println!("no framebuffer; restart QEMU with -device ramfb"),
+            None => {
+                println!("no framebuffer; restart QEMU with -device ramfb");
+                return 1;
+            }
         }
+        0
     }
 }

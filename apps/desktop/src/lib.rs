@@ -20,6 +20,7 @@ use core::cell::Cell;
 
 use feos_app::shell::{Level, Request};
 use feos_app::{App, Context, Platform};
+use feos_bundle::install;
 use feos_console::println;
 use feos_desktop::{
     CommandTarget, Desktop, DesktopConfig, DesktopResponse, LaunchOutcome, ServiceStatus,
@@ -72,7 +73,11 @@ impl App for DesktopApp {
         "run the YAML-configured desktop session"
     }
 
-    fn run(&self, context: &mut Context<'_>) {
+    fn needs_display(&self) -> bool {
+        true
+    }
+
+    fn run(&self, context: &mut Context<'_>) -> i32 {
         let args = context.args.trim();
 
         // No arguments means an interactive session: the boot path calls
@@ -87,7 +92,7 @@ impl App for DesktopApp {
             let mut back = shell_back_buffer(context.display);
             run_session(context.display, &mut back, context.platform);
             *SHELL_BACK.lock() = back;
-            return;
+            return 0;
         }
 
         // The session holds this lock for as long as it runs, so anything that
@@ -95,18 +100,18 @@ impl App for DesktopApp {
         let config = load_config();
         let Some(mut session) = SESSION.try_lock() else {
             println!("desktop: session busy; try again after logging off");
-            return;
+            return 1;
         };
         prepare(&mut session, config, context.platform, true);
         let desktop = &mut *session;
 
         if args.eq_ignore_ascii_case("list") {
             list_apps(desktop);
-            return;
+            return 0;
         }
         if args.eq_ignore_ascii_case("status") {
             print_status(desktop);
-            return;
+            return 0;
         }
         if let Some(id) = args
             .strip_prefix("run ")
@@ -115,23 +120,24 @@ impl App for DesktopApp {
             render(desktop, context);
             run_app(desktop, id.trim(), context.platform, context.display);
             render(desktop, context);
-            return;
+            return 0;
         }
         if let Some(rest) = args.strip_prefix("service ") {
             run_service(desktop, rest.trim(), context.platform);
-            return;
+            return 0;
         }
         if args.eq_ignore_ascii_case("menu") {
             desktop.start_menu_mut().show();
             render(desktop, context);
-            return;
+            return 0;
         }
         if !args.is_empty() {
             println!("desktop: unknown option '{args}' (try 'desktop list' or 'desktop status')");
-            return;
+            return 2;
         }
 
         render(desktop, context);
+        0
     }
 }
 
@@ -171,7 +177,166 @@ fn provide_buffers(desktop: &mut Session, width: usize, height: usize) {
     }
 }
 
+/// What's in the application folder, so that a change can be noticed cheaply.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct AppsSignature {
+    hash: u64,
+}
+
+/// A digest of `/apps`'s names, sizes and dates. Zero when there's nothing.
+fn apps_signature(tree: &dyn feos_fs::VfsTree) -> AppsSignature {
+    let mut hash = 0u64;
+    if let Ok(entries) = tree.read_dir(install::APPS_DIR) {
+        for entry in entries {
+            for byte in entry.name.bytes() {
+                hash = hash.wrapping_mul(0x100_0000_01b3) ^ byte as u64;
+            }
+            hash = hash.wrapping_mul(0x100_0000_01b3) ^ entry.stat.size;
+            let modified = entry.stat.times.modified.unwrap_or(0);
+            hash = hash.wrapping_mul(0x100_0000_01b3) ^ modified;
+        }
+    }
+    AppsSignature { hash }
+}
+
+/// One verified package, kept for the session: the catalog borrows its bytes.
+struct LoadedPackage {
+    name: &'static str,
+    digest: alloc::string::String,
+    data: &'static [u8],
+}
+
+/// Packages already read, so that a rescan doesn't leak another copy of each.
+static LOADED_PACKAGES: SpinLock<Vec<LoadedPackage>> = SpinLock::new(Vec::new());
+
+/// Reads and checks what's installed in `/apps`. A package that doesn't match its
+/// digest is left out and reported: the disk changed it, or an install was cut
+/// short.
+fn installed_packages(platform: &Platform, announce: bool) -> Vec<feos_desktop::DirEntry<'static>> {
+    let mut entries = Vec::new();
+    let Some(tree) = platform.filesystem.and_then(|fs| fs.tree()) else {
+        return entries;
+    };
+    let Ok(listing) = tree.read_dir(install::APPS_DIR) else {
+        return entries;
+    };
+    for entry in listing {
+        if !entry.name.ends_with(install::PACKAGE_SUFFIX) {
+            continue;
+        }
+        let path = alloc::format!("{}/{}", install::APPS_DIR, entry.name);
+        let digest_path = alloc::format!("{path}{}", install::DIGEST_SUFFIX);
+        let Some(digest) = read_small(tree, &digest_path, 256) else {
+            println!("[desktop] {path}: no digest, not loaded");
+            continue;
+        };
+        let digest = core::str::from_utf8(&digest).ok().and_then(install::parse_digest);
+        let Some(digest) = digest else {
+            println!("[desktop] {path}: bad digest file, not loaded");
+            continue;
+        };
+        if let Some(known) = find_loaded(&entry.name, digest) {
+            entries.push(feos_desktop::DirEntry::new(known.0, known.1));
+            continue;
+        }
+        let Some(data) = read_small(tree, &path, install::MAX_PACKAGE_BYTES) else {
+            println!("[desktop] {path}: unreadable, not loaded");
+            continue;
+        };
+        match install::verify_package(&data, digest) {
+            Ok(manifest) => {
+                if announce {
+                    println!("[desktop] installed app: {}", manifest.id.as_str());
+                }
+                let data: &'static [u8] = alloc::boxed::Box::leak(data.into_boxed_slice());
+                let name: &'static str = alloc::boxed::Box::leak(entry.name.into_boxed_str());
+                LOADED_PACKAGES.lock().push(LoadedPackage {
+                    name,
+                    digest: alloc::string::String::from(digest),
+                    data,
+                });
+                entries.push(feos_desktop::DirEntry::new(name, data));
+            }
+            Err(problem) => println!("[desktop] {path}: {problem}, not loaded"),
+        }
+    }
+    entries
+}
+
+fn find_loaded(name: &str, digest: &str) -> Option<(&'static str, &'static [u8])> {
+    let loaded = LOADED_PACKAGES.lock();
+    let known = loaded
+        .iter()
+        .find(|package| package.name == name && package.digest == digest)?;
+    Some((known.name, known.data))
+}
+
+fn read_small(tree: &dyn feos_fs::VfsTree, path: &str, limit: usize) -> Option<Vec<u8>> {
+    let size = tree.stat(path).ok()?.size as usize;
+    if size > limit {
+        return None;
+    }
+    let mut data = Vec::new();
+    data.try_reserve_exact(size).ok()?;
+    data.resize(size, 0);
+    let mut done = 0;
+    while done < size {
+        let count = tree.read_at(path, done as u64, &mut data[done..]).ok()?;
+        if count == 0 {
+            return None;
+        }
+        done += count;
+    }
+    Some(data)
+}
+
+/// Scans the embedded folder and everything installed at run time.
+fn scan_all(
+    desktop: &mut Session,
+    platform: &Platform,
+    announce: bool,
+) -> feos_bundle::ScanReport {
+    let mut entries: Vec<feos_desktop::DirEntry<'static>> = FOLDER.to_vec();
+    entries.extend(installed_packages(platform, announce));
+    desktop.scan(&entries)
+}
+
 /// Parses the embedded configuration, falling back to defaults.
+/// Where the choices made in Display Properties are kept.
+const SETTINGS_PATH: &str = "/etc/desktop.conf";
+
+/// Applies what the user chose in an earlier session, on a machine with a disk.
+fn restore_settings(config: &mut DesktopConfig, platform: &Platform) {
+    let Some(tree) = platform.filesystem.and_then(|fs| fs.tree()) else {
+        return;
+    };
+    let Ok(bytes) = feos_fs::vfs::read_atomic(tree, SETTINGS_PATH) else {
+        return;
+    };
+    if let Ok(text) = core::str::from_utf8(&bytes) {
+        config.apply_settings(text);
+        println!(
+            "[desktop] settings restored: theme={} keyboard={}",
+            config.theme.name(),
+            config.keyboard_layout.name()
+        );
+    }
+}
+
+/// Keeps the settings for next time. Failing is no reason to interrupt anyone:
+/// the choice still holds for this session.
+fn save_settings(config: &DesktopConfig, platform: &Platform) {
+    let Some(tree) = platform.filesystem.and_then(|fs| fs.tree()) else {
+        return;
+    };
+    // `/etc` is only there if the image put it there.
+    let _ = tree.create_dir("/etc");
+    let text = config.settings_text();
+    if let Err(error) = tree.write_file_atomic(SETTINGS_PATH, text.as_str().as_bytes()) {
+        println!("[desktop] couldn't save settings: {error}");
+    }
+}
+
 fn load_config() -> DesktopConfig {
     match DesktopConfig::parse(CONFIG_YAML) {
         Ok(config) => config,
@@ -190,7 +355,7 @@ fn prepare(desktop: &mut Session, config: DesktopConfig, platform: &Platform, an
         desktop.start_menu_mut().show();
     }
 
-    let report = desktop.scan(FOLDER);
+    let report = scan_all(desktop, platform, announce);
     if announce {
         println!(
             "[desktop] {} application(s) discovered in the application folder ({} skipped)",
@@ -223,7 +388,7 @@ fn render(desktop: &mut Session, context: &mut Context<'_>) {
         desktop.render_with_platform(canvas, &input, uptime, Some(platform))
     };
     apply_response(desktop, &response, platform, context.display);
-    desktop.tick_session(platform.processes);
+    desktop.tick_session_at(platform.processes, platform.clock.uptime_ms());
     let (width, height) = context
         .display
         .as_ref()
@@ -308,6 +473,14 @@ fn apply_request(
             desktop.begin_drag(payload.as_str());
             false
         }
+        Request::Activate(window) => {
+            desktop.activate_window(usize::from(window));
+            false
+        }
+        Request::CloseWindow(window) => {
+            desktop.close_window(usize::from(window));
+            false
+        }
     }
 }
 
@@ -335,15 +508,18 @@ fn apply_response(
                 let suspend_area = foreground_suspend_area(desktop, display, window);
                 let suspend = Cell::new(false);
                 if let Some(app) = platform.apps.find(request.entry.as_str()) {
+                    let block = feos_app::ArgBlock::parse(request.args.as_str()).unwrap_or_default();
+                    let mut slots = [""; feos_app::MAX_ARGC];
                     let mut context = Context {
                         args: request.args.as_str(),
+                        argv: block.argv(&mut slots),
                         display,
                         viewport,
                         suspend: Some(&suspend),
                         suspend_area,
                         platform,
                     };
-                    app.run(&mut context);
+                    let _ = app.run(&mut context);
                 }
                 finish_foreground(desktop, window, suspend.get());
                 println!("[desktop] returned from '{}'", request.entry);
@@ -428,8 +604,7 @@ fn spawn_error_text(error: feos_app::SpawnError) -> &'static str {
     match error {
         feos_app::SpawnError::NoFreeSlot => "no free process slot; end a task and try again",
         feos_app::SpawnError::ArgsTooLong => "its arguments are too long",
-        #[allow(unreachable_patterns)]
-        _ => "the kernel could not start a process",
+        feos_app::SpawnError::Unsupported => "the kernel could not start a process",
     }
 }
 
@@ -461,18 +636,26 @@ fn run_command(
         }
         CommandTarget::Foreground { app, args } => {
             let viewport = foreground_viewport(desktop, display);
+            let block = feos_app::ArgBlock::parse(args).unwrap_or_default();
+            let mut slots = [""; feos_app::MAX_ARGC];
             let mut context = Context {
                 args,
+                argv: block.argv(&mut slots),
                 display,
                 viewport,
                 suspend: None,
                 suspend_area: None,
                 platform,
             };
-            app.run(&mut context);
+            let _ = app.run(&mut context);
             true
         }
         CommandTarget::Spawn { app, args } => {
+            // A command that only prints needs somewhere to print: a Terminal
+            // window running it. Without one, it can still run.
+            if let Some(args) = terminal_command(desktop, command) {
+                return launch_id_with(desktop, "terminal", Some(args.as_str()), platform, display);
+            }
             match platform.processes.spawn(app, args) {
                 Ok(pid) => {
                     println!("[desktop] run: '{command}' started as pid {pid}");
@@ -488,10 +671,26 @@ fn run_command(
             false
         }
         CommandTarget::NotFound => {
+            // It may still be a shell builtin or utility, which only a shell knows.
+            if let Some(args) = terminal_command(desktop, command) {
+                return launch_id_with(desktop, "terminal", Some(args.as_str()), platform, display);
+            }
             report_failure(desktop, platform, command, "not found");
             false
         }
     }
+}
+
+/// A Terminal window's arguments for running `command`, when there is a Terminal
+/// and the command fits.
+fn terminal_command(
+    desktop: &Session,
+    command: &str,
+) -> Option<feos_text::Text<{ feos_app::shell::REQUEST_MAX }>> {
+    desktop.catalog().find_id("terminal")?;
+    let mut args = feos_text::Text::new();
+    let _ = write!(args, "-c {command}");
+    (args.as_str().len() == command.len() + 3).then_some(args)
 }
 
 /// Launches an installed application by bundle id.
@@ -547,15 +746,18 @@ fn launch_id_with(
             let suspend_area = foreground_suspend_area(desktop, display, window);
             let suspend = Cell::new(false);
             if let Some(app) = platform.apps.find(entry.as_str()) {
+                let block = feos_app::ArgBlock::parse(args.as_str()).unwrap_or_default();
+                let mut slots = [""; feos_app::MAX_ARGC];
                 let mut context = Context {
                     args: args.as_str(),
+                    argv: block.argv(&mut slots),
                     display,
                     viewport,
                     suspend: Some(&suspend),
                     suspend_area,
                     platform,
                 };
-                app.run(&mut context);
+                let _ = app.run(&mut context);
             }
             finish_foreground(desktop, window, suspend.get());
             true
@@ -616,15 +818,18 @@ fn run_app(
             let suspend_area = foreground_suspend_area(desktop, display, window);
             let suspend = Cell::new(false);
             if let Some(app) = platform.apps.find(entry.as_str()) {
+                let block = feos_app::ArgBlock::parse(args.as_str()).unwrap_or_default();
+                let mut slots = [""; feos_app::MAX_ARGC];
                 let mut context = Context {
                     args: args.as_str(),
+                    argv: block.argv(&mut slots),
                     display,
                     viewport,
                     suspend: Some(&suspend),
                     suspend_area,
                     platform,
                 };
-                app.run(&mut context);
+                let _ = app.run(&mut context);
             }
             finish_foreground(desktop, window, suspend.get());
             println!("[desktop] returned from '{id}'");

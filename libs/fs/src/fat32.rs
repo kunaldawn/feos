@@ -11,6 +11,21 @@
 //! marked [damaged](FileSystem::is_damaged): what's intact stays readable, and
 //! writes are refused.
 //!
+//! ## Surviving a crash
+//!
+//! A write-back device may reorder writes, so each one is
+//! [classified](WriteClass): contents, then the FAT, then directory entries.
+//! Whatever a crash cuts off, a directory entry only ever refers to a chain and
+//! contents that exist. What has to go the other way (deleting, truncating) is
+//! split by a [commit](WritableBlockDevice::commit): the entry changes first, and
+//! the clusters are freed after. Renaming writes the new entry and commits before
+//! erasing the old one.
+//!
+//! So a crash leaves only lost clusters, a file shorter than its chain, or one
+//! name too many. The dirty bits (`FAT[1]` and the boot sector, set before the
+//! first change and cleared by [`flush`](WritableFileSystem::flush)) say when to
+//! look, and [`check`](WritableFileSystem::check) repairs all three.
+//!
 //! Layout references: Microsoft's FAT specification, sections "Boot Sector and
 //! BPB" and "FAT 32", and the Linux `fs/fat` implementation for the LFN
 //! checksum and entry ordering rules.
@@ -18,10 +33,15 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::block::{BlockDevice, WritableBlockDevice};
+use feos_hal::time::DateTime;
+
+use crate::block::{BlockDevice, WritableBlockDevice, WriteClass};
 use crate::tree::{sanitize_name, try_push, try_zeroed, ClusterSet, EntryLocation, NodeTable};
 use crate::volume::Volume;
-use crate::{EntryKind, FileSystem, FsError, NodeId, WritableFileSystem, MAX_PATH_DEPTH};
+use crate::{
+    attr, CheckReport, EntryKind, FileSystem, FsError, NodeId, NodeTimes, TimeSource, VolumeStats,
+    WritableFileSystem, MAX_PATH_DEPTH,
+};
 
 const FAT_MASK: u32 = 0x0fff_ffff;
 const FAT_EOC_MIN: u32 = 0x0fff_fff8;
@@ -31,6 +51,17 @@ const MAX_PATH_NAME_UNITS: usize = 260;
 const MAX_FILE_SIZE: u64 = u32::MAX as u64;
 /// The specification's limit on a directory: 2 MiB of 32-byte entries.
 const MAX_DIRECTORY_ENTRIES: usize = 65_536;
+/// `FAT[1]` bit: set when the volume was unmounted cleanly.
+const FAT1_CLEAN: u32 = 0x0800_0000;
+/// Boot sector byte holding the dirty flag Linux and `fsck.vfat` use.
+const BOOT_FLAGS: u64 = 65;
+const BOOT_FLAG_DIRTY: u8 = 0x01;
+/// Attribute bits kept on a node. Directory and volume bits are the entry's type.
+const NODE_ATTRIBUTES: u8 = attr::SETTABLE;
+/// FAT dates start here.
+const FAT_EPOCH_YEAR: u32 = 1980;
+/// Bytes of the FAT handled at a time by the mount-time check.
+const CHECK_CHUNK: usize = 64 * 1024;
 
 /// A mounted FAT32 volume.
 pub struct Fat32<D: BlockDevice> {
@@ -48,6 +79,57 @@ pub struct Fat32<D: BlockDevice> {
     free_count: Option<u32>,
     next_free: u32,
     damaged: bool,
+    damage_reason: Option<&'static str>,
+    /// The on-disk flags say a change is, or may be, in progress.
+    dirty: bool,
+    /// Directories that share a start with another, seen while the volume was
+    /// dirty: the two names of an interrupted rename.
+    suspects: Vec<u32>,
+    now: Option<TimeSource>,
+}
+
+/// Encodes a time as FAT's `(date, time)` words, or `None` before 1980 and past
+/// what the seven-bit year holds.
+pub(crate) fn fat_timestamp(seconds: u64) -> Option<(u16, u16)> {
+    let date = DateTime::from_unix(seconds);
+    if !(FAT_EPOCH_YEAR..FAT_EPOCH_YEAR + 128).contains(&date.year) {
+        return None;
+    }
+    let day = ((date.year - FAT_EPOCH_YEAR) as u16) << 9
+        | (date.month as u16) << 5
+        | date.day as u16;
+    let time = (date.hour as u16) << 11 | (date.minute as u16) << 5 | (date.second as u16) / 2;
+    Some((day, time))
+}
+
+/// Decodes FAT's date and time words. Zero, which a clockless writer leaves, and
+/// anything impossible decode to `None`.
+pub(crate) fn fat_time_to_unix(day: u16, time: u16) -> Option<u64> {
+    if day == 0 {
+        return None;
+    }
+    DateTime {
+        year: FAT_EPOCH_YEAR + (day >> 9) as u32,
+        month: ((day >> 5) & 0x0f) as u8,
+        day: (day & 0x1f) as u8,
+        hour: (time >> 11) as u8,
+        minute: ((time >> 5) & 0x3f) as u8,
+        second: ((time & 0x1f) * 2) as u8,
+    }
+    .to_unix()
+}
+
+fn entry_u16(entry: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([entry[at], entry[at + 1]])
+}
+
+/// Reads the timestamps out of a short entry.
+pub(crate) fn entry_times(entry: &[u8]) -> NodeTimes {
+    NodeTimes {
+        created: fat_time_to_unix(entry_u16(entry, 16), entry_u16(entry, 14)),
+        modified: fat_time_to_unix(entry_u16(entry, 24), entry_u16(entry, 22)),
+        accessed: fat_time_to_unix(entry_u16(entry, 18), 0),
+    }
 }
 
 impl<D: BlockDevice> Fat32<D> {
@@ -201,6 +283,10 @@ impl<D: BlockDevice> Fat32<D> {
             }
         }
 
+        // A dirty volume's tree can legitimately hold an interrupted rename.
+        let fat1 = volume.read_u32_le(fat_start + 4)?;
+        let dirty = boot[BOOT_FLAGS as usize] & BOOT_FLAG_DIRTY != 0 || fat1 & FAT1_CLEAN == 0;
+
         let mut fs = Self {
             volume,
             nodes: NodeTable::new(root_cluster),
@@ -215,6 +301,10 @@ impl<D: BlockDevice> Fat32<D> {
             free_count,
             next_free,
             damaged: false,
+            damage_reason: None,
+            dirty,
+            suspects: Vec::new(),
+            now: None,
         };
 
         let mut queue: Vec<DirTask> = Vec::new();
@@ -238,11 +328,31 @@ impl<D: BlockDevice> Fat32<D> {
                 Err(error) if is_root && fs.nodes.child_count(NodeId::ROOT) == 0 => {
                     return Err(error)
                 }
-                Err(_) => fs.damaged = true,
+                Err(error) => {
+                    let _ = error;
+                    fs.mark_damaged("unreadable directory");
+                }
             }
         }
 
         Ok(fs)
+    }
+
+    fn mark_damaged(&mut self, reason: &'static str) {
+        self.damaged = true;
+        if self.damage_reason.is_none() {
+            self.damage_reason = Some(reason);
+        }
+    }
+
+    /// What mounting found wrong first, if anything.
+    pub fn damage_reason(&self) -> Option<&'static str> {
+        self.damage_reason
+    }
+
+    /// Gives the device back, without writing anything further.
+    pub fn into_device(self) -> D {
+        self.volume.into_device()
     }
 
     /// Offset of `cluster`'s entry in the FAT that's being used.
@@ -297,11 +407,16 @@ impl<D: BlockDevice> Fat32<D> {
         let mut cluster = task.cluster;
         let mut entries = 0usize;
 
+        if visited.contains(cluster) && self.dirty && task.node != 0 {
+            try_push(&mut self.suspects, task.node)?;
+            return Ok(());
+        }
+
         loop {
             if !visited.insert(cluster) {
                 // A loop in this chain, or a cluster shared with a directory
                 // already walked. Either way, there's nothing new here.
-                self.damaged = true;
+                self.mark_damaged("directory loop or shared cluster");
                 return Ok(());
             }
             self.read_cluster(cluster, buffer)?;
@@ -314,7 +429,7 @@ impl<D: BlockDevice> Fat32<D> {
                 }
                 entries += 1;
                 if entries > MAX_DIRECTORY_ENTRIES {
-                    self.damaged = true;
+                    self.mark_damaged("directory too large");
                     return Ok(());
                 }
                 if entry[0] == 0xe5 {
@@ -369,7 +484,7 @@ impl<D: BlockDevice> Fat32<D> {
                     }
                 };
                 if !usable {
-                    self.damaged = true;
+                    self.mark_damaged("unusable entry");
                     continue;
                 }
 
@@ -383,11 +498,17 @@ impl<D: BlockDevice> Fat32<D> {
                     false,
                     Some(location),
                 )?;
+                if let Some(added) = self.nodes.get_mut(NodeId(node)) {
+                    added.attributes = attributes & NODE_ATTRIBUTES;
+                    added.times = entry_times(entry);
+                }
 
                 if kind == EntryKind::Directory {
                     let depth = task.depth + 1;
-                    if depth >= MAX_PATH_DEPTH || visited.contains(start) {
-                        self.damaged = true;
+                    if visited.contains(start) && self.dirty {
+                        try_push(&mut self.suspects, node)?;
+                    } else if depth >= MAX_PATH_DEPTH || visited.contains(start) {
+                        self.mark_damaged("directory nested too deep or shared");
                     } else {
                         try_push(
                             queue,
@@ -435,11 +556,26 @@ impl<D: BlockDevice> Fat32<D> {
         let mut done = 0usize;
         while done < wanted {
             let cluster_offset = self.cluster_offset(cluster)?;
-            let take = (self.cluster_size - within).min(wanted - done);
+            let mut take = (self.cluster_size - within).min(wanted - done);
+            // Consecutive clusters go to the device as one transfer.
+            let mut last = cluster;
+            let mut last_index = index;
+            while take < wanted - done {
+                match self.next_cluster(last)? {
+                    Some(next) if next == last + 1 => {
+                        last = next;
+                        last_index += 1;
+                        take = (take + self.cluster_size).min(wanted - done);
+                    }
+                    _ => break,
+                }
+            }
             self.volume
                 .read_bytes(cluster_offset + within as u64, &mut out[done..done + take])?;
             done += take;
             within = 0;
+            cluster = last;
+            index = last_index;
 
             if done < wanted {
                 cluster = self.next_cluster(cluster)?.ok_or(FsError::Corrupt)?;
@@ -449,16 +585,74 @@ impl<D: BlockDevice> Fat32<D> {
         entry.remember_position(index, cluster);
         Ok(done)
     }
+
+    /// Counts free FAT entries, for a volume whose FSInfo doesn't say.
+    fn count_free(&self) -> Result<u32, FsError> {
+        let mut chunk = try_zeroed(CHECK_CHUNK)?;
+        let total = self.cluster_count as u64 + 2;
+        let start = self.fat_entry_offset(0)?;
+        let mut free = 0u32;
+        let mut done = 0u64;
+        while done < total {
+            let entries = (total - done).min((CHECK_CHUNK / 4) as u64) as usize;
+            self.volume.read_bytes(start + done * 4, &mut chunk[..entries * 4])?;
+            for (index, entry) in chunk[..entries * 4].chunks_exact(4).enumerate() {
+                let value = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+                if done + index as u64 >= 2 && value & FAT_MASK == 0 {
+                    free += 1;
+                }
+            }
+            done += entries as u64;
+        }
+        Ok(free)
+    }
 }
 
 impl<D: WritableBlockDevice> Fat32<D> {
     /// Fails when mounting found damage. Writing to a tree that's only partly
     /// understood could reuse clusters that hold skipped files.
-    fn ensure_writable(&self) -> Result<(), FsError> {
+    fn ensure_writable(&mut self) -> Result<(), FsError> {
         if self.damaged {
             return Err(FsError::Corrupt);
         }
+        if self.volume.is_read_only() {
+            return Err(FsError::ReadOnly);
+        }
+        if !self.dirty {
+            // Durable before anything else changes, or a crash looks clean.
+            self.write_dirty_flags(true)?;
+            self.volume.commit()?;
+            self.dirty = true;
+        }
         Ok(())
+    }
+
+    /// Writes both dirty flags. `FAT[1]`'s bit is in every copy, because tools
+    /// compare the copies.
+    fn write_dirty_flags(&mut self, dirty: bool) -> Result<(), FsError> {
+        self.volume.class = WriteClass::Data;
+        let flags = self.volume.read_array::<1>(BOOT_FLAGS)?[0];
+        let flags = if dirty {
+            flags | BOOT_FLAG_DIRTY
+        } else {
+            flags & !BOOT_FLAG_DIRTY
+        };
+        self.volume.write_bytes(BOOT_FLAGS, &[flags])?;
+        for copy in 0..self.fat_count {
+            let offset = self.fat_start + 4 + copy as u64 * self.fat_size_bytes;
+            let value = self.volume.read_u32_le(offset)?;
+            let value = if dirty {
+                value & !FAT1_CLEAN
+            } else {
+                value | FAT1_CLEAN
+            };
+            self.volume.write_u32_le(offset, value)?;
+        }
+        Ok(())
+    }
+
+    fn now(&self) -> Option<u64> {
+        self.now.and_then(|now| now())
     }
 
     fn read_fat_entry(&self, cluster: u32) -> Result<u32, FsError> {
@@ -467,6 +661,7 @@ impl<D: WritableBlockDevice> Fat32<D> {
     }
 
     fn write_fat_entry(&mut self, cluster: u32, value: u32) -> Result<(), FsError> {
+        self.volume.class = WriteClass::Fat;
         let offset = self
             .fat_start
             .checked_add(cluster as u64 * 4)
@@ -485,6 +680,7 @@ impl<D: WritableBlockDevice> Fat32<D> {
     }
 
     fn update_fsinfo(&mut self) -> Result<(), FsError> {
+        self.volume.class = WriteClass::Fat;
         let free = self.free_count;
         for offset in self.fsinfo.iter().copied().flatten() {
             if let Some(free) = free {
@@ -495,16 +691,21 @@ impl<D: WritableBlockDevice> Fat32<D> {
         Ok(())
     }
 
-    fn alloc_cluster(&mut self) -> Result<u32, FsError> {
+    /// Allocates a cluster. Only a directory's needs clearing: a file's bytes
+    /// past its size are never read, and growing a file zeroes what it exposes.
+    fn alloc_cluster(&mut self, clear: bool) -> Result<u32, FsError> {
         let max_cluster = self.max_cluster();
         let start = self.next_free.clamp(2, max_cluster.saturating_sub(1));
         for step in 0..self.cluster_count {
             let cluster = 2 + ((start - 2 + step) % self.cluster_count);
             if self.read_fat_entry(cluster)? == 0 {
+                if clear {
+                    let offset = self.cluster_offset(cluster)?;
+                    let zeros = try_zeroed(self.cluster_size)?;
+                    self.volume.class = WriteClass::Data;
+                    self.volume.write_bytes(offset, &zeros)?;
+                }
                 self.write_fat_entry(cluster, FAT_EOC_MIN)?;
-                let offset = self.cluster_offset(cluster)?;
-                let zeros = try_zeroed(self.cluster_size)?;
-                self.volume.write_bytes(offset, &zeros)?;
                 self.next_free = if cluster + 1 < max_cluster {
                     cluster + 1
                 } else {
@@ -513,7 +714,6 @@ impl<D: WritableBlockDevice> Fat32<D> {
                 if let Some(free) = self.free_count.as_mut() {
                     *free = free.saturating_sub(1);
                 }
-                self.update_fsinfo()?;
                 return Ok(cluster);
             }
         }
@@ -556,7 +756,7 @@ impl<D: WritableBlockDevice> Fat32<D> {
             }
             cluster = next;
         }
-        self.update_fsinfo()
+        Ok(())
     }
 
     fn chain_length(&self, start: u32) -> Result<usize, FsError> {
@@ -592,46 +792,66 @@ impl<D: WritableBlockDevice> Fat32<D> {
         }
     }
 
-    fn ensure_chain(&mut self, start: u32, needed: usize) -> Result<u32, FsError> {
+    /// Grows `node`'s chain to at least `needed` clusters and returns its start.
+    fn ensure_chain(&mut self, node: NodeId, start: u32, needed: usize) -> Result<u32, FsError> {
         if needed == 0 {
             return Ok(start);
         }
         if start < 2 {
-            let first = self.alloc_cluster()?;
-            if let Err(error) = self.extend_chain(first, needed - 1) {
-                // Nothing refers to the partial chain yet, so it would leak.
-                self.free_chain(first)?;
-                return Err(error);
-            }
-            self.update_fsinfo()?;
+            let first = self.alloc_cluster(false)?;
+            let last = match self.extend_chain(first, needed - 1) {
+                Ok(last) => last,
+                Err(error) => {
+                    // Nothing refers to the partial chain yet, so it would leak.
+                    self.free_chain(first)?;
+                    return Err(error);
+                }
+            };
+            self.remember_tail(node, needed - 1, last);
             return Ok(first);
         }
 
-        let length = self.chain_length(start)?;
+        let tail = self.nodes.get(node).and_then(|entry| entry.tail);
+        let (length, last) = match tail {
+            Some((index, cluster)) => (index as usize + 1, cluster),
+            None => (self.chain_length(start)?, self.chain_last(start)?),
+        };
         if length >= needed {
+            self.remember_tail(node, length - 1, last);
             return Ok(start);
         }
-        let last = self.chain_last(start)?;
-        if let Err(error) = self.extend_chain(last, needed - length) {
-            // Give back what was added: the file's size still ends at `last`.
-            if let Some(tail) = self.next_cluster(last)? {
-                self.write_fat_entry(last, FAT_EOC_MIN)?;
-                self.free_chain(tail)?;
+        match self.extend_chain(last, needed - length) {
+            Ok(tail) => {
+                self.remember_tail(node, needed - 1, tail);
+                Ok(start)
             }
-            return Err(error);
+            Err(error) => {
+                // Give back what was added: the file's size still ends at `last`.
+                if let Some(tail) = self.next_cluster(last)? {
+                    self.write_fat_entry(last, FAT_EOC_MIN)?;
+                    self.free_chain(tail)?;
+                }
+                Err(error)
+            }
         }
-        self.update_fsinfo()?;
-        Ok(start)
     }
 
-    /// Appends `count` clusters after `last`, linking each as it's allocated.
-    fn extend_chain(&mut self, mut last: u32, count: usize) -> Result<(), FsError> {
+    fn remember_tail(&mut self, node: NodeId, index: usize, cluster: u32) {
+        if let Some(entry) = self.nodes.get_mut(node) {
+            entry.tail = Some((index as u32, cluster));
+        }
+    }
+
+    /// Appends `count` clusters after `last`, linking each as it's allocated,
+    /// and returns the new last cluster. Linking one at a time means the walk
+    /// back on failure finds them all.
+    fn extend_chain(&mut self, mut last: u32, count: usize) -> Result<u32, FsError> {
         for _ in 0..count {
-            let next = self.alloc_cluster()?;
+            let next = self.alloc_cluster(false)?;
             self.write_fat_entry(last, next)?;
             last = next;
         }
-        Ok(())
+        Ok(last)
     }
 
     fn truncate_chain(&mut self, start: u32, needed: usize) -> Result<u32, FsError> {
@@ -654,7 +874,6 @@ impl<D: WritableBlockDevice> Fat32<D> {
         let tail = self.next_cluster(cluster)?.ok_or(FsError::Corrupt)?;
         self.write_fat_entry(cluster, FAT_EOC_MIN)?;
         self.free_chain(tail)?;
-        self.update_fsinfo()?;
         Ok(start)
     }
 
@@ -662,6 +881,7 @@ impl<D: WritableBlockDevice> Fat32<D> {
         if data.is_empty() {
             return Ok(());
         }
+        self.volume.class = WriteClass::Data;
         let cluster_size = self.cluster_size as u64;
         let mut cluster = start;
         for _ in 0..(offset / cluster_size) {
@@ -670,8 +890,18 @@ impl<D: WritableBlockDevice> Fat32<D> {
         let mut within = (offset % cluster_size) as usize;
         let mut done = 0usize;
         while done < data.len() {
-            let take = (self.cluster_size - within).min(data.len() - done);
+            let mut take = (self.cluster_size - within).min(data.len() - done);
             let offset = self.cluster_offset(cluster)?;
+            // Consecutive clusters go to the device as one transfer.
+            while take < data.len() - done {
+                match self.next_cluster(cluster)? {
+                    Some(next) if next == cluster + 1 => {
+                        cluster = next;
+                        take = (take + self.cluster_size).min(data.len() - done);
+                    }
+                    _ => break,
+                }
+            }
             self.volume
                 .write_bytes(offset + within as u64, &data[done..done + take])?;
             done += take;
@@ -692,6 +922,7 @@ impl<D: WritableBlockDevice> Fat32<D> {
         for _ in 0..(from / cluster_size) {
             cluster = self.next_cluster(cluster)?.ok_or(FsError::Corrupt)?;
         }
+        self.volume.class = WriteClass::Data;
         let mut within = (from % cluster_size) as usize;
         let mut position = from;
         let zeros = [0u8; 4096];
@@ -718,17 +949,36 @@ impl<D: WritableBlockDevice> Fat32<D> {
             .get(node)
             .and_then(|entry| entry.entry)
             .ok_or(FsError::Corrupt)?;
+        self.volume.class = WriteClass::Dir;
         self.volume
             .write_u16_le(location.primary + 20, (start >> 16) as u16)?;
         self.volume
             .write_u16_le(location.primary + 26, (start & 0xffff) as u16)?;
         self.volume
             .write_u32_le(location.primary + 28, size as u32)?;
+        let now = self.now();
+        let stamp = now.and_then(fat_timestamp);
+        if let Some((day, time)) = stamp {
+            self.volume.write_u16_le(location.primary + 22, time)?;
+            self.volume.write_u16_le(location.primary + 24, day)?;
+            self.volume.write_u16_le(location.primary + 18, day)?;
+        }
+        // Whatever backs up this volume should know it changed.
+        let flags = self.volume.read_array::<1>(location.primary + 11)?[0];
+        if flags & attr::ARCHIVE == 0 {
+            self.volume
+                .write_bytes(location.primary + 11, &[flags | attr::ARCHIVE])?;
+        }
         if let Some(entry) = self.nodes.get_mut(node) {
             entry.start_cluster = start;
             entry.size = size;
             entry.valid_size = size;
             entry.data_length = size;
+            entry.attributes |= attr::ARCHIVE;
+            if stamp.is_some() {
+                entry.times.modified = now;
+                entry.times.accessed = now;
+            }
             entry.chain_changed();
         }
         Ok(())
@@ -753,9 +1003,10 @@ impl<D: WritableBlockDevice> Fat32<D> {
             return Err(FsError::NoSpace);
         }
         let needed = ((end + self.cluster_size as u64 - 1) / self.cluster_size as u64) as usize;
-        let start = self.ensure_chain(start_cluster, needed)?;
-        if end > old_size {
-            self.zero_stream_range(start, old_size, end)?;
+        let start = self.ensure_chain(node, start_cluster, needed)?;
+        // A gap reads as zeros. What the new data covers needs no clearing.
+        if offset as u64 > old_size {
+            self.zero_stream_range(start, old_size, offset as u64)?;
         }
         self.write_stream_at(start, offset as u64, data)?;
         let size = old_size.max(end);
@@ -779,18 +1030,20 @@ impl<D: WritableBlockDevice> Fat32<D> {
         if new_size == old_size {
             return Ok(());
         }
-        if new_size == 0 {
-            self.free_chain(start_cluster)?;
-            self.update_file_meta(node, 0, 0)?;
-            return Ok(());
-        }
         let needed =
             ((new_size + self.cluster_size as u64 - 1) / self.cluster_size as u64) as usize;
         if new_size < old_size {
-            let start = self.truncate_chain(start_cluster, needed)?;
+            // The entry first and durably, so that it never promises clusters
+            // that have been freed.
+            let start = if new_size == 0 { 0 } else { start_cluster };
             self.update_file_meta(node, start, new_size)?;
+            self.volume.commit()?;
+            if let Some(entry) = self.nodes.get_mut(node) {
+                entry.tail = None;
+            }
+            self.truncate_chain(start_cluster, needed)?;
         } else {
-            let start = self.ensure_chain(start_cluster, needed)?;
+            let start = self.ensure_chain(node, start_cluster, needed)?;
             self.zero_stream_range(start, old_size, new_size)?;
             self.update_file_meta(node, start, new_size)?;
         }
@@ -954,9 +1207,12 @@ impl<D: WritableBlockDevice> Fat32<D> {
             match self.next_cluster(cluster)? {
                 Some(next) => cluster = next,
                 None => {
-                    let next = self.alloc_cluster()?;
+                    let next = self.alloc_cluster(true)?;
+                    // Durably clear before the chain reaches it. Entries written
+                    // into it next are a later class, and would take the clearing
+                    // with them, leaving the old bytes to read as a directory.
+                    self.volume.commit()?;
                     self.write_fat_entry(cluster, next)?;
-                    self.update_fsinfo()?;
                     cluster = next;
                 }
             }
@@ -984,6 +1240,7 @@ impl<D: WritableBlockDevice> Fat32<D> {
         let needed = lfn_count + 1;
         let offsets = self.find_free_entries(parent, needed)?;
 
+        self.volume.class = WriteClass::Dir;
         let checksum = short_checksum_bytes(&short);
         for (offset_index, sequence) in (1..=lfn_count).rev().enumerate() {
             let entry = build_lfn_entry(
@@ -1003,6 +1260,12 @@ impl<D: WritableBlockDevice> Fat32<D> {
             // timestamps survive. The case flags described the old short name.
             entry[11..].copy_from_slice(&template[11..]);
             entry[12] = 0;
+        } else if let Some((day, time)) = self.now().and_then(fat_timestamp) {
+            entry[14..16].copy_from_slice(&time.to_le_bytes());
+            entry[16..18].copy_from_slice(&day.to_le_bytes());
+            entry[18..20].copy_from_slice(&day.to_le_bytes());
+            entry[22..24].copy_from_slice(&time.to_le_bytes());
+            entry[24..26].copy_from_slice(&day.to_le_bytes());
         }
         self.volume.write_bytes(short_offset, &entry)?;
 
@@ -1015,6 +1278,7 @@ impl<D: WritableBlockDevice> Fat32<D> {
     }
 
     fn delete_entry_set(&mut self, parent: NodeId, location: EntryLocation) -> Result<(), FsError> {
+        self.volume.class = WriteClass::Dir;
         let start = self
             .nodes
             .get(parent)
@@ -1050,7 +1314,8 @@ impl<D: WritableBlockDevice> Fat32<D> {
     fn create_file_node(&mut self, parent: NodeId, name: &str) -> Result<NodeId, FsError> {
         self.validate_new_name(parent, name, 0)?;
         let location = self.write_entry_set(parent, name, 0x20, 0, 0, None)?;
-        self.nodes
+        let node = self
+            .nodes
             .add(
                 parent.0,
                 String::from(name),
@@ -1061,14 +1326,29 @@ impl<D: WritableBlockDevice> Fat32<D> {
                 false,
                 Some(location),
             )
-            .map(NodeId)
+            .map(NodeId)?;
+        self.stamp_new_node(node, attr::ARCHIVE);
+        Ok(node)
+    }
+
+    /// Fills in a node's facts to match the entry just written.
+    fn stamp_new_node(&mut self, node: NodeId, attributes: u8) {
+        let now = self.now().filter(|&now| fat_timestamp(now).is_some());
+        if let Some(entry) = self.nodes.get_mut(node) {
+            entry.attributes = attributes;
+            entry.times = NodeTimes {
+                created: now,
+                modified: now,
+                accessed: now,
+            };
+        }
     }
 
     fn create_dir_node(&mut self, parent: NodeId, name: &str) -> Result<NodeId, FsError> {
         // A directory must leave room for its own children: one at the limit
         // could not be walked on the next mount.
         self.validate_new_name(parent, name, 1)?;
-        let cluster = self.alloc_cluster()?;
+        let cluster = self.alloc_cluster(true)?;
         let parent_cluster = if parent == NodeId::ROOT {
             0
         } else {
@@ -1079,10 +1359,24 @@ impl<D: WritableBlockDevice> Fat32<D> {
         };
 
         let base = self.cluster_offset(cluster)?;
-        let dot = build_short_entry(&dot_name(true), 0x10, cluster, 0);
-        let dotdot = build_short_entry(&dot_name(false), 0x10, parent_cluster, 0);
+        let mut dot = build_short_entry(&dot_name(true), 0x10, cluster, 0);
+        let mut dotdot = build_short_entry(&dot_name(false), 0x10, parent_cluster, 0);
+        if let Some((day, time)) = self.now().and_then(fat_timestamp) {
+            for entry in [&mut dot, &mut dotdot] {
+                entry[14..16].copy_from_slice(&time.to_le_bytes());
+                entry[16..18].copy_from_slice(&day.to_le_bytes());
+                entry[18..20].copy_from_slice(&day.to_le_bytes());
+                entry[22..24].copy_from_slice(&time.to_le_bytes());
+                entry[24..26].copy_from_slice(&day.to_le_bytes());
+            }
+        }
+        // The new directory is unreachable until its entry lands.
+        self.volume.class = WriteClass::Data;
         self.volume.write_bytes(base, &dot)?;
         self.volume.write_bytes(base + 32, &dotdot)?;
+        // Durable before an entry can refer to it, for the same reason as when a
+        // directory grows.
+        self.volume.commit()?;
 
         let location = match self.write_entry_set(parent, name, 0x10, cluster, 0, None) {
             Ok(location) => location,
@@ -1092,7 +1386,8 @@ impl<D: WritableBlockDevice> Fat32<D> {
             }
         };
 
-        self.nodes
+        let node = self
+            .nodes
             .add(
                 parent.0,
                 String::from(name),
@@ -1103,7 +1398,9 @@ impl<D: WritableBlockDevice> Fat32<D> {
                 false,
                 Some(location),
             )
-            .map(NodeId)
+            .map(NodeId)?;
+        self.stamp_new_node(node, 0);
+        Ok(node)
     }
 
     fn update_dotdot(&mut self, node: NodeId, parent_cluster: u32) -> Result<(), FsError> {
@@ -1114,6 +1411,7 @@ impl<D: WritableBlockDevice> Fat32<D> {
         let base = self.cluster_offset(start)?;
         let mut buffer = try_zeroed(self.cluster_size)?;
         self.read_cluster(start, &mut buffer)?;
+        self.volume.class = WriteClass::Dir;
         for (index, entry) in buffer.chunks_exact(32).enumerate() {
             if entry[0] == b'.' && entry[1] == b'.' {
                 let offset = base + index as u64 * 32;
@@ -1148,9 +1446,11 @@ impl<D: WritableBlockDevice> Fat32<D> {
         self.delete_entry_set(NodeId(parent), location.ok_or(FsError::Corrupt)?)?;
         self.nodes.remove(node)?;
         if start_cluster >= 2 {
+            // Durably gone before its clusters can be handed to anything else.
+            self.volume.commit()?;
             self.free_chain(start_cluster)?;
         }
-        self.update_fsinfo()
+        Ok(())
     }
 
     fn rename_node(
@@ -1208,6 +1508,9 @@ impl<D: WritableBlockDevice> Fat32<D> {
             size_field,
             Some(template),
         )?;
+        // The new name durably exists before the old one goes. A crash in
+        // between leaves two names, which `check` resolves, and never none.
+        self.volume.commit()?;
         self.delete_entry_set(NodeId(old_parent), old_location)?;
 
         if kind == EntryKind::Directory {
@@ -1259,7 +1562,433 @@ impl<D: WritableBlockDevice> WritableFileSystem for Fat32<D> {
     }
 
     fn flush(&mut self) -> Result<(), FsError> {
-        self.volume.flush()
+        if self.volume.is_read_only() {
+            return Ok(());
+        }
+        if self.dirty && !self.damaged {
+            self.update_fsinfo()?;
+            // Everything lands first: only then is the volume clean.
+            self.volume.commit()?;
+            self.write_dirty_flags(false)?;
+            self.volume.commit()?;
+            self.dirty = false;
+            return Ok(());
+        }
+        self.volume.commit()
+    }
+
+    fn set_attributes(&mut self, node: NodeId, attributes: u8) -> Result<(), FsError> {
+        if node == NodeId::ROOT {
+            return Err(FsError::Unsupported);
+        }
+        self.ensure_writable()?;
+        let attributes = attributes & NODE_ATTRIBUTES;
+        let entry = self.nodes.get(node).ok_or(FsError::NotFound)?;
+        let location = entry.entry.ok_or(FsError::Corrupt)?;
+        self.volume.class = WriteClass::Dir;
+        // The directory bit is the entry's type, and stays.
+        let current = self.volume.read_array::<1>(location.primary + 11)?[0];
+        self.volume
+            .write_bytes(location.primary + 11, &[(current & !NODE_ATTRIBUTES) | attributes])?;
+        if let Some(entry) = self.nodes.get_mut(node) {
+            entry.attributes = attributes;
+        }
+        Ok(())
+    }
+
+    fn set_times(&mut self, node: NodeId, times: NodeTimes) -> Result<(), FsError> {
+        if node == NodeId::ROOT {
+            return Err(FsError::Unsupported);
+        }
+        self.ensure_writable()?;
+        let location = self
+            .nodes
+            .get(node)
+            .ok_or(FsError::NotFound)?
+            .entry
+            .ok_or(FsError::Corrupt)?;
+        self.volume.class = WriteClass::Dir;
+        let mut stored = self.nodes.get(node).ok_or(FsError::NotFound)?.times;
+        if let Some((day, time)) = times.created.and_then(fat_timestamp) {
+            self.volume.write_u16_le(location.primary + 14, time)?;
+            self.volume.write_u16_le(location.primary + 16, day)?;
+            stored.created = times.created;
+        }
+        if let Some((day, time)) = times.modified.and_then(fat_timestamp) {
+            self.volume.write_u16_le(location.primary + 22, time)?;
+            self.volume.write_u16_le(location.primary + 24, day)?;
+            stored.modified = times.modified;
+        }
+        if let Some((day, _)) = times.accessed.and_then(fat_timestamp) {
+            self.volume.write_u16_le(location.primary + 18, day)?;
+            stored.accessed = times.accessed;
+        }
+        if let Some(entry) = self.nodes.get_mut(node) {
+            entry.times = stored;
+        }
+        Ok(())
+    }
+
+    fn set_time_source(&mut self, now: TimeSource) {
+        self.now = Some(now);
+    }
+
+    fn check(&mut self) -> Result<CheckReport, FsError> {
+        if !self.dirty || self.volume.is_read_only() {
+            return Ok(CheckReport::default());
+        }
+        self.repair()
+    }
+}
+
+/// The mount-time check. See the module docs for what a crash can leave.
+impl<D: WritableBlockDevice> Fat32<D> {
+    fn repair(&mut self) -> Result<CheckReport, FsError> {
+        let mut report = CheckReport {
+            was_dirty: true,
+            ..CheckReport::default()
+        };
+        // Damage found at mount isn't a crash's doing, and repairing around what
+        // isn't understood could destroy what can still be read.
+        if self.damaged {
+            return Err(FsError::Corrupt);
+        }
+
+        self.copy_primary_fat()?;
+        for node in core::mem::take(&mut self.suspects) {
+            self.drop_entry(NodeId(node), &mut report)?;
+        }
+
+        let mut used = ClusterSet::new(self.cluster_count)?;
+        // Directories claim their clusters first: their chains were walked at
+        // mount, and a file sharing one with them is the one that has to give.
+        let limit = self.nodes.id_limit() as u32;
+        for id in 0..limit {
+            let node = NodeId(id);
+            if self.nodes.kind(node) == Some(EntryKind::Directory) {
+                let start = self.nodes.get(node).ok_or(FsError::Corrupt)?.start_cluster;
+                self.claim_directory(start, &mut used)?;
+                self.fix_directory(node, &mut report)?;
+            }
+        }
+        for id in 0..limit {
+            let node = NodeId(id);
+            if self.nodes.kind(node) == Some(EntryKind::File) {
+                self.fix_file(node, &mut used, &mut report)?;
+            }
+        }
+
+        report.lost_clusters = self.free_unclaimed(&used)?;
+        self.free_count = Some(self.count_free()?);
+        self.next_free = 2;
+        self.update_fsinfo()?;
+        self.volume.commit()?;
+        self.write_dirty_flags(false)?;
+        self.volume.commit()?;
+        self.dirty = false;
+        Ok(report)
+    }
+
+    /// Makes every mirror match the first, which a crash can leave differing.
+    fn copy_primary_fat(&mut self) -> Result<(), FsError> {
+        if self.active_fat.is_some() || self.fat_count < 2 {
+            return Ok(());
+        }
+        self.volume.class = WriteClass::Fat;
+        let mut primary = try_zeroed(CHECK_CHUNK)?;
+        let mut mirror = try_zeroed(CHECK_CHUNK)?;
+        let mut offset = 0u64;
+        while offset < self.fat_size_bytes {
+            let take = (self.fat_size_bytes - offset).min(CHECK_CHUNK as u64) as usize;
+            self.volume
+                .read_bytes(self.fat_start + offset, &mut primary[..take])?;
+            for copy in 1..self.fat_count as u64 {
+                let at = self.fat_start + copy * self.fat_size_bytes + offset;
+                self.volume.read_bytes(at, &mut mirror[..take])?;
+                if primary[..take] != mirror[..take] {
+                    self.volume.write_bytes(at, &primary[..take])?;
+                }
+            }
+            offset += take as u64;
+        }
+        Ok(())
+    }
+
+    fn drop_entry(&mut self, node: NodeId, report: &mut CheckReport) -> Result<(), FsError> {
+        let entry = self.nodes.get(node).ok_or(FsError::NotFound)?;
+        let parent = entry.parent.ok_or(FsError::Corrupt)?;
+        let location = entry.entry.ok_or(FsError::Corrupt)?;
+        self.delete_entry_set(NodeId(parent), location)?;
+        self.nodes.remove(node)?;
+        report.removed_entries += 1;
+        Ok(())
+    }
+
+    fn claim_directory(&self, start: u32, used: &mut ClusterSet) -> Result<(), FsError> {
+        let mut cluster = start;
+        let mut walked = 0usize;
+        loop {
+            used.insert(cluster);
+            walked += 1;
+            if walked > self.cluster_count as usize {
+                return Err(FsError::Corrupt);
+            }
+            match self.next_cluster(cluster)? {
+                Some(next) => cluster = next,
+                None => return Ok(()),
+            }
+        }
+    }
+
+    /// Clears orphaned long-name entries, and points `..` at the real parent,
+    /// which an interrupted move of a directory can leave wrong.
+    fn fix_directory(&mut self, node: NodeId, report: &mut CheckReport) -> Result<(), FsError> {
+        let entry = self.nodes.get(node).ok_or(FsError::Corrupt)?;
+        let start = entry.start_cluster;
+        if let Some(parent) = entry.parent {
+            let parent_cluster = if parent == NodeId::ROOT.0 {
+                0
+            } else {
+                self.nodes
+                    .get(NodeId(parent))
+                    .ok_or(FsError::Corrupt)?
+                    .start_cluster
+            };
+            self.fix_dotdot(start, parent_cluster)?;
+        }
+
+        let mut buffer = try_zeroed(self.cluster_size)?;
+        let mut cluster = start;
+        let mut pending: Vec<u64> = Vec::new();
+        let mut checksum = 0u8;
+        // Sequence number the next fragment must carry. Fragments count down.
+        let mut expected = 0u8;
+        let mut walked = 0usize;
+        'walk: loop {
+            self.read_cluster(cluster, &mut buffer)?;
+            let base = self.cluster_offset(cluster)?;
+            for (index, slot) in buffer.chunks_exact(32).enumerate() {
+                let offset = base + index as u64 * 32;
+                if slot[0] == 0x00 {
+                    self.clear_past_end(cluster, offset)?;
+                    break 'walk;
+                }
+                if slot[0] == 0xe5 {
+                    self.clear_orphans(&mut pending, report)?;
+                    continue;
+                }
+                if slot[11] & 0x3f == 0x0f {
+                    let order = slot[0] & 0x1f;
+                    if slot[0] & 0x40 != 0 {
+                        // A new name starts: anything pending had no owner.
+                        self.clear_orphans(&mut pending, report)?;
+                        checksum = slot[13];
+                        expected = order.saturating_sub(1);
+                        try_push(&mut pending, offset)?;
+                    } else if !pending.is_empty()
+                        && slot[13] == checksum
+                        && order == expected
+                        && expected > 0
+                    {
+                        expected -= 1;
+                        try_push(&mut pending, offset)?;
+                    } else {
+                        // Out of sequence: it can't be part of any name.
+                        self.clear_orphans(&mut pending, report)?;
+                        try_push(&mut pending, offset)?;
+                        self.clear_orphans(&mut pending, report)?;
+                    }
+                    continue;
+                }
+                if !pending.is_empty() && (expected != 0 || short_checksum(slot) != checksum) {
+                    self.clear_orphans(&mut pending, report)?;
+                }
+                pending.clear();
+            }
+            walked += 1;
+            if walked > self.cluster_count as usize {
+                return Err(FsError::Corrupt);
+            }
+            match self.next_cluster(cluster)? {
+                Some(next) => cluster = next,
+                None => break,
+            }
+        }
+        self.clear_orphans(&mut pending, report)
+    }
+
+    /// Zeroes a directory past its end marker. An earlier block that didn't land
+    /// reads as the end, while later ones may hold entries. Nothing sees those
+    /// today, but they'd come alive when the directory next grew over the marker,
+    /// pointing at clusters long since reused.
+    fn clear_past_end(&mut self, cluster: u32, from: u64) -> Result<(), FsError> {
+        let mut buffer = try_zeroed(self.cluster_size)?;
+        let mut cluster = cluster;
+        let mut first = from;
+        let mut walked = 0usize;
+        loop {
+            self.read_cluster(cluster, &mut buffer)?;
+            let base = self.cluster_offset(cluster)?;
+            let within = (first - base) as usize;
+            if buffer[within..].iter().any(|&byte| byte != 0) {
+                buffer[within..].fill(0);
+                self.volume.class = WriteClass::Dir;
+                self.volume.write_bytes(first, &buffer[within..])?;
+            }
+            walked += 1;
+            if walked > self.cluster_count as usize {
+                return Err(FsError::Corrupt);
+            }
+            match self.next_cluster(cluster)? {
+                Some(next) => {
+                    cluster = next;
+                    first = self.cluster_offset(next)?;
+                }
+                None => return Ok(()),
+            }
+        }
+    }
+
+    fn clear_orphans(
+        &mut self,
+        pending: &mut Vec<u64>,
+        report: &mut CheckReport,
+    ) -> Result<(), FsError> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        self.volume.class = WriteClass::Dir;
+        for &offset in pending.iter() {
+            self.volume.write_bytes(offset, &[0xe5])?;
+        }
+        report.orphan_names += 1;
+        pending.clear();
+        Ok(())
+    }
+
+    fn fix_dotdot(&mut self, start: u32, parent_cluster: u32) -> Result<(), FsError> {
+        let base = self.cluster_offset(start)?;
+        let entry = self.volume.read_array::<32>(base + 32)?;
+        if entry[0] != b'.' || entry[1] != b'.' {
+            return Ok(());
+        }
+        let stored = (entry_u16(&entry, 20) as u32) << 16 | entry_u16(&entry, 26) as u32;
+        if stored != parent_cluster {
+            self.volume.class = WriteClass::Dir;
+            self.volume
+                .write_u16_le(base + 32 + 20, (parent_cluster >> 16) as u16)?;
+            self.volume
+                .write_u16_le(base + 32 + 26, (parent_cluster & 0xffff) as u16)?;
+        }
+        Ok(())
+    }
+
+    /// Makes one file's entry and chain agree, and claims its clusters.
+    fn fix_file(
+        &mut self,
+        node: NodeId,
+        used: &mut ClusterSet,
+        report: &mut CheckReport,
+    ) -> Result<(), FsError> {
+        let entry = self.nodes.get(node).ok_or(FsError::Corrupt)?;
+        let start = entry.start_cluster;
+        let size = entry.size;
+        if start < 2 {
+            if size != 0 {
+                self.set_recovered(node, 0, 0)?;
+                report.truncated_files += 1;
+            }
+            return Ok(());
+        }
+        // Already somebody's: the second name of an interrupted rename. Both
+        // names hold the same bytes, so dropping this one loses nothing.
+        if used.contains(start) {
+            return self.drop_entry(node, report);
+        }
+        // A chain that starts on a free cluster has nothing behind it.
+        if self.read_fat_entry(start)? == 0 {
+            self.set_recovered(node, 0, 0)?;
+            report.truncated_files += 1;
+            return Ok(());
+        }
+
+        let cluster_size = self.cluster_size as u64;
+        let needed = size.div_ceil(cluster_size);
+        let mut length = 0u64;
+        let mut cluster = start;
+        let mut last;
+        // Walk as far as the size needs, stopping at anything that isn't a link
+        // or isn't this file's to use.
+        loop {
+            used.insert(cluster);
+            last = cluster;
+            length += 1;
+            if length == needed.max(1) {
+                break;
+            }
+            let value = self.read_fat_entry(cluster)?;
+            if value == 0 || value >= FAT_EOC_MIN || value == FAT_BAD || value < 2 {
+                break;
+            }
+            if value >= self.max_cluster() || used.contains(value) {
+                break;
+            }
+            cluster = value;
+        }
+
+        if length < needed {
+            // Keep what's there; the file ends where its chain does.
+            self.set_recovered(node, start, length * cluster_size)?;
+            report.truncated_files += 1;
+        }
+        // Whatever followed `last` is not this file's, and the sweep frees it.
+        if self.read_fat_entry(last)? < FAT_EOC_MIN {
+            self.write_fat_entry(last, FAT_EOC_MIN)?;
+            if length >= needed {
+                report.truncated_files += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn set_recovered(&mut self, node: NodeId, start: u32, size: u64) -> Result<(), FsError> {
+        let location = self
+            .nodes
+            .get(node)
+            .and_then(|entry| entry.entry)
+            .ok_or(FsError::Corrupt)?;
+        self.volume.class = WriteClass::Dir;
+        self.volume
+            .write_u16_le(location.primary + 20, (start >> 16) as u16)?;
+        self.volume
+            .write_u16_le(location.primary + 26, (start & 0xffff) as u16)?;
+        self.volume
+            .write_u32_le(location.primary + 28, size as u32)?;
+        if let Some(entry) = self.nodes.get_mut(node) {
+            entry.start_cluster = start;
+            entry.size = size;
+            entry.valid_size = size;
+            entry.data_length = size;
+            entry.tail = None;
+            entry.chain_changed();
+        }
+        Ok(())
+    }
+
+    /// Frees every allocated cluster nothing claimed. Bad clusters stay marked.
+    fn free_unclaimed(&mut self, used: &ClusterSet) -> Result<u32, FsError> {
+        let mut lost = 0u32;
+        for cluster in 2..self.max_cluster() {
+            if used.contains(cluster) {
+                continue;
+            }
+            let value = self.read_fat_entry(cluster)?;
+            if value != 0 && value != FAT_BAD {
+                self.write_fat_entry(cluster, 0)?;
+                lost += 1;
+            }
+        }
+        Ok(lost)
     }
 }
 
@@ -1274,6 +2003,32 @@ impl<D: BlockDevice> FileSystem for Fat32<D> {
 
     fn is_damaged(&self) -> bool {
         self.damaged
+    }
+
+    fn attributes(&self, node: NodeId) -> u8 {
+        self.nodes.get(node).map_or(0, |entry| entry.attributes)
+    }
+
+    fn times(&self, node: NodeId) -> NodeTimes {
+        self.nodes.get(node).map_or(NodeTimes::NONE, |entry| entry.times)
+    }
+
+    fn is_read_only(&self) -> bool {
+        self.damaged || self.volume.is_read_only()
+    }
+
+    fn stats(&self) -> VolumeStats {
+        let free = match self.free_count {
+            Some(free) => free,
+            None => self.count_free().unwrap_or(0),
+        };
+        VolumeStats {
+            block_size: self.cluster_size as u64,
+            total_blocks: self.cluster_count as u64,
+            free_blocks: free as u64,
+            read_only: self.damaged || self.volume.is_read_only(),
+            kind: "fat32",
+        }
     }
 
     fn kind(&self, node: NodeId) -> Option<EntryKind> {
@@ -1320,7 +2075,7 @@ struct DirTask {
     depth: usize,
 }
 
-struct LfnState {
+pub(crate) struct LfnState {
     units: [u16; MAX_PATH_NAME_UNITS],
     len: usize,
     checksum: Option<u8>,
@@ -1332,7 +2087,7 @@ struct LfnState {
 }
 
 impl LfnState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             units: [0xffff; MAX_PATH_NAME_UNITS],
             len: 0,
@@ -1344,7 +2099,7 @@ impl LfnState {
         }
     }
 
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.len = 0;
         self.checksum = None;
         self.active = false;
@@ -1353,7 +2108,7 @@ impl LfnState {
         self.expected = 0;
     }
 
-    fn push(&mut self, entry: &[u8], offset: u64) {
+    pub(crate) fn push(&mut self, entry: &[u8], offset: u64) {
         let order = (entry[0] & 0x1f) as usize;
         if order == 0 {
             self.active = false;
@@ -1405,7 +2160,7 @@ impl LfnState {
         }
     }
 
-    fn finish(
+    pub(crate) fn finish(
         &self,
         short_entry: &[u8],
         short: &Option<String>,
@@ -1458,7 +2213,7 @@ fn short_checksum(entry: &[u8]) -> u8 {
     sum
 }
 
-fn short_name(entry: &[u8]) -> Option<String> {
+pub(crate) fn short_name(entry: &[u8]) -> Option<String> {
     let mut base = [0u8; 8];
     base.copy_from_slice(&entry[..8]);
     if base[0] == 0x05 {

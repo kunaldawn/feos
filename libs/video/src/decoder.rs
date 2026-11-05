@@ -11,7 +11,7 @@ use crate::h264::{self, Framing, H264Stream};
 use crate::index::{DecoderLimits, Index, FLAG_KEY};
 use crate::matroska::Compression;
 use crate::pixel::{matrix_for, YuvCoefficients};
-use crate::{avi, flv, gif, matroska, mjpeg, mp4, raw, rle};
+use crate::{avi, flv, gif, matroska, mjpeg, mp4, mpeg1, raw, rle};
 use crate::{detect, info, ContainerFormat, DecodedFrame, VideoInfo};
 
 /// Frame rate assumed for streams with no timing at all.
@@ -35,6 +35,7 @@ enum State {
     H264(H264Stream),
     Gif(GifStream),
     Rle(RleStream),
+    Mpeg1(mpeg1::Mpeg1Stream),
     /// No decoder for this codec. The file can still be inspected.
     None,
 }
@@ -95,7 +96,15 @@ impl<S: AsRef<[u8]>> VideoDecoder<S> {
         let mut palette = 0..0;
         let mut configs = Vec::new();
         let mut uniform = false;
+        let mut mpeg1_stream = None;
         let mut index = match format {
+            ContainerFormat::Mpeg1 => {
+                uniform = true;
+                let stream = mpeg1::Mpeg1Stream::open(input, &limits)?;
+                let index = stream.build_index(input.len(), &limits)?;
+                mpeg1_stream = Some(stream);
+                index
+            }
             ContainerFormat::Gif => gif::build_index(input, &limits)?,
             ContainerFormat::Mp4 => {
                 let (index, config) = mp4::build_index(input, &limits)?;
@@ -145,6 +154,9 @@ impl<S: AsRef<[u8]>> VideoDecoder<S> {
         }
 
         let state = match info.codec {
+            Codec::Mpeg1 if mpeg1_stream.is_some() => {
+                mpeg1_stream.map_or(State::None, State::Mpeg1)
+            }
             Codec::Gif => State::Gif(GifStream::new(info.width, info.height)?),
             Codec::H264 => {
                 let config = configs
@@ -312,6 +324,11 @@ impl<S: AsRef<[u8]>> VideoDecoder<S> {
                 match stream.advance(input, table, &mut expand, index, budget, out)? {
                     Some(size) => (width, height, shown) = size,
                     None => return Ok(None),
+                }
+            }
+            State::Mpeg1(stream) => {
+                if !stream.advance(input, index, budget, out)? {
+                    return Ok(None);
                 }
             }
             State::Gif(stream) => {

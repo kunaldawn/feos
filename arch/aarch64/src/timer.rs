@@ -52,9 +52,9 @@ static IDLE_HINTS: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; M
 ///
 /// The scheduler's periodic tick wakes the CPU, so this never sleeps longer
 /// than one tick. Each wait marks the current tick as idle, which lets the
-/// task manager distinguish spinning from genuinely waiting work. The kernel's
-/// clock blocks the process instead once the scheduler is running, so this only
-/// serves code with interrupts masked or running before it starts.
+/// task manager distinguish spinning from genuinely waiting work. Interrupts are
+/// unmasked during the wait, so this must not be called from a critical section.
+/// The kernel's clock blocks the process instead of using this.
 pub fn idle_ms(ms: u64) {
     let freq = frequency();
     if freq == 0 {
@@ -85,65 +85,35 @@ pub fn take_idle_hint() -> bool {
     IDLE_HINTS[cpu].swap(false, Ordering::Relaxed)
 }
 
-/// Period between scheduler ticks, in counter ticks (0 when stopped).
+/// Counter units per scheduler tick, once started.
 static PERIOD: AtomicU64 = AtomicU64::new(0);
 
-/// Starts the EL1 physical timer as a periodic tick at `hz` hertz.
+/// Starts this CPU's timer, first firing a tick from now at `hz` hertz.
 ///
 /// The interrupt is delivered on the board's non-secure EL1 timer PPI and must
 /// be enabled in the interrupt controller separately.
-pub fn start_periodic(hz: u64) {
-    let freq = frequency();
-    let period = if hz == 0 || freq == 0 {
-        0
-    } else {
-        (freq / hz).max(1)
-    };
-
+pub fn start(hz: u64) {
+    let period = (frequency() / hz.max(1)).max(1);
     PERIOD.store(period, Ordering::Relaxed);
-    if period == 0 {
-        stop();
-        return;
-    }
-
-    // Program the first deadline before unmasking the timer.
-    let deadline = ticks().wrapping_add(period);
+    arm(ticks().wrapping_add(period));
+    // SAFETY: enabling this CPU's timer has no memory effect.
     unsafe {
-        asm!("msr cntp_ctl_el0, {}", in(reg) 0u64, options(nomem, nostack));
-        asm!("msr cntp_cval_el0, {}", in(reg) deadline, options(nomem, nostack));
         asm!("msr cntp_ctl_el0, {}", in(reg) 1u64, options(nomem, nostack));
         asm!("isb", options(nomem, nostack));
     }
 }
 
-/// Reprograms the timer after a tick and returns `true` when it was running.
-pub fn tick() -> bool {
-    let period = PERIOD.load(Ordering::Relaxed);
-    if period == 0 {
-        return false;
-    }
-
-    // Advance the deadline by exactly one period, so the time spent reaching
-    // this handler doesn't accumulate as drift. After a long stall, skip the
-    // missed ticks instead of firing once per period until caught up.
-    let previous: u64;
-    // SAFETY: reading the timer's compare value has no side effects.
-    unsafe { asm!("mrs {}, cntp_cval_el0", out(reg) previous, options(nomem, nostack)) };
-    let deadline = feos_hal::next_deadline(previous, period, ticks());
-
-    // Writing CVAL clears the condition and schedules the next deadline.
-    unsafe {
-        asm!("msr cntp_cval_el0, {}", in(reg) deadline, options(nomem, nostack));
-        asm!("isb", options(nomem, nostack));
-    }
-    true
+/// Counter units per scheduler tick.
+pub fn period() -> u64 {
+    PERIOD.load(Ordering::Relaxed)
 }
 
-/// Stops the periodic tick and masks the timer interrupt.
-pub fn stop() {
-    PERIOD.store(0, Ordering::Relaxed);
+/// Has this CPU's timer interrupt fire at counter value `deadline`, replacing what
+/// was set before. One that's already passed fires at once.
+pub fn arm(deadline: u64) {
+    // SAFETY: writing the compare value clears the condition and sets the next one.
     unsafe {
-        asm!("msr cntp_ctl_el0, {}", in(reg) 0u64, options(nomem, nostack));
+        asm!("msr cntp_cval_el0, {}", in(reg) deadline, options(nomem, nostack));
         asm!("isb", options(nomem, nostack));
     }
 }

@@ -4,7 +4,9 @@ version: 1.1.0
 entry: files
 category: System
 description: Browse, search and preview files
-icon: icon.bmp
+icon: icon.ico
+icon_medium: icon-32.ico
+icon_small: icon-16.ico
 window:
   width: 760
   height: 520

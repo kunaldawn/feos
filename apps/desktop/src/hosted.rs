@@ -1,9 +1,9 @@
 //! Windowed front ends for commands that otherwise only print to the console.
 //!
-//! `info` and `help` write to serial, which is fine at the shell and invisible
-//! from the desktop. Without a way to capture a process's output, the Start
-//! menu's entries for them open these apps instead. The shell commands are
-//! untouched: [`Registry`] shadows them only for desktop launches.
+//! The Start menu's entries for `info` and `help` open these apps, which suit a
+//! window better than the same text in a Terminal. Anything else that only prints
+//! opens in a Terminal window. The shell commands are untouched: [`Registry`]
+//! shadows them only for desktop launches.
 
 use core::fmt::Write as _;
 use core::sync::atomic::{AtomicI32, Ordering};
@@ -194,7 +194,9 @@ impl App for SystemInfo {
         draw_info(&mut output, context.platform, width, height);
         WindowFrame::Continue
     }
-    fn run(&self, _context: &mut Context<'_>) {}
+    fn run(&self, _context: &mut Context<'_>) -> i32 {
+        0
+    }
 }
 
 /// `help`, in a window.
@@ -253,7 +255,9 @@ impl App for ConsoleHelp {
         }
         WindowFrame::Continue
     }
-    fn run(&self, _context: &mut Context<'_>) {}
+    fn run(&self, _context: &mut Context<'_>) -> i32 {
+        0
+    }
 }
 
 #[cfg(test)]

@@ -4,7 +4,9 @@ version: 1.0.0
 entry: splash
 category: Utilities
 description: Redraw the feos boot splash
-icon: icon.bmp
+icon: icon.ico
+icon_medium: icon-32.ico
+icon_small: icon-16.ico
 window:
   width: 640
   height: 480

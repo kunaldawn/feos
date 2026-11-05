@@ -1,0 +1,10 @@
+[package]
+name = "feos-driver-pl031"
+description = "ARM PL031 real-time clock driver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+feos-hal = { workspace = true }

@@ -1,14 +1,22 @@
 //! A Bash-compatible shell language for FEOS.
 //!
-//! The library owns the parser, expansion engine, builtins and interactive
-//! line editor. It does not know about the app registry: the embedding
-//! application implements [`Host`] to launch external commands.
+//! The library owns the parser, expansion engine, builtins, interactive line
+//! editor and the terminal emulator the desktop window renders. It does not know
+//! about the app registry: the embedding application implements [`Host`] to
+//! launch external commands.
 //!
-//! Supported syntax includes quoting, parameter/command/arithmetic
-//! substitution, globbing, pipelines, redirections, `&&`, `||`, `;`, `&`,
-//! variables, aliases, `if`/`for`/`while`/`until`, `break`/`continue` and
-//! `source`. Shell functions, arrays and full job control are not implemented
-//! yet.
+//! Supported syntax includes quoting (`'…'`, `"…"`, `$'…'`), parameter, command
+//! and arithmetic substitution with the full `${}` operators, globbing, `IFS`
+//! word splitting, pipelines, redirection of any descriptor including here-docs
+//! and on compound commands, `&&`, `||`, `;`, `&`, functions with `local`,
+//! `if`/`for`/`while`/`until`/`case`, `(( ))`, `[[ ]]`, subshells, aliases,
+//! `set -e -u -x -o pipefail`, `getopts`, script execution by path, and, with a
+//! [`TaskHost`], streaming pipelines, `&`, `jobs`, `fg`, `bg`, `wait` and `$!`.
+//! `trap` handles EXIT, INT and ERR. Arrays are not implemented.
+//!
+//! Commands share one address space and one kernel stack, so every recursive
+//! path is bounded and every buffer has a budget: a hostile script gets an error
+//! message, not a dead kernel thread.
 //!
 //! # Example
 //!
@@ -53,19 +61,43 @@
 
 extern crate alloc;
 
+mod arith;
+mod builtins;
+pub mod console;
 mod editor;
 mod exec;
 mod expand;
+mod fds;
+mod jobs;
 pub mod lexer;
+pub mod line;
 pub mod parser;
+#[cfg(test)]
+mod regress;
+pub mod vt;
 
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
-use feos_console::read_byte;
-use feos_coreutils::{Env, Input, Output, OverlayFs, System, Vfs, COMMANDS};
+pub use console::{ConsoleInput, ConsoleOutput};
+use feos_coreutils::{Env, Input, Output, OverlayFs, System, Var, Vfs, COMMANDS};
 use feos_fs::FileSystem;
+use parser::Command;
+
+/// Deepest nesting of functions, `eval`, `source`, subshells, command
+/// substitutions and `${...}` operands.
+pub const MAX_DEPTH: usize = 64;
+
+/// How much stack the interpreter may use before it refuses to nest further.
+/// Debug builds have far larger frames than release builds.
+const DEFAULT_STACK_LIMIT: usize = if cfg!(debug_assertions) {
+    192 * 1024
+} else {
+    88 * 1024
+};
 
 /// A byte stream bundle handed to a command.
 pub struct Io<'a> {
@@ -75,41 +107,6 @@ pub struct Io<'a> {
     pub stdout: &'a mut dyn Output,
     /// Standard error.
     pub stderr: &'a mut dyn Output,
-}
-
-/// Console input backed by the registered FEOS console.
-pub struct ConsoleInput;
-
-impl Input for ConsoleInput {
-    fn read(&mut self, out: &mut [u8]) -> usize {
-        if out.is_empty() {
-            return 0;
-        }
-        loop {
-            if let Some(byte) = read_byte() {
-                out[0] = byte;
-                return 1;
-            }
-            feos_console::wait_for_input();
-        }
-    }
-
-    fn is_terminal(&self) -> bool {
-        true
-    }
-}
-
-/// Console output backed by the registered FEOS console.
-pub struct ConsoleOutput;
-
-impl Output for ConsoleOutput {
-    fn write(&mut self, bytes: &[u8]) {
-        feos_console::write_bytes(bytes);
-    }
-
-    fn is_terminal(&self) -> bool {
-        true
-    }
 }
 
 /// External-command dispatch supplied by the embedding application.
@@ -128,10 +125,182 @@ pub trait Host {
         background: bool,
     ) -> Option<i32>;
 
+    /// Runs a user program: the file at the absolute `path`, which holds an ELF image.
+    /// `args` doesn't include its name, and `cwd` is where relative paths start from.
+    ///
+    /// Returns `None` when this host can't run programs.
+    #[allow(clippy::too_many_arguments)]
+    fn run_program(
+        &mut self,
+        _path: &str,
+        _args: &[String],
+        _cwd: &str,
+        _stdin: &mut dyn Input,
+        _stdout: &mut dyn Output,
+        _stderr: &mut dyn Output,
+        _background: bool,
+    ) -> Option<i32> {
+        None
+    }
+
     /// Names of external commands, used by tab completion.
     fn command_names(&self) -> Vec<&'static str> {
         Vec::new()
     }
+
+    /// True when an external command exists, without running it.
+    fn has_command(&self, name: &str) -> bool {
+        self.command_names().contains(&name)
+    }
+
+    /// Asked at every checkpoint whether the running command should stop. A
+    /// host returns true to deliver Ctrl-C or enforce a time limit.
+    fn poll_cancel(&mut self) -> bool {
+        false
+    }
+
+    /// Concurrent tasks, when this host has them. Without them pipelines buffer
+    /// and `&` runs in the foreground.
+    fn tasks(&mut self) -> Option<&mut dyn TaskHost> {
+        None
+    }
+}
+
+/// What became of a task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobStatus {
+    /// It is running.
+    Running,
+    /// Job control is holding it off the CPU.
+    Stopped,
+    /// It finished with this status.
+    Exited(i32),
+    /// There's no such task, or it finished so long ago that nobody knows.
+    Unknown,
+}
+
+/// Standard input, output and error for a task.
+pub type ConsoleStreams = (
+    alloc::boxed::Box<dyn Input + Send>,
+    alloc::boxed::Box<dyn Output + Send>,
+    alloc::boxed::Box<dyn Output + Send>,
+);
+
+/// What a host offers to run shells side by side.
+pub trait TaskHost {
+    /// A bounded pipe, read end first. `None` when none are free. A write blocks
+    /// while it is full and a read while it is empty; dropping an end closes it.
+    fn pipe(
+        &mut self,
+    ) -> Option<(
+        alloc::boxed::Box<dyn Input + Send>,
+        alloc::boxed::Box<dyn Output + Send>,
+    )>;
+
+    /// New streams on the terminal this shell belongs to.
+    fn console_streams(&mut self) -> ConsoleStreams;
+
+    /// A host for a forked shell, which is stopped through `cancel`.
+    fn fork_host(&mut self, cancel: CancelToken) -> alloc::boxed::Box<dyn Host + Send>;
+
+    /// Starts `job` on a task of its own. Its value is the exit status.
+    fn spawn(
+        &mut self,
+        name: &str,
+        background: bool,
+        job: alloc::boxed::Box<dyn FnOnce() -> i32 + Send>,
+    ) -> Option<u32>;
+
+    /// Looks at a task.
+    fn status(&mut self, pid: u32) -> JobStatus;
+
+    /// Asks a task to stop for good.
+    fn kill(&mut self, pid: u32);
+
+    /// Holds a task off the CPU, or lets it run again.
+    fn set_stopped(&mut self, pid: u32, stopped: bool);
+
+    /// Gives the CPU away for a moment, between looks at a task.
+    fn pause(&mut self);
+
+    /// System facts for forked shells.
+    fn system(&mut self) -> &'static dyn System;
+}
+
+/// A shareable handle that stops whatever the shell is running.
+///
+/// The shell polls it between commands, on each loop pass and as commands read
+/// and write. Another task or an interrupt handler can hold a clone.
+#[derive(Clone, Debug, Default)]
+pub struct CancelToken {
+    flag: Arc<AtomicBool>,
+}
+
+impl CancelToken {
+    /// Asks the shell to stop the current command.
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+    }
+
+    /// True once cancellation was requested and not yet handled.
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+
+    /// Forgets a cancellation that has been dealt with.
+    pub fn clear(&self) {
+        self.flag.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Non-local control flow travelling up through the interpreter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Flow {
+    None,
+    Break(usize),
+    Continue(usize),
+    Return(i32),
+    Exit(i32),
+    /// An error that ends the current line of input.
+    Abort(i32),
+    /// Ctrl-C, a cancel request or an expired `timeout`.
+    Interrupted,
+}
+
+impl Flow {
+    pub(crate) fn is_active(self) -> bool {
+        self != Self::None
+    }
+}
+
+/// Options changed by `set`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Options {
+    pub(crate) errexit: bool,
+    pub(crate) nounset: bool,
+    pub(crate) xtrace: bool,
+    pub(crate) noglob: bool,
+    pub(crate) noclobber: bool,
+    pub(crate) pipefail: bool,
+}
+
+/// Saved state of a subshell's parent.
+pub(crate) struct Snapshot {
+    pub(crate) env: Env,
+    pub(crate) cwd: String,
+    pub(crate) aliases: BTreeMap<String, String>,
+    pub(crate) functions: BTreeMap<String, Arc<Command>>,
+    pub(crate) params: Vec<String>,
+    pub(crate) arg0: String,
+    pub(crate) opts: Options,
+    pub(crate) locals: Vec<Vec<(String, Option<Var>)>>,
+    pub(crate) loop_depth: usize,
+    pub(crate) function_depth: usize,
+    pub(crate) source_depth: usize,
+    pub(crate) errexit_off: usize,
+    pub(crate) interactive: bool,
+    pub(crate) getopts_offset: usize,
+    pub(crate) traps: BTreeMap<String, String>,
 }
 
 /// A shell instance with its own filesystem overlay, variables and history.
@@ -148,16 +317,46 @@ pub struct Shell<'a> {
     pub last_status: i32,
     /// Platform facts for the system utilities.
     pub system: &'a dyn System,
-    exit_requested: Option<i32>,
-    return_requested: Option<i32>,
-    break_level: usize,
-    continue_level: usize,
-    loop_depth: usize,
+    pub(crate) functions: BTreeMap<String, Arc<Command>>,
+    pub(crate) params: Vec<String>,
+    pub(crate) arg0: String,
+    pub(crate) opts: Options,
+    pub(crate) flow: Flow,
+    pub(crate) exit_requested: Option<i32>,
+    pub(crate) fds: fds::FdTable,
+    pub(crate) keep_redirects: bool,
+    pub(crate) loop_depth: usize,
+    pub(crate) function_depth: usize,
+    pub(crate) source_depth: usize,
+    pub(crate) depth: usize,
+    pub(crate) stack_base: Option<usize>,
+    pub(crate) stack_limit: usize,
+    pub(crate) locals: Vec<Vec<(String, Option<Var>)>>,
+    pub(crate) errexit_off: usize,
+    pub(crate) interactive: bool,
+    pub(crate) cancel: CancelToken,
+    pub(crate) deadline: Option<u64>,
+    pub(crate) timed_out: bool,
+    pub(crate) subst_status: Option<i32>,
+    pub(crate) last_background: Option<u32>,
+    pub(crate) getopts_offset: usize,
+    pub(crate) getopts_index: usize,
+    pub(crate) random: u64,
+    pub(crate) columns: Option<usize>,
+    pub(crate) jobs: Vec<jobs::Job>,
+    pub(crate) next_job: usize,
+    pub(crate) traps: BTreeMap<String, String>,
+    pub(crate) in_trap: bool,
 }
 
 impl<'a> Shell<'a> {
     /// Creates a shell over an optional read-only base filesystem.
     pub fn new(base: Option<&'static dyn FileSystem>, system: &'a dyn System) -> Self {
+        Self::with_fs(OverlayFs::new(base), system)
+    }
+
+    /// Creates a shell over an existing filesystem view.
+    pub(crate) fn with_fs(fs: OverlayFs, system: &'a dyn System) -> Self {
         let mut aliases = BTreeMap::new();
         aliases.insert(String::from("ll"), String::from("ls -l"));
         aliases.insert(String::from("la"), String::from("ls -a"));
@@ -167,85 +366,117 @@ impl<'a> Shell<'a> {
         aliases.insert(String::from("h"), String::from("history"));
 
         let mut shell = Self {
-            fs: OverlayFs::new(base),
+            fs,
             env: Env::feos(),
             aliases,
             history: Vec::new(),
             last_status: 0,
             system,
+            functions: BTreeMap::new(),
+            params: Vec::new(),
+            arg0: String::from("sh"),
+            opts: Options::default(),
+            flow: Flow::None,
             exit_requested: None,
-            return_requested: None,
-            break_level: 0,
-            continue_level: 0,
+            fds: fds::FdTable::new(),
+            keep_redirects: false,
             loop_depth: 0,
+            function_depth: 0,
+            source_depth: 0,
+            depth: 0,
+            stack_base: None,
+            stack_limit: DEFAULT_STACK_LIMIT,
+            locals: Vec::new(),
+            errexit_off: 0,
+            interactive: true,
+            cancel: CancelToken::default(),
+            deadline: None,
+            timed_out: false,
+            subst_status: None,
+            last_background: None,
+            getopts_offset: 0,
+            getopts_index: 1,
+            random: u64::from(system.pid()).wrapping_mul(0x9e37_79b9) | 1,
+            columns: None,
+            jobs: Vec::new(),
+            next_job: 0,
+            traps: BTreeMap::new(),
+            in_trap: false,
         };
-        shell.env.set("PWD", shell.fs.cwd());
+        // What scripts assume exists. A failure only means the base image
+        // already provides the path, or does not allow it.
+        for directory in ["/tmp", "/dev"] {
+            let _ = shell.fs.create_dir(directory);
+        }
+        let _ = shell.fs.add_null_device("/dev/null");
+        let _ = shell.fs.add_zero_device("/dev/zero");
+        let cwd = shell.fs.cwd().to_string();
+        shell.env.set("PWD", &cwd);
+        shell.env.set("OPTIND", "1");
         shell
+    }
+
+    /// A handle that stops whatever this shell is running.
+    pub fn cancel_token(&self) -> CancelToken {
+        self.cancel.clone()
+    }
+
+    /// Sets how much stack the interpreter may use, for hosts that know theirs.
+    /// Leave room for a command's own frames, which the limit does not count.
+    pub fn set_stack_limit(&mut self, bytes: usize) {
+        self.stack_limit = bytes;
     }
 
     /// Lexes, parses and runs `line`, returning its status.
     pub fn execute_line(&mut self, line: &str, io: &mut Io<'_>, host: &mut dyn Host) -> i32 {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        if line.trim().is_empty() {
             return self.last_status;
         }
-
-        let tokens = match lexer::lex(line) {
-            Ok(tokens) => tokens,
-            Err(error) => {
-                let _ = io.stderr.write_str("sh: ");
-                let _ = io.stderr.write_str(error.message);
-                io.stderr.write(b"\n");
-                self.last_status = 2;
-                return 2;
-            }
-        };
-        let script = match parser::parse(&tokens) {
-            Ok(script) => script,
-            Err(error) => {
-                let _ = io.stderr.write_str("sh: syntax error: ");
-                let _ = io.stderr.write_str(error.message);
-                io.stderr.write(b"\n");
-                self.last_status = 2;
-                return 2;
-            }
-        };
-
-        let status = self.run_script(&script, io, host);
-        self.last_status = status;
-        self.env.set("?", &status.to_string());
-        status
+        self.run_text(line, io, host)
     }
 
-    /// Runs a script from a string (used by `source` and `sh script`).
+    /// Runs a script from a string, one command at a time.
     ///
-    /// The whole text is parsed at once, so multi-line `if`/`for`/`while`
-    /// constructs work exactly as they do in Bash.
+    /// Multi-line `if`/`for`/`while` constructs work exactly as they do in Bash,
+    /// and a syntax error stops the script without undoing what already ran.
     pub fn run_text(&mut self, text: &str, io: &mut Io<'_>, host: &mut dyn Host) -> i32 {
-        let tokens = match lexer::lex(text) {
-            Ok(tokens) => tokens,
-            Err(error) => {
-                let _ = io.stderr.write_str("sh: ");
-                let _ = io.stderr.write_str(error.message);
-                io.stderr.write(b"\n");
-                self.last_status = 2;
-                return 2;
-            }
-        };
-        let script = match parser::parse(&tokens) {
-            Ok(script) => script,
-            Err(error) => {
-                let _ = io.stderr.write_str("sh: syntax error: ");
-                let _ = io.stderr.write_str(error.message);
-                io.stderr.write(b"\n");
-                self.last_status = 2;
-                return 2;
-            }
-        };
+        let outermost = self.note_stack_base();
+        if outermost {
+            self.flow = Flow::None;
+            self.cancel.clear();
+            self.timed_out = false;
+            self.depth = 0;
+        }
 
-        let status = self.run_script(&script, io, host);
+        let mut status = self.run_text_inner(text, io, host);
+
+        // Whatever was still travelling up stops here, so a stray `return` or
+        // `break` cannot affect the next line.
+        match core::mem::replace(&mut self.flow, Flow::None) {
+            Flow::Exit(code) => {
+                self.exit_requested = Some(code);
+                status = code;
+                self.last_status = status;
+                if outermost {
+                    self.run_exit_trap(io, host);
+                }
+            }
+            Flow::Return(code) | Flow::Abort(code) => status = code,
+            Flow::Interrupted => {
+                self.cancel.clear();
+                status = 130;
+                self.last_status = status;
+                self.run_interrupt_trap(io, host);
+            }
+            Flow::None | Flow::Break(_) | Flow::Continue(_) => {}
+        }
+        if outermost {
+            if self.interactive {
+                self.notify_jobs(io, host);
+            }
+            self.stack_base = None;
+        }
         self.last_status = status;
-        self.env.set("?", &status.to_string());
         status
     }
 
@@ -287,6 +518,10 @@ impl<'a> Shell<'a> {
         }
         prompt
     }
+    /// The continuation prompt.
+    pub fn continuation_prompt(&self) -> String {
+        self.env.get("PS2").unwrap_or("> ").to_string()
+    }
 
     fn display_cwd(&self) -> String {
         let cwd = self.fs.cwd();
@@ -307,7 +542,10 @@ impl<'a> Shell<'a> {
 
     /// Computes a tab completion for `line` at byte offset `cursor`.
     pub fn complete(&mut self, line: &str, cursor: usize, host: &dyn Host) -> Completion {
-        let cursor = cursor.min(line.len());
+        let mut cursor = cursor.min(line.len());
+        while !line.is_char_boundary(cursor) {
+            cursor -= 1;
+        }
         let mut start = cursor;
         for (index, ch) in line[..cursor].char_indices().rev() {
             if is_word_separator(ch) {
@@ -332,16 +570,16 @@ impl<'a> Shell<'a> {
             (self.path_candidates(prefix), "")
         };
 
-        if candidates.is_empty() {
+        let Some(first) = candidates.first() else {
             return Completion {
                 line: line.to_string(),
                 cursor,
                 candidates: Vec::new(),
             };
-        }
+        };
 
         if candidates.len() == 1 {
-            let mut replacement = candidates[0].clone();
+            let mut replacement = first.clone();
             if single_suffix == " " {
                 replacement.push(' ');
             }
@@ -381,6 +619,9 @@ impl<'a> Shell<'a> {
             names.push(name.to_string());
         }
         for name in self.aliases.keys() {
+            names.push(name.clone());
+        }
+        for name in self.functions.keys() {
             names.push(name.clone());
         }
         finish_candidates(names, prefix)
@@ -428,24 +669,6 @@ impl<'a> Shell<'a> {
     pub fn take_exit_status(&mut self) -> Option<i32> {
         self.exit_requested.take()
     }
-
-    /// Runs a script read from `path`.
-    pub(crate) fn source(&mut self, path: &str, io: &mut Io<'_>, host: &mut dyn Host) -> i32 {
-        match self.fs.read_file(path) {
-            Ok(data) => {
-                let text = String::from_utf8_lossy(&data);
-                self.run_text(&text, io, host)
-            }
-            Err(error) => {
-                let _ = io.stderr.write_str("sh: ");
-                let _ = io.stderr.write_str(path);
-                let _ = io.stderr.write_str(": ");
-                let _ = io.stderr.write_str(error.text());
-                io.stderr.write(b"\n");
-                1
-            }
-        }
-    }
 }
 
 /// Result of a tab-completion request.
@@ -470,7 +693,7 @@ fn common_prefix(values: &[String]) -> String {
         return String::new();
     };
     let mut length = first.len();
-    for value in &values[1..] {
+    for value in values.iter().skip(1) {
         length = length.min(value.len());
         while !first.is_char_boundary(length) || !value.is_char_boundary(length) {
             length -= 1;
@@ -492,8 +715,10 @@ fn is_word_separator(ch: char) -> bool {
 /// Names of the shell's built-in commands.
 pub fn builtin_names() -> &'static [&'static str] {
     &[
-        "alias", "break", "cd", "clear", "command", "continue", "eval", "exit", "export", "help",
-        "history", "pwd", "read", "return", "set", "source", ".", "type", "unalias", "unset",
+        ".", ":", "alias", "bash", "bg", "break", "builtin", "cd", "clear", "command", "continue",
+        "declare", "eval", "exec", "exit", "export", "false", "fg", "getopts", "help", "history",
+        "jobs", "kill", "let", "local", "pwd", "read", "readonly", "return", "set", "sh", "shift",
+        "source", "timeout", "trap", "true", "type", "typeset", "unalias", "unset", "wait", "which",
     ]
 }
 
@@ -506,12 +731,7 @@ pub fn interactive(shell: &mut Shell<'_>, host: &mut dyn Host, io: &mut Io<'_>) 
                 if trimmed.is_empty() {
                     continue;
                 }
-                if shell.history.last() != Some(&line) {
-                    shell.history.push(line.clone());
-                    if shell.history.len() > 200 {
-                        shell.history.remove(0);
-                    }
-                }
+                remember(shell, &line);
                 shell.execute_line(&line, io, host);
                 if let Some(status) = shell.exit_requested.take() {
                     return status;
@@ -521,11 +741,19 @@ pub fn interactive(shell: &mut Shell<'_>, host: &mut dyn Host, io: &mut Io<'_>) 
                 io.stdout.write(b"\n");
                 return 0;
             }
-            editor::ReadResult::Interrupted => {
-                shell.last_status = 130;
-                shell.env.set("?", "130");
-            }
+            editor::ReadResult::Interrupted => shell.last_status = 130,
         }
+    }
+}
+
+/// Adds a line to the history unless it repeats the last one.
+pub fn remember(shell: &mut Shell<'_>, line: &str) {
+    if line.trim().is_empty() || shell.history.last().map(String::as_str) == Some(line) {
+        return;
+    }
+    shell.history.push(line.to_string());
+    if shell.history.len() > 200 {
+        shell.history.remove(0);
     }
 }
 
@@ -587,37 +815,6 @@ mod tests {
         ) -> Option<i32> {
             None
         }
-    }
-
-    static CONSOLE_INPUT: std::sync::Mutex<std::collections::VecDeque<u8>> =
-        std::sync::Mutex::new(std::collections::VecDeque::new());
-
-    fn test_console_reader() -> Option<u8> {
-        CONSOLE_INPUT.lock().unwrap().pop_front()
-    }
-
-    #[test]
-    fn the_interactive_loop_reads_the_registered_console() {
-        {
-            let mut input = CONSOLE_INPUT.lock().unwrap();
-            input.clear();
-            input.extend(b"echo hi\r\x04");
-        }
-        feos_console::set_reader(test_console_reader);
-
-        let mut shell = Shell::new(None, &NoSystem);
-        let mut host = NoHost;
-        let mut stdin = crate::ConsoleInput;
-        let mut stdout = crate::ConsoleOutput;
-        let mut stderr = crate::ConsoleOutput;
-        let mut io = Io {
-            stdin: &mut stdin,
-            stdout: &mut stdout,
-            stderr: &mut stderr,
-        };
-
-        assert_eq!(crate::interactive(&mut shell, &mut host, &mut io), 0);
-        assert_eq!(shell.history, ["echo hi"]);
     }
 
     #[test]
@@ -752,5 +949,18 @@ mod tests {
         let (status, out, _) = run(&mut shell, "help grep");
         assert_eq!(status, 0);
         assert!(out.contains("grep"));
+    }
+
+    #[test]
+    fn completion_handles_commands_paths_and_odd_cursors() {
+        let mut shell = Shell::new(None, &NoSystem);
+        run(&mut shell, "mkdir project; touch project/file.txt");
+        let done = shell.complete("cd pro", 6, &NoHost);
+        assert_eq!(done.line, "cd project/");
+        let done = shell.complete("whoam", 5, &NoHost);
+        assert_eq!(done.line, "whoami ");
+        // A cursor inside a multi-byte character must not panic.
+        let done = shell.complete("é", 1, &NoHost);
+        assert_eq!(done.line, "é");
     }
 }

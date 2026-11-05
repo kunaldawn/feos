@@ -12,7 +12,7 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use crate::block::{BlockDevice, WritableBlockDevice, MAX_BLOCK_SIZE};
+use crate::block::{BlockDevice, WritableBlockDevice, WriteClass, MAX_BLOCK_SIZE};
 use crate::FsError;
 
 /// Lines in the sector cache. Each holds one device block.
@@ -152,8 +152,10 @@ fn with_block_buffer<R>(block_size: usize, action: impl FnOnce(&mut [u8]) -> R) 
 /// Filesystem formats this crate can mount.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VolumeKind {
-    /// FAT12/16/32 with a FAT32 directory layout (only FAT32 is accepted).
+    /// FAT32, read and write.
     Fat32,
+    /// FAT12 or FAT16, read-only.
+    Fat16,
     /// Extended File Allocation Table.
     Exfat,
 }
@@ -163,6 +165,8 @@ pub(crate) struct Volume<D: BlockDevice> {
     block_size: usize,
     len: u64,
     cache: Option<SectorCache>,
+    /// What the writes in progress hold. See [`WriteClass`].
+    pub(crate) class: WriteClass,
 }
 
 impl<D: BlockDevice> Volume<D> {
@@ -180,6 +184,7 @@ impl<D: BlockDevice> Volume<D> {
             block_size,
             len,
             cache: None,
+            class: WriteClass::Data,
         })
     }
 
@@ -192,6 +197,16 @@ impl<D: BlockDevice> Volume<D> {
 
     pub(crate) fn len(&self) -> u64 {
         self.len
+    }
+
+    /// Gives the device back.
+    pub(crate) fn into_device(self) -> D {
+        self.device
+    }
+
+    /// True when the device refuses writes.
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.device.is_read_only()
     }
 
     /// Copies part of one block, through the cache when a line is free.
@@ -246,12 +261,14 @@ impl<D: BlockDevice> Volume<D> {
             let chunk = (out.len() - done).min(self.block_size - within);
 
             if within == 0 && chunk == self.block_size {
-                self.device
-                    .read_block(block, &mut out[done..done + chunk])?;
+                // Every whole block left goes to the device as one transfer.
+                let whole = (out.len() - done) / self.block_size * self.block_size;
+                self.device.read_blocks(block, &mut out[done..done + whole])?;
+                done += whole;
             } else {
                 self.read_partial(block, within, &mut out[done..done + chunk])?;
+                done += chunk;
             }
-            done += chunk;
         }
         Ok(())
     }
@@ -289,8 +306,9 @@ impl<D: WritableBlockDevice> Volume<D> {
             let chunk = (data.len() - done).min(self.block_size - within);
 
             if within == 0 && chunk == self.block_size {
-                let source = &data[done..done + chunk];
-                self.write_block_through(block, source, false)?;
+                let whole = (data.len() - done) / self.block_size * self.block_size;
+                self.write_whole_blocks(block, &data[done..done + whole])?;
+                done += whole;
             } else {
                 let block_size = self.block_size;
                 with_block_buffer(block_size, |buffer| {
@@ -298,10 +316,25 @@ impl<D: WritableBlockDevice> Volume<D> {
                     buffer[within..within + chunk].copy_from_slice(&data[done..done + chunk]);
                     self.write_block_through(block, buffer, true)
                 })?;
+                done += chunk;
             }
-            done += chunk;
         }
         Ok(())
+    }
+
+    /// Writes whole blocks as one transfer, keeping any cached copies in step.
+    fn write_whole_blocks(&mut self, start: u64, data: &[u8]) -> Result<(), FsError> {
+        let result = self.device.write_classified(start, data, self.class);
+        if let Some(cache) = self.cache.as_ref() {
+            for (index, chunk) in data.chunks_exact(self.block_size).enumerate() {
+                let block = start + index as u64;
+                match result {
+                    Ok(()) => cache.update(block, chunk, false),
+                    Err(_) => cache.invalidate(block),
+                }
+            }
+        }
+        result
     }
 
     /// Writes a block and keeps the cache in step. After a failed write the
@@ -312,7 +345,7 @@ impl<D: WritableBlockDevice> Volume<D> {
         data: &[u8],
         allocate: bool,
     ) -> Result<(), FsError> {
-        let result = self.device.write_block(block, data);
+        let result = self.device.write_classified(block, data, self.class);
         if let Some(cache) = self.cache.as_ref() {
             match result {
                 Ok(()) => cache.update(block, data, allocate),
@@ -334,8 +367,9 @@ impl<D: WritableBlockDevice> Volume<D> {
         self.write_bytes(offset, &value.to_le_bytes())
     }
 
-    pub(crate) fn flush(&mut self) -> Result<(), FsError> {
-        self.device.flush()
+    /// Makes everything written so far durable, in class order.
+    pub(crate) fn commit(&mut self) -> Result<(), FsError> {
+        self.device.commit()
     }
 }
 
@@ -351,7 +385,28 @@ pub fn detect<D: BlockDevice>(device: &D) -> Result<VolumeKind, FsError> {
 
     let signature = u16::from_le_bytes([boot[510], boot[511]]);
     if signature == 0xaa55 && boot[0] != 0 {
-        return Ok(VolumeKind::Fat32);
+        // A partition table ends in the same signature, so ask for a BPB too:
+        // a jump, and fields only a FAT boot sector would have.
+        let bytes_per_sector = u16::from_le_bytes([boot[11], boot[12]]);
+        let sectors_per_cluster = boot[13];
+        let reserved = u16::from_le_bytes([boot[14], boot[15]]);
+        let jump = boot[0] == 0xeb || boot[0] == 0xe9;
+        if jump
+            && (512..=4096).contains(&bytes_per_sector)
+            && bytes_per_sector.is_power_of_two()
+            && sectors_per_cluster.is_power_of_two()
+            && reserved != 0
+            && boot[16] != 0
+        {
+            // FAT32 says how big its FAT is in a different field. A short FAT
+            // size means an old volume.
+            let short_fat = u16::from_le_bytes([boot[22], boot[23]]);
+            return Ok(if short_fat != 0 {
+                VolumeKind::Fat16
+            } else {
+                VolumeKind::Fat32
+            });
+        }
     }
 
     // exFAT keeps a backup boot region 12 sectors in. The sector size is in the

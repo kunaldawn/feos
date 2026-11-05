@@ -4,7 +4,7 @@
 A bundle is one ZIP file (deflate) containing at least:
 
     manifest.yaml   id, name, entry, category, description, icon
-    icon.bmp        application icon (BMP, PNG, JPEG, PPM or QOI)
+    icon.ico        application icon (ICO, BMP, PNG, JPEG, PPM or QOI)
 
 Everything else in the directory is copied as a resource. The desktop detects
 bundles by their ZIP magic, not by the file suffix, and scans the application
@@ -54,6 +54,8 @@ def pack(source: pathlib.Path, output: pathlib.Path) -> None:
         and not any(part.startswith(".") for part in path.relative_to(source).parts)
         # A previous run may have left the output inside the source tree.
         and path.resolve() != target
+        # An older icon left beside the one the manifest now names.
+        and not (path.name == "icon.bmp" and "icon: icon.bmp" not in manifest.read_text(encoding="utf-8"))
     )
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in files:

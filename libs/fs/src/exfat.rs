@@ -21,10 +21,14 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::block::{BlockDevice, WritableBlockDevice};
+use crate::block::{BlockDevice, WritableBlockDevice, WriteClass};
+use crate::fat32::{fat_time_to_unix, fat_timestamp};
 use crate::tree::{sanitize_name, try_push, try_zeroed, ClusterSet, EntryLocation, NodeTable};
 use crate::volume::Volume;
-use crate::{EntryKind, FileSystem, FsError, NodeId, WritableFileSystem, MAX_PATH_DEPTH};
+use crate::{
+    attr, CheckReport, EntryKind, FileSystem, FsError, NodeId, NodeTimes, TimeSource, VolumeStats,
+    WritableFileSystem, MAX_PATH_DEPTH,
+};
 
 const EXFAT_SIGNATURE: &[u8; 8] = b"EXFAT   ";
 // exFAT FAT entries are a full 32 bits, unlike FAT32's 28.
@@ -36,6 +40,9 @@ const MAX_CLUSTER_COUNT: u32 = 0xffff_fff5;
 const MAX_NAME_UNITS: usize = 255;
 /// The specification's limit on a directory's size.
 const MAX_DIRECTORY_BYTES: u64 = 256 * 1024 * 1024;
+
+/// `VolumeFlags` bit: the volume may be inconsistent.
+const VOLUME_DIRTY: u16 = 0x0002;
 
 const ENTRY_END: u8 = 0x00;
 const ENTRY_BITMAP: u8 = 0x81;
@@ -67,6 +74,12 @@ pub struct Exfat<D: BlockDevice> {
     next_free: u32,
     dirty: bool,
     damaged: bool,
+    /// Directories that share a start with another, seen while the volume was
+    /// dirty: the two names of an interrupted rename.
+    suspects: Vec<u32>,
+    /// `(start, length)` of the bitmap and up-case table, which no node owns.
+    system_streams: Vec<(u32, u64)>,
+    now: Option<TimeSource>,
 }
 
 impl<D: BlockDevice> Exfat<D> {
@@ -168,8 +181,11 @@ impl<D: BlockDevice> Exfat<D> {
             bitmap: None,
             upcase: None,
             next_free: 2,
-            dirty: false,
+            dirty: volume_flags & VOLUME_DIRTY != 0,
             damaged: selected.used_backup,
+            suspects: Vec::new(),
+            system_streams: Vec::new(),
+            now: None,
         };
 
         let mut buffer = try_zeroed(fs.cluster_size)?;
@@ -259,6 +275,11 @@ impl<D: BlockDevice> Exfat<D> {
         let mut pending: Option<FileSet> = None;
         let mut cluster = task.cluster;
         let mut index = 0usize;
+
+        if visited.contains(cluster) && self.dirty && task.node != 0 {
+            try_push(&mut self.suspects, task.node)?;
+            return Ok(());
+        }
 
         loop {
             if !visited.insert(cluster) || index as u64 >= max_clusters {
@@ -370,11 +391,15 @@ impl<D: BlockDevice> Exfat<D> {
         }
         if let Some(entry) = self.nodes.get_mut(NodeId(node)) {
             entry.valid_size = info.valid_length.min(info.data_length);
+            entry.attributes = info.attributes as u8 & attr::SETTABLE;
+            entry.times = info.times;
         }
 
         if info.kind == EntryKind::Directory && info.data_length > 0 {
             let depth = parent.depth + 1;
-            if depth >= MAX_PATH_DEPTH || visited.contains(info.start_cluster) {
+            if visited.contains(info.start_cluster) && self.dirty {
+                try_push(&mut self.suspects, node)?;
+            } else if depth >= MAX_PATH_DEPTH || visited.contains(info.start_cluster) {
                 self.damaged = true;
             } else {
                 try_push(
@@ -596,6 +621,7 @@ impl<D: BlockDevice> Exfat<D> {
                     entry[24], entry[25], entry[26], entry[27], entry[28], entry[29], entry[30],
                     entry[31],
                 ]);
+                try_push(&mut self.system_streams, (start, length))?;
                 if start < 2 || start >= self.max_cluster() || length == 0 {
                     self.damaged = true;
                 } else if entry[0] == ENTRY_BITMAP {
@@ -761,11 +787,23 @@ impl<D: BlockDevice> Exfat<D> {
 impl<D: WritableBlockDevice> Exfat<D> {
     /// Fails when mounting found damage. Writing to a tree that's only partly
     /// understood could reuse clusters that hold skipped files.
-    fn ensure_writable(&self) -> Result<(), FsError> {
+    fn ensure_writable(&mut self) -> Result<(), FsError> {
         if self.damaged {
             return Err(FsError::Corrupt);
         }
+        if self.volume.is_read_only() {
+            return Err(FsError::ReadOnly);
+        }
+        if !self.dirty {
+            // Durable before anything else changes, or a crash looks clean.
+            self.set_dirty(true)?;
+            self.volume.commit()?;
+        }
         Ok(())
+    }
+
+    fn now(&self) -> Option<u64> {
+        self.now.and_then(|now| now())
     }
 
     fn read_fat_entry(&self, cluster: u32) -> Result<u32, FsError> {
@@ -777,6 +815,7 @@ impl<D: WritableBlockDevice> Exfat<D> {
     }
 
     fn write_fat_entry(&mut self, cluster: u32, value: u32) -> Result<(), FsError> {
+        self.volume.class = WriteClass::Fat;
         let offset = self
             .fat_start
             .checked_add(cluster as u64 * 4)
@@ -792,11 +831,12 @@ impl<D: WritableBlockDevice> Exfat<D> {
         if self.dirty == dirty {
             return Ok(());
         }
+        self.volume.class = WriteClass::Data;
         let flags = self.volume.read_u16_le(106)?;
         let flags = if dirty {
-            flags | 0x0002
+            flags | VOLUME_DIRTY
         } else {
-            flags & !0x0002
+            flags & !VOLUME_DIRTY
         };
         self.volume.write_u16_le(106, flags)?;
         if let Some(base) = self.backup_base {
@@ -824,7 +864,8 @@ impl<D: WritableBlockDevice> Exfat<D> {
             return Ok(());
         };
         let start = bitmap.start_cluster;
-        self.write_stream_at(start, false, byte as u64, &[value])
+        self.volume.class = WriteClass::Fat;
+        self.write_stream_raw(start, false, byte as u64, &[value])
     }
 
     fn alloc_cluster(&mut self) -> Result<u32, FsError> {
@@ -844,13 +885,13 @@ impl<D: WritableBlockDevice> Exfat<D> {
                 self.write_fat_entry(cluster, EXFAT_EOC)?;
                 let offset = self.cluster_offset(cluster)?;
                 let zeros = try_zeroed(self.cluster_size)?;
+                self.volume.class = WriteClass::Data;
                 self.volume.write_bytes(offset, &zeros)?;
                 self.next_free = if cluster + 1 < max_cluster {
                     cluster + 1
                 } else {
                     2
                 };
-                self.set_dirty(true)?;
                 return Ok(cluster);
             }
         }
@@ -1101,6 +1142,18 @@ impl<D: WritableBlockDevice> Exfat<D> {
         offset: u64,
         data: &[u8],
     ) -> Result<(), FsError> {
+        self.volume.class = WriteClass::Data;
+        self.write_stream_raw(start, contiguous, offset, data)
+    }
+
+    /// Writes to a stream in whatever class is current.
+    fn write_stream_raw(
+        &mut self,
+        start: u32,
+        contiguous: bool,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), FsError> {
         if data.is_empty() {
             return Ok(());
         }
@@ -1135,6 +1188,7 @@ impl<D: WritableBlockDevice> Exfat<D> {
         if from >= to {
             return Ok(());
         }
+        self.volume.class = WriteClass::Data;
         let cluster_size = self.cluster_size as u64;
         let index = u32::try_from(from / cluster_size).map_err(|_| FsError::OutOfBounds)?;
         let mut cluster = self.cluster_at(start, contiguous, index)?;
@@ -1245,12 +1299,20 @@ impl<D: WritableBlockDevice> Exfat<D> {
         if location.stream == 0 {
             return Err(FsError::Corrupt);
         }
+        self.volume.class = WriteClass::Dir;
         self.volume
             .write_bytes(location.stream + 1, &[if contiguous { 0x03 } else { 0x01 }])?;
         self.volume.write_u64_le(location.stream + 8, valid_size)?;
         self.volume.write_u32_le(location.stream + 20, start)?;
         self.volume
             .write_u64_le(location.stream + 24, data_length)?;
+        let now = self.now();
+        let stamp = now.and_then(fat_timestamp);
+        if let Some((day, time)) = stamp {
+            let value = (day as u32) << 16 | time as u32;
+            self.volume.write_u32_le(location.primary + 12, value)?;
+            self.volume.write_u32_le(location.primary + 16, value)?;
+        }
         if let Some(entry) = self.nodes.get_mut(node) {
             entry.start_cluster = start;
             entry.data_length = data_length;
@@ -1260,9 +1322,12 @@ impl<D: WritableBlockDevice> Exfat<D> {
                 entry.size = data_length;
                 entry.valid_size = valid_size;
             }
+            if stamp.is_some() {
+                entry.times.modified = now;
+                entry.times.accessed = now;
+            }
         }
-        self.update_set_checksum(parent, location)?;
-        self.set_dirty(true)
+        self.update_set_checksum(parent, location)
     }
 
     fn update_set_checksum(
@@ -1270,6 +1335,7 @@ impl<D: WritableBlockDevice> Exfat<D> {
         parent: NodeId,
         location: EntryLocation,
     ) -> Result<(), FsError> {
+        self.volume.class = WriteClass::Dir;
         let offsets = self.entry_offsets(parent, location)?;
         let mut checksum = 0u16;
         let mut entry = [0u8; 32];
@@ -1331,6 +1397,10 @@ impl<D: WritableBlockDevice> Exfat<D> {
     ) -> Result<(u32, bool, u64), FsError> {
         let new_cluster = self.alloc_cluster()?;
         let new_length = data_length.saturating_add(self.cluster_size as u64);
+        // Durably clear before the chain reaches it. Entries written into it next
+        // are a later class, and would take the clearing with them, leaving the
+        // old bytes to read as a directory.
+        self.volume.commit()?;
         if contiguous {
             if clusters == 0 {
                 return Err(FsError::Corrupt);
@@ -1440,12 +1510,19 @@ impl<D: WritableBlockDevice> Exfat<D> {
         let secondary = 1 + name_entries;
         let needed = 1 + secondary;
         let offsets = self.find_free_entries(parent, needed)?;
+        self.volume.class = WriteClass::Dir;
 
         let mut entries: Vec<[u8; 32]> = Vec::with_capacity(needed);
         let mut primary = [0u8; 32];
         primary[0] = ENTRY_FILE;
         primary[1] = secondary as u8;
         primary[4..6].copy_from_slice(&attributes.to_le_bytes());
+        if let Some((day, time)) = self.now().and_then(fat_timestamp) {
+            let value = ((day as u32) << 16 | time as u32).to_le_bytes();
+            primary[8..12].copy_from_slice(&value);
+            primary[12..16].copy_from_slice(&value);
+            primary[16..20].copy_from_slice(&value);
+        }
         if let Some([old_primary, _]) = &template {
             // A rename changes the name and nothing else: attributes and
             // timestamps survive.
@@ -1493,7 +1570,6 @@ impl<D: WritableBlockDevice> Exfat<D> {
         for (offset, entry) in offsets.iter().zip(entries.iter()) {
             self.volume.write_bytes(*offset, entry)?;
         }
-        self.set_dirty(true)?;
 
         Ok(EntryLocation {
             first: offsets[0],
@@ -1504,19 +1580,33 @@ impl<D: WritableBlockDevice> Exfat<D> {
     }
 
     fn delete_entry_set(&mut self, parent: NodeId, location: EntryLocation) -> Result<(), FsError> {
+        self.volume.class = WriteClass::Dir;
         let offsets = self.entry_offsets(parent, location)?;
         let mut entry_type = [0u8; 1];
         for offset in offsets {
             self.volume.read_bytes(offset, &mut entry_type)?;
             self.volume.write_bytes(offset, &[entry_type[0] & 0x7f])?;
         }
-        self.set_dirty(true)
+        Ok(())
+    }
+
+    /// Fills in a node's facts to match the entry just written.
+    fn stamp_new_node(&mut self, node: NodeId, attributes: u8) {
+        let now = self.now().filter(|&now| fat_timestamp(now).is_some());
+        if let Some(entry) = self.nodes.get_mut(node) {
+            entry.attributes = attributes;
+            entry.times = NodeTimes {
+                created: now,
+                modified: now,
+                accessed: now,
+            };
+        }
     }
 
     fn create_file_node(&mut self, parent: NodeId, name: &str) -> Result<NodeId, FsError> {
         self.validate_new_name(parent, name, 0)?;
         let location = self.write_entry_set(parent, name, 0x20, 0, 0, false, None)?;
-        self.nodes
+        let node = self.nodes
             .add(
                 parent.0,
                 String::from(name),
@@ -1527,7 +1617,9 @@ impl<D: WritableBlockDevice> Exfat<D> {
                 false,
                 Some(location),
             )
-            .map(NodeId)
+            .map(NodeId)?;
+        self.stamp_new_node(node, attr::ARCHIVE);
+        Ok(node)
     }
 
     fn create_dir_node(&mut self, parent: NodeId, name: &str) -> Result<NodeId, FsError> {
@@ -1535,6 +1627,8 @@ impl<D: WritableBlockDevice> Exfat<D> {
         // could not be walked on the next mount.
         self.validate_new_name(parent, name, 1)?;
         let cluster = self.alloc_cluster()?;
+        // Durable before an entry can refer to it.
+        self.volume.commit()?;
         let location = match self.write_entry_set(
             parent,
             name,
@@ -1550,7 +1644,8 @@ impl<D: WritableBlockDevice> Exfat<D> {
                 return Err(error);
             }
         };
-        self.nodes
+        let node = self
+            .nodes
             .add(
                 parent.0,
                 String::from(name),
@@ -1561,7 +1656,9 @@ impl<D: WritableBlockDevice> Exfat<D> {
                 false,
                 Some(location),
             )
-            .map(NodeId)
+            .map(NodeId)?;
+        self.stamp_new_node(node, 0);
+        Ok(node)
     }
 
     fn remove_node(&mut self, node: NodeId) -> Result<(), FsError> {
@@ -1586,6 +1683,8 @@ impl<D: WritableBlockDevice> Exfat<D> {
         // chain, not a name that points at freed clusters.
         self.delete_entry_set(NodeId(parent), location.ok_or(FsError::Corrupt)?)?;
         self.nodes.remove(node)?;
+        // Durably gone before its clusters can be handed to anything else.
+        self.volume.commit()?;
         self.free_stream(start_cluster, contiguous, data_length)
     }
 
@@ -1654,6 +1753,9 @@ impl<D: WritableBlockDevice> Exfat<D> {
             contiguous,
             Some(template),
         )?;
+        // The new name durably exists before the old one goes. A crash in
+        // between leaves two names, which `check` resolves, and never none.
+        self.volume.commit()?;
         self.delete_entry_set(NodeId(old_parent), old_location)?;
         self.nodes
             .reparent(node, new_parent, String::from(new_name), new_location)
@@ -1719,18 +1821,29 @@ impl<D: WritableBlockDevice> Exfat<D> {
         if new_size == old_size {
             return Ok(());
         }
+        // Shrinking: the entry first and durably, so that it never promises
+        // clusters that have been freed.
         if new_size == 0 {
-            self.free_stream(start_cluster, contiguous, data_length)?;
             self.update_stream_entry(node, 0, 0, false, 0)?;
+            self.volume.commit()?;
+            self.free_stream(start_cluster, contiguous, data_length)?;
             return Ok(());
         }
         let needed = new_size.div_ceil(self.cluster_size as u64) as usize;
-        let (start, contiguous) = if new_size < old_size {
-            self.truncate_chain(start_cluster, contiguous, data_length, needed)?
-        } else {
-            // No zeroing: bytes past ValidDataLength read as zero already.
-            self.ensure_chain(start_cluster, contiguous, data_length, needed)?
-        };
+        if new_size < old_size {
+            self.update_stream_entry(
+                node,
+                start_cluster,
+                new_size,
+                contiguous,
+                old_valid.min(new_size),
+            )?;
+            self.volume.commit()?;
+            self.truncate_chain(start_cluster, contiguous, data_length, needed)?;
+            return Ok(());
+        }
+        // No zeroing: bytes past ValidDataLength read as zero already.
+        let (start, contiguous) = self.ensure_chain(start_cluster, contiguous, data_length, needed)?;
         self.update_stream_entry(node, start, new_size, contiguous, old_valid.min(new_size))?;
         Ok(())
     }
@@ -1768,9 +1881,202 @@ impl<D: WritableBlockDevice> WritableFileSystem for Exfat<D> {
     }
 
     fn flush(&mut self) -> Result<(), FsError> {
-        self.set_dirty(false)?;
-        self.volume.flush()
+        if self.volume.is_read_only() {
+            return Ok(());
+        }
+        if self.dirty && !self.damaged {
+            // Everything lands first: only then is the volume clean.
+            self.volume.commit()?;
+            self.set_dirty(false)?;
+        }
+        self.volume.commit()
     }
+
+    fn set_attributes(&mut self, node: NodeId, attributes: u8) -> Result<(), FsError> {
+        if node == NodeId::ROOT {
+            return Err(FsError::Unsupported);
+        }
+        self.ensure_writable()?;
+        let attributes = attributes & attr::SETTABLE;
+        let entry = self.nodes.get(node).ok_or(FsError::NotFound)?;
+        let location = entry.entry.ok_or(FsError::Corrupt)?;
+        let parent = NodeId(entry.parent.ok_or(FsError::Unsupported)?);
+        self.volume.class = WriteClass::Dir;
+        // The directory bit is the entry's type, and stays.
+        let current = self.volume.read_u16_le(location.primary + 4)?;
+        let value = (current & !(attr::SETTABLE as u16)) | attributes as u16;
+        self.volume.write_u16_le(location.primary + 4, value)?;
+        self.update_set_checksum(parent, location)?;
+        if let Some(entry) = self.nodes.get_mut(node) {
+            entry.attributes = attributes;
+        }
+        Ok(())
+    }
+
+    fn set_times(&mut self, node: NodeId, times: NodeTimes) -> Result<(), FsError> {
+        if node == NodeId::ROOT {
+            return Err(FsError::Unsupported);
+        }
+        self.ensure_writable()?;
+        let entry = self.nodes.get(node).ok_or(FsError::NotFound)?;
+        let location = entry.entry.ok_or(FsError::Corrupt)?;
+        let parent = NodeId(entry.parent.ok_or(FsError::Unsupported)?);
+        let mut stored = entry.times;
+        self.volume.class = WriteClass::Dir;
+        let fields = [
+            (times.created, 8u64),
+            (times.modified, 12),
+            (times.accessed, 16),
+        ];
+        for (value, offset) in fields {
+            if let Some((day, time)) = value.and_then(fat_timestamp) {
+                self.volume
+                    .write_u32_le(location.primary + offset, (day as u32) << 16 | time as u32)?;
+                match offset {
+                    8 => stored.created = value,
+                    12 => stored.modified = value,
+                    _ => stored.accessed = value,
+                }
+            }
+        }
+        self.update_set_checksum(parent, location)?;
+        if let Some(entry) = self.nodes.get_mut(node) {
+            entry.times = stored;
+        }
+        Ok(())
+    }
+
+    fn set_time_source(&mut self, now: TimeSource) {
+        self.now = Some(now);
+    }
+
+    fn check(&mut self) -> Result<CheckReport, FsError> {
+        if !self.dirty || self.volume.is_read_only() {
+            return Ok(CheckReport::default());
+        }
+        self.repair()
+    }
+}
+
+/// The mount-time check, for what ordered updates can leave after a crash: lost
+/// clusters, a second name from an interrupted rename, and a file whose chain is
+/// short. A torn entry set fails its checksum at mount, flagging the volume
+/// damaged and so read-only, because guessing what it held could lose more.
+impl<D: WritableBlockDevice> Exfat<D> {
+    fn repair(&mut self) -> Result<CheckReport, FsError> {
+        let mut report = CheckReport {
+            was_dirty: true,
+            ..CheckReport::default()
+        };
+        if self.damaged {
+            return Err(FsError::Corrupt);
+        }
+        for node in core::mem::take(&mut self.suspects) {
+            self.drop_entry(NodeId(node), &mut report)?;
+        }
+
+        let mut used = ClusterSet::new(self.cluster_count)?;
+        for (start, length) in self.system_streams.clone() {
+            let clusters = length.div_ceil(self.cluster_size as u64);
+            self.claim_stream(start, false, clusters, &mut used)?;
+        }
+        self.claim_stream(self.root_cluster, false, u64::MAX, &mut used)?;
+
+        let limit = self.nodes.id_limit() as u32;
+        for id in 0..limit {
+            let node = NodeId(id);
+            if self.nodes.kind(node) == Some(EntryKind::Directory) {
+                let entry = self.nodes.get(node).ok_or(FsError::Corrupt)?;
+                if id != NodeId::ROOT.0 && entry.start_cluster >= 2 {
+                    let clusters = entry.data_length.div_ceil(self.cluster_size as u64);
+                    let (start, contiguous) = (entry.start_cluster, entry.contiguous);
+                    self.claim_stream(start, contiguous, clusters, &mut used)?;
+                }
+            }
+        }
+        for id in 0..limit {
+            let node = NodeId(id);
+            if self.nodes.kind(node) != Some(EntryKind::File) {
+                continue;
+            }
+            let entry = self.nodes.get(node).ok_or(FsError::Corrupt)?;
+            let (start, contiguous, length) =
+                (entry.start_cluster, entry.contiguous, entry.data_length);
+            if start < 2 || length == 0 {
+                continue;
+            }
+            if used.contains(start) {
+                self.drop_entry(node, &mut report)?;
+                continue;
+            }
+            let needed = length.div_ceil(self.cluster_size as u64);
+            let found = self.claim_stream(start, contiguous, needed, &mut used)?;
+            if found < needed {
+                let size = found * self.cluster_size as u64;
+                let valid = entry_valid(&self.nodes, node).min(size);
+                self.update_stream_entry(node, start, size, contiguous, valid)?;
+                report.truncated_files += 1;
+            }
+        }
+
+        // The bitmap says what's allocated, whatever the FAT holds.
+        for cluster in 2..self.max_cluster() {
+            let claimed = used.contains(cluster);
+            if self.bitmap_used(cluster) != claimed {
+                if !claimed {
+                    report.lost_clusters += 1;
+                }
+                self.set_bitmap_bit(cluster, claimed)?;
+            }
+        }
+        self.next_free = 2;
+        self.volume.commit()?;
+        self.set_dirty(false)?;
+        self.volume.commit()?;
+        Ok(report)
+    }
+
+    fn drop_entry(&mut self, node: NodeId, report: &mut CheckReport) -> Result<(), FsError> {
+        let entry = self.nodes.get(node).ok_or(FsError::NotFound)?;
+        let parent = entry.parent.ok_or(FsError::Corrupt)?;
+        let location = entry.entry.ok_or(FsError::Corrupt)?;
+        self.delete_entry_set(NodeId(parent), location)?;
+        self.nodes.remove(node)?;
+        report.removed_entries += 1;
+        Ok(())
+    }
+
+    /// Marks up to `wanted` clusters of a stream as used. Returns how many there
+    /// were, stopping at a break or at a cluster already claimed.
+    fn claim_stream(
+        &self,
+        start: u32,
+        contiguous: bool,
+        wanted: u64,
+        used: &mut ClusterSet,
+    ) -> Result<u64, FsError> {
+        let mut cluster = start;
+        let mut found = 0u64;
+        while found < wanted {
+            if cluster < 2 || cluster >= self.max_cluster() || !used.insert(cluster) {
+                break;
+            }
+            found += 1;
+            if contiguous {
+                cluster += 1;
+            } else {
+                match self.next_cluster(cluster) {
+                    Ok(Some(next)) => cluster = next,
+                    _ => break,
+                }
+            }
+        }
+        Ok(found)
+    }
+}
+
+fn entry_valid(nodes: &NodeTable, node: NodeId) -> u64 {
+    nodes.get(node).map_or(0, |entry| entry.valid_size)
 }
 
 impl<D: BlockDevice> FileSystem for Exfat<D> {
@@ -1784,6 +2090,34 @@ impl<D: BlockDevice> FileSystem for Exfat<D> {
 
     fn is_damaged(&self) -> bool {
         self.damaged
+    }
+
+    fn attributes(&self, node: NodeId) -> u8 {
+        self.nodes.get(node).map_or(0, |entry| entry.attributes)
+    }
+
+    fn times(&self, node: NodeId) -> NodeTimes {
+        self.nodes.get(node).map_or(NodeTimes::NONE, |entry| entry.times)
+    }
+
+    fn is_read_only(&self) -> bool {
+        self.damaged || self.volume.is_read_only()
+    }
+
+    fn stats(&self) -> VolumeStats {
+        let free = match &self.bitmap {
+            Some(bitmap) => (2..self.max_cluster())
+                .filter(|&cluster| !bitmap.is_used(cluster))
+                .count() as u64,
+            None => 0,
+        };
+        VolumeStats {
+            block_size: self.cluster_size as u64,
+            total_blocks: self.cluster_count as u64,
+            free_blocks: free,
+            read_only: self.damaged || self.volume.is_read_only(),
+            kind: "exfat",
+        }
     }
 
     fn kind(&self, node: NodeId) -> Option<EntryKind> {
@@ -1841,6 +2175,8 @@ struct PendingEntry {
     data_length: u64,
     contiguous: bool,
     location: EntryLocation,
+    attributes: u16,
+    times: NodeTimes,
 }
 
 /// One directory entry's contribution to a `SetChecksum`, which skips the
@@ -1855,9 +2191,24 @@ fn checksum_entry(mut checksum: u16, entry: &[u8], primary: bool) -> u16 {
     checksum
 }
 
+/// Reads a file entry's timestamps: each a FAT time in the low half of a word,
+/// and a FAT date in the high half.
+fn entry_times(entry: &[u8]) -> NodeTimes {
+    let stamp = |at: usize| {
+        let word = u32::from_le_bytes([entry[at], entry[at + 1], entry[at + 2], entry[at + 3]]);
+        fat_time_to_unix((word >> 16) as u16, word as u16)
+    };
+    NodeTimes {
+        created: stamp(8),
+        modified: stamp(12),
+        accessed: stamp(16),
+    }
+}
+
 struct FileSet {
     remaining: u8,
     attributes: u16,
+    times: NodeTimes,
     flags: u8,
     name_len: usize,
     name_hash: u16,
@@ -1881,6 +2232,7 @@ impl FileSet {
         Self {
             remaining: entry[1],
             attributes: u16::from_le_bytes([entry[4], entry[5]]),
+            times: entry_times(entry),
             flags: 0,
             name_len: 0,
             name_hash: 0,
@@ -1979,6 +2331,8 @@ impl FileSet {
                 count: self.count,
                 stream: self.stream,
             },
+            attributes: self.attributes,
+            times: self.times,
         })
     }
 }

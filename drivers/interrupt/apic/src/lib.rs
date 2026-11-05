@@ -1,17 +1,15 @@
 //! x86 Local APIC and IOAPIC driver.
 //!
-//! The board supplies the MMIO bases. [`LocalApic`] owns the per-CPU
-//! registers used for interrupt acknowledgement; [`IoApic`] routes external
-//! lines (today the PIT on GSI 2) to a vector on the boot CPU.
-//!
-//! Only the boot processor is brought up by the current port. The driver keeps
-//! the pieces a future SMP port needs (LAPIC ID, EOI, ISR scan) separate from
-//! the routing policy.
+//! The board supplies the MMIO bases and the firmware's CPU numbering.
+//! [`LocalApic`] owns the per-CPU registers used for interrupt acknowledgement
+//! and IPIs; every CPU reaches its own at the same address. [`IoApic`] routes
+//! external lines to a vector on a chosen CPU.
 
 #![cfg_attr(not(test), no_std)]
 
 use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use feos_hal::{InterruptController, IpiTarget};
 use feos_port_io::outb;
@@ -37,6 +35,8 @@ const LAPIC_ICR_HIGH: usize = 0x310;
 const ICR_PENDING: u32 = 1 << 12;
 /// ICR: level assert. Required for anything other than an INIT de-assert.
 const ICR_ASSERT: u32 = 1 << 14;
+/// ICR delivery mode: NMI.
+const ICR_DELIVERY_NMI: u32 = 0b100 << 8;
 /// ICR destination shorthand: all CPUs excluding this one.
 const ICR_ALL_OTHERS: u32 = 0b11 << 18;
 /// Polls of the delivery-status bit before sending anyway.
@@ -46,6 +46,9 @@ const ICR_POLLS: usize = 100_000;
 const IOAPIC_IOREGSEL: usize = 0x00;
 const IOAPIC_IOWIN: usize = 0x10;
 const IOAPIC_REDIRECT: u32 = 0x10;
+/// Redirection entry: level triggered, active low.
+const REDIRECT_LEVEL: u32 = 1 << 15;
+const REDIRECT_ACTIVE_LOW: u32 = 1 << 13;
 
 /// Vector reported when no in-service interrupt is visible.
 pub const SPURIOUS: u32 = 0xff;
@@ -86,7 +89,7 @@ impl LocalApic {
         self.write(LAPIC_TPR, 0);
         self.write(LAPIC_SVR, 0x100 | SPURIOUS);
 
-        // The PIT drives the scheduler tick, so mask the local timer and
+        // The architecture's timer code arms the local timer. Mask it and the
         // local interrupt lines the firmware may have left enabled.
         self.write(LAPIC_LVT_TIMER, 1 << 16);
         self.write(LAPIC_LVT_LINT0, 1 << 16);
@@ -106,8 +109,9 @@ impl LocalApic {
         self.write(LAPIC_EOI, 0);
     }
 
-    /// Sends a fixed-delivery IPI with `vector` to `target`.
-    pub fn send_ipi(&self, target: IpiTarget, vector: u8) {
+    /// Sends a fixed-delivery IPI with `vector` to the CPU with this APIC ID, or
+    /// to everyone else.
+    pub fn send_ipi(&self, target: ApicTarget, vector: u8) {
         for _ in 0..ICR_POLLS {
             if self.read(LAPIC_ICR_LOW) & ICR_PENDING == 0 {
                 break;
@@ -135,12 +139,25 @@ impl LocalApic {
     }
 }
 
+/// Who a local APIC sends an IPI to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ApicTarget {
+    /// One CPU, by APIC ID.
+    Id(u32),
+    /// Every CPU except the sender.
+    AllOthers,
+    /// Every CPU except the sender, as a non-maskable interrupt, which reaches a
+    /// CPU however its interrupts are masked. The vector is ignored.
+    AllOthersNmi,
+}
+
 /// Encodes an ICR write as its high and low halves.
-fn icr_value(target: IpiTarget, vector: u8) -> (u32, u32) {
+fn icr_value(target: ApicTarget, vector: u8) -> (u32, u32) {
     let low = vector as u32 | ICR_ASSERT;
     match target {
-        IpiTarget::Cpu(cpu) => ((cpu as u32) << 24, low),
-        IpiTarget::AllOthers => (0, low | ICR_ALL_OTHERS),
+        ApicTarget::Id(id) => (id << 24, low),
+        ApicTarget::AllOthers => (0, low | ICR_ALL_OTHERS),
+        ApicTarget::AllOthersNmi => (0, ICR_ASSERT | ICR_DELIVERY_NMI | ICR_ALL_OTHERS),
     }
 }
 
@@ -208,6 +225,21 @@ impl IoApic {
         self.write(register, low);
     }
 
+    /// Routes `gsi` to `vector` on the CPU with this APIC ID, unmasked. A level
+    /// line is taken as active low, as PCI's are.
+    pub fn route_line(&self, gsi: u32, vector: u8, destination: u32, level: bool) {
+        let register = IOAPIC_REDIRECT + gsi * 2;
+        let low = vector as u32 | if level { REDIRECT_LEVEL | REDIRECT_ACTIVE_LOW } else { 0 };
+        self.write(register + 1, destination << 24);
+        self.write(register, low);
+    }
+
+    /// The line routed to `vector`, if there is one.
+    pub fn line_for_vector(&self, vector: u8) -> Option<u32> {
+        (0..=self.max_redirection_entry())
+            .find(|gsi| self.read(IOAPIC_REDIRECT + gsi * 2) & 0xff == vector as u32)
+    }
+
     /// Masks or unmasks one redirection entry.
     pub fn set_masked(&self, gsi: u32, masked: bool) {
         let register = IOAPIC_REDIRECT + gsi * 2;
@@ -221,11 +253,16 @@ impl IoApic {
     }
 }
 
+/// CPUs a controller keeps the APIC ID of.
+pub const MAX_CPUS: usize = 8;
+
 /// Local APIC + IOAPIC pair used as the kernel's interrupt controller.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub struct ApicController {
     lapic: LocalApic,
-    ioapic: IoApic,
+    ioapic_base: AtomicUsize,
+    /// APIC ID of each logical CPU.
+    apic_ids: [AtomicU32; MAX_CPUS],
 }
 
 impl ApicController {
@@ -233,11 +270,33 @@ impl ApicController {
     pub const fn new(lapic_base: usize, ioapic_base: usize) -> Self {
         Self {
             lapic: LocalApic::new(lapic_base),
-            ioapic: IoApic::new(ioapic_base),
+            ioapic_base: AtomicUsize::new(ioapic_base),
+            apic_ids: [const { AtomicU32::new(0) }; MAX_CPUS],
         }
     }
 
-    /// Brings up the local APIC and masks the legacy 8259 PIC.
+    fn ioapic(&self) -> IoApic {
+        IoApic::new(self.ioapic_base.load(Ordering::Relaxed))
+    }
+
+    /// Uses the IOAPIC firmware reports. Call before [`init`](Self::init).
+    pub fn set_ioapic_base(&self, base: usize) {
+        self.ioapic_base.store(base, Ordering::Relaxed);
+    }
+
+    /// Records the firmware's APIC ID for a logical CPU.
+    pub fn set_apic_id(&self, cpu: usize, id: u32) {
+        if let Some(slot) = self.apic_ids.get(cpu) {
+            slot.store(id, Ordering::Relaxed);
+        }
+    }
+
+    /// The APIC ID of a logical CPU.
+    pub fn apic_id(&self, cpu: usize) -> u32 {
+        self.apic_ids.get(cpu).map_or(0, |id| id.load(Ordering::Relaxed))
+    }
+
+    /// Brings up the boot CPU's local APIC and masks the legacy 8259 PIC.
     pub fn init(&self) {
         // Mask the legacy PIC so its IRQs cannot arrive as vector 0x20..0x27
         // before the IOAPIC is programmed.
@@ -247,31 +306,43 @@ impl ApicController {
         }
 
         self.lapic.init();
-        self.ioapic.mask_all();
+        self.ioapic().mask_all();
     }
 
-    /// Local APIC ID of the boot CPU.
+    /// Brings up the calling CPU's local APIC.
+    pub fn init_cpu(&self) {
+        self.lapic.init();
+    }
+
+    /// Local APIC ID of the calling CPU.
     pub fn cpu_id(&self) -> u32 {
         self.lapic.id()
+    }
+
+    /// Routes an IOAPIC line to a vector on the boot CPU.
+    pub fn route_line(&self, gsi: u32, vector: u8, level: bool) {
+        self.ioapic().route_line(gsi, vector, self.apic_id(0), level);
     }
 }
 
 impl InterruptController for ApicController {
+    /// An interrupt ID here is a vector, so this needs a line routed to it by
+    /// [`route_line`](Self::route_line). A message-signalled vector has no line,
+    /// and nothing to enable.
     fn enable(&self, irq: u32) {
-        if irq < 32 {
-            return;
+        if let Some(gsi) = self.ioapic().line_for_vector(irq as u8) {
+            self.ioapic().set_masked(gsi, false);
         }
-        self.ioapic
-            .route(irq - 32, irq as u8, self.lapic.id(), false);
     }
 
     fn disable(&self, irq: u32) {
-        if irq < 32 {
-            return;
+        if let Some(gsi) = self.ioapic().line_for_vector(irq as u8) {
+            self.ioapic().set_masked(gsi, true);
         }
-        self.ioapic.set_masked(irq - 32, true);
     }
 
+    /// Not used on the interrupt path, where the trap frame has the vector. It
+    /// takes up to eight MMIO reads.
     fn acknowledge(&self) -> u32 {
         self.lapic.isr_vector().unwrap_or(SPURIOUS)
     }
@@ -285,7 +356,16 @@ impl InterruptController for ApicController {
     }
 
     fn send_ipi(&self, target: IpiTarget, id: u32) {
+        let target = match target {
+            IpiTarget::Cpu(cpu) => ApicTarget::Id(self.apic_id(cpu)),
+            IpiTarget::AllOthers => ApicTarget::AllOthers,
+        };
         self.lapic.send_ipi(target, id as u8);
+    }
+
+    fn send_stop_nmi(&self) -> bool {
+        self.lapic.send_ipi(ApicTarget::AllOthersNmi, 0);
+        true
     }
 }
 
@@ -318,11 +398,26 @@ mod tests {
 
     #[test]
     fn icr_encodes_destination_and_shorthand() {
-        assert_eq!(icr_value(IpiTarget::Cpu(2), 50), (2 << 24, 50 | ICR_ASSERT));
+        assert_eq!(icr_value(ApicTarget::Id(2), 50), (2 << 24, 50 | ICR_ASSERT));
         assert_eq!(
-            icr_value(IpiTarget::AllOthers, 49),
+            icr_value(ApicTarget::AllOthers, 49),
             (0, 49 | ICR_ASSERT | ICR_ALL_OTHERS)
         );
+        assert_eq!(
+            icr_value(ApicTarget::AllOthersNmi, 49),
+            (0, ICR_ASSERT | ICR_DELIVERY_NMI | ICR_ALL_OTHERS)
+        );
+    }
+
+    #[test]
+    fn a_logical_cpu_is_addressed_by_its_firmware_id() {
+        let controller = ApicController::new(0, 0);
+        controller.set_apic_id(0, 6);
+        controller.set_apic_id(1, 2);
+        controller.set_apic_id(MAX_CPUS, 9);
+        assert_eq!(controller.apic_id(0), 6);
+        assert_eq!(controller.apic_id(1), 2);
+        assert_eq!(controller.apic_id(MAX_CPUS), 0);
     }
 
     #[test]

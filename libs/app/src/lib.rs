@@ -17,14 +17,23 @@
 
 #![cfg_attr(not(test), no_std)]
 
+extern crate alloc;
+
+pub mod args;
+pub mod isolate;
+pub mod pipe;
 pub mod shell;
 
+use alloc::boxed::Box;
 use core::cell::Cell;
 
 use feos_fs::FileSystem;
 use feos_gfx::{Canvas, Point, Rect};
 use feos_gui::{Event, Input};
+use feos_hal::net::Network;
 use feos_hal::{Audio, Clock, Cpu, Keyboard, Memory, Pointer, PointerEvent, Power};
+
+pub use args::{ArgBlock, MAX_ARGC};
 
 /// The version shared by every crate in the workspace.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -46,7 +55,7 @@ pub struct BoardInfo {
 }
 
 /// Maximum number of processes the kernel can track at once.
-pub const MAX_PROCESSES: usize = 16;
+pub const MAX_PROCESSES: usize = 32;
 
 /// Maximum number of CPUs the scheduler can report in [`SystemInfo`].
 ///
@@ -58,7 +67,7 @@ pub const MAX_CPUS: usize = 8;
 pub const PROCESS_NAME_MAX: usize = 24;
 
 /// Maximum argument string length copied into a new process, in bytes.
-pub const PROCESS_ARGS_MAX: usize = 96;
+pub const PROCESS_ARGS_MAX: usize = 1024;
 
 /// Lifecycle state of a process.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -95,8 +104,13 @@ pub struct ProcessInfo {
     pub memory_bytes: usize,
     /// Number of threads in the process (currently always one).
     pub threads: u16,
-    /// Scheduler priority (currently a single normal priority).
+    /// Scheduler priority, from 0 to [`PRIORITY_MAX`]. Larger is more urgent, and
+    /// [`PRIORITY_NORMAL`] is what a process gets unless someone changes it.
     pub priority: u8,
+    /// PID of the process that started this one, or zero for the first.
+    pub parent: u32,
+    /// Started as a background job, so an interrupt to its parent spares it.
+    pub background: bool,
 }
 
 impl ProcessInfo {
@@ -111,12 +125,33 @@ impl ProcessInfo {
         memory_bytes: 0,
         threads: 0,
         priority: 0,
+        parent: 0,
+        background: false,
     };
 
     /// Returns the process name as a string.
     pub fn name(&self) -> &str {
         core::str::from_utf8(&self.name[..self.name_len as usize]).unwrap_or("?")
     }
+}
+
+/// Collects `pid` and its descendants from a snapshot, parents first, and
+/// returns how many there are.
+pub fn process_tree(infos: &[ProcessInfo], pid: u32, out: &mut [u32; MAX_PROCESSES]) -> usize {
+    out[0] = pid;
+    let mut count = 1;
+    let mut next = 0;
+    while next < count {
+        let parent = out[next];
+        next += 1;
+        for info in infos {
+            if info.parent == parent && count < MAX_PROCESSES && !out[..count].contains(&info.pid) {
+                out[count] = info.pid;
+                count += 1;
+            }
+        }
+    }
+    count
 }
 
 /// System-wide scheduler and process accounting.
@@ -202,6 +237,47 @@ pub struct ProcessDetail {
     pub stack_used: usize,
     /// Heap bytes the process currently owns.
     pub heap_bytes: usize,
+    /// Held off the CPU by job control.
+    pub stopped: bool,
+    /// The CPU whose queue the process is on.
+    pub cpu: u8,
+    /// The CPUs the process may run on, as a bit each. Zero means any.
+    pub affinity: u32,
+}
+
+/// The priority of a process nobody has said anything about.
+pub const PRIORITY_NORMAL: u8 = 8;
+/// The highest priority.
+pub const PRIORITY_MAX: u8 = 15;
+
+/// What a process can look forward to, or what became of it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WaitStatus {
+    /// It is still alive.
+    Running,
+    /// It finished with this status. A killed process reports [`EXIT_KILLED`].
+    Exited(i32),
+    /// No such process, or it finished so long ago that its status is gone.
+    Unknown,
+}
+
+/// Status of a process that was killed: 128 plus SIGKILL, as a shell shows it.
+pub const EXIT_KILLED: i32 = 137;
+
+/// The console a new process gets. A field left `None` inherits the parent's.
+#[derive(Clone, Copy, Default)]
+pub struct SpawnIo<'a> {
+    /// Where a user program's standard input comes from. Kernel-linked apps are given
+    /// their streams some other way, and don't look at this.
+    pub stdin: Option<&'a pipe::PipeReader>,
+    /// Where the process's standard output goes.
+    pub stdout: Option<&'a pipe::PipeWriter>,
+    /// Where the process's standard error goes.
+    pub stderr: Option<&'a pipe::PipeWriter>,
+    /// The terminal the process belongs to, for its background children.
+    pub console: Option<&'a pipe::PipeWriter>,
+    /// Spared by an interrupt to the parent: see [`ProcessInfo::background`].
+    pub background: bool,
 }
 
 /// Reasons a process could not be started.
@@ -211,6 +287,8 @@ pub enum SpawnError {
     NoFreeSlot,
     /// The argument string did not fit in the process table.
     ArgsTooLong,
+    /// This kernel, or test double, can't do what was asked.
+    Unsupported,
 }
 
 /// Kernel process-management service.
@@ -225,6 +303,68 @@ pub enum SpawnError {
 pub trait Processes: Sync {
     /// Starts `app` in a new process with `args`.
     fn spawn(&self, app: &'static dyn App, args: &str) -> Result<u32, SpawnError>;
+
+    /// Starts `app` with exactly these arguments, each a word of its own, and
+    /// the given console.
+    ///
+    /// The default joins the words, for simple test doubles.
+    fn spawn_argv(
+        &self,
+        app: &'static dyn App,
+        argv: &[&str],
+        _io: SpawnIo<'_>,
+    ) -> Result<u32, SpawnError> {
+        let mut block = ArgBlock::new();
+        if !block.push_all(argv) {
+            return Err(SpawnError::ArgsTooLong);
+        }
+        let mut joined = [0u8; PROCESS_ARGS_MAX];
+        self.spawn(app, block.joined(&mut joined))
+    }
+
+    /// Runs `task` as a new process. Its value is the exit status.
+    ///
+    /// A kill may stop the task without dropping what it owns, so anything that
+    /// has to outlive it belongs to the kernel, as a pipe end does.
+    fn spawn_task(
+        &self,
+        _name: &str,
+        _io: SpawnIo<'_>,
+        _task: Box<dyn FnOnce() -> i32 + Send>,
+    ) -> Result<u32, SpawnError> {
+        Err(SpawnError::Unsupported)
+    }
+
+    /// Starts the user program at `path` in a new process, with its own address space.
+    /// `argv` doesn't include the program's name, and `cwd` is the directory relative
+    /// paths in it start from. A program that can't be loaded isn't an error here: the
+    /// process ends straight away with a status of 126 or 127.
+    fn spawn_user(
+        &self,
+        _path: &str,
+        _argv: &[&str],
+        _cwd: &str,
+        _io: SpawnIo<'_>,
+    ) -> Result<u32, SpawnError> {
+        Err(SpawnError::Unsupported)
+    }
+
+    /// Blocks until the process has finished and returns its status. `None`
+    /// when there's no such process, or its status is gone.
+    fn wait(&self, _pid: u32) -> Option<i32> {
+        None
+    }
+
+    /// Looks at a process without blocking.
+    fn try_wait(&self, _pid: u32) -> WaitStatus {
+        WaitStatus::Unknown
+    }
+
+    /// Holds a process off the CPU (`stopped`) or lets it run again. Returns
+    /// `false` when there's no such process, or it may not be stopped.
+    fn set_stopped(&self, _pid: u32, _stopped: bool) -> bool {
+        false
+    }
 
     /// Stops the process with `pid`. Returns `false` when it does not exist or
     /// is the main shell process.
@@ -264,6 +404,18 @@ pub trait Processes: Sync {
     /// Details of the process with `pid`, when it exists.
     fn detail(&self, _pid: u32) -> Option<ProcessDetail> {
         None
+    }
+
+    /// Sets how urgent a process is, from 0 to [`PRIORITY_MAX`]. Returns `false`
+    /// when it can't be: no such process, or a priority out of range.
+    fn set_priority(&self, _pid: u32, _priority: u8) -> bool {
+        false
+    }
+
+    /// Sets the CPUs a process may run on, as a bit each. Returns `false` when it
+    /// can't be: no such process, or a mask with no online CPU.
+    fn set_affinity(&self, _pid: u32, _mask: u32) -> bool {
+        false
     }
 
     /// Heap bytes lost so far to processes killed while they owned them.
@@ -310,12 +462,36 @@ pub struct Platform {
     pub apps: &'static dyn AppRegistry,
     /// Read-only filesystem exposed by the board, when it has one.
     pub filesystem: Option<&'static dyn FileSystem>,
+    /// The TCP/IP stack, on a machine with a network card.
+    pub net: Option<&'static dyn Network>,
+}
+
+static GLOBAL_PLATFORM: core::sync::atomic::AtomicPtr<Platform> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Publishes the kernel's [`Platform`], once, for code that outlives its caller.
+pub fn publish_platform(platform: &'static Platform) {
+    let pointer = platform as *const Platform as *mut Platform;
+    GLOBAL_PLATFORM.store(pointer, core::sync::atomic::Ordering::Release);
+}
+
+/// The kernel's [`Platform`]. A task of an app's own needs this, because a
+/// [`Context`] lasts only as long as the call it came with. `None` on a host.
+pub fn platform() -> Option<&'static Platform> {
+    let pointer = GLOBAL_PLATFORM.load(core::sync::atomic::Ordering::Acquire);
+    // SAFETY: only `publish_platform` writes this, from a `'static` reference.
+    unsafe { pointer.cast_const().as_ref() }
 }
 
 /// Everything an app is allowed to see when it runs.
 pub struct Context<'a> {
-    /// Arguments following the command name, trimmed but otherwise untouched.
+    /// Arguments following the command name, joined by single spaces.
+    ///
+    /// Good for a single free-form argument such as a path. Anything that takes
+    /// several should read [`argv`](Self::argv), which keeps them apart.
     pub args: &'a str,
+    /// Each argument following the command name, as the shell expanded it.
+    pub argv: &'a [&'a str],
     /// The boot framebuffer, if the board provided one.
     ///
     /// The canvas is stable for the lifetime of the kernel; apps draw
@@ -355,6 +531,9 @@ pub enum WindowFrame {
 pub struct WindowContext<'a, 'b> {
     /// Arguments the application was opened with.
     pub args: &'a str,
+    /// Which window this is, for an app with [`App::multi_instance`]: stable
+    /// while the window is open and less than the desktop's window count.
+    pub instance: usize,
     /// Drawing surface for the window content.
     pub canvas: &'a mut Canvas<'b>,
     /// Input events for this frame.
@@ -509,6 +688,7 @@ pub trait App: Sync {
     ///
     /// The media player and task manager return `true` so playback and live
     /// graphs keep advancing; ordinary document-style apps leave it `false`.
+    /// The session asks on every pass, so an app can change its answer.
     fn animates(&self) -> bool {
         false
     }
@@ -530,8 +710,18 @@ pub trait App: Sync {
         WindowFrame::Close
     }
 
+    /// Whether each launch opens another window, instead of raising the first.
+    fn multi_instance(&self) -> bool {
+        false
+    }
+
     /// Releases any state owned by a windowed session.
     fn close_window(&self) {}
+
+    /// Releases the state of one window of an app with several.
+    fn close_instance(&self, _instance: usize) {
+        self.close_window();
+    }
 
     /// Advances a minimized window, which receives no frames.
     ///
@@ -546,8 +736,15 @@ pub trait App: Sync {
         false
     }
 
-    /// Executes the app.
-    fn run(&self, context: &mut Context<'_>);
+    /// Whether the app must run where the framebuffer is, instead of in a
+    /// process of its own. Everything else run by a shell gets its own process
+    /// and console, so its output can be captured and it can be interrupted.
+    fn needs_display(&self) -> bool {
+        self.foreground()
+    }
+
+    /// Executes the app and returns its exit status: zero means success.
+    fn run(&self, context: &mut Context<'_>) -> i32;
 
     /// Returns `true` if `name` is the primary name or an alias.
     fn matches(&self, name: &str) -> bool {
@@ -577,6 +774,13 @@ mod tests {
         fn snapshot(&self, _out: &mut [ProcessInfo]) -> usize {
             0
         }
+    }
+
+    #[test]
+    fn spawn_task_defaults_to_unsupported() {
+        let result = Double.spawn_task("x", SpawnIo::default(), Box::new(|| 0));
+        assert_eq!(result, Err(SpawnError::Unsupported));
+        assert_eq!(Double.try_wait(2), WaitStatus::Unknown);
     }
 
     #[test]

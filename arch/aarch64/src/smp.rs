@@ -72,6 +72,7 @@ extern "C" {
 /// Called from `secondary_entry` in `boot.S`.
 #[no_mangle]
 extern "C" fn secondary_main(context: usize) -> ! {
+    cpu::protect();
     match handler() {
         Some(handler) => handler(context),
         None => cpu::halt(),

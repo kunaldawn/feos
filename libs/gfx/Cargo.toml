@@ -3,6 +3,7 @@ name = "feos-gfx"
 description = "A small dependency-free 2D graphics library for the feos kernel"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

@@ -1,22 +1,22 @@
 //! Recoverable traps and the saved register frame used by the scheduler.
 //!
 //! The vector table in `vectors.S` saves every general-purpose and SIMD register
-//! on this CPU's private exception stack and calls [`trap_dispatch`], which asks
-//! the registered handler to service the trap. The stub then restores whatever
-//! frame the handler leaves behind. The scheduler uses that indirection to
-//! replace the frame with another process's saved context, so returning from the
-//! exception resumes a different process.
+//! directly into the [`TrapFrame`] of what was running on this CPU, which
+//! [`set_trap_frame`] said where to find, and calls [`trap_dispatch`] on a private
+//! stack to service the trap. A handler can ask for another frame to be resumed with
+//! [`resume`], which also makes it the one the next trap saves into. Switching tasks
+//! is a change of pointer, then, not a copy.
 //!
-//! Threads run on `SP_EL0`, so hardware-selected `SP_EL1` is always a stack the
-//! interrupted thread doesn't own. Once the scheduler has offered a task to other
-//! CPUs, this CPU no longer touches that task's stack.
+//! Threads run on `SP_EL0`, so hardware-selected `SP_EL1` is never a stack the
+//! interrupted thread owns. Once the scheduler has offered a task to other CPUs,
+//! this CPU no longer touches that task's stack or frame.
 //!
 //! Faults and exceptions from other vector groups go through
-//! [`crate::exceptions`], which doesn't return.
+//! [`crate::exceptions`].
 
 use core::arch::asm;
 use core::mem::{offset_of, transmute};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use crate::exceptions;
 
@@ -24,6 +24,10 @@ use crate::exceptions;
 const VECTOR_THREAD_IRQ: u64 = 1;
 /// Vector index of a synchronous exception taken from a thread.
 const VECTOR_THREAD_SYNC: u64 = 0;
+/// Vector index of a synchronous exception from a user program.
+const VECTOR_USER_SYNC: u64 = 8;
+/// Vector index of an IRQ taken from a user program.
+const VECTOR_USER_IRQ: u64 = 9;
 /// `ESR_EL1` exception class for `SVC` from AArch64.
 const ESR_CLASS_SVC: u64 = 0x15;
 
@@ -67,6 +71,19 @@ const _: () = assert!(offset_of!(TrapFrame, fpsr) == 792);
 /// masks and only ever clears I.
 const SPSR_THREAD: u64 = 0b0100 | (1 << 9) | (1 << 8) | (1 << 6);
 
+/// `SPSR_EL1` for a user program: EL0t, with the same masks. It can't change them:
+/// `SCTLR_EL1.UMA` is clear, so `msr daif` from EL0 traps.
+const SPSR_USER: u64 = (1 << 9) | (1 << 8) | (1 << 6);
+
+/// `PSTATE.PAN`, in the form `SPSR_EL1` has it, when this machine has PAN on.
+const SPSR_PAN: u64 = 1 << 22;
+static THREAD_PAN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// New threads start with PAN set, as the rest of the kernel runs.
+pub(crate) fn set_thread_pan() {
+    THREAD_PAN.store(SPSR_PAN, Ordering::Relaxed);
+}
+
 impl TrapFrame {
     /// A frame with every register cleared.
     pub const ZERO: Self = Self {
@@ -92,23 +109,53 @@ impl TrapFrame {
         frame.x[30] = lr as u64;
         frame.sp = stack_top as u64;
         frame.elr = entry as u64;
-        frame.spsr = SPSR_THREAD;
+        frame.spsr = SPSR_THREAD | THREAD_PAN.load(Ordering::Relaxed);
         frame
+    }
+
+    /// Builds the initial frame of a user program.
+    pub fn new_user(entry: usize, stack_top: usize, arg0: usize, arg1: usize) -> Self {
+        let mut frame = Self::ZERO;
+        frame.x[0] = arg0 as u64;
+        frame.x[1] = arg1 as u64;
+        frame.sp = stack_top as u64;
+        frame.elr = entry as u64;
+        frame.spsr = SPSR_USER;
+        frame
+    }
+
+    /// Whether this is a user program's state: a trap from EL0t.
+    pub fn is_user(&self) -> bool {
+        self.spsr & 0xf == 0
     }
 
     /// Stack pointer of the interrupted context.
     pub fn stack_pointer(&self) -> usize {
         self.sp as usize
     }
+
+    /// Whether the trapped code could take interrupts. If it could, it wasn't an
+    /// interrupt handler, and held no lock that masks them.
+    pub fn interrupts_were_enabled(&self) -> bool {
+        self.spsr & (1 << 7) == 0
+    }
+
+    /// The interrupt that caused this trap, when the CPU says. It doesn't here:
+    /// only the interrupt controller knows.
+    pub fn interrupt_id(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// Callback invoked with the frame of the interrupted process.
 ///
-/// The handler may modify the frame; the stub restores it before returning.
+/// The stub restores that frame when this returns, unless the handler asks for
+/// another with [`resume`].
 pub type IrqHandler = fn(&mut TrapFrame);
 
 static HANDLER: AtomicUsize = AtomicUsize::new(0);
 static SWITCH_HANDLER: AtomicUsize = AtomicUsize::new(0);
+static SYSCALL_HANDLER: AtomicUsize = AtomicUsize::new(0);
 
 /// Installs the function called for every IRQ from EL1.
 pub fn set_handler(handler: IrqHandler) {
@@ -118,6 +165,11 @@ pub fn set_handler(handler: IrqHandler) {
 /// Installs the function called when a thread uses [`request_switch`].
 pub fn set_switch_handler(handler: IrqHandler) {
     SWITCH_HANDLER.store(handler as usize, Ordering::Release);
+}
+
+/// Installs the function called when a user program makes a system call.
+pub fn set_syscall_handler(handler: IrqHandler) {
+    SYSCALL_HANDLER.store(handler as usize, Ordering::Release);
 }
 
 fn load_handler(slot: &AtomicUsize) -> Option<IrqHandler> {
@@ -131,28 +183,74 @@ fn load_handler(slot: &AtomicUsize) -> Option<IrqHandler> {
     }
 }
 
-/// Called from `trap_common` in `vectors.S`.
+/// A frame a handler on each CPU asked to resume, or null.
+static RESUME: [AtomicPtr<TrapFrame>; crate::smp::MAX_CPUS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; crate::smp::MAX_CPUS];
+
+/// Has traps on this CPU save their state in `frame` from now on.
 ///
-/// Returns only for an IRQ or a software switch from a thread. Everything else
-/// is fatal.
+/// Call with interrupts masked, for the frame of what's about to run, on a CPU not
+/// yet switching through [`resume`].
+pub fn set_trap_frame(frame: *mut TrapFrame) {
+    let top = frame as usize + core::mem::size_of::<TrapFrame>();
+    // SAFETY: with interrupts masked and on SP_EL0, nothing is using SP_EL1.
+    unsafe {
+        asm!(
+            "msr spsel, #1",
+            "mov sp, {top}",
+            "msr spsel, #0",
+            top = in(reg) top,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+/// From a handler: returns to `frame` instead of the frame the trap saved, and has
+/// the next trap on this CPU save there.
+///
+/// `frame` must be a complete frame, 16-byte aligned, that stays put.
+pub fn resume(frame: *mut TrapFrame) {
+    RESUME[crate::cpu::index().min(crate::smp::MAX_CPUS - 1)].store(frame, Ordering::Relaxed);
+}
+
+/// Called from `trap_common` in `vectors.S`. Returns the frame to resume.
+///
+/// Returns for an IRQ or a software switch from a thread, or when the fault handler
+/// has ended the faulting thread. Anything else stops the CPU.
 ///
 /// # Safety
 /// Only called from the assembly trap stub with a valid frame pointer.
 #[no_mangle]
-unsafe extern "C" fn trap_dispatch(index: u64, frame: *mut TrapFrame) {
-    // SAFETY: the stub passes the frame it just saved on this CPU's stack.
-    let frame = unsafe { &mut *frame };
+unsafe extern "C" fn trap_dispatch(index: u64, saved: *mut TrapFrame) -> *mut TrapFrame {
+    // SAFETY: the stub passes the frame it just saved.
+    let frame = unsafe { &mut *saved };
     let esr: u64;
     // SAFETY: reading a system register has no side effects.
     unsafe { asm!("mrs {}, esr_el1", out(reg) esr, options(nomem, nostack)) };
 
     let handler = match index {
-        VECTOR_THREAD_IRQ => &HANDLER,
+        VECTOR_THREAD_IRQ | VECTOR_USER_IRQ => &HANDLER,
         VECTOR_THREAD_SYNC if (esr >> 26) & 0x3f == ESR_CLASS_SVC => &SWITCH_HANDLER,
-        _ => exceptions::fatal(index, esr, frame),
+        VECTOR_USER_SYNC if (esr >> 26) & 0x3f == ESR_CLASS_SVC => &SYSCALL_HANDLER,
+        _ => {
+            // A handler that returns has dealt with it, and asked for another frame.
+            exceptions::fault(index, esr, frame);
+            return take_resume(saved);
+        }
     };
     if let Some(handler) = load_handler(handler) {
         handler(frame);
+    }
+    take_resume(saved)
+}
+
+fn take_resume(saved: *mut TrapFrame) -> *mut TrapFrame {
+    let slot = &RESUME[crate::cpu::index().min(crate::smp::MAX_CPUS - 1)];
+    let next = slot.swap(core::ptr::null_mut(), Ordering::Relaxed);
+    if next.is_null() {
+        saved
+    } else {
+        next
     }
 }
 

@@ -16,14 +16,20 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+extern crate alloc;
+
 pub mod checksum;
 pub mod deflate;
 mod error;
 pub mod gzip;
 pub mod inflate;
+pub mod sha256;
 pub mod zlib;
 
 pub use checksum::{adler32, crc32, Crc32};
 pub use deflate::{compress as deflate_compress, Deflater};
 pub use error::{CompressError, Result};
-pub use inflate::{inflate, inflate_with_consumed, InflateResult};
+pub use inflate::{
+    inflate, inflate_stream, inflate_with_consumed, InflateResult, StreamInput, StreamOutput,
+    StreamResult, WINDOW_SIZE,
+};

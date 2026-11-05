@@ -56,6 +56,10 @@ pub struct TaskbarResponse {
     pub tray_clicked: bool,
     /// The bell in the notification area was clicked.
     pub bell_clicked: bool,
+    /// The speaker in the notification area was clicked.
+    pub speaker_clicked: bool,
+    /// The wheel moved over the speaker.
+    pub speaker_wheel: i32,
     /// A task button was right-clicked.
     pub task_menu: Option<usize>,
 }
@@ -86,7 +90,7 @@ pub fn layout(canvas: Rect, config: &TaskbarConfig) -> TaskbarLayout {
         height.saturating_sub(4),
     );
 
-    let tray_width = 56 + if config.show_clock { 76 } else { 0 };
+    let tray_width = 84 + if config.show_clock { 76 } else { 0 };
     let tray = Rect::new(
         bar.right_i32() - tray_width,
         bar.y,
@@ -174,6 +178,55 @@ pub fn bell_rect(layout: &TaskbarLayout) -> Rect {
     )
 }
 
+/// The speaker inside the tray, beside the bell.
+pub fn speaker_rect(layout: &TaskbarLayout) -> Rect {
+    let bell = bell_rect(layout);
+    Rect::new(bell.right_i32() + 2, bell.y, bell.width, bell.height)
+}
+
+fn draw_speaker<const N: usize>(
+    ui: &mut Ui<'_, '_, '_, N>,
+    rect: Rect,
+    theme: &DesktopTheme,
+    level: u8,
+    muted: bool,
+) {
+    let cx = rect.x + rect.width as i32 / 2 - 3;
+    let cy = rect.y + rect.height as i32 / 2;
+    let body = [
+        feos_gfx::Point::new(cx - 4, cy - 2),
+        feos_gfx::Point::new(cx - 1, cy - 2),
+        feos_gfx::Point::new(cx + 3, cy - 6),
+        feos_gfx::Point::new(cx + 3, cy + 6),
+        feos_gfx::Point::new(cx - 1, cy + 2),
+        feos_gfx::Point::new(cx - 4, cy + 2),
+    ];
+    ui.painter.fill_polygon(&body, theme.tray_text);
+    if muted {
+        for step in 0..7 {
+            ui.painter.fill_rect(
+                Rect::new(cx + 5 + step, cy - 3 + step, 1, 1),
+                theme.close_button,
+            );
+            ui.painter.fill_rect(
+                Rect::new(cx + 11 - step, cy - 3 + step, 1, 1),
+                theme.close_button,
+            );
+        }
+        return;
+    }
+    // A bar per third of the volume, each taller than the last.
+    for bar in 0..3 {
+        if level as i32 > bar * 33 {
+            let half = 1 + bar * 2;
+            ui.painter.fill_rect(
+                Rect::new(cx + 5 + bar * 2, cy - half, 1, 2 * half as u32 + 1 - 1),
+                theme.tray_text,
+            );
+        }
+    }
+}
+
 fn draw_bell<const N: usize>(
     ui: &mut Ui<'_, '_, '_, N>,
     rect: Rect,
@@ -208,6 +261,7 @@ pub fn render<const N: usize, const W: usize, const A: usize>(
     catalog: &AppCatalog<A>,
     clock: &str,
     unread: usize,
+    sound: crate::volume::Sound,
 ) -> TaskbarResponse {
     let mut response = TaskbarResponse::default();
     let bar = layout.bar;
@@ -415,6 +469,12 @@ pub fn render<const N: usize, const W: usize, const A: usize>(
     let tray = ui.interact(tray_id, layout.tray, Sense::click());
     let bell = bell_rect(layout);
     let bell_hit = ui.interact(Id::from_name("desktop.taskbar.bell"), bell, Sense::click());
+    let speaker = speaker_rect(layout);
+    let speaker_hit = ui.interact(
+        Id::from_name("desktop.taskbar.speaker"),
+        speaker,
+        Sense::click(),
+    );
     ui.painter.fill_rect(layout.tray, theme.tray_bg);
     ui.painter.fill_rect(
         Rect::new(layout.tray.x, layout.tray.y, 1, layout.tray.height),
@@ -426,6 +486,16 @@ pub fn render<const N: usize, const W: usize, const A: usize>(
             .fill_rounded_rect(bell, 3, theme.task_button_hover);
     }
     draw_bell(ui, bell, theme, unread);
+    if speaker_hit.hovered {
+        ui.painter
+            .fill_rounded_rect(speaker, 3, theme.task_button_hover);
+        // The wheel changes the volume without opening anything.
+        response.speaker_wheel = ui.wheel();
+    }
+    draw_speaker(ui, speaker, theme, sound.level, sound.muted);
+    if speaker_hit.clicked {
+        response.speaker_clicked = true;
+    }
     if bell_hit.clicked {
         response.bell_clicked = true;
     }

@@ -1,0 +1,12 @@
+id: image-viewer
+name: Image Viewer
+version: 1.0.0
+entry: viewer
+category: Multimedia
+description: Show pictures, one at a time
+icon: icon.ico
+icon_medium: icon-32.ico
+icon_small: icon-16.ico
+window:
+  width: 640
+  height: 480

@@ -1,14 +1,18 @@
 //! Command registry and dispatch for [`crate::run`].
 
 mod archive;
+mod awk;
 mod diff;
+mod edit;
 mod files;
 mod find;
+mod less;
 mod more;
 mod opts;
 mod sed;
 mod system;
 mod text;
+mod tty;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -296,6 +300,41 @@ pub static COMMANDS: &[CommandSpec] = &[
         run: files::du,
     },
     CommandSpec {
+        name: "appinstall",
+        aliases: &[],
+        usage: "appinstall FILE [SHA256]",
+        description: "install a .fapp package after checking its digest",
+        run: archive::appinstall,
+    },
+    CommandSpec {
+        name: "sync",
+        aliases: &[],
+        usage: "sync",
+        description: "write pending changes to disk",
+        run: files::sync,
+    },
+    CommandSpec {
+        name: "mount",
+        aliases: &[],
+        usage: "mount",
+        description: "list mounted filesystems",
+        run: files::mount,
+    },
+    CommandSpec {
+        name: "ln",
+        aliases: &[],
+        usage: "ln -s TARGET LINK",
+        description: "make a symbolic link",
+        run: files::ln,
+    },
+    CommandSpec {
+        name: "readlink",
+        aliases: &[],
+        usage: "readlink LINK",
+        description: "print where a symbolic link points",
+        run: files::readlink,
+    },
+    CommandSpec {
         name: "df",
         aliases: &[],
         usage: "df [-h]",
@@ -429,6 +468,27 @@ pub static COMMANDS: &[CommandSpec] = &[
         run: system::run_false,
     },
     CommandSpec {
+        name: "awk",
+        aliases: &[],
+        usage: "awk [-F fs] [-v var=value] [-f file | program] [file...]",
+        description: "scan and process patterns in text",
+        run: awk::awk,
+    },
+    CommandSpec {
+        name: "edit",
+        aliases: &["nano"],
+        usage: "edit [file]",
+        description: "edit a text file (^S save, ^Q quit, ^F find)",
+        run: edit::edit,
+    },
+    CommandSpec {
+        name: "less",
+        aliases: &["more"],
+        usage: "less [file]",
+        description: "page through text (q quits, / searches)",
+        run: less::less,
+    },
+    CommandSpec {
         name: "yes",
         aliases: &[],
         usage: "yes [text]",
@@ -471,8 +531,15 @@ pub static COMMANDS: &[CommandSpec] = &[
         run: archive::gzip,
     },
     CommandSpec {
+        name: "zcat",
+        aliases: &[],
+        usage: "zcat [file...]",
+        description: "print decompressed files",
+        run: archive::zcat,
+    },
+    CommandSpec {
         name: "gunzip",
-        aliases: &["zcat"],
+        aliases: &[],
         usage: "gunzip [-kcf] [file...]",
         description: "decompress files",
         run: archive::gunzip,
@@ -687,17 +754,6 @@ pub(super) fn split_lines(data: &[u8]) -> Vec<&[u8]> {
     lines
 }
 
-/// Splits text into lines without their newline characters.
-pub(super) fn text_lines(data: &[u8]) -> Vec<String> {
-    split_lines(data)
-        .into_iter()
-        .map(|line| {
-            let line = line.strip_suffix(b"\n").unwrap_or(line);
-            String::from_utf8_lossy(line).into_owned()
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -860,5 +916,58 @@ mod tests {
         let (status, _, err) = h.run_stdin("xargs", &args, b"a\n");
         assert_ne!(status, 0);
         assert!(err.contains("nested too deeply"), "{err}");
+    }
+
+    #[test]
+    fn tar_extracts_links_and_refuses_to_leave_the_directory() {
+        let tree: &'static feos_fs::Vfs =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(feos_fs::Vfs::in_memory(1 << 20)));
+        let mut h = Harness::new();
+        h.fs = OverlayFs::new(Some(tree));
+
+        let mut image = alloc::vec![0u8; 8192];
+        let mut writer = feos_archive::TarWriter::new(&mut image);
+        writer.write_file("real.txt", b"contents").unwrap();
+        writer.write_symlink("link.txt", "real.txt").unwrap();
+        writer.write_file("../escaped.txt", b"out").unwrap();
+        let len = writer.finish().unwrap();
+        h.fs.write_file("/a.tar", &image[..len], false).unwrap();
+        h.fs.create_dir("/out").unwrap();
+
+        let (status, _, err) = h.run("tar", &["-xf", "/a.tar", "-C", "/out"]);
+        assert_eq!(status, 2, "one member was refused");
+        assert!(err.contains("escaped"), "{err}");
+        assert_eq!(h.fs.read_file("/out/link.txt").unwrap(), b"contents");
+        assert_eq!(h.fs.read_link("/out/link.txt").unwrap(), "real.txt");
+        assert!(!h.fs.exists("/escaped.txt"));
+    }
+
+    #[test]
+    fn appinstall_needs_a_digest_that_matches() {
+        let tree: &'static feos_fs::Vfs =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(feos_fs::Vfs::in_memory(1 << 20)));
+        let mut h = Harness::new();
+        h.fs = OverlayFs::new(Some(tree));
+        let mut image = alloc::vec![0u8; 2048];
+        let mut writer = feos_archive::ZipWriter::new(&mut image);
+        writer
+            .write_stored("manifest.yaml", b"id: demo\nname: Demo\nversion: \"1\"\nentry: ps\n")
+            .unwrap();
+        let len = writer.finish().unwrap();
+        let package = &image[..len];
+        h.fs.write_file("/p.fapp", package, false).unwrap();
+        let digest = crate::sha256::hex(&crate::sha256::sha256(package));
+
+        assert_eq!(h.run("appinstall", &["/p.fapp"]).0, 1);
+        let wrong = "0".repeat(64);
+        assert_eq!(h.run("appinstall", &["/p.fapp", &wrong]).0, 1);
+        assert!(!h.fs.exists("/apps/demo.fapp"));
+
+        assert_eq!(h.run("appinstall", &["/p.fapp", &digest]).0, 0);
+        assert_eq!(h.fs.read_file("/apps/demo.fapp").unwrap(), package);
+
+        // A digest beside the package works too.
+        h.fs.write_file("/p.fapp.sha256", digest.as_bytes(), false).unwrap();
+        assert_eq!(h.run("appinstall", &["/p.fapp"]).0, 0);
     }
 }

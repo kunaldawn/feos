@@ -37,6 +37,31 @@ pub struct InflateResult {
     pub consumed: usize,
 }
 
+/// Where Huffman decoding gets its bits: all at once, or as they arrive.
+trait Bits {
+    /// Tops the window up, as far as input allows.
+    fn refill(&mut self);
+    /// The window, lowest bits next.
+    fn window(&self) -> u64;
+    /// Valid bits in the window.
+    fn available(&self) -> u32;
+    /// Drops bits already used.
+    fn consume(&mut self, n: u32);
+
+    fn read(&mut self, n: u8) -> Result<u32> {
+        let n = n as u32;
+        if self.available() < n {
+            self.refill();
+            if self.available() < n {
+                return Err(CompressError::UnexpectedEnd);
+            }
+        }
+        let value = (self.window() & ((1u64 << n) - 1)) as u32;
+        self.consume(n);
+        Ok(value)
+    }
+}
+
 /// LSB-first bit reader over a 64-bit window.
 struct BitReader<'a> {
     data: &'a [u8],
@@ -53,46 +78,6 @@ impl<'a> BitReader<'a> {
             bits: 0,
             count: 0,
         }
-    }
-
-    /// Tops the window up to at least 56 bits while input remains.
-    fn refill(&mut self) {
-        if let Some(chunk) = self.data.get(self.pos..self.pos + 8) {
-            let word = u64::from_le_bytes([
-                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-            ]);
-            self.bits |= word << self.count;
-            let taken = (63 - self.count) >> 3;
-            self.pos += taken as usize;
-            self.count += taken * 8;
-            return;
-        }
-        while self.count <= 56 {
-            let Some(&byte) = self.data.get(self.pos) else {
-                return;
-            };
-            self.bits |= (byte as u64) << self.count;
-            self.pos += 1;
-            self.count += 8;
-        }
-    }
-
-    fn consume(&mut self, n: u32) {
-        self.bits >>= n;
-        self.count -= n;
-    }
-
-    fn read(&mut self, n: u8) -> Result<u32> {
-        let n = n as u32;
-        if self.count < n {
-            self.refill();
-            if self.count < n {
-                return Err(CompressError::UnexpectedEnd);
-            }
-        }
-        let value = (self.bits & ((1u64 << n) - 1)) as u32;
-        self.consume(n);
-        Ok(value)
     }
 
     /// Drops to the next byte boundary and returns whole unread bytes to the
@@ -117,6 +102,43 @@ impl<'a> BitReader<'a> {
     /// Input bytes used so far, counting a partly read byte as used.
     fn consumed(&self) -> usize {
         self.pos - (self.count / 8) as usize
+    }
+}
+
+impl Bits for BitReader<'_> {
+    /// Tops the window up to at least 56 bits while input remains.
+    fn refill(&mut self) {
+        if let Some(chunk) = self.data.get(self.pos..self.pos + 8) {
+            let word = u64::from_le_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            ]);
+            self.bits |= word << self.count;
+            let taken = (63 - self.count) >> 3;
+            self.pos += taken as usize;
+            self.count += taken * 8;
+            return;
+        }
+        while self.count <= 56 {
+            let Some(&byte) = self.data.get(self.pos) else {
+                return;
+            };
+            self.bits |= (byte as u64) << self.count;
+            self.pos += 1;
+            self.count += 8;
+        }
+    }
+
+    fn window(&self) -> u64 {
+        self.bits
+    }
+
+    fn available(&self) -> u32 {
+        self.count
+    }
+
+    fn consume(&mut self, n: u32) {
+        self.bits >>= n;
+        self.count -= n;
     }
 }
 
@@ -204,14 +226,14 @@ impl Huffman {
     }
 
     #[inline]
-    fn decode(&self, reader: &mut BitReader<'_>) -> Result<u16> {
-        if reader.count < MAX_BITS as u32 {
+    fn decode<B: Bits>(&self, reader: &mut B) -> Result<u16> {
+        if reader.available() < MAX_BITS as u32 {
             reader.refill();
         }
-        let entry = self.lookup[reader.bits as usize & (LOOKUP_SIZE - 1)];
+        let entry = self.lookup[reader.window() as usize & (LOOKUP_SIZE - 1)];
         if entry != 0 {
             let length = (entry & ((1 << LOOKUP_LEN_BITS) - 1)) as u32;
-            if length > reader.count {
+            if length > reader.available() {
                 return Err(CompressError::UnexpectedEnd);
             }
             reader.consume(length);
@@ -221,15 +243,15 @@ impl Huffman {
     }
 
     /// Canonical bit-by-bit walk, for codes the table doesn't resolve.
-    fn decode_long(&self, reader: &mut BitReader<'_>) -> Result<u16> {
+    fn decode_long<B: Bits>(&self, reader: &mut B) -> Result<u16> {
         let mut code: i32 = 0;
         let mut first: i32 = 0;
         let mut index: i32 = 0;
         for len in 1..=MAX_BITS {
-            if len as u32 > reader.count {
+            if len as u32 > reader.available() {
                 return Err(CompressError::UnexpectedEnd);
             }
-            code |= ((reader.bits >> (len - 1)) & 1) as i32;
+            code |= ((reader.window() >> (len - 1)) & 1) as i32;
             let count = self.count[len] as i32;
             if code - first < count {
                 let slot = index + (code - first);
@@ -265,7 +287,7 @@ fn fixed_tables() -> Result<(Huffman, Huffman)> {
     ))
 }
 
-fn dynamic_tables(reader: &mut BitReader<'_>) -> Result<(Huffman, Huffman)> {
+fn dynamic_tables<B: Bits>(reader: &mut B) -> Result<(Huffman, Huffman)> {
     let hlit = reader.read(5)? as usize + 257;
     let hdist = reader.read(5)? as usize + 1;
     let hclen = reader.read(4)? as usize + 4;
@@ -429,4 +451,386 @@ pub fn inflate_with_consumed(input: &[u8], out: &mut [u8]) -> Result<InflateResu
         written,
         consumed: reader.consumed(),
     })
+}
+
+/// Input for [`inflate_stream`]: fills the buffer and returns how much it wrote,
+/// with zero at the end of the input.
+pub type StreamInput<'a> = &'a mut dyn FnMut(&mut [u8]) -> Result<usize>;
+/// Output for [`inflate_stream`]: takes each piece as it's ready.
+pub type StreamOutput<'a> = &'a mut dyn FnMut(&[u8]) -> Result<()>;
+
+/// Bytes of history a DEFLATE stream can refer back to.
+pub const WINDOW_SIZE: usize = 32 * 1024;
+
+/// Totals from a streaming decode.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StreamResult {
+    /// Bytes handed to the output.
+    pub written: u64,
+    /// Bytes of input the stream used.
+    pub consumed: u64,
+}
+
+/// Bits drawn from a callback, a buffer at a time.
+pub(crate) struct StreamBits<'a> {
+    input: StreamInput<'a>,
+    buffer: [u8; 4096],
+    len: usize,
+    pos: usize,
+    bits: u64,
+    count: u32,
+    total_read: u64,
+    /// An input error, returned once decoding stops for lack of bits.
+    failure: Option<CompressError>,
+}
+
+impl<'a> StreamBits<'a> {
+    pub(crate) fn new(input: StreamInput<'a>) -> Self {
+        Self {
+            input,
+            buffer: [0; 4096],
+            len: 0,
+            pos: 0,
+            bits: 0,
+            count: 0,
+            total_read: 0,
+            failure: None,
+        }
+    }
+
+    fn next_byte(&mut self) -> Option<u8> {
+        if self.pos == self.len {
+            if self.failure.is_some() {
+                return None;
+            }
+            match (self.input)(&mut self.buffer) {
+                Ok(0) => return None,
+                Ok(count) => {
+                    self.len = count.min(self.buffer.len());
+                    self.pos = 0;
+                    self.total_read += self.len as u64;
+                }
+                Err(error) => {
+                    self.failure = Some(error);
+                    return None;
+                }
+            }
+        }
+        let byte = self.buffer[self.pos];
+        self.pos += 1;
+        Some(byte)
+    }
+
+    /// Reads a byte on a byte boundary, or `None` at the end of the input.
+    pub(crate) fn byte(&mut self) -> Option<u8> {
+        self.read(8).ok().map(|value| value as u8)
+    }
+
+    /// Drops to the next byte boundary. Whole bytes stay in the window.
+    pub(crate) fn align(&mut self) {
+        self.consume(self.count % 8);
+    }
+
+    /// Input used so far.
+    pub(crate) fn consumed(&self) -> u64 {
+        self.total_read - (self.len - self.pos) as u64 - (self.count / 8) as u64
+    }
+
+    /// What stopped the input, or a plain unexpected end.
+    fn stop_reason(&mut self, error: CompressError) -> CompressError {
+        match (error, self.failure.take()) {
+            (CompressError::UnexpectedEnd, Some(failure)) => failure,
+            (error, _) => error,
+        }
+    }
+}
+
+impl Bits for StreamBits<'_> {
+    fn refill(&mut self) {
+        while self.count <= 56 {
+            let Some(byte) = self.next_byte() else {
+                return;
+            };
+            self.bits |= (byte as u64) << self.count;
+            self.count += 8;
+        }
+    }
+
+    fn window(&self) -> u64 {
+        self.bits
+    }
+
+    fn available(&self) -> u32 {
+        self.count
+    }
+
+    fn consume(&mut self, n: u32) {
+        self.bits >>= n;
+        self.count -= n;
+    }
+}
+
+/// The last [`WINDOW_SIZE`] bytes, and whatever hasn't gone to the output yet.
+struct Ring<'a, 'b> {
+    window: &'a mut [u8],
+    output: StreamOutput<'b>,
+    /// Bytes ever produced. Their position in the ring is this, wrapped.
+    total: u64,
+    /// How many of them have gone to the output.
+    flushed: u64,
+}
+
+impl Ring<'_, '_> {
+    fn flush(&mut self) -> Result<()> {
+        let size = self.window.len() as u64;
+        while self.flushed < self.total {
+            let start = (self.flushed % size) as usize;
+            let run = (self.total - self.flushed).min(size - start as u64) as usize;
+            (self.output)(&self.window[start..start + run])?;
+            self.flushed += run as u64;
+        }
+        Ok(())
+    }
+
+    fn push(&mut self, byte: u8) -> Result<()> {
+        let size = self.window.len() as u64;
+        if self.total - self.flushed == size {
+            self.flush()?;
+        }
+        self.window[(self.total % size) as usize] = byte;
+        self.total += 1;
+        Ok(())
+    }
+
+    fn copy_match(&mut self, distance: usize, length: usize) -> Result<()> {
+        let size = self.window.len() as u64;
+        if distance as u64 > self.total || distance > self.window.len() {
+            return Err(CompressError::InvalidData("distance before output"));
+        }
+        for _ in 0..length {
+            let from = ((self.total - distance as u64) % size) as usize;
+            self.push(self.window[from])?;
+        }
+        Ok(())
+    }
+}
+
+/// Decodes one raw DEFLATE stream from a source to a sink, holding only the
+/// window: the output need not fit in memory, or even have a known size.
+pub(crate) fn inflate_bits(
+    bits: &mut StreamBits<'_>,
+    window: &mut [u8],
+    output: StreamOutput<'_>,
+) -> Result<u64> {
+    if window.len() < WINDOW_SIZE {
+        return Err(CompressError::BufferTooSmall {
+            required: WINDOW_SIZE,
+            available: window.len(),
+        });
+    }
+    // The ring arithmetic wraps at the exact size given.
+    let window = &mut window[..WINDOW_SIZE];
+    let mut ring = Ring {
+        window,
+        output,
+        total: 0,
+        flushed: 0,
+    };
+    let result = inflate_blocks(bits, &mut ring);
+    let result = result.and_then(|()| ring.flush());
+    result.map_err(|error| bits.stop_reason(error))?;
+    Ok(ring.total)
+}
+
+fn inflate_blocks(bits: &mut StreamBits<'_>, ring: &mut Ring<'_, '_>) -> Result<()> {
+    loop {
+        let final_block = bits.read(1)? != 0;
+        let block_type = bits.read(2)?;
+        match block_type {
+            0 => {
+                bits.align();
+                let length = bits.read(16)? as u16;
+                let complement = bits.read(16)? as u16;
+                if length != !complement {
+                    return Err(CompressError::InvalidData("stored block length mismatch"));
+                }
+                for _ in 0..length {
+                    let byte = bits.read(8)? as u8;
+                    ring.push(byte)?;
+                }
+            }
+            1 | 2 => {
+                let (literal, distance) = if block_type == 1 {
+                    fixed_tables()?
+                } else {
+                    dynamic_tables(bits)?
+                };
+                loop {
+                    match literal.decode(bits)? {
+                        symbol @ 0..=255 => ring.push(symbol as u8)?,
+                        256 => break,
+                        symbol @ 257..=285 => {
+                            let index = symbol as usize - 257;
+                            let length =
+                                LENGTH_BASE[index] as usize + bits.read(LENGTH_EXTRA[index])? as usize;
+                            let dist_symbol = distance.decode(bits)? as usize;
+                            if dist_symbol >= 30 {
+                                return Err(CompressError::InvalidData("invalid distance symbol"));
+                            }
+                            let dist = DIST_BASE[dist_symbol] as usize
+                                + bits.read(DIST_EXTRA[dist_symbol])? as usize;
+                            ring.copy_match(dist, length)?;
+                        }
+                        _ => return Err(CompressError::InvalidData("invalid literal symbol")),
+                    }
+                }
+            }
+            _ => return Err(CompressError::InvalidData("invalid deflate block type")),
+        }
+        if final_block {
+            return Ok(());
+        }
+    }
+}
+
+/// Decompresses a raw DEFLATE stream from `input` to `output`.
+///
+/// `window` holds the history and must be at least [`WINDOW_SIZE`] bytes.
+pub fn inflate_stream(
+    input: StreamInput<'_>,
+    window: &mut [u8],
+    output: StreamOutput<'_>,
+) -> Result<StreamResult> {
+    let mut bits = StreamBits::new(input);
+    let written = inflate_bits(&mut bits, window, output)?;
+    Ok(StreamResult {
+        written,
+        consumed: bits.consumed(),
+    })
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    fn pseudo_random(len: usize) -> std::vec::Vec<u8> {
+        let mut state = 0x1234_5678u32;
+        (0..len)
+            .map(|index| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                // Compressible stretches, with far-back repeats.
+                if index % 4096 < 2048 {
+                    (index % 251) as u8
+                } else {
+                    (state >> 24) as u8
+                }
+            })
+            .collect()
+    }
+
+    fn stream(compressed: &[u8], piece: usize) -> Result<(std::vec::Vec<u8>, StreamResult)> {
+        let mut at = 0;
+        let mut input = |buffer: &mut [u8]| -> Result<usize> {
+            let take = piece.min(buffer.len()).min(compressed.len() - at);
+            buffer[..take].copy_from_slice(&compressed[at..at + take]);
+            at += take;
+            Ok(take)
+        };
+        let mut out = std::vec::Vec::new();
+        let mut output = |chunk: &[u8]| -> Result<()> {
+            out.extend_from_slice(chunk);
+            Ok(())
+        };
+        let mut window = std::vec![0u8; WINDOW_SIZE];
+        let result = inflate_stream(&mut input, &mut window, &mut output)?;
+        Ok((out, result))
+    }
+
+    fn compressed_form(data: &[u8]) -> std::vec::Vec<u8> {
+        let mut out = std::vec![0u8; data.len() + data.len() / 2 + 1024];
+        let written = crate::deflate_compress(data, &mut out).unwrap();
+        out.truncate(written);
+        out
+    }
+
+    #[test]
+    fn agrees_with_the_one_shot_decoder_for_any_input_chunking() {
+        let data = pseudo_random(200_000);
+        let compressed = compressed_form(&data);
+        for piece in [1usize, 7, 4096, usize::MAX] {
+            let (out, result) = stream(&compressed, piece).unwrap();
+            assert_eq!(out, data, "input in pieces of {piece}");
+            assert_eq!(result.written, data.len() as u64);
+            assert_eq!(result.consumed, compressed.len() as u64);
+        }
+    }
+
+    #[test]
+    fn output_larger_than_the_window_needs_no_more_memory() {
+        // Well past the window, all zeros, so that matches run across the wrap.
+        let data = std::vec![0u8; 1_000_000];
+        let compressed = compressed_form(&data);
+        let (out, _) = stream(&compressed, 512).unwrap();
+        assert_eq!(out.len(), data.len());
+        assert!(out.iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn stored_blocks_stream_too() {
+        // A stored block by hand: final, type 0, length 3, complement, "abc".
+        let raw = [0b001u8, 3, 0, 0xfc, 0xff, b'a', b'b', b'c'];
+        assert_eq!(stream(&raw, 1).unwrap().0, b"abc");
+        assert_eq!(stream(&raw[..7], 3), Err(CompressError::UnexpectedEnd));
+        let bad = [0b001u8, 3, 0, 0, 0, b'a', b'b', b'c'];
+        assert!(stream(&bad, 3).is_err());
+    }
+
+    #[test]
+    fn a_distance_before_the_start_is_refused_and_junk_never_panics() {
+        // Fixed-table match at distance 1 with nothing written: symbol 257.
+        assert!(stream(&[0x03, 0x02, 0x00], 3).is_err());
+        let mut state = 7u32;
+        for _ in 0..2000 {
+            let junk: std::vec::Vec<u8> = (0..64)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1);
+                    (state >> 24) as u8
+                })
+                .collect();
+            let _ = stream(&junk, 16);
+        }
+    }
+
+    #[test]
+    fn errors_from_the_callbacks_come_back() {
+        let data = pseudo_random(100_000);
+        let compressed = compressed_form(&data);
+        let mut window = std::vec![0u8; WINDOW_SIZE];
+
+        let mut at = 0;
+        let mut input = |buffer: &mut [u8]| -> Result<usize> {
+            let take = buffer.len().min(compressed.len() - at);
+            buffer[..take].copy_from_slice(&compressed[at..at + take]);
+            at += take;
+            Ok(take)
+        };
+        let mut refusing = |_: &[u8]| -> Result<()> { Err(CompressError::Overflow) };
+        assert_eq!(
+            inflate_stream(&mut input, &mut window, &mut refusing),
+            Err(CompressError::Overflow)
+        );
+
+        let mut failing = |_: &mut [u8]| -> Result<usize> { Err(CompressError::Checksum) };
+        let mut sink = |_: &[u8]| -> Result<()> { Ok(()) };
+        assert_eq!(
+            inflate_stream(&mut failing, &mut window, &mut sink),
+            Err(CompressError::Checksum)
+        );
+        let mut tiny = [0u8; 16];
+        let mut empty = |_: &mut [u8]| -> Result<usize> { Ok(0) };
+        assert!(matches!(
+            inflate_stream(&mut empty, &mut tiny, &mut sink),
+            Err(CompressError::BufferTooSmall { .. })
+        ));
+    }
 }

@@ -41,6 +41,8 @@ use feos_sync::SpinLock;
 use feos_text::Text;
 
 /// Number of history samples kept for the performance graphs.
+/// Rows in the process list: every process and every window the desktop draws.
+const MAX_ROWS: usize = MAX_PROCESSES + shell::MAX_WINDOWS;
 const HISTORY: usize = 120;
 /// Height of one process list row.
 const ROW_HEIGHT: i32 = 20;
@@ -136,8 +138,9 @@ impl App for TaskManager {
         tick_task_manager(platform, now_ms);
     }
 
-    fn run(&self, context: &mut Context<'_>) {
+    fn run(&self, context: &mut Context<'_>) -> i32 {
         run(context);
+        0
     }
 }
 
@@ -393,9 +396,9 @@ impl Row {
 
     fn priority_name(&self) -> &'static str {
         match self.priority {
-            0..=5 => "High",
+            0..=5 => "Low",
             6..=10 => "Normal",
-            11..=15 => "Low",
+            11..=15 => "High",
             _ => "Normal",
         }
     }
@@ -423,6 +426,7 @@ enum Dialog {
     Help,
     Properties(u32),
     EndProcess { pid: u32, tab: Tab },
+    EndTree(u32),
 }
 
 /// The edge or corner used to resize the task manager window.
@@ -488,6 +492,7 @@ enum Action {
     NewTask,
     EndTask,
     EndProcess,
+    EndTree,
     Close,
     Refresh,
     SpeedHigh,
@@ -572,7 +577,7 @@ struct State {
     dialog: Dialog,
     dialog_scroll: usize,
 
-    rows: [Row; MAX_PROCESSES],
+    rows: [Row; MAX_ROWS],
     row_count: usize,
     sort: SortKey,
     sort_desc: bool,
@@ -582,7 +587,7 @@ struct State {
     app_scroll: usize,
     user_scroll: usize,
 
-    previous: [Previous; MAX_PROCESSES],
+    previous: [Previous; MAX_ROWS],
     previous_count: usize,
     last_total_ticks: u64,
     last_idle_ticks: u64,
@@ -651,7 +656,7 @@ impl State {
             context: None,
             dialog: Dialog::None,
             dialog_scroll: 0,
-            rows: [Row::EMPTY; MAX_PROCESSES],
+            rows: [Row::EMPTY; MAX_ROWS],
             row_count: 0,
             sort: SortKey::Name,
             sort_desc: false,
@@ -660,7 +665,7 @@ impl State {
             process_scroll: 0,
             app_scroll: 0,
             user_scroll: 0,
-            previous: [Previous::EMPTY; MAX_PROCESSES],
+            previous: [Previous::EMPTY; MAX_ROWS],
             previous_count: 0,
             last_total_ticks: 0,
             last_idle_ticks: 0,
@@ -947,16 +952,36 @@ impl State {
         self.cpu_percent = percentage(busy_delta, total_delta);
 
         let hz = system.ticks_per_second.max(1);
-        let mut rows = [Row::EMPTY; MAX_PROCESSES];
-        let mut previous = [Previous::EMPTY; MAX_PROCESSES];
+        let mut rows = [Row::EMPTY; MAX_ROWS];
+        let mut previous = [Previous::EMPTY; MAX_ROWS];
         let mut row_count = 0;
         let mut previous_count = 0;
         let mut reserved_memory = 0usize;
 
+        // The desktop draws hosted windows on its own thread, so their time is
+        // inside the desktop's. Show it where it belongs.
+        let mut windows = [shell::WindowInfo::empty(); shell::MAX_WINDOWS];
+        let window_count = shell::windows(&mut windows);
+        let windows = &windows[..window_count];
+        let hosted_ticks = |window: &shell::WindowInfo| {
+            (window.cpu_us as u128 * hz as u128 / 1_000_000) as u64
+        };
+        let hosted_total: u64 = windows
+            .iter()
+            .filter(|window| window.hosted)
+            .map(hosted_ticks)
+            .sum();
+
         for info in infos.iter().take(count.min(MAX_PROCESSES)) {
+            // PID 1 is the desktop's thread.
+            let cpu_ticks = if info.pid == 1 {
+                info.cpu_ticks.saturating_sub(hosted_total)
+            } else {
+                info.cpu_ticks
+            };
             previous[previous_count] = Previous {
                 pid: info.pid,
-                cpu_ticks: info.cpu_ticks,
+                cpu_ticks,
             };
             previous_count += 1;
 
@@ -965,7 +990,7 @@ impl State {
             }
 
             let before = self.find_previous(info.pid);
-            let delta = info.cpu_ticks.saturating_sub(before);
+            let delta = cpu_ticks.saturating_sub(before);
             let detail = if details {
                 platform.processes.detail(info.pid)
             } else {
@@ -978,8 +1003,8 @@ impl State {
                 name: Text::from_str(info.name()),
                 state: info.state,
                 cpu_percent: percentage(delta, total_delta),
-                cpu_ticks: info.cpu_ticks,
-                cpu_time_ms: info.cpu_ticks.saturating_mul(1_000) / hz,
+                cpu_ticks,
+                cpu_time_ms: cpu_ticks.saturating_mul(1_000) / hz,
                 // Reserved stacks are all the same size, so what a process has
                 // actually touched is the figure that says something about it.
                 memory_bytes: if detail.stack_size > 0 {
@@ -994,6 +1019,29 @@ impl State {
                 kill_pending: detail.kill_pending,
                 stack_used: detail.stack_used,
                 stack_size: detail.stack_size,
+            };
+            row_count += 1;
+        }
+
+        for window in windows.iter().filter(|window| window.hosted) {
+            let pid = window.list_pid();
+            if row_count == rows.len() {
+                break;
+            }
+            let cpu_ticks = hosted_ticks(window);
+            let delta = cpu_ticks.saturating_sub(self.find_previous(pid));
+            previous[previous_count] = Previous { pid, cpu_ticks };
+            previous_count += 1;
+            rows[row_count] = Row {
+                pid,
+                name: Text::from_str(window.title.as_str()),
+                state: ProcessState::Ready,
+                cpu_percent: percentage(delta, total_delta),
+                cpu_ticks,
+                cpu_time_ms: window.cpu_us / 1_000,
+                threads: 0,
+                priority: 8,
+                ..Row::EMPTY
             };
             row_count += 1;
         }
@@ -1212,6 +1260,17 @@ impl State {
             .map(|row| row.name)
             .unwrap_or_else(|| Text::from_str("process"));
         let mut message = Text::<160>::new();
+        if pid >= shell::HOSTED_PID_BASE {
+            // A window the desktop draws has no process: closing it ends it.
+            let window = (pid - shell::HOSTED_PID_BASE) as u16;
+            if shell::request_close(window) {
+                let _ = write!(message, "Closing '{}'...", name.as_str());
+                self.set_notice(now, message.as_str());
+            } else {
+                self.set_notice(now, "Too many requests are waiting; try again.");
+            }
+            return;
+        }
         match platform.processes.try_kill(pid) {
             KillResult::Killed => {
                 let _ = write!(message, "Ended '{}' (PID {pid}).", name.as_str());
@@ -1230,6 +1289,25 @@ impl State {
                 self.set_notice(now, "Access is denied: this process cannot be ended.");
             }
         }
+    }
+
+    /// Ends `pid` and everything it started, children first.
+    fn confirm_end_tree(&mut self, platform: &Platform, pid: u32, now: u64) {
+        let mut infos = [ProcessInfo::EMPTY; MAX_PROCESSES];
+        let count = platform.processes.snapshot(&mut infos);
+        let mut tree = [0u32; MAX_PROCESSES];
+        let found = feos_app::process_tree(&infos[..count], pid, &mut tree);
+        let current = platform.processes.current();
+        let mut ended = 0;
+        for &member in tree[..found].iter().rev() {
+            if member != current && platform.processes.try_kill(member).accepted() {
+                ended += 1;
+            }
+        }
+        let mut message = Text::<160>::new();
+        let _ = write!(message, "Ended {ended} process(es) in the tree of PID {pid}.");
+        self.set_notice(now, message.as_str());
+        self.sample(platform, now);
     }
 
     fn launch(&mut self, platform: &Platform, now: u64) {
@@ -1284,6 +1362,9 @@ impl State {
             }
             Err(feos_app::SpawnError::NoFreeSlot) => {
                 self.set_notice(now, "No free process slot is available.");
+            }
+            Err(feos_app::SpawnError::Unsupported) => {
+                self.set_notice(now, "This kernel can't start that.");
             }
             Err(feos_app::SpawnError::ArgsTooLong) => {
                 self.set_notice(now, "The command line is too long.");
@@ -1502,7 +1583,7 @@ fn dialog_panel(layout: Layout, dialog: Dialog) -> Rect {
         Dialog::Columns => (330, 470),
         Dialog::Help => (560, 440),
         Dialog::Properties(_) => (480, 400),
-        Dialog::EndProcess { .. } => (440, 200),
+        Dialog::EndProcess { .. } | Dialog::EndTree(_) => (440, 200),
         Dialog::None => (1, 1),
     };
     Rect::new(0, 0, width, height).center_in(layout.window.inset(12))
@@ -1512,7 +1593,7 @@ fn dialog_buttons(dialog: Dialog) -> &'static [&'static str] {
     match dialog {
         Dialog::Run => &["OK", "Cancel"],
         Dialog::Columns => &["OK", "Cancel"],
-        Dialog::EndProcess { .. } => &["Yes", "No"],
+        Dialog::EndProcess { .. } | Dialog::EndTree(_) => &["Yes", "No"],
         Dialog::About | Dialog::Help | Dialog::Properties(_) => &["OK"],
         Dialog::None => &[],
     }
@@ -2230,7 +2311,7 @@ impl State {
     /// with no window must not be started a second time by asking for it. So a
     /// row can only be switched to when its name is a windowed app, which the
     /// session then focuses (or opens).
-    fn switch_to(&mut self, platform: &Platform, now: u64) {
+    fn switch_to(&mut self, _platform: &Platform, now: u64) {
         let Some(row) = self.selected_row().copied() else {
             self.set_notice(now, "Select a task to switch to.");
             return;
@@ -2241,9 +2322,12 @@ impl State {
             self.exit_message = "switching to the desktop";
             return;
         }
+        let mut windows = [shell::WindowInfo::empty(); shell::MAX_WINDOWS];
+        let count = shell::windows(&mut windows);
+        let window = windows[..count].iter().find(|window| window.list_pid() == row.pid);
         let mut message = Text::<160>::new();
-        match platform.apps.find(row.name.as_str()).filter(|app| app.windowed()) {
-            Some(app) if shell::session_active() && shell::request_run(app.name()) => {
+        match window {
+            Some(window) if shell::session_active() && shell::request_activate(window.window) => {
                 let _ = write!(message, "Switching to '{}'...", row.name.as_str());
             }
             _ if row.pid == 1 => {
@@ -2372,6 +2456,12 @@ impl State {
                 self.dialog = Dialog::None;
                 if index == 0 {
                     self.confirm_end(platform, pid, now);
+                }
+            }
+            Dialog::EndTree(pid) => {
+                self.dialog = Dialog::None;
+                if index == 0 {
+                    self.confirm_end_tree(platform, pid, now);
                 }
             }
             Dialog::About | Dialog::Help | Dialog::Properties(_) | Dialog::None => {
@@ -2622,6 +2712,9 @@ impl State {
                 out[count] =
                     MenuItem::new("End Process", Action::EndProcess, on_processes && selected);
                 count += 1;
+                out[count] =
+                    MenuItem::new("End Process Tree", Action::EndTree, on_processes && selected);
+                count += 1;
                 out[count] = MenuItem::separator();
                 count += 1;
                 out[count] = MenuItem::new("Close", Action::Close, true);
@@ -2712,6 +2805,11 @@ impl State {
                 self.dialog = Dialog::Run;
             }
             Action::EndTask | Action::EndProcess => self.end_selected(),
+            Action::EndTree => {
+                if let Some(row) = self.selected_row().copied() {
+                    self.dialog = Dialog::EndTree(row.pid);
+                }
+            }
             Action::Close => {
                 self.exit = true;
                 self.exit_message = "";
@@ -2814,6 +2912,7 @@ fn context_items(tab: Tab) -> &'static [(&'static str, Action)] {
     } else {
         &[
             ("End Process", Action::EndProcess),
+            ("End Process Tree", Action::EndTree),
             ("Properties", Action::Properties),
         ]
     }
@@ -3221,7 +3320,7 @@ fn draw_content(
         Tab::Processes => draw_processes(painter, state, layout),
         Tab::Performance => draw_performance(painter, state, layout),
         Tab::Networking => draw_networking(painter, state, layout),
-        Tab::Users => draw_users(painter, state, layout),
+        Tab::Users => draw_users(painter, layout),
     }
     let _ = (platform, now);
 }
@@ -3741,6 +3840,7 @@ fn draw_resize_grip(painter: &mut Painter<'_, '_>, window: Rect) {
 // ---------------------------------------------------------------------------
 
 fn draw_performance(painter: &mut Painter<'_, '_>, state: &State, layout: Layout) {
+    let span = history_span(state.update);
     let area = content_area(layout);
     let graphs = state.show_cpu_graph || state.show_mem_graph;
     let per_core = state.show_cpu_graph && state.cpu_view == CpuView::PerCore;
@@ -4150,7 +4250,7 @@ fn draw_networking(painter: &mut Painter<'_, '_>, state: &State, layout: Layout)
     let _ = state;
 }
 
-fn draw_users(painter: &mut Painter<'_, '_>, state: &State, layout: Layout) {
+fn draw_users(painter: &mut Painter<'_, '_>, layout: Layout) {
     let list = list_layout(layout);
     painter
         .canvas_mut()
@@ -4440,7 +4540,7 @@ fn dialog_title(dialog: Dialog) -> &'static str {
         Dialog::Columns => "Select Columns",
         Dialog::Help => "Task Manager Help",
         Dialog::Properties(_) => "Process Properties",
-        Dialog::EndProcess { .. } => "Task Manager Warning",
+        Dialog::EndProcess { .. } | Dialog::EndTree(_) => "Task Manager Warning",
         Dialog::None => "",
     }
 }
@@ -4493,7 +4593,9 @@ fn draw_dialog(
         Dialog::Columns => draw_columns_dialog(painter, state, body),
         Dialog::Help => draw_help_dialog(painter, state, body),
         Dialog::Properties(pid) => draw_properties_dialog(painter, state, pid, body),
-        Dialog::EndProcess { pid, .. } => draw_end_dialog(painter, state, pid, body),
+        Dialog::EndProcess { pid, .. } | Dialog::EndTree(pid) => {
+            draw_end_dialog(painter, state, pid, body)
+        }
         Dialog::None => {}
     }
 
@@ -5049,6 +5151,7 @@ mod render_tests {
             memory: Some(&MEMORY),
             apps: &APPS,
             filesystem: None,
+            net: None,
         }
     }
 
@@ -5636,6 +5739,30 @@ mod cursor_tests {
 mod behavior_tests {
     use super::render_tests::{platform, test_state};
     use super::*;
+
+    #[test]
+    fn the_process_tree_lists_parents_before_their_children() {
+        let info = |pid, parent| ProcessInfo {
+            pid,
+            parent,
+            ..ProcessInfo::EMPTY
+        };
+        let infos = [info(1, 0), info(2, 1), info(3, 2), info(4, 3), info(5, 1), info(6, 2)];
+        let mut tree = [0u32; MAX_PROCESSES];
+        let count = feos_app::process_tree(&infos, 2, &mut tree);
+        assert_eq!(&tree[..count], [2, 3, 6, 4]);
+    }
+
+    #[test]
+    fn a_hosted_window_lists_under_a_stand_in_id() {
+        let mut window = shell::WindowInfo::empty();
+        window.window = 3;
+        window.hosted = true;
+        assert_eq!(window.list_pid(), shell::HOSTED_PID_BASE + 3);
+        window.hosted = false;
+        window.pid = Some(9);
+        assert_eq!(window.list_pid(), 9);
+    }
     use feos_app::{Processes, ProcessDetail, SpawnError};
     use std::sync::Mutex;
 
@@ -5793,6 +5920,7 @@ mod behavior_tests {
         let mut canvas = Canvas::new(&mut pixels, 800, 500, 800).unwrap();
         let context = WindowContext {
             args: "",
+            instance: 0,
             canvas: &mut canvas,
             input: &input,
             platform: &platform,
@@ -5848,11 +5976,14 @@ mod behavior_tests {
         }
         fn detail(&self, _pid: u32) -> Option<ProcessDetail> {
             Some(ProcessDetail {
+                stopped: false,
                 blocked: true,
                 kill_pending: false,
                 stack_size: 128 * 1024,
                 stack_used: 8 * 1024,
                 heap_bytes: 2 * 1024,
+                cpu: 0,
+                affinity: 0,
             })
         }
     }
@@ -6171,6 +6302,7 @@ mod fuzz_tests {
                 let mut canvas = Canvas::new(&mut pixels, width, height, width).unwrap();
                 let mut context = WindowContext {
                     args: "",
+                    instance: 0,
                     canvas: &mut canvas,
                     input: &input,
                     platform: &platform,

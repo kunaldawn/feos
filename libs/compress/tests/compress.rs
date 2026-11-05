@@ -393,3 +393,45 @@ fn concatenated_gzip_members() {
     assert_eq!(&out[..PLAIN.len()], PLAIN);
     assert_eq!(&out[PLAIN.len()..], PLAIN);
 }
+
+#[test]
+fn gzip_streaming_agrees_with_one_shot_and_checks_the_trailer() {
+    use feos_compress::{gzip, CompressError, Result, WINDOW_SIZE};
+    let data: Vec<u8> = (0..120_000u32).map(|value| (value / 7) as u8).collect();
+    let mut packed = vec![0u8; data.len() + 4096];
+    let len = gzip::compress(&data, &mut packed).unwrap();
+    packed.truncate(len);
+    // Two members are one stream.
+    let mut twice = packed.clone();
+    twice.extend_from_slice(&packed);
+
+    let run = |input: &[u8]| -> Result<Vec<u8>> {
+        let mut at = 0;
+        let mut read = |buffer: &mut [u8]| -> Result<usize> {
+            let take = buffer.len().min(1000).min(input.len() - at);
+            buffer[..take].copy_from_slice(&input[at..at + take]);
+            at += take;
+            Ok(take)
+        };
+        let mut out = Vec::new();
+        let mut write = |chunk: &[u8]| -> Result<()> {
+            out.extend_from_slice(chunk);
+            Ok(())
+        };
+        let mut window = vec![0u8; WINDOW_SIZE];
+        gzip::decompress_stream(&mut read, &mut window, &mut write)?;
+        Ok(out)
+    };
+    assert_eq!(run(&packed).unwrap(), data);
+    let mut expected = data.clone();
+    expected.extend_from_slice(&data);
+    assert_eq!(run(&twice).unwrap(), expected);
+
+    let mut damaged = packed.clone();
+    let last = damaged.len() - 6;
+    damaged[last] ^= 1;
+    assert_eq!(run(&damaged), Err(CompressError::Checksum));
+    assert_eq!(run(&packed[..packed.len() - 3]), Err(CompressError::UnexpectedEnd));
+    assert_eq!(run(&[]), Err(CompressError::UnexpectedEnd));
+    assert!(run(b"not gzip at all, sorry").is_err());
+}

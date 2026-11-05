@@ -18,9 +18,6 @@ use crate::parser::{
 };
 use crate::{Flow, Host, Io, Shell, Snapshot, MAX_DEPTH};
 
-/// Roughly how much stack one nested compound command needs while parsing.
-const PARSE_STACK_PER_LEVEL: usize = if cfg!(debug_assertions) { 4096 } else { 1536 };
-
 /// Words that take assignments as arguments, so `local x=$y` does not split.
 fn is_declaration(word: &str) -> bool {
     matches!(
@@ -31,7 +28,7 @@ fn is_declaration(word: &str) -> bool {
 
 /// Reads the address of a local to estimate how much stack is in use.
 #[inline(never)]
-fn stack_position() -> usize {
+pub(crate) fn stack_position() -> usize {
     let marker = 0u8;
     core::ptr::addr_of!(marker) as usize
 }
@@ -172,8 +169,9 @@ impl Shell<'_> {
         host: &mut dyn Host,
     ) -> i32 {
         let mut parser = Parser::new(text);
-        let room = self.stack_limit.saturating_sub(self.stack_used());
-        parser.set_max_depth(room / PARSE_STACK_PER_LEVEL);
+        if let Some(base) = self.stack_base {
+            parser.set_stack_bound(base, self.stack_limit);
+        }
         let mut status = 0;
         loop {
             match parser.next_list(Some(&self.aliases)) {
@@ -185,7 +183,12 @@ impl Shell<'_> {
                 }
                 Ok(None) => break,
                 Err(error) => {
-                    self.error(io, &format!("syntax error: {}", error.message));
+                    if error.message == crate::parser::TOO_DEEP {
+                        self.error(io, "maximum nesting depth exceeded");
+                        self.flow = Flow::Abort(2);
+                    } else {
+                        self.error(io, &format!("syntax error: {}", error.message));
+                    }
                     status = 2;
                     self.last_status = 2;
                     break;
@@ -211,7 +214,13 @@ impl Shell<'_> {
         status
     }
 
-    fn run_list(&mut self, list: &List, io: &mut Io<'_>, host: &mut dyn Host) -> i32 {
+    pub(crate) fn run_list(&mut self, list: &List, io: &mut Io<'_>, host: &mut dyn Host) -> i32 {
+        if list.background {
+            if let Some(status) = self.start_job(list, io, host) {
+                self.last_status = status;
+                return status;
+            }
+        }
         // Only the last command of an `&&`/`||` chain can trigger `set -e`.
         let count = list.rest.len();
         if count > 0 {
@@ -248,6 +257,9 @@ impl Shell<'_> {
             }
         }
 
+        if status != 0 && !self.flow.is_active() {
+            self.run_err_trap(io, host);
+        }
         if status != 0
             && self.opts.errexit
             && self.errexit_off == 0
@@ -285,6 +297,9 @@ impl Shell<'_> {
     /// Runs a pipeline: each stage's output is buffered and becomes the next
     /// stage's input.
     fn run_stages(&mut self, commands: &[Command], io: &mut Io<'_>, host: &mut dyn Host) -> i32 {
+        if let Some(status) = self.run_streaming(commands, io, host) {
+            return status;
+        }
         let count = commands.len();
         let mut previous: Option<Vec<u8>> = None;
         let mut status = 0;
@@ -342,7 +357,7 @@ impl Shell<'_> {
         }
     }
 
-    fn stage_needs_isolation(&self, command: &Command) -> bool {
+    pub(crate) fn stage_needs_isolation(&self, command: &Command) -> bool {
         let Command::Simple(simple) = command else {
             return true;
         };
@@ -368,6 +383,10 @@ impl Shell<'_> {
         let snapshot = self.snapshot();
         let saved = self.fds.save();
         let status = body(self, io, host);
+        self.last_status = status;
+        if !matches!(self.flow, Flow::Interrupted) {
+            self.run_exit_trap(io, host);
+        }
         self.finish_redirects(saved, io);
         let flow = core::mem::replace(&mut self.flow, Flow::None);
         self.restore_snapshot(snapshot);
@@ -398,6 +417,7 @@ impl Shell<'_> {
             params: self.params.clone(),
             arg0: self.arg0.clone(),
             opts: self.opts,
+            traps: core::mem::take(&mut self.traps),
             locals: core::mem::take(&mut self.locals),
             loop_depth: self.loop_depth,
             function_depth: self.function_depth,
@@ -417,6 +437,7 @@ impl Shell<'_> {
         self.params = snapshot.params;
         self.arg0 = snapshot.arg0;
         self.opts = snapshot.opts;
+        self.traps = snapshot.traps;
         self.locals = snapshot.locals;
         self.loop_depth = snapshot.loop_depth;
         self.function_depth = snapshot.function_depth;
@@ -826,6 +847,10 @@ impl Shell<'_> {
             for assignment in &command.assignments {
                 if let Err(code) = self.assign(assignment, io, host) {
                     status = code;
+                    // Assigning to a read-only variable ends a script.
+                    if !self.interactive && self.env.is_readonly(&assignment.name) {
+                        self.flow = Flow::Exit(code);
+                    }
                     break;
                 }
             }
@@ -1185,56 +1210,117 @@ impl Shell<'_> {
         background: bool,
     ) -> i32 {
         if name.contains('/') {
+            if self.is_program(name) {
+                return self.run_program(name, args, io, host, background);
+            }
             return self.run_script_path(name, args, io, host);
         }
         if is_command(name) {
             return self.run_coreutil(name, args, io, host);
         }
 
-        let attached = self.fd_is_terminal(io, 0) && self.fd_is_terminal(io, 1);
-        if !attached && host.has_command(name) {
-            self.error(
+        let result = {
+            let view = RefCell::new(StreamView {
+                fds: &mut self.fds,
                 io,
-                "external commands cannot be used in pipelines or with redirection",
-            );
-            return 1;
-        }
-        if attached {
-            let result = {
-                let view = RefCell::new(StreamView {
-                    fds: &mut self.fds,
-                    io,
-                    cancel: &self.cancel,
-                    host: None,
-                    system: self.system,
-                    deadline: self.deadline,
-                    timed_out: &mut self.timed_out,
-                    calls: 0,
-                });
-                let mut stdin = FdInput {
-                    view: &view,
-                    fd: 0,
-                };
-                let mut stdout = FdOutput {
-                    view: &view,
-                    fd: 1,
-                };
-                let mut stderr = FdOutput {
-                    view: &view,
-                    fd: 2,
-                };
-                host.run_external(name, args, &mut stdin, &mut stdout, &mut stderr, background)
+                cancel: &self.cancel,
+                host: None,
+                system: self.system,
+                deadline: self.deadline,
+                timed_out: &mut self.timed_out,
+                calls: 0,
+            });
+            let mut stdin = FdInput {
+                view: &view,
+                fd: 0,
             };
-            if let Some(status) = result {
-                return status;
+            let mut stdout = FdOutput {
+                view: &view,
+                fd: 1,
+            };
+            let mut stderr = FdOutput {
+                view: &view,
+                fd: 2,
+            };
+            host.run_external(name, args, &mut stdin, &mut stdout, &mut stderr, background)
+        };
+        if let Some(status) = result {
+            // The host stopped the command for an interrupt. That ends the line,
+            // as if the shell had seen it itself.
+            if status == 130 {
+                self.cancel.cancel();
             }
+            if self.cancel.is_cancelled() {
+                self.flow = Flow::Interrupted;
+                return 130;
+            }
+            return status;
         }
 
         if let Some(path) = self.find_in_path(name) {
+            if self.is_program(&path) {
+                return self.run_program(&path, args, io, host, background);
+            }
             return self.run_script_path(&path, args, io, host);
         }
         self.write_err(io, &format!("sh: {name}: command not found\n"));
         127
+    }
+
+    /// Whether the file at `path` starts as an ELF image does.
+    fn is_program(&mut self, path: &str) -> bool {
+        let mut magic = [0u8; 4];
+        matches!(self.fs.read_at(path, 0, &mut magic), Ok(4)) && magic == *b"\x7fELF"
+    }
+
+    /// Runs a user program, with its streams wherever this shell's descriptors point.
+    fn run_program(
+        &mut self,
+        path: &str,
+        args: &[String],
+        io: &mut Io<'_>,
+        host: &mut dyn Host,
+        background: bool,
+    ) -> i32 {
+        let absolute = self.fs.resolve(path);
+        let cwd = self.fs.cwd().to_string();
+        let result = {
+            let view = RefCell::new(StreamView {
+                fds: &mut self.fds,
+                io,
+                cancel: &self.cancel,
+                host: None,
+                system: self.system,
+                deadline: self.deadline,
+                timed_out: &mut self.timed_out,
+                calls: 0,
+            });
+            let mut stdin = FdInput {
+                view: &view,
+                fd: 0,
+            };
+            let mut stdout = FdOutput {
+                view: &view,
+                fd: 1,
+            };
+            let mut stderr = FdOutput {
+                view: &view,
+                fd: 2,
+            };
+            host.run_program(&absolute, args, &cwd, &mut stdin, &mut stdout, &mut stderr, background)
+        };
+        let Some(status) = result else {
+            self.error(io, &format!("{path}: cannot execute binary file"));
+            return 126;
+        };
+        if status == 130 {
+            self.cancel.cancel();
+        }
+        if self.cancel.is_cancelled() {
+            self.flow = Flow::Interrupted;
+            return 130;
+        }
+        status
     }
 
     fn run_coreutil(

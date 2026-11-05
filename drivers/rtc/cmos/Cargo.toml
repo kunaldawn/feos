@@ -1,0 +1,13 @@
+[package]
+name = "feos-driver-cmos-rtc"
+description = "PC CMOS real-time clock driver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+feos-hal = { workspace = true }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+feos-port-io = { workspace = true }

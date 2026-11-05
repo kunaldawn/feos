@@ -3,6 +3,7 @@ name = "feos-arch-x86_64"
 description = "x86_64 CPU primitives: boot entry, long-mode setup, IDT, APIC timer and power"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

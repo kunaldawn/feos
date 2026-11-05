@@ -3,14 +3,18 @@ name = "feos-dosbox-app"
 description = "The FEOS-DOS desktop application"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license = "GPL-2.0-or-later"
 
 [dependencies]
 feos-app = { workspace = true }
+feos-audio = { workspace = true }
 feos-console = { workspace = true }
 feos-dosbox = { workspace = true }
 feos-gfx = { workspace = true }
 feos-gui = { workspace = true }
 feos-hal = { workspace = true }
 feos-keys = { workspace = true }
+feos-mixer = { workspace = true }
 feos-sync = { workspace = true }
+feos-text = { workspace = true }

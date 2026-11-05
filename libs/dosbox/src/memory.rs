@@ -37,6 +37,9 @@ pub struct Memory {
     chunks: Vec<Option<Vec<u8>>>,
     /// The address mask: `A20` clear folds addresses onto the first megabyte.
     a20_mask: u32,
+    /// Where the EMS page frame's four pages are mapped now. The CPU's accesses
+    /// go through the bus, but DOS's own transfers look here.
+    ems_frame: [Option<u32>; 4],
 }
 
 impl Default for Memory {
@@ -54,6 +57,7 @@ impl Memory {
             data: vec![0; LOW_SIZE as usize],
             chunks,
             a20_mask: !(1 << 20),
+            ems_frame: [None; 4],
         }
     }
 
@@ -63,6 +67,23 @@ impl Memory {
 
     pub fn is_empty(&self) -> bool {
         false
+    }
+
+    /// Records where the EMS page frame is mapped.
+    pub fn set_ems_frame(&mut self, frame: [Option<u32>; 4]) {
+        self.ems_frame = frame;
+    }
+
+    /// The address behind one in the EMS page frame: `Some(None)` for a page
+    /// that isn't mapped, and `None` for an address outside the frame.
+    #[inline]
+    pub fn ems_address(&self, addr: u32) -> Option<Option<u32>> {
+        let offset = addr.wrapping_sub(crate::xms::EMS_FRAME);
+        if offset >= 0x1_0000 {
+            return None;
+        }
+        let page = (offset / 0x4000) as usize;
+        Some(self.ems_frame[page].map(|base| base + offset % 0x4000))
     }
 
     /// Sets the state of the A20 gate.
@@ -136,11 +157,42 @@ impl Memory {
         }
     }
 
+    /// The bytes of a backed extended chunk from `at`, if `len` of them are in it:
+    /// the page map's fast path for wider accesses.
+    #[inline(always)]
+    fn page(&self, at: u32, len: usize) -> Option<&[u8]> {
+        if !(LOW_SIZE..TOP).contains(&at) {
+            return None;
+        }
+        let offset = at as usize & (CHUNK_SIZE - 1);
+        if offset + len > CHUNK_SIZE {
+            return None;
+        }
+        let chunk = self.chunks[((at - LOW_SIZE) >> CHUNK_SHIFT) as usize].as_ref()?;
+        chunk.get(offset..offset + len)
+    }
+
+    #[inline(always)]
+    fn page_mut(&mut self, at: u32, len: usize) -> Option<&mut [u8]> {
+        if !(LOW_SIZE..TOP).contains(&at) {
+            return None;
+        }
+        let offset = at as usize & (CHUNK_SIZE - 1);
+        if offset + len > CHUNK_SIZE {
+            return None;
+        }
+        let chunk = self.chunks[((at - LOW_SIZE) >> CHUNK_SHIFT) as usize].as_mut()?;
+        chunk.get_mut(offset..offset + len)
+    }
+
     #[inline(always)]
     pub fn read16(&self, addr: u32) -> u16 {
         let at = (addr & self.a20_mask) as usize;
         if at + 1 < LOW_SIZE as usize {
             return u16::from_le_bytes([self.data[at], self.data[at + 1]]);
+        }
+        if let Some(bytes) = self.page(at as u32, 2) {
+            return u16::from_le_bytes([bytes[0], bytes[1]]);
         }
         self.read8(addr) as u16 | ((self.read8(addr.wrapping_add(1)) as u16) << 8)
     }
@@ -150,6 +202,10 @@ impl Memory {
         let at = (addr & self.a20_mask) as usize;
         if at + 1 < LOW_SIZE as usize {
             self.data[at..at + 2].copy_from_slice(&value.to_le_bytes());
+            return;
+        }
+        if let Some(bytes) = self.page_mut(at as u32, 2) {
+            bytes[..2].copy_from_slice(&value.to_le_bytes());
             return;
         }
         self.write8(addr, value as u8);
@@ -167,6 +223,9 @@ impl Memory {
                 self.data[at + 3],
             ]);
         }
+        if let Some(bytes) = self.page(at as u32, 4) {
+            return u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        }
         self.read16(addr) as u32 | ((self.read16(addr.wrapping_add(2)) as u32) << 16)
     }
 
@@ -175,6 +234,10 @@ impl Memory {
         let at = (addr & self.a20_mask) as usize;
         if at + 3 < LOW_SIZE as usize {
             self.data[at..at + 4].copy_from_slice(&value.to_le_bytes());
+            return;
+        }
+        if let Some(bytes) = self.page_mut(at as u32, 4) {
+            bytes[..4].copy_from_slice(&value.to_le_bytes());
             return;
         }
         self.write16(addr, value as u16);

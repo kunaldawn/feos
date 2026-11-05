@@ -4,7 +4,9 @@ version: 1.0.0
 entry: terminal
 category: System
 description: Bash-compatible shell with POSIX core utilities
-icon: icon.bmp
+icon: icon.ico
+icon_medium: icon-32.ico
+icon_small: icon-16.ico
 window:
   width: 760
   height: 520

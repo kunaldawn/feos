@@ -175,13 +175,11 @@ impl Header {
         self.0[3] & 0x20 != 0
     }
     // This is only used for Layer 1/2
-    #[expect(unused)]
     fn get_stereo_mode(self) -> u8 {
         (self.0[3] >> 6) & 3
     }
 
     // This is only used for Layer 1/2
-    #[expect(unused)]
     fn get_stereo_mode_ext(self) -> u8 {
         (self.0[3] >> 4) & 3
     }
@@ -1063,8 +1061,39 @@ impl Decoder {
             self.l3_save_reservoir(&scratch);
             success as usize * self.header.frame_samples()
         } else {
-            // optional TODO: implement level 1 & 2
-            0
+            let mut sci = L12ScaleInfo::new();
+            l12_read_scale_info(header, &mut bs_frame, &mut sci);
+            scratch.grbuf = [[0.0; 576]; 2];
+            let mut at = 0;
+            let mut written = 0;
+            for igr in 0..3 {
+                at += l12_dequantize_granule(
+                    &mut scratch.grbuf,
+                    at,
+                    &mut bs_frame,
+                    &sci,
+                    info.layer | 1,
+                );
+                if at == 12 {
+                    at = 0;
+                    l12_apply_scf_384(&sci, igr, &mut scratch.grbuf);
+                    mp3d_synth_granule(
+                        &mut self.qmf_state,
+                        &mut scratch.grbuf,
+                        12,
+                        info.channels,
+                        &mut pcm[written..],
+                        &mut scratch.syn,
+                    );
+                    scratch.grbuf = [[0.0; 576]; 2];
+                    written += 384 * info.channels;
+                }
+                if bs_frame.core.pos > bs_frame.core.limit {
+                    *self = Self::new();
+                    return 0;
+                }
+            }
+            self.header.frame_samples()
         }
     }
 
@@ -1636,6 +1665,202 @@ fn mp3d_scale_pcm(sample: f32) -> Sample {
 }
 
 #[allow(clippy::identity_op, clippy::erasing_op)]
+/// Layers I and II. Ported from minimp3 by the same route as the rest of this
+/// module; minimp3 is under CC0.
+struct L12ScaleInfo {
+    /// Three values for each channel of each band.
+    scf: [f32; 3 * 64],
+    total_bands: usize,
+    stereo_bands: usize,
+    bitalloc: [u8; 64],
+    scfcod: [u8; 64],
+}
+
+impl L12ScaleInfo {
+    fn new() -> Self {
+        Self {
+            scf: [0.0; 3 * 64],
+            total_bands: 0,
+            stereo_bands: 0,
+            bitalloc: [0; 64],
+            scfcod: [0; 64],
+        }
+    }
+}
+
+/// `(code table offset, bits per code, bands)`.
+type L12Alloc = (usize, usize, usize);
+
+const ALLOC_L1: &[L12Alloc] = &[(76, 4, 32)];
+const ALLOC_L2M2: &[L12Alloc] = &[(60, 4, 4), (44, 3, 7), (44, 2, 19)];
+const ALLOC_L2M1: &[L12Alloc] = &[(0, 4, 3), (16, 4, 8), (32, 3, 12), (40, 2, 7)];
+const ALLOC_L2M1_LOWRATE: &[L12Alloc] = &[(44, 4, 2), (44, 3, 10)];
+
+const MODE_MONO: u8 = 3;
+const MODE_JOINT_STEREO: u8 = 1;
+
+fn l12_subband_alloc(header: Header, sci: &mut L12ScaleInfo) -> &'static [L12Alloc] {
+    let mode = header.get_stereo_mode();
+    let stereo_bands = if mode == MODE_MONO {
+        0
+    } else if mode == MODE_JOINT_STEREO {
+        ((header.get_stereo_mode_ext() as usize) << 2) + 4
+    } else {
+        32
+    };
+    let (alloc, bands) = if header.is_layer_1() {
+        (ALLOC_L1, 32)
+    } else if !header.test_mpeg1() {
+        (ALLOC_L2M2, 30)
+    } else {
+        let sample_rate = header.get_sample_rate();
+        let mut kbps = header.bitrate_kbps() >> usize::from(mode != MODE_MONO);
+        if kbps == 0 {
+            kbps = 192;
+        }
+        if kbps < 56 {
+            (ALLOC_L2M1_LOWRATE, if sample_rate == 2 { 12 } else { 8 })
+        } else if kbps >= 96 && sample_rate != 1 {
+            (ALLOC_L2M1, 30)
+        } else {
+            (ALLOC_L2M1, 27)
+        }
+    };
+    sci.total_bands = bands;
+    sci.stereo_bands = stereo_bands.min(bands);
+    alloc
+}
+
+fn l12_read_scalefactors(bs: &mut Bs, sci: &mut L12ScaleInfo) {
+    // 2^-20, and that times 2^(-1/3) and 2^(-2/3), in the order the three
+    // fractions of a scale step come in.
+    const BASE: [f32; 3] = [9.53674316e-07, 7.56931807e-07, 6.00777173e-07];
+    const DIVISORS: [f32; 18] = [
+        3.0, 7.0, 15.0, 31.0, 63.0, 127.0, 255.0, 511.0, 1023.0, 2047.0, 4095.0, 8191.0, 16383.0,
+        32767.0, 65535.0, 3.0, 5.0, 9.0,
+    ];
+    let mut at = 0;
+    for band in 0..sci.total_bands * 2 {
+        let mut value = 0.0f32;
+        let ba = sci.bitalloc[band] as usize;
+        let mask = if ba != 0 {
+            4 + ((19u32 >> sci.scfcod[band]) & 3)
+        } else {
+            0
+        };
+        let mut m = 4;
+        while m != 0 {
+            if mask & m != 0 {
+                let b = bs.get_bits(6) as usize;
+                let index = ba.saturating_sub(2).min(DIVISORS.len() - 1);
+                let exponent = 21i32 - (b / 3) as i32;
+                let power = if exponent >= 0 {
+                    (1u32 << exponent) as f32
+                } else {
+                    0.0
+                };
+                value = BASE[b % 3] / DIVISORS[index] * power;
+            }
+            sci.scf[at] = value;
+            at += 1;
+            m >>= 1;
+        }
+    }
+}
+
+fn l12_read_scale_info(header: Header, bs: &mut Bs, sci: &mut L12ScaleInfo) {
+    const CODES: [u8; 92] = [
+        0, 17, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, //
+        0, 17, 18, 3, 19, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 16, //
+        0, 17, 18, 3, 19, 4, 5, 16, //
+        0, 17, 18, 16, //
+        0, 17, 18, 19, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, //
+        0, 17, 18, 3, 19, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, //
+        0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+    ];
+    let alloc = l12_subband_alloc(header, sci);
+    let mut next = alloc.iter();
+    let (mut limit, mut bits, mut table) = (0usize, 0usize, 0usize);
+    for band in 0..sci.total_bands {
+        if band == limit {
+            if let Some(&(offset, width, count)) = next.next() {
+                limit += count;
+                bits = width;
+                table = offset;
+            }
+        }
+        let mut ba = CODES[table + bs.get_bits(bits) as usize];
+        sci.bitalloc[2 * band] = ba;
+        if band < sci.stereo_bands {
+            ba = CODES[table + bs.get_bits(bits) as usize];
+        }
+        sci.bitalloc[2 * band + 1] = if sci.stereo_bands != 0 { ba } else { 0 };
+    }
+    for band in 0..2 * sci.total_bands {
+        sci.scfcod[band] = if sci.bitalloc[band] == 0 {
+            6
+        } else if header.is_layer_1() {
+            2
+        } else {
+            bs.get_bits(2) as u8
+        };
+    }
+    l12_read_scalefactors(bs, sci);
+    for band in sci.stereo_bands..sci.total_bands {
+        sci.bitalloc[2 * band + 1] = 0;
+    }
+}
+
+/// Reads four groups of samples, starting `at` in each band. Returns how many
+/// samples that was per band.
+fn l12_dequantize_granule(
+    grbuf: &mut [[f32; 576]; 2],
+    at: usize,
+    bs: &mut Bs,
+    sci: &L12ScaleInfo,
+    group_size: usize,
+) -> usize {
+    for group in 0..4 {
+        let start = at + group_size * group;
+        for index in 0..2 * sci.total_bands {
+            let ba = sci.bitalloc[index] as usize;
+            if ba == 0 {
+                continue;
+            }
+            let target = &mut grbuf[index % 2][index / 2 * 18 + start..][..group_size];
+            if ba < 17 {
+                let half = (1i32 << (ba - 1)) - 1;
+                for slot in target.iter_mut() {
+                    *slot = (bs.get_bits(ba) as i32 - half) as f32;
+                }
+            } else {
+                let modulus = (2u32 << (ba - 17)) + 1;
+                let mut code = bs.get_bits((modulus + 2 - (modulus >> 3)) as usize);
+                for slot in target.iter_mut() {
+                    *slot = ((code % modulus) as i32 - (modulus / 2) as i32) as f32;
+                    code /= modulus;
+                }
+            }
+        }
+    }
+    group_size * 4
+}
+
+fn l12_apply_scf_384(sci: &L12ScaleInfo, igr: usize, grbuf: &mut [[f32; 576]; 2]) {
+    let [left, right] = grbuf;
+    let from = sci.stereo_bands * 18;
+    let to = sci.total_bands * 18;
+    right[from..to].copy_from_slice(&left[from..to]);
+    for band in 0..sci.total_bands {
+        let scale_left = sci.scf[band * 6 + igr];
+        let scale_right = sci.scf[band * 6 + 3 + igr];
+        for k in 0..12 {
+            left[band * 18 + k] *= scale_left;
+            right[band * 18 + k] *= scale_right;
+        }
+    }
+}
+
 fn mp3d_synth_pair(pcm: &mut [Sample], nch: usize, z: &[f32]) {
     let mut a = (z[14 * 64] - z[0]) * 29.;
     a += (z[1 * 64] + z[13 * 64]) * 213.;

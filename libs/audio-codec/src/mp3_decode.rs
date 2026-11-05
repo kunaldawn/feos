@@ -1,7 +1,8 @@
-//! Streaming MP3 (MPEG-1/2/2.5 Layer III) decoding.
+//! Streaming MPEG audio decoding: MP3, and Layers I and II.
 //!
 //! The actual decoder is a vendored copy of Raph Levien's safe-Rust port of
-//! minimp3 (MIT OR Apache-2.0). See `src/mp3/mod.rs` for attribution.
+//! minimp3 (MIT OR Apache-2.0), with Layers I and II ported here from minimp3
+//! itself (CC0). See `src/mp3/mod.rs` for attribution.
 
 use crate::error::{AudioError, Result};
 use crate::mp3::{Decoder, FrameInfo, MAX_SAMPLES_PER_FRAME};
@@ -53,9 +54,6 @@ impl Mp3Decoder {
     /// A return value of zero means no further frame could be found. Frames
     /// that cannot be decoded yet (for example the first frame before the bit
     /// reservoir is filled) consume input but append no samples.
-    ///
-    /// A Layer I or Layer II frame returns
-    /// [`AudioError::UnsupportedFeature`]: only Layer III is implemented.
     pub fn decode_frame(
         &mut self,
         input: &[u8],
@@ -71,9 +69,6 @@ impl Mp3Decoder {
         let consumed = self.frame.frame_bytes;
         if consumed == 0 {
             return Ok(0);
-        }
-        if matches!(self.frame.layer, 1 | 2) {
-            return Err(AudioError::UnsupportedFeature("MP3 layer"));
         }
         if self.frame.channels != 0 {
             self.channels = self.frame.channels;
@@ -111,9 +106,6 @@ pub fn info(input: &[u8]) -> Result<AudioInfo> {
             break;
         }
         if samples != 0 {
-            if frame.layer != 3 {
-                return Err(AudioError::UnsupportedFeature("MP3 layer"));
-            }
             if channels == 0 {
                 sample_rate = frame.hz;
                 channels = frame.channels;

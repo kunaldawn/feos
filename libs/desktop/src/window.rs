@@ -128,6 +128,10 @@ pub struct DesktopWindow {
     pub hidden_by_show_desktop: bool,
     /// Uptime of the app's last frame, for per-window animation periods.
     pub last_frame_ms: u64,
+    /// Time spent drawing this window's app, in microseconds.
+    pub cpu_us: u64,
+    /// The status its app's task died with, if it did.
+    pub failed: Option<i32>,
     /// Window title.
     pub title: Text<TITLE_MAX>,
     /// Current rectangle.
@@ -164,6 +168,8 @@ impl DesktopWindow {
         title_moved: false,
         hidden_by_show_desktop: false,
         last_frame_ms: 0,
+    cpu_us: 0,
+    failed: None,
         title: Text::EMPTY,
         rect: Rect::new(0, 0, 0, 0),
         restore: Rect::new(0, 0, 0, 0),
@@ -221,7 +227,19 @@ impl<const N: usize> WindowManager<N> {
             self.focus(index);
             return Some(index);
         }
+        self.open_new(app, title, work_area, default_width, default_height, cascade)
+    }
 
+    /// Opens a window for `app`, even if it already has one.
+    pub fn open_new(
+        &mut self,
+        app: usize,
+        title: &str,
+        work_area: Rect,
+        default_width: u32,
+        default_height: u32,
+        cascade: i32,
+    ) -> Option<usize> {
         let index = self.windows.iter().position(|window| !window.open)?;
         let offset = (self.next_z as i32 % 6) * cascade.max(0);
         // Keep the wallpaper's icon column visible for normal windows. The

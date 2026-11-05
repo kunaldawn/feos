@@ -10,7 +10,13 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod arch;
+pub mod display;
 pub mod dma;
+pub mod net;
+pub mod time;
+
+pub use arch::{Arch, FaultDetails, FirmwareConduit, PageAccess, PageBits, SecondaryEntry, TrapContext};
 
 /// A byte-oriented character device (UART, virtual console, ...).
 ///
@@ -77,6 +83,68 @@ pub trait Clock: Sync {
     fn idle_ms(&self, ms: u64) {
         self.spin_ms(ms);
     }
+
+    /// Wall-clock seconds since the Unix epoch, when the machine has a clock
+    /// that knows the date. The default is a port without one.
+    fn unix_time(&self) -> Option<u64> {
+        None
+    }
+}
+
+/// Why a block device refused or failed a transfer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BlockIoError {
+    /// The device reported a failure, or stopped answering.
+    Io,
+    /// The range falls outside the device, or isn't whole blocks.
+    OutOfRange,
+    /// The device is write-protected.
+    ReadOnly,
+}
+
+/// A device that transfers whole blocks: a disk, seen from the driver's side.
+///
+/// Calls don't overlap, because the caller owns the device. `feos-fs` builds
+/// partitions, a buffer cache and filesystems on top.
+pub trait BlockIo: Send {
+    /// Logical block size in bytes, a power of two.
+    fn block_size(&self) -> usize;
+
+    /// Number of blocks.
+    fn block_count(&self) -> u64;
+
+    /// True when writes will be refused.
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
+    /// Reads whole blocks starting at `start`.
+    fn read(&mut self, start: u64, out: &mut [u8]) -> Result<(), BlockIoError>;
+
+    /// Writes whole blocks starting at `start`.
+    fn write(&mut self, start: u64, data: &[u8]) -> Result<(), BlockIoError>;
+
+    /// Returns once everything written so far is on the medium.
+    fn flush(&mut self) -> Result<(), BlockIoError>;
+}
+
+/// Counters from the USB host controller, for proving things work.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UsbStats {
+    /// Devices configured.
+    pub devices: u32,
+    /// Keyboard reports taken.
+    pub keyboard_reports: u32,
+    /// Pointer reports taken.
+    pub pointer_reports: u32,
+    /// SCSI commands sent to disks.
+    pub storage_commands: u32,
+}
+
+/// A battery-backed clock that knows the date.
+pub trait RealTimeClock: Sync {
+    /// Seconds since 1970-01-01 00:00:00 UTC, or `None` if the clock can't say.
+    fn unix_time(&self) -> Option<u64>;
 }
 
 /// Converts a counter value to milliseconds.
@@ -107,13 +175,13 @@ pub const fn next_deadline(previous: u64, period: u64, now: u64) -> u64 {
 
 /// A snapshot of the kernel's memory accounting.
 ///
-/// `total_bytes`, `used_bytes` and `free_bytes` describe the whole loaded
-/// system (kernel image, `.bss`, stacks and the heap). The heap-specific
+/// `total_bytes`, `used_bytes` and `free_bytes` describe the machine's RAM: the
+/// kernel image, `.bss`, stacks, the heap and what's free. The heap-specific
 /// figures let the task manager show commit charge separately from physical
 /// memory.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct MemoryInfo {
-    /// Total memory owned by the loaded system image.
+    /// RAM the machine has, as far as the kernel can use it.
     pub total_bytes: usize,
     /// Memory in use by the image, stacks and live heap allocations.
     pub used_bytes: usize,
@@ -307,11 +375,30 @@ pub trait InterruptController: Sync {
         id == 1023
     }
 
+    /// Says how a device line behaves and which CPU takes it. Call before
+    /// [`enable`](Self::enable). The default suits a controller with one CPU.
+    fn configure(&self, _irq: u32, _trigger: IrqTrigger, _cpu: usize) {}
+
     /// Sends an inter-processor interrupt.
     ///
     /// `id` is a controller-specific number, published by the board. The
     /// default does nothing, which is correct for a single-CPU controller.
     fn send_ipi(&self, _target: IpiTarget, _id: u32) {}
+
+    /// Interrupts every other CPU in a way masking can't hold off, for stopping
+    /// the machine. Returns `false` when the controller can't, as a GICv2 can't.
+    fn send_stop_nmi(&self) -> bool {
+        false
+    }
+}
+
+/// How a device signals an interrupt.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IrqTrigger {
+    /// The line stays asserted until the device is told to stop.
+    Level,
+    /// A pulse, which is what message-signalled interrupts become.
+    Edge,
 }
 
 /// An acknowledged interrupt.
@@ -371,8 +458,6 @@ pub trait Board {
     const CONSOLE_NAME: &'static str;
     /// Address of the console device.
     const CONSOLE_BASE: usize;
-    /// Name of the interrupt controller, used by the boot log.
-    const INTERRUPT_CONTROLLER_NAME: &'static str;
     /// Name of the pointer device family, used by the boot log.
     const POINTER_NAME: &'static str;
     /// Hint shown when no pointer was found.
@@ -389,6 +474,8 @@ pub trait Board {
     const IPI_RESCHEDULE: u32;
     /// CPUs the board can bring up.
     const MAX_CPUS: usize;
+    /// RAM at or above this address isn't mapped cached, so it isn't used.
+    const RAM_LIMIT: u64;
 
     /// The framebuffer canvas.
     type Display;
@@ -406,12 +493,22 @@ pub trait Board {
     /// This must not depend on any lock or on mutable state, which a failure may
     /// have corrupted.
     fn write_emergency(bytes: &[u8]);
+    /// Reads what firmware says about the machine from the pointer it passed to
+    /// the kernel. Runs once, first thing, with only the console up.
+    fn init_boot_info(boot_info: usize);
+    /// RAM ranges firmware reported, as `(base, size)`. Returns how many it wrote.
+    /// None at all means the machine didn't say.
+    fn usable_ram(out: &mut [(u64, u64)]) -> usize;
+    /// How many CPUs firmware says this machine has, at most [`MAX_CPUS`](Self::MAX_CPUS).
+    fn cpu_count() -> usize;
     /// Initializes the interrupt controller and the timer on the boot CPU.
     fn init_interrupts();
     /// Initializes the calling secondary CPU's interrupt state.
     fn init_cpu_interrupts();
     /// Returns the interrupt controller.
     fn interrupts() -> &'static dyn InterruptController;
+    /// Name of the interrupt controller, used by the boot log.
+    fn interrupt_controller_name() -> &'static str;
     /// Firmware affinity value for a logical CPU index.
     fn cpu_mpidr(index: usize) -> u64;
 
@@ -432,8 +529,38 @@ pub trait Board {
     fn init_keyboard() -> bool;
     /// Returns the keyboard shared with apps, when one was initialised.
     fn keyboard() -> Option<&'static dyn Keyboard>;
+    /// Everything below this, or below the kernel's image if that's lower, is off
+    /// limits to the frame allocator.
+    const LOW_RESERVED: u64 = u64::MAX;
+
+    /// How firmware says it's reached.
+    fn firmware_conduit() -> FirmwareConduit {
+        FirmwareConduit::Unknown
+    }
+    /// Brings up the first network card, if the machine has one.
+    fn init_network() -> Option<net::NetBinding> {
+        None
+    }
+    /// Brings up the USB host controller, if the machine has one. Runs after the
+    /// display, whose size a USB pointer maps to, and before anything asks for input
+    /// devices or disks.
+    fn init_usb(_clock: &'static dyn Clock) {}
+    /// Counters from the USB host controller, when there is one.
+    fn usb_stats() -> Option<UsbStats> {
+        None
+    }
     /// Returns the filesystem apps browse.
     fn filesystem() -> &'static Self::FileSystem;
+
+    /// The driver behind the display, for the boot log.
+    fn display_name() -> &'static str {
+        "ramfb"
+    }
+
+    /// Wall-clock seconds since the Unix epoch, when the board has a clock.
+    fn unix_time() -> Option<u64> {
+        None
+    }
 
     /// Address range `[start, end)` of the loaded kernel image.
     fn kernel_range() -> (usize, usize);

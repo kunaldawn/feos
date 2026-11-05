@@ -3,6 +3,7 @@ name = "feos-sched"
 description = "Scheduler policy and task state machine, split from the kernel so it can be tested on the host"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [lib]

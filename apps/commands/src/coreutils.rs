@@ -1,7 +1,7 @@
 //! `coreutils`: list or describe the POSIX utilities built into the shell.
 
 use feos_app::{App, Context};
-use feos_console::{print, println};
+use feos_console::{eprintln, print, println};
 
 /// The `coreutils` application.
 pub struct CoreUtils;
@@ -23,15 +23,14 @@ impl App for CoreUtils {
         "list POSIX utilities available in the terminal"
     }
 
-    fn run(&self, context: &mut Context<'_>) {
-        let name = context.args.trim();
-        if name.is_empty() {
+    fn run(&self, context: &mut Context<'_>) -> i32 {
+        let Some(name) = context.argv.first().copied() else {
             println!("coreutils ({} commands):", feos_coreutils::COMMANDS.len());
             for spec in feos_coreutils::COMMANDS {
                 println!("  {:<18} {}", spec.usage, spec.description);
             }
-            return;
-        }
+            return 0;
+        };
 
         match feos_coreutils::command(name) {
             Some(spec) => {
@@ -46,8 +45,12 @@ impl App for CoreUtils {
                     }
                     println!();
                 }
+                0
             }
-            None => println!("coreutils: unknown command '{name}'"),
+            None => {
+                eprintln!("coreutils: unknown command '{name}'");
+                1
+            }
         }
     }
 }

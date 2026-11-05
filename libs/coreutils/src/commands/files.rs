@@ -694,6 +694,21 @@ pub(super) fn touch(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
     let mut status = 0;
     for file in files {
         if ctx.fs.exists(&file) {
+            if let Some(now) = ctx.system.unix_time() {
+                let times = feos_fs::NodeTimes {
+                    modified: Some(now),
+                    accessed: Some(now),
+                    created: None,
+                };
+                // A filesystem with no timestamps has nothing to update.
+                match ctx.fs.set_times(&file, times) {
+                    Ok(()) | Err(FsError::NotSupported) => {}
+                    Err(err) => {
+                        path_error(ctx.stderr, "touch", &file, err);
+                        status = 1;
+                    }
+                }
+            }
             continue;
         }
         if no_create {
@@ -732,6 +747,19 @@ pub(super) fn stat(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
             ctx.stdout,
             format_args!("  Size: {:<10} Type: {kind}", meta.size),
         );
+        if let Ok(target) = ctx.fs.read_link(path) {
+            write_line(ctx.stdout, format_args!("  Link: {target}"));
+        }
+        if let Some(modified) = ctx.fs.times(path).and_then(|times| times.modified) {
+            let date = feos_hal::time::DateTime::from_unix(modified);
+            write_line(
+                ctx.stdout,
+                format_args!(
+                    "Modify: {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+                    date.year, date.month, date.day, date.hour, date.minute, date.second
+                ),
+            );
+        }
         if meta.kind == Kind::Dir {
             match ctx.fs.read_dir(&absolute) {
                 Ok(entries) => write_line(ctx.stdout, format_args!("  Entries: {}", entries.len())),
@@ -907,8 +935,112 @@ fn du_walk(
     Ok(size)
 }
 
+/// `sync`: everything so far reaches the disk before this returns.
+pub(super) fn sync(_args: &[String], ctx: &mut Ctx<'_>) -> i32 {
+    match ctx.fs.sync() {
+        Ok(()) => 0,
+        Err(err) => {
+            error(ctx.stderr, "sync", err.text());
+            1
+        }
+    }
+}
+
+/// `mount`: lists what's attached. Attaching is left to the kernel for now.
+pub(super) fn mount(_args: &[String], ctx: &mut Ctx<'_>) -> i32 {
+    for mount in ctx.fs.mounts() {
+        let mode = if mount.read_only || mount.stats.read_only {
+            "ro"
+        } else {
+            "rw"
+        };
+        write_line(
+            ctx.stdout,
+            format_args!("{} on {} type {} ({mode})", mount.source, mount.path, mount.stats.kind),
+        );
+    }
+    0
+}
+
+/// `ln -s TARGET LINK`. Links must be symbolic: FAT has no hard links.
+pub(super) fn ln(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
+    let mut symbolic = false;
+    let mut opts = Opts::new(args, "s");
+    while let Some(opt) = opts.next() {
+        match opt {
+            Opt::Flag('s') => symbolic = true,
+            other => return bad_option(ctx, "ln", other),
+        }
+    }
+    let operands = core::mem::take(&mut opts.operands);
+    let [target, link] = operands.as_slice() else {
+        return usage(ctx.stderr, "ln", "ln -s TARGET LINK");
+    };
+    if !symbolic {
+        error(ctx.stderr, "ln", "hard links are not supported; use -s");
+        return 1;
+    }
+    match ctx.fs.symlink(target, link) {
+        Ok(()) => 0,
+        Err(err) => {
+            path_error(ctx.stderr, "ln", link, err);
+            1
+        }
+    }
+}
+
+/// `readlink LINK`.
+pub(super) fn readlink(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
+    let [link] = args else {
+        return usage(ctx.stderr, "readlink", "readlink LINK");
+    };
+    match ctx.fs.read_link(link) {
+        Ok(target) => {
+            write_line(ctx.stdout, format_args!("{target}"));
+            0
+        }
+        Err(err) => {
+            path_error(ctx.stderr, "readlink", link, err);
+            1
+        }
+    }
+}
+
 pub(super) fn df(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
     let human = args.iter().any(|arg| arg.contains('h'));
+    let mounts = ctx.fs.mounts();
+    if !mounts.is_empty() {
+        write_line(
+            ctx.stdout,
+            format_args!("Filesystem      Size      Used     Avail Use% Mounted on"),
+        );
+        for mount in mounts {
+            let unit = mount.stats.block_size as usize;
+            let total = mount.stats.total_blocks as usize * unit;
+            let free = mount.stats.free_blocks as usize * unit;
+            let used = total.saturating_sub(free);
+            let percent = if total == 0 { 0 } else { used.saturating_mul(100) / total };
+            let show = |bytes: usize| {
+                if human {
+                    format_size(bytes)
+                } else {
+                    format!("{bytes}")
+                }
+            };
+            write_line(
+                ctx.stdout,
+                format_args!(
+                    "{:<15} {:>4} {:>9} {:>9} {percent:>3}% {}",
+                    mount.source,
+                    show(total),
+                    show(used),
+                    show(free),
+                    mount.path
+                ),
+            );
+        }
+        return 0;
+    }
     let Some(memory) = ctx.system.memory() else {
         error(ctx.stderr, "df", "no memory accounting available");
         return 1;

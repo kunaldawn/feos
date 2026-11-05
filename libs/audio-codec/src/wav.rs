@@ -125,13 +125,30 @@ pub fn decode(input: &[u8], out: &mut [i16]) -> Result<DecodedAudio> {
             available: out.len(),
         });
     }
-    let data = &input[format.data_offset..format.data_offset + format.data_len];
+    read_frames(input, 0, out)?;
+    Ok(DecodedAudio {
+        info: AudioInfo {
+            sample_rate: format.sample_rate,
+            channels: format.channels,
+            frames: frame_count as u64,
+            format: AudioFormat::Wav,
+        },
+        frames: frame_count,
+    })
+}
+
+/// Decodes as many frames as fit in `out`, from frame `start`, and returns how
+/// many that was.
+pub(crate) fn read_frames(input: &[u8], start: usize, out: &mut [i16]) -> Result<usize> {
+    let format = parse(input)?;
     let channels = format.channels as usize;
+    let frame_count = frames(&format).saturating_sub(start).min(out.len() / channels);
+    let data = &input[format.data_offset..format.data_offset + format.data_len];
     let bytes = format.block_align / channels;
 
     for frame in 0..frame_count {
         for channel in 0..channels {
-            let index = frame * format.block_align + channel * bytes;
+            let index = (start + frame) * format.block_align + channel * bytes;
             let sample = &data[index..index + bytes];
             let value = match format.tag {
                 1 => match format.bits {
@@ -160,15 +177,7 @@ pub fn decode(input: &[u8], out: &mut [i16]) -> Result<DecodedAudio> {
         }
     }
 
-    Ok(DecodedAudio {
-        info: AudioInfo {
-            sample_rate: format.sample_rate,
-            channels: format.channels,
-            frames: frame_count as u64,
-            format: AudioFormat::Wav,
-        },
-        frames: frame_count,
-    })
+    Ok(frame_count)
 }
 
 /// Encodes interleaved signed 16-bit samples as a PCM WAVE file.

@@ -3,11 +3,13 @@ name = "feos-apps"
 description = "Built-in feos shell applications"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
 feos-app = { workspace = true }
 feos-audio = { workspace = true }
+feos-audio-codec = { workspace = true }
 feos-console = { workspace = true }
 feos-coreutils = { workspace = true }
 feos-desktop-app = { workspace = true }
@@ -16,8 +18,10 @@ feos-fs = { workspace = true }
 feos-gfx = { workspace = true }
 feos-gui = { workspace = true }
 feos-hal = { workspace = true }
+feos-iconset = { workspace = true }
 feos-image = { workspace = true }
 feos-keys = { workspace = true }
+feos-mixer = { workspace = true }
 feos-sh = { workspace = true }
 feos-sync = { workspace = true }
 feos-text = { workspace = true }

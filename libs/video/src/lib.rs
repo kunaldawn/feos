@@ -19,8 +19,9 @@
 //! | IVF | yes | metadata (VP8/VP9/AV1 payload) |
 //! | Annex-B H.264 | yes | yes |
 //! | Motion JPEG | yes | yes |
+//! | MPEG-1 elementary and program streams | yes (video only) | yes |
 //!
-//! Other codecs (HEVC, VP8, VP9, AV1, MPEG-1/2/4, Theora, ProRes, VC-1, VP6,
+//! Other codecs (HEVC, VP8, VP9, AV1, MPEG-2/4, MPEG-1 inside other containers, Theora, ProRes, VC-1, VP6,
 //! H.263, Cinepak) are recognised and described by [`info`]. Their samples are
 //! located by the demuxers, but pixel reconstruction is not implemented yet
 //! and [`decode_frame`] returns [`VideoError::UnsupportedCodec`].
@@ -54,6 +55,7 @@
 
 extern crate alloc;
 
+pub mod audio;
 mod avi;
 mod bitstream;
 pub mod codec;
@@ -67,10 +69,13 @@ mod ivf;
 mod matroska;
 mod mjpeg;
 mod mp4;
+mod mpeg1;
+mod mpeg1_tables;
 pub mod pixel;
 mod raw;
 mod rle;
 
+pub use audio::{audio_track, AudioCodec, AudioPacket, AudioTrack};
 pub use codec::Codec;
 pub use decoder::VideoDecoder;
 pub use error::{Result, VideoError};
@@ -96,6 +101,8 @@ pub enum ContainerFormat {
     H264,
     /// Concatenated JPEG images (Motion JPEG).
     MotionJpeg,
+    /// MPEG-1 video: an elementary or program stream.
+    Mpeg1,
 }
 
 impl ContainerFormat {
@@ -110,6 +117,7 @@ impl ContainerFormat {
             Self::Ivf => "ivf",
             Self::H264 => "h264",
             Self::MotionJpeg => "mjpeg",
+            Self::Mpeg1 => "mpeg1",
         }
     }
 }
@@ -237,8 +245,9 @@ impl VideoInfo {
     }
 
     /// Whether this build can decode the codec into pixels.
-    pub const fn can_decode(&self) -> bool {
-        self.codec.can_decode()
+    pub fn can_decode(&self) -> bool {
+        // MPEG-1 only comes from its own streams, not from inside other containers.
+        self.codec.can_decode() || self.format == ContainerFormat::Mpeg1
     }
 }
 
@@ -283,6 +292,8 @@ pub fn detect(input: &[u8]) -> Option<ContainerFormat> {
         Some(ContainerFormat::Flv)
     } else if input.len() >= 4 && &input[..4] == b"DKIF" {
         Some(ContainerFormat::Ivf)
+    } else if mpeg1::is_magic(input) {
+        Some(ContainerFormat::Mpeg1)
     } else if is_annex_b(input) {
         Some(ContainerFormat::H264)
     } else if input.len() >= 3 && input[0] == 0xff && input[1] == 0xd8 && input[2] == 0xff {
@@ -371,6 +382,16 @@ pub fn info(input: &[u8]) -> Result<VideoInfo> {
                 colour: flv.colour,
                 ..plain(flv.width, flv.height, flv.codec, flv.frame_count, flv.frame_rate)
             })
+        }
+        ContainerFormat::Mpeg1 => {
+            let found = mpeg1::info(input)?;
+            Ok(plain(
+                found.width,
+                found.height,
+                Codec::Mpeg1,
+                found.frames,
+                Some(found.frame_rate),
+            ))
         }
         ContainerFormat::Ivf => {
             let ivf = ivf::info(input)?;

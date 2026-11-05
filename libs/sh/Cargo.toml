@@ -3,9 +3,15 @@ name = "feos-sh"
 description = "Bash-compatible shell language for feos"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
 feos-console = { workspace = true }
 feos-coreutils = { workspace = true }
 feos-fs = { workspace = true }
+feos-keys = { path = "../keys", default-features = false }
+feos-sync = { workspace = true }
+
+[dev-dependencies]
+feos-archive = { workspace = true }

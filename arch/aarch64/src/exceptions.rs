@@ -2,9 +2,9 @@
 //!
 //! The assembly table in `vectors.S` routes every entry through
 //! `irq::trap_dispatch`, which sends anything that isn't an IRQ or a software
-//! switch here. [`fatal`] builds a [`FaultInfo`] and forwards it to the handler
-//! registered with [`set_handler`]. The handler reports the fault and stops the
-//! machine; there is no recovery path.
+//! switch here. [`fault`] builds a [`FaultInfo`] and forwards it to the handler
+//! registered with [`set_handler`]. The handler may end the faulting task, and
+//! otherwise reports the fault and stops the machine.
 
 use core::arch::{asm, global_asm};
 use core::fmt;
@@ -39,7 +39,41 @@ pub struct FaultInfo {
     pub regs: [u64; 31],
 }
 
+/// Vector index of a synchronous exception from a thread.
+const VECTOR_THREAD_SYNC: u64 = 0;
+/// Vector index of a synchronous exception from a user program.
+const VECTOR_USER_SYNC: u64 = 8;
+/// `ESR_EL1` classes of an instruction or data abort from the current level.
+const CLASS_INSTRUCTION_ABORT: u64 = 0x21;
+const CLASS_DATA_ABORT: u64 = 0x25;
+/// The same from a lower level.
+const CLASS_USER_INSTRUCTION_ABORT: u64 = 0x20;
+const CLASS_USER_DATA_ABORT: u64 = 0x24;
+
 impl FaultInfo {
+    /// Whether this is something a thread did, as opposed to the machine failing,
+    /// so that ending the task could be an answer to it. An SError or anything from
+    /// the exception handlers themselves isn't.
+    pub const fn is_task_fault(&self) -> bool {
+        self.index == VECTOR_THREAD_SYNC || self.index == VECTOR_USER_SYNC
+    }
+
+    /// Whether a user program caused this.
+    pub const fn from_user(&self) -> bool {
+        self.index == VECTOR_USER_SYNC
+    }
+
+    /// The address an abort was on, if this is one.
+    pub const fn fault_address(&self) -> Option<u64> {
+        match self.exception_class() {
+            CLASS_INSTRUCTION_ABORT
+            | CLASS_DATA_ABORT
+            | CLASS_USER_INSTRUCTION_ABORT
+            | CLASS_USER_DATA_ABORT => Some(self.far),
+            _ => None,
+        }
+    }
+
     /// Writes the general-purpose registers, four to a line.
     pub fn write_registers(&self, out: &mut dyn fmt::Write) -> fmt::Result {
         for (index, value) in self.regs.iter().enumerate() {
@@ -107,7 +141,9 @@ impl FaultInfo {
 }
 
 /// Callback invoked for every exception.
-pub type FaultHandler = fn(&FaultInfo);
+/// It can replace the frame with another task's and return `true` to resume that,
+/// rather than stopping the machine.
+pub type FaultHandler = fn(&FaultInfo, &mut TrapFrame) -> bool;
 
 static HANDLER: AtomicUsize = AtomicUsize::new(0);
 
@@ -140,8 +176,9 @@ fn handler() -> Option<FaultHandler> {
     }
 }
 
-/// Reports a trap that can't be recovered from. Called from `irq::trap_dispatch`.
-pub(crate) fn fatal(index: u64, esr: u64, frame: &TrapFrame) -> ! {
+/// Reports a trap that isn't an interrupt or a request. Called from
+/// `irq::trap_dispatch`. Doesn't return unless the handler has dealt with it.
+pub(crate) fn fault(index: u64, esr: u64, frame: &mut TrapFrame) {
     let elr: u64;
     let far: u64;
     // SAFETY: reading system registers has no side effects.
@@ -160,7 +197,9 @@ pub(crate) fn fatal(index: u64, esr: u64, frame: &TrapFrame) -> ! {
     };
 
     if let Some(handler) = handler() {
-        handler(&info);
+        if handler(&info, frame) {
+            return;
+        }
     }
 
     cpu::halt()

@@ -8,12 +8,19 @@
 //!   (see [`SchedHooks`]) and the kernel never reaps a task that holds one.
 //! - [`IrqSpinLock`] also masks interrupts on this CPU while held, so it is
 //!   safe to share with interrupt handlers and its holder cannot be preempted.
-//!   Use it for short critical sections.
+//!   Use it for short critical sections. It's a ticket lock, so CPUs get it in the
+//!   order they asked. [`SpinLock`] can't be: a waiter can be preempted or killed,
+//!   and everyone behind it in the queue would wait for it.
 //! - [`Mutex`] blocks in the scheduler instead of spinning. Use it for anything
 //!   that may be held for a long time.
 //!
 //! Without installed hooks (host tests, early boot) a contended [`Mutex`]
 //! falls back to spinning.
+//!
+//! Waiting CPUs use [`irq::wait_event`], which on AArch64 is `wfe`: the core sleeps
+//! until a release sends it an event. Taking a lock a CPU or task already holds is
+//! a certain deadlock, so both spin locks record their owner and panic instead,
+//! which is at least a report.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -40,8 +47,14 @@ pub struct SchedHooks {
     pub relax: fn(),
     /// Blocks the caller while `word` still holds `expected`.
     pub wait: fn(word: &AtomicU32, expected: u32),
+    /// The same as `wait`, for at most this many milliseconds.
+    pub wait_ms: fn(word: &AtomicU32, expected: u32, ms: u64),
     /// Wakes up to `count` tasks blocked on `word`.
     pub wake: fn(word: &AtomicU32, count: usize),
+    /// An ID for the calling CPU, not zero.
+    pub cpu_id: fn() -> u32,
+    /// An ID for the calling task, or zero outside any task.
+    pub task_id: fn() -> u32,
 }
 
 static HOOKS: AtomicPtr<SchedHooks> = AtomicPtr::new(core::ptr::null_mut());
@@ -72,10 +85,47 @@ fn lock_exit() {
     }
 }
 
+/// The ID an [`IrqSpinLock`] records for its owner. Zero when nothing is installed.
+#[inline]
+fn cpu_id() -> u32 {
+    hooks().map_or(0, |hooks| (hooks.cpu_id)())
+}
+
+/// The ID a [`SpinLock`] records for its owner. Zero outside a task.
+#[inline]
+fn task_id() -> u32 {
+    hooks().map_or(0, |hooks| (hooks.task_id)())
+}
+
 /// Offers the CPU to another runnable task, when a scheduler is installed.
 pub fn yield_now() {
     if let Some(hooks) = hooks() {
         (hooks.relax)();
+    }
+}
+
+/// Blocks the caller while `word` still holds `expected`, or just spins once
+/// when no scheduler is installed. A spurious return is always possible.
+pub fn futex_wait(word: &AtomicU32, expected: u32) {
+    match hooks() {
+        Some(hooks) => (hooks.wait)(word, expected),
+        None => spin_loop(),
+    }
+}
+
+/// [`futex_wait`], for at most `ms` milliseconds. For waiting on something that
+/// might never come, such as a device's interrupt.
+pub fn futex_wait_ms(word: &AtomicU32, expected: u32, ms: u64) {
+    match hooks() {
+        Some(hooks) => (hooks.wait_ms)(word, expected, ms),
+        None => spin_loop(),
+    }
+}
+
+/// Wakes up to `count` tasks blocked on `word`.
+pub fn futex_wake(word: &AtomicU32, count: usize) {
+    if let Some(hooks) = hooks() {
+        (hooks.wake)(word, count);
     }
 }
 
@@ -88,6 +138,8 @@ pub fn yield_now() {
 /// A task still waiting for the lock holds nothing, so it can be killed.
 pub struct SpinLock<T: ?Sized> {
     locked: AtomicBool,
+    /// The task holding it, for catching a self-deadlock. Zero when unknown.
+    owner: AtomicU32,
     value: UnsafeCell<T>,
 }
 
@@ -100,6 +152,7 @@ impl<T> SpinLock<T> {
     pub const fn new(value: T) -> Self {
         Self {
             locked: AtomicBool::new(false),
+            owner: AtomicU32::new(0),
             value: UnsafeCell::new(value),
         }
     }
@@ -113,21 +166,26 @@ impl<T> SpinLock<T> {
 impl<T: ?Sized> SpinLock<T> {
     /// Acquires the lock, spinning until it becomes available.
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
+        let task = task_id();
         let mut spins = 0u32;
         loop {
             // Count the attempt first: preemption between a successful swap
             // and the count would let the kernel reap a task holding the lock.
             lock_enter();
             if !self.locked.swap(true, Ordering::Acquire) {
+                self.owner.store(task, Ordering::Relaxed);
                 return SpinLockGuard { lock: self };
             }
             lock_exit();
+            if task != 0 && self.owner.load(Ordering::Relaxed) == task {
+                panic!("a task took a spin lock it already holds");
+            }
 
             // Contended: spin on a relaxed load so we do not keep hammering
             // the cache line with read-modify-write operations. The holder may
             // have been preempted, so let others run after a while.
             while self.locked.load(Ordering::Relaxed) {
-                spin_loop();
+                irq::wait_event();
                 spins = spins.wrapping_add(1);
                 if spins % RELAX_SPINS == 0 {
                     yield_now();
@@ -143,6 +201,7 @@ impl<T: ?Sized> SpinLock<T> {
             lock_exit();
             None
         } else {
+            self.owner.store(task_id(), Ordering::Relaxed);
             Some(SpinLockGuard { lock: self })
         }
     }
@@ -191,7 +250,9 @@ impl<T: ?Sized> DerefMut for SpinLockGuard<'_, T> {
 
 impl<T: ?Sized> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
+        self.lock.owner.store(0, Ordering::Relaxed);
         self.lock.locked.store(false, Ordering::Release);
+        irq::send_event();
         lock_exit();
     }
 }
@@ -203,11 +264,16 @@ impl<T: ?Sized> Drop for SpinLockGuard<'_, T> {
 /// preempted or reaped, so these acquisitions are not part of the task's lock
 /// depth. Keep the critical section short: it delays this CPU's interrupts.
 pub struct IrqSpinLock<T: ?Sized> {
-    locked: AtomicBool,
+    /// The next ticket to give out.
+    next: AtomicU32,
+    /// The ticket that holds the lock. Held when this differs from `next`.
+    serving: AtomicU32,
+    /// The CPU holding it, for catching a self-deadlock. Zero when unknown.
+    owner: AtomicU32,
     value: UnsafeCell<T>,
 }
 
-// SAFETY: access to `value` is serialized by `locked`.
+// SAFETY: access to `value` is serialized by the tickets.
 unsafe impl<T: ?Sized + Send> Sync for IrqSpinLock<T> {}
 unsafe impl<T: ?Sized + Send> Send for IrqSpinLock<T> {}
 
@@ -215,38 +281,55 @@ impl<T> IrqSpinLock<T> {
     /// Creates an unlocked lock containing `value`.
     pub const fn new(value: T) -> Self {
         Self {
-            locked: AtomicBool::new(false),
+            next: AtomicU32::new(0),
+            serving: AtomicU32::new(0),
+            owner: AtomicU32::new(0),
             value: UnsafeCell::new(value),
         }
     }
 }
 
 impl<T: ?Sized> IrqSpinLock<T> {
-    /// Masks interrupts and acquires the lock.
+    /// Masks interrupts and acquires the lock, in the order CPUs asked for it.
+    ///
+    /// With its interrupts masked a waiter can't be preempted or killed, so its
+    /// ticket always gets used.
     pub fn lock(&self) -> IrqSpinLockGuard<'_, T> {
         let flags = irq::save_and_disable();
-        while self.locked.swap(true, Ordering::Acquire) {
-            while self.locked.load(Ordering::Relaxed) {
-                spin_loop();
-            }
+        let cpu = cpu_id();
+        if cpu != 0 && self.owner.load(Ordering::Relaxed) == cpu {
+            // Interrupts stay masked: the panic path looks at that.
+            panic!("a CPU took a lock it already holds");
         }
+        let ticket = self.next.fetch_add(1, Ordering::Relaxed);
+        while self.serving.load(Ordering::Acquire) != ticket {
+            irq::wait_event();
+        }
+        self.owner.store(cpu, Ordering::Relaxed);
         IrqSpinLockGuard { lock: self, flags }
     }
 
     /// Tries to acquire the lock; the interrupt state is unchanged on failure.
     pub fn try_lock(&self) -> Option<IrqSpinLockGuard<'_, T>> {
         let flags = irq::save_and_disable();
-        if self.locked.swap(true, Ordering::Acquire) {
+        let serving = self.serving.load(Ordering::Acquire);
+        // Only an idle lock has the ticket being served as the next to give out.
+        if self
+            .next
+            .compare_exchange(serving, serving.wrapping_add(1), Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.owner.store(cpu_id(), Ordering::Relaxed);
+            Some(IrqSpinLockGuard { lock: self, flags })
+        } else {
             irq::restore(flags);
             None
-        } else {
-            Some(IrqSpinLockGuard { lock: self, flags })
         }
     }
 
     /// Returns `true` if the lock is currently held.
     pub fn is_locked(&self) -> bool {
-        self.locked.load(Ordering::Relaxed)
+        self.next.load(Ordering::Relaxed) != self.serving.load(Ordering::Relaxed)
     }
 }
 
@@ -274,7 +357,11 @@ impl<T: ?Sized> DerefMut for IrqSpinLockGuard<'_, T> {
 
 impl<T: ?Sized> Drop for IrqSpinLockGuard<'_, T> {
     fn drop(&mut self) {
-        self.lock.locked.store(false, Ordering::Release);
+        self.lock.owner.store(0, Ordering::Relaxed);
+        // This CPU is the only one that writes `serving` while it holds the lock.
+        let next = self.lock.serving.load(Ordering::Relaxed).wrapping_add(1);
+        self.lock.serving.store(next, Ordering::Release);
+        irq::send_event();
         irq::restore(self.flags);
     }
 }
@@ -474,6 +561,44 @@ mod tests {
         drop(guard);
         assert!(irq::is_enabled());
         assert!(lock.try_lock().is_some());
+    }
+
+    #[test]
+    fn irq_lock_tickets_are_exclusive_across_threads() {
+        static LOCK: IrqSpinLock<u64> = IrqSpinLock::new(0);
+        let mut threads = Vec::new();
+        for _ in 0..4 {
+            threads.push(std::thread::spawn(|| {
+                for _ in 0..10_000 {
+                    // A read and a write apart, so overlap would lose counts.
+                    let mut value = LOCK.lock();
+                    let seen = *value;
+                    spin_loop();
+                    *value = seen + 1;
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(*LOCK.lock(), 40_000);
+        assert!(!LOCK.is_locked());
+    }
+
+    #[test]
+    fn irq_lock_try_lock_works_across_wrapping_tickets() {
+        let lock = IrqSpinLock::new(1);
+        lock.next.store(u32::MAX, Ordering::Relaxed);
+        lock.serving.store(u32::MAX, Ordering::Relaxed);
+        {
+            let guard = lock.try_lock().expect("idle lock");
+            assert_eq!(*guard, 1);
+            assert!(lock.is_locked());
+            assert!(lock.try_lock().is_none());
+        }
+        assert!(!lock.is_locked());
+        assert_eq!(*lock.lock(), 1);
+        assert!(!lock.is_locked());
     }
 
     #[test]

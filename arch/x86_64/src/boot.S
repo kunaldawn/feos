@@ -1,7 +1,7 @@
 /*
  * x86_64 multiboot entry.
  *
- * QEMU loads the flat image at 1 MiB (the address in the multiboot header)
+ * QEMU loads the flat image at 32 MiB (the address in the multiboot header)
  * and enters `_start` in 32-bit protected mode with:
  *   eax = 0x2BADB002
  *   ebx = physical address of the multiboot information structure
@@ -15,6 +15,69 @@
 .set MB_FLAGS,    0x00010003          /* page align, memory info, load addrs */
 .set MB_CHECKSUM, -(MB_MAGIC + MB_FLAGS)
 
+/*
+ * From protected mode with a flat stack-free state to long mode. Shared by the
+ * boot CPU and the others: enables PAE, sets EFER.LME, loads the boot page tables
+ * and turns on paging, then far-jumps to \target. Clobbers eax, ecx, edx.
+ */
+.macro ENTER_LONG_MODE target
+    movw $0x10, %ax
+    movw %ax, %ds
+    movw %ax, %es
+    movw %ax, %fs
+    movw %ax, %gs
+    movw %ax, %ss
+
+    /* Enable PAE. */
+    movl %cr4, %eax
+    orl $0x20, %eax
+    movl %eax, %cr4
+
+    /* Set EFER.LME. */
+    movl $0xC0000080, %ecx
+    rdmsr
+    orl $0x100, %eax
+    wrmsr
+
+    /* Point CR3 at the PML4 and turn on paging (which enters long mode once
+     * we load the 64-bit code segment below). Caches are on: the mapping
+     * is what keeps device windows uncached. */
+    movl $pml4, %eax
+    movl %eax, %cr3
+
+    movl %cr0, %eax
+    andl $0x9FFFFFFB, %eax           /* clear CD | NW | EM */
+    orl $0x80010022, %eax            /* PG | WP | MP | NE */
+    movl %eax, %cr0
+
+    ljmp $0x08, $\target
+.endm
+
+/*
+ * What every CPU needs in long mode before any Rust: the data segments and the
+ * x87/SSE state. The compiler uses XMM registers for everything, including float
+ * arithmetic, so CR0.EM must be clear and CR4.OSFXSR set before the first call.
+ * Interrupt entry saves and restores the state. Clobbers rax.
+ */
+.macro CPU_LONG_MODE_SETUP
+    movw $0x10, %ax
+    movw %ax, %ds
+    movw %ax, %es
+    movw %ax, %fs
+    movw %ax, %gs
+    movw %ax, %ss
+
+    movq %cr4, %rax
+    orq $0x600, %rax                 /* OSFXSR | OSXMMEXCPT */
+    movq %rax, %cr4
+
+    movq %cr0, %rax
+    andq $-5, %rax                   /* clear EM */
+    orq $0x22, %rax                  /* MP | NE */
+    movq %rax, %cr0
+    fninit
+.endm
+
 .section .multiboot, "a"
 .balign 4
     .long MB_MAGIC
@@ -25,6 +88,10 @@
     .long __load_end                 /* load_end_addr */
     .long __kernel_end               /* bss_end_addr */
     .long _start                     /* entry_addr */
+/* How the EFI loader finds the entry point firmware needs. */
+.balign 8
+    .ascii "FEOSEFI\0"
+    .quad _start_efi
 
 .section .text.boot, "ax"
 .code32
@@ -121,36 +188,7 @@ _start:
     lgdt (%eax)
     ljmp $0x18, $1f
 1:
-    movw $0x10, %ax
-    movw %ax, %ds
-    movw %ax, %es
-    movw %ax, %fs
-    movw %ax, %gs
-    movw %ax, %ss
-
-    /* Enable PAE. */
-    movl %cr4, %eax
-    orl $0x20, %eax
-    movl %eax, %cr4
-
-    /* Set EFER.LME. */
-    movl $0xC0000080, %ecx
-    rdmsr
-    orl $0x100, %eax
-    wrmsr
-
-    /* Point CR3 at the PML4 and turn on paging (which enters long mode once
-     * we load the 64-bit code segment below). Caches are on: the mapping above
-     * is what keeps device windows uncached. */
-    movl $pml4, %eax
-    movl %eax, %cr3
-
-    movl %cr0, %eax
-    andl $0x9FFFFFFB, %eax           /* clear CD | NW | EM */
-    orl $0x80010022, %eax            /* PG | WP | MP | NE */
-    movl %eax, %cr0
-
-    ljmp $0x08, $long_mode
+    ENTER_LONG_MODE long_mode
 
 /* Writes the NUL-terminated string at edi to COM1 and stops. No stack needed. */
 .Lboot_fail:
@@ -165,30 +203,79 @@ _start:
     jmp 2b
 .size _start, . - _start
 
+/*
+ * Where the EFI loader comes in, in long mode, on firmware's identity map, with
+ * rdi = the handoff, below 4 GiB. It sets up what the 32-bit path sets up, and joins
+ * it. No stack until this has its own.
+ */
 .code64
+.global _start_efi
+.type _start_efi, @function
+_start_efi:
+    cli
+    cld
+    clts
+    movq %rdi, %r12
+
+    movl $__bss_start, %edi
+    movl $__bss_end, %ecx
+    subq %rdi, %rcx
+    shrq $3, %rcx
+    xorl %eax, %eax
+    rep stosq
+
+    movl $pdpt, %eax
+    orq $0x3, %rax
+    movl $pml4, %edi
+    movq %rax, (%rdi)
+
+    movl $page_directories, %eax
+    orq $0x3, %rax
+    movl $pdpt, %edi
+    movl $4, %ecx
+1:  movq %rax, (%rdi)
+    addq $4096, %rax
+    addq $8, %rdi
+    loop 1b
+
+    /* The same 2 MiB pages as the 32-bit path: see there. */
+    movl $page_directories, %edi
+    xorl %ebx, %ebx
+    movl $2048, %ecx
+2:  movq %rbx, %rax
+    orq $0x83, %rax
+    testl $0x80000000, %ebx
+    jz 3f
+    orq $0x18, %rax
+3:  movq %rax, (%rdi)
+    addq $0x200000, %rbx
+    addq $8, %rdi
+    loop 2b
+
+    movl $pml4, %eax
+    movq %rax, %cr3
+    lgdtq gdt_ptr(%rip)
+    pushq $0x08
+    leaq 4f(%rip), %rax
+    pushq %rax
+    lretq
+4:  movq %r12, %rsi
+    jmp long_mode
+.size _start_efi, . - _start_efi
+
 long_mode:
-    movw $0x10, %ax
-    movw %ax, %ds
-    movw %ax, %es
-    movw %ax, %fs
-    movw %ax, %gs
-    movw %ax, %ss
+    CPU_LONG_MODE_SETUP
 
     /* The linker script reserves a 256 KiB boot stack. */
     movq $__stack_top, %rsp
     andq $-16, %rsp
 
-    /* Enable SSE2 so the compiler may use the XMM registers for copies and
-     * integer formatting. Interrupt entry saves and restores them. */
-    movq %cr4, %rax
-    orq $0x600, %rax                 /* OSFXSR | OSXMMEXCPT */
-    movq %rax, %cr4
-
-    movq %cr0, %rax
-    andq $-5, %rax                   /* clear EM */
-    orq $0x22, %rax                  /* MP | NE */
-    movq %rax, %cr0
-    fninit
+    /* GS points at this CPU's area, for `cpu::index`. It's zero until the area is
+     * written, which is right for the boot CPU. */
+    movl $0xC0000101, %ecx           /* IA32_GS_BASE */
+    movl $CPU_AREAS, %eax
+    xorl %edx, %edx
+    wrmsr
 
     movl %esi, %edi                  /* multiboot info, zero-extended */
     call kmain
@@ -196,6 +283,47 @@ long_mode:
 .Lhalt:
     cli
     hlt
+    jmp .Lhalt
+
+/*
+ * Where the other CPUs start. A startup IPI enters real mode at a page-aligned
+ * address below 1 MiB, so `smp::start_secondaries` copies this page-relocatable
+ * stub to AP_TRAMPOLINE. It only gets to 32-bit protected mode, and the rest runs
+ * from the kernel image like the boot CPU's path.
+ */
+.set AP_TRAMPOLINE, 0x8000
+
+.code16
+.global ap_trampoline_start
+ap_trampoline_start:
+    cli
+    cld
+    xorw %ax, %ax
+    movw %ax, %ds
+    lgdtl (AP_TRAMPOLINE + (ap_gdt_ptr - ap_trampoline_start))
+    movl %cr0, %eax
+    orl $1, %eax
+    movl %eax, %cr0
+    ljmpl $0x18, $ap_protected
+.balign 8
+ap_gdt_ptr:
+    .word gdt_end - gdt_start - 1
+    .long gdt_start
+.global ap_trampoline_end
+ap_trampoline_end:
+
+.code32
+ap_protected:
+    ENTER_LONG_MODE ap_long_mode
+
+.code64
+ap_long_mode:
+    CPU_LONG_MODE_SETUP
+    /* The starting CPU waits for `x86_ap_entry` before writing these again. */
+    movq ap_boot_stack, %rsp
+    andq $-16, %rsp
+    movq ap_boot_index, %rdi
+    call x86_ap_entry
     jmp .Lhalt
 
 .section .rodata
@@ -206,22 +334,33 @@ gdt_start:
     .quad 0x00CF92000000FFFF         /* 0x10 flat data */
     .quad 0x00CF9A000000FFFF         /* 0x18 flat 32-bit code */
 gdt_end:
+/* Six bytes for a 32-bit LGDT, and the whole of it for a 64-bit one. */
 gdt_ptr:
     .word gdt_end - gdt_start - 1
-    .long gdt_start
+    .quad gdt_start
 message_no_long_mode:
     .asciz "\r\nfeos: this CPU has no long mode (use -cpu max or qemu64)\r\n"
 message_no_ram:
     .asciz "\r\nfeos: not enough RAM for the kernel image\r\n"
 
 .section .bss
+.global ap_boot_stack
+.balign 8
+ap_boot_stack:
+    .skip 8
+.global ap_boot_index
+ap_boot_index:
+    .skip 8
 .balign 4096
+.global pml4
 pml4:
     .skip 4096
 .balign 4096
+.global pdpt
 pdpt:
     .skip 4096
 .balign 4096
+.global page_directories
 page_directories:
     .skip 4 * 4096
 

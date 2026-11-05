@@ -1,11 +1,16 @@
 /*
  * x86_64 interrupt entry stubs.
  *
- * Vectors 0..31 are CPU exceptions; vectors 32..47 are hardware IRQs (the
- * x86_64 port routes the PIT through vector 34); vector 48 is the software
- * switch and vectors 49..50 are inter-processor interrupts. The IDT switches
- * each one to a per-CPU stack through the TSS, so none of this frame is on the
- * interrupted task's stack. Each stub normalises the stack to:
+ * Vectors 0..31 are CPU exceptions and the rest are interrupts: the local timer
+ * on vector 34, the software switch on 48, IPIs on 49 and 50, and devices above
+ * those. The IDT switches each one to another stack through the TSS, so none of
+ * the frame is on the interrupted task's stack. For an interrupt, that "stack" is
+ * the TrapFrame of whatever is running: the frame exactly fills it, so saving a
+ * task needs no copying, and switching to another is a change of pointer. The
+ * handler then runs on this CPU's interrupt stack. An exception's frame goes on
+ * this CPU's fault stack instead, and its handler stays there.
+ *
+ * Each stub normalises the stack to:
  *
  *     vector
  *     error code
@@ -13,7 +18,14 @@
  *
  * Long mode pushes SS:RSP even for same-privilege interrupts. The kernel's
  * `TrapFrame` mirrors that exact layout. `interrupt_common` then saves the
- * general-purpose and XMM registers.
+ * general-purpose registers and the FXSAVE area.
+ *
+ * A trap from ring 3 takes the same path, into the process's user frame. All that
+ * differs is a little on each side of it. The CPU's interrupt stack and index are at
+ * the GS base, which a program can overwrite by loading a selector, so a program runs
+ * with the kernel's in IA32_KERNEL_GS_BASE and `swapgs` brings it back. Flags a
+ * program chose (AC, which turns SMAP off) and its floating point rounding and
+ * exception masks don't follow it into the kernel.
  */
 
 .section .text
@@ -66,25 +78,23 @@ ISR_NOERR 28
 ISR_ERR   29
 ISR_ERR   30
 ISR_NOERR 31
-ISR_NOERR 32
-ISR_NOERR 33
-ISR_NOERR 34
-ISR_NOERR 35
-ISR_NOERR 36
-ISR_NOERR 37
-ISR_NOERR 38
-ISR_NOERR 39
-ISR_NOERR 40
-ISR_NOERR 41
-ISR_NOERR 42
-ISR_NOERR 43
-ISR_NOERR 44
-ISR_NOERR 45
-ISR_NOERR 46
-ISR_NOERR 47
-ISR_NOERR 48
-ISR_NOERR 49
-ISR_NOERR 50
+
+/*
+ * Vectors 32..=254: hardware interrupts, the software switch and IPIs, all alike.
+ * Each stub has the same size, so the IDT computes the address of any of them.
+ */
+.balign 16
+.global isr_irq_stubs
+isr_irq_stubs:
+.set vector, 32
+.rept 223
+.balign 16
+    pushq $0
+    pushq $vector
+    jmp interrupt_common
+.set vector, vector + 1
+.endr
+.balign 16
 
 /* Any unexpected interrupt returns without touching the stack. */
 .global isr_spurious
@@ -92,6 +102,17 @@ isr_spurious:
     iretq
 
 interrupt_common:
+    /* Rust assumes the direction flag is clear. */
+    cld
+
+    /* The stub's two words are on top of the CPU's frame: CS is at 24. */
+    testb $3, 24(%rsp)
+    jz 2f
+    swapgs
+    pushq $2
+    popfq
+2:
+
     /* Save GPRs. The order after the pushes is: r15, r14, ..., rax. */
     pushq %rax
     pushq %rbx
@@ -109,77 +130,62 @@ interrupt_common:
     pushq %r14
     pushq %r15
 
-    /* XMM0..XMM15 occupy the first 256 bytes of the TrapFrame. `movups`
-     * doesn't depend on the stubs' 8-byte frame alignment. */
-    subq $256, %rsp
-    movups %xmm0,   0(%rsp)
-    movups %xmm1,  16(%rsp)
-    movups %xmm2,  32(%rsp)
-    movups %xmm3,  48(%rsp)
-    movups %xmm4,  64(%rsp)
-    movups %xmm5,  80(%rsp)
-    movups %xmm6,  96(%rsp)
-    movups %xmm7, 112(%rsp)
-    movups %xmm8, 128(%rsp)
-    movups %xmm9, 144(%rsp)
-    movups %xmm10, 160(%rsp)
-    movups %xmm11, 176(%rsp)
-    movups %xmm12, 192(%rsp)
-    movups %xmm13, 208(%rsp)
-    movups %xmm14, 224(%rsp)
-    movups %xmm15, 240(%rsp)
+    /* The x87, MMX and SSE state, MXCSR included, occupy the first 512 bytes of
+     * the TrapFrame. The kernel uses XMM registers for everything, so this comes
+     * before any Rust runs. Every gate switches to a 16-byte aligned stack through
+     * the TSS, so after the 5 CPU words, the 2 stub words and the 15 GPRs, RSP is
+     * 16-byte aligned here, as FXSAVE needs. */
+    subq $512, %rsp
+    fxsave64 (%rsp)
 
-    /* Keep the frame pointer in a callee-saved register and give the Rust
-     * helper a 16-byte aligned stack. */
-    movq %rsp, %r15
+    testb $3, 656(%rsp)
+    jz 3f
+    fninit
+    ldmxcsr kernel_mxcsr(%rip)
+3:
+    /* An interrupt's handler moves to the CPU's interrupt stack, at gs:8 in its
+     * CpuArea. Either stack is 16-byte aligned here, as the ABI asks of a call. */
     movq %rsp, %rdi
-    andq $-16, %rsp
+    cmpq $32, 632(%rsp)
+    jb 1f
+    movq %gs:8, %rsp
+1:
     call x86_interrupt_dispatch
-    movq %r15, %rsp
 
-    /* The CPU frame at frame_base + 392 is already a complete long-mode
-     * IRET frame: RIP, CS, RFLAGS, RSP, SS. The scheduler may have replaced
-     * it with another task's saved frame, but it is still in the required
-     * layout. Point RSP at it and return directly: IRET loads the task's own
-     * RSP from it, leaving this per-CPU stack free for the next interrupt. */
-    movq %rsp, %r15
-    leaq 392(%r15), %rsp
+    /* It returns the frame to resume: this one, or another task's. The CPU frame
+     * at its end is a complete long-mode IRET frame: RIP, CS, RFLAGS, RSP, SS. IRET
+     * loads the task's own RSP from it. */
+    movq %rax, %rsp
+    fxrstor64 (%rsp)
+    addq $512, %rsp
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %r11
+    popq %r10
+    popq %r9
+    popq %r8
+    popq %rbp
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    popq %rcx
+    popq %rbx
+    popq %rax
+    /* Vector and error code. */
+    addq $16, %rsp
 
-    movups   0(%r15), %xmm0
-    movups  16(%r15), %xmm1
-    movups  32(%r15), %xmm2
-    movups  48(%r15), %xmm3
-    movups  64(%r15), %xmm4
-    movups  80(%r15), %xmm5
-    movups  96(%r15), %xmm6
-    movups 112(%r15), %xmm7
-    movups 128(%r15), %xmm8
-    movups 144(%r15), %xmm9
-    movups 160(%r15), %xmm10
-    movups 176(%r15), %xmm11
-    movups 192(%r15), %xmm12
-    movups 208(%r15), %xmm13
-    movups 224(%r15), %xmm14
-    movups 240(%r15), %xmm15
-
-    movq 368(%r15), %rax
-    movq 360(%r15), %rbx
-    movq 352(%r15), %rcx
-    movq 344(%r15), %rdx
-    movq 336(%r15), %rsi
-    movq 328(%r15), %rdi
-    movq 320(%r15), %rbp
-    movq 312(%r15), %r8
-    movq 304(%r15), %r9
-    movq 296(%r15), %r10
-    movq 288(%r15), %r11
-    movq 280(%r15), %r12
-    movq 272(%r15), %r13
-    movq 264(%r15), %r14
-    movq 256(%r15), %r15
+    /* The frame going back to might not be the one that came in: CS is at 8. */
+    testb $3, 8(%rsp)
+    jz 4f
+    swapgs
+4:
     iretq
 
 .section .rodata
+kernel_mxcsr:
+    .long 0x1f80
 .balign 8
 .global isr_stub_table
 isr_stub_table:
@@ -187,8 +193,5 @@ isr_stub_table:
     .quad isr8,  isr9,  isr10, isr11, isr12, isr13, isr14, isr15
     .quad isr16, isr17, isr18, isr19, isr20, isr21, isr22, isr23
     .quad isr24, isr25, isr26, isr27, isr28, isr29, isr30, isr31
-    .quad isr32, isr33, isr34, isr35, isr36, isr37, isr38, isr39
-    .quad isr40, isr41, isr42, isr43, isr44, isr45, isr46, isr47
-    .quad isr48, isr49, isr50
 
 .section .note.GNU-stack, "", @progbits

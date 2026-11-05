@@ -40,6 +40,10 @@ impl Bus for Mem {
         *regs.flags = (*regs.flags & !(FLAG_CF | FLAG_ZF)) | self.flags_to_return;
         InterruptAction::Continue
     }
+    fn host_call(&mut self, _cpu: &mut Cpu, code: u8) -> InterruptAction {
+        self.calls.push(code);
+        InterruptAction::Continue
+    }
 }
 
 const CODE: u32 = 0x1_0000;
@@ -91,13 +95,48 @@ const STATUS: u32 = FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF;
 fn alu_flag_table() {
     // (name, a, b, op, result, flags)
     let cases: &[(&str, u16, u16, &[u8], u16, u32)] = &[
-        ("add carry", 0xFFFF, 1, &[0x01, 0xD8], 0, FLAG_CF | FLAG_ZF | FLAG_PF | FLAG_AF),
-        ("add overflow", 0x7FFF, 1, &[0x01, 0xD8], 0x8000, FLAG_OF | FLAG_SF | FLAG_PF | FLAG_AF),
-        ("sub borrow", 0, 1, &[0x29, 0xD8], 0xFFFF, FLAG_CF | FLAG_SF | FLAG_PF | FLAG_AF),
-        ("sub overflow", 0x8000, 1, &[0x29, 0xD8], 0x7FFF, FLAG_OF | FLAG_PF | FLAG_AF),
+        (
+            "add carry",
+            0xFFFF,
+            1,
+            &[0x01, 0xD8],
+            0,
+            FLAG_CF | FLAG_ZF | FLAG_PF | FLAG_AF,
+        ),
+        (
+            "add overflow",
+            0x7FFF,
+            1,
+            &[0x01, 0xD8],
+            0x8000,
+            FLAG_OF | FLAG_SF | FLAG_PF | FLAG_AF,
+        ),
+        (
+            "sub borrow",
+            0,
+            1,
+            &[0x29, 0xD8],
+            0xFFFF,
+            FLAG_CF | FLAG_SF | FLAG_PF | FLAG_AF,
+        ),
+        (
+            "sub overflow",
+            0x8000,
+            1,
+            &[0x29, 0xD8],
+            0x7FFF,
+            FLAG_OF | FLAG_PF | FLAG_AF,
+        ),
         ("cmp equal", 5, 5, &[0x39, 0xD8], 5, FLAG_ZF | FLAG_PF),
         ("and clears", 0xFF00, 0x0F0F, &[0x21, 0xD8], 0x0F00, FLAG_PF),
-        ("xor zero", 0x1234, 0x1234, &[0x31, 0xD8], 0, FLAG_ZF | FLAG_PF),
+        (
+            "xor zero",
+            0x1234,
+            0x1234,
+            &[0x31, 0xD8],
+            0,
+            FLAG_ZF | FLAG_PF,
+        ),
         ("or sign", 0x8000, 1, &[0x09, 0xD8], 0x8001, FLAG_SF),
         ("add8 half", 0x000F, 1, &[0x00, 0xD8], 0x0010, FLAG_AF),
     ];
@@ -202,7 +241,11 @@ fn shift_table() {
         ];
         let (cpu, _) = run(&code, 3);
         assert_eq!(cpu.r[AX] as u16, *result, "{value:x} {kind} {count}");
-        assert_eq!(cpu.flags() & FLAG_CF != 0, *cf, "{value:x} {kind} {count} cf");
+        assert_eq!(
+            cpu.flags() & FLAG_CF != 0,
+            *cf,
+            "{value:x} {kind} {count} cf"
+        );
     }
     // A zero count changes no flags, and the count masks to five bits.
     let (cpu, _) = run(&[0xF9, 0xB8, 1, 0, 0xB1, 32, 0xD3, 0xE0], 4);
@@ -310,7 +353,12 @@ fn identifies_as_a_386() {
 
 #[test]
 fn undefined_opcodes_raise_int_6() {
-    for code in [&[0x0F, 0xFF][..], &[0xFE, 0xFF][..], &[0xFF, 0xFF][..], &[0x8D, 0xC0][..]] {
+    for code in [
+        &[0x0F, 0xFF][..],
+        &[0xFE, 0xFF][..],
+        &[0xFF, 0xFF][..],
+        &[0x8D, 0xC0][..],
+    ] {
         let (mut cpu, mut mem) = setup(code);
         assert_eq!(cpu.step(&mut mem), Step::Ok);
         assert_eq!((cpu.sregs[CS], cpu.ip), (0xF000, 6 * 4), "{code:02X?}");
@@ -393,7 +441,11 @@ fn blocked_services_stay_on_the_callback() {
     assert_eq!(cpu.step(&mut mem), Step::Blocked);
     assert_eq!(cpu.ip, ip, "stays on the callback");
     assert_eq!(cpu.r[SP], sp, "without pushing another frame");
-    assert_ne!(cpu.flags() & FLAG_IF, 0, "interrupts can arrive while it waits");
+    assert_ne!(
+        cpu.flags() & FLAG_IF,
+        0,
+        "interrupts can arrive while it waits"
+    );
     assert_eq!(cpu.step(&mut mem), Step::Ok);
     assert_eq!(cpu.step(&mut mem), Step::Ok);
     assert_eq!((cpu.sregs[CS], cpu.ip), (0x1000, 2));
@@ -563,7 +615,12 @@ fn bit_scan_and_test_family() {
     assert_eq!(cpu.r[DX] & 0xFFFF, 8);
     assert_eq!(cpu.flags() & FLAG_ZF, 0);
     // BTS AX,3: CF is the old bit.
-    let (cpu, _) = run(&[0xB8, 0x08, 0x00, 0x0F, 0xBA, 0xE8, 0x03, 0x0F, 0xBA, 0xE8, 0x04], 3);
+    let (cpu, _) = run(
+        &[
+            0xB8, 0x08, 0x00, 0x0F, 0xBA, 0xE8, 0x03, 0x0F, 0xBA, 0xE8, 0x04,
+        ],
+        3,
+    );
     assert_eq!(cpu.r[AX] & 0xFFFF, 0x18);
     assert_eq!(cpu.flags() & FLAG_CF, 0);
     // BT [mem],reg addresses beyond the word.
@@ -578,11 +635,26 @@ fn bit_scan_and_test_family() {
 #[test]
 fn double_shifts() {
     // MOV AX,1234h; MOV BX,ABCDh; SHLD AX,BX,4
-    let (cpu, _) = run(&[0xB8, 0x34, 0x12, 0xBB, 0xCD, 0xAB, 0x0F, 0xA4, 0xD8, 4], 3);
+    let (cpu, _) = run(
+        &[0xB8, 0x34, 0x12, 0xBB, 0xCD, 0xAB, 0x0F, 0xA4, 0xD8, 4],
+        3,
+    );
     assert_eq!(cpu.r[AX] & 0xFFFF, 0x234A);
     // SHRD AX,BX,4
-    let (cpu, _) = run(&[0xB8, 0x34, 0x12, 0xBB, 0xCD, 0xAB, 0x0F, 0xAC, 0xD8, 4], 3);
+    let (cpu, _) = run(
+        &[0xB8, 0x34, 0x12, 0xBB, 0xCD, 0xAB, 0x0F, 0xAC, 0xD8, 4],
+        3,
+    );
     assert_eq!(cpu.r[AX] & 0xFFFF, 0xD123);
+    // A 16-bit count above 16: DX:AX shifted left by 24 with a pair of SHLDs.
+    let (mut cpu, mut mem) = setup(&[0xB1, 24, 0x0F, 0xA5, 0xC2, 0x31, 0xDB, 0x0F, 0xA5, 0xD8]);
+    cpu.r[AX] = 0x16;
+    cpu.r[DX] = 0;
+    for _ in 0..4 {
+        cpu.step(&mut mem);
+    }
+    assert_eq!(cpu.r[DX] & 0xFFFF, 0x1600);
+    assert_eq!(cpu.r[AX] & 0xFFFF, 0);
     // 32-bit SHLD.
     let (mut cpu, mut mem) = setup(&[0x66, 0x0F, 0xA4, 0xD8, 8]);
     cpu.r[AX] = 0x1234_5678;
@@ -775,9 +847,7 @@ fn real_mode_guest_enters_protected_mode_itself() {
 #[test]
 fn null_and_limit_violations_fault_with_gp() {
     // MOV AX,0; MOV DS,AX; MOV EAX,[0]: #GP(0).
-    let (mut cpu, mut mem) = protected(&[
-        0x66, 0xB8, 0, 0, 0x8E, 0xD8, 0xA1, 0, 0, 0, 0,
-    ]);
+    let (mut cpu, mut mem) = protected(&[0x66, 0xB8, 0, 0, 0x8E, 0xD8, 0xA1, 0, 0, 0, 0]);
     assert_eq!(run_until_halt(&mut cpu, &mut mem), 0xF000 + 13);
     // A write past a limited segment.
     let (mut cpu, mut mem) = protected(&[
@@ -813,7 +883,11 @@ fn software_int_through_interrupt_and_trap_gates() {
     assert_eq!(cpu.ip, PM_CODE + 0xF000 + 0x30);
     assert_eq!(cpu.flags() & FLAG_IF, 0, "interrupt gates clear IF");
     let (mut cpu, mut mem) = protected(&[0xFB, 0xCD, 0x31, 0x90]);
-    write64(&mut mem, IDT + 0x31 * 8, idt_gate(0x08, PM_CODE + 0xF000, 0xF, 0));
+    write64(
+        &mut mem,
+        IDT + 0x31 * 8,
+        idt_gate(0x08, PM_CODE + 0xF000, 0xF, 0),
+    );
     cpu.step(&mut mem);
     cpu.step(&mut mem);
     assert_ne!(cpu.flags() & FLAG_IF, 0, "trap gates leave IF");
@@ -853,7 +927,8 @@ fn ring_3_interrupt_switches_to_the_tss_stack() {
     assert_eq!(cpu.cpl, 0);
     assert_eq!(cpu.r[SP], 0x17_0000 - 20);
     assert_eq!(cpu.sregs[SS], 0x10);
-    let word = |at: u32| u32::from_le_bytes(mem.data[at as usize..at as usize + 4].try_into().unwrap());
+    let word =
+        |at: u32| u32::from_le_bytes(mem.data[at as usize..at as usize + 4].try_into().unwrap());
     let frame = cpu.r[SP];
     assert_eq!(word(frame), PM_CODE + 0x1002);
     assert_eq!(word(frame + 4), 0x1B);
@@ -863,7 +938,12 @@ fn ring_3_interrupt_switches_to_the_tss_stack() {
 
 #[test]
 fn ring_3_cant_run_privileged_instructions() {
-    for code in [&[0xF4][..], &[0xFA][..], &[0x0F, 0x20, 0xC0][..], &[0xEC][..]] {
+    for code in [
+        &[0xF4][..],
+        &[0xFA][..],
+        &[0x0F, 0x20, 0xC0][..],
+        &[0xEC][..],
+    ] {
         let (mut cpu, mut mem) = in_ring3(code);
         assert_eq!(cpu.step(&mut mem), Step::Ok, "{code:02X?}");
         assert_eq!(cpu.ip, PM_CODE + 0xF000 + 13, "{code:02X?}");
@@ -1010,7 +1090,8 @@ fn hardware_task_switch_saves_and_loads_state() {
     assert_eq!(cpu.r[SP], 0x17_8000);
     assert_ne!(cpu.cr0 & 8, 0, "TS is set");
     // The old task's state was saved, and its descriptor isn't busy any more.
-    let word = |at: u32| u32::from_le_bytes(mem.data[at as usize..at as usize + 4].try_into().unwrap());
+    let word =
+        |at: u32| u32::from_le_bytes(mem.data[at as usize..at as usize + 4].try_into().unwrap());
     assert_eq!(word(TSS + 0x20), PM_CODE + 12);
     assert_eq!(word(TSS + 0x28), 0x11);
     assert_eq!(mem.data[GDT as usize + 0x28 + 5] & 0x02, 0);
@@ -1022,8 +1103,7 @@ fn returning_to_real_mode_keeps_the_guest_running() {
     // In 16-bit protected code: clear PE and far jump back.
     let (mut cpu, mut mem) = protected(&[
         0xEA, 0x08, 0x00, 0x00, 0x00, 0x40, 0x00, // JMP FAR 40:8 (16-bit code)
-        0x90,
-        // At offset 8, 16-bit:
+        0x90, // At offset 8, 16-bit:
         0x0F, 0x20, 0xC0, // MOV EAX,CR0
         0x66, 0x83, 0xE0, 0xFE, // AND EAX,-2
         0x0F, 0x22, 0xC0, // MOV CR0,EAX
@@ -1112,4 +1192,343 @@ fn random_code_never_panics() {
             }
         }
     }
+}
+
+// ----------------------------------------------------------------------
+// Virtual-8086 mode
+// ----------------------------------------------------------------------
+
+const V86_CODE: u32 = 0x3_0000;
+const V86_SEG: u32 = 0x3000;
+
+/// Protected mode at level 0 about to `IRETD` into virtual-8086 mode at `3000:0`,
+/// with `program` there and the stack at `4000:1000`.
+fn into_v86(iopl: u32, program: &[u8]) -> (Cpu, Mem) {
+    let flags = FLAG_VM | (iopl << 12) | 2;
+    let mut code = Vec::new();
+    for value in [
+        0x7777u32, // GS
+        0x6666,    // FS
+        0x5555,    // DS
+        0x4444,    // ES
+        0x4000,    // SS
+        0x1000,    // ESP
+        flags,
+        V86_SEG, // CS
+        0,       // EIP
+    ] {
+        code.push(0x68);
+        code.extend_from_slice(&value.to_le_bytes());
+    }
+    code.push(0xCF);
+    let (cpu, mut mem) = protected(&code);
+    mem.data[V86_CODE as usize..V86_CODE as usize + program.len()].copy_from_slice(program);
+    // Vector 3Fh returns to the caller.
+    let handler = PM_CODE + 0xE000;
+    mem.data[handler as usize] = 0xCF;
+    write64(&mut mem, IDT + 0x3F * 8, idt_gate(0x08, handler, 0xE, 3));
+    (cpu, mem)
+}
+
+/// Runs the frame pushes and the `IRETD`.
+fn enter(cpu: &mut Cpu, mem: &mut Mem) {
+    for _ in 0..10 {
+        assert_eq!(cpu.step(mem), Step::Ok);
+    }
+    assert!(cpu.v86_mode());
+    assert!(!cpu.protected_mode());
+    assert_eq!(cpu.cpl, 3);
+}
+
+#[test]
+fn iret_enters_v86_with_real_style_segments() {
+    let (mut cpu, mut mem) = into_v86(3, &[0xB8, 0x34, 0x12, 0x8E, 0xD8, 0xA3, 0x10, 0x00]);
+    enter(&mut cpu, &mut mem);
+    assert_eq!(cpu.sregs, [0x4444, 0x3000, 0x4000, 0x5555, 0x6666, 0x7777]);
+    assert_eq!(cpu.seg[CS].base, 0x3_0000);
+    assert_eq!(cpu.r[SP], 0x1000);
+    assert_ne!(cpu.flags() & FLAG_VM, 0);
+    for _ in 0..3 {
+        assert_eq!(cpu.step(&mut mem), Step::Ok);
+    }
+    // MOV DS,AX loads paragraphs, not selectors.
+    assert_eq!(&mem.data[0x1_2350..0x1_2352], &[0x34, 0x12]);
+}
+
+#[test]
+fn an_interrupt_leaves_v86_through_the_idt_and_iret_comes_back() {
+    let (mut cpu, mut mem) = into_v86(3, &[0xCD, 0x3F, 0xBB, 0x42, 0x00]);
+    enter(&mut cpu, &mut mem);
+    assert_eq!(cpu.step(&mut mem), Step::Ok);
+    assert!(!cpu.v86_mode());
+    assert!(cpu.protected_mode());
+    assert_eq!(cpu.cpl, 0);
+    assert_eq!(cpu.sregs[CS], 0x08);
+    assert_eq!(cpu.flags() & FLAG_VM, 0);
+    assert_eq!([cpu.sregs[DS], cpu.sregs[ES], cpu.sregs[FS], cpu.sregs[GS]], [0; 4]);
+    // The level 0 stack, from the TSS, has the whole virtual-8086 state.
+    assert_eq!(cpu.r[SP], 0x17_0000 - 36);
+    let word = |mem: &Mem, index: usize| {
+        let at = cpu.r[SP] as usize + index * 4;
+        u32::from_le_bytes([mem.data[at], mem.data[at + 1], mem.data[at + 2], mem.data[at + 3]])
+    };
+    assert_eq!(word(&mem, 0), 2);
+    assert_eq!(word(&mem, 1), V86_SEG);
+    assert_ne!(word(&mem, 2) & FLAG_VM, 0);
+    assert_eq!(word(&mem, 3), 0x1000);
+    assert_eq!(word(&mem, 4), 0x4000);
+    assert_eq!(word(&mem, 5), 0x4444);
+    assert_eq!(word(&mem, 6), 0x5555);
+    assert_eq!(word(&mem, 7), 0x6666);
+    assert_eq!(word(&mem, 8), 0x7777);
+    // The handler's IRETD returns to virtual-8086 mode with everything restored.
+    assert_eq!(cpu.step(&mut mem), Step::Ok);
+    assert!(cpu.v86_mode());
+    assert_eq!(cpu.sregs, [0x4444, 0x3000, 0x4000, 0x5555, 0x6666, 0x7777]);
+    assert_eq!(cpu.step(&mut mem), Step::Ok);
+    assert_eq!(cpu.r[BX] & 0xFFFF, 0x42);
+}
+
+#[test]
+fn iopl_guards_the_sensitive_instructions_in_v86() {
+    for (name, program) in [
+        ("CLI", &[0xFA][..]),
+        ("STI", &[0xFB][..]),
+        ("PUSHF", &[0x9C][..]),
+        ("POPF", &[0x9D][..]),
+        ("INT n", &[0xCD, 0x3F][..]),
+        ("IRET", &[0xCF][..]),
+    ] {
+        let (mut cpu, mut mem) = into_v86(0, program);
+        enter(&mut cpu, &mut mem);
+        assert_eq!(cpu.step(&mut mem), Step::Ok, "{name}");
+        assert!(!cpu.v86_mode(), "{name} faults to level 0");
+        assert_eq!(cpu.ip, PM_CODE + 0xF000 + 13, "{name}");
+        // The faulting address is the instruction's, error code zero.
+        let at = cpu.r[SP] as usize;
+        assert_eq!(mem.data[at..at + 4], [0, 0, 0, 0], "{name}");
+        assert_eq!(mem.data[at + 4], 0, "{name}");
+    }
+    // With IOPL 3 they just run.
+    let (mut cpu, mut mem) = into_v86(3, &[0xFA, 0xFB, 0x9C, 0x9D]);
+    enter(&mut cpu, &mut mem);
+    for _ in 0..4 {
+        assert_eq!(cpu.step(&mut mem), Step::Ok);
+        assert!(cpu.v86_mode());
+    }
+}
+
+#[test]
+fn popf_in_v86_cannot_change_iopl_or_leave_the_mode() {
+    let (mut cpu, mut mem) = into_v86(3, &[0x66, 0x9D]);
+    enter(&mut cpu, &mut mem);
+    // POPFD of an image with IOPL 0 and VM clear.
+    cpu.r[SP] = 0x0FFC;
+    mem.data[0x4_0FFC..0x4_1000].copy_from_slice(&0x0000_0002u32.to_le_bytes());
+    assert_eq!(cpu.step(&mut mem), Step::Ok);
+    assert!(cpu.v86_mode());
+    assert_eq!(cpu.iopl(), 3);
+    assert_ne!(cpu.flags() & FLAG_VM, 0);
+}
+
+#[test]
+fn v86_io_goes_by_the_bitmap_not_iopl() {
+    // OUT 60h,AL; the TSS's bitmap starts past its limit, so it's refused.
+    let (mut cpu, mut mem) = into_v86(3, &[0xE6, 0x60]);
+    enter(&mut cpu, &mut mem);
+    assert_eq!(cpu.step(&mut mem), Step::Ok);
+    assert!(!cpu.v86_mode());
+    assert_eq!(cpu.ip, PM_CODE + 0xF000 + 13);
+    // A bitmap that lets the port through.
+    let (mut cpu, mut mem) = into_v86(0, &[0xE6, 0x60]);
+    write64(&mut mem, GDT + 5 * 8, gdt_entry(TSS, 0x2000 + 8, 0x89, 0x0));
+    cpu.tr.limit = 0x2000 + 8;
+    mem.data[TSS as usize + 102] = 0x00;
+    mem.data[TSS as usize + 103] = 0x10;
+    enter(&mut cpu, &mut mem);
+    assert_eq!(cpu.step(&mut mem), Step::Ok);
+    assert!(cpu.v86_mode(), "port allowed by the bitmap");
+    assert_eq!(cpu.ip, 2);
+}
+
+#[test]
+fn privileged_instructions_fault_in_v86() {
+    for program in [
+        &[0xF4][..],                   // HLT
+        &[0x0F, 0x20, 0xC0][..],       // MOV EAX,CR0
+        &[0x0F, 0x22, 0xC0][..],       // MOV CR0,EAX
+        &[0x0F, 0x01, 0x16, 0, 0][..], // LGDT
+    ] {
+        let (mut cpu, mut mem) = into_v86(3, program);
+        enter(&mut cpu, &mut mem);
+        assert_eq!(cpu.step(&mut mem), Step::Ok);
+        assert!(!cpu.v86_mode());
+        assert_eq!(cpu.ip, PM_CODE + 0xF000 + 13);
+    }
+    // These don't exist in the mode at all.
+    let (mut cpu, mut mem) = into_v86(3, &[0x0F, 0x00, 0xD8]);
+    enter(&mut cpu, &mut mem);
+    assert_eq!(cpu.step(&mut mem), Step::Ok);
+    assert_eq!(cpu.ip, PM_CODE + 0xF000 + 6);
+}
+
+#[test]
+fn a_task_switch_can_enter_v86() {
+    // JMP to the second TSS, whose image has VM set.
+    let (mut cpu, mut mem) = protected(&[0xEA, 0, 0, 0, 0, 0x38, 0]);
+    let image = TSS2 as usize;
+    mem.data[image + 0x20..image + 0x24].copy_from_slice(&0x10u32.to_le_bytes());
+    mem.data[image + 0x24..image + 0x28].copy_from_slice(&(FLAG_VM | 2).to_le_bytes());
+    for (index, value) in [0x1111u16, 0x2222, 0x3333, 0x4444, 0x5555, 0x6666].into_iter().enumerate() {
+        let at = image + 0x48 + index * 4;
+        mem.data[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    assert_eq!(cpu.step(&mut mem), Step::Ok);
+    assert!(cpu.v86_mode());
+    assert_eq!(cpu.sregs[CS], 0x2222);
+    assert_eq!(cpu.seg[CS].base, 0x2_2220);
+    assert_eq!(cpu.ip, 0x10);
+    assert_eq!(cpu.cpl, 3);
+}
+
+#[test]
+fn the_monitor_runs_v86_on_the_guests_vector_table() {
+    // INT 40h through the IVT, to a handler that sets BX and returns.
+    let (mut cpu, mut mem) = setup(&[0xCD, 0x40, 0xFA, 0x90]);
+    mem.data[0x40 * 4..0x40 * 4 + 4].copy_from_slice(&[0x00, 0x00, 0x00, 0x50]);
+    mem.data[0x5_0000..0x5_0004].copy_from_slice(&[0xBB, 0x42, 0x00, 0xCF]);
+    cpu.set_v86_monitor(true);
+    assert!(cpu.v86_mode());
+    assert_eq!(cpu.iopl(), 3);
+    assert_eq!(cpu.step(&mut mem), Step::Ok);
+    assert!(cpu.v86_mode());
+    assert_eq!(cpu.sregs[CS], 0x5000);
+    assert_eq!(cpu.step(&mut mem), Step::Ok);
+    assert_eq!(cpu.step(&mut mem), Step::Ok);
+    assert_eq!(cpu.r[BX] & 0xFFFF, 0x42);
+    assert_eq!(cpu.sregs[CS], 0x1000);
+    // CLI works, on the real IF.
+    assert_eq!(cpu.step(&mut mem), Step::Ok);
+    assert_eq!(cpu.flags() & FLAG_IF, 0);
+}
+
+#[test]
+fn the_monitor_emulates_what_it_can_and_reports_the_rest() {
+    let (mut cpu, mut mem) = setup(&[
+        0x0F, 0x20, 0xC3, // MOV EBX,CR0
+        0xF4, // HLT
+        0x0F, 0x01, 0x16, 0, 0, // LGDT
+    ]);
+    cpu.set_v86_monitor(true);
+    assert_eq!(cpu.step(&mut mem), Step::Ok);
+    assert_eq!(cpu.r[BX] & 1, 1, "the guest sees PE set");
+    assert_eq!(cpu.step(&mut mem), Step::Halted);
+    assert_eq!(cpu.ip, 4);
+    cpu.halted = false;
+    assert_eq!(cpu.step(&mut mem), Step::Halted);
+    assert_eq!(mem.calls, [HOST_MONITOR_FAULT]);
+}
+
+// ----------------------------------------------------------------------
+// Per-instruction vectors, recorded from a real CPU
+// ----------------------------------------------------------------------
+
+/// One line of a vector file, as `scripts/gen-dos-cpu-vectors.py` writes it.
+struct Vector<'a> {
+    name: &'a str,
+    code: Vec<u8>,
+    mask: u32,
+    init: [u32; 5],
+    want: [u32; 5],
+}
+
+fn text_field<'a>(line: &'a str, key: &str) -> &'a str {
+    let marker = format!("\"{key}\":\"");
+    let start = line.find(&marker).expect("field") + marker.len();
+    let rest = &line[start..];
+    &rest[..rest.find('"').expect("end of field")]
+}
+
+fn list_field(line: &str, key: &str) -> [u32; 5] {
+    let marker = format!("\"{key}\":[");
+    let start = line.find(&marker).expect("field") + marker.len();
+    let rest = &line[start..];
+    let text = &rest[..rest.find(']').expect("end of list")];
+    let values: Vec<u32> = text.split(',').map(|value| value.parse().expect("number")).collect();
+    [values[0], values[1], values[2], values[3], values[4]]
+}
+
+fn parse_vector(line: &str) -> Vector<'_> {
+    let hex = text_field(line, "c");
+    let code = (0..hex.len() / 2)
+        .map(|at| u8::from_str_radix(&hex[at * 2..at * 2 + 2], 16).expect("hex"))
+        .collect();
+    let mask_text = &line[line.find("\"m\":").expect("mask") + 4..];
+    let mask = mask_text[..mask_text.find(',').expect("end")].parse().expect("mask");
+    Vector {
+        name: text_field(line, "n"),
+        code,
+        mask,
+        init: list_field(line, "i"),
+        want: list_field(line, "f"),
+    }
+}
+
+fn run_vectors(file: &str) {
+    let (mut cpu, mut mem) = protected(&[]);
+    let at = PM_CODE + 0x100;
+    let mut failures = Vec::new();
+    let mut count = 0;
+    for line in file.lines() {
+        if !line.starts_with('{') {
+            continue;
+        }
+        count += 1;
+        let vector = parse_vector(line);
+        mem.data[at as usize..at as usize + vector.code.len()].copy_from_slice(&vector.code);
+        cpu.ip = at;
+        cpu.r[AX] = vector.init[0];
+        cpu.r[CX] = vector.init[1];
+        cpu.r[DX] = vector.init[2];
+        cpu.r[BX] = vector.init[3];
+        cpu.set_flags(vector.init[4]);
+        assert_eq!(cpu.step(&mut mem), Step::Ok, "{}", vector.name);
+        let got = [cpu.r[AX], cpu.r[CX], cpu.r[DX], cpu.r[BX], cpu.flags()];
+        let registers_match = got[..4] == vector.want[..4];
+        let flags_match = (got[4] ^ vector.want[4]) & vector.mask == 0;
+        let back_in_place = cpu.ip == at + vector.code.len() as u32;
+        if !(registers_match && flags_match && back_in_place) && failures.len() < 12 {
+            failures.push(format!(
+                "{}: from {:08X?} got {:08X?} want {:08X?} (flags mask {:03X})",
+                vector.name, vector.init, got, vector.want, vector.mask
+            ));
+        }
+    }
+    assert!(count > 100, "the file has vectors");
+    assert!(failures.is_empty(), "{count} vectors:\n{}", failures.join("\n"));
+}
+
+#[test]
+fn alu_vectors_match_a_real_cpu() {
+    run_vectors(include_str!("vectors/alu.json"));
+}
+
+#[test]
+fn shift_vectors_match_a_real_cpu() {
+    run_vectors(include_str!("vectors/shift.json"));
+}
+
+#[test]
+fn mul_and_div_vectors_match_a_real_cpu() {
+    run_vectors(include_str!("vectors/muldiv.json"));
+}
+
+#[test]
+fn bcd_vectors_match_a_real_cpu() {
+    run_vectors(include_str!("vectors/bcd.json"));
+}
+
+#[test]
+fn bit_and_extension_vectors_match_a_real_cpu() {
+    run_vectors(include_str!("vectors/bits.json"));
 }

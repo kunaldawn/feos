@@ -134,10 +134,13 @@ pub fn lines_after(fs: &dyn FileSystem, node: NodeId, offset: usize, count: usiz
 /// or not a newline closes it, is the first one counted.
 pub fn lines_before(fs: &dyn FileSystem, node: NodeId, offset: usize, count: usize) -> usize {
     let offset = offset.min(fs.size(node));
+    if count == 0 {
+        return offset;
+    }
     let mut chunk = [0u8; CHUNK];
     let mut end = offset;
-    // Newlines to pass: each line back crosses one, plus the one that ends the
-    // line just before the target.
+    // Each line back crosses one newline; the last one crossed is the one just
+    // before the target line.
     let mut left = count;
     let mut first = true;
     while end > 0 {
@@ -157,10 +160,10 @@ pub fn lines_before(fs: &dyn FileSystem, node: NodeId, offset: usize, count: usi
                 continue;
             }
             first = false;
+            left -= 1;
             if left == 0 {
                 return start + index + 1;
             }
-            left -= 1;
         }
         end = start;
     }

@@ -18,8 +18,16 @@ for name, enc in (('mulaw_all.au', 1), ('alaw_all.au', 27)):
     open(name, 'wb').write(b'.snd' + struct.pack('>5I', 24, 256, enc, 8000, 1) + bytes(range(256)))"
 for f in mulaw_all alaw_all; do ffmpeg -v error -y -i $f.au -f s16le $f.s16; done
 
-# MP3 Layer II, which must be refused.
+# MPEG Layer II, MPEG-1 and MPEG-2, with ffmpeg's decode as the reference. Layer I
+# is random frames from make_layer1.py, as nothing here encodes it. Vorbis floor 0
+# is the same, from make_floor0.py.
 ffmpeg $F -f lavfi -i "sine=f=440:r=44100:d=0.2" -c:a mp2 -b:a 64k -f mp2 tone.mp2
+ffmpeg -v error -y -i tone.mp2 -f s16le tone.mp2.s16
+ffmpeg -v error -y -f lavfi -i "sine=f=330:r=22050:d=0.3" -f lavfi -i "sine=f=550:r=22050:d=0.3" -filter_complex "[0][1]amerge=2[a]" -map "[a]" -c:a mp2 -b:a 64k -f mp2 mpeg2-stereo.mp2
+ffmpeg -v error -y -i mpeg2-stereo.mp2 -f s16le mpeg2-stereo.mp2.s16
+(cd .. && python3 make_layer1.py && python3 make_floor0.py)
+ffmpeg -v error -y -f mp3 -i layer1.mp1 -f s16le layer1.mp1.s16
+ffmpeg -v error -y -i floor0.ogg -f s16le floor0.ogg.s16
 
 # FLAC. Hashes of the decoded output are in tests/audio.rs.
 SRC='sine=f=440:r=44100:d=0.15[a];sine=f=1171:r=44100:d=0.15[b];anoisesrc=d=0.15:r=44100:c=pink:a=0.01:s=7[n];[a][b]amerge=2[ab];[n]asplit[n1][n2];[n1][n2]amerge=2[nn];[ab][nn]amix=normalize=0[o]'
@@ -52,8 +60,10 @@ The older fixtures here (`pcm*.wav`, `pcm16.aiff`, `pcm16.au`, `float32.wav`,
 ## `src/aac_tables.rs`
 
 The Huffman codebooks and scalefactor band offsets are the normative tables of
-ISO/IEC 14496-3. They were read from the data section of the installed
-`libavcodec.so.62`, then checked: each codebook is a complete prefix code
-(its Kraft sum is exactly 1), and decoding matches ffmpeg as above at each
-sampling rate from 8 to 96 kHz. The windows are computed from the standard's
+ISO/IEC 14496-3. `scripts/gen-aac-tables.py` generates them from
+`libxaac/decoder/ixheaacd_aac_rom.c` in the `libxaac-sys` 0.1.0 crate: libxaac, the
+Android Open Source Project's AAC decoder, under Apache-2.0. The script checks that
+each codebook is a complete prefix code (its Kraft sum is exactly 1), and decoding
+matches ffmpeg as above at each sampling rate from 8 to 96 kHz. The windows are
+computed from the standard's
 formula for the Kaiser-Bessel-derived window (alpha 4 long, alpha 6 short).

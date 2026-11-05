@@ -3,6 +3,7 @@ name = "feos-archive"
 description = "Dependency-free ZIP, TAR and gzip archives for the feos kernel"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

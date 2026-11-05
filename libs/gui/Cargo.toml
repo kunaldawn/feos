@@ -3,6 +3,7 @@ name = "feos-gui"
 description = "A dependency-free immediate-mode GUI toolkit for the feos kernel"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

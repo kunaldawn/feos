@@ -23,9 +23,35 @@ pub fn is_enabled() -> bool {
     imp::is_enabled()
 }
 
+/// Waits a moment for a lock to be released. On AArch64 the core sleeps until
+/// [`send_event`], or a timer, wakes it. An event sent since the last wait is
+/// remembered, so a release just before this can't be missed.
+#[inline]
+pub fn wait_event() {
+    imp::wait_event()
+}
+
+/// Wakes CPUs in [`wait_event`]. The store that released the lock has been made.
+#[inline]
+pub fn send_event() {
+    imp::send_event()
+}
+
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 mod imp {
     use core::arch::asm;
+
+    #[inline]
+    pub fn wait_event() {
+        // SAFETY: `wfe` only suspends execution, and every wait is in a loop.
+        unsafe { asm!("wfe", options(nomem, nostack, preserves_flags)) };
+    }
+
+    #[inline]
+    pub fn send_event() {
+        // SAFETY: the barrier makes the store visible first; `sev` has no other effect.
+        unsafe { asm!("dsb ishst", "sev", options(nostack, preserves_flags)) };
+    }
 
     /// `DAIF.I`.
     const IRQ_MASKED: u64 = 1 << 7;
@@ -56,6 +82,14 @@ mod imp {
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 mod imp {
     use core::arch::asm;
+
+    #[inline]
+    pub fn wait_event() {
+        core::hint::spin_loop();
+    }
+
+    #[inline]
+    pub fn send_event() {}
 
     /// `RFLAGS.IF`.
     const IRQ_ENABLED: u64 = 1 << 9;
@@ -93,6 +127,12 @@ mod imp {
         static MASKED: Cell<bool> = const { Cell::new(false) };
     }
 
+    pub fn wait_event() {
+        core::hint::spin_loop();
+    }
+
+    pub fn send_event() {}
+
     pub fn save_and_disable() -> u64 {
         MASKED.with(|masked| masked.replace(true)) as u64
     }
@@ -111,6 +151,14 @@ mod imp {
     not(all(any(target_arch = "aarch64", target_arch = "x86_64"), target_os = "none"))
 ))]
 mod imp {
+    #[inline]
+    pub fn wait_event() {
+        core::hint::spin_loop();
+    }
+
+    #[inline]
+    pub fn send_event() {}
+
     #[inline]
     pub fn save_and_disable() -> u64 {
         0

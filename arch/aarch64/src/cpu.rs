@@ -46,3 +46,40 @@ pub fn midr_el1() -> u64 {
     unsafe { asm!("mrs {}, MIDR_EL1", out(reg) value, options(nomem, nostack)) };
     value
 }
+
+/// Whether this machine has PAN on, once the boot CPU has looked.
+static PAN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// `SCTLR_EL1.SPAN`: clear, an exception to EL1 sets PAN by itself.
+const SCTLR_SPAN: u64 = 1 << 23;
+
+/// Shuts what EL0 can reach by default on this CPU. Call once on each, at EL1.
+///
+/// `SCTLR_EL1` is already right for this: `el_setup` left WFI, WFE, `dc zva`, `msr
+/// daif`, CTR_EL0 and cache maintenance all trapping from EL0. The counters and
+/// performance monitors have their own switches, and aren't promised to be off. PAN
+/// keeps the kernel off user pages, which it never needs: see `feos-vm`. A CPU before
+/// ARMv8.1, such as the Cortex-A53, doesn't have it.
+pub fn protect() {
+    // SAFETY: at EL1, with nothing mapped for EL0 yet, and all of this only narrows
+    // what EL0 can do. The encoding of `msr pan, #1` is spelt out because the assembler
+    // wants a newer architecture named otherwise.
+    unsafe {
+        asm!("msr cntkctl_el1, xzr", "msr pmuserenr_el0, xzr", options(nomem, nostack));
+        let features: u64;
+        asm!("mrs {}, id_aa64mmfr1_el1", out(reg) features, options(nomem, nostack));
+        if (features >> 20) & 0xf != 0 {
+            let mut control: u64;
+            asm!("mrs {}, sctlr_el1", out(reg) control, options(nomem, nostack));
+            control &= !SCTLR_SPAN;
+            asm!("msr sctlr_el1, {}", "isb", ".inst 0xd500419f", "isb", in(reg) control, options(nostack));
+            PAN.store(true, core::sync::atomic::Ordering::Relaxed);
+            crate::irq::set_thread_pan();
+        }
+    }
+}
+
+/// Whether PAN is on.
+pub fn has_pan() -> bool {
+    PAN.load(core::sync::atomic::Ordering::Relaxed)
+}

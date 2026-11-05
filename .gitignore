@@ -1,2 +1,3 @@
 target/
+user/out/
 boards/qemu-virt/disk*.img

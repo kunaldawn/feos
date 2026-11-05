@@ -1,9 +1,15 @@
 //! An 80386 interpreter, with the 486 additions commonly used by DOS programs.
 //!
-//! Real mode, 16- and 32-bit protected mode, paging and hardware task
-//! switching are implemented; virtual-8086 mode is not. The CPU identifies
-//! itself consistently as a 386 through the FLAGS and `PUSH SP` tests, and
-//! raises `INT 6` for undefined opcodes.
+//! Real mode, 16- and 32-bit protected mode, paging, hardware task switching
+//! and virtual-8086 mode are implemented. The CPU identifies itself consistently
+//! as a 386 through the FLAGS and `PUSH SP` tests, and raises `INT 6` for undefined
+//! opcodes.
+//!
+//! In virtual-8086 mode `pmode` is false, because segments, far transfers and
+//! stacks behave as they do in real mode, and `vm86` is true. What differs is what
+//! needs privilege: the mode runs at CPL 3, and IOPL decides `CLI`, `STI`, `PUSHF`,
+//! `POPF`, `INT n` and `IRET`. An interrupt leaves it through the IDT at level 0,
+//! unless `v86_monitor` says the machine's own monitor runs it ([`crate::emm386`]).
 //!
 //! Interrupts in real mode go through the guest's interrupt vector table, like
 //! on hardware. The machine seeds that table with stubs in ROM of the form
@@ -20,6 +26,7 @@
 //! Memory, ports and interrupts are supplied by the [`Bus`] trait, so the same
 //! CPU runs against the FEOS-DOS machine, a host-test memory or a debugger.
 
+pub(crate) mod host;
 mod ops;
 mod ops0f;
 mod pmode;
@@ -71,7 +78,7 @@ pub const FLAG_IOPL: u32 = 0x3000;
 pub const FLAG_NT: u32 = 0x4000;
 /// Resume flag.
 pub const FLAG_RF: u32 = 0x1_0000;
-/// Virtual-8086 flag. It can't be set here: virtual-8086 mode isn't implemented.
+/// Virtual-8086 flag.
 pub const FLAG_VM: u32 = 0x2_0000;
 
 const ARITH_FLAGS: u32 = FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF;
@@ -86,6 +93,11 @@ pub const CALLBACK_OPCODE: u8 = 0xFE;
 pub const CALLBACK_MODRM: u8 = 0x38;
 /// Lowest physical address a callback instruction is honoured at.
 pub const CALLBACK_ROM_BASE: u32 = 0xF_0000;
+/// The modrm byte of the host call instruction: `FE 3A n`, also from the ROM
+/// only, in any mode. It enters [`Bus::host_call`], which has the whole CPU.
+pub const HOST_CALL_MODRM: u8 = 0x3A;
+/// What [`Bus::host_call`] gets when the monitor can't handle what the guest did.
+pub const HOST_MONITOR_FAULT: u8 = 0xFF;
 
 /// How many iterations one [`Cpu::step`] of a `REP` instruction runs before it
 /// resumes on the next step, which is also when pending interrupts are taken.
@@ -341,6 +353,19 @@ pub trait Bus: 'static {
         InterruptAction::Continue
     }
 
+    /// Runs a host call: a service in the ROM that changes the CPU's mode. It has
+    /// the whole CPU, and whatever state it leaves is where the guest continues.
+    fn host_call(&mut self, _cpu: &mut Cpu, _code: u8) -> InterruptAction {
+        InterruptAction::Continue
+    }
+
+    /// Runs after a service, which may have asked for what only [`Self::host_call`]
+    /// can do. Returns whether it replaced the CPU's state, so that the callback
+    /// leaves it alone.
+    fn after_service(&mut self, _cpu: &mut Cpu) -> bool {
+        false
+    }
+
     /// Tells the bus the CPU's time before a port access or service.
     fn sync(&mut self, _cycles: u64) {}
 
@@ -475,8 +500,20 @@ pub struct Cpu {
     pub tr: SysSeg,
     /// Current privilege level.
     pub cpl: u8,
+    /// Protected-mode segmentation: PE set, and not virtual-8086 mode.
     pmode: bool,
+    /// Virtual-8086 mode.
+    vm86: bool,
+    /// The machine's own monitor runs virtual-8086 mode, so interrupts go straight
+    /// to the guest's vector table without guest tables at level 0.
+    v86_monitor: bool,
     paging: bool,
+    /// The page instructions are being fetched from, so that the TLB isn't asked
+    /// for every byte: its linear page number, or `u32::MAX`, and its frame.
+    fetch_page: u32,
+    fetch_frame: u32,
+    /// How the last interrupt came in, for a host that has to tell them apart.
+    pub(crate) int_source: IntSource,
     tlb: Vec<u64>,
 
     /// STI, `MOV SS` and `POP SS` hold off interrupts for one instruction.
@@ -494,6 +531,8 @@ pub struct Cpu {
 
     /// x87 floating-point state.
     pub fpu: crate::fpu::Fpu,
+    /// The last exception raised: its vector and the faulting `CS:EIP`.
+    pub last_fault: Option<(u8, u16, u32)>,
 
     /// Ring of recently executed instructions, for debugging.
     #[cfg(feature = "trace")]
@@ -523,6 +562,14 @@ impl Default for Cpu {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// How an interrupt got to the IDT.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum IntSource {
+    Hardware,
+    Software,
+    Exception,
 }
 
 struct Saved {
@@ -564,7 +611,12 @@ impl Cpu {
             tr: SysSeg::default(),
             cpl: 0,
             pmode: false,
+            vm86: false,
+            v86_monitor: false,
             paging: false,
+            fetch_page: u32::MAX,
+            fetch_frame: 0,
+            int_source: IntSource::Hardware,
             tlb: vec![0; TLB_SIZE],
             inhibit: false,
             no_trap: false,
@@ -575,6 +627,7 @@ impl Cpu {
             seg_override: None,
             rep: 0,
             fpu: crate::fpu::Fpu::new(),
+            last_fault: None,
             #[cfg(feature = "trace")]
             trace: [TraceEntry::default(); TRACE_LEN],
             #[cfg(feature = "trace")]
@@ -594,6 +647,11 @@ impl Cpu {
         ((segment as u32) << 4).wrapping_add(offset as u32)
     }
 
+    /// Reads a byte at a linear address, through paging, for debuggers.
+    pub fn read_linear<B: Bus>(&mut self, bus: &mut B, linear: u32) -> Option<u8> {
+        self.sys_rd8(bus, linear).ok()
+    }
+
     /// The offset of the instruction being executed.
     pub(crate) fn instr_start(&self) -> u32 {
         self.start_ip
@@ -602,6 +660,11 @@ impl Cpu {
     /// Whether the CPU is in protected mode.
     pub fn protected_mode(&self) -> bool {
         self.pmode
+    }
+
+    /// Whether the CPU is in virtual-8086 mode.
+    pub fn v86_mode(&self) -> bool {
+        self.vm86
     }
 
     /// Whether a hardware interrupt can be taken before the next instruction.
@@ -701,7 +764,7 @@ impl Cpu {
     /// Sets `EFLAGS` without any privilege checks.
     pub fn set_flags(&mut self, value: u32) {
         self.lazy = 0;
-        self.eflags = (value | 2) & !0x28 & !FLAG_VM;
+        self.eflags = ((value | 2) & !0x28 & !FLAG_VM) | (self.eflags & FLAG_VM);
     }
 
     fn compute_lazy(&self) -> u32 {
@@ -988,6 +1051,22 @@ impl Cpu {
         for entry in self.tlb.iter_mut() {
             *entry = 0;
         }
+        self.fetch_page = u32::MAX;
+    }
+
+    /// The physical address to fetch a code byte from.
+    #[inline(always)]
+    fn fetch_address<B: Bus>(&mut self, bus: &mut B, linear: u32) -> Exec<u32> {
+        if !self.paging {
+            return Ok(linear);
+        }
+        if linear >> 12 == self.fetch_page {
+            return Ok(self.fetch_frame | (linear & 0xFFF));
+        }
+        let phys = self.translate(bus, linear, false)?;
+        self.fetch_page = linear >> 12;
+        self.fetch_frame = phys & 0xFFFF_F000;
+        Ok(phys)
     }
 
     #[inline(always)]
@@ -1247,7 +1326,7 @@ impl Cpu {
         }
         let linear = s.base.wrapping_add(self.ip);
         let big = s.big;
-        let phys = self.translate(bus, linear, false)?;
+        let phys = self.fetch_address(bus, linear)?;
         let value = bus.read8(phys);
         self.ip = self.ip.wrapping_add(1);
         if !big {
@@ -1258,6 +1337,13 @@ impl Cpu {
 
     #[inline(always)]
     pub(crate) fn fetch16<B: Bus>(&mut self, bus: &mut B) -> Exec<u16> {
+        let s = &self.seg[CS];
+        let linear = s.base.wrapping_add(self.ip);
+        if self.ip < s.hi && self.ip < 0xFFFF_FFFE && linear & 0xFFF <= 0xFFE {
+            let phys = self.fetch_address(bus, linear)?;
+            self.ip += 2;
+            return Ok(bus.read16(phys));
+        }
         let lo = self.fetch8(bus)? as u16;
         let hi = self.fetch8(bus)? as u16;
         Ok(lo | (hi << 8))
@@ -1265,6 +1351,13 @@ impl Cpu {
 
     #[inline(always)]
     pub(crate) fn fetch32<B: Bus>(&mut self, bus: &mut B) -> Exec<u32> {
+        let s = &self.seg[CS];
+        let linear = s.base.wrapping_add(self.ip);
+        if s.hi >= 3 && self.ip <= s.hi - 3 && self.ip < 0xFFFF_FFFC && linear & 0xFFF <= 0xFFC {
+            let phys = self.fetch_address(bus, linear)?;
+            self.ip += 4;
+            return Ok(bus.read32(phys));
+        }
         let lo = self.fetch16(bus)? as u32;
         let hi = self.fetch16(bus)? as u32;
         Ok(lo | (hi << 16))
@@ -1599,6 +1692,11 @@ impl Cpu {
     /// Delivers a processor exception, escalating when delivery itself faults.
     fn exception<B: Bus>(&mut self, bus: &mut B, vector: u8, code: Option<u32>) -> Step {
         self.no_trap = true;
+        self.last_fault = Some((vector, self.sregs[CS], self.ip));
+        if vector == 13 && self.vm86 && self.v86_monitor {
+            return self.monitor_gp(bus);
+        }
+        self.int_source = IntSource::Exception;
         let first = match self.interrupt(bus, vector, code, false) {
             Ok(()) => return Step::Ok,
             Err(trap) => trap,
@@ -1629,6 +1727,7 @@ impl Cpu {
         self.halted = false;
         self.start_ip = self.ip;
         self.start_sp = self.r[SP];
+        self.int_source = IntSource::Hardware;
         match self.interrupt(bus, vector, None, false) {
             Ok(()) => Step::Ok,
             Err(Trap::FaultCode(vector, code)) => self.exception(bus, vector, Some(code)),
@@ -1645,7 +1744,7 @@ impl Cpu {
         code: Option<u32>,
         software: bool,
     ) -> Exec {
-        if self.pmode {
+        if self.pmode || (self.vm86 && !self.v86_monitor) {
             return self.interrupt_protected(bus, vector, code, software);
         }
         let entry = (vector as u32) * 4;
@@ -1685,6 +1784,9 @@ impl Cpu {
             InterruptAction::Blocked => return Err(Trap::Blocked),
             InterruptAction::Halt => return Err(Trap::Terminated),
             InterruptAction::Continue => {}
+        }
+        if bus.after_service(self) {
+            return Ok(());
         }
         for index in [ES, SS, DS, FS, GS] {
             let selector = self.sregs[index];

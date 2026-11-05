@@ -19,7 +19,7 @@ impl App for Info {
         "kernel, CPU, board and display information"
     }
 
-    fn run(&self, context: &mut Context<'_>) {
+    fn run(&self, context: &mut Context<'_>) -> i32 {
         let platform = context.platform;
         let (kernel_start, kernel_end) = platform.board.kernel_range;
         let (bss_start, bss_end) = platform.board.bss_range;
@@ -53,14 +53,9 @@ impl App for Info {
             platform.board.console_base
         );
 
-        match context.display.as_mut() {
-            Some(canvas) => println!(
-                "  graphics        : ramfb {}x{} XRGB8888 at {:#x}",
-                canvas.width(),
-                canvas.height(),
-                platform.board.framebuffer_addr
-            ),
-            None => println!("  graphics        : unavailable (no -device ramfb)"),
+        match platform.board.framebuffer_addr {
+            0 => println!("  graphics        : unavailable (no -device ramfb)"),
+            address => println!("  graphics        : ramfb XRGB8888 at {address:#x}"),
         }
 
         match platform.audio {
@@ -72,5 +67,6 @@ impl App for Info {
             ),
             _ => println!("  audio           : unavailable (no -device intel-hda)"),
         }
+        0
     }
 }

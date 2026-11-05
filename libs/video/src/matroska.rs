@@ -5,6 +5,9 @@
 //! expanded so one block may yield several video frames. Live-muxed files with
 //! unknown-size clusters and files cut off inside a cluster are both handled.
 
+use alloc::vec::Vec;
+
+use crate::audio::{push_packet, AudioCodec, AudioTrack};
 use crate::codec::Codec;
 use crate::error::{Result, VideoError};
 use crate::index::{DecoderLimits, Index, FLAG_KEY};
@@ -829,4 +832,120 @@ pub(crate) fn build_index(input: &[u8], limits: &DecoderLimits) -> Result<Matros
         dib: track.dib,
         palette,
     })
+}
+
+const ID_AUDIO: u32 = 0xe1;
+const ID_SAMPLING_FREQUENCY: u32 = 0xb5;
+const ID_CHANNELS: u32 = 0x9f;
+const ID_BIT_DEPTH: u32 = 0x6264;
+
+/// Reads a float element of 4 or 8 bytes.
+fn read_float(data: &[u8], elem: Elem) -> Option<f64> {
+    let bytes = data.get(elem.payload..elem.end)?;
+    match bytes.len() {
+        4 => Some(f32::from_be_bytes(bytes.try_into().ok()?) as f64),
+        8 => Some(f64::from_be_bytes(bytes.try_into().ok()?)),
+        _ => None,
+    }
+}
+
+/// Finds the first audio track.
+pub(crate) fn audio_track(input: &[u8]) -> Option<AudioTrack> {
+    let seg = segment(input).ok()?;
+    let tracks = find_in_segment(input, seg, ID_TRACKS)?;
+    let scale_ns = find_in_segment(input, seg, ID_INFO)
+        .and_then(|element| {
+            find_elem(input, element.payload, element.end, ID_TIMESTAMP_SCALE)
+                .ok()
+                .flatten()
+                .and_then(|e| read_uint(input, e).ok())
+        })
+        .filter(|&scale| scale != 0)
+        .unwrap_or(1_000_000);
+    let mut pos = tracks.payload;
+    while let Some(entry) = next_elem(input, pos, tracks.end).ok()? {
+        pos = entry.next;
+        if entry.id != ID_TRACK_ENTRY {
+            continue;
+        }
+        let track_type = find_elem(input, entry.payload, entry.end, ID_TRACK_TYPE)
+            .ok()?
+            .and_then(|e| read_uint(input, e).ok())
+            .unwrap_or(0);
+        if track_type != 2 {
+            continue;
+        }
+        let number = find_elem(input, entry.payload, entry.end, ID_TRACK_NUMBER)
+            .ok()?
+            .and_then(|e| read_uint(input, e).ok())?;
+        let codec_id = find_elem(input, entry.payload, entry.end, ID_CODEC_ID)
+            .ok()?
+            .map(|e| read_str(input, e))?;
+        let config = find_elem(input, entry.payload, entry.end, ID_CODEC_PRIVATE)
+            .ok()?
+            .map_or(0..0, |e| e.payload..e.end);
+        let audio = find_elem(input, entry.payload, entry.end, ID_AUDIO).ok()??;
+        let rate = find_elem(input, audio.payload, audio.end, ID_SAMPLING_FREQUENCY)
+            .ok()?
+            .and_then(|e| read_float(input, e))
+            .unwrap_or(8000.0) as u32;
+        let channels = find_elem(input, audio.payload, audio.end, ID_CHANNELS)
+            .ok()?
+            .and_then(|e| read_uint(input, e).ok())
+            .unwrap_or(1) as u16;
+        let bits = find_elem(input, audio.payload, audio.end, ID_BIT_DEPTH)
+            .ok()?
+            .and_then(|e| read_uint(input, e).ok())
+            .unwrap_or(16) as u8;
+        // Stripped or compressed packets would need putting back together.
+        let compressed = find_elem(input, entry.payload, entry.end, ID_CONTENT_ENCODINGS)
+            .ok()?
+            .is_some();
+        let codec = match codec_id {
+            _ if compressed => AudioCodec::Other,
+            b"A_AAC" => AudioCodec::Aac,
+            b"A_MPEG/L3" | b"A_MPEG/L2" | b"A_MPEG/L1" => AudioCodec::Mp3,
+            b"A_VORBIS" => AudioCodec::Vorbis,
+            b"A_FLAC" => AudioCodec::Flac,
+            b"A_OPUS" => AudioCodec::Opus,
+            b"A_PCM/INT/LIT" => AudioCodec::Pcm {
+                bytes: bits.div_ceil(8),
+                big_endian: false,
+                float: false,
+            },
+            b"A_PCM/INT/BIG" => AudioCodec::Pcm {
+                bytes: bits.div_ceil(8),
+                big_endian: true,
+                float: false,
+            },
+            b"A_PCM/FLOAT/IEEE" => AudioCodec::Pcm {
+                bytes: bits.div_ceil(8),
+                big_endian: false,
+                float: true,
+            },
+            _ => AudioCodec::Other,
+        };
+        let mut packets = Vec::new();
+        let mut full = false;
+        let walked = visit_clusters(input, seg, number, |cluster_time, frame| {
+            let ticks = cluster_time as i128 + frame.relative_time as i128;
+            let ms = (ticks * scale_ns as i128 / 1_000_000).max(0) as u64;
+            if push_packet(&mut packets, input.len(), frame.offset, frame.size, ms).is_none() {
+                full = true;
+                return Ok(false);
+            }
+            Ok(true)
+        });
+        if walked.is_err() || full {
+            return None;
+        }
+        return Some(AudioTrack {
+            codec,
+            sample_rate: rate,
+            channels,
+            config,
+            packets,
+        });
+    }
+    None
 }

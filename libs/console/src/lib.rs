@@ -40,10 +40,16 @@ pub type ReadFn = fn() -> Option<u8>;
 /// Waits for input or the next timer tick without busy-spinning.
 pub type WaitFn = fn();
 
+/// Offers printed text to the calling task's own console. Returns `false` when
+/// the task has none, so the text goes to the registered console instead. The
+/// flag says the text is error output.
+pub type RouteFn = fn(bytes: &[u8], error: bool) -> bool;
+
 static WRITER: AtomicUsize = AtomicUsize::new(0);
 static BYTE_WRITER: AtomicUsize = AtomicUsize::new(0);
 static READER: AtomicUsize = AtomicUsize::new(0);
 static WAITER: AtomicUsize = AtomicUsize::new(0);
+static ROUTER: AtomicUsize = AtomicUsize::new(0);
 static PRINT_LOCK: IrqSpinLock<()> = IrqSpinLock::new(());
 
 /// Bytes formatted before each write. This bounds how long one print keeps
@@ -80,6 +86,22 @@ pub fn set_reader(reader: ReadFn) {
 /// waiting falls back to a spin loop for host tests and minimal ports.
 pub fn set_waiter(waiter: WaitFn) {
     WAITER.store(waiter as usize, Ordering::Release);
+}
+
+/// Installs the per-task router consulted by the print macros.
+pub fn set_router(router: RouteFn) {
+    ROUTER.store(router as usize, Ordering::Release);
+}
+
+fn route(bytes: &[u8], error: bool) -> bool {
+    let address = ROUTER.load(Ordering::Acquire);
+    if address == 0 {
+        return false;
+    }
+    // SAFETY: only `set_router` writes this atomic, and it stores a valid
+    // `RouteFn` (a plain function pointer is `usize`-sized).
+    let router: RouteFn = unsafe { transmute::<usize, RouteFn>(address) };
+    router(bytes, error)
 }
 
 /// Reads one byte from the registered console, if any is available.
@@ -214,20 +236,22 @@ impl Write for Sink {
 struct BufferedSink {
     buffer: [u8; PRINT_BUFFER],
     len: usize,
+    error: bool,
 }
 
 impl BufferedSink {
-    const fn new() -> Self {
+    const fn new(error: bool) -> Self {
         Self {
             buffer: [0; PRINT_BUFFER],
             len: 0,
+            error,
         }
     }
 
     fn flush(&mut self) {
         // The buffer only ever holds whole characters: see `write_str`.
         if let Ok(text) = core::str::from_utf8(&self.buffer[..self.len]) {
-            if !text.is_empty() {
+            if !text.is_empty() && !route(text.as_bytes(), self.error) {
                 // A panic while the lock is held is handled by
                 // `_print_unlocked`, so this cannot deadlock the panic path.
                 let _guard = PRINT_LOCK.lock();
@@ -256,7 +280,15 @@ impl Write for BufferedSink {
 /// Serialized console output used by the print macros.
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
-    let mut sink = BufferedSink::new();
+    let mut sink = BufferedSink::new(false);
+    let _ = sink.write_fmt(args);
+    sink.flush();
+}
+
+/// Like [`_print`], for error output.
+#[doc(hidden)]
+pub fn _eprint(args: fmt::Arguments) {
+    let mut sink = BufferedSink::new(true);
     let _ = sink.write_fmt(args);
     sink.flush();
 }
@@ -293,6 +325,25 @@ macro_rules! println {
     };
 }
 
+/// Prints to the task's error output without a trailing newline.
+#[macro_export]
+macro_rules! eprint {
+    ($($arg:tt)*) => {
+        $crate::_eprint(format_args!($($arg)*))
+    };
+}
+
+/// Prints to the task's error output with a trailing newline.
+#[macro_export]
+macro_rules! eprintln {
+    () => {
+        $crate::eprint!("\n")
+    };
+    ($($arg:tt)*) => {
+        $crate::eprint!("{}\n", format_args!($($arg)*))
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,7 +364,7 @@ mod tests {
 
     #[test]
     fn long_text_stays_whole_across_buffer_flushes() {
-        let mut sink = BufferedSink::new();
+        let mut sink = BufferedSink::new(false);
         // Multi-byte characters that straddle the buffer end must not split.
         for _ in 0..PRINT_BUFFER {
             sink.write_str("é").unwrap();

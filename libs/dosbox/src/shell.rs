@@ -43,6 +43,12 @@ pub enum CommandResult {
     LoadState,
     /// Change the CPU's speed, in instruction units per millisecond.
     SetCycles(u32),
+    /// Run later programs under the memory manager, or not.
+    SetMemoryManager(bool),
+    /// When to offer the DPMI host.
+    SetDpmi(crate::dpmi::Mode),
+    /// Change which Sound Blaster the machine has.
+    SetSoundBlaster(crate::sb::Model),
     /// Close the DOS window.
     Exit,
 }
@@ -126,7 +132,7 @@ impl Shell {
             ("COMSPEC", "C:\\COMMAND.COM"),
             ("PATH", "C:\\"),
             ("PROMPT", "$P$G"),
-            ("BLASTER", "A220 I7 D1 T3"),
+            ("BLASTER", "A220 I7 D1 H5 T6"),
         ]
         .iter()
         .map(|(key, value)| (key.to_string(), value.to_string()))
@@ -234,6 +240,11 @@ impl Shell {
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.as_str())
+    }
+
+    /// Sets a variable in the prompt's environment, for host tools.
+    pub fn set_env_public(&mut self, name: &str, value: &str, dos: &mut Dos, mem: &mut Memory) {
+        self.set_env(name, value, dos, mem);
     }
 
     fn set_env(&mut self, name: &str, value: &str, dos: &mut Dos, mem: &mut Memory) {
@@ -901,7 +912,7 @@ impl Shell {
             "SAVESTATE" => return CommandResult::SaveState,
             "LOADSTATE" => return CommandResult::LoadState,
             "SOUND" => out.line(
-                "PC speaker, OPL2/OPL3 FM on 388h and a Sound Blaster 2.0 on 220h, IRQ 7, DMA 1.",
+                "PC speaker, OPL3 FM on 388h and a Sound Blaster on 220h, IRQ 7, DMA 1 and 5.",
             ),
             "CYCLES" => match args.first().and_then(|value| value.parse::<u32>().ok()) {
                 Some(cycles) => return CommandResult::SetCycles(cycles),
@@ -990,6 +1001,43 @@ impl Shell {
             "PAUSE" => {
                 out.line("Press any key to continue . . .");
                 self.waiting_for_key = true;
+            }
+            "EMM386" => {
+                return match args.first().map(|word| word.to_ascii_uppercase()).as_deref() {
+                    Some("ON") => CommandResult::SetMemoryManager(true),
+                    Some("OFF") => CommandResult::SetMemoryManager(false),
+                    _ => {
+                        out.line("Syntax: EMM386 ON | OFF");
+                        CommandResult::None
+                    }
+                };
+            }
+            "DPMI" => {
+                use crate::dpmi::Mode;
+                return match args.first().map(|word| word.to_ascii_uppercase()).as_deref() {
+                    Some("ON") => CommandResult::SetDpmi(Mode::On),
+                    Some("OFF") => CommandResult::SetDpmi(Mode::Off),
+                    Some("AUTO") => CommandResult::SetDpmi(Mode::Auto),
+                    _ => {
+                        out.line("Syntax: DPMI ON | OFF | AUTO");
+                        CommandResult::None
+                    }
+                };
+            }
+            "SBTYPE" => {
+                use crate::sb::Model;
+                let model = match args.first().map(|word| word.to_ascii_uppercase()).as_deref() {
+                    Some("2") | Some("SB2") => Model::Sb2,
+                    Some("PRO") | Some("SBPRO") => Model::SbPro,
+                    Some("16") | Some("SB16") => Model::Sb16,
+                    _ => {
+                        out.line("Syntax: SBTYPE 2 | PRO | 16");
+                        return CommandResult::None;
+                    }
+                };
+                self.set_env("BLASTER", model.blaster(), dos, out.mem);
+                out.line(&format!("{}: BLASTER={}", model.name(), model.blaster()));
+                return CommandResult::SetSoundBlaster(model);
             }
             "SET" => {
                 let text = rest.trim_start();
@@ -1084,6 +1132,9 @@ fn is_builtin(upper: &str) -> bool {
             | "SHIFT"
             | "PAUSE"
             | "SET"
+            | "SBTYPE"
+            | "EMM386"
+            | "DPMI"
             | "PATH"
             | "EXIT"
     )
@@ -1435,6 +1486,8 @@ fn help(out: &mut Out<'_>) {
         "DATE / TIME       show clock        SET / PATH     environment",
         "MOUNT name        copy a game in    UNMOUNT name   remove it again",
         "GAMES             list the library  SOUND          sound hardware",
+        "SBTYPE 2|PRO|16   pick the card     EMM386 ON|OFF  memory manager, VCPI",
+        "DPMI ON|OFF|AUTO  the DPMI host",
         "SCREEN            save a BMP        SAVESTATE      save the machine",
         "LOADSTATE         restore it        CYCLES n       CPU speed",
         "IF FOR GOTO CALL SHIFT PAUSE REM    batch file language; > >> < redirect",

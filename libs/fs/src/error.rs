@@ -43,6 +43,16 @@ pub enum FsError {
     InvalidName,
     /// The operation is not supported by this backend.
     Unsupported,
+    /// The volume or mount refuses writes.
+    ReadOnly,
+    /// Something is using it: an open handle, a mount, or a working directory.
+    Busy,
+    /// The handle was closed, or its file has since been removed.
+    StaleHandle,
+    /// The entry is a directory where a file is needed.
+    IsDirectory,
+    /// Following symbolic links went round too many times.
+    SymlinkLoop,
 }
 
 impl fmt::Display for FsError {
@@ -66,6 +76,11 @@ impl fmt::Display for FsError {
             Self::NotEmpty => "directory is not empty",
             Self::InvalidName => "invalid file name",
             Self::Unsupported => "operation not supported",
+            Self::ReadOnly => "read-only filesystem",
+            Self::Busy => "device or resource busy",
+            Self::StaleHandle => "stale file handle",
+            Self::IsDirectory => "is a directory",
+            Self::SymlinkLoop => "too many levels of symbolic links",
         };
         f.write_str(message)
     }

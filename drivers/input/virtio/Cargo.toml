@@ -3,7 +3,9 @@ name = "feos-driver-virtio-input"
 description = "Virtio MMIO pointer (tablet/mouse) driver"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
 feos-hal = { workspace = true }
+feos-virtio-core = { workspace = true }

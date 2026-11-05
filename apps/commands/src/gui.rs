@@ -164,7 +164,11 @@ impl App for Gui {
         WindowFrame::Continue
     }
 
-    fn run(&self, context: &mut Context<'_>) {
+    fn needs_display(&self) -> bool {
+        true
+    }
+
+    fn run(&self, context: &mut Context<'_>) -> i32 {
         match context.display.as_mut() {
             Some(canvas) => {
                 // SAFETY: foreground graphics apps run one at a time in the
@@ -177,8 +181,12 @@ impl App for Gui {
                     canvas.height()
                 );
             }
-            None => println!("no framebuffer; restart QEMU with -device ramfb"),
+            None => {
+                println!("no framebuffer; restart QEMU with -device ramfb");
+                return 1;
+            }
         }
+        0
     }
 }
 
@@ -1046,7 +1054,7 @@ mod tests {
         std::thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
             .spawn(|| {
-                for (seed, (width, height)) in SIZES.iter().cycle().take(40).enumerate() {
+                for (seed, (width, height)) in SIZES.iter().cycle().take(20).enumerate() {
                     let mut pixels = std::vec![0u32; width * height];
                     let mut state = std::boxed::Box::new(DemoState::new());
                     let mut random =

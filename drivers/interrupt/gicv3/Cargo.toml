@@ -1,0 +1,10 @@
+[package]
+name = "feos-driver-gicv3"
+description = "ARM Generic Interrupt Controller v3 driver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+feos-hal = { workspace = true }

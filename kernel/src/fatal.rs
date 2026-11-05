@@ -1,23 +1,32 @@
-//! What happens when the kernel can't continue.
+//! What happens when something fails.
 //!
 //! The policy is the same for every panic and CPU fault, on every port and on
-//! any CPU: **the whole machine stops**. Processes share one address space and
-//! can hold each other's locks, so nothing would be safe to keep running after
-//! one of them has failed, and a half-alive system hides the failure.
+//! any CPU. A failure in an ordinary task, which holds no lock and wasn't masking
+//! interrupts, **ends that task**: see [`sched::contain_failure`]. A failure
+//! anywhere else, in the boot task, an interrupt handler or with a lock held,
+//! **stops the whole machine**: it could have left anything inconsistent, and a
+//! half-alive system hides the failure.
 //!
-//! The sequence is: mask this CPU's interrupts, stop every other CPU with an
-//! IPI, print one report, and halt. Only the first failure gets to report. A
+//! For a kernel thread, ending a task isn't full isolation. They share one address
+//! space, so one that scribbled on someone else's memory before it faulted has done
+//! it, and nothing can tell. What it held under a lock is safe; what it allocated stays
+//! allocated, and is reported as a leak. A user program's fault comes this way too, and
+//! there it's all there is to it: see [`crate::user`].
+//!
+//! Stopping the machine is:
+//! mask this CPU's interrupts, stop every other CPU with an
+//! IPI, then, for a CPU with interrupts masked, with an NMI where the machine has
+//! them, print one report, and halt. Only the first failure gets to report. A
 //! second one, on any CPU, including one raised while printing the report, halts
 //! quietly.
 
 use core::fmt::Write;
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use feos_hal::{Board, IpiTarget};
+use feos_hal::{Arch, Board, Clock, FaultDetails, IpiTarget};
 
-use crate::arch::{cpu, exceptions, irq, timer};
-use crate::{sched, Machine};
+use crate::{sched, Fault, Frame, Machine, Port};
 
 /// How long to wait for other CPUs to stop. One may have interrupts masked, so
 /// the stop has to be allowed to time out, but the report shouldn't interleave
@@ -25,40 +34,58 @@ use crate::{sched, Machine};
 const STOP_WAIT_MS: u64 = 50;
 
 static CLAIMED: AtomicBool = AtomicBool::new(false);
-static STOPPED_CPUS: AtomicUsize = AtomicUsize::new(0);
+/// CPUs that have stopped, as a bit each: an NMI can reach one that an IPI did too.
+static STOPPED_CPUS: AtomicU64 = AtomicU64::new(0);
 /// The CPU writing the report, plus one.
 static REPORTER: AtomicUsize = AtomicUsize::new(0);
 
 /// Stops the rest of the machine, or this CPU if another failure got here first.
 fn begin() {
-    irq::disable();
+    Port::irq_disable();
     if CLAIMED.swap(true, Ordering::AcqRel) {
-        if REPORTER.load(Ordering::Acquire) == cpu::index() + 1 {
+        if REPORTER.load(Ordering::Acquire) == Port::cpu_index() + 1 {
             let _ = writeln!(Report, "\n[fatal] failed while reporting; system halted");
         }
-        cpu::halt();
+        // An NMI that lands here is how a CPU with interrupts masked stops.
+        stop_this_cpu();
     }
-    REPORTER.store(cpu::index() + 1, Ordering::Release);
+    REPORTER.store(Port::cpu_index() + 1, Ordering::Release);
 
     let others = sched::online_cpus().saturating_sub(1);
     if others == 0 {
         return;
     }
     Machine::interrupts().send_ipi(IpiTarget::AllOthers, Machine::IPI_STOP);
+    let mut stopped = wait_for_stop(others);
+    if !stopped && Machine::interrupts().send_stop_nmi() {
+        stopped = wait_for_stop(others);
+    }
+    let count = stopped_cpus();
+    let verdict = if stopped { "" } else { " (the rest have interrupts masked)" };
+    let _ = writeln!(Report, "\n[fatal] stopped {count} of {others} other CPU(s){verdict}");
+}
 
-    let start = timer::ticks();
-    let wait = timer::frequency() / 1000 * STOP_WAIT_MS;
-    while STOPPED_CPUS.load(Ordering::Acquire) < others
-        && timer::ticks().wrapping_sub(start) < wait
-    {
+/// Waits a moment for `others` CPUs to report they've stopped.
+fn wait_for_stop(others: usize) -> bool {
+    let start = Port::services().ticks();
+    let wait = Port::services().frequency() / 1000 * STOP_WAIT_MS;
+    while stopped_cpus() < others {
+        if Port::services().ticks().wrapping_sub(start) >= wait {
+            return false;
+        }
         core::hint::spin_loop();
     }
+    true
+}
+
+fn stopped_cpus() -> usize {
+    STOPPED_CPUS.load(Ordering::Acquire).count_ones() as usize
 }
 
 /// Handles the stop IPI on a CPU that isn't reporting.
 pub fn stop_this_cpu() -> ! {
-    STOPPED_CPUS.fetch_add(1, Ordering::AcqRel);
-    cpu::halt()
+    STOPPED_CPUS.fetch_or(1 << Port::cpu_index(), Ordering::AcqRel);
+    Port::halt()
 }
 
 /// Writes straight to the board's UART.
@@ -84,40 +111,79 @@ fn report_location() {
     let _ = writeln!(
         Report,
         "[fatal] cpu {}, pid {pid}{separator}{name}; system halted",
-        cpu::index(),
+        Port::cpu_index(),
     );
 }
 
-/// Reports a CPU exception and stops the machine.
-pub fn on_exception(info: &exceptions::FaultInfo) {
-    begin();
-    let _ = write!(
+/// Whether the machine has started to stop.
+pub fn is_stopping() -> bool {
+    CLAIMED.load(Ordering::Acquire)
+}
+
+/// Reports a task ended because its stack is gone wrong. Called under the
+/// scheduler's lock, and writes around every other lock.
+pub fn report_stack_overflow(pid: u32, name: &str, sp: usize, bottom: usize, top: usize) {
+    let _ = writeln!(
         Report,
-        "\n[fatal] {} / {} (vector {})\n\
-         [fatal] error={:#018x} class={:#04x} ({})\n\
-         [fatal] ip={:#018x} fault address={:#018x}\n\
-         [fatal] flags={:#018x} sp={:#018x}\n",
-        info.vector_group(),
-        info.vector_type(),
-        info.index,
-        info.esr,
-        info.exception_class(),
-        info.syndrome_name(),
-        info.elr,
-        info.far,
-        info.spsr,
-        info.sp,
+        "\n[fault] pid {pid} ({name}): stack overflow, sp={sp:#x}, stack {bottom:#x}..{top:#x}; ended"
     );
-    let _ = info.write_registers(&mut Report);
-    report_location();
-    cpu::halt()
 }
 
-/// Reports a panic and stops the machine.
+/// Writes which task failed, for a report of a failure it alone pays for.
+fn report_task() {
+    let mut name = [0u8; feos_app::PROCESS_NAME_MAX];
+    let (pid, len) = sched::current_identity(&mut name);
+    let name = core::str::from_utf8(&name[..len]).unwrap_or("?");
+    let _ = write!(Report, "\n[fault] pid {pid} ({name}) on cpu {}: ", Port::cpu_index());
+}
+
+/// Takes a CPU exception: ends the task if that's safe, and otherwise reports it
+/// and stops the machine. Returns `true` having replaced the frame.
+pub fn on_exception(info: &Fault, frame: &mut Frame) -> bool {
+    let overflow = info.fault_address().and_then(sched::stack_overflow_at);
+    if info.is_task_fault() && frame.interrupts_were_enabled() && sched::contain_failure() {
+        report_task();
+        match info.fault_address() {
+            Some(address) if overflow.is_some() => {
+                let _ = writeln!(Report, "stack overflow into the guard page at {address:#x}; ended");
+            }
+            Some(address) => {
+                let _ = writeln!(
+                    Report,
+                    "{} at {address:#x}, ip={:#x}; ended",
+                    info.syndrome_name(),
+                    info.instruction()
+                );
+            }
+            None => {
+                let _ = writeln!(Report, "{}, ip={:#x}; ended", info.syndrome_name(), info.instruction());
+            }
+        }
+        sched::end_task_from_trap(frame);
+        return true;
+    }
+
+    begin();
+    if overflow.is_some() {
+        let _ = writeln!(Report, "\n[fatal] stack overflow into a guard page");
+    }
+    let _ = writeln!(Report);
+    let _ = info.write_report(&mut Report);
+    report_location();
+    Port::halt()
+}
+
+/// Ends the task if that's safe, and otherwise reports the panic and stops the
+/// machine.
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    if Port::irqs_enabled() && sched::contain_failure() {
+        report_task();
+        let _ = writeln!(Report, "{info}; ended");
+        sched::end_task();
+    }
     begin();
     let _ = writeln!(Report, "\n[fatal] panic: {info}");
     report_location();
-    cpu::halt()
+    Port::halt()
 }

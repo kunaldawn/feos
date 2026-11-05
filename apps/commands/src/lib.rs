@@ -10,51 +10,65 @@
 
 extern crate alloc;
 
-pub mod clear;
+pub mod audio_worker;
 pub mod coreutils;
-pub mod echo;
+pub mod decode_worker;
+pub mod displayd;
 pub mod files;
+pub mod fsflush;
 pub mod gfx;
 pub mod gui;
-pub mod help;
+pub mod host;
+pub mod image_viewer;
 pub mod info;
 pub mod kill;
+pub mod music;
+pub mod net;
+pub mod netd;
+pub mod play;
 pub mod player;
 pub mod power;
 pub mod ps;
+pub mod renice;
 pub mod sleep;
 pub mod spawn;
 pub mod splash;
+pub mod subtitles;
 pub mod taskmgr;
 pub mod terminal;
 pub mod tick;
 pub mod tone;
 pub mod ui;
-pub mod uptime;
 
 use feos_app::App;
 
 /// Every app the shell knows about, in `help` order.
 pub static REGISTRY: &[&dyn App] = &[
-    &help::Help,
     &coreutils::CoreUtils,
     &terminal::Terminal,
-    &echo::Echo,
     &info::Info,
     &ps::Ps,
     &taskmgr::TaskManager,
     &spawn::Spawn,
     &kill::Kill,
+    &renice::Renice,
+    &renice::Taskset,
     &tick::Tick,
     &gfx::Gfx,
     &gui::Gui,
     &files::Files,
     &player::Player,
+    &music::Music,
+    &image_viewer::ImageViewer,
+    &play::Play,
     &splash::Splash,
     &tone::Tone,
-    &uptime::Uptime,
     &sleep::Sleep,
-    &clear::Clear,
+    &net::Ifconfig,
+    &net::Ping,
+    &net::Nslookup,
+    &net::Wget,
+    &net::Nc,
     &power::PowerOff,
     &power::Reboot,
     &feos_desktop_app::DesktopApp,
@@ -97,6 +111,13 @@ mod tests {
     }
 
     #[test]
+    fn shell_builtins_are_not_shadowed_by_apps() {
+        for name in ["echo", "clear", "help", "uptime"] {
+            assert!(find(name).is_none(), "{name} would never be reached");
+        }
+    }
+
+    #[test]
     fn desktop_resolves_to_the_session_app() {
         let app = find("desktop").expect("desktop command");
         assert_eq!(app.name(), "desktop");
@@ -109,7 +130,6 @@ mod tests {
         let app = find("player").expect("player command");
         assert_eq!(app.name(), "player");
         assert!(app.foreground());
-        assert!(find("vlc").is_some());
         assert!(find("media-player").is_some());
     }
 

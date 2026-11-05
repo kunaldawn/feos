@@ -18,6 +18,8 @@ use crate::bios::{
 };
 use crate::cpu::{self, Bus, Cpu, CpuRegs, InterruptAction, Step};
 use crate::dos::{Dos, COMMAND_PSP};
+use crate::dpmi::Dpmi;
+use crate::emm386::Emm386;
 use crate::hw::{Dma, Pics, Pit};
 use crate::keyboard::Keyboard;
 use crate::memory::{Memory, BDA_BASE, MONO_BASE, VIDEO_BASE};
@@ -65,6 +67,8 @@ pub struct SystemBus {
     pub sb: SoundBlaster,
     pub xms: Xms,
     pub ems: Ems,
+    pub dpmi: Dpmi,
+    pub emm: Emm386,
     pub joystick: Option<Joystick>,
     /// When the game port's axis timers fired, in microseconds of guest time.
     joystick_fired: u64,
@@ -117,6 +121,8 @@ impl SystemBus {
             sb: SoundBlaster::new(),
             xms: Xms::new(),
             ems: Ems::new(),
+            dpmi: Dpmi::new(),
+            emm: Emm386::new(),
             joystick: None,
             joystick_fired: 0,
             exit_requested: false,
@@ -145,6 +151,7 @@ impl SystemBus {
         bus.bios.install(&mut bus.mem);
         bus.vga.install_rom(&mut bus.mem);
         bus.dos.install(&mut bus.mem);
+        Dpmi::install_rom(&mut bus.mem);
         bus
     }
 
@@ -195,11 +202,12 @@ impl SystemBus {
         if self.mouse.handler_due() {
             self.pics.raise(self.mouse.irq);
         }
-        if self.sb.active || self.sb.next_block_us().is_some() {
+        if self.sb.running() {
             self.generate_audio();
         }
+        self.sb.service_dma_write(&mut self.dma, &mut self.mem);
         if self.sb.take_irq() {
-            self.pics.raise(sb::IRQ);
+            self.pics.raise(self.sb.irq_line());
         }
     }
 
@@ -248,6 +256,7 @@ impl SystemBus {
         let frames = frames.min(self.audio_rate as usize);
         let mut samples = vec![0i16; frames * 2];
         self.opl.generate(&mut samples);
+        self.sb.apply_fm_volume(&mut samples);
         self.sb.generate(
             &mut self.dma,
             &self.mem,
@@ -262,7 +271,8 @@ impl SystemBus {
         let room = MAX_PENDING_SAMPLES.saturating_sub(samples.len());
         if self.pending_audio.len() > room {
             let excess = self.pending_audio.len() - room;
-            self.pending_audio.drain(..excess.min(self.pending_audio.len()));
+            self.pending_audio
+                .drain(..excess.min(self.pending_audio.len()));
         }
         self.pending_audio.extend_from_slice(&samples);
     }
@@ -309,8 +319,8 @@ impl SystemBus {
             }
             if value != 0 {
                 for sample in &mut samples[frame * 2..frame * 2 + 2] {
-                    *sample = (*sample as i32 + value).clamp(i16::MIN as i32, i16::MAX as i32)
-                        as i16;
+                    *sample =
+                        (*sample as i32 + value).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
                 }
             }
         }
@@ -412,10 +422,13 @@ impl SystemBus {
     /// The `INT 2Fh` multiplex.
     fn int2f(&mut self, regs: &mut CpuRegs<'_>) {
         match regs.ax() {
-            // Not running under Windows, and no DPMI host to switch to.
+            // Not running under Windows.
             0x1600 | 0x4680 => regs.set_al(0),
             0x1680 => regs.set_al(0),
-            0x1687 => {}
+            0x1687 => {
+                let self_hosting = self.dos.self_hosting == Some(self.dos.psp);
+                self.dpmi.installation_check(regs, self_hosting);
+            }
             0x4300 => regs.set_al(0x80),
             0x4310 => {
                 regs.set_es(ROM_SEGMENT);
@@ -423,6 +436,11 @@ impl SystemBus {
             }
             _ => {}
         }
+    }
+
+    /// Charges guest work a service has done.
+    pub(crate) fn charge(&mut self, units: u32) {
+        self.cost = self.cost.saturating_add(units);
     }
 
     /// The default handlers for fatal exceptions.
@@ -460,9 +478,12 @@ impl SystemBus {
         self.pit.next_irq = Some(tick + 0x1_0000);
         self.pit.channels[0].start = tick;
         self.dma = Dma::new();
-        self.sb = SoundBlaster::new();
+        self.sb = SoundBlaster::with_model(self.sb.model);
         self.xms.reset();
         self.ems.reset();
+        self.mem.set_ems_frame(self.ems.frame_map());
+        self.dpmi.reset();
+        self.emm.reset();
         self.mem.set_a20(false);
         self.port61 = 0;
         self.keyboard.output_full = false;
@@ -527,6 +548,21 @@ impl Bus for SystemBus {
         self.cycles = cycles;
     }
 
+    fn host_call(&mut self, cpu: &mut Cpu, code: u8) -> InterruptAction {
+        self.dpmi_host_call(cpu, code)
+    }
+
+    fn after_service(&mut self, cpu: &mut Cpu) -> bool {
+        if core::mem::take(&mut self.dos.process_ended) && self.dpmi.active() {
+            self.dpmi_check_clients();
+        }
+        if let Some(at) = self.emm.take_switch() {
+            self.vcpi_enter_client(cpu, at);
+            return true;
+        }
+        false
+    }
+
     fn take_cost(&mut self) -> u32 {
         let dos = core::mem::take(&mut self.dos.cost);
         core::mem::take(&mut self.cost).saturating_add(dos)
@@ -542,7 +578,9 @@ impl Bus for SystemBus {
 
     fn in8(&mut self, port: u16) -> u8 {
         match port {
-            0x00..=0x0F | 0x81..=0x83 | 0x87 => self.dma.port_in(port),
+            0x00..=0x0F | 0x81..=0x83 | 0x87 | 0x89..=0x8B | 0x8F | 0xC0..=0xDF => {
+                self.dma.port_in(port)
+            }
             0x20 | 0x21 | 0xA0 | 0xA1 => self.pics.port_in(port),
             0x40..=0x43 => {
                 let tick = self.ticks();
@@ -569,20 +607,35 @@ impl Bus for SystemBus {
                 self.sync_opl();
                 self.opl.read_status()
             }
+            // The SB Pro and SB16 show the FM chip at their base as well.
+            0x220 | 0x222 if self.sb.model != sb::Model::Sb2 => {
+                self.sync_opl();
+                self.opl.read_status()
+            }
             0x389 | 0x38A | 0x38B | 0x229 => 0xFF,
             0x3B4 | 0x3B5 | 0x3BA | 0x3C0..=0x3CF | 0x3D4 | 0x3D5 | 0x3D8 | 0x3D9 | 0x3DA => {
                 let now = self.time_us();
                 let SystemBus { vga, mem, .. } = self;
                 vga.port_in(port, mem, now)
             }
-            sb::BASE..=0x22F => self.sb.port_in(port),
+            sb::BASE..=0x22F => {
+                // Port reads see where the DSP has got to.
+                self.generate_audio();
+                let value = self.sb.port_in(port);
+                if matches!(port, 0x22E | 0x22F) && self.sb.irq_cleared() {
+                    self.pics.lower(self.sb.irq_line());
+                }
+                value
+            }
             _ => 0xFF,
         }
     }
 
     fn out8(&mut self, port: u16, value: u8) {
         match port {
-            0x00..=0x0F | 0x81..=0x83 | 0x87 => self.dma.port_out(port, value),
+            0x00..=0x0F | 0x81..=0x83 | 0x87 | 0x89..=0x8B | 0x8F | 0xC0..=0xDF => {
+                self.dma.port_out(port, value)
+            }
             0x20 | 0x21 | 0xA0 | 0xA1 => self.pics.port_out(port, value),
             0x40..=0x43 => {
                 let tick = self.ticks();
@@ -603,11 +656,23 @@ impl Bus for SystemBus {
             0x64 => self.keyboard.write_command(value),
             0x92 => self.set_a20(value & 2 != 0),
             0x201 => self.joystick_fired = self.time_us(),
+            0x1CE..=0x1D3 => self.vga.vesa_pm_port(port, value),
             0x388 | 0x38A | 0x228 => self.opl.write_address(port, value),
             0x389 | 0x38B | 0x229 => {
                 self.sync_opl();
                 self.generate_audio();
                 self.opl.write_data(port, value);
+            }
+            0x220..=0x223 if self.sb.model != sb::Model::Sb2 => {
+                // 2x0h and 2x1h are the first register file, 2x2h and 2x3h the second.
+                let mapped = 0x388 + port - 0x220;
+                if port & 1 == 0 {
+                    self.opl.write_address(mapped, value);
+                } else {
+                    self.sync_opl();
+                    self.generate_audio();
+                    self.opl.write_data(mapped, value);
+                }
             }
             0x3B4 | 0x3B5 | 0x3BA | 0x3C0..=0x3CF | 0x3D4 | 0x3D5 | 0x3D8 | 0x3D9 | 0x3DA => {
                 let SystemBus { vga, mem, .. } = self;
@@ -735,9 +800,17 @@ impl Bus for SystemBus {
                 let action = self.mouse.int33(regs);
                 action
             }
+            0x67 if regs.ah() == 0xDE && self.emm.enabled => {
+                let SystemBus {
+                    emm, mem, xms, ems, ..
+                } = self;
+                emm.service(regs, mem, xms, ems, 0x11);
+                InterruptAction::Continue
+            }
             0x67 => {
                 let SystemBus { ems, mem, vga, .. } = self;
                 ems.int67(regs, mem, vga);
+                self.mem.set_ems_frame(self.ems.frame_map());
                 InterruptAction::Continue
             }
             CALLBACK_XMS => {
@@ -829,7 +902,8 @@ impl DosBox {
         for line in banner {
             self.bus.vga.write_line(&mut self.bus.mem, line.as_bytes());
         }
-        self.shell.load_batch(&mut self.bus.dos, "AUTOEXEC.BAT", &[]);
+        self.shell
+            .load_batch(&mut self.bus.dos, "AUTOEXEC.BAT", &[]);
         if !self.shell.in_batch() {
             self.shell
                 .show_prompt(&self.bus.dos, &mut self.bus.vga, &mut self.bus.mem, 0);
@@ -1037,6 +1111,11 @@ impl DosBox {
                 self.bus.vga.write_line(&mut self.bus.mem, text);
             }
             CommandResult::SetCycles(cycles) => self.set_cycles_per_ms(cycles),
+            CommandResult::SetSoundBlaster(model) => {
+                self.bus.sb = SoundBlaster::with_model(model);
+            }
+            CommandResult::SetMemoryManager(on) => self.bus.emm.enabled = on,
+            CommandResult::SetDpmi(mode) => self.bus.dpmi.mode = mode,
             CommandResult::Exit => {
                 self.exit = true;
                 return;
@@ -1174,6 +1253,11 @@ impl DosBox {
         self.cpu.r[cpu::DI] = loaded.sp as u32;
         self.cpu.r[cpu::BP] = 0x091C;
         self.cpu.set_flags(0x0202);
+        if self.bus.emm.enabled {
+            self.bus.emm.reserve(&mut self.bus.xms);
+            self.bus.mem.set_a20(true);
+            self.cpu.set_v86_monitor(true);
+        }
         self.running = true;
         self.shell.running = true;
         self.bus.exit_requested = false;
@@ -1200,7 +1284,9 @@ impl DosBox {
             if self.bus.exit_requested || self.cpu.cycles >= end {
                 return;
             }
-            let slice_end = end.min(self.bus.next_event_cycle()).max(self.cpu.cycles + 1);
+            let slice_end = end
+                .min(self.bus.next_event_cycle())
+                .max(self.cpu.cycles + 1);
             while self.cpu.cycles < slice_end {
                 match self.cpu.step(&mut self.bus) {
                     Step::Ok => {
@@ -1231,7 +1317,9 @@ impl DosBox {
     fn cpu_shutdown(&mut self, vector: u8) {
         let line = format!(
             "CPU shutdown after exception {:02X}h at {:04X}:{:08X}",
-            vector, self.cpu.sregs[cpu::CS], self.cpu.ip
+            vector,
+            self.cpu.sregs[cpu::CS],
+            self.cpu.ip
         );
         self.bus.vga.write_line(&mut self.bus.mem, line.as_bytes());
         self.bus.exit_requested = true;
@@ -1280,6 +1368,17 @@ impl DosBox {
 
     /// Draws the screen into a desktop canvas.
     pub fn render(&mut self, canvas: &mut feos_gfx::Canvas<'_>) {
+        self.refresh_screen();
+        self.bus.vga.blit(canvas, &self.screen);
+        if let Some((x, y)) = self.software_cursor() {
+            draw_software_cursor(canvas, x, y);
+        }
+    }
+
+    /// Brings [`screen`](Self::screen) up to date with video memory, and returns
+    /// whether that changed anything. [`render`](Self::render) does this too; a
+    /// caller that draws on another thread calls this and copies the buffer.
+    pub fn refresh_screen(&mut self) -> bool {
         let blink = (self.bus.now_ms / 500) % 2 == 0;
         if blink != self.last_blink {
             self.bus.vga.dirty = true;
@@ -1287,19 +1386,31 @@ impl DosBox {
         }
         if self.bus.vga.dirty {
             self.bus.vga.render(&self.bus.mem, &mut self.screen, blink);
+            return true;
         }
-        self.bus.vga.blit(canvas, &self.screen);
-        if self.cursor_seen && self.bus.mouse.visible() {
-            let (x, y) = self.cursor_canvas;
-            let shape = [
-                0b10000u8, 0b11000, 0b11100, 0b11110, 0b11111, 0b11100, 0b11000, 0b10010, 0b00010,
-            ];
-            for (row, bits) in shape.iter().enumerate() {
-                for column in 0..5 {
-                    if bits & (1 << (4 - column)) != 0 {
-                        canvas.put_pixel(x + column, y + row as i32, feos_gfx::Color::WHITE);
-                    }
-                }
+        false
+    }
+
+    /// The size of the picture in [`screen`](Self::screen).
+    pub fn display_size(&self) -> (usize, usize) {
+        self.bus.vga.display_size()
+    }
+
+    /// Where the guest's mouse cursor belongs on the canvas, if it's showing.
+    pub fn software_cursor(&self) -> Option<(i32, i32)> {
+        (self.cursor_seen && self.bus.mouse.visible()).then_some(self.cursor_canvas)
+    }
+}
+
+/// Draws the guest's mouse cursor at a canvas position.
+pub fn draw_software_cursor(canvas: &mut feos_gfx::Canvas<'_>, x: i32, y: i32) {
+    let shape = [
+        0b10000u8, 0b11000, 0b11100, 0b11110, 0b11111, 0b11100, 0b11000, 0b10010, 0b00010,
+    ];
+    for (row, bits) in shape.iter().enumerate() {
+        for column in 0..5 {
+            if bits & (1 << (4 - column)) != 0 {
+                canvas.put_pixel(x + column, y + row as i32, feos_gfx::Color::WHITE);
             }
         }
     }

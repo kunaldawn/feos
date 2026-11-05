@@ -12,4 +12,8 @@ These tiny clips exercise the video demuxers and decoders built into feos:
   h264-stream.h264     Annex-B H.264 elementary stream
   vp9-unsupported.*    metadata only; VP9 pixel decoding is not built in
 
-Run `player` from the shell, or open Media Player from the Start menu.
+Sound files, the same two seconds in every format, are in sound/. av-sample.mp4
+has video and sound. Pictures are in pictures/.
+
+Run `player` from the shell, or open Media Player from the Start menu. Run
+`play sound/tone.wav` to hear a file; Music and Image Viewer are in the Start menu.

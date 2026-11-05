@@ -18,7 +18,7 @@ use alloc::vec::Vec;
 use feos_archive::zip::ZipReader;
 
 use crate::bios::{clock_date, clock_time, day_of_week};
-use crate::cpu::{CpuRegs, InterruptAction, DS, ES, SI, DI};
+use crate::cpu::{CpuRegs, InterruptAction, DI, DS, ES, SI};
 use crate::demo;
 use crate::keyboard::{bda_flush, bda_peek, bda_pop};
 use crate::memory::Memory;
@@ -113,6 +113,8 @@ pub struct LoadedProgram {
 struct Process {
     psp: u16,
     dta: u32,
+    /// The parent's registers at `EXEC`, which DOS 3 and up preserve for it.
+    regs: Option<([u32; 8], u16, u16)>,
 }
 
 /// The DOS kernel state.
@@ -124,6 +126,10 @@ pub struct Dos {
     pub psp: u16,
     /// `AH=4Dh`: the termination type and code of the last child.
     pub last_return: u16,
+    /// A process has ended since this was last cleared.
+    pub process_ended: bool,
+    /// The last program loaded, if it brings an extender of its own.
+    pub self_hosting: Option<u16>,
     pub last_error: u16,
     /// `AH=58h`: the allocation strategy.
     pub strategy: u8,
@@ -154,6 +160,10 @@ impl Default for Dos {
 pub fn guest_write(mem: &mut Memory, vga: &mut Vga, addr: u32, value: u8) {
     if vga.is_vram(addr) {
         vga.vram_write(addr, value);
+    } else if let Some(mapped) = mem.ems_address(addr) {
+        if let Some(mapped) = mapped {
+            mem.write8(mapped, value);
+        }
     } else if !(0xC_0000..0x10_0000).contains(&addr) {
         mem.write8(addr, value);
         if (0xA_0000..0xC_0000).contains(&addr) {
@@ -166,6 +176,8 @@ pub fn guest_write(mem: &mut Memory, vga: &mut Vga, addr: u32, value: u8) {
 pub fn guest_read(mem: &Memory, vga: &mut Vga, addr: u32) -> u8 {
     if vga.is_vram(addr) {
         vga.vram_read(addr)
+    } else if let Some(mapped) = mem.ems_address(addr) {
+        mapped.map_or(0xFF, |mapped| mem.read8(mapped))
     } else {
         mem.read8(addr)
     }
@@ -223,6 +235,8 @@ impl Dos {
             last_error: 0,
             strategy: 0,
             stack: Vec::new(),
+            process_ended: false,
+            self_hosting: None,
             line: LineInput {
                 text: Vec::new(),
                 active: false,
@@ -320,13 +334,18 @@ impl Dos {
             put(mem, "COMSPEC=C:\\COMMAND.COM");
             put(mem, "PATH=C:\\");
             put(mem, "PROMPT=$P$G");
-            put(mem, "BLASTER=A220 I7 D1 T3");
+            put(mem, "BLASTER=A220 I7 D1 H5 T6");
         } else {
             for (key, value) in vars {
                 let line = format!("{key}={value}");
                 put(mem, &line);
             }
         }
+    }
+
+    /// Whether a process is the running one, or waiting for a child.
+    pub fn process_alive(&self, psp: u16) -> bool {
+        self.psp == psp || self.stack.iter().any(|process| process.psp == psp)
     }
 
     /// Whether the current process is the root, meaning no program is running.
@@ -493,10 +512,12 @@ impl Dos {
     /// Reads a file from the board's filesystem.
     pub fn read_fs_file(&self, path: &str) -> Option<Vec<u8>> {
         let fs = self.fs?;
-        let node = fs.resolve(path)?;
-        if !fs.is_file(node) {
-            return None;
-        }
+        // The boards mount a linked disk image at `/exfat` or `/fat32`, so the game
+        // library is there rather than at the root.
+        let node = ["", "exfat/", "fat32/"].iter().find_map(|prefix| {
+            let node = fs.resolve(&format!("{prefix}{path}"))?;
+            fs.is_file(node).then_some(node)
+        })?;
         let size = fs.size(node);
         let mut data = Vec::new();
         data.try_reserve_exact(size).ok()?;
@@ -975,7 +996,11 @@ impl Dos {
             };
             Sft {
                 node,
-                offset: if append { self.disk.size(node) as u32 } else { 0 },
+                offset: if append {
+                    self.disk.size(node) as u32
+                } else {
+                    0
+                },
                 mode: 1,
                 device: Device::File,
                 refs: 1,
@@ -1111,10 +1136,14 @@ impl Dos {
                 self.load_com(mem, &data, tail, env, parent)
             }
         })();
+        let self_hosting = crate::dpmi::brings_its_own_extender(&data);
         self.disk.nodes[node].data = data;
         if let Err(code) = result {
             self.free_all_owned_tagged(mem);
             return Err(code);
+        }
+        if let Ok(loaded) = &result {
+            self.self_hosting = self_hosting.then_some(loaded.psp);
         }
         result
     }
@@ -1205,6 +1234,7 @@ impl Dos {
         self.stack.push(Process {
             psp: parent,
             dta: self.dta,
+            regs: None,
         });
         self.psp = psp;
         self.dta = linear(psp, 0x80);
@@ -1314,7 +1344,16 @@ impl Dos {
             psp.wrapping_add(0x10)
         };
         self.finish_load(mem, psp, env, parent, paras, tail);
-        self.load_image(mem, data, image_offset, module, load_seg, load_seg, reloc_table, reloc_count);
+        self.load_image(
+            mem,
+            data,
+            image_offset,
+            module,
+            load_seg,
+            load_seg,
+            reloc_table,
+            reloc_count,
+        );
         let entry_ss = load_seg.wrapping_add(ss);
         let entry_sp = if sp == 0 && ss == 0 { 0xFFFE } else { sp };
         Ok(LoadedProgram {
@@ -1411,6 +1450,9 @@ impl Dos {
         };
         mem.write16(parent_base + 0x2E, regs.sp());
         mem.write16(parent_base + 0x30, regs.ss());
+        if let Some(process) = self.stack.last_mut() {
+            process.regs = Some((*regs.r, regs.ds(), regs.es()));
+        }
         self.cost = self.cost.saturating_add(2_000);
         // The child's terminate address is where this INT 21h returns to.
         let frame = linear(regs.ss(), regs.sp());
@@ -1496,7 +1538,16 @@ impl Dos {
             module = module.saturating_sub(image_offset);
             if image_offset <= data.len() {
                 module = module.min(data.len() - image_offset);
-                self.load_image(mem, &data, image_offset, module, load_seg, reloc, word(0x18), word(6));
+                self.load_image(
+                    mem,
+                    &data,
+                    image_offset,
+                    module,
+                    load_seg,
+                    reloc,
+                    word(0x18),
+                    word(6),
+                );
             }
         } else {
             let at = (load_seg as u32) << 4;
@@ -1521,6 +1572,7 @@ impl Dos {
         exit_code: &mut u8,
     ) -> InterruptAction {
         let psp = self.psp;
+        self.process_ended = true;
         self.last_return = ((kind as u16) << 8) | code as u16;
         let base = (psp as u32) << 4;
         let parent = mem.read16(base + 0x16);
@@ -1564,8 +1616,15 @@ impl Dos {
         let frame = linear(ss, sp);
         mem.write16(frame, terminate_ip);
         mem.write16(frame + 2, terminate_cs);
-        regs.set_ds(self.psp);
-        regs.set_es(self.psp);
+        if let Some((saved_regs, ds, es)) = saved.and_then(|process| process.regs) {
+            *regs.r = saved_regs;
+            regs.set_ds(ds);
+            regs.set_es(es);
+        } else {
+            regs.set_ds(self.psp);
+            regs.set_es(self.psp);
+        }
+        regs.set_sp(sp);
         regs.set_ax(0);
         regs.set_carry(false);
         InterruptAction::Continue
@@ -1597,7 +1656,16 @@ impl Dos {
     // ------------------------------------------------------------------
 
     /// Fills the found-file part of the DTA.
-    fn fill_found(&self, mem: &mut Memory, vga: &mut Vga, name: &str, attr: u8, time: u16, date: u16, size: u32) {
+    fn fill_found(
+        &self,
+        mem: &mut Memory,
+        vga: &mut Vga,
+        name: &str,
+        attr: u8,
+        time: u16,
+        date: u16,
+        size: u32,
+    ) {
         let dta = self.dta;
         guest_write(mem, vga, dta + 0x15, attr);
         guest_write(mem, vga, dta + 0x16, time as u8);
@@ -1712,7 +1780,11 @@ impl Dos {
             guest_write(mem, vga, dta + 1 + index as u32, *byte);
         }
         guest_write(mem, vga, dta + 0x0C, attr);
-        for (index, byte) in (next.min(0xFFFF_FFFF) as u32).to_le_bytes().iter().enumerate() {
+        for (index, byte) in (next.min(0xFFFF_FFFF) as u32)
+            .to_le_bytes()
+            .iter()
+            .enumerate()
+        {
             guest_write(mem, vga, dta + 0x0D + index as u32, *byte);
         }
         for (index, byte) in (dir as u32).to_le_bytes().iter().enumerate() {
@@ -1806,7 +1878,13 @@ impl Dos {
     }
 
     /// Creates or truncates a file and opens it.
-    fn create_path(&mut self, mem: &mut Memory, path: &str, attr: u8, mode: u8) -> Result<u16, u16> {
+    fn create_path(
+        &mut self,
+        mem: &mut Memory,
+        path: &str,
+        attr: u8,
+        mode: u8,
+    ) -> Result<u16, u16> {
         if let Some(device) = device_for(path) {
             return self.open_handle(
                 mem,
@@ -2514,15 +2592,20 @@ impl Dos {
         let attr = regs.cl();
         let action = regs.dl();
         let exists = device_for(&path).is_some()
-            || self.resolve(&path).is_some_and(|node| self.disk.is_file(node));
+            || self
+                .resolve(&path)
+                .is_some_and(|node| self.disk.is_file(node));
         let result = if exists {
             match action & 0x0F {
                 1 => self.open_path(mem, &path, mode).map(|handle| (handle, 1)),
-                2 => self.create_path(mem, &path, attr, mode).map(|handle| (handle, 3)),
+                2 => self
+                    .create_path(mem, &path, attr, mode)
+                    .map(|handle| (handle, 3)),
                 _ => Err(error::FILE_EXISTS),
             }
         } else if action & 0xF0 == 0x10 {
-            self.create_path(mem, &path, attr, mode).map(|handle| (handle, 2))
+            self.create_path(mem, &path, attr, mode)
+                .map(|handle| (handle, 2))
         } else {
             Err(self.missing_error(&path))
         };
@@ -2573,7 +2656,11 @@ impl Dos {
             }
             0x21 | 0x22 => {
                 let start = linear(regs.ds(), regs.dx());
-                let count = if regs.al() == 0x21 { regs.cx() as u32 } else { 0x1_0000 };
+                let count = if regs.al() == 0x21 {
+                    regs.cx() as u32
+                } else {
+                    0x1_0000
+                };
                 for index in 0..count {
                     let byte = mem.read8(start + index);
                     if regs.al() == 0x22 && byte == 0 {
@@ -2719,7 +2806,12 @@ impl Dos {
         None
     }
 
-    fn read_file(&mut self, regs: &mut CpuRegs<'_>, mem: &mut Memory, vga: &mut Vga) -> InterruptAction {
+    fn read_file(
+        &mut self,
+        regs: &mut CpuRegs<'_>,
+        mem: &mut Memory,
+        vga: &mut Vga,
+    ) -> InterruptAction {
         let Some(index) = self.sft_index(mem, regs.bx()) else {
             self.set_last_error(regs, error::BAD_HANDLE);
             return InterruptAction::Continue;
@@ -2777,7 +2869,12 @@ impl Dos {
         InterruptAction::Continue
     }
 
-    fn write_file(&mut self, regs: &mut CpuRegs<'_>, mem: &mut Memory, vga: &mut Vga) -> InterruptAction {
+    fn write_file(
+        &mut self,
+        regs: &mut CpuRegs<'_>,
+        mem: &mut Memory,
+        vga: &mut Vga,
+    ) -> InterruptAction {
         let Some(index) = self.sft_index(mem, regs.bx()) else {
             self.set_last_error(regs, error::BAD_HANDLE);
             return InterruptAction::Continue;
@@ -2864,7 +2961,12 @@ impl Dos {
         }
     }
 
-    fn fcb_call(&mut self, regs: &mut CpuRegs<'_>, mem: &mut Memory, vga: &mut Vga) -> InterruptAction {
+    fn fcb_call(
+        &mut self,
+        regs: &mut CpuRegs<'_>,
+        mem: &mut Memory,
+        vga: &mut Vga,
+    ) -> InterruptAction {
         let (at, attr) = self.fcb_at(regs, mem);
         let drive_ok = matches!(mem.read8(at), 0 | 3);
         match regs.ah() {
@@ -3177,7 +3279,10 @@ fn parse_filename(
     let fcb = linear(fcb_seg, fcb_off);
     let mut at = 0u32;
     if flags & 1 != 0 {
-        while matches!(mem.read8(source + at), b' ' | b'\t' | b',' | b';' | b':' | b'=' | b'+') {
+        while matches!(
+            mem.read8(source + at),
+            b' ' | b'\t' | b',' | b';' | b':' | b'=' | b'+'
+        ) {
             at += 1;
             if at > 128 {
                 return (at as u16, false);

@@ -3,6 +3,7 @@ name = "feos-init"
 description = "Init process manager and service supervisor for feos"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

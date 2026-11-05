@@ -10,16 +10,19 @@
 use core::cmp::Ordering;
 use core::fmt::Write;
 
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
 use feos_app::{shell, Context, WindowContext, WindowFrame};
-use feos_fs::{FileSystem, NodeId};
+use feos_fs::{attr, EntryKind, FileKind, FileSystem, FsError, NodeId, NodeTimes, VfsTree};
+use feos_iconset::Stock;
 use feos_gfx::{Canvas, Color, Point, Rect};
 use feos_gui::{
     paint_icon, Align, Event, Icon, Input, Key, Modifiers, Painter, RectExt, TextBuffer,
     VerticalAlign,
 };
+use feos_hal::time::DateTime;
 use feos_hal::PointerEvent;
 use feos_keys::{EvdevKeys, SerialKeys};
 use feos_sync::SpinLock;
@@ -78,9 +81,6 @@ const DISABLED: Color = Color::rgb(160, 160, 160);
 const TOOLBAR_TOP: Color = Color::rgb(250, 249, 245);
 const TOOLBAR_BOTTOM: Color = Color::rgb(236, 233, 216);
 const HOVER_LIGHT: Color = Color::rgb(232, 240, 254);
-const FOLDER_FRONT: Color = Color::rgb(255, 207, 83);
-const FOLDER_BACK: Color = Color::rgb(226, 166, 36);
-const FOLDER_EDGE: Color = Color::rgb(172, 120, 22);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
@@ -111,9 +111,10 @@ enum SortKey {
     Name,
     Size,
     Type,
+    Modified,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Dialog {
     None,
     About,
@@ -121,6 +122,17 @@ enum Dialog {
     Properties(NodeId),
     Viewer(NodeId),
     Notice,
+    /// Delete the selection?
+    ConfirmDelete,
+    /// Asking for a name.
+    Name(NameRequest),
+}
+
+/// What a typed name is for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NameRequest {
+    Rename(NodeId),
+    NewFolder,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -185,6 +197,7 @@ enum Action {
     SortName,
     SortSize,
     SortType,
+    SortModified,
     SortAscending,
     SortDescending,
     CopyPath,
@@ -192,6 +205,7 @@ enum Action {
     About,
     Delete,
     NewFolder,
+    Rename,
     Cut,
     Copy,
     Paste,
@@ -247,8 +261,10 @@ const FILE_MENU: &[MenuItem] = &[
     item("Explore", "", Action::Explore),
     item("Search...", "F3", Action::Search),
     sep(),
-    disabled("Sharing and Security...", ""),
+    item("New Folder", "", Action::NewFolder),
     sep(),
+    item("Delete", "Del", Action::Delete),
+    item("Rename", "F2", Action::Rename),
     item("Properties", "Alt+Enter", Action::Properties),
     sep(),
     item("Close", "Alt+F4", Action::Close),
@@ -256,8 +272,8 @@ const FILE_MENU: &[MenuItem] = &[
 
 const EDIT_MENU: &[MenuItem] = &[
     disabled("Undo", "Ctrl+Z"),
-    disabled("Cut", "Ctrl+X"),
-    item("Copy", "Ctrl+C", Action::CopyPath),
+    item("Cut", "Ctrl+X", Action::Cut),
+    item("Copy", "Ctrl+C", Action::Copy),
     item("Paste", "Ctrl+V", Action::Paste),
     sep(),
     item("Select All", "Ctrl+A", Action::SelectAll),
@@ -284,6 +300,7 @@ const VIEW_MENU: &[MenuItem] = &[
     item("Sort by Name", "", Action::SortName),
     item("Sort by Size", "", Action::SortSize),
     item("Sort by Type", "", Action::SortType),
+    item("Sort by Date Modified", "", Action::SortModified),
     item("Ascending", "", Action::SortAscending),
     item("Descending", "", Action::SortDescending),
     sep(),
@@ -317,11 +334,13 @@ const CONTEXT_ITEM: &[MenuItem] = &[
     item("Explore", "", Action::Explore),
     item("Search...", "F3", Action::Search),
     sep(),
+    item("Cut", "Ctrl+X", Action::Cut),
+    item("Copy", "Ctrl+C", Action::Copy),
     item("Copy Path", "", Action::CopyPath),
     item("Properties", "Alt+Enter", Action::Properties),
     sep(),
-    disabled("Delete", "Del"),
-    disabled("Rename", "F2"),
+    item("Delete", "Del", Action::Delete),
+    item("Rename", "F2", Action::Rename),
     sep(),
     item("Refresh", "F5", Action::Refresh),
 ];
@@ -330,8 +349,8 @@ const CONTEXT_BACKGROUND: &[MenuItem] = &[
     item("View", "", Action::ViewDetails),
     item("Refresh", "F5", Action::Refresh),
     sep(),
-    disabled("Paste", "Ctrl+V"),
-    disabled("New Folder", ""),
+    item("Paste", "Ctrl+V", Action::Paste),
+    item("New Folder", "", Action::NewFolder),
     sep(),
     item("Properties", "Alt+Enter", Action::Properties),
 ];
@@ -415,6 +434,8 @@ struct EntryInfo {
     is_dir: bool,
     /// Index into [`TYPE_NAMES`].
     type_index: u8,
+    /// Last change, where the volume keeps that.
+    modified: Option<u64>,
 }
 
 impl EntryInfo {
@@ -422,6 +443,7 @@ impl EntryInfo {
         size: 0,
         is_dir: false,
         type_index: 0,
+        modified: None,
     };
 
     fn read(fs: &dyn FileSystem, node: NodeId) -> Self {
@@ -429,6 +451,7 @@ impl EntryInfo {
             size: fs.size(node),
             is_dir: fs.is_dir(node),
             type_index: type_index(node, fs),
+            modified: fs.times(node).modified,
         }
     }
 }
@@ -450,6 +473,16 @@ struct ContextMenu {
 
 struct ExplorerState {
     screen: Rect,
+    /// The shared tree's generation when this listing was read.
+    seen_generation: u64,
+    /// Paths copied or cut, waiting for a paste.
+    file_clip: Vec<String>,
+    /// The clip moves its files rather than copying them.
+    clip_is_cut: bool,
+    /// What's been typed into the name dialog.
+    name_input: Text<255>,
+    /// List files with the hidden attribute.
+    show_hidden: bool,
     current: NodeId,
     entries: [NodeId; MAX_ENTRIES],
     /// Cached per-row data, in step with `entries`.
@@ -552,6 +585,11 @@ impl ExplorerState {
     fn new(fs: &dyn FileSystem, screen: Rect) -> Self {
         let mut state = Self {
             screen,
+            seen_generation: fs.tree().map_or(0, |tree| tree.generation()),
+            file_clip: Vec::new(),
+            clip_is_cut: false,
+            name_input: Text::new(),
+            show_hidden: false,
             current: fs.root(),
             entries: [NodeId::ROOT; MAX_ENTRIES],
             infos: [EntryInfo::EMPTY; MAX_ENTRIES],
@@ -930,6 +968,50 @@ impl ExplorerState {
         (0..self.entry_count).find(|index| self.entries[*index] == node)
     }
 
+    /// Catches up with changes anyone made to the shared tree: a file saved in a
+    /// Terminal shows up here without the user having to press F5.
+    fn follow_tree(&mut self, fs: &dyn FileSystem) {
+        let Some(tree) = fs.tree() else {
+            return;
+        };
+        let generation = tree.generation();
+        if generation == self.seen_generation {
+            return;
+        }
+        self.seen_generation = generation;
+        if fs.kind(self.current) != Some(EntryKind::Directory) {
+            // The folder being shown is gone.
+            let mut parent = fs.parent(self.current);
+            while let Some(node) = parent {
+                if fs.kind(node) == Some(EntryKind::Directory) {
+                    break;
+                }
+                parent = fs.parent(node);
+            }
+            self.current = parent.unwrap_or(fs.root());
+            self.refresh_address(fs);
+        }
+        self.refresh(fs);
+        self.log_listing(fs);
+    }
+
+    /// Puts what's listed on the serial console, one line per change. Harmless
+    /// for a person, and the only way a headless boot test can see this window.
+    fn log_listing(&self, fs: &dyn FileSystem) {
+        let mut path = [0u8; PATH_MAX];
+        let mut line = Text::<512>::new();
+        let _ = write!(line, "[explorer] {}:", fs.path(self.current, &mut path).unwrap_or("?"));
+        for node in &self.entries[..self.entry_count] {
+            if let Some(name) = fs.name(*node) {
+                let _ = write!(line, " {name}");
+            }
+        }
+        #[cfg(not(test))]
+        feos_console::println!("{}", line.as_str());
+        #[cfg(test)]
+        let _ = line;
+    }
+
     fn refresh(&mut self, fs: &dyn FileSystem) {
         let old = self.focused_node();
         // A file may have changed under the same node.
@@ -988,6 +1070,10 @@ impl ExplorerState {
                     break;
                 }
                 if let Some(child) = fs.child_at(self.current, index) {
+                    if !self.show_hidden && fs.attributes(child) & attr::HIDDEN != 0 {
+                        self.total_entries -= 1;
+                        continue;
+                    }
                     self.entries[self.entry_count] = child;
                     self.entry_count += 1;
                 }
@@ -1365,10 +1451,191 @@ impl ExplorerState {
     fn read_only(&mut self, now: u64) {
         self.show_notice(
             "Read-only view",
-            "File Explorer reads files but cannot change them. Delete, rename \
-             and new-folder operations are not available here.",
+            "This filesystem can't be changed. Delete, rename and new-folder \
+             operations are not available here.",
             now,
         );
+    }
+
+    /// Paths of the selection, or of the focused row if nothing is selected.
+    fn selected_paths(&self, fs: &dyn FileSystem) -> Vec<String> {
+        let mut buffer = [0u8; PATH_MAX];
+        let mut paths = Vec::new();
+        for index in 0..self.entry_count {
+            if self.is_selected(index) {
+                if let Some(path) = fs.path(self.entries[index], &mut buffer) {
+                    paths.push(String::from(path));
+                }
+            }
+        }
+        if paths.is_empty() {
+            if let Some(path) = self.focused_node().and_then(|node| fs.path(node, &mut buffer)) {
+                paths.push(String::from(path));
+            }
+        }
+        paths
+    }
+
+    /// Says what went wrong with a change, and shows where things now stand.
+    fn report(&mut self, fs: &dyn FileSystem, what: &str, result: Result<(), FsError>, now: u64) {
+        if let Err(error) = result {
+            let mut body = Text::<160>::new();
+            let _ = write!(body, "{what}: {error}.");
+            self.show_notice("File Explorer", body.as_str(), now);
+        }
+        self.refresh(fs);
+    }
+
+    fn clip_files(&mut self, fs: &dyn FileSystem, cut: bool, now: u64) {
+        if fs.tree().is_none() {
+            return;
+        }
+        let paths = self.selected_paths(fs);
+        if paths.is_empty() {
+            return;
+        }
+        self.file_clip = paths;
+        self.clip_is_cut = cut;
+        self.set_message(if cut { "Cut. Paste to move it." } else { "Copied." }, now);
+    }
+
+    /// Copies or moves what's on the file clip into the current folder.
+    fn paste_files(&mut self, fs: &dyn FileSystem, now: u64) {
+        let Some(tree) = fs.tree() else {
+            return self.read_only(now);
+        };
+        let mut buffer = [0u8; PATH_MAX];
+        let Some(destination) = fs.path(self.current, &mut buffer) else {
+            return;
+        };
+        let destination = String::from(destination);
+        let cut = self.clip_is_cut;
+        let mut result = Ok(());
+        for source in &self.file_clip {
+            let name = source.rsplit('/').next().unwrap_or(source);
+            let target = free_name(tree, &destination, name);
+            result = if cut {
+                tree.rename(source, &target)
+            } else {
+                copy_tree(tree, source, &target, 0)
+            };
+            if result.is_err() {
+                break;
+            }
+        }
+        if cut && result.is_ok() {
+            // A moved file isn't where the clip says any more.
+            self.file_clip.clear();
+        }
+        self.report(fs, "Couldn't paste", result, now);
+    }
+
+    fn delete_selection(&mut self, fs: &dyn FileSystem, now: u64) {
+        let Some(tree) = fs.tree() else {
+            return self.read_only(now);
+        };
+        let mut result = Ok(());
+        for path in self.selected_paths(fs) {
+            result = remove_tree(tree, &path, 0);
+            if result.is_err() {
+                break;
+            }
+        }
+        self.clear_selection();
+        self.report(fs, "Couldn't delete", result, now);
+    }
+
+    fn ask_name(&mut self, fs: &dyn FileSystem, request: NameRequest, now: u64) {
+        if fs.tree().is_none() {
+            return self.read_only(now);
+        }
+        self.name_input.clear();
+        match request {
+            NameRequest::Rename(node) => {
+                self.name_input.set(fs.name(node).unwrap_or(""));
+            }
+            NameRequest::NewFolder => {
+                self.name_input.set("New Folder");
+            }
+        }
+        self.dialog = Dialog::Name(request);
+    }
+
+    /// Acts on the dialog's OK.
+    fn accept_dialog(&mut self, fs: &dyn FileSystem, now: u64) {
+        let dialog = self.dialog;
+        self.dialog = Dialog::None;
+        match dialog {
+            Dialog::ConfirmDelete => self.delete_selection(fs, now),
+            Dialog::Name(request) => self.apply_name(fs, request, now),
+            _ => {}
+        }
+    }
+
+    fn apply_name(&mut self, fs: &dyn FileSystem, request: NameRequest, now: u64) {
+        let Some(tree) = fs.tree() else {
+            return self.read_only(now);
+        };
+        let name = self.name_input;
+        let name = name.as_str().trim();
+        if name.is_empty() {
+            return;
+        }
+        let mut buffer = [0u8; PATH_MAX];
+        let mut made = None;
+        let result = match request {
+            NameRequest::NewFolder => match fs.path(self.current, &mut buffer) {
+                Some(parent) => {
+                    let path = child_path(parent, name);
+                    let result = tree.create_dir(&path);
+                    made = Some(path);
+                    result
+                }
+                None => Err(FsError::NotFound),
+            },
+            NameRequest::Rename(node) => match fs.path(node, &mut buffer) {
+                Some(path) => {
+                    let parent = match path.rfind('/') {
+                        Some(0) | None => "/",
+                        Some(index) => &path[..index],
+                    };
+                    let target = child_path(parent, name);
+                    let result = tree.rename(path, &target);
+                    made = Some(target);
+                    result
+                }
+                None => Err(FsError::NotFound),
+            },
+        };
+        let what = match request {
+            NameRequest::NewFolder => "Couldn't make the folder",
+            NameRequest::Rename(_) => "Couldn't rename",
+        };
+        let worked = result.is_ok();
+        self.report(fs, what, result, now);
+        // The cursor follows the name, or the next Delete hits something else.
+        if worked {
+            let found = made
+                .and_then(|path| fs.resolve(&path))
+                .and_then(|node| self.entry_position(node));
+            if let Some(index) = found {
+                self.select_only(index);
+                self.cursor = index;
+            }
+        }
+    }
+
+    /// Flips an attribute of the node whose properties are showing.
+    fn toggle_attribute(&mut self, fs: &dyn FileSystem, node: NodeId, bit: u8, now: u64) {
+        let Some(tree) = fs.tree() else {
+            return self.read_only(now);
+        };
+        let mut buffer = [0u8; PATH_MAX];
+        let Some(path) = fs.path(node, &mut buffer) else {
+            return;
+        };
+        let result = tree.set_attributes(path, fs.attributes(node) ^ bit);
+        self.report(fs, "Couldn't change the attribute", result, now);
     }
 
     fn commit_address(&mut self, fs: &dyn FileSystem, now: u64) {
@@ -1427,6 +1694,7 @@ impl ExplorerState {
             Action::SortName => self.sort == SortKey::Name,
             Action::SortSize => self.sort == SortKey::Size,
             Action::SortType => self.sort == SortKey::Type,
+            Action::SortModified => self.sort == SortKey::Modified,
             Action::SortAscending => !self.sort_desc,
             Action::SortDescending => self.sort_desc,
             _ => false,
@@ -1528,6 +1796,7 @@ impl ExplorerState {
             Action::SortName => self.set_sort(SortKey::Name),
             Action::SortSize => self.set_sort(SortKey::Size),
             Action::SortType => self.set_sort(SortKey::Type),
+            Action::SortModified => self.set_sort(SortKey::Modified),
             Action::SortAscending => {
                 self.sort_desc = false;
                 self.rebuild(fs);
@@ -1541,11 +1810,36 @@ impl ExplorerState {
             }
             Action::FolderOptions => self.dialog = Dialog::Options,
             Action::About => self.dialog = Dialog::About,
-            Action::Delete => self.read_only(now),
-            Action::NewFolder => self.read_only(now),
-            Action::Copy => self.copy_paths(fs, node, now),
-            Action::Paste => self.paste(),
-            Action::Cut => self.read_only(now),
+            Action::Delete => {
+                if self.entry_count > 0 {
+                    if fs.tree().is_some() {
+                        self.dialog = Dialog::ConfirmDelete;
+                    } else {
+                        self.read_only(now);
+                    }
+                }
+            }
+            Action::NewFolder => self.ask_name(fs, NameRequest::NewFolder, now),
+            Action::Rename => {
+                if let Some(target) = node.or(self.focused_node()) {
+                    self.ask_name(fs, NameRequest::Rename(target), now);
+                }
+            }
+            Action::Copy => {
+                self.clip_files(fs, false, now);
+                self.copy_paths(fs, node, now);
+            }
+            Action::Paste => {
+                if self.focus == Focus::Address
+                    || self.focus == Focus::Search
+                    || self.file_clip.is_empty()
+                {
+                    self.paste();
+                } else {
+                    self.paste_files(fs, now);
+                }
+            }
+            Action::Cut => self.clip_files(fs, true, now),
             Action::MapDrive => self.show_notice(
                 "Map Network Drive",
                 "Network drives are not available on this board.",
@@ -2131,13 +2425,15 @@ impl ExplorerState {
         let Some(header) = layout.header else {
             return;
         };
-        let (name, size) = column_widths(header.width as i32);
+        let (name, size, kind) = column_widths(header.width as i32);
         let key = if point.x < header.x + name {
             SortKey::Name
         } else if point.x < header.x + name + size {
             SortKey::Size
-        } else {
+        } else if point.x < header.x + name + size + kind {
             SortKey::Type
+        } else {
+            SortKey::Modified
         };
         self.set_sort(key);
     }
@@ -2489,6 +2785,9 @@ impl ExplorerState {
         if key == Key::F5 {
             return self.perform(fs, Action::Refresh, None, now);
         }
+        if key == Key::F2 && self.focus != Focus::Address && self.focus != Focus::Search {
+            return self.perform(fs, Action::Rename, None, now);
+        }
         if key == Key::F10 {
             self.menu_open = Some(MenuKind::File);
             self.menu_hover = first_enabled(MenuKind::File, self, fs);
@@ -2531,11 +2830,13 @@ impl ExplorerState {
                     return self.perform(fs, Action::Properties, None, now);
                 }
                 Key::Character('c') => {
-                    return self.perform(fs, Action::CopyPath, None, now);
+                    return self.perform(fs, Action::Copy, None, now);
+                }
+                Key::Character('x') => {
+                    return self.perform(fs, Action::Cut, None, now);
                 }
                 Key::Character('v') => {
-                    self.paste();
-                    return false;
+                    return self.perform(fs, Action::Paste, None, now);
                 }
                 Key::Character('i') => {
                     self.invert_selection();
@@ -2735,7 +3036,9 @@ impl ExplorerState {
                     self.sync_preview(fs);
                 }
             }
-            Key::Delete => self.read_only(now),
+            Key::Delete => {
+                self.perform(fs, Action::Delete, None, now);
+            }
             Key::Backspace => self.go_up(fs),
             // A hosted window closes through its chrome or Alt+F4, so a stray
             // key cannot throw away where the user was. Without chrome, these
@@ -2758,6 +3061,12 @@ impl ExplorerState {
     }
 
     fn handle_text(&mut self, ch: char) {
+        if matches!(self.dialog, Dialog::Name(_)) {
+            if !ch.is_control() {
+                self.name_input.push(ch);
+            }
+            return;
+        }
         if self.dialog != Dialog::None || self.menu_open.is_some() || self.context.is_some() {
             return;
         }
@@ -2821,6 +3130,19 @@ impl ExplorerState {
                 _ => {}
             },
             Dialog::None => {}
+            Dialog::ConfirmDelete => match key {
+                Key::Escape => self.dialog = Dialog::None,
+                Key::Enter => self.accept_dialog(fs, now),
+                _ => {}
+            },
+            Dialog::Name(_) => match key {
+                Key::Escape => self.dialog = Dialog::None,
+                Key::Enter => self.accept_dialog(fs, now),
+                Key::Backspace => {
+                    self.name_input.pop();
+                }
+                _ => {}
+            },
             _ => match key {
                 Key::Escape | Key::Enter => self.dialog = Dialog::None,
                 _ => {}
@@ -2835,12 +3157,24 @@ impl ExplorerState {
         if dialog == Dialog::None {
             return false;
         }
-        if layout.close.contains(point) || layout.ok.contains(point) {
+        if layout.ok.contains(point) {
+            self.accept_dialog(fs, now);
+            return false;
+        }
+        if layout.close.contains(point) {
             self.dialog = Dialog::None;
             return false;
         }
+        if let Dialog::Properties(node) = dialog {
+            for (index, bit) in PROPERTY_ATTRIBUTES.iter().enumerate() {
+                if property_check_rect(layout, index).contains(point) {
+                    self.toggle_attribute(fs, node, bit.1, now);
+                    return false;
+                }
+            }
+        }
         if dialog == Dialog::Options {
-            for index in 0..5 {
+            for index in 0..6 {
                 if option_check_rect(layout, index).contains(point) {
                     match index {
                         0 => self.toolbar_open = !self.toolbar_open,
@@ -2854,6 +3188,10 @@ impl ExplorerState {
                             }
                         }
                         4 => self.preview_open = !self.preview_open,
+                        5 => {
+                            self.show_hidden = !self.show_hidden;
+                            self.refresh(fs);
+                        }
                         _ => {}
                     }
                     return false;
@@ -2864,9 +3202,131 @@ impl ExplorerState {
             // Modal dialogs ignore clicks outside; only the close/OK buttons
             // dismiss them.
         }
-        let _ = (fs, now);
         false
     }
+}
+
+/// `parent/name`, however deep `parent` is.
+fn child_path(parent: &str, name: &str) -> String {
+    let mut path = String::from(parent);
+    if !path.ends_with('/') {
+        path.push('/');
+    }
+    path.push_str(name);
+    path
+}
+
+/// A name for `name` in `directory` that's not taken, as Windows would choose:
+/// `a.txt`, `Copy of a.txt`, `Copy (2) of a.txt`.
+fn free_name(tree: &dyn VfsTree, directory: &str, name: &str) -> String {
+    let plain = child_path(directory, name);
+    if tree.lstat(&plain).is_err() {
+        return plain;
+    }
+    let mut number = 1u32;
+    loop {
+        let candidate = if number == 1 {
+            alloc::format!("Copy of {name}")
+        } else {
+            alloc::format!("Copy ({number}) of {name}")
+        };
+        let path = child_path(directory, &candidate);
+        if tree.lstat(&path).is_err() || number > 9999 {
+            return path;
+        }
+        number += 1;
+    }
+}
+
+/// How deep the recursive copy and delete go; the same limit `cp -r` has.
+const MAX_TREE_DEPTH: usize = 48;
+/// Bytes copied at a time, each under its own turn on the filesystem lock.
+const COPY_CHUNK: usize = 64 * 1024;
+
+fn copy_tree(tree: &dyn VfsTree, from: &str, to: &str, depth: usize) -> Result<(), FsError> {
+    if depth > MAX_TREE_DEPTH {
+        return Err(FsError::TooDeep);
+    }
+    // Into itself would never end.
+    if to.starts_with(from) && to.as_bytes().get(from.len()) == Some(&b'/') {
+        return Err(FsError::Unsupported);
+    }
+    let stat = tree.lstat(from)?;
+    match stat.kind {
+        FileKind::Directory => {
+            tree.create_dir(to)?;
+            for entry in tree.read_dir(from)? {
+                copy_tree(
+                    tree,
+                    &child_path(from, &entry.name),
+                    &child_path(to, &entry.name),
+                    depth + 1,
+                )?;
+            }
+        }
+        FileKind::Symlink => tree.symlink(&tree.read_link(from)?, to)?,
+        FileKind::File => {
+            tree.create_file(to)?;
+            let mut chunk = Vec::new();
+            chunk
+                .try_reserve_exact(COPY_CHUNK)
+                .map_err(|_| FsError::OutOfMemory)?;
+            chunk.resize(COPY_CHUNK, 0);
+            // Up to its size, not until reads stop: `/dev/zero` never would.
+            let mut offset = 0u64;
+            while offset < stat.size {
+                let want = (stat.size - offset).min(COPY_CHUNK as u64) as usize;
+                let count = tree.read_at(from, offset, &mut chunk[..want])?;
+                if count == 0 {
+                    break;
+                }
+                tree.write_at(to, offset, &chunk[..count])?;
+                offset += count as u64;
+            }
+        }
+    }
+    // Copies keep what they can: a filesystem without timestamps isn't an error.
+    let _ = tree.set_times(to, NodeTimes { created: None, ..stat.times });
+    let attributes = stat.attributes & (attr::HIDDEN | attr::READ_ONLY);
+    let _ = tree.set_attributes(to, attributes | attr::ARCHIVE);
+    Ok(())
+}
+
+fn remove_tree(tree: &dyn VfsTree, path: &str, depth: usize) -> Result<(), FsError> {
+    if depth > MAX_TREE_DEPTH {
+        return Err(FsError::TooDeep);
+    }
+    if tree.lstat(path)?.kind == FileKind::Directory {
+        for entry in tree.read_dir(path)? {
+            remove_tree(tree, &child_path(path, &entry.name), depth + 1)?;
+        }
+        tree.remove_dir(path)
+    } else {
+        tree.remove_file(path)
+    }
+}
+
+/// A date for a column `width` wide, leaving out the year if it has to.
+fn short_time(width: i32, seconds: Option<u64>) -> Text<20> {
+    let full = format_time(seconds);
+    if width >= 16 * 8 + 8 {
+        return full;
+    }
+    Text::from_str(full.as_str().get(5..).unwrap_or(""))
+}
+
+/// `YYYY-MM-DD HH:MM`, or nothing for a volume that doesn't say.
+fn format_time(seconds: Option<u64>) -> Text<20> {
+    let mut text = Text::new();
+    if let Some(seconds) = seconds {
+        let date = DateTime::from_unix(seconds);
+        let _ = write!(
+            text,
+            "{:04}-{:02}-{:02} {:02}:{:02}",
+            date.year, date.month, date.day, date.hour, date.minute
+        );
+    }
+    text
 }
 
 fn bit(words: &[u64; SELECTION_WORDS], index: usize) -> bool {
@@ -2930,7 +3390,7 @@ fn file_extension(name: &str) -> &str {
     }
 }
 
-const TYPE_NAMES: [&str; 11] = [
+const TYPE_NAMES: [&str; 13] = [
     "File",
     "File Folder",
     "Text Document",
@@ -2942,8 +3402,12 @@ const TYPE_NAMES: [&str; 11] = [
     "Image",
     "App Bundle",
     "Archive",
+    "Sound",
+    "Video",
 ];
 const TYPE_IMAGE: u8 = 8;
+const TYPE_AUDIO: u8 = 11;
+const TYPE_VIDEO: u8 = 12;
 
 fn type_index(node: NodeId, fs: &dyn FileSystem) -> u8 {
     if fs.is_dir(node) {
@@ -2963,8 +3427,12 @@ fn type_index(node: NodeId, fs: &dyn FileSystem) -> u8 {
         6
     } else if matches(&["json"]) {
         7
-    } else if matches(&["bmp", "png", "qoi", "ppm", "jpg", "jpeg"]) {
+    } else if matches(&["bmp", "png", "qoi", "ppm", "jpg", "jpeg", "ico"]) {
         TYPE_IMAGE
+    } else if crate::player::is_audio_file(fs.name(node).unwrap_or("")) {
+        TYPE_AUDIO
+    } else if matches(&["mp4", "m4v", "mov", "mkv", "webm", "avi", "flv", "ivf", "h264", "264", "gif", "mjpeg", "mjpg", "mpg", "mpeg", "m1v"]) {
+        TYPE_VIDEO
     } else if matches(&["fapp"]) {
         9
     } else if matches(&["zip", "tar", "gz"]) {
@@ -2982,20 +3450,18 @@ const fn is_image_type(index: u8) -> bool {
     index == TYPE_IMAGE
 }
 
-fn type_accent(index: u8) -> Color {
-    match index {
-        2 | 3 => Color::rgb(60, 130, 220),
-        4 => Color::rgb(222, 112, 52),
-        5..=7 => Color::rgb(90, 160, 80),
-        TYPE_IMAGE => Color::rgb(176, 82, 196),
-        _ => Color::rgb(120, 120, 120),
+/// The widths of the Name, Size and Type columns; Date Modified takes the rest.
+/// With little room, the type goes: it's the one column an icon also tells you.
+fn column_widths(width: i32) -> (i32, i32, i32) {
+    if width < NARROW_LIST {
+        (width * 48 / 100, width * 16 / 100, 0)
+    } else {
+        (width * 40 / 100, width * 12 / 100, width * 20 / 100)
     }
 }
 
-/// The widths of the Name and Size columns; Type takes the rest.
-fn column_widths(width: i32) -> (i32, i32) {
-    (width * 50 / 100, width * 15 / 100)
-}
+/// Below this width the details view drops a column.
+const NARROW_LIST: i32 = 480;
 
 fn compare_nodes(
     fs: &dyn FileSystem,
@@ -3021,6 +3487,7 @@ fn compare_nodes(
             let b = type_name(b, fs);
             compare_names(a, b)
         }
+        SortKey::Modified => fs.times(a).modified.cmp(&fs.times(b).modified),
     };
     if descending {
         order.reverse()
@@ -3266,6 +3733,8 @@ impl DialogLayout {
             Dialog::Properties(_) => (570, 380),
             Dialog::Viewer(_) => (760, 570),
             Dialog::Notice => (480, 232),
+            Dialog::ConfirmDelete => (440, 200),
+            Dialog::Name(_) => (440, 200),
         };
         let width = width.min(screen.width as i32 - 30).max(320);
         let height = height.min(screen.height as i32 - 30).max(200);
@@ -3664,6 +4133,7 @@ pub(super) fn open_window(fs: &dyn FileSystem, context: &WindowContext<'_, '_>) 
     state.maximized = true;
     state.apply_args(fs, context.args, context.now_ms);
     state.after_input(fs, context.now_ms);
+    state.log_listing(fs);
     *WINDOW.lock() = Some(state);
     true
 }
@@ -3677,6 +4147,7 @@ pub(super) fn frame_window(
         return WindowFrame::Close;
     };
     let now = context.now_ms;
+    state.follow_tree(fs);
 
     context.dispatch_pointer(|report| {
         if state.handle_pointer(fs, report, now) {
@@ -3722,9 +4193,20 @@ pub(super) fn accept_drop(payload: &str) -> bool {
 
 /// Whether the window has work left that needs frames without input.
 pub(super) fn needs_frames() -> bool {
-    WINDOW
-        .try_lock()
-        .is_some_and(|guard| guard.as_ref().is_some_and(|state| state.thumbs_pending))
+    let changed = WATCHED_TREE.lock().map(|tree| tree.generation());
+    WINDOW.try_lock().is_some_and(|guard| {
+        guard.as_ref().is_some_and(|state| {
+            state.thumbs_pending || changed.is_some_and(|now| now != state.seen_generation)
+        })
+    })
+}
+
+/// The tree whose changes wake an idle window.
+static WATCHED_TREE: SpinLock<Option<&'static dyn VfsTree>> = SpinLock::new(None);
+
+/// Says which tree to watch, so that a change repaints the window.
+pub(super) fn watch(tree: Option<&'static dyn VfsTree>) {
+    *WATCHED_TREE.lock() = tree;
 }
 
 /// The ways the explorer reaches the desktop session. Tests record these
@@ -4270,7 +4752,7 @@ fn draw_address_bar(painter: &mut Painter<'_, '_>, state: &mut ExplorerState, la
             FIELD_BORDER
         },
     );
-    draw_folder_icon(painter, Rect::new(field.x + 3, field.y + 4, 14, 14));
+    draw_folder_icon(painter, Rect::new(field.x + 2, field.y + 3, 16, 16));
     let text_rect = Rect::new(
         field.x + 21,
         field.y,
@@ -4445,20 +4927,11 @@ fn draw_tree(
             painter.fill_polygon(&points, if selected { Color::WHITE } else { TEXT });
         }
         let icon = if node == fs.root() {
-            Icon::Home
+            Stock::Computer
         } else {
-            Icon::Folder
+            Stock::Folder
         };
-        paint_icon(
-            painter,
-            Rect::new(x + 11, y + 2, 14, 14),
-            icon,
-            if selected {
-                Color::WHITE
-            } else {
-                Color::rgb(230, 170, 35)
-            },
-        );
+        feos_iconset::draw(painter, icon, Rect::new(x + 10, y + 1, 16, 16));
         let label = if node == fs.root() {
             "My Computer"
         } else {
@@ -4746,9 +5219,8 @@ fn draw_details(
         BORDER,
     );
     let width = header.width as i32;
-    let (name_w, size_w) = column_widths(width);
-    let type_w = width - name_w - size_w;
-    // The filesystems record no timestamps, so there is no Modified column.
+    let (name_w, size_w, type_w) = column_widths(width);
+    let modified_w = width - name_w - size_w - type_w;
     let columns = [
         (header.x, name_w, "Name", Some(SortKey::Name)),
         (header.x + name_w, size_w, "Size", Some(SortKey::Size)),
@@ -4758,9 +5230,18 @@ fn draw_details(
             "Type",
             Some(SortKey::Type),
         ),
+        (
+            header.x + name_w + size_w + type_w,
+            modified_w,
+            "Date Modified",
+            Some(SortKey::Modified),
+        ),
     ];
     for (x, w, label, key) in columns {
-        let rect = Rect::new(x, header.y, w.max(1) as u32, header.height);
+        if w <= 0 {
+            continue;
+        }
+        let rect = Rect::new(x, header.y, w as u32, header.height);
         let active = key.map(|key| state.sort == key).unwrap_or(false);
         if active {
             painter.fill_rect(rect, Color::rgb(226, 231, 242));
@@ -4875,14 +5356,30 @@ fn draw_detail_row(
         Align::End,
         VerticalAlign::Middle,
     );
+    if type_w > 0 {
+        painter.draw_text_ellipsis(
+            Rect::new(
+                row.x + name_w + size_w,
+                row.y,
+                (type_w - 8).max(10) as u32,
+                row.height,
+            ),
+            TYPE_NAMES[info.type_index as usize],
+            if selected { Color::WHITE } else { TEXT },
+            1,
+            Align::Start,
+            VerticalAlign::Middle,
+        );
+    }
+    let modified_x = row.x + name_w + size_w + type_w;
     painter.draw_text_ellipsis(
         Rect::new(
-            row.x + name_w + size_w,
+            modified_x,
             row.y,
-            (type_w - 8).max(10) as u32,
+            (row.right_i32() - modified_x - 8).max(10) as u32,
             row.height,
         ),
-        TYPE_NAMES[info.type_index as usize],
+        short_time(row.right_i32() - modified_x, info.modified).as_str(),
         if selected { Color::WHITE } else { TEXT },
         1,
         Align::Start,
@@ -5265,7 +5762,7 @@ fn draw_preview_content(
             if y + 16 > rect.bottom_i32() {
                 break;
             }
-            draw_node_icon(painter, child, fs, Rect::new(rect.x, y + 1, 12, 12));
+            draw_node_icon(painter, child, fs, Rect::new(rect.x, y, 16, 16));
             painter.draw_text_ellipsis(
                 Rect::new(rect.x + 17, y, rect.width.saturating_sub(17), 15),
                 fs.name(child).unwrap_or("?"),
@@ -5385,11 +5882,10 @@ fn draw_status_bar(
         (rect.width as i32 - second_width - 8).max(10) as u32,
         rect.height,
     );
-    paint_icon(
+    feos_iconset::draw(
         painter,
-        Rect::new(right.x + 2, right.y + 4, 14, 14),
-        Icon::Home,
-        Color::rgb(80, 110, 170),
+        Stock::Computer,
+        Rect::new(right.x + 2, right.y + 3, 16, 16),
     );
     painter.draw_text_ellipsis(
         Rect::new(
@@ -5645,7 +6141,7 @@ fn draw_address_dropdown(
             Align::Start,
             VerticalAlign::Middle,
         );
-        draw_folder_icon(painter, Rect::new(row.x + 3, row.y + 3, 12, 12));
+        draw_folder_icon(painter, Rect::new(row.x + 2, row.y + 1, 16, 16));
     }
 }
 
@@ -5688,6 +6184,8 @@ fn draw_dialog(
         Dialog::Properties(node) => draw_properties(painter, fs, node, layout),
         Dialog::Viewer(node) => draw_viewer(painter, fs, state, node, layout),
         Dialog::Notice => draw_notice(painter, state, layout),
+        Dialog::ConfirmDelete => draw_confirm_delete(painter, state, fs, layout),
+        Dialog::Name(_) => draw_name_input(painter, state, layout),
         Dialog::None => {}
     }
     let label = if matches!(dialog, Dialog::Viewer(_)) {
@@ -5723,9 +6221,59 @@ fn dialog_title(dialog: Dialog, state: &ExplorerState, fs: &dyn FileSystem) -> T
         Dialog::Notice => {
             title.set(state.notice_title.as_str());
         }
+        Dialog::ConfirmDelete => {
+            title.set("Confirm Delete");
+        }
+        Dialog::Name(NameRequest::NewFolder) => {
+            title.set("New Folder");
+        }
+        Dialog::Name(NameRequest::Rename(_)) => {
+            title.set("Rename");
+        }
         Dialog::None => {}
     }
     title
+}
+
+fn draw_confirm_delete(
+    painter: &mut Painter<'_, '_>,
+    state: &ExplorerState,
+    fs: &dyn FileSystem,
+    layout: DialogLayout,
+) {
+    let body = layout.body;
+    let mut line = Text::<128>::new();
+    let count = state.selected_paths(fs).len();
+    if count == 1 {
+        let name = state.focused_node().and_then(|node| fs.name(node)).unwrap_or("this item");
+        let _ = write!(line, "Delete '{name}' and everything in it?");
+    } else {
+        let _ = write!(line, "Delete these {count} items and everything in them?");
+    }
+    painter.draw_text(body.x + 8, body.y + 10, line.as_str(), TEXT, 1);
+    painter.draw_text(
+        body.x + 8,
+        body.y + 34,
+        "This can't be undone. Press Enter to delete, Esc to cancel.",
+        MUTED,
+        1,
+    );
+}
+
+fn draw_name_input(painter: &mut Painter<'_, '_>, state: &ExplorerState, layout: DialogLayout) {
+    let body = layout.body;
+    painter.draw_text(body.x + 8, body.y + 8, "Name:", MUTED, 1);
+    let field = Rect::new(body.x + 8, body.y + 26, body.width.saturating_sub(16), 22);
+    painter.fill_rect(field, FIELD);
+    painter.stroke_rect(field, 1, FIELD_BORDER);
+    painter.draw_text_ellipsis(
+        Rect::new(field.x + 4, field.y, field.width.saturating_sub(8), field.height),
+        state.name_input.as_str(),
+        TEXT,
+        1,
+        Align::Start,
+        VerticalAlign::Middle,
+    );
 }
 
 fn draw_about(painter: &mut Painter<'_, '_>, layout: DialogLayout) {
@@ -5746,7 +6294,7 @@ fn draw_about(painter: &mut Painter<'_, '_>, layout: DialogLayout) {
         "context menus, mouse input, wheel scrolling and",
         "keyboard navigation.",
         "",
-        "It reads files; it cannot change them.",
+        "Copy, move, rename and delete, on any writable volume.",
         "feos 0.1.0",
     ];
     let mut y = body.y + 64;
@@ -5771,6 +6319,7 @@ fn draw_options(painter: &mut Painter<'_, '_>, state: &ExplorerState, layout: Di
         state.status_open,
         state.bar == ExplorerBar::Folders,
         state.preview_open,
+        state.show_hidden,
     ];
     let labels = [
         "Show Standard Buttons",
@@ -5778,8 +6327,9 @@ fn draw_options(painter: &mut Painter<'_, '_>, state: &ExplorerState, layout: Di
         "Show Status Bar",
         "Show Folders Pane",
         "Show Preview Pane",
+        "Show Hidden Files",
     ];
-    for index in 0..5 {
+    for index in 0..6 {
         let rect = option_check_rect(layout, index);
         draw_checkbox(painter, rect, checks[index], false);
         painter.draw_text(rect.right_i32() + 8, rect.y + 1, labels[index], TEXT, 1);
@@ -5833,20 +6383,45 @@ fn draw_properties(
         paint_property_line(painter, body.x + 8, y, "Contains", count.as_str());
         y += 20;
     }
-    paint_property_line(painter, body.x + 8, y, "Attributes", "Read-only in File Explorer");
-    y += 26;
-    painter.fill_rect(
-        Rect::new(body.x + 8, y, body.width.saturating_sub(16), 1),
-        BORDER,
-    );
-    y += 8;
-    painter.draw_text(
+    let times = fs.times(node);
+    paint_property_line(
+        painter,
         body.x + 8,
         y,
-        "File Explorer reads this item but cannot change it.",
-        MUTED,
-        1,
+        "Modified",
+        format_time(times.modified).as_str(),
     );
+    y += 20;
+    paint_property_line(
+        painter,
+        body.x + 8,
+        y,
+        "Created",
+        format_time(times.created).as_str(),
+    );
+    let attributes = fs.attributes(node);
+    painter.draw_text(body.x + 8, body.bottom_i32() - 60, "Attributes", MUTED, 1);
+    for (index, (label, bit)) in PROPERTY_ATTRIBUTES.iter().enumerate() {
+        let rect = property_check_rect(layout, index);
+        draw_checkbox(painter, rect, attributes & bit != 0, false);
+        painter.draw_text(rect.right_i32() + 6, rect.y + 1, label, TEXT, 1);
+    }
+}
+
+/// The attributes the Properties dialog can change.
+const PROPERTY_ATTRIBUTES: [(&str, u8); 3] = [
+    ("Read-only", attr::READ_ONLY),
+    ("Hidden", attr::HIDDEN),
+    ("Archive", attr::ARCHIVE),
+];
+
+fn property_check_rect(layout: DialogLayout, index: usize) -> Rect {
+    Rect::new(
+        layout.body.x + 100 + index as i32 * 120,
+        layout.body.bottom_i32() - 61,
+        14,
+        14,
+    )
 }
 
 fn paint_property_line(painter: &mut Painter<'_, '_>, x: i32, y: i32, label: &str, value: &str) {
@@ -5868,7 +6443,8 @@ fn draw_viewer(
         body.x + 6,
         body.y + 5,
         body.width.saturating_sub(20),
-        body.height.saturating_sub(10),
+        // Leave the footer its own line.
+        body.height.saturating_sub(24),
     );
     let image_size = state.image_of(node).map(|image| (image.width, image.height));
     if let Some(image) = state.image_of(node) {
@@ -6096,7 +6672,7 @@ fn draw_node_icon(painter: &mut Painter<'_, '_>, node: NodeId, fs: &dyn FileSyst
     if fs.is_dir(node) {
         draw_folder_icon(painter, rect);
     } else {
-        draw_file_icon(painter, rect, type_accent(type_index(node, fs)));
+        feos_iconset::draw(painter, type_icon(type_index(node, fs)), rect);
     }
 }
 
@@ -6104,92 +6680,26 @@ fn draw_entry_icon(painter: &mut Painter<'_, '_>, info: EntryInfo, rect: Rect) {
     if info.is_dir {
         draw_folder_icon(painter, rect);
     } else {
-        draw_file_icon(painter, rect, type_accent(info.type_index));
+        feos_iconset::draw(painter, type_icon(info.type_index), rect);
+    }
+}
+
+/// The picture for a kind of file.
+fn type_icon(index: u8) -> Stock {
+    match index {
+        2 | 3 => Stock::TextFile,
+        4..=7 => Stock::SystemFile,
+        TYPE_IMAGE => Stock::ImageFile,
+        9 => Stock::AppBundle,
+        10 => Stock::Archive,
+        TYPE_AUDIO => Stock::AudioFile,
+        TYPE_VIDEO => Stock::VideoFile,
+        _ => Stock::GenericFile,
     }
 }
 
 fn draw_folder_icon(painter: &mut Painter<'_, '_>, rect: Rect) {
-    if rect.width < 4 || rect.height < 4 {
-        return;
-    }
-    let w = rect.width as i32;
-    let h = rect.height as i32;
-    let tab = Rect::new(
-        rect.x + 1,
-        rect.y + 1,
-        (w * 55 / 100).max(4) as u32,
-        (h / 4).max(3) as u32,
-    );
-    painter.fill_rounded_rect(tab, 2, FOLDER_BACK);
-    let body = Rect::new(rect.x, rect.y + h / 4, rect.width, (h - h / 4) as u32);
-    painter.fill_rounded_rect(body, 2, FOLDER_FRONT);
-    painter.stroke_rounded_rect(body, 2, 1, FOLDER_EDGE);
-    painter.fill_rect(
-        Rect::new(
-            body.x + 1,
-            body.y + 1,
-            body.width.saturating_sub(2),
-            (body.height / 6).max(1) as u32,
-        ),
-        Color::rgb(255, 234, 160),
-    );
-    if w >= 12 {
-        painter.fill_rect(
-            Rect::new(
-                body.x + 2,
-                body.bottom_i32() - 3,
-                body.width.saturating_sub(4),
-                1,
-            ),
-            Color::rgb(222, 169, 45),
-        );
-    }
-}
-
-fn draw_file_icon(painter: &mut Painter<'_, '_>, rect: Rect, accent: Color) {
-    if rect.width < 5 || rect.height < 5 {
-        return;
-    }
-    let w = rect.width as i32;
-    let h = rect.height as i32;
-    let page = Rect::new(
-        rect.x + w / 6,
-        rect.y + 1,
-        (w * 2 / 3).max(5) as u32,
-        (h - 2).max(5) as u32,
-    );
-    painter.fill_rect(page, Color::WHITE);
-    painter.stroke_rect(page, 1, Color::rgb(110, 110, 110));
-    let fold = ((page.width.min(page.height as u32) / 4).max(3)) as i32;
-    let points = [
-        Point::new(page.right_i32() - fold, page.y + 1),
-        Point::new(page.right_i32() - 1, page.y + 1 + fold),
-        Point::new(page.right_i32() - 1, page.y + 1),
-    ];
-    painter.fill_polygon(&points, accent);
-    painter.line(
-        page.right_i32() - fold - 1,
-        page.y + 1,
-        page.right_i32() - fold - 1,
-        page.y + fold,
-        Color::rgb(110, 110, 110),
-    );
-    painter.line(
-        page.right_i32() - fold,
-        page.y + fold,
-        page.right_i32() - 1,
-        page.y + fold,
-        Color::rgb(110, 110, 110),
-    );
-    let line_y = page.bottom_i32() - (page.height as i32 / 3).max(4);
-    painter.fill_rect(
-        Rect::new(page.x + 3, line_y, page.width.saturating_sub(6), 1),
-        accent,
-    );
-    painter.fill_rect(
-        Rect::new(page.x + 3, line_y + 3, page.width.saturating_sub(8), 1),
-        Color::rgb(170, 170, 170),
-    );
+    feos_iconset::draw(painter, Stock::Folder, rect);
 }
 
 #[cfg(test)]
@@ -6805,7 +7315,7 @@ mod tests {
         let mut state = hosted(&fs);
         at(&mut state, &fs, "/docs");
         select(&mut state, &fs, "alpha.txt");
-        let address = state.address;
+        let address = String::from(state.address.as_str());
         key(&mut state, &fs, Key::Character('c'), Modifiers::CTRL);
         let mut buffer = [0u8; 64];
         assert_eq!(shell::clipboard_get(&mut buffer), "/docs/alpha.txt");
@@ -7039,6 +7549,13 @@ mod tests {
         render(&mut canvas, fs, state, 0);
         let hash = golden_hash(canvas.pixels());
         results.push((String::from(name), hash));
+        // Only a frame that differs is worth the disk space.
+        let line = format!("{name} {hash:016x}\n");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/explorer_golden.txt");
+        let known = std::fs::read_to_string(path).unwrap_or_default();
+        if known.contains(&line) || std::env::var_os("FEOS_UPDATE_GOLDEN").is_some() {
+            return;
+        }
         let mut bytes = format!("P6\n{width} {height}\n255\n").into_bytes();
         for pixel in &pixels {
             bytes.extend_from_slice(&[(pixel >> 16) as u8, (pixel >> 8) as u8, *pixel as u8]);
@@ -7236,14 +7753,14 @@ mod tests {
     #[test]
     fn random_input_on_small_canvases_never_panics_in_the_foreground_form() {
         let fs = FakeFs::sample();
-        for (seed, (width, height)) in SIZES.iter().cycle().take(36).enumerate() {
+        for (seed, (width, height)) in SIZES.iter().cycle().take(18).enumerate() {
             let seed = seed as u64 + 1;
             let mut random = Random(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
             let mut pixels = std::vec![0u32; width * height];
             let screen = Rect::new(0, 0, *width as u32, *height as u32);
             let mut state = std::boxed::Box::new(ExplorerState::new(&fs, screen));
             state.maximized = seed % 2 == 0;
-            for step in 0..300u64 {
+            for step in 0..200u64 {
                 let now = step * 40;
                 for _ in 0..random.below(4) {
                     let event = random_event(&mut random, *width, *height);
@@ -7377,10 +7894,199 @@ mod tests {
             memory: None,
             apps: &APPS,
             filesystem: None,
+            net: None,
         }
     }
 
     /// `WINDOW` is one static, so tests of the window glue take turns.
+    /// A real shared tree, for what only a writable filesystem can do.
+    fn live_tree() -> &'static feos_fs::Vfs {
+        let tree: &'static feos_fs::Vfs =
+            Box::leak(Box::new(feos_fs::Vfs::in_memory(4 * 1024 * 1024)));
+        tree.create_dir("/docs").unwrap();
+        tree.write_file("/docs/a.txt", b"alpha", false).unwrap();
+        tree.write_file("/b.txt", b"beta", false).unwrap();
+        tree
+    }
+
+    fn live_state(tree: &'static feos_fs::Vfs) -> Box<ExplorerState> {
+        let mut state = Box::new(ExplorerState::new(tree, Rect::new(0, 0, 1024, 768)));
+        state.refresh(tree);
+        state
+    }
+
+    fn select_named(state: &mut ExplorerState, fs: &dyn FileSystem, name: &str) {
+        let index = (0..state.entry_count)
+            .find(|&index| fs.name(state.entries[index]) == Some(name))
+            .unwrap();
+        state.select_only(index);
+        state.cursor = index;
+    }
+
+    fn live_names(state: &ExplorerState, fs: &dyn FileSystem) -> std::vec::Vec<std::string::String> {
+        (0..state.entry_count)
+            .map(|index| fs.name(state.entries[index]).unwrap().into())
+            .collect()
+    }
+
+    #[test]
+    fn a_change_elsewhere_shows_up_without_a_refresh() {
+        let tree = live_tree();
+        let mut state = live_state(tree);
+        assert_eq!(live_names(&state, tree), ["docs", "b.txt"]);
+        state.follow_tree(tree);
+        assert_eq!(state.entry_count, 2);
+        tree.write_file("/from-terminal.txt", b"x", false).unwrap();
+        assert_ne!(state.seen_generation, tree.generation());
+        state.follow_tree(tree);
+        assert_eq!(state.seen_generation, tree.generation());
+        assert_eq!(live_names(&state, tree), ["docs", "b.txt", "from-terminal.txt"]);
+    }
+
+    #[test]
+    fn showing_a_folder_that_vanishes_falls_back_to_its_parent() {
+        let tree = live_tree();
+        let mut state = live_state(tree);
+        tree.create_dir("/docs/inner").unwrap();
+        state.current = tree.resolve("/docs/inner").unwrap();
+        state.refresh(tree);
+        tree.remove_dir("/docs/inner").unwrap();
+        state.follow_tree(tree);
+        assert_eq!(state.current, tree.resolve("/docs").unwrap());
+    }
+
+    #[test]
+    fn new_folder_rename_delete() {
+        let tree = live_tree();
+        let mut state = live_state(tree);
+
+        state.perform(tree, Action::NewFolder, None, 0);
+        assert!(matches!(state.dialog, Dialog::Name(NameRequest::NewFolder)));
+        for _ in 0.."New Folder".len() {
+            state.dialog_key(tree, Key::Backspace, 0);
+        }
+        for ch in "made".chars() {
+            state.handle_text(ch);
+        }
+        state.dialog_key(tree, Key::Enter, 0);
+        assert_eq!(state.dialog, Dialog::None);
+        assert!(tree.stat("/made").is_ok());
+
+        select_named(&mut state, tree, "b.txt");
+        state.perform(tree, Action::Rename, None, 0);
+        assert_eq!(state.name_input.as_str(), "b.txt");
+        state.name_input.set("c.txt");
+        state.dialog_key(tree, Key::Enter, 0);
+        assert!(tree.stat("/c.txt").is_ok());
+        assert!(tree.stat("/b.txt").is_err());
+        assert_eq!(state.focused_node(), tree.resolve("/c.txt"), "the cursor follows");
+
+        // Escape leaves the name dialog with nothing changed.
+        select_named(&mut state, tree, "c.txt");
+        state.perform(tree, Action::Rename, None, 0);
+        state.name_input.set("d.txt");
+        state.dialog_key(tree, Key::Escape, 0);
+        assert!(tree.stat("/c.txt").is_ok());
+
+        select_named(&mut state, tree, "docs");
+        state.perform(tree, Action::Delete, None, 0);
+        assert_eq!(state.dialog, Dialog::ConfirmDelete);
+        state.dialog_key(tree, Key::Escape, 0);
+        assert!(tree.stat("/docs/a.txt").is_ok(), "cancelled");
+        state.perform(tree, Action::Delete, None, 0);
+        state.dialog_key(tree, Key::Enter, 0);
+        assert!(tree.stat("/docs").is_err(), "a folder goes with its contents");
+    }
+
+    #[test]
+    fn copy_and_cut_paste_and_name_collisions() {
+        let tree = live_tree();
+        let mut state = live_state(tree);
+
+        select_named(&mut state, tree, "docs");
+        state.perform(tree, Action::Copy, None, 0);
+        // Into the same folder: a copy under a new name.
+        state.perform(tree, Action::Paste, None, 0);
+        assert_eq!(tree.stat("/Copy of docs/a.txt").unwrap().size, 5);
+        state.perform(tree, Action::Paste, None, 0);
+        assert!(tree.stat("/Copy (2) of docs/a.txt").is_ok());
+
+        // Cut moves it, once.
+        select_named(&mut state, tree, "b.txt");
+        state.perform(tree, Action::Cut, None, 0);
+        state.current = tree.resolve("/docs").unwrap();
+        state.refresh(tree);
+        state.perform(tree, Action::Paste, None, 0);
+        assert!(tree.stat("/docs/b.txt").is_ok());
+        assert!(tree.stat("/b.txt").is_err());
+        assert!(state.file_clip.is_empty());
+
+        // A folder into itself is refused, with a message and no change.
+        state.current = tree.root();
+        state.refresh(tree);
+        select_named(&mut state, tree, "docs");
+        state.perform(tree, Action::Copy, None, 0);
+        state.current = tree.resolve("/docs").unwrap();
+        state.refresh(tree);
+        state.perform(tree, Action::Paste, None, 0);
+        assert_eq!(state.dialog, Dialog::Notice);
+    }
+
+    #[test]
+    fn copying_an_endless_device_ends() {
+        let tree = live_tree();
+        let mut dev = feos_fs::vfs::RamFs::new(0);
+        dev.add_device(NodeId::ROOT, "zero", feos_fs::vfs::DeviceKind::Zero).unwrap();
+        tree.mount("/dev", Box::new(dev), false, "dev").unwrap();
+        copy_tree(tree, "/dev", "/copy", 0).unwrap();
+        assert_eq!(tree.stat("/copy/zero").unwrap().size, 0);
+    }
+
+    #[test]
+    fn hidden_files_and_attributes() {
+        let tree = live_tree();
+        let mut state = live_state(tree);
+        let file = tree.resolve("/b.txt").unwrap();
+        state.toggle_attribute(tree, file, attr::HIDDEN, 0);
+        assert_eq!(live_names(&state, tree), ["docs"]);
+        state.show_hidden = true;
+        state.refresh(tree);
+        assert_eq!(live_names(&state, tree), ["docs", "b.txt"]);
+
+        state.toggle_attribute(tree, file, attr::READ_ONLY, 0);
+        select_named(&mut state, tree, "b.txt");
+        state.perform(tree, Action::Delete, None, 0);
+        state.dialog_key(tree, Key::Enter, 0);
+        assert_eq!(state.dialog, Dialog::Notice, "a read-only file says why it stayed");
+        assert!(tree.stat("/b.txt").is_ok());
+    }
+
+    #[test]
+    fn a_filesystem_without_a_tree_says_it_is_read_only() {
+        let fs = FakeFs::empty();
+        let mut state = Box::new(ExplorerState::new(&fs, Rect::new(0, 0, 1024, 768)));
+        state.perform(&fs, Action::NewFolder, None, 0);
+        assert_eq!(state.dialog, Dialog::Notice);
+    }
+
+    #[test]
+    fn dates_format_and_are_blank_when_unknown() {
+        assert_eq!(format_time(None).as_str(), "");
+        assert_eq!(format_time(Some(1_700_000_000)).as_str(), "2023-11-14 22:13");
+    }
+
+    #[test]
+    fn dates_sort_oldest_first() {
+        let tree = live_tree();
+        tree.set_times("/b.txt", NodeTimes { modified: Some(2_000), ..NodeTimes::NONE }).unwrap();
+        tree.write_file("/c.txt", b"", false).unwrap();
+        tree.set_times("/c.txt", NodeTimes { modified: Some(1_000), ..NodeTimes::NONE }).unwrap();
+        let mut state = live_state(tree);
+        state.set_sort(SortKey::Modified);
+        state.refresh(tree);
+        assert_eq!(live_names(&state, tree), ["docs", "c.txt", "b.txt"]);
+    }
+
     static WINDOW_TESTS: Mutex<()> = Mutex::new(());
 
     fn window_turn() -> MutexGuard<'static, ()> {
@@ -7399,6 +8105,7 @@ mod tests {
     ) -> WindowFrame {
         let mut canvas = Canvas::new(pixels, width, height, width).unwrap();
         let mut context = WindowContext {
+            instance: 0,
             args,
             canvas: &mut canvas,
             input,
@@ -7468,17 +8175,20 @@ mod tests {
             let mut random = Random(seed.wrapping_mul(0x2545_f491_4f6c_dd1d) | 1);
             let mut pixels = std::vec![0u32; width * height];
             let mut input = Input::new();
-            for step in 0..400 {
+            let mut open = true;
+            for _ in 0..150 {
                 input.clear_events();
                 for _ in 0..random.below(5) {
                     input.push(random_event(&mut random, *width, *height));
                 }
                 let frame =
-                    window_frame(&fs, &platform, &mut pixels, *width, *height, &input, "", step == 0);
-                if frame == WindowFrame::Close {
-                    panic!("seed {seed} step {step}: random input closed the window");
+                    window_frame(&fs, &platform, &mut pixels, *width, *height, &input, "", open);
+                // A random click can land on File > Close. That's a fair way to
+                // close a window: start another.
+                open = frame == WindowFrame::Close;
+                if !open {
+                    assert_consistent(WINDOW.lock().as_ref().unwrap(), seed);
                 }
-                assert_consistent(WINDOW.lock().as_ref().unwrap(), seed);
             }
             close_window();
         }

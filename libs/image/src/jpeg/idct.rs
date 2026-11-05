@@ -2,8 +2,7 @@
 //!
 //! This is the Loeffler, Ligtenberg and Moschytz factorisation with 12
 //! multiplications per 1-D transform, the same one libjpeg calls "islow". It
-//! uses no floating point, which matters on `x86_64-unknown-none`, where floats
-//! are soft-float.
+//! uses no floating point.
 //!
 //! The coefficients come from untrusted input, so [`dequantize`] bounds them to
 //! `±LIMIT`. With that bound nothing below can overflow `i64`: the largest

@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "feos-abi"
+version = "0.1.0"
+
+[[package]]
 name = "feos-app"
 version = "0.1.0"
 dependencies = [
@@ -20,6 +24,7 @@ version = "0.1.0"
 dependencies = [
  "feos-app",
  "feos-audio",
+ "feos-audio-codec",
  "feos-bundle",
  "feos-console",
  "feos-coreutils",
@@ -30,8 +35,10 @@ dependencies = [
  "feos-gfx",
  "feos-gui",
  "feos-hal",
+ "feos-iconset",
  "feos-image",
  "feos-keys",
+ "feos-mixer",
  "feos-sh",
  "feos-sync",
  "feos-text",
@@ -71,46 +78,84 @@ name = "feos-audio-codec"
 version = "0.1.0"
 
 [[package]]
+name = "feos-board-common"
+version = "0.1.0"
+dependencies = [
+ "feos-bootinfo",
+ "feos-console",
+ "feos-driver-fw-cfg",
+ "feos-driver-intel-hda",
+ "feos-driver-pci",
+ "feos-driver-ramfb",
+ "feos-driver-virtio-blk",
+ "feos-driver-virtio-gpu",
+ "feos-driver-virtio-net",
+ "feos-driver-xhci",
+ "feos-fs",
+ "feos-gfx",
+ "feos-hal",
+ "feos-irq",
+ "feos-sync",
+ "feos-virtio-core",
+]
+
+[[package]]
 name = "feos-board-qemu-virt"
 version = "0.1.0"
 dependencies = [
+ "feos-board-common",
+ "feos-bootinfo",
  "feos-console",
  "feos-driver-fw-cfg",
  "feos-driver-gicv2",
- "feos-driver-intel-hda",
+ "feos-driver-gicv3",
  "feos-driver-pci",
  "feos-driver-pl011",
- "feos-driver-ramfb",
+ "feos-driver-pl031",
+ "feos-driver-virtio-blk",
  "feos-driver-virtio-input",
+ "feos-firmware",
  "feos-fs",
  "feos-gfx",
  "feos-hal",
  "feos-sync",
+ "feos-virtio-core",
 ]
 
 [[package]]
 name = "feos-board-qemu-x86_64"
 version = "0.1.0"
 dependencies = [
+ "feos-arch-x86_64",
+ "feos-board-common",
+ "feos-bootinfo",
  "feos-console",
  "feos-driver-apic",
+ "feos-driver-cmos-rtc",
  "feos-driver-fw-cfg",
  "feos-driver-i8042",
- "feos-driver-intel-hda",
  "feos-driver-pci",
- "feos-driver-ramfb",
  "feos-driver-uart16550",
+ "feos-driver-virtio-blk",
+ "feos-driver-virtio-input",
+ "feos-firmware",
  "feos-fs",
  "feos-gfx",
  "feos-hal",
  "feos-sync",
+ "feos-virtio-core",
 ]
+
+[[package]]
+name = "feos-bootinfo"
+version = "0.1.0"
 
 [[package]]
 name = "feos-bundle"
 version = "0.1.0"
 dependencies = [
  "feos-archive",
+ "feos-compress",
  "feos-image",
  "feos-sync",
  "feos-text",
@@ -133,8 +178,10 @@ name = "feos-coreutils"
 version = "0.1.0"
 dependencies = [
  "feos-archive",
+ "feos-bundle",
  "feos-compress",
  "feos-fs",
+ "feos-hal",
 ]
 
 [[package]]
@@ -144,10 +191,13 @@ dependencies = [
  "feos-app",
  "feos-archive",
  "feos-bundle",
+ "feos-console",
  "feos-gfx",
  "feos-gui",
  "feos-hal",
+ "feos-iconset",
  "feos-init",
+ "feos-mixer",
  "feos-sync",
  "feos-text",
  "feos-yaml",
@@ -158,8 +208,10 @@ name = "feos-desktop-app"
 version = "0.1.0"
 dependencies = [
  "feos-app",
+ "feos-bundle",
  "feos-console",
  "feos-desktop",
+ "feos-fs",
  "feos-gfx",
  "feos-gui",
  "feos-hal",
@@ -182,17 +234,28 @@ name = "feos-dosbox-app"
 version = "0.1.0"
 dependencies = [
  "feos-app",
+ "feos-audio",
  "feos-console",
  "feos-dosbox",
  "feos-gfx",
  "feos-gui",
  "feos-hal",
  "feos-keys",
+ "feos-mixer",
  "feos-sync",
+ "feos-text",
 ]
 
 [[package]]
 name = "feos-driver-apic"
+version = "0.1.0"
+dependencies = [
+ "feos-hal",
+ "feos-port-io",
+]
+
+[[package]]
+name = "feos-driver-cmos-rtc"
 version = "0.1.0"
 dependencies = [
  "feos-hal",
@@ -209,6 +272,13 @@ dependencies = [
 
 [[package]]
 name = "feos-driver-gicv2"
+version = "0.1.0"
+dependencies = [
+ "feos-hal",
+]
+
+[[package]]
+name = "feos-driver-gicv3"
 version = "0.1.0"
 dependencies = [
  "feos-hal",
@@ -236,10 +306,18 @@ name = "feos-driver-pci"
 version = "0.1.0"
 dependencies = [
  "feos-port-io",
+ "feos-sync",
 ]
 
 [[package]]
 name = "feos-driver-pl011"
+version = "0.1.0"
+dependencies = [
+ "feos-hal",
+]
+
+[[package]]
+name = "feos-driver-pl031"
 version = "0.1.0"
 dependencies = [
  "feos-hal",
@@ -261,15 +339,72 @@ dependencies = [
 ]
 
 [[package]]
+name = "feos-driver-virtio-blk"
+version = "0.1.0"
+dependencies = [
+ "feos-hal",
+ "feos-sync",
+ "feos-virtio-core",
+]
+
+[[package]]
+name = "feos-driver-virtio-gpu"
+version = "0.1.0"
+dependencies = [
+ "feos-hal",
+ "feos-virtio-core",
+]
+
+[[package]]
 name = "feos-driver-virtio-input"
 version = "0.1.0"
 dependencies = [
  "feos-hal",
+ "feos-virtio-core",
 ]
+
+[[package]]
+name = "feos-driver-virtio-net"
+version = "0.1.0"
+dependencies = [
+ "feos-hal",
+ "feos-virtio-core",
+]
+
+[[package]]
+name = "feos-driver-xhci"
+version = "0.1.0"
+dependencies = [
+ "feos-hal",
+ "feos-sync",
+]
+
+[[package]]
+name = "feos-efi"
+version = "0.1.0"
+dependencies = [
+ "feos-bootinfo",
+]
+
+[[package]]
+name = "feos-elf"
+version = "0.1.0"
+
+[[package]]
+name = "feos-firmware"
+version = "0.1.0"
+
+[[package]]
+name = "feos-frames"
+version = "0.1.0"
 
 [[package]]
 name = "feos-fs"
 version = "0.1.0"
+dependencies = [
+ "feos-hal",
+ "feos-sync",
+]
 
 [[package]]
 name = "feos-gfx"
@@ -295,6 +430,15 @@ name = "feos-heap"
 version = "0.1.0"
 
 [[package]]
+name = "feos-iconset"
+version = "0.1.0"
+dependencies = [
+ "feos-gfx",
+ "feos-gui",
+ "feos-image",
+]
+
+[[package]]
 name = "feos-image"
 version = "0.1.0"
 dependencies = [
@@ -312,6 +456,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "feos-irq"
+version = "0.1.0"
+
+[[package]]
 name = "feos-json"
 version = "0.1.0"
 
@@ -319,6 +467,7 @@ version = "0.1.0"
 name = "feos-kernel"
 version = "0.1.0"
 dependencies = [
+ "feos-abi",
  "feos-app",
  "feos-apps",
  "feos-arch-aarch64",
@@ -327,11 +476,19 @@ dependencies = [
  "feos-board-qemu-x86_64",
  "feos-console",
  "feos-desktop-app",
+ "feos-elf",
+ "feos-frames",
+ "feos-fs",
+ "feos-gfx",
+ "feos-gui",
  "feos-hal",
  "feos-heap",
+ "feos-irq",
+ "feos-net",
  "feos-sched",
  "feos-shell",
  "feos-sync",
+ "feos-vm",
 ]
 
 [[package]]
@@ -341,6 +498,24 @@ dependencies = [
  "feos-console",
  "feos-gui",
  "feos-hal",
+]
+
+[[package]]
+name = "feos-mixer"
+version = "0.1.0"
+dependencies = [
+ "feos-app",
+ "feos-audio",
+ "feos-hal",
+ "feos-sync",
+]
+
+[[package]]
+name = "feos-net"
+version = "0.1.0"
+dependencies = [
+ "feos-hal",
+ "feos-sync",
 ]
 
 [[package]]
@@ -355,9 +530,12 @@ version = "0.1.0"
 name = "feos-sh"
 version = "0.1.0"
 dependencies = [
+ "feos-archive",
  "feos-console",
  "feos-coreutils",
  "feos-fs",
+ "feos-keys",
+ "feos-sync",
 ]
 
 [[package]]
@@ -387,6 +565,21 @@ dependencies = [
  "feos-compress",
  "feos-h264",
  "feos-image",
+]
+
+[[package]]
+name = "feos-virtio-core"
+version = "0.1.0"
+dependencies = [
+ "feos-driver-pci",
+ "feos-hal",
+]
+
+[[package]]
+name = "feos-vm"
+version = "0.1.0"
+dependencies = [
+ "feos-hal",
 ]
 
 [[package]]

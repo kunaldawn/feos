@@ -5,13 +5,20 @@
  * four groups of four (synchronous, IRQ, FIQ, SError):
  *   0-3   current EL, SP_EL0   the kernel's threads run here (EL1t)
  *   4-7   current EL, SP_ELx   the exception handlers themselves (EL1h)
- *   8-11  lower EL, AArch64
+ *   8-11  lower EL, AArch64      user programs (EL0t)
  *   12-15 lower EL, AArch32
  *
- * Every entry switches to SP_EL1 in hardware, which is a private stack for this
- * CPU, and saves a full TrapFrame on it. A task's stack therefore holds none of
- * its saved state once it has been offered to another CPU, and a task whose
- * stack pointer is bad can still fault cleanly.
+ * Every entry switches to SP_EL1 in hardware. While a thread runs, SP_EL1 points
+ * just past that thread's TrapFrame, so the frame "pushed" here lands right in it:
+ * saving a thread needs no copying, and switching to another is a change of
+ * pointer. The handler then runs on this CPU's private exception stack. A task's
+ * stack therefore holds none of its saved state once it has been offered to another
+ * CPU, and a task whose stack pointer is bad can still fault cleanly.
+ *
+ * A trap from a user program is no different. SP_EL1 is just past the frame the
+ * scheduler resumed, here the process's user frame, and the program's own stack
+ * pointer is in SP_EL0. So nothing a program does to its registers reaches kernel
+ * memory: it can't choose where the trap saves.
  */
 
 .section .text.vectors, "ax"
@@ -60,9 +67,12 @@ exception_vector_table:
  *   [ 784, 792)  SPSR_EL1
  *   [ 792, 800)  FPSR
  *
- * trap_dispatch() may replace the frame in place with another process's saved
- * state. If it returns, we restore that state and eret into it. It only returns
- * for traps taken from a thread on SP_EL0, so the restore targets SP_EL0.
+ * trap_dispatch() returns the frame to resume: this one, or another thread's. We
+ * restore it and eret, which leaves SP_EL1 just past that frame, ready for the next
+ * trap. It only returns for traps taken from a thread or a program, both on SP_EL0, so
+ * the restore targets SP_EL0, and SPSR_EL1 in the frame says which level to go to. A
+ * trap from the handlers themselves (groups 4-7) is already on the exception stack,
+ * and doesn't come back.
  */
 .type trap_common, %function
 trap_common:
@@ -99,11 +109,12 @@ trap_common:
     stp q28, q29, [sp, #704]
     stp q30, q31, [sp, #736]
 
-    /* Groups 0-3 interrupted SP_EL0; the others interrupted this stack. */
+    /* Groups 4-7 interrupted this stack; the others interrupted SP_EL0. */
     mrs x9, sp_el0
     add x10, sp, #800
-    cmp x0, #4
-    csel x9, x9, x10, lo
+    sub x11, x0, #4
+    cmp x11, #4
+    csel x9, x10, x9, lo
     str x9, [sp, #768]
 
     mrs x9, elr_el1
@@ -115,8 +126,28 @@ trap_common:
     mrs x9, fpsr
     str x9, [sp, #792]
 
+    /* A program chooses its own rounding mode and traps; the kernel's floating
+     * point mustn't run with them. */
+    cmp x0, #8
+    b.lo 0f
+    msr fpcr, xzr
+0:
     mov x1, sp
+    /* Groups 4-7 are already on the exception stack. */
+    sub x11, x0, #4
+    cmp x11, #4
+    b.lo 1f
+    /* sp = irq_stacks + (index + 1) * IRQ_STACK_SIZE */
+    mrs x9, tpidr_el1
+    adrp x10, irq_stacks
+    add  x10, x10, :lo12:irq_stacks
+    mov  x11, #0x8000
+    madd x10, x9, x11, x10
+    add  x10, x10, x11
+    mov  sp, x10
+1:
     bl  trap_dispatch
+    mov sp, x0
 
     ldr x9, [sp, #768]
     msr sp_el0, x9

@@ -4,6 +4,8 @@ use feos_bundle::AppCatalog;
 use feos_gfx::{Color, Rect};
 use feos_gui::{paint_icon, Align, Icon as GuiIcon, Id, RectExt, Sense, Ui, VerticalAlign};
 
+use feos_iconset::Stock;
+
 use crate::config::{StartMenuConfig, TaskbarPosition};
 use crate::paint::draw_icon;
 use crate::taskbar::TaskbarLayout;
@@ -508,22 +510,22 @@ pub fn render<const N: usize, const A: usize>(
     // Right column -------------------------------------------------------
     if two_columns {
         let entries = [
-            (GuiIcon::Home, "My Computer", StartMenuCommand::MyComputer),
+            (Stock::Computer, "My Computer", StartMenuCommand::MyComputer),
             (
-                GuiIcon::Folder,
+                Stock::Documents,
                 "My Documents",
                 StartMenuCommand::MyDocuments,
             ),
             (
-                GuiIcon::Settings,
+                Stock::ControlPanel,
                 "Control Panel",
                 StartMenuCommand::ControlPanel,
             ),
-            (GuiIcon::Help, "Help and Support", StartMenuCommand::Help),
-            (GuiIcon::Search, "Search", StartMenuCommand::Search),
-            (GuiIcon::Terminal, "Run...", StartMenuCommand::Run),
+            (Stock::Help, "Help and Support", StartMenuCommand::Help),
+            (Stock::Search, "Search", StartMenuCommand::Search),
+            (Stock::Run, "Run...", StartMenuCommand::Run),
             (
-                GuiIcon::Sliders,
+                Stock::Display,
                 "Desktop Settings",
                 StartMenuCommand::Settings,
             ),
@@ -536,16 +538,7 @@ pub fn render<const N: usize, const A: usize>(
             if hit.hovered {
                 ui.painter.fill_rounded_rect(row, 3, theme.menu_hover);
             }
-            paint_icon(
-                &mut ui.painter,
-                Rect::new(row.x + 5, row.y + 8, 16, 16),
-                *icon,
-                if hit.hovered {
-                    theme.menu_hover_text
-                } else {
-                    theme.menu_text
-                },
-            );
+            feos_iconset::draw(&mut ui.painter, *icon, Rect::new(row.x + 4, row.y + 4, 24, 24));
             ui.painter.draw_text_ellipsis(
                 Rect::new(row.x + 30, row.y, row.width.saturating_sub(34), row.height),
                 label,

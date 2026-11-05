@@ -9,7 +9,8 @@ use crate::cpu::CpuRegs;
 use crate::memory::{Memory, BDA_BASE};
 use crate::vga::{
     font_block_offset, rom_ptr, GraphicsKind, Vga, ROM_ALT_FONT, ROM_FONT14, ROM_FONT16, ROM_FONT8,
-    ROM_SEGMENT, ROM_STATIC, ROM_VESA_MODES, ROM_VESA_OEM, ROM_VESA_WINDOW, SVGA_SIZE,
+    ROM_SEGMENT, ROM_STATIC, ROM_VESA_MODES, ROM_VESA_OEM, ROM_VESA_PM, ROM_VESA_WINDOW, SVGA_SIZE,
+    VESA_PM_TABLE,
 };
 
 /// The cost of a mode set.
@@ -85,18 +86,43 @@ impl Vga {
             }
             0x09 | 0x0A => {
                 let keep_attr = regs.ah() == 0x0A;
-                self.write_repeated(mem, regs.bh() & 7, regs.al(), regs.bl(), regs.cx(), keep_attr);
+                self.write_repeated(
+                    mem,
+                    regs.bh() & 7,
+                    regs.al(),
+                    regs.bl(),
+                    regs.cx(),
+                    keep_attr,
+                );
             }
             0x0B => self.background_or_palette(mem, regs.bh(), regs.bl()),
             0x0C => {
                 let color = regs.al();
-                let xor = color & 0x80 != 0 && self.kind != GraphicsKind::Vga13 && self.kind != GraphicsKind::Vesa;
+                let xor = color & 0x80 != 0
+                    && self.kind != GraphicsKind::Vga13
+                    && self.kind != GraphicsKind::Vesa;
                 let color = if xor { color & 0x7F } else { color };
-                self.plot(mem, regs.bh() & 7, regs.cx() as usize, regs.dx() as usize, color, xor);
+                self.plot(
+                    mem,
+                    regs.bh() & 7,
+                    regs.cx() as usize,
+                    regs.dx() as usize,
+                    color,
+                    xor,
+                );
             }
-            0x0D => regs.set_al(self.pixel_on(mem, regs.bh() & 7, regs.cx() as usize, regs.dx() as usize)),
+            0x0D => regs.set_al(self.pixel_on(
+                mem,
+                regs.bh() & 7,
+                regs.cx() as usize,
+                regs.dx() as usize,
+            )),
             0x0E => {
-                let color = if self.is_text() { None } else { Some(regs.bl()) };
+                let color = if self.is_text() {
+                    None
+                } else {
+                    Some(regs.bl())
+                };
                 self.teletype_on(mem, self.page, regs.al(), color);
             }
             0x0F => {
@@ -111,7 +137,11 @@ impl Vga {
             0x1A => {
                 if regs.al() <= 1 {
                     if regs.al() == 0 {
-                        regs.set_bl(if self.crtc_port() == 0x3B4 { 0x07 } else { 0x08 });
+                        regs.set_bl(if self.crtc_port() == 0x3B4 {
+                            0x07
+                        } else {
+                            0x08
+                        });
                         regs.set_bh(0);
                     }
                     regs.set_al(0x1A);
@@ -159,7 +189,15 @@ impl Vga {
 
     /// `AH=09h` and `AH=0Ah`. Text runs through memory; graphics stops at the
     /// end of the row, as the BIOS does.
-    fn write_repeated(&mut self, mem: &mut Memory, page: u8, ch: u8, color: u8, count: u16, keep_attr: bool) {
+    fn write_repeated(
+        &mut self,
+        mem: &mut Memory,
+        page: u8,
+        ch: u8,
+        color: u8,
+        count: u16,
+        keep_attr: bool,
+    ) {
         let (row, column) = self.cursor_of(page);
         let count = count as usize;
         if self.is_text() {
@@ -224,7 +262,14 @@ impl Vga {
             0x03 => {
                 let control = self.ac[0x10];
                 let blink = regs.bl() & 1 != 0;
-                self.set_ac(0x10, if blink { control | 0x08 } else { control & !0x08 });
+                self.set_ac(
+                    0x10,
+                    if blink {
+                        control | 0x08
+                    } else {
+                        control & !0x08
+                    },
+                );
                 let mode = self.cga_mode;
                 self.cga_mode = if blink { mode | 0x20 } else { mode & !0x20 };
                 mem.write8(BDA_BASE + 0x65, self.cga_mode);
@@ -268,7 +313,11 @@ impl Vga {
                     self.set_ac(0x10, if on { control | 0x80 } else { control & !0x80 });
                 } else if regs.bl() == 1 {
                     let page = regs.bh();
-                    let value = if control & 0x80 != 0 { page & 0x0F } else { (page & 0x03) << 2 };
+                    let value = if control & 0x80 != 0 {
+                        page & 0x0F
+                    } else {
+                        (page & 0x03) << 2
+                    };
                     self.set_ac(0x14, value);
                 }
             }
@@ -302,7 +351,11 @@ impl Vga {
                 let control = self.ac[0x10];
                 let select = self.ac[0x14];
                 regs.set_bl(control >> 7);
-                regs.set_bh(if control & 0x80 != 0 { select & 0x0F } else { (select >> 2) & 3 });
+                regs.set_bh(if control & 0x80 != 0 {
+                    select & 0x0F
+                } else {
+                    (select >> 2) & 3
+                });
             }
             0x1B => {
                 let first = regs.bx() as usize;
@@ -342,7 +395,15 @@ impl Vga {
     }
 
     /// Writes glyphs to a character map in plane 2.
-    fn load_user_font(&mut self, mem: &Memory, at: u32, first: usize, count: usize, height: usize, block: u8) {
+    fn load_user_font(
+        &mut self,
+        mem: &Memory,
+        at: u32,
+        first: usize,
+        count: usize,
+        height: usize,
+        block: u8,
+    ) {
         let base = font_block_offset(block);
         let count = count.min(256usize.saturating_sub(first));
         for code in 0..count {
@@ -373,7 +434,14 @@ impl Vga {
             sub @ (0x00 | 0x10) => {
                 let height = if regs.bh() == 0 { 16 } else { regs.bh() };
                 let at = linear(regs.es(), regs.bp());
-                self.load_user_font(mem, at, regs.dx() as usize, regs.cx() as usize, height as usize, regs.bl());
+                self.load_user_font(
+                    mem,
+                    at,
+                    regs.dx() as usize,
+                    regs.cx() as usize,
+                    height as usize,
+                    regs.bl(),
+                );
                 if sub == 0x10 {
                     self.activate_font(mem, height);
                 }
@@ -533,8 +601,10 @@ impl Vga {
     // ------------------------------------------------------------------
 
     fn functionality_state(&self, mem: &mut Memory, at: u32) {
-        let put8 = |mem: &mut Memory, offset: u32, value: u8| mem.write8(at.wrapping_add(offset), value);
-        let put16 = |mem: &mut Memory, offset: u32, value: u16| mem.write16(at.wrapping_add(offset), value);
+        let put8 =
+            |mem: &mut Memory, offset: u32, value: u8| mem.write8(at.wrapping_add(offset), value);
+        let put16 =
+            |mem: &mut Memory, offset: u32, value: u16| mem.write16(at.wrapping_add(offset), value);
         for offset in 0..64 {
             put8(mem, offset, 0);
         }
@@ -557,7 +627,15 @@ impl Vga {
         put8(mem, 0x21, self.cga_palette);
         put8(mem, 0x22, self.rows.min(255) as u8);
         put16(mem, 0x23, self.char_height as u16);
-        put8(mem, 0x25, if self.crtc_port() == 0x3B4 { 0x07 } else { 0x08 });
+        put8(
+            mem,
+            0x25,
+            if self.crtc_port() == 0x3B4 {
+                0x07
+            } else {
+                0x08
+            },
+        );
         put8(mem, 0x26, 0);
         let colors: u16 = match self.kind {
             GraphicsKind::Vga13 | GraphicsKind::Vesa => 256,
@@ -653,6 +731,93 @@ impl Vga {
                     _ => VBE_FAILED,
                 }
             }
+            0x06 if self.vesa_mode != 0 => {
+                let lines = self.height.max(1);
+                let widest = SVGA_SIZE / lines;
+                match regs.bl() {
+                    0 | 2 => {
+                        self.vesa_pitch = (regs.cx() as usize).clamp(640, widest);
+                        self.dirty = true;
+                    }
+                    1 => {}
+                    3 => {
+                        regs.set_bx(widest as u16);
+                        regs.set_cx(widest as u16);
+                        regs.set_dx((SVGA_SIZE / widest) as u16);
+                        regs.set_ax(VBE_OK);
+                        return;
+                    }
+                    _ => {
+                        regs.set_ax(VBE_FAILED);
+                        return;
+                    }
+                }
+                regs.set_bx(self.vesa_pitch as u16);
+                regs.set_cx(self.vesa_pitch as u16);
+                regs.set_dx((SVGA_SIZE / self.vesa_pitch) as u16);
+                VBE_OK
+            }
+            0x07 if self.vesa_mode != 0 => match regs.bl() {
+                0 | 0x80 => {
+                    self.vesa_start = (regs.dx() as usize * self.vesa_pitch + regs.cx() as usize)
+                        .min(SVGA_SIZE - 1);
+                    self.dirty = true;
+                    VBE_OK
+                }
+                1 => {
+                    regs.set_bh(0);
+                    regs.set_cx((self.vesa_start % self.vesa_pitch) as u16);
+                    regs.set_dx((self.vesa_start / self.vesa_pitch) as u16);
+                    VBE_OK
+                }
+                _ => VBE_FAILED,
+            },
+            // The DAC is always 6 bits wide, which a program can ask for and see.
+            0x08 => match regs.bl() {
+                0 | 1 => {
+                    regs.set_bh(6);
+                    VBE_OK
+                }
+                _ => VBE_FAILED,
+            },
+            0x0A if regs.bl() == 0 => {
+                regs.set_es(ROM_SEGMENT);
+                regs.set_di((ROM_VESA_PM & 0xFFFF) as u16);
+                regs.set_cx(VESA_PM_TABLE.len() as u16);
+                VBE_OK
+            }
+            0x09 => {
+                let table = ((regs.es() as u32) << 4).wrapping_add(regs.di() as u32);
+                let first = regs.dx() as usize;
+                let count = regs.cx() as usize;
+                match regs.bl() {
+                    0 | 0x80 if first + count <= 256 => {
+                        for index in 0..count {
+                            let at = table.wrapping_add(index as u32 * 4);
+                            self.set_dac(
+                                (first + index) as u8,
+                                mem.read8(at.wrapping_add(2)),
+                                mem.read8(at.wrapping_add(1)),
+                                mem.read8(at),
+                            );
+                        }
+                        self.work = self.work.saturating_add(count as u32 / 4);
+                        VBE_OK
+                    }
+                    1 if first + count <= 256 => {
+                        for index in 0..count {
+                            let at = table.wrapping_add(index as u32 * 4);
+                            let entry = self.dac[first + index];
+                            mem.write8(at, entry[2]);
+                            mem.write8(at.wrapping_add(1), entry[1]);
+                            mem.write8(at.wrapping_add(2), entry[0]);
+                            mem.write8(at.wrapping_add(3), 0);
+                        }
+                        VBE_OK
+                    }
+                    _ => VBE_FAILED,
+                }
+            }
             _ => VBE_FAILED,
         };
         regs.set_ax(result);
@@ -727,8 +892,8 @@ impl Vga {
 mod tests {
     use super::*;
     use crate::cpu::{AX, BP, BX, CX, DI, DX, ES};
-    use crate::vga::{palette16, GraphicsKind, SCREEN_HEIGHT, SCREEN_WIDTH};
     use crate::memory::VIDEO_BASE;
+    use crate::vga::{palette16, GraphicsKind, SCREEN_HEIGHT, SCREEN_WIDTH};
 
     const BUFFER_SEGMENT: u16 = 0x2000;
     const BUFFER: u32 = 0x2_0000;
@@ -809,38 +974,94 @@ mod tests {
     fn set_mode_reports_and_costs() {
         let (mut vga, mut mem, _) = setup(3);
         vga.mode_changed = false;
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x0013, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0013,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.mode, 0x13);
         assert_eq!(out.ax & 0xFF, 0x20);
         assert!(out.cost >= 20_000);
         assert!(vga.mode_changed);
 
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x0F00, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0F00,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.ax, 0x2813);
         assert_eq!(out.bx >> 8, 0);
 
-        int10(&mut vga, &mut mem, Call { ax: 0x0006, ..Call::default() });
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x0F00, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0006,
+                ..Call::default()
+            },
+        );
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0F00,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.ax, 0x5006);
     }
 
     #[test]
     fn set_mode_edge_cases() {
         let (mut vga, mut mem, _) = setup(3);
-        int10(&mut vga, &mut mem, Call { ax: 0x0013, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0013,
+                ..Call::default()
+            },
+        );
         vga.vram_write(A, 7);
         vga.mode_changed = false;
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x0055, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0055,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.mode, 0x13);
         assert_eq!(out.ax, 0x0055);
         assert!(!vga.mode_changed);
         assert!(out.cost < 1000);
 
-        int10(&mut vga, &mut mem, Call { ax: 0x0093, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0093,
+                ..Call::default()
+            },
+        );
         assert!(vga.mode_changed);
         assert_eq!(vga.mode, 0x13);
         assert_eq!(vga.vram_read(A), 7);
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x0F00, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0F00,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.ax & 0xFF, 0x93);
     }
 
@@ -851,11 +1072,41 @@ mod tests {
     #[test]
     fn cursor_shape_and_position_read_back() {
         let (mut vga, mut mem, _) = setup(3);
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x0300, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0300,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.cx, 0x0607);
-        int10(&mut vga, &mut mem, Call { ax: 0x0100, cx: 0x0A0C, ..Call::default() });
-        int10(&mut vga, &mut mem, Call { ax: 0x0200, dx: 0x0512, ..Call::default() });
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x0300, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0100,
+                cx: 0x0A0C,
+                ..Call::default()
+            },
+        );
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0200,
+                dx: 0x0512,
+                ..Call::default()
+            },
+        );
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0300,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.cx, 0x0A0C);
         assert_eq!(out.dx, 0x0512);
         assert_eq!(vga.cursor, (5, 0x12));
@@ -868,15 +1119,38 @@ mod tests {
         let (mut vga, mut mem, mut screen) = setup(3);
         vga.render(&mem, &mut screen, true);
         assert_eq!(at(&screen, 0, 14), rgb(7));
-        int10(&mut vga, &mut mem, Call { ax: 0x0100, cx: 0x2000, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0100,
+                cx: 0x2000,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.crtc[0x0A] & 0x20, 0x20);
         vga.render(&mem, &mut screen, true);
         for y in 0..16 {
             assert_eq!(at(&screen, 0, y), 0);
         }
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x0300, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0300,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.cx, 0x2000);
-        int10(&mut vga, &mut mem, Call { ax: 0x0100, cx: 0x0607, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0100,
+                cx: 0x0607,
+                ..Call::default()
+            },
+        );
         vga.render(&mem, &mut screen, true);
         assert_eq!(at(&screen, 0, 14), rgb(7));
     }
@@ -884,28 +1158,80 @@ mod tests {
     #[test]
     fn cursor_is_per_page_and_survives_off_screen_row() {
         let (mut vga, mut mem, _) = setup(3);
-        int10(&mut vga, &mut mem, Call { ax: 0x0200, bx: 0x0100, dx: 0x0102, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0200,
+                bx: 0x0100,
+                dx: 0x0102,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.cursor, (0, 0));
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x0300, bx: 0x0100, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0300,
+                bx: 0x0100,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.dx, 0x0102);
         assert_eq!(mem.read16(BDA_BASE + 0x52), 0x0102);
 
-        int10(&mut vga, &mut mem, Call { ax: 0x0200, dx: 0x1900, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0200,
+                dx: 0x1900,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.cursor, (25, 0));
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x0300, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0300,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.dx, 0x1900);
     }
 
     #[test]
     fn graphics_cursor_moves_with_ah02() {
         let (mut vga, mut mem, _) = setup(0x13);
-        int10(&mut vga, &mut mem, Call { ax: 0x0200, dx: 0x0203, ..Call::default() });
-        int10(&mut vga, &mut mem, Call { ax: 0x0E00 | b'H' as u16, bx: 0x000C, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0200,
+                dx: 0x0203,
+                ..Call::default()
+            },
+        );
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0E00 | b'H' as u16,
+                bx: 0x000C,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.cursor, (2, 4));
         let glyph = crate::font::rom8(b'H');
         for line in 0..8 {
             for bit in 0..8 {
-                let expected = if glyph[line] & (0x80 >> bit) != 0 { 12 } else { 0 };
+                let expected = if glyph[line] & (0x80 >> bit) != 0 {
+                    12
+                } else {
+                    0
+                };
                 assert_eq!(vga.read_pixel(&mem, 24 + bit, 16 + line), expected);
             }
         }
@@ -918,13 +1244,39 @@ mod tests {
     #[test]
     fn text_page_select_moves_start_address() {
         let (mut vga, mut mem, mut screen) = setup(3);
-        int10(&mut vga, &mut mem, Call { ax: 0x0200, bx: 0x0200, dx: 0x0304, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0200,
+                bx: 0x0200,
+                dx: 0x0304,
+                ..Call::default()
+            },
+        );
         // Write a character on page 2 without selecting it.
-        int10(&mut vga, &mut mem, Call { ax: 0x0900 | 0xDB, bx: 0x020F, cx: 1, dx: 0, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0900 | 0xDB,
+                bx: 0x020F,
+                cx: 1,
+                dx: 0,
+                ..Call::default()
+            },
+        );
         assert_eq!(mem.read8(VIDEO_BASE + 0x2000 + (3 * 80 + 4) * 2), 0xDB);
         assert_eq!(mem.read8(VIDEO_BASE + (3 * 80 + 4) * 2), b' ');
 
-        int10(&mut vga, &mut mem, Call { ax: 0x0502, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0502,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.page, 2);
         assert_eq!(vga.cursor, (3, 4));
         assert_eq!(vga.start_counter(), 0x1000);
@@ -932,11 +1284,25 @@ mod tests {
         assert_eq!(mem.read8(BDA_BASE + 0x62), 2);
         vga.render(&mem, &mut screen, false);
         assert_eq!(at(&screen, 32, 48), rgb(15));
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x0F00, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0F00,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.bx >> 8, 2);
 
         // Out-of-range pages are ignored.
-        int10(&mut vga, &mut mem, Call { ax: 0x0508, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0508,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.page, 2);
     }
 
@@ -944,14 +1310,50 @@ mod tests {
     fn planar_pages_flip_through_bios() {
         let (mut vga, mut mem, mut screen) = setup(0x0D);
         // AH=0Ch to page 1.
-        int10(&mut vga, &mut mem, Call { ax: 0x0C05, bx: 0x0100, cx: 1, dx: 2, ..Call::default() });
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x0D00, bx: 0x0100, cx: 1, dx: 2, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0C05,
+                bx: 0x0100,
+                cx: 1,
+                dx: 2,
+                ..Call::default()
+            },
+        );
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0D00,
+                bx: 0x0100,
+                cx: 1,
+                dx: 2,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.ax & 0xFF, 5);
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x0D00, cx: 1, dx: 2, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0D00,
+                cx: 1,
+                dx: 2,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.ax & 0xFF, 0);
         vga.render(&mem, &mut screen, false);
         assert_eq!(at(&screen, 2, 4), 0);
-        int10(&mut vga, &mut mem, Call { ax: 0x0501, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0501,
+                ..Call::default()
+            },
+        );
         vga.render(&mem, &mut screen, false);
         assert_eq!(at(&screen, 2, 4), rgb(5));
         assert_eq!(vga.start_counter(), 0x2000);
@@ -964,22 +1366,64 @@ mod tests {
     #[test]
     fn text_read_and_write_characters() {
         let (mut vga, mut mem, _) = setup(3);
-        int10(&mut vga, &mut mem, Call { ax: 0x0200, dx: 0x0178, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0200,
+                dx: 0x0178,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.cursor, (1, 0x78));
         vga.set_cursor(&mut mem, 1, 78);
-        int10(&mut vga, &mut mem, Call { ax: 0x0900 | b'x' as u16, bx: 0x001E, cx: 3, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0900 | b'x' as u16,
+                bx: 0x001E,
+                cx: 3,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.read_cell(&mem, 1, 78), (b'x', 0x1E));
         assert_eq!(vga.read_cell(&mem, 2, 0), (b'x', 0x1E));
         assert_eq!(vga.cursor, (1, 78));
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x0800, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0800,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.ax, 0x1E00 | b'x' as u16);
 
         // AH=0Ah keeps the attribute.
-        int10(&mut vga, &mut mem, Call { ax: 0x0A00 | b'y' as u16, bx: 0x0007, cx: 1, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0A00 | b'y' as u16,
+                bx: 0x0007,
+                cx: 1,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.read_cell(&mem, 1, 78), (b'y', 0x1E));
 
         // A huge count is limited to the page.
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x0900 | b'z' as u16, bx: 0x0007, cx: 0xFFFF, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0900 | b'z' as u16,
+                bx: 0x0007,
+                cx: 0xFFFF,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.read_cell(&mem, 24, 79).0, b'z');
         assert_eq!(mem.read8(VIDEO_BASE + 25 * 160), b' ');
         assert!(out.cost < 2000);
@@ -987,8 +1431,25 @@ mod tests {
 
     fn check_graphics_char_modes(mode: u8, cell: usize) {
         let (mut vga, mut mem, _) = setup(mode);
-        int10(&mut vga, &mut mem, Call { ax: 0x0200, dx: 0x0101, ..Call::default() });
-        int10(&mut vga, &mut mem, Call { ax: 0x0900 | b'#' as u16, bx: 0x0003, cx: 2, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0200,
+                dx: 0x0101,
+                ..Call::default()
+            },
+        );
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0900 | b'#' as u16,
+                bx: 0x0003,
+                cx: 2,
+                ..Call::default()
+            },
+        );
         let (x, y) = (8, cell);
         let mut lit = 0;
         for line in 0..cell {
@@ -1003,14 +1464,29 @@ mod tests {
         if mode >= 0x0D {
             assert_eq!(mem.read16(VIDEO_BASE), 0x0720);
         }
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x0800, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0800,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.ax & 0xFF, b'#' as u16, "mode {mode:x}");
         assert_eq!(vga.cursor, (1, 1));
     }
 
     #[test]
     fn graphics_characters_in_every_mode() {
-        for (mode, cell) in [(4, 8), (6, 8), (0x0D, 8), (0x0E, 8), (0x10, 14), (0x12, 16), (0x13, 8)] {
+        for (mode, cell) in [
+            (4, 8),
+            (6, 8),
+            (0x0D, 8),
+            (0x0E, 8),
+            (0x10, 14),
+            (0x12, 16),
+            (0x13, 8),
+        ] {
             check_graphics_char_modes(mode, cell);
         }
     }
@@ -1020,39 +1496,117 @@ mod tests {
         let (mut vga, mut mem, _) = setup(0x12);
         let glyph = crate::font::rom16(0xDB);
         assert_eq!(glyph[0], 0xFF);
-        int10(&mut vga, &mut mem, Call { ax: 0x0900 | 0xDB, bx: 0x0005, cx: 1, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0900 | 0xDB,
+                bx: 0x0005,
+                cx: 1,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.read_pixel(&mem, 0, 0), 5);
         // Bit 7 XORs.
-        int10(&mut vga, &mut mem, Call { ax: 0x0900 | 0xDB, bx: 0x0083, cx: 1, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0900 | 0xDB,
+                bx: 0x0083,
+                cx: 1,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.read_pixel(&mem, 0, 0), 6);
         // AH=0Ah takes BL in graphics modes too.
-        int10(&mut vga, &mut mem, Call { ax: 0x0A00 | 0xDB, bx: 0x0002, cx: 1, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0A00 | 0xDB,
+                bx: 0x0002,
+                cx: 1,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.read_pixel(&mem, 0, 0), 2);
         // An opaque write clears what was there.
-        int10(&mut vga, &mut mem, Call { ax: 0x0900 | b' ' as u16, bx: 0x0007, cx: 1, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0900 | b' ' as u16,
+                bx: 0x0007,
+                cx: 1,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.read_pixel(&mem, 0, 0), 0);
         // XOR through AH=0Ch.
-        int10(&mut vga, &mut mem, Call { ax: 0x0C05, cx: 3, dx: 3, ..Call::default() });
-        int10(&mut vga, &mut mem, Call { ax: 0x0C83, cx: 3, dx: 3, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0C05,
+                cx: 3,
+                dx: 3,
+                ..Call::default()
+            },
+        );
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0C83,
+                cx: 3,
+                dx: 3,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.read_pixel(&mem, 3, 3), 6);
     }
 
     #[test]
     fn teletype_uses_bl_in_graphics_and_ignores_it_in_text() {
         let (mut vga, mut mem, _) = setup(0x0D);
-        int10(&mut vga, &mut mem, Call { ax: 0x0E00 | 0xDB, bx: 0x000A, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0E00 | 0xDB,
+                bx: 0x000A,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.read_pixel(&mem, 0, 0), 0x0A);
         assert_eq!(vga.cursor, (0, 1));
         // Wraps and scrolls with the same cursor model.
         vga.set_cursor(&mut mem, 24, 39);
-        int10(&mut vga, &mut mem, Call { ax: 0x0E00 | 0xDB, bx: 0x0004, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0E00 | 0xDB,
+                bx: 0x0004,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.cursor, (24, 0));
         assert_eq!(vga.read_pixel(&mem, 319, 191), 4);
         assert_eq!(vga.read_pixel(&mem, 319, 199), 0);
 
         let (mut vga, mut mem, _) = setup(3);
         vga.write_cell(&mut mem, 0, 0, b' ', 0x1E);
-        int10(&mut vga, &mut mem, Call { ax: 0x0E00 | b'A' as u16, bx: 0x004F, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0E00 | b'A' as u16,
+                bx: 0x004F,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.read_cell(&mem, 0, 0), (b'A', 0x1E));
     }
 
@@ -1061,32 +1615,106 @@ mod tests {
         let (mut vga, mut mem, _) = setup(3);
         mem.copy_from(BUFFER, b"Hi\r\nyo");
         // AL=0: attribute in BL, cursor not moved.
-        int10(&mut vga, &mut mem, Call { ax: 0x1300, bx: 0x001F, cx: 6, dx: 0x0203, es: BUFFER_SEGMENT, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1300,
+                bx: 0x001F,
+                cx: 6,
+                dx: 0x0203,
+                es: BUFFER_SEGMENT,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.cursor, (0, 0));
         assert_eq!(vga.read_cell(&mem, 2, 3), (b'H', 0x1F));
         assert_eq!(vga.read_cell(&mem, 3, 0), (b'y', 0x1F));
         // AL=1: cursor follows.
-        int10(&mut vga, &mut mem, Call { ax: 0x1301, bx: 0x0007, cx: 2, dx: 0x0500, es: BUFFER_SEGMENT, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1301,
+                bx: 0x0007,
+                cx: 2,
+                dx: 0x0500,
+                es: BUFFER_SEGMENT,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.cursor, (5, 2));
         // AL=2 and 3: character and attribute pairs; BP used.
         mem.copy_from(BUFFER + 0x10, &[b'a', 0x2A, b'b', 0x3B]);
-        int10(&mut vga, &mut mem, Call { ax: 0x1302, cx: 2, dx: 0x0600, bp: 0x10, es: BUFFER_SEGMENT, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1302,
+                cx: 2,
+                dx: 0x0600,
+                bp: 0x10,
+                es: BUFFER_SEGMENT,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.read_cell(&mem, 6, 1), (b'b', 0x3B));
         assert_eq!(vga.cursor, (5, 2));
-        int10(&mut vga, &mut mem, Call { ax: 0x1303, cx: 2, dx: 0x0700, bp: 0x10, es: BUFFER_SEGMENT, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1303,
+                cx: 2,
+                dx: 0x0700,
+                bp: 0x10,
+                es: BUFFER_SEGMENT,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.read_cell(&mem, 7, 0), (b'a', 0x2A));
         assert_eq!(vga.cursor, (7, 2));
         // Other pages.
-        int10(&mut vga, &mut mem, Call { ax: 0x1301, bx: 0x0107, cx: 1, dx: 0x0100, es: BUFFER_SEGMENT, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1301,
+                bx: 0x0107,
+                cx: 1,
+                dx: 0x0100,
+                es: BUFFER_SEGMENT,
+                ..Call::default()
+            },
+        );
         assert_eq!(mem.read8(VIDEO_BASE + 0x1000 + 160), b'H');
         assert_eq!(vga.cursor, (7, 2));
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x0300, bx: 0x0100, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0300,
+                bx: 0x0100,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.dx, 0x0101);
 
         // Graphics.
         let (mut vga, mut mem, _) = setup(0x13);
         mem.write8(BUFFER, 0xDB);
-        int10(&mut vga, &mut mem, Call { ax: 0x1301, bx: 0x0009, cx: 1, dx: 0x0102, es: BUFFER_SEGMENT, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1301,
+                bx: 0x0009,
+                cx: 1,
+                dx: 0x0102,
+                es: BUFFER_SEGMENT,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.read_pixel(&mem, 16, 8), 9);
         assert_eq!(vga.cursor, (1, 3));
     }
@@ -1101,32 +1729,106 @@ mod tests {
         for row in 0..5 {
             vga.write_cell(&mut mem, row, 2, b'a' + row as u8, 0x07);
         }
-        int10(&mut vga, &mut mem, Call { ax: 0x0601, bx: 0x1700, cx: 0x0002, dx: 0x0402, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0601,
+                bx: 0x1700,
+                cx: 0x0002,
+                dx: 0x0402,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.read_cell(&mem, 0, 2).0, b'b');
         assert_eq!(vga.read_cell(&mem, 3, 2).0, b'e');
         assert_eq!(vga.read_cell(&mem, 4, 2), (b' ', 0x17));
-        int10(&mut vga, &mut mem, Call { ax: 0x0702, bx: 0x2700, cx: 0x0002, dx: 0x0402, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0702,
+                bx: 0x2700,
+                cx: 0x0002,
+                dx: 0x0402,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.read_cell(&mem, 2, 2).0, b'b');
         assert_eq!(vga.read_cell(&mem, 0, 2), (b' ', 0x27));
         // AL=0 clears, and out-of-range corners clamp.
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x0600, bx: 0x3000, cx: 0x0000, dx: 0xFFFF, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0600,
+                bx: 0x3000,
+                cx: 0x0000,
+                dx: 0xFFFF,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.read_cell(&mem, 24, 79), (b' ', 0x30));
         assert!(out.cost > 100);
     }
 
     #[test]
     fn graphics_scrolling_in_every_kind() {
-        for (mode, cell) in [(4usize, 8usize), (6, 8), (0x0D, 8), (0x10, 14), (0x12, 16), (0x13, 8)] {
+        for (mode, cell) in [
+            (4usize, 8usize),
+            (6, 8),
+            (0x0D, 8),
+            (0x10, 14),
+            (0x12, 16),
+            (0x13, 8),
+        ] {
             let (mut vga, mut mem, _) = setup(mode as u8);
-            int10(&mut vga, &mut mem, Call { ax: 0x0200, dx: 0x0201, ..Call::default() });
-            int10(&mut vga, &mut mem, Call { ax: 0x0900 | 0xDB, bx: 1, cx: 1, ..Call::default() });
+            int10(
+                &mut vga,
+                &mut mem,
+                Call {
+                    ax: 0x0200,
+                    dx: 0x0201,
+                    ..Call::default()
+                },
+            );
+            int10(
+                &mut vga,
+                &mut mem,
+                Call {
+                    ax: 0x0900 | 0xDB,
+                    bx: 1,
+                    cx: 1,
+                    ..Call::default()
+                },
+            );
             assert_eq!(vga.read_pixel(&mem, 8, 2 * cell), 1, "mode {mode:x}");
 
-            int10(&mut vga, &mut mem, Call { ax: 0x0601, bx: 0x0000, cx: 0x0000, dx: 0x1827, ..Call::default() });
+            int10(
+                &mut vga,
+                &mut mem,
+                Call {
+                    ax: 0x0601,
+                    bx: 0x0000,
+                    cx: 0x0000,
+                    dx: 0x1827,
+                    ..Call::default()
+                },
+            );
             assert_eq!(vga.read_pixel(&mem, 8, cell), 1, "mode {mode:x}");
             assert_eq!(vga.read_pixel(&mem, 8, 2 * cell), 0, "mode {mode:x}");
 
-            int10(&mut vga, &mut mem, Call { ax: 0x0702, bx: 0x0100, cx: 0x0000, dx: 0x1827, ..Call::default() });
+            int10(
+                &mut vga,
+                &mut mem,
+                Call {
+                    ax: 0x0702,
+                    bx: 0x0100,
+                    cx: 0x0000,
+                    dx: 0x1827,
+                    ..Call::default()
+                },
+            );
             assert_eq!(vga.read_pixel(&mem, 8, 3 * cell), 1, "mode {mode:x}");
             // The new rows take the fill colour, within the window.
             assert_eq!(vga.read_pixel(&mem, 8, 0), 1, "mode {mode:x}");
@@ -1154,13 +1856,53 @@ mod tests {
             let (mut vga, mut mem, _) = setup(mode as u8);
             let cx = x;
             let dx = y;
-            let write = if mode == 0x13 { color as u16 } else { (color & 0x7F) as u16 };
-            int10(&mut vga, &mut mem, Call { ax: 0x0C00 | write, cx, dx, ..Call::default() });
-            let out = int10(&mut vga, &mut mem, Call { ax: 0x0D00, cx, dx, ..Call::default() });
+            let write = if mode == 0x13 {
+                color as u16
+            } else {
+                (color & 0x7F) as u16
+            };
+            int10(
+                &mut vga,
+                &mut mem,
+                Call {
+                    ax: 0x0C00 | write,
+                    cx,
+                    dx,
+                    ..Call::default()
+                },
+            );
+            let out = int10(
+                &mut vga,
+                &mut mem,
+                Call {
+                    ax: 0x0D00,
+                    cx,
+                    dx,
+                    ..Call::default()
+                },
+            );
             assert_eq!(out.ax & 0xFF, color as u16, "mode {mode:x}");
             // Outside the mode: ignored and reads 0.
-            int10(&mut vga, &mut mem, Call { ax: 0x0C01, cx: 0xFFFF, dx: 0xFFFF, ..Call::default() });
-            let out = int10(&mut vga, &mut mem, Call { ax: 0x0D00, cx: 0xFFFF, dx: 0xFFFF, ..Call::default() });
+            int10(
+                &mut vga,
+                &mut mem,
+                Call {
+                    ax: 0x0C01,
+                    cx: 0xFFFF,
+                    dx: 0xFFFF,
+                    ..Call::default()
+                },
+            );
+            let out = int10(
+                &mut vga,
+                &mut mem,
+                Call {
+                    ax: 0x0D00,
+                    cx: 0xFFFF,
+                    dx: 0xFFFF,
+                    ..Call::default()
+                },
+            );
             assert_eq!(out.ax & 0xFF, 0);
         }
     }
@@ -1179,11 +1921,27 @@ mod tests {
     fn cga_palette_service() {
         let (mut vga, mut mem, mut screen) = setup(4);
         mem.write8(VIDEO_BASE, 0b01_00_00_00);
-        int10(&mut vga, &mut mem, Call { ax: 0x0B00, bx: 0x0100, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0B00,
+                bx: 0x0100,
+                ..Call::default()
+            },
+        );
         vga.render(&mem, &mut screen, false);
         // Palette 0, keeping intensity: light green.
         assert_eq!(at(&screen, 0, 0), rgb(10));
-        int10(&mut vga, &mut mem, Call { ax: 0x0B00, bx: 0x0001, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0B00,
+                bx: 0x0001,
+                ..Call::default()
+            },
+        );
         vga.render(&mem, &mut screen, false);
         // Background 1, intensity off.
         assert_eq!(at(&screen, 2, 0), rgb(1));
@@ -1200,9 +1958,25 @@ mod tests {
         let (mut vga, mut mem, mut screen) = setup(0x12);
         let dac = vga.dac;
         // AX=1000h.
-        int10(&mut vga, &mut mem, Call { ax: 0x1000, bx: 0x3F01, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1000,
+                bx: 0x3F01,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.ac[1], 0x3F);
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x1007, bx: 0x0001, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1007,
+                bx: 0x0001,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.bx >> 8, 0x3F);
         // AX=1002h with 17 bytes from ES:DX.
         let mut table = [0u8; 17];
@@ -1210,17 +1984,50 @@ mod tests {
             *slot = (16 - index) as u8;
         }
         mem.copy_from(BUFFER, &table);
-        int10(&mut vga, &mut mem, Call { ax: 0x1002, dx: 0, es: BUFFER_SEGMENT, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1002,
+                dx: 0,
+                es: BUFFER_SEGMENT,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.ac[0], 16);
         assert_eq!(vga.ac[15], 1);
         assert_eq!(vga.ac[0x11], 0);
         assert!(vga.dac == dac);
         // AX=1001h and 1008h.
-        int10(&mut vga, &mut mem, Call { ax: 0x1001, bx: 0x2200, ..Call::default() });
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x1008, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1001,
+                bx: 0x2200,
+                ..Call::default()
+            },
+        );
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1008,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.bx >> 8, 0x22);
         // AX=1009h reads all back.
-        int10(&mut vga, &mut mem, Call { ax: 0x1009, dx: 0x100, es: BUFFER_SEGMENT, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1009,
+                dx: 0x100,
+                es: BUFFER_SEGMENT,
+                ..Call::default()
+            },
+        );
         assert_eq!(mem.read8(BUFFER + 0x100), 16);
         assert_eq!(mem.read8(BUFFER + 0x100 + 16), 0x22);
         // It reaches the screen.
@@ -1233,12 +2040,28 @@ mod tests {
     fn blink_service() {
         let (mut vga, mut mem, mut screen) = setup(3);
         vga.write_cell(&mut mem, 0, 0, b' ', 0xC0);
-        int10(&mut vga, &mut mem, Call { ax: 0x1003, bx: 0x0000, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1003,
+                bx: 0x0000,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.ac[0x10] & 0x08, 0);
         vga.render(&mem, &mut screen, false);
         assert_eq!(at(&screen, 0, 2), rgb(12));
         assert_eq!(mem.read8(BDA_BASE + 0x65) & 0x20, 0);
-        int10(&mut vga, &mut mem, Call { ax: 0x1003, bx: 0x0001, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1003,
+                bx: 0x0001,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.ac[0x10] & 0x08, 0x08);
         vga.render(&mem, &mut screen, false);
         assert_eq!(at(&screen, 0, 2), rgb(4));
@@ -1248,40 +2071,158 @@ mod tests {
     fn dac_services_use_bx_es_dx_and_cx() {
         let (mut vga, mut mem, _) = setup(0x13);
         // AX=1010h: single set.
-        int10(&mut vga, &mut mem, Call { ax: 0x1010, bx: 0x0050, cx: 0x0203, dx: 0x0100, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1010,
+                bx: 0x0050,
+                cx: 0x0203,
+                dx: 0x0100,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.dac[0x50], [1, 2, 3]);
         // AX=1015h: single read.
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x1015, bx: 0x0050, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1015,
+                bx: 0x0050,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.dx >> 8, 1);
         assert_eq!(out.cx, 0x0203);
         // AX=1012h: block set, BX first, CX count, ES:DX source (not ES:BP).
         mem.copy_from(BUFFER + 0x40, &[10, 11, 12, 20, 21, 22]);
-        int10(&mut vga, &mut mem, Call { ax: 0x1012, bx: 0x00F0, cx: 2, dx: 0x40, bp: 0x7777, es: BUFFER_SEGMENT, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1012,
+                bx: 0x00F0,
+                cx: 2,
+                dx: 0x40,
+                bp: 0x7777,
+                es: BUFFER_SEGMENT,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.dac[0xF0], [10, 11, 12]);
         assert_eq!(vga.dac[0xF1], [20, 21, 22]);
         // AX=1017h: block read.
-        int10(&mut vga, &mut mem, Call { ax: 0x1017, bx: 0x00F0, cx: 2, dx: 0x80, es: BUFFER_SEGMENT, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1017,
+                bx: 0x00F0,
+                cx: 2,
+                dx: 0x80,
+                es: BUFFER_SEGMENT,
+                ..Call::default()
+            },
+        );
         assert_eq!(mem.read8(BUFFER + 0x80), 10);
         assert_eq!(mem.read8(BUFFER + 0x85), 22);
         // Values are 6 bits, and the block stops at the end of the DAC.
         mem.copy_from(BUFFER, &[0xFF, 0xFF, 0xFF]);
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x1012, bx: 0x00FF, cx: 0xFFFF, es: BUFFER_SEGMENT, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1012,
+                bx: 0x00FF,
+                cx: 0xFFFF,
+                es: BUFFER_SEGMENT,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.dac[0xFF], [0x3F, 0x3F, 0x3F]);
         assert!(out.cost < 200);
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x1012, bx: 0xFFFF, cx: 0xFFFF, es: BUFFER_SEGMENT, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1012,
+                bx: 0xFFFF,
+                cx: 0xFFFF,
+                es: BUFFER_SEGMENT,
+                ..Call::default()
+            },
+        );
         assert!(out.cost < 200);
         // AX=1018h, 1019h: PEL mask.
-        int10(&mut vga, &mut mem, Call { ax: 0x1018, bx: 0x000F, ..Call::default() });
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x1019, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1018,
+                bx: 0x000F,
+                ..Call::default()
+            },
+        );
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1019,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.bx & 0xFF, 0x0F);
         // AX=1013h, 101Ah: colour paging.
-        int10(&mut vga, &mut mem, Call { ax: 0x1013, bx: 0x0100, ..Call::default() });
-        int10(&mut vga, &mut mem, Call { ax: 0x1013, bx: 0x0501, ..Call::default() });
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x101A, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1013,
+                bx: 0x0100,
+                ..Call::default()
+            },
+        );
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1013,
+                bx: 0x0501,
+                ..Call::default()
+            },
+        );
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x101A,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.bx, 0x0501);
         // AX=101Bh: grey summing.
-        int10(&mut vga, &mut mem, Call { ax: 0x1010, bx: 3, cx: 0x3F00, dx: 0, ..Call::default() });
-        int10(&mut vga, &mut mem, Call { ax: 0x101B, bx: 3, cx: 1, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1010,
+                bx: 3,
+                cx: 0x3F00,
+                dx: 0,
+                ..Call::default()
+            },
+        );
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x101B,
+                bx: 3,
+                cx: 1,
+                ..Call::default()
+            },
+        );
         let grey = ((0x3F * 59 + 50) / 100) as u8;
         assert_eq!(vga.dac[3], [grey, grey, grey]);
     }
@@ -1299,7 +2240,17 @@ mod tests {
             (4, ROM_FONT8 + 0x400),
             (6, ROM_FONT16),
         ] {
-            let out = int10(&mut vga, &mut mem, Call { ax: 0x1130, bx: bh << 8, cx: 0x1111, dx: 0x2200, ..Call::default() });
+            let out = int10(
+                &mut vga,
+                &mut mem,
+                Call {
+                    ax: 0x1130,
+                    bx: bh << 8,
+                    cx: 0x1111,
+                    dx: 0x2200,
+                    ..Call::default()
+                },
+            );
             assert_eq!(out.es, ROM_SEGMENT);
             assert_eq!(out.bp, (offset & 0xFFFF) as u16);
             assert_eq!(out.cx, 16);
@@ -1309,30 +2260,75 @@ mod tests {
         }
         // The fonts are in ROM, in the BIOS layout.
         for line in 0..8 {
-            assert_eq!(mem.read8(ROM_FONT8 + b'A' as u32 * 8 + line), crate::font::rom8(b'A')[line as usize]);
+            assert_eq!(
+                mem.read8(ROM_FONT8 + b'A' as u32 * 8 + line),
+                crate::font::rom8(b'A')[line as usize]
+            );
         }
         assert_eq!(mem.read8(ROM_FONT16 + 0xDB * 16), 0xFF);
         assert_eq!(mem.read8(ROM_FONT14 + 0xDB * 14), 0xFF);
 
         // BH=1 is the graphics font of the mode, also in the vector.
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x1130, bx: 0x0100, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1130,
+                bx: 0x0100,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.bp, (ROM_FONT16 & 0xFFFF) as u16);
         assert_eq!(mem.read16(0x43 * 4), (ROM_FONT16 & 0xFFFF) as u16);
         assert_eq!(mem.read16(0x43 * 4 + 2), ROM_SEGMENT);
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x1130, bx: 0x0000, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1130,
+                bx: 0x0000,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.bp, ((ROM_FONT8 + 0x400) & 0xFFFF) as u16);
 
         // Other subfunctions leave CX and DL alone.
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x1103, bx: 0, cx: 0x1234, dx: 0x5678, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1103,
+                bx: 0,
+                cx: 0x1234,
+                dx: 0x5678,
+                ..Call::default()
+            },
+        );
         assert_eq!((out.cx, out.dx), (0x1234, 0x5678));
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x11FF, cx: 0x1234, dx: 0x5678, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x11FF,
+                cx: 0x1234,
+                dx: 0x5678,
+                ..Call::default()
+            },
+        );
         assert_eq!((out.cx, out.dx), (0x1234, 0x5678));
     }
 
     #[test]
     fn rom_font_activation_changes_text_rows() {
         let (mut vga, mut mem, mut screen) = setup(3);
-        int10(&mut vga, &mut mem, Call { ax: 0x1112, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1112,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.rows, 50);
         assert_eq!(mem.read8(BDA_BASE + 0x84), 49);
         assert_eq!(mem.read16(BDA_BASE + 0x85), 8);
@@ -1342,12 +2338,34 @@ mod tests {
         vga.render(&mem, &mut screen, false);
         assert_eq!(at(&screen, 639, 399), rgb(15));
         assert_eq!(at(&screen, 639, 391), 0);
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x1130, bx: 0x0300, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1130,
+                bx: 0x0300,
+                ..Call::default()
+            },
+        );
         assert_eq!((out.cx, out.dx & 0xFF), (8, 49));
 
-        int10(&mut vga, &mut mem, Call { ax: 0x1111, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1111,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.rows, 28);
-        int10(&mut vga, &mut mem, Call { ax: 0x1114, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1114,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.rows, 25);
     }
 
@@ -1355,13 +2373,35 @@ mod tests {
     fn user_text_font_reaches_the_screen() {
         let (mut vga, mut mem, mut screen) = setup(3);
         mem.copy_from(BUFFER, &[0xAA; 16]);
-        int10(&mut vga, &mut mem, Call { ax: 0x1100, bx: 0x1000, cx: 1, dx: b'Q' as u16, es: BUFFER_SEGMENT, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1100,
+                bx: 0x1000,
+                cx: 1,
+                dx: b'Q' as u16,
+                es: BUFFER_SEGMENT,
+                ..Call::default()
+            },
+        );
         vga.write_cell(&mut mem, 0, 0, b'Q', 0x0F);
         vga.render(&mem, &mut screen, false);
         assert_eq!(at(&screen, 0, 0), rgb(15));
         assert_eq!(at(&screen, 1, 0), 0);
         // Counts and heights from the guest are bounded.
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x1110, bx: 0xFF07, cx: 0xFFFF, dx: 0xFFFF, es: BUFFER_SEGMENT, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1110,
+                bx: 0xFF07,
+                cx: 0xFFFF,
+                dx: 0xFFFF,
+                es: BUFFER_SEGMENT,
+                ..Call::default()
+            },
+        );
         assert!(out.cost < 1000);
         assert_eq!(vga.char_height, 32);
         vga.render(&mem, &mut screen, false);
@@ -1371,21 +2411,66 @@ mod tests {
     fn graphics_font_services() {
         let (mut vga, mut mem, _) = setup(0x13);
         mem.copy_from(BUFFER + b'K' as u32 * 4, &[0xFF, 0xFF, 0xFF, 0xFF]);
-        int10(&mut vga, &mut mem, Call { ax: 0x1121, bx: 0x0002, cx: 4, es: BUFFER_SEGMENT, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1121,
+                bx: 0x0002,
+                cx: 4,
+                es: BUFFER_SEGMENT,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.rows, 25);
-        int10(&mut vga, &mut mem, Call { ax: 0x0900 | b'K' as u16, bx: 0x0005, cx: 1, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0900 | b'K' as u16,
+                bx: 0x0005,
+                cx: 1,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.read_pixel(&mem, 0, 3), 5);
         assert_eq!(vga.read_pixel(&mem, 0, 4), 0);
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x1130, bx: 0x0100, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1130,
+                bx: 0x0100,
+                ..Call::default()
+            },
+        );
         assert_eq!((out.es, out.bp, out.cx), (BUFFER_SEGMENT, 0, 4));
 
-        int10(&mut vga, &mut mem, Call { ax: 0x1123, bx: 0x0000, dx: 10, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1123,
+                bx: 0x0000,
+                dx: 10,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.rows, 10);
         assert_eq!(mem.read8(BDA_BASE + 0x84), 9);
         assert_eq!(vga.gfx_cell_height(), 8);
         // Text modes ignore the graphics-only row counts.
         let (mut vga, mut mem, _) = setup(3);
-        int10(&mut vga, &mut mem, Call { ax: 0x1123, bx: 0x0000, dx: 10, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1123,
+                bx: 0x0000,
+                dx: 10,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.rows, 25);
     }
 
@@ -1396,45 +2481,145 @@ mod tests {
     #[test]
     fn ega_info_and_alternate_select() {
         let (mut vga, mut mem, _) = setup(3);
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x1200, bx: 0x0010, cx: 0xFFFF, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1200,
+                bx: 0x0010,
+                cx: 0xFFFF,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.bx, 0x0003);
         assert_eq!(out.cx, 0x0009);
         // An unknown BL leaves the registers.
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x1200, bx: 0x00FE, cx: 0xABCD, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1200,
+                bx: 0x00FE,
+                cx: 0xABCD,
+                ..Call::default()
+            },
+        );
         assert_eq!((out.ax, out.bx, out.cx), (0x1200, 0x00FE, 0xABCD));
         // 350 lines: the next text mode uses them, 43 rows with the 8x8 font.
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x1201, bx: 0x0030, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1201,
+                bx: 0x0030,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.ax & 0xFF, 0x12);
         assert_eq!(mem.read8(BDA_BASE + 0x89) & 0x90, 0x00);
-        int10(&mut vga, &mut mem, Call { ax: 0x0003, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0003,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.display_size(), (640, 350));
         assert_eq!(vga.rows, 25);
         assert_eq!(mem.read16(BDA_BASE + 0x85), 14);
-        int10(&mut vga, &mut mem, Call { ax: 0x1112, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1112,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.rows, 43);
         // Default palette loading can be turned off.
         vga.set_dac(1, 9, 9, 9);
-        int10(&mut vga, &mut mem, Call { ax: 0x1201, bx: 0x0031, ..Call::default() });
-        int10(&mut vga, &mut mem, Call { ax: 0x0003, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1201,
+                bx: 0x0031,
+                ..Call::default()
+            },
+        );
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0003,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.dac[1], [9, 9, 9]);
-        int10(&mut vga, &mut mem, Call { ax: 0x1200, bx: 0x0031, ..Call::default() });
-        int10(&mut vga, &mut mem, Call { ax: 0x0003, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1200,
+                bx: 0x0031,
+                ..Call::default()
+            },
+        );
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0003,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.dac[1], [0, 0, 0x2A]);
     }
 
     #[test]
     fn display_combination() {
         let (mut vga, mut mem, _) = setup(3);
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x1A00, bx: 0xFFFF, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1A00,
+                bx: 0xFFFF,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.ax & 0xFF, 0x1A);
         assert_eq!(out.bx, 0x0008);
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x1A01, bx: 0x1234, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1A01,
+                bx: 0x1234,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.ax & 0xFF, 0x1A);
         assert_eq!(out.bx, 0x1234);
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x1A02, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1A02,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.ax & 0xFF, 0x02);
         let (mut vga, mut mem, _) = setup(7);
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x1A00, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1A00,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.bx, 0x0007);
     }
 
@@ -1442,7 +2627,16 @@ mod tests {
     fn functionality_table() {
         let (mut vga, mut mem, _) = setup(0x12);
         vga.set_cursor(&mut mem, 3, 4);
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x1B00, es: BUFFER_SEGMENT, di: 0x20, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1B00,
+                es: BUFFER_SEGMENT,
+                di: 0x20,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.ax & 0xFF, 0x1B);
         let at_b = BUFFER + 0x20;
         let segment = mem.read16(at_b + 2);
@@ -1465,7 +2659,16 @@ mod tests {
         assert_eq!(mem.read8(at_b + 0x31), 3);
 
         // BX other than 0 is not this function.
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x1B00, bx: 1, es: BUFFER_SEGMENT, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x1B00,
+                bx: 1,
+                es: BUFFER_SEGMENT,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.ax, 0x1B00);
     }
 
@@ -1476,9 +2679,25 @@ mod tests {
     #[test]
     fn vbe_info_block() {
         let (mut vga, mut mem, _) = setup(3);
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x4F00, es: BUFFER_SEGMENT, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x4F00,
+                es: BUFFER_SEGMENT,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.ax, 0x004F);
-        assert_eq!(&[mem.read8(BUFFER), mem.read8(BUFFER + 1), mem.read8(BUFFER + 2), mem.read8(BUFFER + 3)], b"VESA");
+        assert_eq!(
+            &[
+                mem.read8(BUFFER),
+                mem.read8(BUFFER + 1),
+                mem.read8(BUFFER + 2),
+                mem.read8(BUFFER + 3)
+            ],
+            b"VESA"
+        );
         assert_eq!(mem.read16(BUFFER + 4), 0x0200);
         let oem = ((mem.read16(BUFFER + 8) as u32) << 4) + mem.read16(BUFFER + 6) as u32;
         let name: Vec<u8> = (0..8).map(|index| mem.read8(oem + index)).collect();
@@ -1494,7 +2713,16 @@ mod tests {
         // A "VBE2" request fills the longer block.
         mem.copy_from(BUFFER + 0x400, b"VBE2");
         mem.write8(BUFFER + 0x400 + 0x1FF, 0x55);
-        int10(&mut vga, &mut mem, Call { ax: 0x4F00, es: BUFFER_SEGMENT, di: 0x400, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x4F00,
+                es: BUFFER_SEGMENT,
+                di: 0x400,
+                ..Call::default()
+            },
+        );
         assert_eq!(mem.read8(BUFFER + 0x400), b'V');
         assert_eq!(mem.read8(BUFFER + 0x400 + 0x1FF), 0);
     }
@@ -1503,7 +2731,16 @@ mod tests {
     fn vbe_mode_info() {
         let (mut vga, mut mem, _) = setup(3);
         for (mode, height, pages) in [(0x100u16, 400u16, 3u8), (0x101, 480, 2)] {
-            let out = int10(&mut vga, &mut mem, Call { ax: 0x4F01, cx: mode, es: BUFFER_SEGMENT, ..Call::default() });
+            let out = int10(
+                &mut vga,
+                &mut mem,
+                Call {
+                    ax: 0x4F01,
+                    cx: mode,
+                    es: BUFFER_SEGMENT,
+                    ..Call::default()
+                },
+            );
             assert_eq!(out.ax, 0x004F);
             assert_eq!(mem.read16(BUFFER) & 0x0001, 1);
             assert_eq!(mem.read16(BUFFER) & 0x0080, 0);
@@ -1518,7 +2755,16 @@ mod tests {
             assert_eq!(mem.read8(BUFFER + 0x1B), 4);
             assert_eq!(mem.read8(BUFFER + 0x1D), pages);
         }
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x4F01, cx: 0x103, es: BUFFER_SEGMENT, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x4F01,
+                cx: 0x103,
+                es: BUFFER_SEGMENT,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.ax, 0x014F);
         assert!(vga.svga.is_empty());
     }
@@ -1528,7 +2774,15 @@ mod tests {
         let (mut vga, mut mem, mut screen) = setup(3);
         assert!(vga.svga.is_empty());
         vga.mode_changed = false;
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x4F02, bx: 0x0101, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x4F02,
+                bx: 0x0101,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.ax, 0x004F);
         assert!(out.cost >= 20_000);
         assert!(vga.mode_changed);
@@ -1536,7 +2790,18 @@ mod tests {
         assert_eq!(vga.svga.len(), SVGA_SIZE);
         assert_eq!(vga.display_size(), (640, 480));
         assert_eq!((vga.width, vga.height), (640, 480));
-        assert_eq!(int10(&mut vga, &mut mem, Call { ax: 0x4F03, ..Call::default() }).bx, 0x0101);
+        assert_eq!(
+            int10(
+                &mut vga,
+                &mut mem,
+                Call {
+                    ax: 0x4F03,
+                    ..Call::default()
+                }
+            )
+            .bx,
+            0x0101
+        );
         assert!(vga.is_vram(A));
         assert!(!vga.is_vram(0xB_0000));
 
@@ -1544,9 +2809,26 @@ mod tests {
         let y = 479usize;
         let offset = y * 640 + 7;
         let bank = offset >> 16;
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x4F05, bx: 0, dx: bank as u16, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x4F05,
+                bx: 0,
+                dx: bank as u16,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.ax, 0x004F);
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x4F05, bx: 0x0100, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x4F05,
+                bx: 0x0100,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.dx, bank as u16);
         vga.vram_write(A + (offset & 0xFFFF) as u32, 15);
         assert_eq!(vga.vram_read(A + (offset & 0xFFFF) as u32), 15);
@@ -1555,34 +2837,175 @@ mod tests {
         assert_eq!(at(&screen, 8, 479), 0);
 
         // Banks and windows out of range fail cleanly.
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x4F05, bx: 0, dx: 16, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x4F05,
+                bx: 0,
+                dx: 16,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.ax, 0x014F);
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x4F05, bx: 1, dx: 0, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x4F05,
+                bx: 1,
+                dx: 0,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.ax, 0x014F);
         assert_eq!(vga.vesa_bank, bank as u16);
 
         // BIOS text and pixels work.
-        int10(&mut vga, &mut mem, Call { ax: 0x0E00 | 0xDB, bx: 0x0004, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0E00 | 0xDB,
+                bx: 0x0004,
+                ..Call::default()
+            },
+        );
         assert_eq!(vga.read_pixel(&mem, 0, 0), 4);
-        int10(&mut vga, &mut mem, Call { ax: 0x0601, bx: 0, cx: 0, dx: 0x1D4F, ..Call::default() });
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x0601,
+                bx: 0,
+                cx: 0,
+                dx: 0x1D4F,
+                ..Call::default()
+            },
+        );
 
         // 640x400, and back to a VGA mode.
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x4F02, bx: 0x0100, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x4F02,
+                bx: 0x0100,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.ax, 0x004F);
         assert_eq!(vga.display_size(), (640, 400));
         assert_eq!(vga.read_pixel(&mem, 0, 0), 0);
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x4F02, bx: 0x0013, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x4F02,
+                bx: 0x0013,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.ax, 0x004F);
         assert_eq!(vga.mode, 0x13);
         assert_eq!(vga.kind, GraphicsKind::Vga13);
-        assert_eq!(int10(&mut vga, &mut mem, Call { ax: 0x4F03, ..Call::default() }).bx, 0x13);
+        assert_eq!(
+            int10(
+                &mut vga,
+                &mut mem,
+                Call {
+                    ax: 0x4F03,
+                    ..Call::default()
+                }
+            )
+            .bx,
+            0x13
+        );
         // Bit 15 keeps the memory.
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x4F02, bx: 0x0100, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x4F02,
+                bx: 0x0100,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.ax, 0x004F);
         vga.vram_write(A, 9);
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x4F02, bx: 0x8101, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x4F02,
+                bx: 0x8101,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.ax, 0x004F);
         assert_eq!(vga.vram_read(A), 9);
+    }
+
+    #[test]
+    fn vbe_logical_width_and_display_start_move_the_picture() {
+        let (mut vga, mut mem, _) = setup(3);
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x4F02,
+                bx: 0x0101,
+                ..Call::default()
+            },
+        );
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x4F06,
+                bx: 0,
+                cx: 1024,
+                ..Call::default()
+            },
+        );
+        assert_eq!((out.ax, out.bx, out.cx), (0x004F, 1024, 1024));
+        vga.put_pixel(&mut mem, 3, 2, 9);
+        assert_eq!(vga.svga[2 * 1024 + 3], 9);
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x4F07,
+                bx: 0,
+                cx: 3,
+                dx: 2,
+                ..Call::default()
+            },
+        );
+        assert_eq!(out.ax, 0x004F);
+        assert_eq!(vga.vesa_start, 2 * 1024 + 3);
+        assert_eq!(vga.read_pixel(&mem, 0, 0), 9);
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x4F07,
+                bx: 1,
+                ..Call::default()
+            },
+        );
+        assert_eq!((out.cx, out.dx), (3, 2));
+        // A mode set goes back to the plain layout.
+        int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x4F02,
+                bx: 0x0101,
+                ..Call::default()
+            },
+        );
+        assert_eq!((vga.vesa_pitch, vga.vesa_start), (640, 0));
     }
 
     #[test]
@@ -1590,13 +3013,35 @@ mod tests {
         let (mut vga, mut mem, _) = setup(3);
         // Unknown functions, unknown modes, the linear frame buffer bit.
         for call in [
-            Call { ax: 0x4F04, ..Call::default() },
-            Call { ax: 0x4F07, ..Call::default() },
-            Call { ax: 0x4FFF, ..Call::default() },
-            Call { ax: 0x4F02, bx: 0x0103, ..Call::default() },
-            Call { ax: 0x4F02, bx: 0x4101, ..Call::default() },
-            Call { ax: 0x4F02, bx: 0x0055, ..Call::default() },
-            Call { ax: 0x4F05, bx: 0, dx: 0, ..Call::default() },
+            Call {
+                ax: 0x4F04,
+                ..Call::default()
+            },
+            Call {
+                ax: 0x4FFF,
+                ..Call::default()
+            },
+            Call {
+                ax: 0x4F02,
+                bx: 0x0103,
+                ..Call::default()
+            },
+            Call {
+                ax: 0x4F02,
+                bx: 0x4101,
+                ..Call::default()
+            },
+            Call {
+                ax: 0x4F02,
+                bx: 0x0055,
+                ..Call::default()
+            },
+            Call {
+                ax: 0x4F05,
+                bx: 0,
+                dx: 0,
+                ..Call::default()
+            },
         ] {
             let out = int10(&mut vga, &mut mem, call);
             assert_eq!(out.ax, 0x014F);
@@ -1605,7 +3050,15 @@ mod tests {
         assert!(vga.svga.is_empty());
         // Failing to allocate is reported, and the mode stays.
         vga.fail_alloc = true;
-        let out = int10(&mut vga, &mut mem, Call { ax: 0x4F02, bx: 0x0101, ..Call::default() });
+        let out = int10(
+            &mut vga,
+            &mut mem,
+            Call {
+                ax: 0x4F02,
+                bx: 0x0101,
+                ..Call::default()
+            },
+        );
         assert_eq!(out.ax, 0x014F);
         assert_eq!(vga.mode, 3);
         assert_eq!(vga.kind, GraphicsKind::Text);
@@ -1688,7 +3141,11 @@ mod tests {
                     }
                     let call = Call {
                         ax: (ah << 8) | al,
-                        bx: if ah == 0x4F && al == 2 { 0x100 + random.word() % 3 } else { random.word() },
+                        bx: if ah == 0x4F && al == 2 {
+                            0x100 + random.word() % 3
+                        } else {
+                            random.word()
+                        },
                         cx: random.word(),
                         dx: random.word(),
                         bp: random.word(),
@@ -1703,7 +3160,12 @@ mod tests {
                     }
                     let out = int10(&mut vga, &mut mem, call);
                     // A service's cost is always finite and sensible.
-                    assert!(out.cost < 100_000_000, "cost {} for {:#x}", out.cost, call.ax);
+                    assert!(
+                        out.cost < 100_000_000,
+                        "cost {} for {:#x}",
+                        out.cost,
+                        call.ax
+                    );
                 }
                 95..=97 => vga.teletype(&mut mem, random.byte()),
                 _ => {
@@ -1732,7 +3194,10 @@ mod tests {
                 let mut state = Vec::new();
                 vga.save_state(&mut state);
                 let mut position = 0;
-                assert!(vga.load_state(&state, &mut position), "own state refused at step {step}");
+                assert!(
+                    vga.load_state(&state, &mut position),
+                    "own state refused at step {step}"
+                );
                 assert_eq!(position, state.len());
                 let mut pixels = vec![0u32; 200 * 150];
                 let mut canvas = feos_gfx::Canvas::new(&mut pixels, 200, 150, 200).unwrap();
@@ -1756,7 +3221,9 @@ mod tests {
     fn fuzz_every_mode_with_random_registers() {
         let mut random = Random(0xDEAD_BEEF_1234_5678);
         let mut screen = vec![0u32; SCREEN_WIDTH * SCREEN_HEIGHT];
-        for mode in [0u8, 1, 2, 3, 4, 5, 6, 7, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13] {
+        for mode in [
+            0u8, 1, 2, 3, 4, 5, 6, 7, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13,
+        ] {
             let mut mem = Memory::new();
             let mut vga = Vga::new();
             vga.reset(&mut mem);

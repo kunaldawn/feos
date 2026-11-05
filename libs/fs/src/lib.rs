@@ -50,20 +50,30 @@
 extern crate alloc;
 
 mod block;
+mod cache;
 mod error;
 mod exfat;
+mod fat16;
 mod fat32;
+mod format;
 mod mount;
+mod partition;
 mod tree;
+pub mod vfs;
 mod volume;
 
 pub use block::{
-    BlockDevice, MemoryBlockDevice, MemoryBlockDeviceMut, RamDisk, WritableBlockDevice,
-    MAX_BLOCK_SIZE,
+    BlockDevice, DriverDevice, MemoryBlockDevice, MemoryBlockDeviceMut, RamDisk,
+    WritableBlockDevice, WriteClass, MAX_BLOCK_SIZE,
 };
+pub use cache::{BufferCache, CacheStats};
+pub use partition::{read_partitions, Partition, PartitionHint, PartitionInfo, MAX_PARTITIONS};
 pub use error::FsError;
 pub use exfat::Exfat;
+pub use fat16::Fat16;
 pub use fat32::Fat32;
+pub use format::{format, format_exfat, format_fat32};
+pub use vfs::{File, FileKind, OpenOptions, Seek, Stat, TreeEntry, Vfs, VfsTree};
 pub use mount::MountTable;
 pub use volume::{detect, VolumeKind};
 
@@ -81,6 +91,7 @@ mod tests;
 pub fn mount<'a, D: BlockDevice + 'a>(device: D) -> Result<Box<dyn FileSystem + 'a>, FsError> {
     match detect(&device)? {
         VolumeKind::Fat32 => Ok(Box::new(Fat32::mount(device)?)),
+        VolumeKind::Fat16 => Ok(Box::new(Fat16::mount(device)?)),
         VolumeKind::Exfat => Ok(Box::new(Exfat::mount(device)?)),
     }
 }
@@ -96,6 +107,7 @@ pub fn mount_writable<'a, D: WritableBlockDevice + 'a>(
 ) -> Result<Box<dyn WritableFileSystem + 'a>, FsError> {
     match detect(&device)? {
         VolumeKind::Fat32 => Ok(Box::new(Fat32::mount(device)?)),
+        VolumeKind::Fat16 => Err(FsError::ReadOnly),
         VolumeKind::Exfat => Ok(Box::new(Exfat::mount(device)?)),
     }
 }
@@ -150,6 +162,86 @@ impl EntryKind {
 /// that would nest deeper, so recursive walkers have a known bound. A deeper
 /// tree on an untrusted volume marks it [damaged](FileSystem::is_damaged).
 pub const MAX_PATH_DEPTH: usize = 32;
+
+/// File attribute bits, the ones FAT and exFAT agree on.
+pub mod attr {
+    /// Writes are refused.
+    pub const READ_ONLY: u8 = 0x01;
+    /// Left out of ordinary listings.
+    pub const HIDDEN: u8 = 0x02;
+    /// Belongs to the system.
+    pub const SYSTEM: u8 = 0x04;
+    /// Changed since the last backup.
+    pub const ARCHIVE: u8 = 0x20;
+    /// Every bit a caller may set.
+    pub const SETTABLE: u8 = READ_ONLY | HIDDEN | SYSTEM | ARCHIVE;
+}
+
+/// When a node was last touched, in seconds since the Unix epoch.
+///
+/// `None` means the volume doesn't say. That's usual on one written by something
+/// with no clock, which leaves the date fields zero.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct NodeTimes {
+    /// Created.
+    pub created: Option<u64>,
+    /// Contents last changed.
+    pub modified: Option<u64>,
+    /// Last read. FAT keeps only the date.
+    pub accessed: Option<u64>,
+}
+
+impl NodeTimes {
+    /// No timestamps at all.
+    pub const NONE: Self = Self {
+        created: None,
+        modified: None,
+        accessed: None,
+    };
+}
+
+/// How much room a volume has.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct VolumeStats {
+    /// Allocation unit in bytes.
+    pub block_size: u64,
+    /// Total allocation units.
+    pub total_blocks: u64,
+    /// Free allocation units.
+    pub free_blocks: u64,
+    /// The volume refuses writes.
+    pub read_only: bool,
+    /// Name of the on-disk format.
+    pub kind: &'static str,
+}
+
+/// What a mount-time check found and repaired.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct CheckReport {
+    /// The volume wasn't cleanly unmounted, so the check ran.
+    pub was_dirty: bool,
+    /// Allocated clusters nothing referred to, now free.
+    pub lost_clusters: u32,
+    /// Files whose size or chain had to change to agree.
+    pub truncated_files: u32,
+    /// Directory entries removed because they duplicate another's data.
+    pub removed_entries: u32,
+    /// Long-name fragments with no entry to belong to, now cleared.
+    pub orphan_names: u32,
+}
+
+impl CheckReport {
+    /// True when the check changed nothing but the dirty flag.
+    pub const fn found_nothing(&self) -> bool {
+        self.lost_clusters == 0
+            && self.truncated_files == 0
+            && self.removed_entries == 0
+            && self.orphan_names == 0
+    }
+}
+
+/// Where a writable filesystem gets the time from.
+pub type TimeSource = fn() -> Option<u64>;
 
 /// A read-only filesystem view.
 ///
@@ -241,6 +333,41 @@ pub trait FileSystem: Sync {
 
     /// Returns the child at `index`, in filesystem order.
     fn child_at(&self, node: NodeId, index: usize) -> Option<NodeId>;
+
+    /// Attribute bits of a node; see [`attr`].
+    fn attributes(&self, _node: NodeId) -> u8 {
+        0
+    }
+
+    /// Timestamps of a node.
+    fn times(&self, _node: NodeId) -> NodeTimes {
+        NodeTimes::NONE
+    }
+
+    /// True when the backend refuses changes. Cheaper than [`stats`](Self::stats),
+    /// which may have to count free space.
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
+    /// Size and free space, as far as the backend knows.
+    fn stats(&self) -> VolumeStats {
+        VolumeStats {
+            block_size: 512,
+            total_blocks: 0,
+            free_blocks: 0,
+            read_only: true,
+            kind: "unknown",
+        }
+    }
+
+    /// The shared writable tree behind this filesystem, if it has one.
+    ///
+    /// This is how a holder of [`Platform::filesystem`] finds out it can write,
+    /// without the type having to change for every caller that only reads.
+    fn tree(&self) -> Option<&dyn VfsTree> {
+        None
+    }
 
     /// The root directory.
     fn root(&self) -> NodeId {
@@ -334,7 +461,7 @@ pub trait FileSystem: Sync {
 /// borrow. Mutations take `&mut self` so a backend can update its block device
 /// without interior locking; callers that need to share a mounted volume should
 /// protect it with a lock.
-pub trait WritableFileSystem: FileSystem {
+pub trait WritableFileSystem: FileSystem + Send {
     /// Creates an empty file in `parent` and returns its node.
     fn create_file(&mut self, parent: NodeId, name: &str) -> Result<NodeId, FsError>;
 
@@ -361,6 +488,30 @@ pub trait WritableFileSystem: FileSystem {
 
     /// Flushes filesystem metadata and device caches.
     fn flush(&mut self) -> Result<(), FsError>;
+
+    /// Replaces a node's attribute bits (see [`attr::SETTABLE`]).
+    fn set_attributes(&mut self, _node: NodeId, _attributes: u8) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    /// Sets whichever timestamps are `Some`.
+    fn set_times(&mut self, _node: NodeId, _times: NodeTimes) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    /// Tells the filesystem what time it is, for the timestamps it stores.
+    fn set_time_source(&mut self, _now: TimeSource) {}
+
+    /// Checks a volume that wasn't cleanly unmounted, and repairs what a crash
+    /// can leave behind. A clean volume returns at once.
+    fn check(&mut self) -> Result<CheckReport, FsError> {
+        Ok(CheckReport::default())
+    }
+
+    /// Turns an empty file into a device node, on a filesystem that can.
+    fn make_device(&mut self, _node: NodeId, _kind: vfs::DeviceKind) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
 }
 
 /// One node in a compiled-in filesystem image.

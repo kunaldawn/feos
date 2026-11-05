@@ -76,6 +76,12 @@ pub(super) fn gunzip(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
     gzip_command(args, ctx, "gunzip", true)
 }
 
+pub(super) fn zcat(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
+    let mut with_flag = alloc::vec![String::from("-c")];
+    with_flag.extend_from_slice(args);
+    gzip_command(&with_flag, ctx, "zcat", true)
+}
+
 fn gzip_command(args: &[String], ctx: &mut Ctx<'_>, cmd: &str, mut decompress: bool) -> i32 {
     let mut to_stdout = false;
     let mut keep = false;
@@ -374,7 +380,7 @@ fn tar_collect(
 
 /// True when an archive member path would leave the extraction directory.
 fn unsafe_member(name: &str) -> bool {
-    name.split('/').any(|part| part == "..")
+    feos_archive::safe_path(name).is_none()
 }
 
 fn tar_read(
@@ -443,8 +449,15 @@ fn tar_read(
                 parent => make_parents(ctx, &parent)
                     .and_then(|()| ctx.fs.write_file(&target, entry.data, false)),
             }
+        } else if entry.is_symlink() {
+            // Its target isn't checked: a link can point anywhere, and only what's
+            // written through it is confined, by the path checks on later members.
+            match entry.link() {
+                Ok(link) => ctx.fs.symlink(link, &target),
+                Err(_) => Err(FsError::InvalidPath),
+            }
         } else {
-            // Links and devices have no equivalent on this filesystem.
+            // Devices have no equivalent on this filesystem.
             Err(FsError::NotSupported)
         };
         if let Err(err) = result {
@@ -467,4 +480,59 @@ fn make_parents(ctx: &mut Ctx<'_>, path: &str) -> Result<(), FsError> {
         }
     }
     Ok(())
+}
+
+/// `appinstall FILE [SHA256]`: installs a package into the application folder.
+///
+/// The digest comes from the command line or from `FILE.sha256`, never from the
+/// package. There's no installing without one.
+pub(super) fn appinstall(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
+    use feos_bundle::install;
+    const USAGE: &str = "appinstall FILE [SHA256]";
+    let (file, supplied) = match args {
+        [file] => (file, None),
+        [file, digest] => (file, Some(digest.clone())),
+        _ => return usage(ctx.stderr, "appinstall", USAGE),
+    };
+    let data = match ctx.fs.read_file(file) {
+        Ok(data) => data,
+        Err(err) => {
+            path_error(ctx.stderr, "appinstall", file, err);
+            return 1;
+        }
+    };
+    let digest = supplied.or_else(|| {
+        let sidecar = ctx.fs.read_file(&format!("{file}{}", install::DIGEST_SUFFIX)).ok()?;
+        let text = core::str::from_utf8(&sidecar).ok()?;
+        install::parse_digest(text).map(ToString::to_string)
+    });
+    let Some(digest) = digest else {
+        error(ctx.stderr, "appinstall", "no SHA-256 digest given, and no FILE.sha256");
+        return 1;
+    };
+    let manifest = match install::verify_package(&data, &digest) {
+        Ok(manifest) => manifest,
+        Err(problem) => {
+            error(ctx.stderr, "appinstall", &format!("{file}: {problem}"));
+            return 1;
+        }
+    };
+
+    let id = manifest.id.as_str();
+    let target = format!("{}/{id}{}", install::APPS_DIR, install::PACKAGE_SUFFIX);
+    let result = make_parents(ctx, install::APPS_DIR)
+        // Digest first: a package is only ever seen with one, and a stale digest
+        // just makes the scan skip the package until this finishes.
+        .and_then(|()| {
+            let digest_file = format!("{target}{}", install::DIGEST_SUFFIX);
+            ctx.fs.write_file(&digest_file, digest.as_bytes(), false)
+        })
+        .and_then(|()| ctx.fs.write_file(&target, &data, false))
+        .and_then(|()| ctx.fs.sync());
+    if let Err(err) = result {
+        path_error(ctx.stderr, "appinstall", &target, err);
+        return 1;
+    }
+    write_line(ctx.stdout, format_args!("installed {id} at {target}"));
+    0
 }

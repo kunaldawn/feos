@@ -1,0 +1,12 @@
+[package]
+name = "feos-iconset"
+description = "The stock icons feos draws, embedded from assets/icons"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+feos-gfx = { workspace = true }
+feos-gui = { workspace = true }
+feos-image = { workspace = true }

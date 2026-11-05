@@ -1,10 +1,10 @@
 //! Interrupt descriptor table and fault reporting.
 //!
-//! The IDT points vectors 0..50 at the stubs in `interrupts.S`. Exceptions
+//! The IDT points every vector at the stubs in `interrupts.S`. Exceptions
 //! (vectors 0..31) build a [`FaultInfo`] and forward it to the handler
-//! registered with [`set_handler`], then halt. Hardware interrupts, the software
-//! switch and IPIs (vectors 32..50) go through the recoverable path in
-//! [`crate::irq`] instead.
+//! registered with [`set_handler`], which may stop the machine or end the task.
+//! Hardware interrupts, the software
+//! switch and IPIs go through the recoverable path in [`crate::irq`] instead.
 //!
 //! Each gate names a per-CPU stack from the TSS, so a fault still has a working
 //! stack when the task's own stack pointer is bad.
@@ -34,6 +34,8 @@ pub struct FaultInfo {
     pub sp: u64,
     /// General-purpose registers except `rsp`, named by [`REGISTER_NAMES`].
     pub regs: [u64; 15],
+    /// Interrupted code segment, whose low bits are the privilege it ran at.
+    pub cs: u64,
 }
 
 /// Names of [`FaultInfo::regs`], in order.
@@ -54,6 +56,35 @@ impl FaultInfo {
             write!(out, "{name:<3}={value:016x}{separator}")?;
         }
         Ok(())
+    }
+
+    /// Whether this is something a task did, as opposed to the machine failing, so
+    /// that ending the task could be an answer to it.
+    pub const fn is_task_fault(&self) -> bool {
+        // Divide, debug, breakpoint, overflow, bound, opcode, device not available,
+        // stack, protection, page, x87, alignment and SIMD. Not NMI, double fault
+        // or machine check.
+        //
+        // From ring 3, anything but those last ones is the program's doing: a bad
+        // segment selector can raise others.
+        if self.from_user() {
+            return !matches!(self.index, 2 | 8 | 18);
+        }
+        matches!(self.index, 0 | 1 | 3 | 4 | 5 | 6 | 7 | 12 | 13 | 14 | 16 | 17 | 19)
+    }
+
+    /// Whether a user program caused this.
+    pub const fn from_user(&self) -> bool {
+        self.cs & 3 == 3
+    }
+
+    /// The address a page fault was on, if this is one.
+    pub const fn fault_address(&self) -> Option<u64> {
+        if self.index == 14 {
+            Some(self.far)
+        } else {
+            None
+        }
     }
 
     /// Exception class. On x86 this is the vector itself.
@@ -109,8 +140,9 @@ impl FaultInfo {
     }
 }
 
-/// Callback invoked for every exception.
-pub type FaultHandler = fn(&FaultInfo);
+/// Callback invoked for every exception. It can replace the frame with another
+/// task's and return `true` to resume that, rather than stopping the machine.
+pub type FaultHandler = fn(&FaultInfo, &mut crate::irq::TrapFrame) -> bool;
 
 static HANDLER: AtomicUsize = AtomicUsize::new(0);
 
@@ -160,12 +192,17 @@ struct IdtPointer {
 
 static mut IDT: [IdtEntry; 256] = [IdtEntry::MISSING; 256];
 
-/// Vectors with a stub in `interrupts.S`.
-const STUBS: usize = 51;
+/// Exception stubs, listed in `isr_stub_table`.
+const EXCEPTIONS: usize = 32;
+/// Bytes per stub from `isr_irq_stubs` on.
+const IRQ_STUB_SIZE: usize = 16;
+/// The local APIC's spurious vector, which must not be acknowledged.
+const SPURIOUS_VECTOR: usize = 255;
 
 extern "C" {
-    static isr_stub_table: [u64; STUBS];
-    static isr_spurious: u64;
+    static isr_stub_table: [u64; EXCEPTIONS];
+    static isr_irq_stubs: u8;
+    static isr_spurious: u8;
 }
 
 /// Builds and loads the IDT.
@@ -174,21 +211,30 @@ pub fn init() {
     // is a private static and every entry is written below.
     let table = unsafe { &mut *addr_of_mut!(IDT) };
 
-    for (index, entry) in table.iter_mut().enumerate().take(STUBS) {
-        // SAFETY: the assembly table has exactly `STUBS` entries.
-        let handler = unsafe { isr_stub_table[index] };
-        let stack = if index < 32 { gdt::IST_FAULT } else { gdt::IST_IRQ };
-        *entry = IdtEntry::new(handler, 0x08, 0x8e, stack);
+    for (vector, entry) in table.iter_mut().enumerate() {
+        let (handler, stack) = if vector < EXCEPTIONS {
+            // SAFETY: the assembly table has exactly `EXCEPTIONS` entries.
+            (unsafe { isr_stub_table[vector] }, gdt::IST_FAULT)
+        } else if vector == SPURIOUS_VECTOR {
+            (addr_of!(isr_spurious) as u64, gdt::IST_IRQ)
+        } else {
+            let stubs = addr_of!(isr_irq_stubs) as u64;
+            (stubs + ((vector - EXCEPTIONS) * IRQ_STUB_SIZE) as u64, gdt::IST_IRQ)
+        };
+        // Present and an interrupt gate. Only the system call's may be raised from
+        // ring 3: `int` to any other gate is a protection fault.
+        let attributes = if vector as u64 == crate::irq::SYSCALL_VECTOR { 0xee } else { 0x8e };
+        *entry = IdtEntry::new(handler, 0x08, attributes, stack);
     }
 
-    let spurious = addr_of!(isr_spurious) as u64;
-    for entry in table.iter_mut().skip(STUBS) {
-        *entry = IdtEntry::new(spurious, 0x08, 0x8e, gdt::IST_IRQ);
-    }
+    load();
+}
 
+/// Loads the IDT on this CPU. [`init`] has already built it.
+pub fn load() {
     let pointer = IdtPointer {
         limit: (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16,
-        base: table.as_ptr() as u64,
+        base: addr_of!(IDT) as u64,
     };
 
     // SAFETY: `pointer` describes the static table and `lidt` reads it.
@@ -221,7 +267,7 @@ fn cr2() -> u64 {
 }
 
 /// Called from the recoverable interrupt dispatch for vectors 0..31.
-pub(crate) fn handle(frame: &crate::irq::TrapFrame) {
+pub(crate) fn handle(frame: &mut crate::irq::TrapFrame) {
     let info = FaultInfo {
         index: frame.vector,
         esr: frame.error,
@@ -233,10 +279,13 @@ pub(crate) fn handle(frame: &crate::irq::TrapFrame) {
             frame.rax, frame.rbx, frame.rcx, frame.rdx, frame.rsi, frame.rdi, frame.rbp, frame.r8,
             frame.r9, frame.r10, frame.r11, frame.r12, frame.r13, frame.r14, frame.r15,
         ],
+        cs: frame.cs,
     };
 
     if let Some(handler) = handler() {
-        handler(&info);
+        if handler(&info, frame) {
+            return;
+        }
     }
 
     cpu::halt()

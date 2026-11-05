@@ -5,19 +5,19 @@
 //! bar, playlist, fullscreen mode, aspect modes, media information and
 //! keyboard/mouse control.
 //!
-//! One [`VideoDecoder`] holds a file's sample table and codec state, so showing
-//! the next frame costs one frame. Decoding still runs on the compositor
-//! thread, so a tick decodes a bounded number of samples and a long seek is
-//! spread across ticks. The frame clock holds while the decoder catches up, so
-//! a slow machine plays slowly rather than dropping frames it must decode anyway.
-//! All buffers here are allocated fallibly: exhausting the heap would be fatal.
+//! Opening and decoding run on a task of their own (see [`crate::decode_worker`]),
+//! so a slow or hostile file can't stall the desktop. The window takes finished
+//! frames from a queue when their time comes. The frame clock holds while the
+//! decoder catches up, so a slow machine plays slowly rather than dropping frames
+//! it must decode anyway. All buffers here are allocated fallibly: exhausting the
+//! heap would be fatal.
 
 use core::fmt::Write;
 
 use alloc::vec;
 use alloc::vec::Vec;
 
-use feos_app::{App, Context, WindowContext, WindowFrame};
+use feos_app::{App, Context, Processes, WindowContext, WindowFrame};
 use feos_console::println;
 use feos_fs::{FileSystem, NodeId};
 use feos_gfx::{Canvas, Color, Point, Rect};
@@ -28,35 +28,24 @@ use feos_hal::PointerEvent;
 use feos_keys::SerialKeys;
 use feos_sync::SpinLock;
 use feos_text::Text;
-use feos_video::{
-    info as video_info, ContainerFormat, DecodedFrame, DecoderLimits, VideoDecoder, VideoError,
-    VideoInfo,
-};
+use feos_video::{info as video_info, ContainerFormat, DecodedFrame, VideoError, VideoInfo};
 
+use crate::audio_worker::{AudioFailure, AudioTask, Source, TrackInfo, PLAYER_PIPE};
+use crate::decode_worker::{
+    read_file, DecodeTask, Failure, Opened, Pipe, Seek, Step, Worker, MAX_MEDIA_BYTES, PIPE,
+};
 use crate::files::format_size;
 
 const MAX_PLAYLIST: usize = 64;
 const MAX_OPEN: usize = 128;
 const MAX_PATH: usize = 256;
-/// Largest file the player reads into memory.
-const MAX_MEDIA_BYTES: usize = 16 * 1024 * 1024;
-/// Largest decoded frame: 1920x1088 in RGBA.
-const MAX_FRAME_BYTES: usize = 1920 * 1088 * 4;
-/// Limits for the decoder, within the 64 MiB kernel heap that also holds the
-/// file and frame above. Level-based reference counts for 1080p fit in this.
-const DECODER_LIMITS: DecoderLimits = DecoderLimits {
-    max_frames: 1 << 18,
-    max_width: 4096,
-    max_height: 4096,
-    max_memory: 40 * 1024 * 1024,
-};
-/// Samples decoded per tick while playing or catching up to a seek.
-const TICK_SAMPLES: u32 = 4;
 /// Longest time one tick advances the clock. A window that was hidden, or a
 /// slow frame, then doesn't jump the video forward.
 const MAX_TICK_MS: u64 = 250;
 /// How long a click on the video waits to see if it's a double-click.
 const DOUBLE_CLICK_MS: u64 = 420;
+/// How often the window checks that its decoder task is still there.
+const WORKER_CHECK_MS: u64 = 500;
 /// Rate assumed for a video with no frame times.
 const DEFAULT_FPS: u32 = 25;
 const PLAYLIST_WIDTH: i32 = 300;
@@ -107,29 +96,191 @@ fn preview_of(fs: &dyn FileSystem, node: NodeId) -> Preview {
     }
 }
 
-/// Reads a whole file, or returns `None` if it's too large or memory is short.
-fn read_file(fs: &dyn FileSystem, node: NodeId, size: usize) -> Option<Vec<u8>> {
-    if size == 0 || size > MAX_MEDIA_BYTES {
-        return None;
-    }
-    let mut data = zeroed(size)?;
-    let mut offset = 0usize;
-    while offset < data.len() {
-        let read = fs.read(node, offset, &mut data[offset..]);
-        if read == 0 {
-            break;
-        }
-        offset += read;
-    }
-    data.truncate(offset);
-    Some(data)
+/// Who runs the decoder for a window.
+struct Engine {
+    pipe: &'static Pipe,
+    /// Starts the decoder task. Without one, as in host tests, the window runs
+    /// the worker itself, to completion, whenever it's asked for something.
+    processes: Option<&'static dyn Processes>,
+    inline: Option<(Worker, &'static dyn FileSystem)>,
+    inline_fs: Option<&'static dyn FileSystem>,
+    pid: Option<u32>,
+    next_check: u64,
 }
 
-fn zeroed(len: usize) -> Option<Vec<u8>> {
-    let mut bytes = Vec::new();
-    bytes.try_reserve_exact(len).ok()?;
-    bytes.resize(len, 0);
-    Some(bytes)
+impl Engine {
+    fn task(processes: &'static dyn Processes) -> Self {
+        Self {
+            pipe: &PIPE,
+            processes: Some(processes),
+            inline: None,
+            inline_fs: None,
+            pid: None,
+            next_check: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn inline(fs: &'static dyn FileSystem) -> Self {
+        Self {
+            pipe: alloc::boxed::Box::leak(alloc::boxed::Box::new(Pipe::new())),
+            processes: None,
+            inline: None,
+            inline_fs: Some(fs),
+            pid: None,
+            next_check: 0,
+        }
+    }
+
+    /// Starts a worker if none is running. Returns `false` when it can't.
+    fn ensure_worker(&mut self) -> bool {
+        let Some(processes) = self.processes else {
+            if self.inline.is_none() {
+                self.inline = self
+                    .inline_fs
+                    .map(|fs| (Worker::new(self.pipe.claim()), fs));
+            }
+            return self.inline.is_some();
+        };
+        if self.pid.is_some() {
+            return true;
+        }
+        let identity = self.pipe.claim();
+        let mut args = Text::<16>::new();
+        let _ = write!(args, "{identity}");
+        match processes.spawn(&DecodeTask, args.as_str()) {
+            Ok(pid) => {
+                self.pid = Some(pid);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Runs an inline worker until it has nothing left to do.
+    fn pump(&mut self) {
+        if let Some((worker, fs)) = self.inline.as_mut() {
+            let fs = *fs;
+            while worker.step(self.pipe, fs) == Step::Busy {}
+        }
+    }
+
+    /// Checks that the task is still there, which a kill may have changed.
+    /// Returns `false` once, the first time it finds it gone.
+    fn check_worker(&mut self, now: u64) -> bool {
+        let (Some(processes), Some(pid)) = (self.processes, self.pid) else {
+            return true;
+        };
+        if now < self.next_check {
+            return true;
+        }
+        self.next_check = now + WORKER_CHECK_MS;
+        if processes.detail(pid).is_some() {
+            return true;
+        }
+        self.pid = None;
+        false
+    }
+}
+
+/// Who plays the sound for a window: a task, once something needs one.
+struct AudioEngine {
+    processes: Option<&'static dyn Processes>,
+    pid: Option<u32>,
+    next_check: u64,
+}
+
+impl AudioEngine {
+    fn ensure_task(&mut self) -> bool {
+        let Some(processes) = self.processes else {
+            return false;
+        };
+        if self.pid.is_some() {
+            return true;
+        }
+        let identity = PLAYER_PIPE.claim();
+        let mut args = Text::<24>::new();
+        let _ = write!(args, "player {identity}");
+        match processes.spawn(&AudioTask, args.as_str()) {
+            Ok(pid) => {
+                self.pid = Some(pid);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Forgets a task that a kill has taken away.
+    fn check_task(&mut self, now: u64) {
+        let (Some(processes), Some(pid)) = (self.processes, self.pid) else {
+            return;
+        };
+        if now >= self.next_check {
+            self.next_check = now + WORKER_CHECK_MS;
+            if processes.detail(pid).is_none() {
+                self.pid = None;
+            }
+        }
+    }
+}
+
+impl Drop for AudioEngine {
+    fn drop(&mut self) {
+        if self.processes.is_some() {
+            PLAYER_PIPE.shut_down();
+        }
+    }
+}
+
+/// Finds `name.srt` beside `name.mp4`, and reads it.
+fn load_subtitles(fs: &dyn FileSystem, node: NodeId) -> Option<crate::subtitles::Subtitles> {
+    let name = fs.name(node)?;
+    let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+    let parent = fs.parent(node)?;
+    let found = (0..fs.child_count(parent))
+        .filter_map(|index| fs.child_at(parent, index))
+        .find(|&child| {
+            fs.name(child).is_some_and(|other| {
+                other.len() == stem.len() + 4
+                    && other.ends_with(".srt")
+                    && other.starts_with(stem)
+            })
+        })?;
+    let size = fs.size(found);
+    if size == 0 || size > crate::subtitles::MAX_FILE_BYTES {
+        return None;
+    }
+    crate::subtitles::Subtitles::parse(&read_file(fs, found, size)?)
+}
+
+/// What a file holds, from its first bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MediaKind {
+    Video,
+    Audio,
+}
+
+/// Looks at a file's start, and at its name if that says nothing.
+fn media_kind(fs: &dyn FileSystem, node: NodeId) -> MediaKind {
+    let mut head = [0u8; 4096];
+    let read = fs.read(node, 0, &mut head);
+    let head = &head[..read];
+    // MP4 audio files look like video until someone reads the name.
+    if fs.name(node).is_some_and(is_audio_file) {
+        return MediaKind::Audio;
+    }
+    if feos_video::detect(head).is_none() && feos_audio_codec::detect(head).is_some() {
+        return MediaKind::Audio;
+    }
+    MediaKind::Video
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // This doesn't wait: the task notices at its next step, and frees the
+        // file and decoder itself.
+        self.pipe.shut_down();
+    }
 }
 
 /// The video player application.
@@ -141,8 +292,7 @@ impl App for Player {
     }
 
     fn aliases(&self) -> &'static [&'static str] {
-        // `vlc` stays as a command alias for existing scripts.
-        &["vlc", "video", "media", "media-player", "movies"]
+        &["video", "media", "media-player", "movies"]
     }
 
     fn usage(&self) -> &'static str {
@@ -183,12 +333,24 @@ impl App for Player {
         close_player();
     }
 
-    fn run(&self, context: &mut Context<'_>) {
-        let Some(fs) = context.platform.filesystem else {
-            println!("player: no filesystem is available on this board");
+    fn background_tick(&self, platform: &feos_app::Platform, now_ms: u64) {
+        let (Some(fs), Some(mut guard)) = (platform.filesystem, WINDOW.try_lock()) else {
             return;
         };
-        run(fs, context);
+        if let Some(state) = guard.as_mut() {
+            state.tick(fs, now_ms);
+        }
+    }
+
+    fn run(&self, context: &mut Context<'_>) -> i32 {
+        (|| {
+            let Some(fs) = context.platform.filesystem else {
+                println!("player: no filesystem is available on this board");
+                return;
+            };
+            run(fs, context);
+        })();
+        0
     }
 }
 
@@ -284,6 +446,9 @@ impl MenuKind {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Action {
+    VolumeUp,
+    VolumeDown,
+    ToggleMute,
     None,
     Open,
     Quit,
@@ -393,9 +558,9 @@ const PLAYBACK_MENU: &[MenuItem] = &[
 ];
 
 const AUDIO_MENU: &[MenuItem] = &[
-    disabled("Increase Volume", "Up"),
-    disabled("Decrease Volume", "Down"),
-    disabled("Mute", "M"),
+    item("Increase Volume", "Up", Action::VolumeUp),
+    item("Decrease Volume", "Down", Action::VolumeDown),
+    item("Mute", "M", Action::ToggleMute),
     sep(),
     disabled("Audio Track", ""),
     disabled("Audio Device", ""),
@@ -519,9 +684,7 @@ struct PlayerState {
     playlist_cursor: usize,
     playlist_scroll: usize,
     current: Option<NodeId>,
-    data: Vec<u8>,
     rgba: Vec<u8>,
-    scratch: Vec<u8>,
     info: Option<VideoInfo>,
     error: Text<160>,
     media_name: Text<96>,
@@ -531,10 +694,37 @@ struct PlayerState {
     frame_height: u32,
     frame_index: u32,
     frame_count: u32,
-    /// The open file and its decoding state.
-    decoder: Option<VideoDecoder<Vec<u8>>>,
-    /// A frame the display is waiting for. The clock holds until it arrives.
-    pending_frame: Option<u32>,
+    /// Runs the decoder for the open file.
+    engine: Engine,
+    /// A file is open or opening, and hasn't failed.
+    media_open: bool,
+    /// The display waits for a frame it asked for. The clock holds until then.
+    waiting_frame: bool,
+    /// That frame was a step, so the position follows it.
+    step_wait: bool,
+    /// What the worker was last told about `playing`.
+    sent_playing: bool,
+    /// Whether the audio task was last told to play.
+    sent_hear: bool,
+    /// The last frame has been decoded.
+    eos: bool,
+    /// When the frame on screen stops being current.
+    next_due: Option<u64>,
+    /// Subtitles found beside the open file.
+    subtitles: Option<crate::subtitles::Subtitles>,
+    subtitles_on: bool,
+    /// Plays the sound of the open file.
+    audio: AudioEngine,
+    /// The open file is sound only, so there's no decoder or picture.
+    audio_only: bool,
+    /// The sound is on its way: the clock waits to hear whether there is any.
+    audio_pending: bool,
+    /// What's playing, when there is sound, and it's the clock.
+    audio_info: Option<TrackInfo>,
+    /// The sound has finished, or never existed, so a timer takes over.
+    audio_done: bool,
+    /// The sound was stopped by a speed that isn't 1, or by stepping frames.
+    audio_stale: bool,
     /// Whether any frame of this file has decoded yet.
     has_frame: bool,
     /// When a click on the video will take effect, unless a second click turns
@@ -586,7 +776,8 @@ struct PlayerState {
 }
 
 impl PlayerState {
-    fn new(fs: &dyn FileSystem, screen: Rect, args: &str, now: u64) -> Self {
+    fn new(fs: &dyn FileSystem, screen: Rect, args: &str, now: u64, engine: Engine) -> Self {
+        let processes = engine.processes;
         let mut state = Self {
             screen,
             playlist: [NodeId::ROOT; MAX_PLAYLIST],
@@ -594,9 +785,7 @@ impl PlayerState {
             playlist_cursor: 0,
             playlist_scroll: 0,
             current: None,
-            data: Vec::new(),
             rgba: Vec::new(),
-            scratch: Vec::new(),
             info: None,
             error: Text::new(),
             media_name: Text::new(),
@@ -608,8 +797,26 @@ impl PlayerState {
             frame_count: 0,
             fps_num: DEFAULT_FPS,
             fps_den: 1,
-            decoder: None,
-            pending_frame: None,
+            engine,
+            media_open: false,
+            waiting_frame: false,
+            step_wait: false,
+            sent_playing: false,
+            sent_hear: false,
+            eos: false,
+            next_due: None,
+            subtitles: None,
+            subtitles_on: true,
+            audio: AudioEngine {
+                processes,
+                pid: None,
+                next_check: 0,
+            },
+            audio_only: false,
+            audio_pending: false,
+            audio_info: None,
+            audio_done: true,
+            audio_stale: false,
             has_frame: false,
             pending_click: None,
             preview: None,
@@ -736,72 +943,25 @@ impl PlayerState {
             self.fail_open("The file is empty.", now);
             return;
         }
-        let Some(data) = read_file(fs, node, self.media_size).filter(|data| !data.is_empty())
-        else {
-            self.fail_open("The file could not be read.", now);
+        self.subtitles = load_subtitles(fs, node);
+        if media_kind(fs, node) == MediaKind::Audio {
+            self.open_audio(node, Source::File, play, now);
             return;
-        };
-
-        match video_info(&data) {
-            Ok(info) => {
-                self.info = Some(info);
-                self.frame_count = info.frame_count;
-                self.frame_width = info.width;
-                self.frame_height = info.height;
-                if !info.can_decode() {
-                    self.fail_open("The codec is recognised but cannot be decoded here.", now);
-                    return;
-                }
-                let Ok(rgba_len) = info.rgba_len() else {
-                    self.fail_open("Invalid video dimensions.", now);
-                    return;
-                };
-                if rgba_len > MAX_FRAME_BYTES {
-                    self.fail_open("The video is larger than the player's 1080p limit.", now);
-                    return;
-                }
-                let decoder = match VideoDecoder::with_limits(data, DECODER_LIMITS) {
-                    Ok(decoder) => decoder,
-                    Err(error) => {
-                        let mut text = Text::<160>::new();
-                        let _ = write!(text, "Unsupported media: {error}");
-                        self.fail_open(text.as_str(), now);
-                        return;
-                    }
-                };
-                let Some(rgba) = zeroed(rgba_len) else {
-                    self.fail_open("Not enough memory for the video frame.", now);
-                    return;
-                };
-                self.rgba = rgba;
-                self.frame_count = decoder.frame_count();
-                self.duration_ms = decoder.duration_ms();
-                // Each file sets its own rate: the status line must not show the
-                // rate of whatever played before.
-                match (info.frame_rate, self.frame_count as u64 * 1000) {
-                    (Some((num, den)), _) if num > 0 && den > 0 => {
-                        self.fps_num = num;
-                        self.fps_den = den;
-                    }
-                    (_, frames) if frames > 0 && frames <= u32::MAX as u64 => {
-                        self.fps_num = frames as u32;
-                        self.fps_den = self.duration_ms.clamp(1, u32::MAX as u64) as u32;
-                    }
-                    _ => {}
-                }
-                self.decoder = Some(decoder);
-                self.playing = play;
-                if !self.decode_current() {
-                    self.playing = false;
-                }
-            }
-            Err(error) => {
-                let mut text = Text::<160>::new();
-                let _ = write!(text, "Unsupported media: {error}");
-                self.error = text;
-                self.playing = false;
-            }
         }
+        if !self.engine.ensure_worker() {
+            self.fail_open("No process is free to decode this file.", now);
+            return;
+        }
+        // Silent if this can't be had: no device, no track, no process.
+        self.open_audio_track(node, play);
+        self.media_open = true;
+        self.waiting_frame = true;
+        self.playing = play;
+        self.sent_playing = play;
+        self.sent_hear = play && self.speed == 1.0;
+        self.engine.pipe.open(node, play);
+        self.engine.pump();
+        self.receive(now);
         self.last_tick = now;
         if let Some(playlist) = Layout::compute(self, now).playlist {
             let rows = playlist_visible_rows(playlist);
@@ -809,10 +969,96 @@ impl PlayerState {
         }
     }
 
+    /// Starts a sound-only file.
+    fn open_audio(&mut self, node: NodeId, source: Source, play: bool, now: u64) {
+        if !self.audio.ensure_task() {
+            self.fail_open("This file cannot be played here.", now);
+            return;
+        }
+        self.audio_only = true;
+        self.audio_pending = true;
+        self.audio_done = false;
+        self.media_open = true;
+        self.playing = play;
+        self.sent_playing = play;
+        PLAYER_PIPE.open(node, source, !play);
+    }
+
+    /// Starts the sound of a video.
+    fn open_audio_track(&mut self, node: NodeId, play: bool) {
+        if !self.audio.ensure_task() {
+            return;
+        }
+        self.audio_pending = true;
+        self.audio_done = false;
+        PLAYER_PIPE.open(node, Source::Track, !play);
+    }
+
+    /// Picks up what the audio task has reported.
+    fn receive_audio(&mut self, fs: &dyn FileSystem, now: u64) -> bool {
+        self.audio.check_task(now);
+        if self.audio.processes.is_none() || !(self.audio_pending || !self.audio_done) {
+            return false;
+        }
+        if self.audio.pid.is_none() {
+            self.audio_gone(now);
+            return false;
+        }
+        let report = PLAYER_PIPE.report();
+        if let Some(info) = report.info {
+            self.audio_pending = false;
+            self.audio_info = Some(info);
+            if self.audio_only {
+                self.duration_ms = info.duration_ms;
+            }
+        }
+        if let Some(failure) = report.failure {
+            self.audio_gone(now);
+            if self.audio_only {
+                let message = match failure {
+                    AudioFailure::Mixer(_) => "No sound device can play this file.",
+                    AudioFailure::Codec(_) => "This sound format cannot be decoded here.",
+                    AudioFailure::Unreadable => "The file could not be read.",
+                    AudioFailure::NoTrack => "This file has no sound to play.",
+                };
+                self.fail_open(message, now);
+            }
+        }
+        if report.ended {
+            self.audio_done = true;
+            if self.audio_only {
+                self.position_ms = self.duration_ms;
+                return self.handle_end(fs, now);
+            }
+        }
+        false
+    }
+
+    /// There's no sound after all, so a timer becomes the clock.
+    fn audio_gone(&mut self, _now: u64) {
+        self.audio_pending = false;
+        self.audio_done = true;
+        self.audio_info = None;
+    }
+
+    /// Whether the sound sets the time right now.
+    fn audio_is_clock(&self) -> bool {
+        self.audio_info.is_some() && !self.audio_done && self.speed == 1.0 && !self.audio_stale
+    }
+
     /// Forgets the open file and everything derived from it.
     fn reset_media(&mut self) {
+        self.audio_only = false;
+        self.audio_pending = false;
+        self.audio_info = None;
+        self.audio_done = true;
+        self.audio_stale = false;
+        if self.audio.pid.is_some() {
+            PLAYER_PIPE.close_media();
+        }
         self.info = None;
-        self.decoder = None;
+        self.media_open = false;
+        self.engine.pipe.close_media();
         self.rgba = Vec::new();
         self.frame_width = 0;
         self.frame_height = 0;
@@ -821,85 +1067,117 @@ impl PlayerState {
         self.fps_num = DEFAULT_FPS;
         self.fps_den = 1;
         self.duration_ms = 0;
-        self.pending_frame = None;
+        self.waiting_frame = false;
+        self.step_wait = false;
+        self.eos = false;
+        self.next_due = None;
         self.has_frame = false;
     }
 
     fn fail_open(&mut self, message: &str, now: u64) {
         self.error.set(message);
         self.playing = false;
+        self.media_open = false;
+        self.waiting_frame = false;
         self.set_notice("Playback Error", message, now);
     }
 
-    /// Decodes the frame at `frame_index`, however long that takes.
-    fn decode_current(&mut self) -> bool {
-        self.pending_frame = Some(self.frame_index);
-        self.service_pending(u32::MAX)
+    /// Takes in a file the worker has opened.
+    fn accept_opened(&mut self, opened: Opened) {
+        let info = opened.info;
+        self.info = Some(info);
+        self.frame_width = info.width;
+        self.frame_height = info.height;
+        self.frame_count = opened.frame_count;
+        self.duration_ms = opened.duration_ms;
+        // Each file sets its own rate: the status line must not show the rate
+        // of whatever played before.
+        match (info.frame_rate, self.frame_count as u64 * 1000) {
+            (Some((num, den)), _) if num > 0 && den > 0 => {
+                self.fps_num = num;
+                self.fps_den = den;
+            }
+            (_, frames) if frames > 0 && frames <= u32::MAX as u64 => {
+                self.fps_num = frames as u32;
+                self.fps_den = self.duration_ms.clamp(1, u32::MAX as u64) as u32;
+            }
+            _ => {}
+        }
     }
 
-    /// Works towards the pending frame, decoding at most `budget` samples.
-    /// Returns true if a new frame is ready to show.
-    fn service_pending(&mut self, budget: u32) -> bool {
-        let Some(target) = self.pending_frame else {
-            return false;
-        };
-        let Some(decoder) = self.decoder.as_mut() else {
-            self.pending_frame = None;
-            return false;
-        };
-        match decoder.advance(target, &mut self.rgba, budget) {
-            Ok(Some(frame)) => {
-                self.show_frame(frame);
-                true
+    /// Reports why the open file can't play.
+    fn accept_failure(&mut self, failure: Failure, now: u64) {
+        self.waiting_frame = false;
+        self.step_wait = false;
+        match failure {
+            Failure::Video(error) if self.has_frame || self.info.is_some() => {
+                self.stop_with_error(error)
             }
-            Ok(None) => false,
-            Err(VideoError::FrameOutOfRange { .. }) => {
-                self.pending_frame = None;
-                self.ended = true;
+            Failure::Video(error) => {
+                let mut text = Text::<160>::new();
+                let _ = write!(text, "Unsupported media: {error}");
+                self.error = text;
                 self.playing = false;
-                self.position_ms = self.duration_ms;
-                false
+                self.media_open = false;
             }
-            // A frame can be larger than the file's first one said. The decoder
-            // holds it, so ask again once the buffer fits.
-            Err(VideoError::BufferTooSmall { required, .. })
-                if required <= MAX_FRAME_BYTES && required > self.rgba.len() =>
-            {
-                match zeroed(required) {
-                    Some(rgba) => {
-                        self.rgba = rgba;
-                        self.service_pending(budget)
-                    }
-                    None => {
-                        self.stop_with_error(VideoError::OutOfMemory);
-                        false
-                    }
-                }
+            Failure::Unreadable => self.fail_open("The file could not be read.", now),
+            Failure::TooLarge => {
+                self.fail_open("The file is larger than the player's 16 MiB limit.", now)
             }
-            Err(error) if error.is_fatal() || matches!(error, VideoError::BufferTooSmall { .. }) => {
-                self.stop_with_error(error);
-                false
+            Failure::FrameTooLarge => {
+                self.fail_open("The video is larger than the player's 1080p limit.", now)
             }
-            // One damaged frame: keep what's on screen and carry on.
-            Err(error) => {
-                self.pending_frame = None;
-                self.frame_index = target;
-                if !self.has_frame {
-                    let mut text = Text::<160>::new();
-                    let _ = write!(text, "Playback error: {error}");
-                    self.error = text;
-                }
-                false
+            Failure::NoDecoder(info) => {
+                self.info = Some(info);
+                self.frame_count = info.frame_count;
+                self.frame_width = info.width;
+                self.frame_height = info.height;
+                self.fail_open("The codec is recognised but cannot be decoded here.", now);
             }
         }
     }
 
+    /// Picks up whatever the worker has finished. Returns true if the picture
+    /// changed.
+    fn receive(&mut self, now: u64) -> bool {
+        let report = self.engine.pipe.report();
+        self.eos = report.eos;
+        if let Some(opened) = report.opened {
+            self.accept_opened(opened);
+        }
+        if let Some(failure) = report.failure {
+            self.accept_failure(failure, now);
+        }
+        if let Some(error) = report.damaged {
+            // One damaged frame: keep what's on screen and carry on.
+            self.waiting_frame = false;
+            self.step_wait = false;
+            if !self.has_frame {
+                let mut text = Text::<160>::new();
+                let _ = write!(text, "Playback error: {error}");
+                self.error = text;
+            }
+        }
+        if self.waiting_frame {
+            if let Some(frame) = self.engine.pipe.take_requested(&mut self.rgba) {
+                self.waiting_frame = false;
+                self.show_frame(frame);
+                if core::mem::take(&mut self.step_wait) {
+                    self.position_ms = frame.pts_ms.min(self.duration_ms);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
     fn show_frame(&mut self, frame: DecodedFrame) {
-        self.pending_frame = None;
         self.has_frame = true;
         self.frame_index = frame.index;
         self.frame_width = frame.width;
         self.frame_height = frame.height;
+        self.next_due =
+            (frame.delay_ms > 0).then(|| frame.pts_ms.saturating_add(frame.delay_ms as u64));
         self.error.clear();
     }
 
@@ -907,21 +1185,42 @@ impl PlayerState {
         let mut text = Text::<160>::new();
         let _ = write!(text, "Playback error: {error}");
         self.error = text;
-        self.pending_frame = None;
+        self.waiting_frame = false;
         self.playing = false;
     }
 
-    fn frame_for_position(&self) -> u32 {
-        self.decoder
-            .as_ref()
-            .map_or(0, |decoder| decoder.frame_at_time(self.position_ms))
+    /// Asks the worker for one frame to land on.
+    fn request_frame(&mut self, seek: Seek, now: u64) {
+        if self.audio_only {
+            return;
+        }
+        self.waiting_frame = true;
+        self.eos = false;
+        self.sync_playing();
+        self.engine.pipe.seek(seek);
+        self.engine.pump();
+        self.receive(now);
     }
 
-    fn position_for_frame(&self, frame: u32) -> u64 {
-        self.decoder
-            .as_ref()
-            .and_then(|decoder| decoder.frame_time_ms(frame))
-            .unwrap_or(0)
+    fn sync_playing(&mut self) {
+        // The sound only keeps up at normal speed.
+        let hear = self.playing && self.speed == 1.0;
+        if self.sent_playing != self.playing || self.sent_hear != hear {
+            self.sent_playing = self.playing;
+            self.sent_hear = hear;
+            self.engine.pipe.set_playing(self.playing);
+            if self.audio_info.is_some() || self.audio_pending {
+                // Frames stepped or a changed speed have moved the picture on.
+                if hear && self.audio_stale {
+                    self.audio_stale = false;
+                    PLAYER_PIPE.seek(self.position_ms);
+                }
+                PLAYER_PIPE.set_paused(!hear);
+            }
+        }
+        if !hear && self.playing && self.audio_info.is_some() {
+            self.audio_stale = true;
+        }
     }
 
     fn tick(&mut self, fs: &dyn FileSystem, now: u64) -> bool {
@@ -938,28 +1237,63 @@ impl PlayerState {
                 changed = true;
             }
         }
-        changed |= self.service_pending(TICK_SAMPLES);
+        self.sync_playing();
+        self.engine.pump();
+        if !self.audio_only {
+            changed |= self.receive(now);
+            if !self.engine.check_worker(now) && self.media_open {
+                self.fail_open("The decoder task has stopped.", now);
+                changed = true;
+            }
+        }
+        changed |= self.receive_audio(fs, now);
         let elapsed = now.saturating_sub(self.last_tick);
         self.last_tick = now;
         if !self.playing {
             return changed;
         }
-        // The decoder is behind: hold the clock, because it would have to decode
-        // the frames in between anyway.
-        if self.pending_frame.is_some() || elapsed == 0 {
+        if self.audio_only {
+            if self.audio_is_clock() {
+                let position = PLAYER_PIPE.position_ms();
+                changed |= position / 1000 != self.position_ms / 1000;
+                self.position_ms = position.min(self.duration_ms);
+            }
             return changed;
         }
-        self.position_ms = self
-            .position_ms
-            .saturating_add((elapsed.min(MAX_TICK_MS) as f64 * self.speed as f64) as u64);
-        let target = self.frame_for_position();
-        if target != self.frame_index {
-            self.pending_frame = Some(target);
-            changed |= self.service_pending(TICK_SAMPLES);
+        // A frame was asked for, or the sound is starting: hold the clock.
+        if self.waiting_frame || self.audio_pending || elapsed == 0 {
+            return changed;
         }
-        if self.pending_frame.is_none()
+        let position = if self.audio_is_clock() {
+            // The sound is the master: frames that would come late get skipped.
+            let position = PLAYER_PIPE.position_ms();
+            self.engine.pipe.set_skip_to(Some(position));
+            position
+        } else {
+            self.engine.pipe.set_skip_to(None);
+            let mut position = self
+                .position_ms
+                .saturating_add((elapsed.min(MAX_TICK_MS) as f64 * self.speed as f64) as u64);
+            // The decoder is behind: hold the clock at the frame it owes, because
+            // it has to decode the frames in between anyway.
+            if !self.eos && self.engine.pipe.queued() == 0 {
+                if let Some(due) = self.next_due {
+                    position = position.min(due.max(self.position_ms));
+                }
+            }
+            position
+        };
+        self.position_ms = position;
+        if let Some(frame) = self.engine.pipe.take_due(position, &mut self.rgba) {
+            self.show_frame(frame);
+            changed = true;
+        }
+        self.engine.pump();
+        let picture_done = self.eos && self.engine.pipe.queued() == 0;
+        if picture_done
             && self.duration_ms > 0
             && self.position_ms >= self.duration_ms
+            && (self.audio_done || self.audio_info.is_none())
         {
             changed |= self.handle_end(fs, now);
         }
@@ -969,8 +1303,8 @@ impl PlayerState {
     fn handle_end(&mut self, fs: &dyn FileSystem, now: u64) -> bool {
         match self.loop_mode {
             LoopMode::One => {
-                self.seek_to(0, now);
                 self.playing = true;
+                self.seek_to(0, now);
                 true
             }
             LoopMode::All => {
@@ -1001,7 +1335,7 @@ impl PlayerState {
         } else {
             // A file that didn't open has nothing to play: don't run the clock
             // over a black picture.
-            if self.decoder.is_none() || (!self.has_frame && !self.error.is_empty()) {
+            if !self.media_open || (!self.has_frame && !self.error.is_empty()) {
                 self.show_osd("Cannot play this file", now);
                 return true;
             }
@@ -1022,22 +1356,33 @@ impl PlayerState {
         self.ended = false;
         self.position_ms = 0;
         self.frame_index = 0;
-        if self.decoder.is_some() {
-            self.decode_current();
+        if self.audio_info.is_some() {
+            PLAYER_PIPE.seek(0);
+            self.audio_done = false;
+            self.audio_stale = false;
+            PLAYER_PIPE.set_paused(true);
+        }
+        if self.media_open {
+            self.request_frame(Seek::Frame(0), now);
         }
         self.show_osd("Stopped", now);
         self.last_tick = now;
     }
 
     fn seek_to(&mut self, position: u64, now: u64) {
-        if self.duration_ms == 0 || self.decoder.is_none() {
+        if self.duration_ms == 0 || !self.media_open {
             return;
         }
         self.position_ms = position.min(self.duration_ms);
-        // Frames arrive over the next ticks if this is far from a key frame.
-        self.pending_frame = Some(self.frame_for_position());
+        self.step_wait = false;
         self.ended = false;
-        self.service_pending(TICK_SAMPLES);
+        if self.audio_info.is_some() {
+            PLAYER_PIPE.seek(self.position_ms);
+            self.audio_done = false;
+            self.audio_stale = false;
+        }
+        // The frame arrives once the worker has decoded its way there.
+        self.request_frame(Seek::Time(self.position_ms), now);
         self.last_tick = now;
         self.show_osd_time(self.position_ms, now);
     }
@@ -1063,22 +1408,36 @@ impl PlayerState {
     }
 
     fn step_frame(&mut self, delta: i64, now: u64) {
-        if self.decoder.is_none() || self.frame_count == 0 {
+        if !self.media_open || self.frame_count == 0 {
             return;
         }
         self.playing = false;
+        self.audio_stale = self.audio_info.is_some();
         let frame = if delta < 0 {
             self.frame_index.saturating_sub((-delta) as u32)
         } else {
             self.frame_index.saturating_add(delta as u32)
         };
         self.frame_index = frame.min(self.frame_count - 1);
-        self.decode_current();
-        self.position_ms = self
-            .position_for_frame(self.frame_index)
-            .min(self.duration_ms);
+        self.step_wait = true;
+        self.request_frame(Seek::Frame(self.frame_index), now);
         self.last_tick = now;
         self.show_osd("Frame step", now);
+    }
+
+    fn change_volume(&mut self, delta: i32, now: u64) {
+        let level = (feos_mixer::volume() as i32 + delta).clamp(0, feos_mixer::MAX_VOLUME as i32);
+        feos_mixer::set_volume(level as u8);
+        feos_mixer::set_muted(false);
+        let mut text = Text::<48>::new();
+        let _ = write!(text, "Volume {level}%");
+        self.show_osd(text.as_str(), now);
+    }
+
+    fn toggle_mute(&mut self, now: u64) {
+        let muted = !feos_mixer::muted();
+        feos_mixer::set_muted(muted);
+        self.show_osd(if muted { "Muted" } else { "Sound on" }, now);
     }
 
     fn set_speed(&mut self, speed: f32, now: u64) {
@@ -1287,6 +1646,7 @@ impl PlayerState {
     fn action_enabled(&self, action: Action) -> bool {
         match action {
             Action::None => false,
+            Action::VolumeUp | Action::VolumeDown | Action::ToggleMute => true,
             Action::Open | Action::Quit | Action::TogglePlaylist | Action::Fullscreen => true,
             Action::PlayPause => self.current.is_some() || self.playlist_len > 0,
             Action::PlayItem | Action::ItemInfo => true,
@@ -1314,6 +1674,7 @@ impl PlayerState {
     fn action_checked(&self, action: Action) -> bool {
         match action {
             Action::TogglePlaylist => self.playlist_open,
+            Action::ToggleMute => feos_mixer::muted(),
             Action::Fullscreen => self.fullscreen,
             Action::CycleLoop => self.loop_mode != LoopMode::Off,
             Action::ToggleShuffle => self.shuffle,
@@ -1350,6 +1711,9 @@ impl PlayerState {
                 }
             }
             Action::Stop => self.stop(now),
+            Action::VolumeUp => self.change_volume(10, now),
+            Action::VolumeDown => self.change_volume(-10, now),
+            Action::ToggleMute => self.toggle_mute(now),
             Action::Previous => {
                 self.previous_media(fs, now, true);
                 self.show_osd("Previous", now);
@@ -1474,7 +1838,19 @@ fn is_media_file(name: &str) -> bool {
     let extension = file_extension(name);
     [
         "gif", "avi", "mp4", "m4v", "mov", "mkv", "webm", "flv", "ivf", "h264", "264", "mjpeg",
-        "mjpg",
+        "mjpg", "mpg", "mpeg", "m1v",
+    ]
+    .iter()
+    .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+        || is_audio_file(name)
+}
+
+/// Whether a name looks like a sound file.
+pub(crate) fn is_audio_file(name: &str) -> bool {
+    let extension = file_extension(name);
+    [
+        "wav", "wave", "aif", "aiff", "aifc", "au", "snd", "mp3", "mp2", "mp1", "flac", "ogg",
+        "oga", "aac", "m4a",
     ]
     .iter()
     .any(|candidate| extension.eq_ignore_ascii_case(candidate))
@@ -1971,13 +2347,6 @@ impl PlayerState {
             }
             Key::Character('a') | Key::Character('A') => self.cycle_aspect(now),
             Key::Character('h') | Key::Character('H') => self.dialog = Dialog::Help,
-            Key::Character('m') | Key::Character('M') => self.set_notice(
-                "Audio",
-                "The feos video containers exposed by feos-video currently \
-                 carry a video track only; this build has no audio stream to \
-                 mute or control.",
-                now,
-            ),
             Key::Character('q') | Key::Character('Q') => self.exit = true,
             Key::Left => self.seek_rel(
                 if modifiers.contains(Modifiers::SHIFT) {
@@ -2008,18 +2377,20 @@ impl PlayerState {
             Key::Character('+') | Key::Character('=') => self.speed_up(now),
             Key::Character('-') | Key::Character('_') => self.speed_down(now),
             Key::Character('0') => self.set_speed(1.0, now),
-            Key::Up => self.set_notice(
-                "Audio",
-                "Volume controls are unavailable because the current video \
-                 containers have no audio track.",
-                now,
-            ),
-            Key::Down => self.set_notice(
-                "Audio",
-                "Volume controls are unavailable because the current video \
-                 containers have no audio track.",
-                now,
-            ),
+            Key::Up => self.change_volume(10, now),
+            Key::Down => self.change_volume(-10, now),
+            Key::Character('m') | Key::Character('M') => self.toggle_mute(now),
+            Key::Character('v') | Key::Character('V') => {
+                self.subtitles_on = !self.subtitles_on;
+                let message = if self.subtitles.is_none() {
+                    "No subtitles for this file"
+                } else if self.subtitles_on {
+                    "Subtitles on"
+                } else {
+                    "Subtitles off"
+                };
+                self.show_osd(message, now);
+            }
             _ => {}
         }
         false
@@ -2586,7 +2957,8 @@ pub(super) fn open_player(fs: &dyn FileSystem, context: &WindowContext<'_, '_>) 
         context.canvas.width() as u32,
         context.canvas.height() as u32,
     );
-    let mut state = PlayerState::new(fs, screen, context.args, context.now_ms);
+    let engine = Engine::task(context.platform.processes);
+    let mut state = PlayerState::new(fs, screen, context.args, context.now_ms, engine);
     state.has_pointer = true;
     state.pointer = context.pointer();
     state.show_cursor = false;
@@ -2645,7 +3017,8 @@ pub fn run(fs: &dyn FileSystem, context: &mut Context<'_>) {
     }
     let screen = Rect::new(0, 0, view.width, view.height);
     let now = platform.clock.uptime_ms();
-    let mut state = PlayerState::new(fs, screen, context.args, now);
+    let engine = Engine::task(platform.processes);
+    let mut state = PlayerState::new(fs, screen, context.args, now, engine);
     state.has_pointer = platform.pointer.is_some();
     if let Some(pointer) = platform.pointer {
         let (x, y) = pointer.position();
@@ -3018,6 +3391,9 @@ fn draw_video(painter: &mut Painter<'_, '_>, state: &mut PlayerState, layout: La
         draw_no_media(painter, layout.video);
         return;
     }
+    if state.audio_only {
+        draw_sound_only(painter, layout.video, state.media_name.as_str());
+    }
     if !state.rgba.is_empty() && state.frame_width > 0 && state.frame_height > 0 {
         let frame = FrameLayout {
             width: state.frame_width,
@@ -3098,6 +3474,14 @@ fn draw_video(painter: &mut Painter<'_, '_>, state: &mut PlayerState, layout: La
             ORANGE,
         );
     }
+    if let Some(text) = state
+        .subtitles
+        .as_ref()
+        .filter(|_| state.subtitles_on)
+        .and_then(|subtitles| subtitles.at(state.position_ms))
+    {
+        draw_subtitle(painter, layout.video, text);
+    }
     if state.fullscreen {
         let name = if state.media_name.is_empty() {
             "No media"
@@ -3120,6 +3504,41 @@ fn draw_video(painter: &mut Painter<'_, '_>, state: &mut PlayerState, layout: La
     }
 }
 
+/// Draws a cue's lines, centred at the bottom of the picture.
+fn draw_subtitle(painter: &mut Painter<'_, '_>, video: Rect, text: &str) {
+    let lines = text.lines().count() as i32;
+    let line_height = 18;
+    let mut y = video.bottom_i32() - 10 - lines * line_height;
+    for line in text.lines() {
+        let width = painter.text_width(line, 1).min(video.width as i32);
+        let x = video.x + (video.width as i32 - width) / 2;
+        painter.fill_rect_alpha(
+            Rect::new(x - 6, y - 1, (width + 12) as u32, line_height as u32),
+            Color::BLACK,
+            150,
+        );
+        painter.draw_text(x, y + 4, line, Color::WHITE, 1);
+        y += line_height;
+    }
+}
+
+/// What the picture area shows for a file that's only sound.
+fn draw_sound_only(painter: &mut Painter<'_, '_>, rect: Rect, name: &str) {
+    let cone = Rect::new(
+        rect.x + (rect.width as i32 - 96) / 2,
+        rect.y + rect.height as i32 / 2 - 90,
+        96,
+        96,
+    );
+    draw_logo(painter, cone);
+    painter.draw_text_centered(
+        Rect::new(rect.x, cone.bottom_i32() + 20, rect.width, 24),
+        name,
+        TEXT,
+        2,
+    );
+}
+
 fn draw_no_media(painter: &mut Painter<'_, '_>, rect: Rect) {
     let cone = Rect::new(
         rect.x + (rect.width as i32 - 96) / 2,
@@ -3136,7 +3555,7 @@ fn draw_no_media(painter: &mut Painter<'_, '_>, rect: Rect) {
     );
     painter.draw_text_centered(
         Rect::new(rect.x, cone.bottom_i32() + 50, rect.width, 18),
-        "Press O to open a video, or double-click a playlist item",
+        "Press O to open a file, or double-click a playlist item",
         MUTED,
         1,
     );
@@ -3287,6 +3706,15 @@ fn draw_status_bar(painter: &mut Painter<'_, '_>, state: &PlayerState, layout: L
             info.height,
             info.frame_count,
             fps.as_str()
+        );
+        if let Some(audio) = state.audio_info {
+            let _ = write!(status, "  |  {} sound", audio.codec);
+        }
+    } else if let Some(audio) = state.audio_info {
+        let _ = write!(
+            status,
+            "{}  |  {} Hz  |  {} channel(s)",
+            audio.codec, audio.sample_rate, audio.channels
         );
     } else {
         status.set("No media");
@@ -4108,6 +4536,7 @@ fn container_name(format: ContainerFormat) -> &'static str {
         ContainerFormat::Ivf => "IVF",
         ContainerFormat::H264 => "H.264 Annex-B",
         ContainerFormat::MotionJpeg => "Motion JPEG",
+        ContainerFormat::Mpeg1 => "MPEG-1",
     }
 }
 
@@ -4311,7 +4740,10 @@ mod tests {
         assert!(is_media_file("animation.gif"));
         assert!(is_media_file("stream.h264"));
         assert!(!is_media_file("README.txt"));
-        assert!(!is_media_file("song.wav"));
+        assert!(is_media_file("song.wav"));
+        assert!(is_media_file("SONG.FLAC"));
+        assert!(is_audio_file("song.m4a"));
+        assert!(!is_audio_file("clip.mp4"));
     }
 
     #[test]
@@ -4394,7 +4826,7 @@ mod tests {
     ]);
 
     fn player() -> PlayerState {
-        PlayerState::new(&MEDIA, Rect::new(0, 0, 800, 600), "", 1000)
+        PlayerState::new(&MEDIA, Rect::new(0, 0, 800, 600), "", 1000, Engine::inline(&MEDIA))
     }
 
     fn node(index: usize) -> NodeId {
@@ -4416,7 +4848,7 @@ mod tests {
     fn frames_follow_their_presentation_times() {
         let mut state = player();
         state.open_node(&MEDIA, node(1), 1000, true);
-        let delay = state.decoder.as_ref().unwrap().frame_delay_ms(0) as u64;
+        let delay = state.next_due.unwrap();
         assert!(delay > 0);
         state.tick(&MEDIA, 1000 + delay - 1);
         assert_eq!(state.frame_index, 0);
@@ -4515,9 +4947,7 @@ mod tests {
         let mut state = player();
         state.open_node(&MEDIA, node(0), 1000, false);
         state.seek_to(650, 1000);
-        while state.pending_frame.is_some() {
-            state.service_pending(TICK_SAMPLES);
-        }
+        assert!(!state.waiting_frame);
         assert_eq!(state.frame_index, 6);
         assert_eq!(state.position_ms, 650);
     }
@@ -4557,6 +4987,71 @@ mod tests {
         assert!(state.error.is_empty());
         assert_eq!((state.frame_width, state.frame_height), (48, 32));
         assert_eq!(state.info.unwrap().display_size(), (32, 48));
+    }
+
+    #[test]
+    fn the_sound_is_the_clock_and_frames_follow_it() {
+        // A/V sync: with sound playing, the picture shows the frame at the audio
+        // position, whatever the timer says, and doesn't wait for frames in between.
+        let mut state = player();
+        state.open_node(&MEDIA, node(0), 1000, true);
+        assert_eq!(state.frame_index, 0);
+        state.audio_info = Some(TrackInfo {
+            codec: "test",
+            sample_rate: 48_000,
+            channels: 2,
+            duration_ms: state.duration_ms,
+        });
+        state.audio_done = false;
+        assert!(state.audio_is_clock());
+
+        PLAYER_PIPE.position_ms_for_test(200);
+        state.tick(&MEDIA, 1005);
+        assert_eq!(state.position_ms, 200, "not the 5 ms the timer saw");
+        assert_eq!(state.frame_index, 2);
+
+        // A stalled sound device holds the picture even as the timer runs on.
+        state.tick(&MEDIA, 1800);
+        assert_eq!(state.position_ms, 200);
+        assert_eq!(state.frame_index, 2);
+
+        // Frames that are already late are skipped.
+        PLAYER_PIPE.position_ms_for_test(500);
+        state.tick(&MEDIA, 1850);
+        assert_eq!(state.frame_index, 5);
+
+        // At another speed the sound can't keep up, so the timer takes over.
+        state.set_speed(2.0, 1850);
+        assert!(!state.audio_is_clock());
+        state.tick(&MEDIA, 1950);
+        assert_eq!(state.position_ms, 700);
+    }
+
+    #[test]
+    fn sound_files_are_told_apart_from_video_by_content_and_name() {
+        static FILES: MockFs = MockFs(&[
+            ("tune.wav", include_bytes!("../../../libs/audio-codec/tests/data/pcm16.wav")),
+            ("noname", include_bytes!("../../../libs/audio-codec/tests/data/tone.flac")),
+            ("clip.mp4", include_bytes!("../../../libs/video/tests/data/bframes.mp4")),
+            ("sound.m4a", include_bytes!("../../../libs/video/tests/data/av-aac.mp4")),
+        ]);
+        assert_eq!(media_kind(&FILES, node(0)), MediaKind::Audio);
+        assert_eq!(media_kind(&FILES, node(1)), MediaKind::Audio);
+        assert_eq!(media_kind(&FILES, node(2)), MediaKind::Video);
+        assert_eq!(media_kind(&FILES, node(3)), MediaKind::Audio);
+    }
+
+    #[test]
+    fn subtitles_beside_a_file_are_found() {
+        static FILES: MockFs = MockFs(&[
+            ("clip.gif", include_bytes!("../../../libs/video/tests/data/anim.gif")),
+            ("clip.srt", b"00:00:00,000 --> 00:00:09,000\nHello\n"),
+            ("other.gif", include_bytes!("../../../libs/video/tests/data/anim.gif")),
+            ("otherwise.srt", b"00:00:00,000 --> 00:00:09,000\nNo\n"),
+        ]);
+        let found = load_subtitles(&FILES, node(0)).unwrap();
+        assert_eq!(found.at(100), Some("Hello"));
+        assert!(load_subtitles(&FILES, node(2)).is_none());
     }
 
     #[test]

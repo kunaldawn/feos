@@ -59,3 +59,25 @@ for clip in ["bframes.h264", "anamorphic.mp4", "bt709_full.h264", "vfr.mp4", "rl
              "raw_i420_w30.avi"]:
     run("-i", clip, "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "rgba",
         clip.replace(".", "_") + ".ref")
+
+# Video with audio, a second of each, for the audio track tests.
+AV = ["-f", "lavfi", "-i", "testsrc=size=64x48:rate=10:duration=1",
+      "-f", "lavfi", "-i", "sine=f=440:r=44100:d=1", "-ac", "2"]
+H264 = ["-c:v", "libx264", "-profile:v", "baseline", "-bf", "0", "-pix_fmt", "yuv420p",
+        "-preset", "ultrafast", "-crf", "40"]
+run(*AV, *H264, "-c:a", "aac", "-b:a", "64k", "av-aac.mp4")
+run(*AV, *H264, "-c:a", "aac", "-b:a", "64k", "av-aac.flv")
+run(*AV, *H264, "-c:a", "libmp3lame", "-b:a", "64k", "av-mp3.mkv")
+run(*AV, *H264, "-c:a", "flac", "av-flac.mkv")
+run(*AV, *H264, "-c:a", "libvorbis", "-q:a", "1", "av-vorbis.mkv")
+run(*AV, "-c:v", "mjpeg", "-c:a", "pcm_s16le", "av-pcm.avi")
+run(*AV, "-c:v", "mjpeg", "-c:a", "pcm_s16le", "av-pcm.mov")
+
+# MPEG-1, with B pictures, as a raw stream and a program stream. Each reference
+# is ffmpeg's decoding to RGBA.
+M1V = ["-f", "lavfi", "-i", "testsrc=size=64x48:rate=25:duration=1", "-c:v", "mpeg1video", "-q:v", "4"]
+run(*M1V, "-bf", "2", "-g", "8", "-f", "mpeg1video", "mpeg1.m1v")
+run("-f", "lavfi", "-i", "testsrc=size=64x48:rate=25:duration=0.5", "-c:v", "mpeg1video", "-q:v", "4",
+    "-bf", "1", "-g", "4", "-f", "mpeg", "mpeg1.mpg")
+for clip in ["mpeg1.m1v", "mpeg1.mpg"]:
+    run("-i", clip, "-f", "rawvideo", "-pix_fmt", "rgba", clip.replace(".", "_") + ".ref")

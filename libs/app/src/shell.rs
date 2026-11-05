@@ -65,6 +65,94 @@ pub enum Request {
     },
     /// Start dragging a path; the desktop draws it and resolves the drop.
     BeginDrag(Text<REQUEST_MAX>),
+    /// Bring this window forward, restoring it if it is minimized.
+    Activate(u16),
+    /// Close this window, as its title bar's button would.
+    CloseWindow(u16),
+}
+
+/// Most windows [`publish_windows`] keeps.
+pub const MAX_WINDOWS: usize = 16;
+
+/// Hosted windows appear in process lists under `HOSTED_PID_BASE + window`. They
+/// have no process of their own: the desktop draws them on its thread.
+pub const HOSTED_PID_BASE: u32 = 1_000_000;
+
+/// One open window, as the session last published it.
+#[derive(Clone, Copy, Debug)]
+pub struct WindowInfo {
+    /// The window's number in [`Request::Activate`] and [`Request::CloseWindow`].
+    pub window: u16,
+    /// The window's process, when it has one.
+    pub pid: Option<u32>,
+    /// The desktop draws this window from an app on its own thread.
+    pub hosted: bool,
+    /// The title bar's text.
+    pub title: Text<32>,
+    /// Time the desktop has spent on this window's frames, in microseconds.
+    pub cpu_us: u64,
+    /// The window is minimized.
+    pub minimized: bool,
+    /// The window has the keyboard.
+    pub focused: bool,
+}
+
+impl WindowInfo {
+    /// The ID a process list shows for this window: its process, or a stand-in.
+    pub fn list_pid(&self) -> u32 {
+        self.pid
+            .filter(|_| !self.hosted)
+            .unwrap_or(HOSTED_PID_BASE + u32::from(self.window))
+    }
+
+    /// An entry for initializing a list.
+    pub const fn empty() -> Self {
+        Self {
+            window: 0,
+            pid: None,
+            hosted: false,
+            title: Text::EMPTY,
+            cpu_us: 0,
+            minimized: false,
+            focused: false,
+        }
+    }
+}
+
+struct WindowList {
+    items: [WindowInfo; MAX_WINDOWS],
+    len: usize,
+}
+
+static WINDOWS: SpinLock<WindowList> = SpinLock::new(WindowList {
+    items: [WindowInfo::empty(); MAX_WINDOWS],
+    len: 0,
+});
+
+/// Replaces the list of open windows. Anything past [`MAX_WINDOWS`] is ignored.
+pub fn publish_windows(windows: &[WindowInfo]) {
+    let mut list = WINDOWS.lock();
+    let len = windows.len().min(MAX_WINDOWS);
+    list.items[..len].copy_from_slice(&windows[..len]);
+    list.len = len;
+}
+
+/// Copies the open windows into `out` and returns how many there are.
+pub fn windows(out: &mut [WindowInfo]) -> usize {
+    let list = WINDOWS.lock();
+    let len = list.len.min(out.len());
+    out[..len].copy_from_slice(&list.items[..len]);
+    len
+}
+
+/// Asks the session to bring a window forward.
+pub fn request_activate(window: u16) -> bool {
+    REQUESTS.lock().push(Request::Activate(window))
+}
+
+/// Asks the session to close a window.
+pub fn request_close(window: u16) -> bool {
+    REQUESTS.lock().push(Request::CloseWindow(window))
 }
 
 struct Queue<T: Copy, const N: usize> {
@@ -222,6 +310,9 @@ pub fn take_notification() -> Option<Notification> {
 /// File extensions the shipped bundles open, as `(extension, bundle id)`.
 const ASSOCIATIONS: &[(&str, &str)] = &[
     ("mp4", "media-player"),
+    ("mpg", "media-player"),
+    ("mpeg", "media-player"),
+    ("m1v", "media-player"),
     ("m4v", "media-player"),
     ("mov", "media-player"),
     ("mkv", "media-player"),
@@ -232,12 +323,31 @@ const ASSOCIATIONS: &[(&str, &str)] = &[
     ("h264", "media-player"),
     ("264", "media-player"),
     ("gif", "media-player"),
-    ("mp3", "media-player"),
-    ("wav", "media-player"),
-    ("flac", "media-player"),
-    ("ogg", "media-player"),
-    ("aac", "media-player"),
-    ("m4a", "media-player"),
+    ("png", "image-viewer"),
+    ("jpg", "image-viewer"),
+    ("jpeg", "image-viewer"),
+    ("bmp", "image-viewer"),
+    ("ppm", "image-viewer"),
+    ("pgm", "image-viewer"),
+    ("pbm", "image-viewer"),
+    ("pnm", "image-viewer"),
+    ("qoi", "image-viewer"),
+    ("ico", "image-viewer"),
+    ("mp3", "music"),
+    ("mp2", "music"),
+    ("mp1", "music"),
+    ("wav", "music"),
+    ("wave", "music"),
+    ("flac", "music"),
+    ("ogg", "music"),
+    ("oga", "music"),
+    ("aac", "music"),
+    ("m4a", "music"),
+    ("aif", "music"),
+    ("aiff", "music"),
+    ("aifc", "music"),
+    ("au", "music"),
+    ("snd", "music"),
 ];
 
 /// The bundle that opens `path`, judged by its extension.

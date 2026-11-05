@@ -3,4 +3,9 @@ name = "feos-fs"
 description = "Read-only StaticFs plus read/write FAT32 and exFAT drivers for feos"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+
+[dependencies]
+feos-hal = { workspace = true }
+feos-sync = { workspace = true }

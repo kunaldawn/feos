@@ -309,3 +309,139 @@ fn zip_rejects_sizes_that_cannot_be_true() {
     let mut reader = ZipReader::open(&image).unwrap();
     assert!(matches!(reader.next(), Err(ArchiveError::InvalidData(_))));
 }
+
+/// A ZIP whose central directory says "see the ZIP64 records" for everything, as
+/// an archiver does past 4 GiB, holding one stored member.
+fn zip64_archive(body: &[u8], count_override: Option<u64>) -> Vec<u8> {
+    use feos_compress::crc32;
+    let crc = crc32(body);
+    let mut out = Vec::new();
+    // Local header.
+    out.extend_from_slice(b"PK\x03\x04");
+    out.extend_from_slice(&[45, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(&u32::MAX.to_le_bytes());
+    out.extend_from_slice(&u32::MAX.to_le_bytes());
+    out.extend_from_slice(&5u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(b"a.txt");
+    out.extend_from_slice(body);
+
+    let central = out.len() as u64;
+    out.extend_from_slice(b"PK\x01\x02");
+    out.extend_from_slice(&[45, 0, 45, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(&u32::MAX.to_le_bytes());
+    out.extend_from_slice(&u32::MAX.to_le_bytes());
+    out.extend_from_slice(&5u16.to_le_bytes());
+    out.extend_from_slice(&28u16.to_le_bytes());
+    out.extend_from_slice(&[0; 10]);
+    out.extend_from_slice(&u32::MAX.to_le_bytes());
+    out.extend_from_slice(b"a.txt");
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&24u16.to_le_bytes());
+    out.extend_from_slice(&(body.len() as u64).to_le_bytes());
+    out.extend_from_slice(&(body.len() as u64).to_le_bytes());
+    out.extend_from_slice(&0u64.to_le_bytes());
+    let central_size = out.len() as u64 - central;
+
+    let end = out.len() as u64;
+    let count = count_override.unwrap_or(1);
+    out.extend_from_slice(b"PK\x06\x06");
+    out.extend_from_slice(&44u64.to_le_bytes());
+    out.extend_from_slice(&[45, 0, 45, 0]);
+    out.extend_from_slice(&[0; 8]);
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&central_size.to_le_bytes());
+    out.extend_from_slice(&central.to_le_bytes());
+
+    out.extend_from_slice(b"PK\x06\x07");
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&end.to_le_bytes());
+    out.extend_from_slice(&1u32.to_le_bytes());
+
+    out.extend_from_slice(b"PK\x05\x06");
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&[0xff; 4]);
+    out.extend_from_slice(&[0xff; 8]);
+    out.extend_from_slice(&[0; 2]);
+    out
+}
+
+#[test]
+fn zip64_records_and_extra_fields_are_read() {
+    let archive = zip64_archive(b"sixty-four bits", None);
+    let mut reader = feos_archive::ZipReader::open(&archive).unwrap();
+    assert_eq!(reader.len(), 1);
+    let entry = reader.next().unwrap().unwrap();
+    assert_eq!(entry.name().unwrap(), "a.txt");
+    assert_eq!(entry.uncompressed_size, 15);
+    assert_eq!(entry.local_offset, 0);
+    let mut out = [0u8; 15];
+    assert_eq!(entry.extract(&mut out).unwrap(), 15);
+    assert_eq!(&out, b"sixty-four bits");
+    assert!(reader.next().unwrap().is_none());
+}
+
+#[test]
+fn damaged_zip64_records_are_refused_without_panicking() {
+    // A count no directory that size could hold.
+    let archive = zip64_archive(b"x", Some(u64::MAX));
+    assert!(feos_archive::ZipReader::open(&archive).is_err());
+
+    // Every single-byte change either opens or errors: never a panic.
+    let good = zip64_archive(b"some member data", None);
+    let mut window = vec![0u8; feos_compress::WINDOW_SIZE];
+    for at in 0..good.len() {
+        for flip in [0x01u8, 0x80, 0xff] {
+            let mut bad = good.clone();
+            bad[at] ^= flip;
+            if let Ok(mut reader) = feos_archive::ZipReader::open(&bad) {
+                while let Ok(Some(entry)) = reader.next() {
+                    let _ = entry.extract_to(&mut window, &mut |_| Ok(()));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_member_can_be_extracted_to_a_sink_without_holding_it() {
+    let data: Vec<u8> = (0..200_000u32).map(|value| (value / 11) as u8).collect();
+    let mut scratch = vec![0u8; 400_000];
+    let mut packed = vec![0u8; 400_000];
+    let mut writer = feos_archive::ZipWriter::new(&mut packed);
+    writer.write_deflated("big.bin", &data, &mut scratch).unwrap();
+    writer.write_stored("small.txt", b"small").unwrap();
+    let len = writer.finish().unwrap();
+    packed.truncate(len);
+
+    let mut window = vec![0u8; feos_compress::WINDOW_SIZE];
+    let mut reader = feos_archive::ZipReader::open(&packed).unwrap();
+    let mut out = Vec::new();
+    let big = reader.next().unwrap().unwrap();
+    assert_eq!(
+        big.extract_to(&mut window, &mut |chunk: &[u8]| {
+            out.extend_from_slice(chunk);
+            Ok(())
+        })
+        .unwrap(),
+        data.len() as u64
+    );
+    assert_eq!(out, data);
+
+    // A refusal from the sink is what comes back.
+    let refused = big.extract_to(&mut window, &mut |_| Err(feos_archive::ArchiveError::Overflow));
+    assert_eq!(refused, Err(feos_archive::ArchiveError::Overflow));
+
+    out.clear();
+    let small = reader.next().unwrap().unwrap();
+    small
+        .extract_to(&mut window, &mut |chunk: &[u8]| {
+            out.extend_from_slice(chunk);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(out, b"small");
+}

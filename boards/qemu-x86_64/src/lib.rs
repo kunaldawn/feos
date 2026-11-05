@@ -9,18 +9,32 @@
 
 extern crate alloc;
 
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
+use feos_board_common::audio::{self, AudioDevice};
+use feos_board_common::usb;
+use feos_board_common::display::{self, back_buffer, display_name, display_size, framebuffer_addr};
+use feos_board_common::{bind_pci_net, bss_range, kernel_range, mount_filesystem, stack_range, wire_pci_disk, IrqRouter};
 use feos_console::println;
 use feos_driver_apic::ApicController;
+use feos_driver_cmos_rtc::CmosRtc;
 use feos_driver_fw_cfg::FwCfg;
 use feos_driver_i8042::{PointerKind, I8042};
-use feos_driver_intel_hda::{CodecInfo, IntelHda};
-use feos_driver_pci::PciPort;
-use feos_driver_ramfb::Ramfb;
+use feos_driver_pci::{configure_bridges, for_each_function, BarAllocator, MsiMessage, PciPort};
 use feos_driver_uart16550::Uart16550;
-use feos_fs::{FileSystem, MemoryBlockDevice, MountTable, StaticFs};
+use feos_driver_virtio_blk::VirtioBlk;
+use feos_driver_virtio_input::{DeviceKind, VirtioInput};
+use feos_bootinfo::Handoff;
+use feos_firmware::{acpi, acpi::Madt, multiboot, PhysMem, Region, RegionList};
+use feos_fs::vfs::Embedded;
+use feos_fs::{FileSystem, StaticFs};
 use feos_gfx::Canvas;
-use feos_hal::{Audio, Board, Clock, InterruptController, Keyboard, Pointer, Serial};
+use feos_hal::net::NetBinding;
+use feos_hal::{
+    Board, Clock, InterruptController, Keyboard, KeyboardEvent, Pointer, PointerEvent, RealTimeClock, Serial,
+};
 use feos_sync::SpinLock;
+use feos_virtio_core::{device, AnyTransport, PciTransport};
 
 /// Human-readable board name, shown by the `info` app.
 pub const NAME: &str = "QEMU x86_64 q35";
@@ -56,10 +70,8 @@ pub const LAPIC_BASE: usize = 0xfee0_0000;
 /// IOAPIC MMIO base.
 pub const IOAPIC_BASE: usize = 0xfec0_0000;
 
-/// Vector the PIT is routed to.
-///
-/// The PIT is connected to GSI 2, so vector `32 + 2 = 34`.
-pub const TIMER_IRQ: u32 = 34;
+/// Vector of each CPU's local APIC timer, which is the scheduler's tick.
+pub const TIMER_IRQ: u32 = feos_arch_x86_64::timer::TIMER_VECTOR;
 
 /// Vector of the IPI that stops a CPU for good.
 pub const IPI_STOP: u32 = 49;
@@ -68,10 +80,7 @@ pub const IPI_STOP: u32 = 49;
 pub const IPI_RESCHEDULE: u32 = 50;
 
 /// CPUs the board can bring up.
-///
-/// The current x86_64 port runs on the boot processor; the scheduler still
-/// reports its normal per-core accounting for that one CPU.
-pub const MAX_CPUS: usize = 1;
+pub const MAX_CPUS: usize = feos_arch_x86_64::smp::MAX_CPUS;
 
 /// Address assigned to BAR0 of the Intel HDA controller when firmware left it
 /// unprogrammed.
@@ -82,6 +91,12 @@ pub const MAX_CPUS: usize = 1;
 /// its choice is normally kept: it knows about the machine's other devices.
 pub const HDA_BAR0: usize = 0xc000_0000;
 
+/// Where the kernel can place a BAR that firmware didn't: the PCI hole above the
+/// q35 ECAM window and below the APICs. BARs already programmed are skipped.
+pub const PCI_MEMORY_START: u64 = 0xc000_0000;
+/// End of that range.
+pub const PCI_MEMORY_END: u64 = 0xfe00_0000;
+
 /// Intel vendor ID.
 const PCI_VENDOR_INTEL: u16 = 0x8086;
 /// ICH6 HD Audio controller device ID.
@@ -90,46 +105,232 @@ const PCI_DEVICE_ICH6_HDA: u16 = 0x2668;
 /// Start of guest RAM.
 pub const RAM_BASE: usize = 0x0010_0000;
 
-/// Width of the ramfb scanout buffer.
-pub const DISPLAY_WIDTH: usize = 1024;
-
-/// Height of the ramfb scanout buffer.
-pub const DISPLAY_HEIGHT: usize = 768;
-
 /// The single UART exposed by the machine.
 pub static UART0: Uart16550 = Uart16550::new(CONSOLE_BASE as u16);
 
 /// The APIC pair used by the timer tick.
 pub static INTERRUPT_CONTROLLER: ApicController = ApicController::new(LAPIC_BASE, IOAPIC_BASE);
 
-/// Initializes the APIC and enables the timer vector.
-pub fn init_interrupts() {
-    INTERRUPT_CONTROLLER.init();
-    INTERRUPT_CONTROLLER.enable(TIMER_IRQ);
+/// Physical memory through the boot identity map, which covers the first 4 GiB.
+struct IdentityMap;
+
+impl PhysMem for IdentityMap {
+    fn read(&self, address: u64, out: &mut [u8]) -> bool {
+        match address.checked_add(out.len() as u64) {
+            Some(end) if end <= 0x1_0000_0000 => {}
+            _ => return false,
+        }
+        for (offset, byte) in out.iter_mut().enumerate() {
+            // SAFETY: the whole range is mapped, and read-only access to it has
+            // no effect: firmware tables are in RAM, and a bad pointer into a
+            // device window at worst reads something meaningless.
+            *byte = unsafe { core::ptr::read_volatile((address as usize + offset) as *const u8) };
+        }
+        true
+    }
 }
 
-/// Initializes the calling CPU's interrupt state.
-///
-/// The current port only runs the boot processor, so this is a no-op retained
-/// for the kernel's generic SMP path.
-pub fn init_cpu_interrupts() {}
+/// What firmware told the boot CPU. Written once, before anything else runs.
+struct BootInfo {
+    ram: SpinLock<RegionList>,
+    madt: SpinLock<Option<Madt>>,
+}
+
+static BOOT_INFO: BootInfo = BootInfo {
+    ram: SpinLock::new(RegionList::new()),
+    madt: SpinLock::new(None),
+};
+
+/// Logical CPUs found, once the boot CPU's APIC ID has sorted them.
+static CPU_COUNT: AtomicUsize = AtomicUsize::new(1);
+
+/// Reads what firmware says: from the EFI loader if it came that way, and otherwise
+/// the multiboot memory map and the ACPI tables in the BIOS area.
+pub fn init_boot_info(boot_info: usize) {
+    // SAFETY: the pointer is the loader's or multiboot's, and in the boot identity map.
+    let handoff = unsafe { Handoff::at(boot_info) };
+    let rsdp = if let Some(handoff) = handoff {
+        let mut ram = RegionList::new();
+        for range in handoff.ram() {
+            ram.push(Region { base: range.base, size: range.size });
+        }
+        *BOOT_INFO.ram.lock() = ram;
+        display::set_firmware_framebuffer(handoff.framebuffer);
+        acpi::rsdp_at(&IdentityMap, handoff.rsdp)
+    } else {
+        if let Some(ram) = multiboot::usable_ram(&IdentityMap, boot_info as u64) {
+            *BOOT_INFO.ram.lock() = ram;
+        }
+        acpi::find_rsdp(&IdentityMap)
+    };
+    let madt = rsdp.and_then(|rsdp| acpi::parse_madt(&IdentityMap, &rsdp));
+    match &madt {
+        Some(madt) => println!(
+            "[acpi] MADT: {} CPU(s), {} IOAPIC(s), {} override(s)",
+            madt.apic_ids().len(),
+            madt.ioapics().len(),
+            madt.overrides().len()
+        ),
+        None => println!("[acpi] no MADT, staying on the boot CPU"),
+    }
+    *BOOT_INFO.madt.lock() = madt;
+}
+
+/// Initializes the APICs, from what the MADT says about them.
+pub fn init_interrupts() {
+    let boot_apic_id = INTERRUPT_CONTROLLER.cpu_id();
+    INTERRUPT_CONTROLLER.set_apic_id(0, boot_apic_id);
+
+    if let Some(madt) = &*BOOT_INFO.madt.lock() {
+        if let Some(ioapic) = madt.ioapics().iter().find(|ioapic| ioapic.gsi_base == 0) {
+            INTERRUPT_CONTROLLER.set_ioapic_base(ioapic.address as usize);
+        }
+        // The boot CPU is logical CPU 0, wherever the firmware lists it.
+        let mut count = 1;
+        for &id in madt.apic_ids() {
+            if id != boot_apic_id && count < MAX_CPUS {
+                INTERRUPT_CONTROLLER.set_apic_id(count, id);
+                count += 1;
+            }
+        }
+        CPU_COUNT.store(count, Ordering::Release);
+    }
+    INTERRUPT_CONTROLLER.init();
+}
+
+/// Initializes the calling CPU's local APIC.
+pub fn init_cpu_interrupts() {
+    INTERRUPT_CONTROLLER.init_cpu();
+}
 
 /// Returns the interrupt controller shared with the kernel IRQ handler.
 pub fn interrupts() -> &'static dyn InterruptController {
     &INTERRUPT_CONTROLLER
 }
 
-/// Firmware CPU affinity for a logical CPU index.
+/// APIC ID for a logical CPU index.
 pub fn cpu_mpidr(index: usize) -> u64 {
-    index as u64
+    u64::from(INTERRUPT_CONTROLLER.apic_id(index))
+}
+
+/// Vectors handed out for devices, past the fixed ones.
+const FIRST_DEVICE_VECTOR: u32 = 64;
+const LAST_DEVICE_VECTOR: u32 = 239;
+static NEXT_VECTOR: AtomicU32 = AtomicU32::new(FIRST_DEVICE_VECTOR);
+
+fn alloc_vector() -> Option<u32> {
+    let vector = NEXT_VECTOR.fetch_add(1, Ordering::Relaxed);
+    (vector <= LAST_DEVICE_VECTOR).then_some(vector)
+}
+
+/// The GSIs q35 gives PCI's wired interrupts, and the vector each has taken.
+const FIRST_PIRQ_GSI: u32 = 20;
+static PIRQ_VECTORS: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+
+struct Router;
+
+impl IrqRouter for Router {
+    fn alloc_msi(&self) -> Option<(MsiMessage, u32)> {
+        let vector = alloc_vector()?;
+        // Fixed delivery, edge triggered, to the boot CPU.
+        let address = 0xfee0_0000 | u64::from(INTERRUPT_CONTROLLER.apic_id(0)) << 12;
+        Some((MsiMessage { address, data: vector }, vector))
+    }
+
+    fn pci_intx(&self, bus: u8, slot: u8, pin: u8) -> Option<u32> {
+        // Only the root bus: behind a bridge the pin is rotated by a slot number
+        // up the tree. Those devices have MSI-X on this machine.
+        if bus != 0 || slot > 24 {
+            return None;
+        }
+        // QEMU's table: slots up to 24 rotate through PIRQ E to H, which the
+        // ICH9's IOAPIC mode wires to GSI 20 to 23.
+        let index = (u32::from(slot) + u32::from(pin) - 1) % 4;
+        let slot = PIRQ_VECTORS.get(index as usize)?;
+        let known = slot.load(Ordering::Acquire);
+        if known != 0 {
+            return Some(known);
+        }
+        let vector = alloc_vector()?;
+        slot.store(vector, Ordering::Release);
+        INTERRUPT_CONTROLLER.route_line(FIRST_PIRQ_GSI + index, vector as u8, true);
+        Some(vector)
+    }
+
+    fn enable_line(&self, _id: u32) {}
 }
 
 /// The PS/2 controller shared by the keyboard and pointer.
 pub static INPUT: I8042 = I8042::new();
 
-/// Finds and initialises the PS/2 pointer.
+/// The virtio pointer on PCI, when there is one. What's added last gets QEMU's events,
+/// so with one of these the PS/2 devices don't hear anything.
+static VIRTIO_POINTER: SpinLock<VirtioInput> = SpinLock::new(VirtioInput::new());
+/// The virtio keyboard on PCI.
+static VIRTIO_KEYBOARD: SpinLock<VirtioInput> = SpinLock::new(VirtioInput::new());
+
+struct BoardPointer;
+
+impl Pointer for BoardPointer {
+    fn poll(&self) -> Option<PointerEvent> {
+        VIRTIO_POINTER.lock().poll()
+    }
+
+    fn position(&self) -> (u16, u16) {
+        VIRTIO_POINTER.lock().position()
+    }
+}
+
+static BOARD_POINTER: BoardPointer = BoardPointer;
+
+struct BoardKeyboard;
+
+impl Keyboard for BoardKeyboard {
+    fn poll(&self) -> Option<KeyboardEvent> {
+        VIRTIO_KEYBOARD.lock().poll_key()
+    }
+}
+
+static BOARD_KEYBOARD: BoardKeyboard = BoardKeyboard;
+
+/// Brings up whatever virtio input devices are on the PCI bus.
+fn init_virtio_input() {
+    let pci = PciPort::new();
+    let mut allocator = BarAllocator::new(PCI_MEMORY_START, PCI_MEMORY_END);
+    allocator.reserve_programmed(pci);
+    configure_bridges(pci, &mut allocator);
+    let (width, height) = display_size();
+    for_each_function(pci, |function| {
+        if !PciTransport::matches(&function, device::INPUT) {
+            return;
+        }
+        let Some(transport) = PciTransport::new(pci, function, &mut allocator) else {
+            println!("[input] virtio-pci {:02x}:{:02x}: unusable", function.bus(), function.slot());
+            return;
+        };
+        let any = AnyTransport::Pci(transport);
+        match feos_driver_virtio_input::probe_transport(&any) {
+            Some(DeviceKind::Pointer(kind)) => {
+                if VIRTIO_POINTER.lock().init_transport(any, width as u16, height as u16) {
+                    println!("[input] virtio-pci pointer ready ({kind:?})");
+                }
+            }
+            Some(DeviceKind::Keyboard) => {
+                if VIRTIO_KEYBOARD.lock().init_transport(any, 1, 1) {
+                    println!("[input] virtio-pci keyboard ready");
+                }
+            }
+            None => {}
+        }
+    });
+}
+
+/// Finds and initialises the pointers: PS/2, and virtio if there is one.
 pub fn init_pointer() -> Option<PointerKind> {
-    if INPUT.init(DISPLAY_WIDTH as u16, DISPLAY_HEIGHT as u16) {
+    init_virtio_input();
+    INPUT.set_clock(feos_arch_x86_64::timer::uptime_ms);
+    let (width, height) = display_size();
+    if INPUT.init(width as u16, height as u16) {
         Some(INPUT.pointer_kind())
     } else {
         None
@@ -138,101 +339,114 @@ pub fn init_pointer() -> Option<PointerKind> {
 
 /// Returns the pointer shared with apps, when one was initialised.
 pub fn pointer() -> Option<&'static dyn Pointer> {
-    if INPUT.is_ready() {
+    let own: Option<&'static dyn Pointer> = if VIRTIO_POINTER.lock().is_ready() {
+        Some(&BOARD_POINTER)
+    } else if INPUT.is_ready() {
         Some(&INPUT)
     } else {
         None
-    }
+    };
+    usb::pointer(own)
 }
 
 /// Finds and initialises the PS/2 keyboard.
 pub fn init_keyboard() -> bool {
-    INPUT.init(DISPLAY_WIDTH as u16, DISPLAY_HEIGHT as u16)
+    let (width, height) = display_size();
+    INPUT.init(width as u16, height as u16)
 }
 
 /// Returns the keyboard shared with apps, when one was initialised.
 pub fn keyboard() -> Option<&'static dyn Keyboard> {
-    if INPUT.is_ready() {
+    let own: Option<&'static dyn Keyboard> = if VIRTIO_KEYBOARD.lock().is_ready() {
+        Some(&BOARD_KEYBOARD)
+    } else if INPUT.is_ready() {
         Some(&INPUT)
     } else {
         None
-    }
+    };
+    usb::keyboard(own)
 }
 
-/// The ramfb scanout buffer. Page aligned as required by the device.
-#[repr(align(4096))]
-struct ScanoutBuffer([u32; DISPLAY_WIDTH * DISPLAY_HEIGHT]);
+feos_board_common::wire_console!(UART0);
 
-static mut SCANOUT: ScanoutBuffer = ScanoutBuffer([0; DISPLAY_WIDTH * DISPLAY_HEIGHT]);
-
-/// Off-screen buffer used by the desktop to compose a frame before presenting.
-#[repr(align(4096))]
-struct BackBuffer([u32; DISPLAY_WIDTH * DISPLAY_HEIGHT]);
-
-static mut BACK: BackBuffer = BackBuffer([0; DISPLAY_WIDTH * DISPLAY_HEIGHT]);
-
-/// Physical address of the scanout buffer.
-pub fn framebuffer_addr() -> usize {
-    // SAFETY: taking the address of a `static mut` does not create a
-    // reference; the buffer is only exposed once through `init_display`.
-    unsafe { core::ptr::addr_of_mut!(SCANOUT.0) as *mut u32 as usize }
-}
-
-/// Returns a canvas over the off-screen composition buffer.
-pub fn back_buffer() -> Option<Canvas<'static>> {
-    // SAFETY: `BACK` is a static, page-aligned buffer that is only handed out
-    // here. The returned canvas owns the only reference for the rest of the
-    // program; the desktop is the sole foreground consumer.
-    let ptr = unsafe { core::ptr::addr_of_mut!(BACK.0).cast::<u32>() };
-    let pixels: &'static mut [u32] =
-        unsafe { core::slice::from_raw_parts_mut(ptr, DISPLAY_WIDTH * DISPLAY_HEIGHT) };
-    Canvas::new(pixels, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_WIDTH)
-}
-
-/// Initializes the UART and registers it as the kernel console.
-pub fn init_console() {
-    UART0.init();
-    feos_console::set_writer(console_writer);
-    feos_console::set_byte_writer(console_byte_writer);
-    feos_console::set_reader(console_reader);
-}
-
-fn console_writer(text: &str) {
-    UART0.write_terminal(text);
-}
-
-fn console_byte_writer(bytes: &[u8]) {
-    for &byte in bytes {
-        UART0.write_byte(byte);
-    }
-}
-
-fn console_reader() -> Option<u8> {
-    UART0.read_byte()
-}
-
-/// Brings up ramfb and returns a canvas over the static scanout buffer.
+/// Brings up a virtio-gpu if the machine has one, and ramfb otherwise.
 pub fn init_display() -> Option<Canvas<'static>> {
-    let ramfb = Ramfb::new(FwCfg::new_io(FW_CFG_IO_BASE));
-    if !ramfb.configure(
-        framebuffer_addr() as u64,
-        DISPLAY_WIDTH,
-        DISPLAY_HEIGHT,
-        DISPLAY_WIDTH,
-    ) {
-        return None;
-    }
+    display::init(FwCfg::new_io(FW_CFG_IO_BASE), find_gpu)
+}
 
-    // SAFETY: taking the address of a `static mut` does not create a
-    // reference; the buffer is only exposed once, here.
-    let ptr = unsafe { core::ptr::addr_of_mut!(SCANOUT.0).cast::<u32>() };
-    // SAFETY: `SCANOUT` is a static, page-aligned buffer that is only handed
-    // out here. The returned canvas owns the only reference for the rest of
-    // the program; only the foreground session draws to it.
-    let pixels: &'static mut [u32] =
-        unsafe { core::slice::from_raw_parts_mut(ptr, DISPLAY_WIDTH * DISPLAY_HEIGHT) };
+/// Wall-clock seconds since the Unix epoch, from the CMOS clock.
+pub fn unix_time() -> Option<u64> {
+    CmosRtc::new().unix_time()
+}
 
-    Canvas::new(pixels, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_WIDTH)
+/// Finds a virtio-gpu on the PCI bus.
+fn find_gpu() -> Option<AnyTransport> {
+    let pci = PciPort::new();
+    let mut found = None;
+    for_each_function(pci, |function| {
+        if found.is_none() && PciTransport::matches(&function, device::GPU) {
+            found = Some(function);
+        }
+    });
+    let function = found?;
+    let mut allocator = BarAllocator::new(PCI_MEMORY_START, PCI_MEMORY_END);
+    allocator.reserve_programmed(pci);
+    configure_bridges(pci, &mut allocator);
+    PciTransport::new(pci, function, &mut allocator).map(AnyTransport::Pci)
+}
+
+/// Brings up every virtio block device on the PCI bus.
+fn block_devices() -> alloc::vec::Vec<VirtioBlk<AnyTransport>> {
+    let mut disks = alloc::vec::Vec::new();
+    let pci = PciPort::new();
+    let mut allocator = BarAllocator::new(PCI_MEMORY_START, PCI_MEMORY_END);
+    allocator.reserve_programmed(pci);
+    configure_bridges(pci, &mut allocator);
+    for_each_function(pci, |function| {
+        if !PciTransport::matches(&function, device::BLOCK) {
+            return;
+        }
+        let Some(transport) = PciTransport::new(pci, function, &mut allocator) else {
+            println!("[disk] virtio-pci {:02x}:{:02x}: unusable", function.bus(), function.slot());
+            return;
+        };
+        match VirtioBlk::new(AnyTransport::Pci(transport), feos_sync::yield_now) {
+            Ok(mut disk) => {
+                let how = wire_pci_disk(&mut disk, &function, transport, &Router);
+                println!("[disk] virtio-pci {:02x}:{:02x}: {how}", function.bus(), function.slot());
+                disks.push(disk);
+            }
+            Err(error) => println!("[disk] virtio-pci: {error:?}"),
+        }
+    });
+    disks
+}
+
+/// Brings up the USB host controller, if there is one.
+pub fn init_usb(clock: &'static dyn Clock) {
+    let pci = PciPort::new();
+    let mut allocator = BarAllocator::new(PCI_MEMORY_START, PCI_MEMORY_END);
+    allocator.reserve_programmed(pci);
+    configure_bridges(pci, &mut allocator);
+    let (width, height) = display_size();
+    usb::init(pci, &mut allocator, &Router, clock, (width as u16, height as u16));
+}
+
+/// Finds the first virtio network card on the PCI bus.
+pub fn init_network() -> Option<NetBinding> {
+    let pci = PciPort::new();
+    let mut found = None;
+    for_each_function(pci, |function| {
+        if found.is_none() && PciTransport::matches(&function, device::NET) {
+            found = Some(function);
+        }
+    });
+    let function = found?;
+    let mut allocator = BarAllocator::new(PCI_MEMORY_START, PCI_MEMORY_END);
+    allocator.reserve_programmed(pci);
+    configure_bridges(pci, &mut allocator);
+    let transport = PciTransport::new(pci, function, &mut allocator)?;
+    bind_pci_net(&function, transport, &Router)
 }
 
 mod fs_image {
@@ -242,67 +456,25 @@ mod fs_image {
 /// The compiled-in read-only filesystem.
 static FILESYSTEM: StaticFs = StaticFs::new(fs_image::FS_IMAGE);
 
-/// Cached result of the optional disk-image probe.
-static MOUNTED_DISK: SpinLock<Option<&'static dyn FileSystem>> =
-    SpinLock::new(None);
-
 /// Returns the filesystem apps browse through `Platform::filesystem`.
+///
+/// The first call probes for disks and assembles the shared tree: a disk's
+/// filesystem at the root when there is one, a writable RAM copy of the embedded
+/// image otherwise. See [`feos_fs::vfs::assemble`].
 pub fn filesystem() -> &'static dyn FileSystem {
-    if let Some(filesystem) = *MOUNTED_DISK.lock() {
-        return filesystem;
-    }
-
-    let mut table = MountTable::new();
-    if let Some(image) = fs_image::DISK_FAT32_IMAGE {
-        match feos_fs::mount(MemoryBlockDevice::new(image)) {
-            Ok(fs) => {
-                if table.mount("fat32", fs).is_ok() {
-                    println!("[fs] FAT32 volume mounted at /fat32");
-                }
-            }
-            Err(error) => println!("[fs] FAT32 image rejected: {error}"),
-        }
-    }
-    if let Some(image) = fs_image::DISK_EXFAT_IMAGE {
-        match feos_fs::mount(MemoryBlockDevice::new(image)) {
-            Ok(fs) => {
-                if table.mount("exfat", fs).is_ok() {
-                    println!("[fs] exFAT volume mounted at /exfat");
-                }
-            }
-            Err(error) => println!("[fs] exFAT image rejected: {error}"),
-        }
-    }
-
-    let filesystem: &'static dyn FileSystem = if !table.is_empty() {
-        alloc::boxed::Box::leak(alloc::boxed::Box::new(table))
-    } else if let Some(image) = fs_image::DISK_IMAGE {
-        match feos_fs::mount(MemoryBlockDevice::new(image)) {
-            Ok(filesystem) => {
-                println!("[fs] disk image mounted at /");
-                alloc::boxed::Box::leak(filesystem)
-            }
-            Err(error) => {
-                println!("[fs] disk image rejected: {error}");
-                &FILESYSTEM
-            }
-        }
-    } else {
-        &FILESYSTEM
-    };
-    *MOUNTED_DISK.lock() = Some(filesystem);
-    filesystem
-}
-
-/// The board's Intel HDA controller.
-pub static AUDIO: IntelHda = IntelHda::new();
-
-/// A discovered audio device and its codec details.
-pub struct AudioDevice {
-    /// Playback interface handed to apps.
-    pub device: &'static dyn Audio,
-    /// Codec nodes found during initialisation.
-    pub codec: CodecInfo,
+    static IMAGES: [(&str, Option<&[u8]>); 2] = [
+        ("fat32", fs_image::DISK_FAT32_IMAGE),
+        ("exfat", fs_image::DISK_EXFAT_IMAGE),
+    ];
+    mount_filesystem(
+        || Embedded {
+            tree: &FILESYSTEM,
+            root_image: fs_image::DISK_IMAGE,
+            images: &IMAGES,
+        },
+        block_devices,
+        unix_time,
+    )
 }
 
 /// Finds the Intel HDA controller on the PCI bus and brings it up.
@@ -322,44 +494,7 @@ pub fn init_audio(clock: &'static dyn Clock) -> Option<AudioDevice> {
     };
     controller.enable();
 
-    let codec = AUDIO.init(bar, clock)?;
-    Some(AudioDevice {
-        device: &AUDIO,
-        codec,
-    })
-}
-
-extern "C" {
-    static __kernel_start: u8;
-    static __bss_start: u8;
-    static __bss_end: u8;
-    static __stack_bottom: u8;
-    static __stack_top: u8;
-    static __kernel_end: u8;
-}
-
-/// Address range `[start, end)` of the loaded kernel image.
-pub fn kernel_range() -> (usize, usize) {
-    (
-        core::ptr::addr_of!(__kernel_start) as usize,
-        core::ptr::addr_of!(__kernel_end) as usize,
-    )
-}
-
-/// Address range `[start, end)` of `.bss`.
-pub fn bss_range() -> (usize, usize) {
-    (
-        core::ptr::addr_of!(__bss_start) as usize,
-        core::ptr::addr_of!(__bss_end) as usize,
-    )
-}
-
-/// Address range `[start, end)` of the boot stack.
-pub fn stack_range() -> (usize, usize) {
-    (
-        core::ptr::addr_of!(__stack_bottom) as usize,
-        core::ptr::addr_of!(__stack_top) as usize,
-    )
+    audio::bring_up(&controller, bar, clock, &Router)
 }
 
 /// This board, as the kernel sees it.
@@ -370,7 +505,6 @@ impl Board for QemuX86_64 {
     const ARCH: &'static str = ARCH;
     const CONSOLE_NAME: &'static str = CONSOLE_NAME;
     const CONSOLE_BASE: usize = CONSOLE_BASE;
-    const INTERRUPT_CONTROLLER_NAME: &'static str = INTERRUPT_CONTROLLER_NAME;
     const POINTER_NAME: &'static str = POINTER_NAME;
     const POINTER_HINT: &'static str = POINTER_HINT;
     const KEYBOARD_NAME: &'static str = KEYBOARD_NAME;
@@ -379,6 +513,11 @@ impl Board for QemuX86_64 {
     const IPI_STOP: u32 = IPI_STOP;
     const IPI_RESCHEDULE: u32 = IPI_RESCHEDULE;
     const MAX_CPUS: usize = MAX_CPUS;
+    /// Where QEMU's PCI hole starts at its lowest. RAM goes up to here, or stops at
+    /// 2 GiB and carries on from 4 GiB, where the frame allocator doesn't reach.
+    const RAM_LIMIT: u64 = 0xb000_0000;
+    /// The BIOS's memory, and the page the other CPUs start from.
+    const LOW_RESERVED: u64 = 0x10_0000;
 
     type Display = Canvas<'static>;
     type AudioDevice = AudioDevice;
@@ -398,6 +537,24 @@ impl Board for QemuX86_64 {
         }
     }
 
+    fn init_boot_info(boot_info: usize) {
+        init_boot_info(boot_info);
+    }
+
+    fn cpu_count() -> usize {
+        CPU_COUNT.load(Ordering::Acquire)
+    }
+
+    fn usable_ram(out: &mut [(u64, u64)]) -> usize {
+        let ram = BOOT_INFO.ram.lock();
+        let mut count = 0;
+        for (slot, region) in out.iter_mut().zip(ram.as_slice()) {
+            *slot = (region.base, region.size);
+            count += 1;
+        }
+        count
+    }
+
     fn init_interrupts() {
         init_interrupts();
     }
@@ -408,6 +565,10 @@ impl Board for QemuX86_64 {
 
     fn interrupts() -> &'static dyn InterruptController {
         interrupts()
+    }
+
+    fn interrupt_controller_name() -> &'static str {
+        INTERRUPT_CONTROLLER_NAME
     }
 
     fn cpu_mpidr(index: usize) -> u64 {
@@ -446,8 +607,28 @@ impl Board for QemuX86_64 {
         keyboard()
     }
 
+    fn init_network() -> Option<NetBinding> {
+        init_network()
+    }
+
+    fn init_usb(clock: &'static dyn Clock) {
+        init_usb(clock);
+    }
+
+    fn usb_stats() -> Option<feos_hal::UsbStats> {
+        usb::stats()
+    }
+
     fn filesystem() -> &'static dyn FileSystem {
         filesystem()
+    }
+
+    fn display_name() -> &'static str {
+        display_name()
+    }
+
+    fn unix_time() -> Option<u64> {
+        unix_time()
     }
 
     fn kernel_range() -> (usize, usize) {

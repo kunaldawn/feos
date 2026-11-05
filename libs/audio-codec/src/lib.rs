@@ -16,9 +16,9 @@
 //! | WAVE (PCM, float, A-law, µ-law) | yes | PCM16 |
 //! | AIFF / AIFF-C | PCM 8/16/24/32-bit (big or little endian) | PCM16 |
 //! | AU / SND | µ-law, A-law, PCM, float | no |
-//! | MP3 (MPEG Layer III only) | yes | no |
+//! | MPEG audio: MP3, Layers I and II | yes | no |
 //! | FLAC, native and in Ogg | yes, to 16 bits | no |
-//! | Ogg Vorbis (floor 1) | yes | no |
+//! | Ogg Vorbis | yes | no |
 //! | AAC-LC, in ADTS or raw frames | yes | no |
 //! | Ogg Opus | headers, pages and packet TOC only | no |
 //!
@@ -54,12 +54,16 @@ mod mp3;
 mod mp3_decode;
 pub mod ogg;
 pub mod opus;
+pub mod packet;
 mod pcm;
+pub mod stream;
 pub mod vorbis;
 pub mod wav;
 
 pub use error::{AudioError, Result};
 pub use mp3_decode::Mp3Decoder;
+pub use packet::{PacketDecoder, PacketFormat};
+pub use stream::AudioStream;
 
 /// Audio container formats understood by this crate.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -70,7 +74,7 @@ pub enum AudioFormat {
     Aiff,
     /// Sun/NeXT AU.
     Au,
-    /// MPEG-1/2/2.5 Layer III.
+    /// MPEG-1/2/2.5 audio, in any layer.
     Mp3,
     /// Ogg container with an Opus stream. Headers only: packets do not decode.
     OggOpus,
@@ -224,7 +228,7 @@ pub fn scratch_len(input: &[u8]) -> Result<usize> {
 /// Decodes any supported stream into interleaved signed 16-bit samples.
 ///
 /// Ogg Opus is detected but its packets cannot be decoded yet; this returns
-/// [`AudioError::UnsupportedFeature`]. So do MP3 Layer I and II.
+/// [`AudioError::UnsupportedFeature`].
 pub fn decode(input: &[u8], out: &mut [i16], _scratch: &mut [u8]) -> Result<DecodedAudio> {
     match detect_or_err(input)? {
         AudioFormat::Wav => wav::decode(input, out),

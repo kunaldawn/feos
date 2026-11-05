@@ -78,9 +78,12 @@ app registry).
 ├── kernel/                     # feos-kernel: the bootable binary (bin: feos)
 │   └── src/
 │       ├── main.rs             # kmain, IRQ handler, panic handler, wiring
-│       ├── smp.rs              # PSCI secondary-CPU startup
-│       ├── allocator.rs        # 64 MiB static first-fit heap for H.264
-│       └── sched.rs            # shared process table + per-CPU round-robin
+│       ├── smp.rs              # secondary-CPU startup
+│       ├── memory.rs           # discovered RAM and the frame allocator
+│       ├── allocator.rs        # first-fit heap over frames, sized from RAM
+│       ├── fatal.rs            # what happens when something fails
+│       ├── ktest.rs            # self-tests behind the boot tests
+│       └── sched.rs            # process table, per-CPU queues and priorities
 │
 ├── arch/
 │   ├── aarch64/                # feos-arch-aarch64
@@ -101,8 +104,9 @@ app registry).
 │           ├── irq.rs          # TrapFrame, IRQ dispatch, mask helpers
 │           ├── cpu.rs          # halt, CPUID, per-CPU index
 │           ├── power.rs        # ACPI poweroff / PCI reset
-│           ├── smp.rs          # single-CPU scheduler interface
-│           └── timer.rs        # TSC clock + PIT scheduler tick
+│           ├── smp.rs          # AP trampoline and INIT/SIPI startup
+│           ├── mmu.rs          # guard pages in the identity map
+│           └── timer.rs        # TSC clock + per-CPU one-shot APIC timer
 │
 ├── boards/
 │   ├── qemu-virt/              # feos-board-qemu-virt (aarch64)
@@ -290,7 +294,7 @@ change.
   update speed; and mouse/keyboard control
 - Real multi-core scheduler and memory accounting: per-process CPU ticks summed
   across cores, per-CPU idle-tick detection through `WFI`, online-CPU counts,
-  and a HAL `Memory` service backed by the 64 MiB kernel heap for commit charge,
+  and a HAL `Memory` service backed by the kernel heap for commit charge,
   physical memory and kernel-memory panels
 - Foreground app launching: an app can request the full framebuffer from the
   desktop and return to it with Esc
@@ -400,7 +404,7 @@ make docker-shell
 cargo build --release --target aarch64-unknown-none
 ./scripts/qemu.sh
 # or:
-cargo build --release --target x86_64-unknown-none
+./scripts/cargo-x64.sh build --release
 ./scripts/qemu-x64.sh
 ```
 
@@ -410,8 +414,7 @@ Requirements: Rust (rustup), `qemu-system-aarch64`, `qemu-system-x86_64` and
 `objcopy` (GNU binutils; only needed for the x86_64 flat image).
 
 ```sh
-rustup target add aarch64-unknown-none x86_64-unknown-none
-# also declared in rust-toolchain.toml
+rustup show    # installs what rust-toolchain.toml declares
 
 make build-arm                           # or: cargo build --release
 make run                                 # AArch64, VNC on localhost:5900
@@ -423,10 +426,12 @@ make run-x64                             # x86_64 q35, VNC on localhost:5900
 `make build` is an alias for `make build-arm`; `make run` is an alias for
 `make run-arm`. The workspace sets `default-members = ["kernel"]`, so a plain
 `cargo build` builds whichever kernel target `.cargo/config.toml` selects
-(AArch64 by default). Pass `--target x86_64-unknown-none` to build the x86_64
-kernel. The run targets boot with four CPUs and 512 MiB of RAM by default;
-override them with `QEMU_SMP` and `QEMU_MEM` (up to eight CPUs are supported on
-AArch64; the current x86_64 port runs the scheduler on the boot CPU).
+(AArch64 by default). The x86_64 kernel has a custom hard-float target, so it builds
+through `scripts/cargo-x64.sh`, which `make build-x64` calls; that script says why. The
+run targets boot with four CPUs and 512 MiB of RAM by default; override them with
+`QEMU_SMP` and `QEMU_MEM` (up to eight CPUs are supported on both ports, and the kernel
+uses whatever RAM firmware reports). On AArch64, `FEOS_MACHINE=virt,gic-version=3
+./scripts/qemu.sh <kernel>` boots with a GICv3.
 
 `make check-arm` and `make check-x64` check the workspace for each port. A
 single `cargo check --workspace` cannot compile both architecture crates in
@@ -1360,10 +1365,10 @@ its peak level, so a non-zero peak confirms the DSP path ran.
 
 ## How the boot works
 
-1. QEMU loads the ELF at `0x4008_0000` (from
+1. QEMU loads the ELF at `0x4020_0000` (from
    `boards/qemu-virt/linker.ld`) and starts at `_start` in EL1 with the MMU,
-   caches, and interrupts off. `x0` holds the device tree pointer (the ELF
-   loader passes 0 here, so the DTB is not used).
+   caches, and interrupts off. `x0` is 0 from the ELF loader, and the device tree
+   is at the start of RAM, below the kernel.
 2. `arch/aarch64/src/boot.S` keeps only the boot CPU running, sets `sp` to
    `__stack_top`, enables FP/SIMD via `CPACR_EL1.FPEN`, zeroes `.bss`, and
    calls `kmain(dtb)`.

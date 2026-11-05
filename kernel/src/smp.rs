@@ -2,13 +2,11 @@
 //!
 //! The boot CPU finishes all one-time initialization and then asks the
 //! architecture to start each remaining CPU. On AArch64 that is a PSCI
-//! `CPU_ON`; the x86_64 port currently runs on the boot processor only and
-//! reports zero secondaries.
+//! `CPU_ON`; on x86_64, INIT and startup IPIs through the local APIC.
 
-use feos_hal::Board;
+use feos_hal::{Arch, Board};
 
-use crate::arch;
-use crate::Machine;
+use crate::{Machine, Port};
 
 /// Scheduler tick rate, shared by every CPU.
 pub const TICK_HZ: u64 = 100;
@@ -18,16 +16,16 @@ pub const TICK_HZ: u64 = 100;
 /// Returns the number of CPUs firmware accepted and, when a request failed,
 /// the raw status code.
 pub fn start_secondaries() -> (usize, Option<i64>) {
-    arch::smp::start_secondaries(Machine::MAX_CPUS, Machine::cpu_mpidr, secondary_main)
+    Port::start_secondaries(Machine::cpu_count(), Machine::cpu_mpidr, secondary_main)
 }
 
 /// Runs on a secondary CPU after its stack and vectors are ready.
 fn secondary_main(cpu: usize) -> ! {
-    if cpu >= Machine::MAX_CPUS || cpu >= arch::smp::MAX_CPUS {
+    if cpu >= Machine::MAX_CPUS || cpu >= Port::MAX_CPUS {
         // The assembly entry already used a stack sized for MAX_CPUS; an
         // out-of-range context id would mean the caller misconfigured the
         // firmware start.
-        arch::cpu::halt()
+        Port::halt()
     }
 
     // Per-CPU interrupt-controller state, such as GICC_* and the timer PPI.

@@ -3,6 +3,7 @@ name = "feos-driver-fw-cfg"
 description = "QEMU fw_cfg MMIO and DMA driver"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

@@ -13,7 +13,7 @@
 
 use core::ptr::{read_volatile, write_volatile};
 
-use feos_hal::{InterruptController, IpiTarget, IrqClaim};
+use feos_hal::{InterruptController, IpiTarget, IrqClaim, IrqTrigger};
 
 /// Distributor register block.
 const GICD_CTLR: usize = 0x000;
@@ -21,6 +21,8 @@ const GICD_IGROUPR: usize = 0x080;
 const GICD_ISENABLER: usize = 0x100;
 const GICD_ICENABLER: usize = 0x180;
 const GICD_IPRIORITYR: usize = 0x400;
+const GICD_ITARGETSR: usize = 0x800;
+const GICD_ICFGR: usize = 0xc00;
 const GICD_SGIR: usize = 0xf00;
 
 /// CPU interface register block.
@@ -126,6 +128,24 @@ impl InterruptController for GicV2 {
 
         let register = self.distributor + GICD_ICENABLER + (irq as usize / 32) * 4;
         write32(register, 1u32 << (irq % 32));
+        barrier();
+    }
+
+    fn configure(&self, irq: u32, trigger: IrqTrigger, cpu: usize) {
+        // SGIs and PPIs are banked and fixed, and there's nothing past 1019.
+        if !(32..SPURIOUS).contains(&irq) {
+            return;
+        }
+        let register = self.distributor + GICD_ICFGR + (irq as usize / 16) * 4;
+        let bit = 1u32 << ((irq % 16) * 2 + 1);
+        let value = read32(register);
+        let edge = matches!(trigger, IrqTrigger::Edge);
+        write32(register, if edge { value | bit } else { value & !bit });
+
+        let register = self.distributor + GICD_ITARGETSR + (irq as usize & !3);
+        let shift = (irq % 4) * 8;
+        let value = read32(register) & !(0xffu32 << shift);
+        write32(register, value | (1u32 << (cpu as u32 & 7)) << shift);
         barrier();
     }
 

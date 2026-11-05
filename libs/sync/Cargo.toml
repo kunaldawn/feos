@@ -3,6 +3,7 @@ name = "feos-sync"
 description = "Synchronization primitives for a bare-metal multi-core kernel"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

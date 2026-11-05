@@ -1,4 +1,7 @@
 [toolchain]
-channel = "stable"
-targets = ["aarch64-unknown-none", "x86_64-unknown-none"]
+# Keep in step with the Dockerfile and `rust-version` in Cargo.toml.
+channel = "1.99.1"
+# rust-src: the x86_64 kernel target builds `core` from source. See scripts/cargo-x64.sh.
+targets = ["aarch64-unknown-none"]
+components = ["rust-src"]
 profile = "minimal"

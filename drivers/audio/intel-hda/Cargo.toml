@@ -3,6 +3,7 @@ name = "feos-driver-intel-hda"
 description = "Intel High Definition Audio driver for feos"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

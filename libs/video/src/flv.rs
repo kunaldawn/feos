@@ -4,6 +4,7 @@ use alloc::vec::Vec;
 
 use crate::bitstream::{u24_be_at, u32_at};
 use crate::codec::Codec;
+use crate::audio::{push_packet, AudioCodec, AudioTrack};
 use crate::error::{Result, VideoError};
 use crate::h264;
 use crate::index::{try_push, DecoderLimits, Index, FLAG_KEY};
@@ -369,4 +370,69 @@ pub(crate) fn build_index(input: &[u8], limits: &DecoderLimits) -> Result<FlvInd
         Ok(false)
     })?;
     Ok(FlvIndex { index, configs })
+}
+
+/// Finds the audio in a file. FLV has one stream of each kind.
+pub(crate) fn audio_track(input: &[u8]) -> Option<AudioTrack> {
+    let mut track: Option<AudioTrack> = None;
+    let mut full = false;
+    for_each_tag(input, |tag_type, timestamp, body| {
+        if tag_type != 8 || body.is_empty() {
+            return Ok(false);
+        }
+        let flags = body[0];
+        let format = flags >> 4;
+        let rate = [5512, 11025, 22050, 44100][(flags as usize >> 2) & 3];
+        let wide = flags & 2 != 0;
+        let channels = if flags & 1 != 0 { 2 } else { 1 };
+        let (codec, header) = match format {
+            // 16-bit PCM here is little-endian. 8-bit is unsigned, which is not
+            // worth a variant for a format nobody has used in decades.
+            0 | 3 if wide => (
+                AudioCodec::Pcm {
+                    bytes: 2,
+                    big_endian: false,
+                    float: false,
+                },
+                1,
+            ),
+            2 | 14 => (AudioCodec::Mp3, 1),
+            7 => (AudioCodec::ALaw, 1),
+            8 => (AudioCodec::MuLaw, 1),
+            10 => (AudioCodec::Aac, 2),
+            _ => (AudioCodec::Other, 1),
+        };
+        let start = body.as_ptr() as usize - input.as_ptr() as usize;
+        let current = track.get_or_insert(AudioTrack {
+            codec,
+            sample_rate: rate,
+            channels,
+            config: 0..0,
+            packets: Vec::new(),
+        });
+        if body.len() < header {
+            return Ok(false);
+        }
+        if format == 10 && body[1] == 0 {
+            current.config = start + 2..start + body.len();
+            return Ok(false);
+        }
+        let added = push_packet(
+            &mut current.packets,
+            input.len(),
+            start + header,
+            body.len() - header,
+            timestamp as u64,
+        );
+        if added.is_none() {
+            full = true;
+            return Ok(true);
+        }
+        Ok(false)
+    })
+    .ok()?;
+    if full {
+        return None;
+    }
+    track
 }

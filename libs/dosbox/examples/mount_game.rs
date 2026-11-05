@@ -22,7 +22,7 @@ fn main() {
     let fs: &'static dyn FileSystem = Box::leak(mount_image(image).expect("mount exFAT image"));
     let mut machine = DosBox::new(Some(fs));
     for _ in 0..16 {
-        if machine.shell.batch.is_empty() {
+        if !machine.shell.in_batch() {
             break;
         }
         machine.frame(0, 10_000);

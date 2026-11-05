@@ -47,13 +47,14 @@
 
 mod catalog;
 mod icon;
+pub mod install;
 mod manifest;
 
 use core::str;
 
 pub use catalog::{AppCatalog, DirEntry, InstalledApp, ScanReport};
 pub use feos_text::Text;
-pub use icon::{Icon, MAX_ICON};
+pub use icon::{Icon, IconImage, MAX_ICON};
 pub use manifest::{Manifest, MANIFEST_MAX};
 
 use feos_archive::{ArchiveError, TarReader, ZipReader};
@@ -244,7 +245,17 @@ impl<'a> Bundle<'a> {
         }
         let mut encoded = [0u8; ICON_FILE_LIMIT];
         let len = self.read_file(manifest.icon.as_str(), &mut encoded)?;
-        Icon::decode(&encoded[..len])
+        let mut icon = Icon::decode(&encoded[..len])?;
+        // Hand-drawn smaller versions, optional and beside the main one.
+        for extra in [manifest.icon_medium.as_str(), manifest.icon_small.as_str()] {
+            if extra.is_empty() {
+                continue;
+            }
+            if let Ok(len) = self.read_file(extra, &mut encoded) {
+                icon.add_size(&encoded[..len]);
+            }
+        }
+        Ok(icon)
     }
 }
 

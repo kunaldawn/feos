@@ -431,7 +431,8 @@ impl Shell<'_> {
         self.flow = if self.interactive {
             Flow::Abort(1)
         } else {
-            Flow::Exit(1)
+            // The status Bash leaves behind in this case.
+            Flow::Exit(127)
         };
         failed
     }

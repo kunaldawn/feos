@@ -19,6 +19,10 @@ use crate::lexer::{valid_name, Assignment, Lexer, RedirOp, Token, Word};
 /// Deepest nesting of compound commands the parser accepts.
 pub const MAX_PARSE_DEPTH: usize = 32;
 
+/// The error for nesting past the limits, which the executor treats like any
+/// other nesting failure.
+pub const TOO_DEEP: &str = "commands are nested too deeply";
+
 /// How many alias substitutions one command position may go through.
 const MAX_ALIAS_CHAIN: usize = 16;
 
@@ -240,8 +244,8 @@ pub fn parse(tokens: &[Token]) -> Result<Script, ParseError> {
         lexer: None,
         aliases: None,
         depth: 0,
-        max_depth: MAX_PARSE_DEPTH,
-        expand_next: false,
+        stack_bound: None,
+        expand_after: 0,
     };
     let mut lists = Vec::new();
     while let Some(list) = parser.parse_top()? {
@@ -269,8 +273,8 @@ pub struct Parser<'a> {
     lexer: Option<Lexer>,
     aliases: Option<&'a BTreeMap<String, String>>,
     depth: usize,
-    max_depth: usize,
-    expand_next: bool,
+    stack_bound: Option<(usize, usize)>,
+    expand_after: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -281,14 +285,15 @@ impl<'a> Parser<'a> {
             lexer: Some(Lexer::new(text)),
             aliases: None,
             depth: 0,
-            max_depth: MAX_PARSE_DEPTH,
-            expand_next: false,
+            stack_bound: None,
+            expand_after: 0,
         }
     }
 
-    /// Lowers the nesting limit, for a parser started on an already deep stack.
-    pub fn set_max_depth(&mut self, depth: usize) {
-        self.max_depth = depth.min(MAX_PARSE_DEPTH);
+    /// Makes nesting fail once the stack has moved `limit` bytes from `base`,
+    /// for a parser that may start on an already deep stack.
+    pub fn set_stack_bound(&mut self, base: usize, limit: usize) {
+        self.stack_bound = Some((base, limit));
     }
 }
 
@@ -305,8 +310,8 @@ impl Parser<'_> {
             lexer: self.lexer.take(),
             aliases,
             depth: 0,
-            max_depth: self.max_depth,
-            expand_next: false,
+            stack_bound: self.stack_bound,
+            expand_after: 0,
         };
         let result = scoped.parse_top();
         self.queue = scoped.queue;
@@ -387,8 +392,13 @@ impl Parser<'_> {
 
     fn enter(&mut self) -> Result<(), ParseError> {
         self.depth += 1;
-        if self.depth > self.max_depth {
-            return Err(ParseError::new("commands are nested too deeply"));
+        if self.depth > MAX_PARSE_DEPTH {
+            return Err(ParseError::new(TOO_DEEP));
+        }
+        if let Some((base, limit)) = self.stack_bound {
+            if base.abs_diff(crate::exec::stack_position()) > limit {
+                return Err(ParseError::new(TOO_DEEP));
+            }
         }
         Ok(())
     }
@@ -541,7 +551,8 @@ impl Parser<'_> {
             message: error.message,
             incomplete: false,
         })?;
-        self.expand_next = value.ends_with(' ');
+        // A trailing blank makes the word after the alias eligible too.
+        self.expand_after = if value.ends_with(' ') { tokens.len() } else { 0 };
         self.advance();
         for token in tokens.into_iter().rev() {
             self.queue.push_front(token);
@@ -579,6 +590,12 @@ impl Parser<'_> {
         }
 
         let word = self.peek_word()?.map(String::from);
+        if matches!(
+            word.as_deref(),
+            Some("then" | "elif" | "else" | "fi" | "do" | "done" | "esac" | "}")
+        ) {
+            return Err(ParseError::new("unexpected reserved word"));
+        }
         let compound = match word.as_deref() {
             Some("if") => Some(self.parse_if()?),
             Some("for") => Some(self.parse_for()?),
@@ -689,8 +706,7 @@ impl Parser<'_> {
         let mut seen = Vec::new();
 
         loop {
-            if words.is_empty() && !assignments.is_empty() || self.expand_next {
-                self.expand_next = false;
+            if words.is_empty() && !assignments.is_empty() {
                 while self.expand_alias(&mut seen)? {}
             }
             match self.peek()? {
@@ -710,6 +726,12 @@ impl Parser<'_> {
                         }
                     }
                     words.push(word);
+                    if self.expand_after > 0 {
+                        self.expand_after -= 1;
+                        if self.expand_after == 0 {
+                            while self.expand_alias(&mut seen)? {}
+                        }
+                    }
                 }
                 _ => break,
             }

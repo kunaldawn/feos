@@ -1,10 +1,15 @@
 //! The kernel's GDT and TSS, and the per-CPU stacks they provide.
 //!
-//! `boot.S` loads a temporary GDT to enter long mode. This one replaces it and
-//! adds a TSS per CPU. The kernel never leaves ring 0, so the TSS exists only for
-//! its interrupt stack table: an IDT gate that names an entry switches to that
-//! stack in hardware, which is the only way to leave the interrupted stack on a
-//! same-privilege interrupt.
+//! `boot.S` loads a temporary GDT to enter long mode. This one replaces it, adds the
+//! user segments and a TSS per CPU. The TSS is there for its interrupt stack table:
+//! an IDT gate that names an entry switches to that stack in hardware, which is the
+//! only way to leave the interrupted stack on a same-privilege interrupt. Every gate
+//! names one, so ring 3 is no different, and `rsp0` is never used. Its I/O permission
+//! map is empty, so a port access from ring 3 faults.
+//!
+//! The entry interrupts use is rewritten on every task switch, to the end of the
+//! next task's [`TrapFrame`](crate::irq::TrapFrame), which is where the CPU then
+//! writes that task's state. See `interrupts.S`.
 
 use core::arch::asm;
 use core::cell::UnsafeCell;
@@ -12,9 +17,11 @@ use core::mem::size_of;
 use core::ptr::{addr_of, addr_of_mut};
 
 use crate::cpu;
+use crate::irq::TrapFrame;
 use crate::smp::MAX_CPUS;
 
-/// IST entry for hardware interrupts, IPIs and the software switch.
+/// IST entry for hardware interrupts, IPIs and the software switch: the current
+/// task's frame.
 pub const IST_IRQ: u8 = 1;
 /// IST entry for CPU exceptions.
 ///
@@ -25,9 +32,15 @@ pub const IST_FAULT: u8 = 2;
 const IRQ_STACK_SIZE: usize = 32 * 1024;
 const FAULT_STACK_SIZE: usize = 16 * 1024;
 
+/// Selectors a user program runs with, ring 3 in their low bits.
+pub const USER_DATA: u64 = 0x20 | 3;
+pub const USER_CODE: u64 = 0x28 | 3;
+
+/// GDT slots before the first TSS.
+const FIXED_ENTRIES: usize = 6;
 /// Selector of the first TSS descriptor. Each takes two GDT slots.
-const TSS_SELECTOR: u16 = 0x20;
-const GDT_ENTRIES: usize = 4 + 2 * MAX_CPUS;
+const TSS_SELECTOR: u16 = (FIXED_ENTRIES * 8) as u16;
+const GDT_ENTRIES: usize = FIXED_ENTRIES + 2 * MAX_CPUS;
 
 #[repr(C, packed(4))]
 #[derive(Clone, Copy)]
@@ -59,6 +72,17 @@ static STACKS: [CpuStacks; MAX_CPUS] = [const {
     }
 }; MAX_CPUS];
 
+/// Where traps save a CPU's state until the scheduler says otherwise. Nothing ever
+/// resumes these frames.
+#[repr(transparent)]
+struct BootFrame(UnsafeCell<TrapFrame>);
+
+// SAFETY: each CPU only uses its own, and only through the CPU itself.
+unsafe impl Sync for BootFrame {}
+
+static BOOT_FRAMES: [BootFrame; MAX_CPUS] =
+    [const { BootFrame(UnsafeCell::new(TrapFrame::ZERO)) }; MAX_CPUS];
+
 static mut TSS: [Tss; MAX_CPUS] = [Tss {
     reserved0: 0,
     rsp: [0; 3],
@@ -70,13 +94,15 @@ static mut TSS: [Tss; MAX_CPUS] = [Tss {
     iomap_base: size_of::<Tss>() as u16,
 }; MAX_CPUS];
 
-/// Null, 64-bit code, flat data, 32-bit code, then two slots per TSS. It must be
-/// writable because `ltr` sets the descriptor's busy bit.
+/// Null, 64-bit code, flat data, 32-bit code, user data, user 64-bit code, then two
+/// slots per TSS. It must be writable because `ltr` sets the descriptor's busy bit.
 static mut GDT: [u64; GDT_ENTRIES] = {
     let mut gdt = [0; GDT_ENTRIES];
     gdt[1] = 0x00AF_9A00_0000_FFFF;
     gdt[2] = 0x00CF_9200_0000_FFFF;
     gdt[3] = 0x00CF_9A00_0000_FFFF;
+    gdt[4] = 0x00CF_F200_0000_FFFF;
+    gdt[5] = 0x00AF_FA00_0000_FFFF;
     gdt
 };
 
@@ -96,24 +122,39 @@ const fn tss_descriptor(base: u64, limit: u64) -> [u64; 2] {
     [low, base >> 32]
 }
 
+/// Has interrupts on this CPU save their state in the frame ending at `top`.
+///
+/// Call with interrupts masked.
+pub(crate) fn set_trap_frame_top(top: u64) {
+    let index = cpu::index().min(MAX_CPUS - 1);
+    // SAFETY: only this CPU writes its own TSS, and interrupts are masked.
+    unsafe {
+        let entry = addr_of_mut!(TSS[index].ist[IST_IRQ as usize - 1]);
+        entry.write_unaligned(top);
+    }
+}
+
 /// Loads the GDT and this CPU's TSS. Call before installing the IDT.
 pub fn init() {
+    cpu::protect();
     let index = cpu::index().min(MAX_CPUS - 1);
     let stacks = &STACKS[index];
     let irq_top = stacks.irq.get() as u64 + IRQ_STACK_SIZE as u64;
     let fault_top = stacks.fault.get() as u64 + FAULT_STACK_SIZE as u64;
+    let frame_top = BOOT_FRAMES[index].0.get() as u64 + size_of::<TrapFrame>() as u64;
+    cpu::area().set_interrupt_stack(irq_top);
 
     // SAFETY: boot runs this once per CPU with interrupts masked, and each CPU
     // only writes its own TSS and descriptor.
     unsafe {
         let tss = addr_of_mut!(TSS[index]);
-        (*tss).ist[IST_IRQ as usize - 1] = irq_top;
+        (*tss).ist[IST_IRQ as usize - 1] = frame_top;
         (*tss).ist[IST_FAULT as usize - 1] = fault_top;
 
         let [low, high] = tss_descriptor(tss as u64, size_of::<Tss>() as u64 - 1);
         let gdt = addr_of_mut!(GDT).cast::<u64>();
-        gdt.add(4 + 2 * index).write(low);
-        gdt.add(5 + 2 * index).write(high);
+        gdt.add(FIXED_ENTRIES + 2 * index).write(low);
+        gdt.add(FIXED_ENTRIES + 1 + 2 * index).write(high);
 
         let pointer = GdtPointer {
             limit: (size_of::<u64>() * GDT_ENTRIES - 1) as u16,

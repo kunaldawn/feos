@@ -14,6 +14,17 @@ use crate::fs::FsError;
 /// runaway producer has to fail with an error before it exhausts the heap.
 pub const MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
 
+/// What [`Input::try_read`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Available {
+    /// This many bytes.
+    Bytes(usize),
+    /// Nothing yet.
+    Pending,
+    /// There won't be any more.
+    End,
+}
+
 /// A byte source.
 pub trait Input {
     /// Reads up to `out.len()` bytes. Returns zero at end of input.
@@ -34,6 +45,41 @@ pub trait Input {
     fn read_pending(&mut self, out: &mut [u8]) -> usize {
         self.read_raw(out)
     }
+
+    /// Reads keys from the terminal behind this stream, even if it reads from
+    /// somewhere else: a pager in a pipeline takes its text from standard input
+    /// and its commands from here. A plain stream is its own terminal.
+    fn read_tty(&mut self, out: &mut [u8]) -> usize {
+        self.read_raw(out)
+    }
+
+    /// Like [`read_tty`](Self::read_tty), only for what has already arrived.
+    fn read_tty_pending(&mut self, out: &mut [u8]) -> usize {
+        self.read_pending(out)
+    }
+
+    /// Whether a terminal is behind this stream.
+    fn tty_is_terminal(&self) -> bool {
+        self.is_terminal()
+    }
+
+    /// Tells a stream that the calling task now owns it, after a move between
+    /// tasks. It closes with its owner, whichever way that ends.
+    fn adopt(&self) {}
+
+    /// Reads what's already here, for something that has other streams to look after.
+    /// The default is for a stream that never has to wait.
+    fn try_read(&mut self, out: &mut [u8]) -> Available {
+        match self.read(out) {
+            0 => Available::End,
+            count => Available::Bytes(count),
+        }
+    }
+
+    /// Asks a terminal to deliver keys as they are, Ctrl-C included, or to go
+    /// back to normal. A program that draws the whole screen brackets its run
+    /// with this. Anything but a terminal ignores it.
+    fn set_raw(&mut self, _raw: bool) {}
 
     /// Reads until end of input, keeping whatever fits the stream budget.
     fn read_to_end(&mut self) -> Vec<u8> {
@@ -91,6 +137,10 @@ pub trait Input {
 pub trait Output {
     /// Writes all bytes.
     fn write(&mut self, bytes: &[u8]);
+
+    /// Tells a stream that the calling task now owns it, after a move between
+    /// tasks. It closes with its owner, whichever way that ends.
+    fn adopt(&self) {}
 
     /// Flushes buffered output, when the sink buffers.
     fn flush(&mut self) {}

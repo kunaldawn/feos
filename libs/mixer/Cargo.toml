@@ -1,0 +1,13 @@
+[package]
+name = "feos-mixer"
+description = "Mixes several audio streams onto one feos sound device"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+feos-app = { workspace = true }
+feos-audio = { workspace = true }
+feos-hal = { workspace = true }
+feos-sync = { workspace = true }

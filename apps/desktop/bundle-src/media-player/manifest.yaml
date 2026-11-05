@@ -4,7 +4,9 @@ version: 2.0.0
 entry: player
 category: Multimedia
 description: Video player with playlist and fullscreen mode
-icon: icon.bmp
+icon: icon.ico
+icon_medium: icon-32.ico
+icon_small: icon-16.ico
 window:
   width: 960
   height: 640

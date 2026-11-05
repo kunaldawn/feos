@@ -1,0 +1,11 @@
+[package]
+name = "feos-driver-virtio-net"
+description = "virtio network device driver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+feos-hal = { workspace = true }
+feos-virtio-core = { workspace = true }

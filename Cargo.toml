@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "kernel",
     "arch/*",
+    "boot/*",
     "boards/*",
     "drivers/*/*",
     "libs/*",
@@ -19,6 +20,7 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.99"
 
 [workspace.dependencies]
+feos-abi = { path = "libs/abi" }
 feos-app = { path = "libs/app" }
 feos-apps = { path = "apps/commands" }
 feos-arch-aarch64 = { path = "arch/aarch64" }
@@ -26,6 +28,8 @@ feos-arch-x86_64 = { path = "arch/x86_64" }
 feos-audio = { path = "libs/audio" }
 feos-audio-codec = { path = "libs/audio-codec" }
 feos-archive = { path = "libs/archive" }
+feos-board-common = { path = "boards/common" }
+feos-bootinfo = { path = "libs/bootinfo" }
 feos-board-qemu-virt = { path = "boards/qemu-virt" }
 feos-board-qemu-x86_64 = { path = "boards/qemu-x86_64" }
 feos-bundle = { path = "libs/bundle" }
@@ -35,18 +39,30 @@ feos-coreutils = { path = "libs/coreutils" }
 feos-desktop = { path = "libs/desktop" }
 feos-desktop-app = { path = "apps/desktop" }
 feos-dosbox = { path = "libs/dosbox" }
+feos-elf = { path = "libs/elf" }
+feos-vm = { path = "libs/vm" }
 feos-dosbox-app = { path = "apps/dosbox" }
 feos-driver-apic = { path = "drivers/interrupt/apic" }
 feos-driver-fw-cfg = { path = "drivers/firmware/fw-cfg" }
 feos-driver-gicv2 = { path = "drivers/interrupt/gicv2" }
+feos-driver-gicv3 = { path = "drivers/interrupt/gicv3" }
 feos-driver-i8042 = { path = "drivers/input/i8042" }
 feos-driver-intel-hda = { path = "drivers/audio/intel-hda" }
 feos-driver-pci = { path = "drivers/bus/pci" }
+feos-driver-cmos-rtc = { path = "drivers/rtc/cmos" }
 feos-driver-pl011 = { path = "drivers/serial/pl011" }
+feos-driver-pl031 = { path = "drivers/rtc/pl031" }
 feos-driver-ramfb = { path = "drivers/display/ramfb" }
 feos-driver-uart16550 = { path = "drivers/serial/uart16550" }
+feos-driver-virtio-blk = { path = "drivers/block/virtio" }
+feos-driver-virtio-gpu = { path = "drivers/display/virtio-gpu" }
 feos-driver-virtio-input = { path = "drivers/input/virtio" }
+feos-driver-virtio-net = { path = "drivers/net/virtio" }
+feos-driver-xhci = { path = "drivers/usb/xhci" }
+feos-virtio-core = { path = "drivers/virtio/core" }
 feos-gfx = { path = "libs/gfx" }
+feos-firmware = { path = "libs/firmware" }
+feos-frames = { path = "libs/frames" }
 feos-fs = { path = "libs/fs" }
 feos-gui = { path = "libs/gui" }
 feos-h264 = { path = "libs/h264" }
@@ -54,8 +70,12 @@ feos-hal = { path = "libs/hal" }
 feos-heap = { path = "libs/heap" }
 feos-image = { path = "libs/image" }
 feos-init = { path = "libs/init" }
+feos-irq = { path = "libs/irq" }
 feos-json = { path = "libs/json" }
 feos-keys = { path = "libs/keys" }
+feos-net = { path = "libs/net" }
+feos-iconset = { path = "libs/iconset" }
+feos-mixer = { path = "libs/mixer" }
 feos-port-io = { path = "libs/port-io" }
 feos-sched = { path = "libs/sched" }
 feos-sh = { path = "libs/sh" }
@@ -88,6 +108,15 @@ opt-level = 3
 opt-level = 3
 
 [profile.release.package.feos-dosbox]
+opt-level = 3
+
+[profile.release.package.feos-audio-codec]
+opt-level = 3
+
+[profile.release.package.feos-audio]
+opt-level = 3
+
+[profile.release.package.feos-mixer]
 opt-level = 3
 
 [profile.release.package.feos-h264]

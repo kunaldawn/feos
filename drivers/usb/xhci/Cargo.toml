@@ -1,0 +1,11 @@
+[package]
+name = "feos-driver-xhci"
+description = "xHCI USB host controller, HID keyboards and pointers, and mass storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+feos-hal = { workspace = true }
+feos-sync = { workspace = true }

@@ -1,0 +1,11 @@
+[package]
+name = "feos-net"
+description = "A small TCP/IP stack: Ethernet, ARP, IPv4, ICMP, UDP, TCP, DHCP and DNS"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+feos-hal = { workspace = true }
+feos-sync = { workspace = true }

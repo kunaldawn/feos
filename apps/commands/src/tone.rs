@@ -2,7 +2,7 @@
 
 use feos_app::{App, Context};
 use feos_audio::{AudioBuffer, AudioFormat, Oscillator, Sample, Waveform};
-use feos_console::println;
+use feos_console::{eprintln, println};
 use feos_sync::Mutex;
 
 /// Longest playable clip, matching the driver's DMA buffer.
@@ -31,10 +31,6 @@ impl App for Tone {
         "tone"
     }
 
-    fn aliases(&self) -> &'static [&'static str] {
-        &["play"]
-    }
-
     fn usage(&self) -> &'static str {
         "tone [ms]"
     }
@@ -43,21 +39,21 @@ impl App for Tone {
         "play a synthesized chord (up to 3000 ms)"
     }
 
-    fn run(&self, context: &mut Context<'_>) {
+    fn run(&self, context: &mut Context<'_>) -> i32 {
         let Some(device) = context.platform.audio else {
-            println!("no audio device; start QEMU with -device intel-hda -device hda-output");
-            return;
+            eprintln!("no audio device; start QEMU with -device intel-hda -device hda-output");
+            return 1;
         };
 
         if !device.is_ready() {
-            println!("audio device is not ready");
-            return;
+            eprintln!("audio device is not ready");
+            return 1;
         }
 
         let milliseconds = context
-            .args
-            .trim()
-            .parse::<usize>()
+            .argv
+            .first()
+            .and_then(|text| text.parse::<usize>().ok())
             .unwrap_or(DEFAULT_MS)
             .clamp(100, MAX_MS);
         let frames = SAMPLE_RATE as usize * milliseconds / 1000;
@@ -88,28 +84,36 @@ impl App for Tone {
             audio.peak()
         );
 
-        // Streamed in pieces, so a kill can stop this between two of them. That
-        // releases the mutex at once; a kill can't reap a task holding it.
+        // Streamed in pieces through the mixer, so other sound keeps playing, and
+        // a kill can stop this between two of them. That releases the mutex at
+        // once; a kill can't reap a task holding it.
+        let stream = match feos_mixer::Stream::open(context.platform, format) {
+            Ok(stream) => stream,
+            Err(error) => {
+                println!("no audio stream: {error:?}");
+                return 1;
+            }
+        };
         let processes = context.platform.processes;
         let mut remaining = audio.samples();
         while !remaining.is_empty() {
             if processes.kill_requested() {
-                device.stop();
-                return;
+                return feos_app::EXIT_KILLED;
             }
-            let accepted = device.write(remaining);
+            let accepted = stream.write(remaining);
             remaining = &remaining[accepted..];
             if accepted == 0 {
                 context.platform.clock.idle_ms(WRITE_RETRY_MS);
             }
         }
-        while device.queued() > 0 {
+        while stream.pending_frames() > 0 || device.queued() > 0 {
             if processes.kill_requested() {
-                device.stop();
-                return;
+                return feos_app::EXIT_KILLED;
             }
+            let _ = stream.write(&[]);
             context.platform.clock.idle_ms(WRITE_RETRY_MS);
         }
         println!("done");
+        0
     }
 }

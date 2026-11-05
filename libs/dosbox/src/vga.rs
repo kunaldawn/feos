@@ -62,6 +62,23 @@ pub(crate) const ROM_ALT_FONT: u32 = 0xF_3610;
 pub(crate) const ROM_VESA_OEM: u32 = 0xF_3620;
 pub(crate) const ROM_VESA_MODES: u32 = 0xF_3630;
 pub(crate) const ROM_VESA_WINDOW: u32 = 0xF_3640;
+pub(crate) const ROM_VESA_PM: u32 = 0xF_3650;
+/// The VBE 2.0 protected-mode interface, as `AX=4F0Ah` hands it out: a table of
+/// offsets (window, display start, palette, ports used) and 32-bit code that
+/// talks to the private ports `1CEh` to `1D3h` and the DAC. It's position
+/// independent, because programs copy it into their own segments.
+pub(crate) const VESA_PM_TABLE: [u8; 113] = [
+    0x08, 0x00, 0x16, 0x00, 0x2d, 0x00, 0x5d, 0x00, 0x52, 0x50, 0x89, 0xd0,
+  0xba, 0xce, 0x01, 0x00, 0x00, 0x66, 0xef, 0x58, 0x5a, 0xc3, 0x52, 0x50,
+  0x52, 0x89, 0xc8, 0xba, 0xd0, 0x01, 0x00, 0x00, 0x66, 0xef, 0x58, 0xba,
+  0xd2, 0x01, 0x00, 0x00, 0x66, 0xef, 0x58, 0x5a, 0xc3, 0x50, 0x51, 0x52,
+  0x57, 0x89, 0xd0, 0xba, 0xc8, 0x03, 0x00, 0x00, 0xee, 0x42, 0xf7, 0xc1,
+  0xff, 0xff, 0x00, 0x00, 0x74, 0x16, 0x0f, 0xb7, 0xc9, 0x26, 0x8a, 0x47,
+  0x02, 0xee, 0x26, 0x8a, 0x47, 0x01, 0xee, 0x26, 0x8a, 0x07, 0xee, 0x83,
+  0xc7, 0x04, 0xe2, 0xed, 0x5f, 0x5a, 0x59, 0x58, 0xc3, 0xce, 0x01, 0xcf,
+  0x01, 0xd0, 0x01, 0xd1, 0x01, 0xd2, 0x01, 0xd3, 0x01, 0xc8, 0x03, 0xc9,
+  0x03, 0xff, 0xff, 0xff, 0xff,
+];
 
 /// The VGA static functionality table returned by `INT 10h AX=1B00h`.
 const STATIC_TABLE: [u8; 16] = [
@@ -220,20 +237,103 @@ const SEQ_256: [u8; 4] = [0x01, 0x0F, 0x00, 0x0E];
 
 /// The standard modes. A mode that is not here is not a mode.
 const MODES: [ModeTable; 15] = [
-    mode_table!(0x00, 0x67, SEQ_TEXT40, CRTC_40, AC_TEXT, GC_TEXT, DAC_EGA, 16, 0x0800, 8, 0x2C, 0x30),
-    mode_table!(0x01, 0x67, SEQ_TEXT40, CRTC_40, AC_TEXT, GC_TEXT, DAC_EGA, 16, 0x0800, 8, 0x28, 0x30),
-    mode_table!(0x02, 0x67, SEQ_TEXT80, CRTC_80, AC_TEXT, GC_TEXT, DAC_EGA, 16, 0x1000, 8, 0x2D, 0x30),
-    mode_table!(0x03, 0x67, SEQ_TEXT80, CRTC_80, AC_TEXT, GC_TEXT, DAC_EGA, 16, 0x1000, 8, 0x29, 0x30),
-    mode_table!(0x04, 0x63, SEQ_CGA4, CRTC_CGA4, AC_CGA4, GC_CGA4, DAC_CGA, 8, 0x4000, 1, 0x2A, 0x30),
-    mode_table!(0x05, 0x63, SEQ_CGA4, CRTC_CGA4, AC_CGA4, GC_CGA4, DAC_CGA, 8, 0x4000, 1, 0x2E, 0x30),
-    mode_table!(0x06, 0x63, SEQ_CGA2, CRTC_CGA2, AC_CGA2, GC_CGA2, DAC_CGA, 8, 0x4000, 1, 0x1E, 0x3F),
-    mode_table!(0x07, 0x66, SEQ_TEXT80, CRTC_MONO, AC_MONO_TEXT, GC_MONO_TEXT, DAC_MONO, 16, 0x1000, 8, 0x29, 0x30),
-    mode_table!(0x0D, 0x63, SEQ_0D, CRTC_0D, AC_EGA_LOW, GC_PLANAR, DAC_CGA, 8, 0x2000, 8, 0x29, 0x30),
-    mode_table!(0x0E, 0x63, SEQ_EGA, CRTC_0E, AC_EGA_LOW, GC_PLANAR, DAC_CGA, 8, 0x4000, 4, 0x29, 0x30),
-    mode_table!(0x0F, 0xA2, SEQ_EGA, CRTC_0F, AC_EGA_MONO, GC_PLANAR, DAC_MONO, 14, 0x8000, 2, 0x29, 0x30),
-    mode_table!(0x10, 0xA3, SEQ_EGA, CRTC_0F, AC_EGA_HIGH, GC_PLANAR, DAC_EGA, 14, 0x8000, 2, 0x29, 0x30),
-    mode_table!(0x11, 0xE3, SEQ_EGA, CRTC_11, AC_VGA_MONO, GC_PLANAR, DAC_EGA, 16, 0xA000, 1, 0x29, 0x30),
-    mode_table!(0x12, 0xE3, SEQ_EGA, CRTC_12, AC_EGA_HIGH, GC_PLANAR, DAC_EGA, 16, 0xA000, 1, 0x29, 0x30),
+    mode_table!(
+        0x00, 0x67, SEQ_TEXT40, CRTC_40, AC_TEXT, GC_TEXT, DAC_EGA, 16, 0x0800, 8, 0x2C, 0x30
+    ),
+    mode_table!(
+        0x01, 0x67, SEQ_TEXT40, CRTC_40, AC_TEXT, GC_TEXT, DAC_EGA, 16, 0x0800, 8, 0x28, 0x30
+    ),
+    mode_table!(
+        0x02, 0x67, SEQ_TEXT80, CRTC_80, AC_TEXT, GC_TEXT, DAC_EGA, 16, 0x1000, 8, 0x2D, 0x30
+    ),
+    mode_table!(
+        0x03, 0x67, SEQ_TEXT80, CRTC_80, AC_TEXT, GC_TEXT, DAC_EGA, 16, 0x1000, 8, 0x29, 0x30
+    ),
+    mode_table!(
+        0x04, 0x63, SEQ_CGA4, CRTC_CGA4, AC_CGA4, GC_CGA4, DAC_CGA, 8, 0x4000, 1, 0x2A, 0x30
+    ),
+    mode_table!(
+        0x05, 0x63, SEQ_CGA4, CRTC_CGA4, AC_CGA4, GC_CGA4, DAC_CGA, 8, 0x4000, 1, 0x2E, 0x30
+    ),
+    mode_table!(
+        0x06, 0x63, SEQ_CGA2, CRTC_CGA2, AC_CGA2, GC_CGA2, DAC_CGA, 8, 0x4000, 1, 0x1E, 0x3F
+    ),
+    mode_table!(
+        0x07,
+        0x66,
+        SEQ_TEXT80,
+        CRTC_MONO,
+        AC_MONO_TEXT,
+        GC_MONO_TEXT,
+        DAC_MONO,
+        16,
+        0x1000,
+        8,
+        0x29,
+        0x30
+    ),
+    mode_table!(
+        0x0D, 0x63, SEQ_0D, CRTC_0D, AC_EGA_LOW, GC_PLANAR, DAC_CGA, 8, 0x2000, 8, 0x29, 0x30
+    ),
+    mode_table!(
+        0x0E, 0x63, SEQ_EGA, CRTC_0E, AC_EGA_LOW, GC_PLANAR, DAC_CGA, 8, 0x4000, 4, 0x29, 0x30
+    ),
+    mode_table!(
+        0x0F,
+        0xA2,
+        SEQ_EGA,
+        CRTC_0F,
+        AC_EGA_MONO,
+        GC_PLANAR,
+        DAC_MONO,
+        14,
+        0x8000,
+        2,
+        0x29,
+        0x30
+    ),
+    mode_table!(
+        0x10,
+        0xA3,
+        SEQ_EGA,
+        CRTC_0F,
+        AC_EGA_HIGH,
+        GC_PLANAR,
+        DAC_EGA,
+        14,
+        0x8000,
+        2,
+        0x29,
+        0x30
+    ),
+    mode_table!(
+        0x11,
+        0xE3,
+        SEQ_EGA,
+        CRTC_11,
+        AC_VGA_MONO,
+        GC_PLANAR,
+        DAC_EGA,
+        16,
+        0xA000,
+        1,
+        0x29,
+        0x30
+    ),
+    mode_table!(
+        0x12,
+        0xE3,
+        SEQ_EGA,
+        CRTC_12,
+        AC_EGA_HIGH,
+        GC_PLANAR,
+        DAC_EGA,
+        16,
+        0xA000,
+        1,
+        0x29,
+        0x30
+    ),
     mode_table!(0x13, 0x63, SEQ_256, CRTC_13, AC_256, GC_256, DAC_VGA, 8, 0xFA00, 1, 0x29, 0x30),
 ];
 
@@ -335,6 +435,8 @@ pub struct Vga {
 
     /// DAC index to XRGB, through the PEL mask.
     pub(crate) lut: [u32; 256],
+    /// What the VBE protected-mode code wrote to its private ports.
+    vesa_pm_latch: [u8; 6],
     /// 4-bit pixel to XRGB, through the attribute controller and the DAC.
     pal16: [u32; 16],
     lut_dirty: bool,
@@ -361,6 +463,10 @@ pub struct Vga {
     pub(crate) svga: Vec<u8>,
     pub(crate) vesa_mode: u16,
     pub(crate) vesa_bank: u16,
+    /// Bytes per line in banked memory (VBE function 06h).
+    pub(crate) vesa_pitch: usize,
+    /// The first displayed byte in banked memory (VBE function 07h).
+    pub(crate) vesa_start: usize,
     #[cfg(test)]
     pub(crate) fail_alloc: bool,
 
@@ -426,8 +532,18 @@ fn dac_default(table: u8, index: usize) -> [u8; 3] {
                 return [0; 3];
             }
             let bright = if index & 0x10 != 0 { 0x15 } else { 0 };
-            let level = |bit: usize| if index & bit != 0 { 0x2A + bright } else { bright };
-            let green = if index & 7 == 6 && bright == 0 { 0x15 } else { level(2) };
+            let level = |bit: usize| {
+                if index & bit != 0 {
+                    0x2A + bright
+                } else {
+                    bright
+                }
+            };
+            let green = if index & 7 == 6 && bright == 0 {
+                0x15
+            } else {
+                level(2)
+            };
             [level(4), green, level(1)]
         }
         DAC_EGA => {
@@ -435,7 +551,8 @@ fn dac_default(table: u8, index: usize) -> [u8; 3] {
                 return [0; 3];
             }
             let level = |low: usize, high: usize| {
-                (if index & low != 0 { 0x2A } else { 0 }) + (if index & high != 0 { 0x15 } else { 0 })
+                (if index & low != 0 { 0x2A } else { 0 })
+                    + (if index & high != 0 { 0x15 } else { 0 })
             };
             [level(4, 0x20), level(2, 0x10), level(1, 0x08)]
         }
@@ -624,6 +741,7 @@ impl Vga {
             planes: new_planes(),
             latch: 0,
             lut: [0; 256],
+            vesa_pm_latch: [0; 6],
             pal16: [0; 16],
             lut_dirty: true,
             pal_dirty: true,
@@ -641,6 +759,8 @@ impl Vga {
             svga: Vec::new(),
             vesa_mode: 0,
             vesa_bank: 0,
+            vesa_pitch: SCREEN_WIDTH,
+            vesa_start: 0,
             #[cfg(test)]
             fail_alloc: false,
             work: 0,
@@ -682,6 +802,7 @@ impl Vga {
         mem.write16(ROM_VESA_MODES + 4, 0xFFFF);
         // MOV AX,4F05h; INT 10h; RETF: the far window function of VBE 1.2.
         mem.copy_from(ROM_VESA_WINDOW, &[0xB8, 0x05, 0x4F, 0xCD, 0x10, 0xCB]);
+        mem.copy_from(ROM_VESA_PM, &VESA_PM_TABLE);
         self.rom_installed = true;
         self.sync_font_vectors(mem);
     }
@@ -771,6 +892,8 @@ impl Vga {
         self.no_clear = mode & 0x80 != 0;
         self.vesa_mode = 0;
         self.vesa_bank = 0;
+        self.vesa_pitch = SCREEN_WIDTH;
+        self.vesa_start = 0;
         self.gfx_font = None;
         self.load_registers(table);
         self.page = 0;
@@ -976,7 +1099,10 @@ impl Vga {
         mem.write16(BDA_BASE + 0x4E, self.page_start(self.page) as u16);
         for page in 0..8u32 {
             let (row, column) = self.page_cursors[page as usize];
-            mem.write16(BDA_BASE + 0x50 + page * 2, ((row as u16) << 8) | column as u16);
+            mem.write16(
+                BDA_BASE + 0x50 + page * 2,
+                ((row as u16) << 8) | column as u16,
+            );
         }
         mem.write16(
             BDA_BASE + 0x60,
@@ -1035,12 +1161,21 @@ impl Vga {
 
     /// Moves a page's cursor. Positions off the screen are legal: programs use
     /// them to hide the cursor.
-    pub(crate) fn set_page_cursor(&mut self, mem: &mut Memory, page: u8, row: usize, column: usize) {
+    pub(crate) fn set_page_cursor(
+        &mut self,
+        mem: &mut Memory,
+        page: u8,
+        row: usize,
+        column: usize,
+    ) {
         let page = page & 7;
         let row = row.min(255);
         let column = column.min(255);
         self.page_cursors[page as usize] = (row as u8, column as u8);
-        mem.write16(BDA_BASE + 0x50 + page as u32 * 2, ((row as u16) << 8) | column as u16);
+        mem.write16(
+            BDA_BASE + 0x50 + page as u32 * 2,
+            ((row as u16) << 8) | column as u16,
+        );
         if page == self.page {
             self.cursor = (row, column);
             self.program_cursor_location();
@@ -1058,8 +1193,8 @@ impl Vga {
     /// Points the CRTC cursor location at the active page's cursor.
     pub(crate) fn program_cursor_location(&mut self) {
         let (row, column) = self.cursor;
-        let location = (self.page_start(self.page) / 2)
-            .wrapping_add((row * self.columns + column) as u32);
+        let location =
+            (self.page_start(self.page) / 2).wrapping_add((row * self.columns + column) as u32);
         self.crtc[0x0E] = (location >> 8) as u8;
         self.crtc[0x0F] = location as u8;
     }
@@ -1099,7 +1234,9 @@ impl Vga {
     /// Physical address of a linear cell index on a page.
     #[inline]
     fn text_address(&self, page: u8, cell: usize) -> u32 {
-        let offset = self.page_start(page).wrapping_add((cell as u32).wrapping_mul(2));
+        let offset = self
+            .page_start(page)
+            .wrapping_add((cell as u32).wrapping_mul(2));
         self.base() + (offset & (TEXT_WINDOW - 1))
     }
 
@@ -1122,7 +1259,13 @@ impl Vga {
         }
     }
 
-    pub(crate) fn read_cell_on(&self, mem: &Memory, page: u8, row: usize, column: usize) -> (u8, u8) {
+    pub(crate) fn read_cell_on(
+        &self,
+        mem: &Memory,
+        page: u8,
+        row: usize,
+        column: usize,
+    ) -> (u8, u8) {
         if row < self.rows && column < self.columns {
             let address = self.text_address(page, row * self.columns + column);
             (mem.read8(address), mem.read8(address + 1))
@@ -1145,7 +1288,17 @@ impl Vga {
         let columns = self.columns;
         let page = self.page;
         let fill = if self.is_text() { attr } else { 0 };
-        self.scroll_window(mem, page, 0, 0, rows.saturating_sub(1), columns.saturating_sub(1), 0, fill, true);
+        self.scroll_window(
+            mem,
+            page,
+            0,
+            0,
+            rows.saturating_sub(1),
+            columns.saturating_sub(1),
+            0,
+            fill,
+            true,
+        );
         self.set_page_cursor(mem, page, 0, 0);
     }
 
@@ -1175,7 +1328,11 @@ impl Vga {
             return;
         }
         let height = bottom - top + 1;
-        let lines = if lines == 0 || lines > height { height } else { lines };
+        let lines = if lines == 0 || lines > height {
+            height
+        } else {
+            lines
+        };
         let keep = height - lines;
         let width = right - left + 1;
         self.dirty = true;
@@ -1205,7 +1362,11 @@ impl Vga {
                 (bottom + 1) * cell - 1 - step
             };
             if step < keep * cell {
-                let source = if up { y + lines * cell } else { y - lines * cell };
+                let source = if up {
+                    y + lines * cell
+                } else {
+                    y - lines * cell
+                };
                 self.gfx_copy_line(mem, page, source, y, left, width);
             } else {
                 self.gfx_fill_line(mem, page, y, left, width, attr);
@@ -1241,7 +1402,15 @@ impl Vga {
         self.scroll_window(mem, self.page, top, left, bottom, right, lines, attr, false);
     }
 
-    fn gfx_copy_line(&mut self, mem: &mut Memory, page: u8, from: usize, to: usize, left: usize, cells: usize) {
+    fn gfx_copy_line(
+        &mut self,
+        mem: &mut Memory,
+        page: u8,
+        from: usize,
+        to: usize,
+        left: usize,
+        cells: usize,
+    ) {
         if self.kind == GraphicsKind::Planar {
             let stride = self.host_stride();
             let start = self.page_start(page) as usize;
@@ -1261,7 +1430,15 @@ impl Vga {
         self.work = self.work.saturating_add(cells as u32 * 8);
     }
 
-    fn gfx_fill_line(&mut self, mem: &mut Memory, page: u8, y: usize, left: usize, cells: usize, color: u8) {
+    fn gfx_fill_line(
+        &mut self,
+        mem: &mut Memory,
+        page: u8,
+        y: usize,
+        left: usize,
+        cells: usize,
+        color: u8,
+    ) {
         if self.kind == GraphicsKind::Planar {
             let stride = self.host_stride();
             let target = self.page_start(page) as usize + y * stride + left;
@@ -1310,7 +1487,8 @@ impl Vga {
         }
         if row >= rows {
             let attr = if self.is_text() {
-                self.read_cell_on(mem, page, rows - 1, column.min(columns - 1)).1
+                self.read_cell_on(mem, page, rows - 1, column.min(columns - 1))
+                    .1
             } else {
                 0
             };
@@ -1388,9 +1566,19 @@ impl Vga {
 
     /// Draws a character at a text cell. Bit 7 of `color` XORs the set bits;
     /// otherwise the cell is drawn opaque over colour 0.
-    pub(crate) fn gfx_char(&mut self, mem: &mut Memory, page: u8, row: usize, column: usize, ch: u8, color: u8) {
+    pub(crate) fn gfx_char(
+        &mut self,
+        mem: &mut Memory,
+        page: u8,
+        row: usize,
+        column: usize,
+        ch: u8,
+        color: u8,
+    ) {
         let (lines, height) = self.gfx_glyph(mem, ch);
-        let xor = color & 0x80 != 0 && self.kind != GraphicsKind::Vga13 && self.kind != GraphicsKind::Vesa;
+        let xor = color & 0x80 != 0
+            && self.kind != GraphicsKind::Vga13
+            && self.kind != GraphicsKind::Vesa;
         let x0 = column * 8;
         let y0 = row * height;
         for (line, bits) in lines.iter().take(height).enumerate() {
@@ -1401,7 +1589,14 @@ impl Vga {
                         self.plot(mem, page, x0 + bit, y0 + line, color & 0x7F, true);
                     }
                 } else {
-                    self.plot(mem, page, x0 + bit, y0 + line, if set { color } else { 0 }, false);
+                    self.plot(
+                        mem,
+                        page,
+                        x0 + bit,
+                        y0 + line,
+                        if set { color } else { 0 },
+                        false,
+                    );
                 }
             }
         }
@@ -1470,14 +1665,22 @@ impl Vga {
     }
 
     /// Writes one pixel, or XORs it.
-    pub(crate) fn plot(&mut self, mem: &mut Memory, page: u8, x: usize, y: usize, color: u8, xor: bool) {
+    pub(crate) fn plot(
+        &mut self,
+        mem: &mut Memory,
+        page: u8,
+        x: usize,
+        y: usize,
+        color: u8,
+        xor: bool,
+    ) {
         if x >= self.width || y >= self.height {
             return;
         }
         match self.kind {
             GraphicsKind::Text => {}
             GraphicsKind::Vesa => {
-                let index = y * SCREEN_WIDTH + x;
+                let index = self.vesa_start + y * self.vesa_pitch + x;
                 if let Some(slot) = self.svga.get_mut(index) {
                     *slot = if xor { *slot ^ color } else { color };
                 }
@@ -1505,7 +1708,11 @@ impl Vga {
                 let mask = (0x80u32 >> (x & 7)) * 0x0101_0101;
                 let bits = EXPAND[(color & 0x0F) as usize] & mask;
                 let word = &mut self.planes[offset & (PLANE_SIZE - 1)];
-                *word = if xor { *word ^ bits } else { (*word & !mask) | bits };
+                *word = if xor {
+                    *word ^ bits
+                } else {
+                    (*word & !mask) | bits
+                };
             }
         }
         self.dirty = true;
@@ -1518,7 +1725,11 @@ impl Vga {
         }
         match self.kind {
             GraphicsKind::Text => 0,
-            GraphicsKind::Vesa => self.svga.get(y * SCREEN_WIDTH + x).copied().unwrap_or(0),
+            GraphicsKind::Vesa => self
+                .svga
+                .get(self.vesa_start + y * self.vesa_pitch + x)
+                .copied()
+                .unwrap_or(0),
             GraphicsKind::Vga13 => {
                 let (offset, plane) = self.pixel_256(x, y);
                 self.plane_byte(offset, plane)
@@ -1582,7 +1793,10 @@ impl Vga {
         let (at, plane) = if self.seq[0x04] & 0x08 != 0 {
             (offset & !3, (offset & 3) as u32)
         } else if self.gc[0x05] & 0x10 != 0 {
-            (offset & !1, ((self.gc[0x04] as u32) & 2) | (offset & 1) as u32)
+            (
+                offset & !1,
+                ((self.gc[0x04] as u32) & 2) | (offset & 1) as u32,
+            )
         } else {
             (offset, (self.gc[0x04] & 3) as u32)
         };
@@ -1700,9 +1914,11 @@ impl Vga {
             0x3CE => self.gc_index,
             0x3CF => self.gc.get(self.gc_index as usize).copied().unwrap_or(0),
             0x3B4 | 0x3D4 if port == self.crtc_port() => self.crtc_index,
-            0x3B5 | 0x3D5 if port == self.crtc_port() + 1 => {
-                self.crtc.get(self.crtc_index as usize).copied().unwrap_or(0)
-            }
+            0x3B5 | 0x3D5 if port == self.crtc_port() + 1 => self
+                .crtc
+                .get(self.crtc_index as usize)
+                .copied()
+                .unwrap_or(0),
             0x3BA | 0x3DA => {
                 self.ac_flip = false;
                 status_bits(time_us)
@@ -1826,7 +2042,8 @@ impl Vga {
                 let columns = self.columns.max(1);
                 let position = location.wrapping_sub(self.start_counter()) as usize & 0x3FFF;
                 self.cursor = ((position / columns).min(255), (position % columns).min(255));
-                self.page_cursors[self.page as usize & 7] = (self.cursor.0 as u8, self.cursor.1 as u8);
+                self.page_cursors[self.page as usize & 7] =
+                    (self.cursor.0 as u8, self.cursor.1 as u8);
                 mem.write16(
                     BDA_BASE + 0x50 + (self.page as u32 & 7) * 2,
                     ((self.cursor.0 as u16) << 8) | self.cursor.1 as u16,
@@ -1877,6 +2094,36 @@ impl Vga {
         self.dirty = true;
     }
 
+    /// Takes a byte on the ports behind the VBE protected-mode interface: `1CEh`
+    /// and `1CFh` hold the bank, and `1D0h` to `1D3h` the display start in dwords.
+    pub fn vesa_pm_port(&mut self, port: u16, value: u8) {
+        let index = (port - 0x1CE) as usize;
+        self.vesa_pm_latch[index] = value;
+        if self.vesa_mode == 0 {
+            return;
+        }
+        match port {
+            0x1CF => {
+                let bank = self.vesa_pm_latch[0] as usize | ((value as usize) << 8);
+                if bank < SVGA_SIZE / 0x1_0000 {
+                    self.vesa_bank = bank as u16;
+                }
+            }
+            0x1D3 => {
+                let [a, b, c, d] = [
+                    self.vesa_pm_latch[2],
+                    self.vesa_pm_latch[3],
+                    self.vesa_pm_latch[4],
+                    value,
+                ];
+                let start = u32::from_le_bytes([a, b, c, d]) as usize;
+                self.vesa_start = start.saturating_mul(4).min(SVGA_SIZE - 1);
+                self.dirty = true;
+            }
+            _ => {}
+        }
+    }
+
     /// Sets one DAC entry, for the BIOS.
     pub(crate) fn set_dac(&mut self, index: u8, red: u8, green: u8, blue: u8) {
         self.dac[index as usize] = [red & 0x3F, green & 0x3F, blue & 0x3F];
@@ -1921,7 +2168,11 @@ impl Vga {
                 let bright = value & 0x10;
                 self.ac[0x00] = mapped;
                 self.ac[0x11] = mapped;
-                let base: [u8; 3] = if value & 0x20 != 0 { [3, 5, 7] } else { [2, 4, 6] };
+                let base: [u8; 3] = if value & 0x20 != 0 {
+                    [3, 5, 7]
+                } else {
+                    [2, 4, 6]
+                };
                 for (slot, color) in self.ac[1..4].iter_mut().zip(base) {
                     *slot = color | bright;
                 }
@@ -2031,7 +2282,7 @@ impl Vga {
             .take(self.display_height)
             .enumerate()
         {
-            let at = y * SCREEN_WIDTH;
+            let at = self.vesa_start + y * self.vesa_pitch;
             match self.svga.get(at..at + SCREEN_WIDTH) {
                 Some(source) => {
                     for (out, index) in row.iter_mut().zip(source) {
@@ -2065,7 +2316,11 @@ impl Vga {
         let mut last = None;
         for y in 0..self.display_height.min(SCREEN_HEIGHT) {
             walker.begin_line(y as u32);
-            let pan = if walker.split && split_pan_off { 0 } else { pan_full };
+            let pan = if walker.split && split_pan_off {
+                0
+            } else {
+                pan_full
+            };
             let key = (
                 walker.counter,
                 if scan_matters { walker.scan } else { 0 },
@@ -2103,7 +2358,14 @@ impl Vga {
         }
     }
 
-    fn decode_256(&self, addressing: &CrtcAddressing, counter: u32, scan: u32, needed: usize, line: &mut [u8]) {
+    fn decode_256(
+        &self,
+        addressing: &CrtcAddressing,
+        counter: u32,
+        scan: u32,
+        needed: usize,
+        line: &mut [u8],
+    ) {
         let clocks = needed / 4 + 1;
         for (clock, slot) in line.chunks_exact_mut(4).take(clocks).enumerate() {
             let at = addressing.address(counter.wrapping_add(clock as u32), scan) as usize;
@@ -2111,7 +2373,14 @@ impl Vga {
         }
     }
 
-    fn decode_planar(&self, addressing: &CrtcAddressing, counter: u32, scan: u32, needed: usize, line: &mut [u8]) {
+    fn decode_planar(
+        &self,
+        addressing: &CrtcAddressing,
+        counter: u32,
+        scan: u32,
+        needed: usize,
+        line: &mut [u8],
+    ) {
         let clocks = needed / 8 + 1;
         for (clock, slot) in line.chunks_exact_mut(8).take(clocks).enumerate() {
             let at = addressing.address(counter.wrapping_add(clock as u32), scan) as usize;
@@ -2172,7 +2441,8 @@ impl Vga {
         let scale = self.pixel_scale.max(1);
         let width = self.display_width;
         let base = self.base();
-        let cells = ((self.crtc[0x01] as usize + 1).min(SCREEN_WIDTH / (8 * scale)) + 1).min(MAX_CELLS);
+        let cells =
+            ((self.crtc[0x01] as usize + 1).min(SCREEN_WIDTH / (8 * scale)) + 1).min(MAX_CELLS);
         let (font_a, font_b) = self.font_maps();
         let control = self.ac[0x10];
         let blink_enabled = control & 0x08 != 0;
@@ -2206,7 +2476,11 @@ impl Vga {
                     } else {
                         (self.pal16[((attr >> 4) & 0x0F) as usize], false)
                     };
-                    cell.foreground = if blinking && !blink { background } else { foreground };
+                    cell.foreground = if blinking && !blink {
+                        background
+                    } else {
+                        foreground
+                    };
                     cell.background = background;
                     let map = if attr & 0x08 != 0 { font_a } else { font_b };
                     cell.glyph = (map + ch as usize * 32) as u32;
@@ -2215,11 +2489,7 @@ impl Vga {
                 }
             }
             let scan = walker.scan;
-            for (cell, slot) in row_cells
-                .iter()
-                .take(cells)
-                .zip(pixels.chunks_exact_mut(8))
-            {
+            for (cell, slot) in row_cells.iter().take(cells).zip(pixels.chunks_exact_mut(8)) {
                 let mut bits = self.plane_byte(cell.glyph as usize + scan as usize, 2);
                 if cell.underline && scan == underline_scan {
                     bits = 0xFF;
@@ -2235,7 +2505,11 @@ impl Vga {
                     };
                 }
             }
-            let pan = if walker.split && split_pan_off { 0 } else { pan_full };
+            let pan = if walker.split && split_pan_off {
+                0
+            } else {
+                pan_full
+            };
             let at = y * SCREEN_WIDTH;
             let row = &mut screen[at..at + width];
             for (out, pixel) in row.chunks_mut(scale).zip(pixels[pan..].iter()) {
@@ -2247,54 +2521,7 @@ impl Vga {
 
     /// Centres the displayed area in the canvas with an integer scale.
     pub fn blit(&self, canvas: &mut Canvas<'_>, screen: &[u32]) {
-        canvas.clear(feos_gfx::Color::BLACK);
-        let canvas_width = canvas.width();
-        let canvas_height = canvas.height();
-        if canvas_width == 0 || canvas_height == 0 || screen.len() < SCREEN_WIDTH * SCREEN_HEIGHT {
-            return;
-        }
-        let (width, height) = self.display_size();
-        let width = width.clamp(1, SCREEN_WIDTH);
-        let height = height.clamp(1, SCREEN_HEIGHT);
-        let scale = (canvas_width / width).min(canvas_height / height).max(1);
-        let draw_width = (width * scale).min(canvas_width);
-        let draw_height = (height * scale).min(canvas_height);
-        let offset_x = (canvas_width - draw_width) / 2;
-        let offset_y = (canvas_height - draw_height) / 2;
-
-        if scale == 1 {
-            for y in 0..draw_height {
-                let at = y * SCREEN_WIDTH;
-                canvas.blit(
-                    offset_x as i32,
-                    (offset_y + y) as i32,
-                    draw_width as u32,
-                    1,
-                    &screen[at..at + draw_width],
-                );
-            }
-            return;
-        }
-
-        let mut row = vec![0u32; draw_width];
-        for y in 0..draw_height.div_ceil(scale) {
-            let at = y * SCREEN_WIDTH;
-            for (slot, pixel) in row.chunks_mut(scale).zip(&screen[at..at + width]) {
-                slot.fill(*pixel);
-            }
-            for repeat in 0..scale {
-                let target = y * scale + repeat;
-                if target < draw_height {
-                    canvas.blit(
-                        offset_x as i32,
-                        (offset_y + target) as i32,
-                        draw_width as u32,
-                        1,
-                        &row,
-                    );
-                }
-            }
-        }
+        blit_screen(canvas, screen, self.display_size());
     }
 
     pub fn text(&self, mem: &Memory) -> String {
@@ -2351,6 +2578,8 @@ impl Vga {
         self.mode = bios_mode;
         self.vesa_mode = mode;
         self.vesa_bank = 0;
+        self.vesa_pitch = SCREEN_WIDTH;
+        self.vesa_start = 0;
         self.char_height = 16;
         self.pages = 1;
         self.page_size = 0;
@@ -2635,20 +2864,23 @@ fn cga_pixel(x: usize, y: usize, wide: bool) -> (u32, u32, u8) {
     ((offset as u32) & (TEXT_WINDOW - 1), shift, mask)
 }
 
-/// Input status 1, from guest time: a 70 Hz frame with a retrace of a twentieth
-/// of it, and display enable toggling at the 31.5 kHz line rate.
+/// Input status 1, from guest time, for a 400-line frame at 70 Hz. Display enable
+/// toggles at the 31.5 kHz line rate during the 400 visible lines and stays off
+/// through vertical blanking, with the retrace a few lines into that. Wolfenstein
+/// 3D finds the bottom of the screen by that run of blank without retrace.
 fn status_bits(time_us: u64) -> u8 {
     const FRAME_US: u64 = 14_286;
-    const RETRACE_US: u64 = FRAME_US / 20;
     const LINE_US: u64 = 32;
-    const HBLANK_US: u64 = 6;
-    let in_retrace = time_us % FRAME_US >= FRAME_US - RETRACE_US;
-    let in_blank = time_us % LINE_US >= LINE_US - HBLANK_US;
+    const VISIBLE_US: u64 = 400 * LINE_US;
+    const RETRACE_START_US: u64 = 412 * LINE_US;
+    const RETRACE_END_US: u64 = 416 * LINE_US;
+    const HBLANK_US: u64 = 5;
+    let at = time_us % FRAME_US;
     let mut value = 0;
-    if in_retrace {
-        value |= 0x08 | 0x01;
+    if (RETRACE_START_US..RETRACE_END_US).contains(&at) {
+        value |= 0x08;
     }
-    if in_blank {
+    if at >= VISIBLE_US || at % LINE_US >= LINE_US - HBLANK_US {
         value |= 0x01;
     }
     value
@@ -2675,6 +2907,59 @@ pub fn palette16(index: usize) -> (u8, u8, u8) {
         (255, 255, 255),
     ];
     COLORS[index & 0x0F]
+}
+
+/// Draws a [`SCREEN_WIDTH`] by [`SCREEN_HEIGHT`] buffer holding a picture of
+/// `size`, centred at the largest integer scale that fits.
+pub fn blit_screen(canvas: &mut Canvas<'_>, screen: &[u32], size: (usize, usize)) {
+    canvas.clear(feos_gfx::Color::BLACK);
+    let canvas_width = canvas.width();
+    let canvas_height = canvas.height();
+    if canvas_width == 0 || canvas_height == 0 || screen.len() < SCREEN_WIDTH * SCREEN_HEIGHT {
+        return;
+    }
+    let (width, height) = size;
+    let width = width.clamp(1, SCREEN_WIDTH);
+    let height = height.clamp(1, SCREEN_HEIGHT);
+    let scale = (canvas_width / width).min(canvas_height / height).max(1);
+    let draw_width = (width * scale).min(canvas_width);
+    let draw_height = (height * scale).min(canvas_height);
+    let offset_x = (canvas_width - draw_width) / 2;
+    let offset_y = (canvas_height - draw_height) / 2;
+
+    if scale == 1 {
+        for y in 0..draw_height {
+            let at = y * SCREEN_WIDTH;
+            canvas.blit(
+                offset_x as i32,
+                (offset_y + y) as i32,
+                draw_width as u32,
+                1,
+                &screen[at..at + draw_width],
+            );
+        }
+        return;
+    }
+
+    let mut row = vec![0u32; draw_width];
+    for y in 0..draw_height.div_ceil(scale) {
+        let at = y * SCREEN_WIDTH;
+        for (slot, pixel) in row.chunks_mut(scale).zip(&screen[at..at + width]) {
+            slot.fill(*pixel);
+        }
+        for repeat in 0..scale {
+            let target = y * scale + repeat;
+            if target < draw_height {
+                canvas.blit(
+                    offset_x as i32,
+                    (offset_y + target) as i32,
+                    draw_width as u32,
+                    1,
+                    &row,
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3525,13 +3810,15 @@ mod tests {
             samples += 1;
             time += 3;
         }
-        let share = retrace * 100 / samples;
-        assert!((4..=6).contains(&share), "retrace share {share}");
+        let share = retrace * 1000 / samples;
+        assert!((8..=10).contains(&share), "retrace share {share}");
         assert!(toggles > 1000, "toggles {toggles}");
         // A wait-for-retrace loop sees both edges.
         assert_eq!(vga.port_in(0x3DA, &mem, 0) & 8, 0);
-        assert_eq!(vga.port_in(0x3DA, &mem, 14_285) & 8, 8);
-        assert_eq!(vga.port_in(0x3DA, &mem, 14_286) & 8, 0);
+        assert_eq!(vga.port_in(0x3DA, &mem, 13_200) & 8, 8);
+        assert_eq!(vga.port_in(0x3DA, &mem, 14_285) & 8, 0);
+        // Vertical blanking before the retrace: blank, with no retrace yet.
+        assert_eq!(vga.port_in(0x3DA, &mem, 12_900) & 9, 1);
     }
 
     // ------------------------------------------------------------------
@@ -3633,7 +3920,10 @@ mod tests {
         assert_eq!(mem.read8(BDA_BASE + 0x66), 0x30);
         vga.set_cursor(&mut mem, 3, 4);
         assert_eq!(mem.read16(BDA_BASE + 0x50), 0x0304);
-        assert_eq!(vga.crtc[0x0F] as usize + ((vga.crtc[0x0E] as usize) << 8), 3 * 80 + 4);
+        assert_eq!(
+            vga.crtc[0x0F] as usize + ((vga.crtc[0x0E] as usize) << 8),
+            3 * 80 + 4
+        );
         vga.teletype(&mut mem, b'A');
         assert_eq!(mem.read16(BDA_BASE + 0x50), 0x0305);
     }
@@ -3791,7 +4081,10 @@ mod tests {
         target.bell = 77;
         for len in (0..fixed_part).chain([fixed_part + 100, data.len() - 1]) {
             let mut at_pos = 0;
-            assert!(!target.load_state(&data[..len], &mut at_pos), "length {len}");
+            assert!(
+                !target.load_state(&data[..len], &mut at_pos),
+                "length {len}"
+            );
             assert_eq!(at_pos, 0);
             assert_eq!(target.bell, 77);
         }
@@ -3801,15 +4094,15 @@ mod tests {
         assert!(!target.load_state(&data, &mut at_pos));
 
         for (offset, value) in [
-            (0usize, 0u8),        // magic
-            (4, 99),              // version
-            (5, 0x7F),            // mode
-            (6, 2),               // flag
-            (7, 1),               // VESA mode without its memory
-            (11, 9),              // page beyond the pages
-            (12, 0),              // pages
-            (13, 0),              // character height
-            (13, 33),             // character height
+            (0usize, 0u8), // magic
+            (4, 99),       // version
+            (5, 0x7F),     // mode
+            (6, 2),        // flag
+            (7, 1),        // VESA mode without its memory
+            (11, 9),       // page beyond the pages
+            (12, 0),       // pages
+            (13, 0),       // character height
+            (13, 33),      // character height
         ] {
             let mut bad = data.clone();
             bad[offset] = value;

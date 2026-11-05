@@ -8,8 +8,28 @@
 //! Sleeping tasks are the table's [`Blocked`](State::Blocked) entries with a
 //! deadline. With a fixed, small table, scanning them on each tick is cheaper
 //! and simpler than keeping a sorted queue.
+//!
+//! # Choosing what runs
+//!
+//! Each task has a home CPU, and a CPU prefers its own tasks, so a task stays where
+//! its data is cached: these are per-CPU run queues, in policy. They share the
+//! table and the one lock around it, which is fine for a table this small, and
+//! means there's no queue to get out of step with the states.
+//!
+//! The highest priority wins, round-robin among equals. A CPU takes another's task
+//! when it has nothing of its own at that priority, or when the other's queue is
+//! longer, which is how load evens out. A task can name the CPUs it may use. A task
+//! passed over too many times gets one turn at the top, so a low priority means
+//! slow, not stopped.
 
 #![cfg_attr(not(test), no_std)]
+
+/// The priority of a task nobody has said anything about.
+pub const PRIORITY_NORMAL: u8 = 8;
+/// The highest priority. Larger numbers are more urgent.
+pub const PRIORITY_MAX: u8 = 15;
+/// How many times a ready task can be passed over before it gets a turn anyway.
+const STARVATION_LIMIT: u16 = 64;
 
 /// Scheduler-visible lifecycle state. The zero value is [`State::Free`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -37,6 +57,8 @@ pub enum Wait {
     Until(u64),
     /// A wake on this address.
     Key(usize),
+    /// A wake on this address, or a counter deadline, whichever comes first.
+    KeyUntil(usize, u64),
 }
 
 /// Why a CPU is choosing what to run next.
@@ -50,6 +72,8 @@ pub enum Request {
     Sleep(u64),
     /// The current task blocks until [`Table::wake_key`] names this key.
     Wait(usize),
+    /// As `Wait`, but not past this counter value.
+    WaitUntil(usize, u64),
     /// The current task has finished.
     Exit,
 }
@@ -103,6 +127,17 @@ pub struct Task {
     pub kill_deadline: u64,
     /// Scheduler ticks consumed by this task across all CPUs.
     pub cpu_ticks: u64,
+    /// Held off the CPU by job control until it is resumed. Only a pending kill
+    /// overrides this, because a task must run to reach a safe point.
+    pub stopped: bool,
+    /// How urgent the task is, up to [`PRIORITY_MAX`].
+    pub priority: u8,
+    /// The CPU whose queue the task is on.
+    pub home: u8,
+    /// The CPUs this task may run on, as a bit each. Zero means any.
+    pub affinity: u32,
+    /// Times this task was ready and something else was chosen.
+    passed_over: u16,
 }
 
 /// The process table and accounting.
@@ -122,6 +157,8 @@ pub struct Table<const TASKS: usize, const CPUS: usize> {
     pub cpu_idle_ticks: [u64; CPUS],
     /// Heap bytes left behind by tasks that were killed before freeing them.
     pub leaked_bytes: usize,
+    /// Counter value each CPU's time was last accounted up to.
+    accounted: [u64; CPUS],
 }
 
 impl<const TASKS: usize, const CPUS: usize> Table<TASKS, CPUS> {
@@ -138,6 +175,11 @@ impl<const TASKS: usize, const CPUS: usize> Table<TASKS, CPUS> {
             kill_pending: false,
             kill_deadline: 0,
             cpu_ticks: 0,
+            stopped: false,
+            priority: 0,
+            home: 0,
+            affinity: 0,
+            passed_over: 0,
         };
         Self {
             tasks: [TASK; TASKS],
@@ -149,6 +191,7 @@ impl<const TASKS: usize, const CPUS: usize> Table<TASKS, CPUS> {
             cpu_total_ticks: [0; CPUS],
             cpu_idle_ticks: [0; CPUS],
             leaked_bytes: 0,
+            accounted: [0; CPUS],
         }
     }
 
@@ -156,6 +199,7 @@ impl<const TASKS: usize, const CPUS: usize> Table<TASKS, CPUS> {
     pub fn init(&mut self) {
         self.tasks[0].state = State::Running;
         self.tasks[0].pid = 1;
+        self.tasks[0].priority = PRIORITY_NORMAL;
         self.current = [0; CPUS];
         self.current[0] = 1;
         self.next_pid = 2;
@@ -199,6 +243,7 @@ impl<const TASKS: usize, const CPUS: usize> Table<TASKS, CPUS> {
     pub fn reserve(&mut self) -> Option<(usize, u32)> {
         let slot = (1..TASKS).find(|&slot| self.tasks[slot].state == State::Free)?;
         let pid = self.next_pid;
+        let home = self.least_loaded();
         self.next_pid = self.next_pid.wrapping_add(1).max(2);
         self.tasks[slot] = Task {
             state: State::Spawning,
@@ -207,8 +252,63 @@ impl<const TASKS: usize, const CPUS: usize> Table<TASKS, CPUS> {
             kill_pending: false,
             kill_deadline: 0,
             cpu_ticks: 0,
+            stopped: false,
+            priority: PRIORITY_NORMAL,
+            home,
+            affinity: 0,
+            passed_over: 0,
         };
         Some((slot, pid))
+    }
+
+    /// The online CPU with the fewest tasks homed on it that aren't blocked.
+    fn least_loaded(&self) -> u8 {
+        let mut load = [0usize; CPUS];
+        for task in &self.tasks {
+            if matches!(task.state, State::Ready | State::Running | State::Spawning) {
+                if let Some(count) = load.get_mut(task.home as usize) {
+                    *count += 1;
+                }
+            }
+        }
+        let online = self.online.clamp(1, CPUS);
+        (0..online).min_by_key(|&cpu| load[cpu]).unwrap_or(0) as u8
+    }
+
+    /// Sets a task's priority. Returns `false` when there's no such task or the
+    /// priority is out of range.
+    pub fn set_priority(&mut self, pid: u32, priority: u8) -> bool {
+        if priority > PRIORITY_MAX {
+            return false;
+        }
+        match self.find_pid(pid) {
+            Some(slot) => {
+                self.tasks[slot].priority = priority;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Sets the CPUs a task may run on, as a bit each. Returns `false` when there's
+    /// no such task or the mask names no online CPU. A running task moves at its
+    /// CPU's next tick.
+    pub fn set_affinity(&mut self, pid: u32, mask: u32) -> bool {
+        let online = if self.online >= 32 { u32::MAX } else { (1u32 << self.online) - 1 };
+        if mask & online == 0 {
+            return false;
+        }
+        match self.find_pid(pid) {
+            Some(slot) => {
+                let task = &mut self.tasks[slot];
+                task.affinity = mask;
+                if mask >> task.home & 1 == 0 {
+                    task.home = mask.trailing_zeros() as u8;
+                }
+                true
+            }
+            None => false,
+        }
     }
 
     /// Makes a reserved slot runnable.
@@ -222,6 +322,22 @@ impl<const TASKS: usize, const CPUS: usize> Table<TASKS, CPUS> {
         self.tasks[slot].state = State::Free;
         self.tasks[slot].wait = Wait::Nothing;
         self.tasks[slot].kill_pending = false;
+        self.tasks[slot].stopped = false;
+    }
+
+    /// Holds or releases `pid`. Returns `false` when it can't be: no such
+    /// process, or the boot task, which the system needs running.
+    pub fn set_stopped(&mut self, pid: u32, stopped: bool) -> bool {
+        if pid == self.tasks[0].pid {
+            return false;
+        }
+        match self.find_pid(pid) {
+            Some(slot) => {
+                self.tasks[slot].stopped = stopped;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Frees a killed task, charging any heap it still owns as leaked.
@@ -295,11 +411,53 @@ impl<const TASKS: usize, const CPUS: usize> Table<TASKS, CPUS> {
         }
     }
 
+    /// Accounts the time on `cpu` since the last call, in whole ticks of
+    /// `tick_length` counter units. A CPU with nothing to do takes no timer
+    /// interrupts, so this is how the time it spent that way gets counted.
+    pub fn account_elapsed(&mut self, cpu: usize, now: u64, tick_length: u64, idle_hint: bool) {
+        if tick_length == 0 {
+            return;
+        }
+        if self.accounted[cpu] == 0 {
+            self.accounted[cpu] = now;
+            return;
+        }
+        let ticks = now.wrapping_sub(self.accounted[cpu]) / tick_length;
+        self.accounted[cpu] = self.accounted[cpu].wrapping_add(ticks * tick_length);
+        self.total_ticks = self.total_ticks.wrapping_add(ticks);
+        self.cpu_total_ticks[cpu] = self.cpu_total_ticks[cpu].wrapping_add(ticks);
+        match self.current(cpu) {
+            Some(slot) if !idle_hint => {
+                self.tasks[slot].cpu_ticks = self.tasks[slot].cpu_ticks.wrapping_add(ticks);
+            }
+            _ => {
+                self.idle_ticks = self.idle_ticks.wrapping_add(ticks);
+                self.cpu_idle_ticks[cpu] = self.cpu_idle_ticks[cpu].wrapping_add(ticks);
+            }
+        }
+    }
+
+    /// When `cpu`'s timer should next fire: the end of a time slice of `slice`, or
+    /// sooner, for a sleeper on this CPU's queue. A CPU that's idle has no slice to
+    /// end, so it can go as long as `idle_limit`.
+    pub fn next_deadline(&self, cpu: usize, now: u64, slice: u64, idle_limit: u64) -> u64 {
+        let wait = if self.current(cpu).is_some() { slice } else { idle_limit };
+        let mut deadline = now.saturating_add(wait);
+        for task in &self.tasks {
+            if task.state == State::Blocked && task.home as usize == cpu {
+                if let Wait::Until(until) | Wait::KeyUntil(_, until) = task.wait {
+                    deadline = deadline.min(until);
+                }
+            }
+        }
+        deadline
+    }
+
     /// Makes every sleeper whose deadline has passed runnable.
     fn wake_expired(&mut self, now: u64) {
         for task in &mut self.tasks {
             if task.state == State::Blocked {
-                if let Wait::Until(deadline) = task.wait {
+                if let Wait::Until(deadline) | Wait::KeyUntil(_, deadline) = task.wait {
                     if now >= deadline {
                         task.state = State::Ready;
                         task.wait = Wait::Nothing;
@@ -316,7 +474,11 @@ impl<const TASKS: usize, const CPUS: usize> Table<TASKS, CPUS> {
             if woken == count {
                 break;
             }
-            if task.state == State::Blocked && task.wait == Wait::Key(key) {
+            let waiting = match task.wait {
+                Wait::Key(waited) | Wait::KeyUntil(waited, _) => waited == key,
+                _ => false,
+            };
+            if task.state == State::Blocked && waiting {
                 task.state = State::Ready;
                 task.wait = Wait::Nothing;
                 woken += 1;
@@ -325,13 +487,28 @@ impl<const TASKS: usize, const CPUS: usize> Table<TASKS, CPUS> {
         woken
     }
 
-    /// Takes the next `Ready` slot after `after`, wrapping around.
+    /// Whether `slot` may run on `cpu`.
+    fn allowed(&self, slot: usize, cpu: usize) -> bool {
+        let affinity = self.tasks[slot].affinity;
+        affinity == 0 || affinity >> cpu & 1 != 0
+    }
+
+    /// Takes what `cpu` should run next, looking from the slot after `after` so
+    /// that equals take turns. See the module's documentation for the rules.
     ///
     /// A flagged task found on the way is reaped instead of being run.
-    fn take_next(&mut self, after: Option<usize>, now: u64, facts: &impl TaskFacts) -> Option<usize> {
+    fn take_next(
+        &mut self,
+        cpu: usize,
+        after: Option<usize>,
+        now: u64,
+        facts: &impl TaskFacts,
+    ) -> Option<usize> {
         let start = after.unwrap_or(TASKS - 1);
-        for step in 1..=TASKS {
-            let slot = (start + step) % TASKS;
+
+        // Everything this CPU could run, and how long each CPU's queue is.
+        let mut queued = [0usize; CPUS];
+        for slot in 0..TASKS {
             if self.tasks[slot].state != State::Ready {
                 continue;
             }
@@ -339,9 +516,60 @@ impl<const TASKS: usize, const CPUS: usize> Table<TASKS, CPUS> {
                 self.reap(slot, facts);
                 continue;
             }
-            return Some(slot);
+            if self.tasks[slot].stopped && !self.tasks[slot].kill_pending {
+                continue;
+            }
+            if let Some(count) = queued.get_mut(self.tasks[slot].home as usize) {
+                *count += 1;
+            }
         }
-        None
+        let mine = queued[cpu];
+
+        let mut best = None;
+        let mut best_rank = (0u8, 0u8);
+        for step in 1..=TASKS {
+            let slot = (start + step) % TASKS;
+            let task = &self.tasks[slot];
+            if task.state != State::Ready
+                || (task.stopped && !task.kill_pending)
+                || !self.allowed(slot, cpu)
+            {
+                continue;
+            }
+            let urgency = if task.passed_over >= STARVATION_LIMIT {
+                PRIORITY_MAX + 1
+            } else {
+                task.priority
+            };
+            // Of equal urgency: a longer queue elsewhere first, then this CPU's
+            // own, then whatever's left, so that the CPU isn't idle.
+            let home = task.home as usize;
+            let preference = if home == cpu {
+                1
+            } else if queued.get(home).is_some_and(|&theirs| theirs > mine) {
+                2
+            } else {
+                0
+            };
+            // One past any real rank, so the first candidate always counts.
+            let rank = (urgency + 1, preference);
+            if rank > best_rank {
+                best_rank = rank;
+                best = Some(slot);
+            }
+        }
+
+        let chosen = best?;
+        for slot in 0..TASKS {
+            if slot != chosen && self.tasks[slot].state == State::Ready && self.allowed(slot, cpu) {
+                let task = &mut self.tasks[slot];
+                task.passed_over = task.passed_over.saturating_add(1);
+            }
+        }
+        let task = &mut self.tasks[chosen];
+        task.passed_over = 0;
+        task.home = cpu as u8;
+        Some(chosen)
     }
 
     /// Retires the current task on `cpu` according to `request` and picks what
@@ -375,6 +603,9 @@ impl<const TASKS: usize, const CPUS: usize> Table<TASKS, CPUS> {
                         (State::Blocked, Wait::Until(deadline))
                     }
                     Request::Wait(key) if !task.kill_pending => (State::Blocked, Wait::Key(key)),
+                    Request::WaitUntil(key, deadline) if !task.kill_pending && now < deadline => {
+                        (State::Blocked, Wait::KeyUntil(key, deadline))
+                    }
                     _ => (State::Ready, Wait::Nothing),
                 };
                 task.state = state;
@@ -387,7 +618,7 @@ impl<const TASKS: usize, const CPUS: usize> Table<TASKS, CPUS> {
             self.wake_expired(now);
         }
 
-        let next = self.take_next(current, now, facts);
+        let next = self.take_next(cpu, current, now, facts);
         if let Some(slot) = next {
             self.tasks[slot].state = State::Running;
         }
@@ -734,6 +965,212 @@ mod tests {
     }
 
     #[test]
+    fn a_timed_wait_ends_at_a_wake_or_its_deadline() {
+        let mut table = table();
+        let facts = Facts::default();
+        let (slot, _) = spawn(&mut table);
+        table.switch(1, Request::Preempt, 0, &facts);
+
+        table.switch(1, Request::WaitUntil(0xa, 100), 10, &facts);
+        assert_eq!(state(&table, slot), State::Blocked);
+        assert_eq!(table.switch(1, Request::Preempt, 99, &facts).next, None);
+        assert_eq!(table.switch(1, Request::Preempt, 100, &facts).next, Some(slot));
+
+        table.switch(1, Request::WaitUntil(0xa, 500), 200, &facts);
+        assert_eq!(table.wake_key(0xa, 1), 1);
+        assert_eq!(state(&table, slot), State::Ready);
+
+        // Already past its deadline, so it never blocks.
+        table.switch(1, Request::Preempt, 300, &facts);
+        table.switch(1, Request::WaitUntil(0xa, 100), 300, &facts);
+        assert_ne!(state(&table, slot), State::Blocked);
+    }
+
+    #[test]
+    fn higher_priority_runs_first_and_equals_take_turns() {
+        let mut table = table();
+        let facts = Facts::default();
+        let (low, low_pid) = spawn(&mut table);
+        let (high, high_pid) = spawn(&mut table);
+        let (other, other_pid) = spawn(&mut table);
+        assert!(table.set_priority(low_pid, 1));
+        assert!(table.set_priority(high_pid, 12));
+        assert!(table.set_priority(other_pid, 12));
+        assert_eq!(table.tasks()[high].priority, 12);
+
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(table.switch(0, Request::Preempt, 0, &facts).next.unwrap());
+        }
+        assert_eq!(seen, [high, other, high, other]);
+        assert_ne!(seen[0], low);
+    }
+
+    #[test]
+    fn a_priority_must_be_in_range_and_the_task_must_exist() {
+        let mut table = table();
+        let (_, pid) = spawn(&mut table);
+        assert!(!table.set_priority(pid, PRIORITY_MAX + 1));
+        assert!(table.set_priority(pid, PRIORITY_MAX));
+        assert!(!table.set_priority(999, 1));
+    }
+
+    #[test]
+    fn a_low_priority_task_is_slowed_not_stopped() {
+        let mut table = table();
+        let facts = Facts::default();
+        let (low, low_pid) = spawn(&mut table);
+        assert!(table.set_priority(low_pid, 0));
+
+        let mut turns = 0;
+        for _ in 0..(STARVATION_LIMIT as usize + 1) * 3 {
+            if table.switch(0, Request::Preempt, 0, &facts).next == Some(low) {
+                turns += 1;
+            }
+        }
+        assert!(turns >= 2, "it got {turns} turns");
+        assert!(turns <= 4, "it got {turns} turns");
+    }
+
+    /// A table with this many CPUs online and CPU 0 idle.
+    fn smp_table() -> TestTable {
+        let mut table = table();
+        table.cpu_online();
+        table
+    }
+
+    #[test]
+    fn affinity_keeps_a_task_off_other_cpus() {
+        let mut table = smp_table();
+        let facts = Facts::default();
+        let (slot, pid) = spawn(&mut table);
+        assert!(table.set_affinity(pid, 1 << 1));
+        assert_eq!(table.tasks()[slot].home, 1);
+
+        // CPU 0 keeps its own task even though this one's waiting.
+        assert_eq!(table.switch(0, Request::Preempt, 0, &facts).next, Some(0));
+        assert_eq!(table.switch(1, Request::Preempt, 0, &facts).next, Some(slot));
+        // It may not be stolen back either.
+        table.switch(1, Request::Yield, 0, &facts);
+        table.switch(0, Request::Exit, 0, &facts);
+        assert_ne!(table.switch(0, Request::Preempt, 0, &facts).next, Some(slot));
+    }
+
+    #[test]
+    fn a_mask_must_name_an_online_cpu() {
+        let mut table = table();
+        let (_, pid) = spawn(&mut table);
+        assert!(!table.set_affinity(pid, 0));
+        assert!(!table.set_affinity(pid, 1 << 1), "CPU 1 isn't online");
+        assert!(table.set_affinity(pid, 1));
+        assert!(!table.set_affinity(999, 1));
+    }
+
+    #[test]
+    fn a_new_task_goes_to_the_quietest_cpu() {
+        let mut table = smp_table();
+        // CPU 0 has the boot task, so CPU 1 gets the first new one.
+        let (first, _) = spawn(&mut table);
+        assert_eq!(table.tasks()[first].home, 1);
+        let (second, _) = spawn(&mut table);
+        assert_eq!(table.tasks()[second].home, 0);
+    }
+
+    #[test]
+    fn a_cpu_prefers_its_own_queue() {
+        let mut table = smp_table();
+        let facts = Facts::default();
+        let (first, _) = spawn(&mut table);
+        let (second, _) = spawn(&mut table);
+        assert_eq!(table.tasks()[first].home, 1);
+        assert_eq!(table.tasks()[second].home, 0);
+
+        // CPU 0 alternates between the boot task and its own second task.
+        assert_eq!(table.switch(0, Request::Preempt, 0, &facts).next, Some(second));
+        assert_eq!(table.switch(1, Request::Preempt, 0, &facts).next, Some(first));
+        assert_eq!(table.switch(0, Request::Preempt, 0, &facts).next, Some(0));
+        assert_eq!(table.switch(1, Request::Preempt, 0, &facts).next, Some(first));
+    }
+
+    #[test]
+    fn an_idle_cpu_takes_work_from_a_busy_one_and_keeps_it() {
+        let mut table = table();
+        let facts = Facts::default();
+        let (slot, _) = spawn(&mut table);
+        assert_eq!(table.tasks()[slot].home, 0);
+        table.cpu_online();
+        assert_eq!(table.switch(1, Request::Preempt, 0, &facts).next, Some(slot));
+        assert_eq!(table.tasks()[slot].home, 1);
+    }
+
+    #[test]
+    fn a_longer_queue_elsewhere_is_evened_out() {
+        let mut table = table();
+        let facts = Facts::default();
+        // All on CPU 0, before CPU 1 came up.
+        spawn(&mut table);
+        spawn(&mut table);
+        table.cpu_online();
+        table.switch(0, Request::Preempt, 0, &facts);
+        let taken = table.switch(1, Request::Preempt, 0, &facts).next.unwrap();
+        assert_eq!(table.tasks()[taken].home, 1);
+
+        // Three on CPU 0's queue against CPU 1's one: at its next tick, CPU 1
+        // has its own task ready, and still takes another.
+        let (extra, _) = spawn(&mut table);
+        table.tasks[extra].home = 0;
+        let next = table.switch(1, Request::Preempt, 0, &facts).next.unwrap();
+        assert_ne!(next, taken);
+        assert_eq!(table.tasks()[next].home, 1);
+    }
+
+    #[test]
+    fn the_timer_is_set_for_the_slice_or_a_sooner_sleeper_at_home() {
+        let mut table = smp_table();
+        let facts = Facts::default();
+        let (slot, _) = spawn(&mut table);
+        let home = table.tasks()[slot].home as usize;
+        assert_eq!(table.switch(home, Request::Preempt, 0, &facts).next, Some(slot));
+
+        assert_eq!(table.next_deadline(home, 100, 50, 1000), 150);
+        table.switch(home, Request::Sleep(120), 100, &facts);
+        // Idle now, with the sleeper's deadline first.
+        assert_eq!(table.next_deadline(home, 100, 50, 1000), 120);
+        // It's nobody else's to wake.
+        assert_eq!(table.next_deadline(1 - home, 100, 50, 1000), 150);
+        table.switch(home, Request::Preempt, 120, &facts);
+        // Awake and running, so there's a slice to end.
+        assert_eq!(table.next_deadline(home, 120, 50, 1000), 170);
+    }
+
+    #[test]
+    fn an_idle_cpu_can_wait_as_long_as_it_likes() {
+        let table = smp_table();
+        assert_eq!(table.next_deadline(1, 100, 50, 1000), 1100);
+    }
+
+    #[test]
+    fn elapsed_time_is_accounted_in_whole_ticks() {
+        let mut table = smp_table();
+        // The first call only sets the starting point.
+        table.account_elapsed(0, 1000, 100, false);
+        assert_eq!(table.total_ticks, 0);
+
+        table.account_elapsed(0, 1250, 100, false);
+        assert_eq!(table.cpu_total_ticks[0], 2);
+        assert_eq!(table.tasks()[0].cpu_ticks, 2);
+        // The rest carries over to the next call.
+        table.account_elapsed(0, 1300, 100, false);
+        assert_eq!(table.cpu_total_ticks[0], 3);
+
+        // Time with nothing to do is idle, in one go, however long it was.
+        table.account_elapsed(1, 1000, 100, false);
+        table.account_elapsed(1, 11_000, 100, false);
+        assert_eq!(table.cpu_idle_ticks[1], 100);
+        assert_eq!(table.total_ticks, 103);
+    }
+
+    #[test]
     fn idle_ticks_are_not_charged_to_a_task() {
         let mut table = table();
         table.account_tick(0, false);
@@ -746,5 +1183,37 @@ mod tests {
         assert_eq!(table.cpu_idle_ticks, [1, 1]);
         assert_eq!(table.cpu_total_ticks, [2, 1]);
         assert_eq!(table.total_ticks, 3);
+    }
+
+    #[test]
+    fn a_stopped_task_is_not_chosen_until_resumed() {
+        let facts = Facts::default();
+        let mut table = TestTable::zeroed();
+        table.init();
+        let (slot, pid) = table.reserve().unwrap();
+        table.commit(slot);
+        assert!(table.set_stopped(pid, true));
+        assert!(!table.set_stopped(1, true));
+
+        let switch = table.switch(0, Request::Yield, 0, &facts);
+        assert_eq!(switch.next, Some(0));
+        assert!(table.set_stopped(pid, false));
+        let switch = table.switch(0, Request::Yield, 0, &facts);
+        assert_eq!(switch.next, Some(slot));
+    }
+
+    #[test]
+    fn a_stopped_task_can_still_be_killed() {
+        let mut facts = Facts::default();
+        let mut table = TestTable::zeroed();
+        table.init();
+        let (slot, pid) = table.reserve().unwrap();
+        table.commit(slot);
+        table.set_stopped(pid, true);
+        facts.depth[slot] = 1;
+        assert_eq!(table.kill(pid, 0, GRACE, &facts), KillOutcome::Pending);
+        // It holds a lock, so it has to run to release it.
+        let switch = table.switch(0, Request::Yield, 0, &facts);
+        assert_eq!(switch.next, Some(slot));
     }
 }

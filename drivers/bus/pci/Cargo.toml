@@ -3,9 +3,11 @@ name = "feos-driver-pci"
 description = "Minimal PCI/PCIe ECAM configuration-space access for feos"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 feos-port-io = { workspace = true }
+feos-sync = { workspace = true }

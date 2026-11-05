@@ -21,7 +21,7 @@ use feos_fs::{EntryKind, FileSystem, NodeId};
 use feos_text::Text;
 
 mod explorer;
-mod preview;
+pub(crate) mod preview;
 
 /// Maximum absolute path length the explorer displays.
 const PATH_MAX: usize = 256;
@@ -58,6 +58,7 @@ impl App for Files {
         let Some(fs) = context.platform.filesystem else {
             return false;
         };
+        explorer::watch(fs.tree());
         explorer::open_window(fs, context)
     }
 
@@ -80,18 +81,21 @@ impl App for Files {
         explorer::accept_drop(payload)
     }
 
-    fn run(&self, context: &mut Context<'_>) {
-        let Some(fs) = context.platform.filesystem else {
-            println!("files: no filesystem is available on this board");
-            return;
-        };
+    fn run(&self, context: &mut Context<'_>) -> i32 {
+        (|| {
+            let Some(fs) = context.platform.filesystem else {
+                println!("files: no filesystem is available on this board");
+                return;
+            };
 
-        let args = context.args.trim();
-        if args.is_empty() {
-            explorer::run(fs, context);
-        } else {
-            run_command(fs, args);
-        }
+            let args = context.args.trim();
+            if args.is_empty() {
+                explorer::run(fs, context);
+            } else {
+                run_command(fs, args);
+            }
+        })();
+        0
     }
 }
 

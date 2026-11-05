@@ -3,6 +3,7 @@ name = "feos-driver-uart16550"
 description = "Polled 16550-compatible UART driver"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

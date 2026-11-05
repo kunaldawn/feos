@@ -10,14 +10,14 @@ impl Cpu {
             0x01 => self.group7(bus),
             0x02 | 0x03 => self.lar_lsl(bus, opcode),
             0x06 => {
-                if self.pmode && self.cpl != 0 {
+                if self.cpl != 0 {
                     return Err(Trap::FaultCode(13, 0));
                 }
                 self.cr0 &= !8;
                 Ok(())
             }
             0x08 | 0x09 => {
-                if self.pmode && self.cpl != 0 {
+                if self.cpl != 0 {
                     return Err(Trap::FaultCode(13, 0));
                 }
                 Ok(())
@@ -77,22 +77,40 @@ impl Cpu {
                 } & 0x1F;
                 let dst = self.rd_rmv(bus, &m, w)?;
                 let src = self.regv(m.reg, w);
-                if count == 0 || count as u32 > w {
+                if count == 0 {
                     return Ok(());
                 }
                 let n = count as u32;
                 let sign = 1u32 << (w - 1);
-                let (dst64, src64) = (dst as u64, src as u64);
-                let (res, cf) = if opcode < 0xA8 {
-                    (
-                        ((dst64 << n) | (src64 >> (w - n))) as u32 & mask(w),
-                        (dst64 >> (w - n)) & 1 != 0,
-                    )
+                let (res, cf) = if w == 32 {
+                    let (dst64, src64) = (dst as u64, src as u64);
+                    if opcode < 0xA8 {
+                        (
+                            ((dst64 << n) | (src64 >> (32 - n))) as u32,
+                            (dst64 >> (32 - n)) & 1 != 0,
+                        )
+                    } else {
+                        (
+                            ((dst64 >> n) | (src64 << (32 - n))) as u32,
+                            (dst64 >> (n - 1)) & 1 != 0,
+                        )
+                    }
+                } else if opcode < 0xA8 {
+                    // A 16-bit count above 16 shifts dst:src:dst on a real 386,
+                    // and compiled long-shift helpers rely on it.
+                    let wide = (dst << 16) | src;
+                    let mut out = ((wide as u64) << n) as u32;
+                    if n > 16 {
+                        out |= dst << (n - 16);
+                    }
+                    (out >> 16, (wide >> (32 - n)) & 1 != 0)
                 } else {
-                    (
-                        ((dst64 >> n) | (src64 << (w - n))) as u32 & mask(w),
-                        (dst64 >> (n - 1)) & 1 != 0,
-                    )
+                    let wide = (src << 16) | dst;
+                    let mut out = wide >> n;
+                    if n > 16 {
+                        out |= dst << (32 - n);
+                    }
+                    (out & 0xFFFF, (wide >> (n - 1)) & 1 != 0)
                 };
                 self.materialize();
                 self.set_flag(FLAG_CF, cf);
@@ -254,7 +272,11 @@ impl Cpu {
         let m = self.modrm(bus)?;
         match m.reg {
             0 | 1 => {
-                let value = if m.reg == 0 { self.ldtr.sel } else { self.tr.sel };
+                let value = if m.reg == 0 {
+                    self.ldtr.sel
+                } else {
+                    self.tr.sel
+                };
                 if m.is_reg {
                     let w = self.vw();
                     self.set_regv(m.rm, w, value as u32);
@@ -305,7 +327,7 @@ impl Cpu {
                 if m.is_reg {
                     return Err(Trap::Fault(6));
                 }
-                if self.pmode && self.cpl != 0 {
+                if self.cpl != 0 {
                     return Err(Trap::FaultCode(13, 0));
                 }
                 let limit = self.rd16(bus, seg, m.off)? as u32;
@@ -332,7 +354,7 @@ impl Cpu {
                 }
             }
             6 => {
-                if self.pmode && self.cpl != 0 {
+                if self.cpl != 0 {
                     return Err(Trap::FaultCode(13, 0));
                 }
                 let value = self.rd_rmv(bus, &m, 16)? & 0xF;
@@ -345,7 +367,7 @@ impl Cpu {
                 if m.is_reg {
                     return Err(Trap::Fault(6));
                 }
-                if self.pmode && self.cpl != 0 {
+                if self.cpl != 0 {
                     return Err(Trap::FaultCode(13, 0));
                 }
                 self.flush_tlb();
@@ -374,7 +396,7 @@ impl Cpu {
     }
 
     fn mov_system<B: Bus>(&mut self, bus: &mut B, opcode: u8) -> Exec {
-        if self.pmode && self.cpl != 0 {
+        if self.cpl != 0 {
             return Err(Trap::FaultCode(13, 0));
         }
         // These always act on registers, whatever the mode bits say.

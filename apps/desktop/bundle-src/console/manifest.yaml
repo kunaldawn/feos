@@ -4,7 +4,9 @@ version: 1.0.0
 entry: help
 category: Utilities
 description: List the built-in shell commands
-icon: icon.bmp
+icon: icon.ico
+icon_medium: icon-32.ico
+icon_small: icon-16.ico
 window:
   width: 520
   height: 360

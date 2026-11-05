@@ -34,15 +34,21 @@ pub fn draw_icon(painter: &mut Painter<'_, '_>, icon: &Icon, rect: Rect, fallbac
 
     let width = rect.width.max(1) as i32;
     let height = rect.height.max(1) as i32;
-    let icon_width = icon.width().max(1) as i32;
-    let icon_height = icon.height().max(1) as i32;
+    let image = icon.image_for(rect.width.max(rect.height));
+    let icon_width = image.width.max(1) as i32;
+    let icon_height = image.height.max(1) as i32;
     for y in 0..height {
-        let source_y = (y * icon_height / height) as u32;
+        let source_y = y * icon_height / height;
         for x in 0..width {
-            let source_x = (x * icon_width / width) as u32;
-            if let Some([r, g, b, a]) = icon.pixel(source_x, source_y) {
-                painter.blend_pixel(rect.x + x, rect.y + y, Color::rgb(r, g, b), a);
-            }
+            let source_x = x * icon_width / width;
+            let at = ((source_y * icon_width + source_x) * 4) as usize;
+            let pixel = &image.pixels[at..at + 4];
+            painter.blend_pixel(
+                rect.x + x,
+                rect.y + y,
+                Color::rgb(pixel[0], pixel[1], pixel[2]),
+                pixel[3],
+            );
         }
     }
 }

@@ -35,6 +35,8 @@ const IRET_OFFSET: u16 = 0x04A0;
 const CONFIG_OFFSET: u16 = 0x04B0;
 /// The segment of the fake EMS driver, whose vector programs inspect.
 pub const EMS_SEGMENT: u16 = 0xF500;
+/// The segment of the DPMI host's and memory manager's code.
+pub const HOST_SEGMENT: u16 = 0xF600;
 /// The callback number the XMS entry passes to the machine.
 pub const CALLBACK_XMS: u8 = 0xF0;
 /// The callback number for "mouse handler returned".
@@ -170,7 +172,10 @@ impl Bios {
         // The reset vector, BIOS date and model byte.
         mem.copy_from(
             0xF_FFF0,
-            &[0xEA, 0x5B, 0xE0, 0x00, 0xF0, b'0', b'6', b'/', b'0', b'1', b'/', b'9', b'2', 0, 0xFC, 0],
+            &[
+                0xEA, 0x5B, 0xE0, 0x00, 0xF0, b'0', b'6', b'/', b'0', b'1', b'/', b'9', b'2', 0,
+                0xFC, 0,
+            ],
         );
 
         // The EMS driver's header, which programs look for at vector 67h.

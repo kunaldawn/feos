@@ -478,11 +478,11 @@ pub struct DmaChannel {
     pub terminal: bool,
 }
 
-/// The first 8237, which handles 8-bit channels 0 to 3.
+/// The two 8237s: channels 0 to 3 move bytes, 4 to 7 move words.
 #[derive(Clone, Debug)]
 pub struct Dma {
-    pub channels: [DmaChannel; 4],
-    flip: bool,
+    pub channels: [DmaChannel; 8],
+    flip: [bool; 2],
 }
 
 impl Default for Dma {
@@ -493,23 +493,69 @@ impl Default for Dma {
 
 impl Dma {
     pub fn new() -> Self {
-        let mut channels: [DmaChannel; 4] = Default::default();
+        let mut channels: [DmaChannel; 8] = Default::default();
         for channel in channels.iter_mut() {
             channel.masked = true;
         }
         Self {
             channels,
-            flip: false,
+            flip: [false; 2],
         }
     }
 
-    pub fn port_out(&mut self, port: u16, value: u8) {
-        match port {
-            0x00..=0x07 => {
-                let index = (port / 2) as usize;
-                let channel = &mut self.channels[index];
-                let high = self.flip;
-                self.flip = !high;
+    /// Whether a channel can transfer now.
+    #[inline]
+    pub fn ready(&self, channel: usize) -> bool {
+        self.channels.get(channel).is_some_and(|c| !c.masked)
+    }
+
+    /// Moves a channel on by one unit: it returns the unit's physical address and
+    /// whether that reached terminal count.
+    pub fn step(&mut self, index: usize) -> (u32, bool) {
+        let channel = &mut self.channels[index];
+        let address = if index >= 4 {
+            // The word address shifts up, and the page's lowest bit drops out.
+            (((channel.page & 0xFE) as u32) << 16) | ((channel.address as u32) << 1)
+        } else {
+            ((channel.page as u32) << 16) | channel.address as u32
+        };
+        channel.address = channel.address.wrapping_add(1);
+        let (count, wrapped) = channel.count.overflowing_sub(1);
+        channel.count = count;
+        if wrapped {
+            channel.terminal = true;
+            if channel.mode & 0x10 != 0 {
+                channel.address = channel.base_address;
+                channel.count = channel.base_count;
+            } else {
+                channel.masked = true;
+            }
+        }
+        (address, wrapped)
+    }
+
+    /// The channel that page register `port` belongs to.
+    fn page_channel(port: u16) -> Option<usize> {
+        Some(match port {
+            0x87 => 0,
+            0x83 => 1,
+            0x81 => 2,
+            0x82 => 3,
+            0x8F => 4,
+            0x8B => 5,
+            0x89 => 6,
+            0x8A => 7,
+            _ => return None,
+        })
+    }
+
+    fn write_register(&mut self, controller: usize, reg: u16, value: u8) {
+        let first = controller * 4;
+        match reg {
+            0..=7 => {
+                let channel = &mut self.channels[first + (reg / 2) as usize];
+                let high = self.flip[controller];
+                self.flip[controller] = !high;
                 let merge = |old: u16| {
                     if high {
                         (old & 0x00FF) | ((value as u16) << 8)
@@ -517,7 +563,7 @@ impl Dma {
                         (old & 0xFF00) | value as u16
                     }
                 };
-                if port & 1 == 0 {
+                if reg & 1 == 0 {
                     channel.base_address = merge(channel.base_address);
                     channel.address = channel.base_address;
                 } else {
@@ -525,44 +571,41 @@ impl Dma {
                     channel.count = channel.base_count;
                 }
             }
-            0x0A => self.channels[(value & 3) as usize].masked = value & 4 != 0,
-            0x0B => self.channels[(value & 3) as usize].mode = value,
-            0x0C => self.flip = false,
+            0x0A => self.channels[first + (value & 3) as usize].masked = value & 4 != 0,
+            0x0B => self.channels[first + (value & 3) as usize].mode = value,
+            0x0C => self.flip[controller] = false,
             0x0D => {
-                self.flip = false;
-                for channel in self.channels.iter_mut() {
+                self.flip[controller] = false;
+                for channel in &mut self.channels[first..first + 4] {
                     channel.masked = true;
                 }
             }
             0x0E => {
-                for channel in self.channels.iter_mut() {
+                for channel in &mut self.channels[first..first + 4] {
                     channel.masked = false;
                 }
             }
             0x0F => {
-                for (index, channel) in self.channels.iter_mut().enumerate() {
+                for (index, channel) in self.channels[first..first + 4].iter_mut().enumerate() {
                     channel.masked = value & (1 << index) != 0;
                 }
             }
-            0x87 => self.channels[0].page = value,
-            0x83 => self.channels[1].page = value,
-            0x81 => self.channels[2].page = value,
-            0x82 => self.channels[3].page = value,
             _ => {}
         }
     }
 
-    pub fn port_in(&mut self, port: u16) -> u8 {
-        match port {
-            0x00..=0x07 => {
-                let channel = &self.channels[(port / 2) as usize];
-                let value = if port & 1 == 0 {
+    fn read_register(&mut self, controller: usize, reg: u16) -> u8 {
+        let first = controller * 4;
+        match reg {
+            0..=7 => {
+                let channel = &self.channels[first + (reg / 2) as usize];
+                let value = if reg & 1 == 0 {
                     channel.address
                 } else {
                     channel.count
                 };
-                let high = self.flip;
-                self.flip = !high;
+                let high = self.flip[controller];
+                self.flip[controller] = !high;
                 if high {
                     (value >> 8) as u8
                 } else {
@@ -571,7 +614,7 @@ impl Dma {
             }
             0x08 => {
                 let mut status = 0;
-                for (index, channel) in self.channels.iter_mut().enumerate() {
+                for (index, channel) in self.channels[first..first + 4].iter_mut().enumerate() {
                     if channel.terminal {
                         status |= 1 << index;
                     }
@@ -579,11 +622,31 @@ impl Dma {
                 }
                 status
             }
-            0x87 => self.channels[0].page,
-            0x83 => self.channels[1].page,
-            0x81 => self.channels[2].page,
-            0x82 => self.channels[3].page,
             _ => 0xFF,
+        }
+    }
+
+    pub fn port_out(&mut self, port: u16, value: u8) {
+        match port {
+            0x00..=0x0F => self.write_register(0, port, value),
+            // The second controller's registers sit on even ports.
+            0xC0..=0xDF => self.write_register(1, (port - 0xC0) / 2, value),
+            _ => {
+                if let Some(channel) = Self::page_channel(port) {
+                    self.channels[channel].page = value;
+                }
+            }
+        }
+    }
+
+    pub fn port_in(&mut self, port: u16) -> u8 {
+        match port {
+            0x00..=0x0F => self.read_register(0, port),
+            0xC0..=0xDF => self.read_register(1, (port - 0xC0) / 2),
+            _ => match Self::page_channel(port) {
+                Some(channel) => self.channels[channel].page,
+                None => 0xFF,
+            },
         }
     }
 }

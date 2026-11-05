@@ -7,8 +7,9 @@
 //!
 //! Limits, each reported as an error rather than attempted:
 //!
-//! - Floor type 0 is not implemented: no encoder has emitted it since 2002, so
-//!   nothing here could test it. Such a stream returns `UnsupportedFeature`.
+//! - Floor type 0 uses floating point, as it's LSP filter arithmetic and no
+//!   encoder has emitted it since 2002, so its speed matters little. The test
+//!   file is built by `tests/make_floor0.py`, and ffmpeg's decoding is the reference.
 //! - At most 8 channels, and at most [`MAX_BOOK_ENTRIES`] codebook entries and
 //!   [`MAX_VQ_VALUES`] expanded VQ values across a stream's codebooks. Real files
 //!   take about a megabyte. These caps keep a hostile setup header under about
@@ -590,6 +591,270 @@ impl Floor {
     }
 }
 
+/// A floor of either type.
+enum AnyFloor {
+    Zero(Floor0),
+    One(Floor),
+}
+
+impl AnyFloor {
+    fn decode(&self, reader: &mut LsbReader<'_>, books: &[Book], curve: &mut [i32]) -> bool {
+        match self {
+            Self::Zero(floor) => floor.decode(reader, books, curve),
+            Self::One(floor) => floor.decode(reader, books, curve),
+        }
+    }
+}
+
+/// Most LSP coefficients a floor 0 can have.
+const MAX_FLOOR0_ORDER: usize = 255;
+
+/// Floor type 0: a line spectral pair filter's response, as an envelope.
+struct Floor0 {
+    order: usize,
+    rate: u32,
+    bark_map_size: u32,
+    amplitude_bits: u32,
+    amplitude_offset: u32,
+    books: [u8; 16],
+    book_count: usize,
+}
+
+impl Floor0 {
+    fn parse(reader: &mut LsbReader<'_>, books: &[Book]) -> Result<Self> {
+        let order = get(reader, 8)? as usize;
+        let rate = get(reader, 16)?;
+        let bark_map_size = get(reader, 16)?;
+        let amplitude_bits = get(reader, 6)?;
+        let amplitude_offset = get(reader, 8)?;
+        let book_count = get(reader, 4)? as usize + 1;
+        if order == 0 || rate == 0 || bark_map_size == 0 || amplitude_bits == 0 {
+            return Err(AudioError::InvalidData("bad Vorbis floor 0"));
+        }
+        if amplitude_bits > 31 {
+            return Err(AudioError::InvalidData("bad Vorbis floor 0 amplitude"));
+        }
+        let mut list = [0u8; 16];
+        for slot in list.iter_mut().take(book_count) {
+            let book = get(reader, 8)?;
+            let usable = books
+                .get(book as usize)
+                .is_some_and(|book| !book.vq.is_empty() && book.dims > 0);
+            if !usable {
+                return Err(AudioError::InvalidData("bad Vorbis floor 0 book"));
+            }
+            *slot = book as u8;
+        }
+        Ok(Self {
+            order,
+            rate,
+            bark_map_size,
+            amplitude_bits,
+            amplitude_offset,
+            books: list,
+            book_count,
+        })
+    }
+
+    /// Reads a channel's floor and renders it into `curve`. Returns `false` for
+    /// an unused floor, in which case the channel is silent.
+    fn decode(&self, reader: &mut LsbReader<'_>, books: &[Book], curve: &mut [i32]) -> bool {
+        let Some(amplitude) = reader.read(self.amplitude_bits).filter(|&value| value != 0) else {
+            return false;
+        };
+        let Some(book) = reader
+            .read(ilog(self.book_count as u32))
+            .and_then(|index| self.books[..self.book_count].get(index as usize))
+            .map(|&index| &books[index as usize])
+        else {
+            return false;
+        };
+        // Vectors from the book, each continuing from the last value before it.
+        let mut cosines = [0f64; MAX_FLOOR0_ORDER];
+        let mut filled = 0;
+        let mut last = 0f64;
+        while filled < self.order {
+            let Some(entry) = book.decode(reader) else {
+                return false;
+            };
+            let Some(vector) = book.vq.get(entry * book.dims..(entry + 1) * book.dims) else {
+                return false;
+            };
+            // Each vector is relative to the last value of the one before it.
+            let base = last;
+            for &value in vector {
+                let value = value as f64 / 65536.0 + base;
+                if filled < self.order {
+                    cosines[filled] = floor0_math::cos(value);
+                    filled += 1;
+                }
+                last = value;
+            }
+        }
+        self.render(&cosines[..self.order], amplitude, curve);
+        true
+    }
+
+    fn render(&self, cosines: &[f64], amplitude: u32, curve: &mut [i32]) {
+        use floor0_math::{bark, cos, exp, sqrt};
+        let n = curve.len();
+        let top = bark(0.5 * self.rate as f64);
+        let scale = self.bark_map_size as f64 / top;
+        let peak = ((1u64 << self.amplitude_bits) - 1) as f64;
+        let scaled_amplitude = amplitude as f64 * self.amplitude_offset as f64 / peak;
+        let mut i = 0;
+        while i < n {
+            let map = (bark(self.rate as f64 * i as f64 / (2.0 * n as f64)) * scale) as u32;
+            let map = map.min(self.bark_map_size - 1);
+            let omega = cos(core::f64::consts::PI * map as f64 / self.bark_map_size as f64);
+            let mut p = 1.0f64;
+            let mut q = 1.0f64;
+            let mut pairs = cosines.chunks_exact(2);
+            for pair in &mut pairs {
+                let (a, b) = (pair[0] - omega, pair[1] - omega);
+                q *= 4.0 * a * a;
+                p *= 4.0 * b * b;
+            }
+            if let [odd] = pairs.remainder() {
+                let a = odd - omega;
+                q *= 4.0 * a * a;
+                p *= 1.0 - omega * omega;
+                q *= 0.25;
+            } else {
+                p *= (1.0 - omega) * 0.5;
+                q *= (1.0 + omega) * 0.5;
+            }
+            let root = sqrt(p + q);
+            let linear = if root > 0.0 {
+                exp(0.11512925 * (scaled_amplitude / root - self.amplitude_offset as f64))
+            } else {
+                1.0
+            };
+            let value = (linear * 2147483648.0).clamp(0.0, 2147483647.0) as i32;
+            // Each map step covers many lines, at the top of the spectrum.
+            while i < n {
+                let same = (bark(self.rate as f64 * i as f64 / (2.0 * n as f64)) * scale) as u32;
+                if same.min(self.bark_map_size - 1) != map {
+                    break;
+                }
+                curve[i] = value;
+                i += 1;
+            }
+        }
+    }
+}
+
+/// The few functions floor 0 needs, which `core` doesn't have.
+mod floor0_math {
+    use core::f64::consts::{FRAC_PI_2, PI};
+
+    fn floor_i(x: f64) -> f64 {
+        let t = x as i64 as f64;
+        if x < t {
+            t - 1.0
+        } else {
+            t
+        }
+    }
+
+    pub(super) fn sqrt(x: f64) -> f64 {
+        if x <= 0.0 {
+            return 0.0;
+        }
+        let mut guess = if x > 1.0 { x } else { 1.0 };
+        for _ in 0..64 {
+            let next = 0.5 * (guess + x / guess);
+            if next >= guess {
+                break;
+            }
+            guess = next;
+        }
+        guess
+    }
+
+    pub(super) fn cos(x: f64) -> f64 {
+        // Into -pi..pi, and then the first half turn, by symmetry.
+        let turns = floor_i(x / (2.0 * PI) + 0.5);
+        let mut x = x - turns * 2.0 * PI;
+        if x < 0.0 {
+            x = -x;
+        }
+        let (x, sign) = if x > FRAC_PI_2 { (PI - x, -1.0) } else { (x, 1.0) };
+        let y = x * x;
+        let mut term = 1.0;
+        let mut total = 1.0;
+        let mut k = 1.0;
+        for _ in 0..10 {
+            term *= -y / (k * (k + 1.0));
+            total += term;
+            k += 2.0;
+        }
+        sign * total
+    }
+
+    fn atan(x: f64) -> f64 {
+        if x < 0.0 {
+            return -atan(-x);
+        }
+        if x > 1.0 {
+            return FRAC_PI_2 - atan(1.0 / x);
+        }
+        // Halved twice, so the series is short.
+        let mut reduced = x;
+        for _ in 0..2 {
+            reduced = reduced / (1.0 + sqrt(1.0 + reduced * reduced));
+        }
+        let y = reduced * reduced;
+        let mut term = reduced;
+        let mut total = reduced;
+        let mut k = 3.0;
+        for _ in 0..12 {
+            term *= -y;
+            total += term / k;
+            k += 2.0;
+        }
+        total * 4.0
+    }
+
+    pub(super) fn bark(x: f64) -> f64 {
+        13.1 * atan(0.00074 * x) + 2.24 * atan(0.0000000185 * x * x) + 0.0001 * x
+    }
+
+    pub(super) fn exp(x: f64) -> f64 {
+        let whole = floor_i(x * core::f64::consts::LOG2_E);
+        let rest = x - whole * core::f64::consts::LN_2;
+        let mut term = 1.0;
+        let mut total = 1.0;
+        for k in 1..18 {
+            term *= rest / k as f64;
+            total += term;
+        }
+        let whole = whole.clamp(-1000.0, 1000.0) as i32;
+        let mut power = 1.0f64;
+        for _ in 0..whole.unsigned_abs() {
+            power *= if whole < 0 { 0.5 } else { 2.0 };
+        }
+        total * power
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn these_match_the_standard_library() {
+            for step in -400..400 {
+                let x = step as f64 * 0.037;
+                assert!((cos(x) - x.cos()).abs() < 1e-12, "cos {x}");
+                assert!((atan(x) - x.atan()).abs() < 1e-12, "atan {x}");
+                assert!((exp(x / 2.0) - (x / 2.0).exp()).abs() < 1e-9 * (x / 2.0).exp(), "exp {x}");
+                let y = x.abs() * 40.0;
+                assert!((sqrt(y) - y.sqrt()).abs() < 1e-9, "sqrt {y}");
+            }
+        }
+    }
+}
+
 #[inline]
 fn floor_value(y: i32) -> i32 {
     FLOOR_DB[(y as usize).min(255)]
@@ -856,7 +1121,7 @@ fn parse_ident(packet: &[u8]) -> Result<Ident> {
 /// The setup header.
 struct Setup {
     books: Vec<Book>,
-    floors: Vec<Floor>,
+    floors: Vec<AnyFloor>,
     residues: Vec<Residue>,
     mappings: Vec<Mapping>,
     modes: Vec<Mode>,
@@ -886,8 +1151,8 @@ fn parse_setup(packet: &[u8], channels: usize) -> Result<Setup> {
     let mut floors = Vec::new();
     for _ in 0..get(reader, 6)? + 1 {
         match get(reader, 16)? {
-            1 => try_push(&mut floors, Floor::parse(reader, books.len())?)?,
-            0 => return Err(AudioError::UnsupportedFeature("Vorbis floor type 0")),
+            1 => try_push(&mut floors, AnyFloor::One(Floor::parse(reader, books.len())?))?,
+            0 => try_push(&mut floors, AnyFloor::Zero(Floor0::parse(reader, &books)?))?,
             _ => return Err(AudioError::InvalidData("bad Vorbis floor type")),
         }
     }
@@ -993,7 +1258,8 @@ fn make_window(len: usize) -> Result<Vec<i32>> {
 
 /// A stateful Ogg Vorbis decoder, one packet at a time.
 pub struct VorbisDecoder<'a> {
-    packets: PacketReader<'a>,
+    /// Where packets come from, unless the caller hands them over itself.
+    packets: Option<PacketReader<'a>>,
     ident: Ident,
     setup: Setup,
     imdct: [Imdct; 2],
@@ -1032,10 +1298,50 @@ impl<'a> VorbisDecoder<'a> {
             ident.channels,
         )?;
 
+        let granule = ogg::final_granule(input, page.serial);
+        Self::from_headers(Some(packets), ident, setup, granule.unwrap_or(u64::MAX))
+    }
+
+    /// Reads headers stored apart from the audio, as Matroska keeps them: a
+    /// count of packets minus one, the Xiph-laced sizes of all but the last, and
+    /// then the three packets. Feed the audio to
+    /// [`decode_packet`](Self::decode_packet).
+    pub fn from_private(private: &'a [u8]) -> Result<Self> {
+        let (&count, rest) = private.split_first().ok_or(AudioError::UnexpectedEnd)?;
+        if count != 2 {
+            return Err(AudioError::InvalidData("Vorbis headers"));
+        }
+        let mut pos = 0usize;
+        let mut sizes = [0usize; 2];
+        for size in &mut sizes {
+            loop {
+                let byte = *rest.get(pos).ok_or(AudioError::UnexpectedEnd)?;
+                pos += 1;
+                *size += byte as usize;
+                if byte != 255 {
+                    break;
+                }
+            }
+        }
+        let ident_end = pos.checked_add(sizes[0]).ok_or(AudioError::Overflow)?;
+        let comment_end = ident_end.checked_add(sizes[1]).ok_or(AudioError::Overflow)?;
+        let ident = parse_ident(rest.get(pos..ident_end).ok_or(AudioError::UnexpectedEnd)?)?;
+        let setup = parse_setup(
+            rest.get(comment_end..).ok_or(AudioError::UnexpectedEnd)?,
+            ident.channels,
+        )?;
+        Self::from_headers(None, ident, setup, u64::MAX)
+    }
+
+    fn from_headers(
+        packets: Option<PacketReader<'a>>,
+        ident: Ident,
+        setup: Setup,
+        remaining: u64,
+    ) -> Result<Self> {
         let [small, large] = ident.block_sizes;
         let half = large / 2;
         let channels = ident.channels;
-        let granule = ogg::final_granule(input, page.serial);
         Ok(Self {
             packets,
             ident,
@@ -1050,7 +1356,7 @@ impl<'a> VorbisDecoder<'a> {
             time: try_vec(large, 0)?,
             classes: try_vec(half * channels, 0)?,
             previous: 0,
-            remaining: granule.unwrap_or(u64::MAX),
+            remaining,
         })
     }
 
@@ -1079,15 +1385,27 @@ impl<'a> VorbisDecoder<'a> {
         if self.remaining == 0 {
             return Ok(None);
         }
-        let Some(packet) = self.packets.next_packet()? else {
+        let Some(mut reader) = self.packets.take() else {
             return Ok(None);
         };
+        let result = match reader.next_packet() {
+            Ok(Some(packet)) => self.decode_packet(packet, out).map(Some),
+            Ok(None) => Ok(None),
+            Err(error) => Err(error),
+        };
+        self.packets = Some(reader);
+        result
+    }
+
+    /// Decodes one audio packet to `out`, for a caller with its own packets.
+    /// Returns the sample frames written.
+    pub fn decode_packet(&mut self, packet: &[u8], out: &mut [i16]) -> Result<usize> {
         let channels = self.ident.channels;
         let mut reader = LsbReader::new(packet);
         let reader = &mut reader;
         // Not an audio packet: ignored, as the specification says.
         if reader.read(1) != Some(0) {
-            return Ok(Some(0));
+            return Ok(0);
         }
         let mode_bits = ilog(self.setup.modes.len() as u32 - 1);
         let Some(mode) = reader
@@ -1095,7 +1413,7 @@ impl<'a> VorbisDecoder<'a> {
             .and_then(|mode| self.setup.modes.get(mode as usize))
             .copied()
         else {
-            return Ok(Some(0));
+            return Ok(0);
         };
         let [small, large] = self.ident.block_sizes;
         let n = if mode.long_block { large } else { small };
@@ -1103,7 +1421,7 @@ impl<'a> VorbisDecoder<'a> {
         let (mut previous_long, mut next_long) = (false, false);
         if mode.long_block {
             let (Some(a), Some(b)) = (reader.read(1), reader.read(1)) else {
-                return Ok(Some(0));
+                return Ok(0);
             };
             previous_long = a != 0;
             next_long = b != 0;
@@ -1137,7 +1455,7 @@ impl<'a> VorbisDecoder<'a> {
             ..
         } = self;
         let Some(mapping) = setup.mappings.get(mode.mapping as usize) else {
-            return Ok(Some(0));
+            return Ok(0);
         };
         let books = &setup.books[..];
 
@@ -1313,7 +1631,7 @@ impl<'a> VorbisDecoder<'a> {
 
         self.previous = n;
         self.remaining -= (frames as u64).min(self.remaining);
-        Ok(Some(frames))
+        Ok(frames)
     }
 }
 

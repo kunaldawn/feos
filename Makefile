@@ -1,6 +1,9 @@
 IMAGE        ?= feos
 TARGET_ARM   ?= aarch64-unknown-none
-TARGET_X64   ?= x86_64-unknown-none
+# The custom hard-float target in arch/x86_64/x86_64-feos.json: scripts/cargo-x64.sh
+# explains why it isn't x86_64-unknown-none, and holds the flags it takes to build.
+TARGET_X64   := x86_64-feos
+CARGO_X64    := ./scripts/cargo-x64.sh
 # Host-side tests build for this machine, whatever it is.
 HOST_TARGET  ?= $(shell rustc -vV | sed -n 's/^host: //p')
 # `PROFILE=debug` is accepted as a spelling of Cargo's `dev` profile, whose
@@ -15,8 +18,7 @@ QEMU_X64     ?= qemu-system-x86_64
 QEMU_DISPLAY ?= vnc=127.0.0.1:0
 QEMU_MEM     ?= 512M
 QEMU_SMP     ?= 4
-# The x86_64 port currently runs the scheduler on the boot CPU.
-QEMU_SMP_X64 ?= 1
+QEMU_SMP_X64 ?= 4
 
 # PulseAudio/PipeWire socket, used for live sound when it exists.
 PULSE_SOCKET ?= /run/user/$(shell id -u)/pulse/native
@@ -53,12 +55,21 @@ RUN_ENV_X64 = FEOS_QEMU="$(QEMU_X64)" FEOS_DISPLAY="$(QEMU_DISPLAY)" FEOS_SMP="$
 # `make run` and `make run-x64` use QEMU_DISPLAY instead.
 DOCKER_DISPLAY ?= gtk
 
-.PHONY: all build build-arm build-x64 check check-arm check-x64 run run-arm run-x64 clean \
-        test test-gfx test-gui test-audio test-sync \
+# User programs for each architecture, built by `make user-arm` and `make user-x64`.
+# The kernel's build script puts what it finds in user/out/<arch> into /bin in the
+# filesystem image, so these come first. RUSTFLAGS replaces the kernel's rustflags
+# from .cargo/config.toml, which are for linking a kernel.
+USER_TARGET_DIR ?= $(or $(CARGO_TARGET_DIR),$(CURDIR)/target)/user
+USER_BINS       := hello cat vmcheck spin utest wdemo malicious
+USER_FLAGS      := -C linker=rust-lld -C link-arg=-T$(CURDIR)/user/link.ld -C link-arg=-z -C link-arg=max-page-size=4096
+
+.PHONY: all build build-arm build-x64 build-efi check check-arm check-x64 run run-arm run-x64 clean \
+        test test-firmware test-frames test-irq test-gfx test-gui test-audio test-mixer test-iconset test-sync \
+        test-heap test-sched test-hal test-console test-app test-pci test-i8042 test-apic test-gicv2 test-gicv3 test-uart16550 test-intel-hda \
         test-json test-yaml test-image test-audio-codec test-compress test-archive \
         test-h264 test-video test-text test-bundle test-init test-fs test-keys \
-        test-coreutils test-sh \
-        test-desktop test-desktop-app test-virtio-input test-dosbox test-apps \
+        test-coreutils test-sh test-abi test-elf test-vm user user-arm user-x64 \
+        test-desktop test-desktop-app test-virtio-input test-virtio-core test-virtio-blk test-virtio-net test-virtio-gpu test-rtc test-net test-xhci test-bootinfo test-dosbox test-dosbox-app test-apps \
         boot-test boot-test-arm boot-test-x64 docker-boot-test \
         bundles games-image games-unlink games-check run-games run-games-x64 audio-demo \
         docker-build docker-run docker-run-arm docker-run-x64 \
@@ -71,11 +82,32 @@ all: build
 # default; use `build-x64` for the QEMU q35 port.
 build: build-arm
 
-build-arm:
+build-arm: user-arm
 	cargo build --profile $(CARGO_PROFILE) --target $(TARGET_ARM)
 
-build-x64:
-	cargo build --profile $(CARGO_PROFILE) --target $(TARGET_X64)
+build-x64: user-x64
+	$(CARGO_X64) build --profile $(CARGO_PROFILE)
+
+user: user-arm user-x64
+
+user-arm:
+	cd user && RUSTFLAGS="$(USER_FLAGS) -C relocation-model=static" \
+		cargo build --release --target $(TARGET_ARM) --target-dir $(USER_TARGET_DIR)
+	mkdir -p user/out/aarch64
+	cd $(USER_TARGET_DIR)/$(TARGET_ARM)/release && cp -f $(USER_BINS) $(CURDIR)/user/out/aarch64/
+
+# A program lives far above 2 GiB, so its code is position-independent, as the x86_64
+# small code model would otherwise want it low, and it's linked at a fixed address.
+user-x64:
+	RUSTFLAGS="$(USER_FLAGS) -C relocation-model=pic -C code-model=small -C link-arg=--no-pie" \
+		$(CARGO_X64) build --release --manifest-path user/Cargo.toml --target-dir $(USER_TARGET_DIR)
+	mkdir -p user/out/x86_64
+	cd $(USER_TARGET_DIR)/$(TARGET_X64)/release && cp -f $(USER_BINS) $(CURDIR)/user/out/x86_64/
+
+# The UEFI loaders. Each reads \\feos.elf, a kernel as built above, from its own volume.
+build-efi:
+	./scripts/cargo-efi.sh aarch64 --profile $(CARGO_PROFILE)
+	./scripts/cargo-efi.sh x86_64 --profile $(CARGO_PROFILE)
 
 # `--workspace` cannot build both architecture crates in one pass: each
 # contains target-specific assembly. Check the port that matches the target.
@@ -83,17 +115,22 @@ check: check-arm
 
 check-arm:
 	cargo check --workspace --target $(TARGET_ARM) \
+		--exclude feos-efi \
 		--exclude feos-arch-x86_64 \
 		--exclude feos-board-qemu-x86_64 \
 		--exclude feos-driver-apic \
 		--exclude feos-driver-i8042 \
 		--exclude feos-driver-uart16550
+	cd user && cargo check --target $(TARGET_ARM) --target-dir $(USER_TARGET_DIR)
 
 check-x64:
-	cargo check --workspace --target $(TARGET_X64) \
+	$(CARGO_X64) check --workspace \
+		--exclude feos-efi \
 		--exclude feos-arch-aarch64 \
 		--exclude feos-board-qemu-virt \
-		--exclude feos-driver-gicv2
+		--exclude feos-driver-gicv2 \
+		--exclude feos-driver-gicv3
+	$(CARGO_X64) check --manifest-path user/Cargo.toml --target-dir $(USER_TARGET_DIR)
 
 run: run-arm
 
@@ -104,22 +141,42 @@ run-x64: build-x64
 	$(RUN_ENV_X64) ./scripts/qemu-x64.sh $(KERNEL_X64)
 
 # Boots each kernel headless, drives the serial shell and checks the results.
-# Needs QEMU on PATH; `make docker-boot-test` runs the same test in the image.
+# Needs QEMU on PATH; `make docker-boot-test` runs the same test in the image, with no
+# network: slirp's name server is one in the test, and nothing leaves the container.
 boot-test: boot-test-arm boot-test-x64
 
-boot-test-arm: build-arm
+boot-test-arm: build-arm build-efi
 	./scripts/boot-test.py arm $(KERNEL_ARM)
 
-boot-test-x64: build-x64
+boot-test-x64: build-x64 build-efi
 	./scripts/boot-test.py x64 $(KERNEL_X64)
 
 docker-boot-test: docker-build
-	docker run --rm --entrypoint sh $(IMAGE) -c 'make boot-test'
+	docker run --rm --network none --entrypoint sh $(IMAGE) \
+		-c 'echo nameserver 127.0.0.1 > /etc/resolv.conf; make boot-test'
 
-test: test-gfx test-gui test-audio test-sync test-json test-yaml test-image test-audio-codec test-compress test-archive test-h264 test-video test-text test-bundle test-init test-fs test-keys test-coreutils test-sh test-desktop test-desktop-app test-virtio-input test-dosbox test-apps
+test: test-firmware test-frames test-irq test-gfx test-gui test-audio test-mixer test-iconset test-sync test-heap test-sched test-hal test-console test-app test-pci test-i8042 test-apic test-gicv2 test-gicv3 test-uart16550 test-intel-hda test-json test-yaml test-image test-audio-codec test-compress test-archive test-h264 test-video test-text test-bundle test-init test-fs test-keys test-coreutils test-sh test-abi test-elf test-vm test-desktop test-desktop-app test-virtio-input test-dosbox test-dosbox-app test-apps test-virtio-core test-virtio-blk test-virtio-net test-virtio-gpu test-rtc test-net test-xhci test-bootinfo
 
 # Host-side tests. Architecture and board crates contain AArch64 assembly or
 # MMIO, so the test set is explicit rather than `--workspace`.
+test-firmware:
+	cargo test -p feos-firmware --target $(HOST_TARGET)
+
+test-frames:
+	cargo test -p feos-frames --target $(HOST_TARGET)
+
+test-abi:
+	cargo test -p feos-abi --target $(HOST_TARGET)
+
+test-elf:
+	cargo test -p feos-elf --target $(HOST_TARGET)
+
+test-vm:
+	cargo test -p feos-vm --target $(HOST_TARGET)
+
+test-irq:
+	cargo test -p feos-irq --target $(HOST_TARGET)
+
 test-gfx:
 	cargo test -p feos-gfx --target $(HOST_TARGET)
 
@@ -129,8 +186,50 @@ test-gui:
 test-audio:
 	cargo test -p feos-audio --target $(HOST_TARGET)
 
+test-mixer:
+	cargo test -p feos-mixer --target $(HOST_TARGET)
+
+test-iconset:
+	cargo test -p feos-iconset --target $(HOST_TARGET)
+
 test-sync:
 	cargo test -p feos-sync --target $(HOST_TARGET)
+
+test-heap:
+	cargo test -p feos-heap --target x86_64-unknown-linux-gnu
+
+test-sched:
+	cargo test -p feos-sched --target x86_64-unknown-linux-gnu
+
+test-hal:
+	cargo test -p feos-hal --target x86_64-unknown-linux-gnu
+
+test-console:
+	cargo test -p feos-console --target x86_64-unknown-linux-gnu
+
+test-app:
+	cargo test -p feos-app --target x86_64-unknown-linux-gnu
+
+test-pci:
+	cargo test -p feos-driver-pci --target x86_64-unknown-linux-gnu
+
+test-i8042:
+	cargo test -p feos-driver-i8042 --target x86_64-unknown-linux-gnu
+
+test-apic:
+	cargo test -p feos-driver-apic --target x86_64-unknown-linux-gnu
+
+test-gicv2:
+	cargo test -p feos-driver-gicv2 --target x86_64-unknown-linux-gnu
+
+test-gicv3:
+	cargo test -p feos-driver-gicv3 --target $(HOST_TARGET)
+
+test-uart16550:
+	cargo test -p feos-driver-uart16550 --target x86_64-unknown-linux-gnu
+
+test-intel-hda:
+	cargo test -p feos-driver-intel-hda --target x86_64-unknown-linux-gnu
 
 test-json:
 	cargo test -p feos-json --target $(HOST_TARGET)
@@ -168,6 +267,30 @@ test-init:
 test-fs:
 	cargo test -p feos-fs --target $(HOST_TARGET)
 
+test-virtio-core:
+	cargo test -p feos-virtio-core --target $(HOST_TARGET)
+
+test-virtio-blk:
+	cargo test -p feos-driver-virtio-blk --target $(HOST_TARGET)
+
+test-virtio-net:
+	cargo test -p feos-driver-virtio-net --target $(HOST_TARGET)
+
+test-net:
+	cargo test -p feos-net --target $(HOST_TARGET)
+
+test-xhci:
+	cargo test -p feos-driver-xhci --target $(HOST_TARGET)
+
+test-bootinfo:
+	cargo test -p feos-bootinfo --target $(HOST_TARGET)
+
+test-virtio-gpu:
+	cargo test -p feos-driver-virtio-gpu --target $(HOST_TARGET)
+
+test-rtc:
+	cargo test -p feos-driver-pl031 -p feos-driver-cmos-rtc --target $(HOST_TARGET)
+
 test-keys:
 	cargo test -p feos-keys --target $(HOST_TARGET)
 
@@ -191,6 +314,9 @@ test-apps:
 
 test-dosbox:
 	cargo test -p feos-dosbox --target $(HOST_TARGET)
+
+test-dosbox-app:
+	cargo test -p feos-dosbox-app --target $(HOST_TARGET)
 
 # Links the 64 MiB exFAT game image as the board's optional disk. The board's
 # build script embeds it, so every later kernel on both architectures includes
@@ -302,7 +428,6 @@ docker-run: docker-run-arm
 docker-run-arm: docker-build
 	$(call DOCKER_RUN_BODY,arm)
 
-docker-run-x64: QEMU_SMP = 1
 docker-run-x64: docker-build
 	$(call DOCKER_RUN_BODY,x64)
 
@@ -335,7 +460,6 @@ docker-run-vnc: docker-run-vnc-arm
 docker-run-vnc-arm: docker-build
 	$(call DOCKER_RUN_VNC_BODY,arm)
 
-docker-run-vnc-x64: QEMU_SMP = 1
 docker-run-vnc-x64: docker-build
 	$(call DOCKER_RUN_VNC_BODY,x64)
 

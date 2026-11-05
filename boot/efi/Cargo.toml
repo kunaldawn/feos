@@ -1,0 +1,16 @@
+[package]
+name = "feos-efi"
+description = "A UEFI loader for the feos kernel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "feos-efi"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+feos-bootinfo = { workspace = true }

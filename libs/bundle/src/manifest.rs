@@ -29,6 +29,10 @@ pub struct Manifest {
     pub description: Text<96>,
     /// Bundle-relative icon path.
     pub icon: Text<32>,
+    /// An exact 32 pixel version of the icon, if the bundle has one.
+    pub icon_medium: Text<32>,
+    /// An exact 16 pixel version of the icon, if the bundle has one.
+    pub icon_small: Text<32>,
     /// Arguments passed to the entry point.
     pub args: Text<64>,
     /// Preferred initial window width.
@@ -47,6 +51,8 @@ impl Manifest {
         category: Text::EMPTY,
         description: Text::EMPTY,
         icon: Text::EMPTY,
+        icon_medium: Text::EMPTY,
+        icon_small: Text::EMPTY,
         args: Text::EMPTY,
         window_width: 0,
         window_height: 0,
@@ -85,6 +91,8 @@ impl Manifest {
         }
         read_text(&document, root, "description", &mut manifest.description)?;
         read_text(&document, root, "icon", &mut manifest.icon)?;
+        read_text(&document, root, "icon_medium", &mut manifest.icon_medium)?;
+        read_text(&document, root, "icon_small", &mut manifest.icon_small)?;
         if manifest.icon.is_empty() {
             manifest.icon.set("icon.bmp");
         }

@@ -1,0 +1,7 @@
+[package]
+name = "feos-irq"
+description = "The table of device interrupt handlers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true

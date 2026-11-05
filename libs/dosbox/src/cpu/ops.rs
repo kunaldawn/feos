@@ -268,6 +268,8 @@ impl Cpu {
                 let mut cf = false;
                 let mut af = false;
                 if (al & 0x0F) > 9 || old_af {
+                    // Subtracting 6 can itself borrow, and that counts for DAS.
+                    cf = sub && al < 6;
                     al = if sub {
                         al.wrapping_sub(6)
                     } else {
@@ -444,7 +446,12 @@ impl Cpu {
     }
 
     fn io_allowed<B: Bus>(&mut self, bus: &mut B, port: u16, bytes: u32) -> Exec {
-        if !self.pmode || self.cpl <= self.iopl() {
+        if self.vm86 {
+            // IOPL doesn't matter here: the I/O bitmap always does.
+            if self.v86_monitor {
+                return Ok(());
+            }
+        } else if !self.pmode || self.cpl <= self.iopl() {
             return Ok(());
         }
         if self.tr.kind & 8 == 0 || self.tr.limit < 103 {
@@ -691,12 +698,19 @@ impl Cpu {
     }
 
     fn op_pushf<B: Bus>(&mut self, bus: &mut B, _opcode: u8) -> Exec {
+        if self.vm86 && self.iopl() < 3 {
+            return Err(Trap::FaultCode(13, 0));
+        }
         let w = self.vw();
-        let flags = (self.flags() | 2) & 0x0003_7FD7 & !FLAG_RF;
+        // The image never shows VM or RF.
+        let flags = (self.flags() | 2) & 0x0000_7FD7;
         self.pushv(bus, flags, w)
     }
 
     fn op_popf<B: Bus>(&mut self, bus: &mut B, _opcode: u8) -> Exec {
+        if self.vm86 && self.iopl() < 3 {
+            return Err(Trap::FaultCode(13, 0));
+        }
         let w = self.vw();
         let value = self.popv(bus, w)?;
         self.load_flags(value, w);
@@ -706,7 +720,10 @@ impl Cpu {
     /// Writes FLAGS from guest data under the current privilege rules.
     pub(crate) fn load_flags(&mut self, value: u32, w: u32) {
         let mut writable = ARITH_FLAGS | FLAG_TF | FLAG_DF | FLAG_NT;
-        if !self.pmode || self.cpl == 0 {
+        if self.vm86 {
+            // Only reached with IOPL 3, and IOPL itself stays out of reach.
+            writable |= FLAG_IF;
+        } else if !self.pmode || self.cpl == 0 {
             writable |= FLAG_IOPL | FLAG_IF;
         } else if self.cpl <= self.iopl() {
             writable |= FLAG_IF;
@@ -1156,9 +1173,16 @@ impl Cpu {
                 4
             }
             0xF1 => 1,
-            _ => self.fetch8(bus)?,
+            _ => {
+                // Only `INT n` goes by IOPL in virtual-8086 mode.
+                if self.vm86 && self.iopl() < 3 {
+                    return Err(Trap::FaultCode(13, 0));
+                }
+                self.fetch8(bus)?
+            }
         };
         self.no_trap = true;
+        self.int_source = IntSource::Software;
         self.interrupt(bus, vector, None, opcode != 0xF1)
     }
 
@@ -1167,6 +1191,9 @@ impl Cpu {
         self.no_trap = true;
         if self.pmode {
             return self.iret_protected(bus, w);
+        }
+        if self.vm86 && self.iopl() < 3 {
+            return Err(Trap::FaultCode(13, 0));
         }
         let ip = self.popv(bus, w)?;
         let cs = self.popv(bus, w)? as u16;
@@ -1291,7 +1318,7 @@ impl Cpu {
     }
 
     fn op_hlt<B: Bus>(&mut self, _bus: &mut B, _opcode: u8) -> Exec {
-        if self.pmode && self.cpl != 0 {
+        if self.cpl != 0 {
             return Err(Trap::FaultCode(13, 0));
         }
         Err(Trap::Hlt)
@@ -1306,7 +1333,7 @@ impl Cpu {
             0xF8 => self.set_flag(FLAG_CF, false),
             0xF9 => self.set_flag(FLAG_CF, true),
             0xFA | 0xFB => {
-                if self.pmode && self.cpl > self.iopl() {
+                if self.cpl > self.iopl() {
                     return Err(Trap::FaultCode(13, 0));
                 }
                 if opcode == 0xFA {
@@ -1436,8 +1463,8 @@ impl Cpu {
                         self.set_reg8(4, (dividend % divisor) as u8);
                     }
                     16 => {
-                        let dividend = (((self.r[DX] & 0xFFFF) << 16) | (self.r[AX] & 0xFFFF)) as i32
-                            as i64;
+                        let dividend =
+                            (((self.r[DX] & 0xFFFF) << 16) | (self.r[AX] & 0xFFFF)) as i32 as i64;
                         let divisor = value as u16 as i16 as i64;
                         let quotient = dividend / divisor;
                         if quotient != quotient as i16 as i64 {
@@ -1473,6 +1500,13 @@ impl Cpu {
             if (CALLBACK_ROM_BASE..=0xF_FFFF).contains(&linear) {
                 let vector = self.fetch8(bus)?;
                 return self.callback(bus, vector, byte == CALLBACK_MODRM);
+            }
+        }
+        if byte == HOST_CALL_MODRM {
+            let linear = self.seg[CS].base.wrapping_add(self.start_ip);
+            if (CALLBACK_ROM_BASE..=0xF_FFFF).contains(&linear) {
+                let code = self.fetch8(bus)?;
+                return self.host_trap(bus, code);
             }
         }
         let m = self.modrm_byte(bus, byte)?;

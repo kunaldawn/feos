@@ -6,6 +6,7 @@
 //! themselves unaware of it, and the filesystem stays borrowable by the command
 //! because a file's writes are buffered here and flushed when the command ends.
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::RefCell;
@@ -36,6 +37,8 @@ pub(crate) enum OpenFile {
     },
     /// Output kept in memory for a pipe or command substitution.
     Capture { data: Vec<u8>, overflow: bool },
+    /// A live stream from another task.
+    Stream(Box<dyn Input + Send>),
 }
 
 struct Entry {
@@ -190,17 +193,17 @@ impl FdTable {
         None
     }
 
-    fn resolve(&mut self, fd: usize) -> Option<&mut OpenFile> {
+    /// True when a descriptor above 2 is open, which a forked shell can't inherit.
+    pub(crate) fn has_extra_descriptors(&self) -> bool {
+        self.slots[3..].iter().any(Option::is_some)
+    }
+
+    pub(crate) fn resolve(&mut self, fd: usize) -> Option<&mut OpenFile> {
         let index = self.slots.get(fd).copied().flatten()?;
         self.files
             .get_mut(usize::from(index))?
             .as_mut()
             .map(|entry| &mut entry.file)
-    }
-
-    /// True when `fd` names an open file.
-    pub(crate) fn is_open(&self, fd: usize) -> bool {
-        self.slots.get(fd).copied().flatten().is_some()
     }
 }
 
@@ -257,8 +260,49 @@ impl StreamView<'_, '_> {
                 out.fill(0);
                 out.len()
             }
+            Some(OpenFile::Stream(reader)) => reader.read(out),
             _ => 0,
         }
+    }
+
+    /// What's already here, without waiting.
+    pub(crate) fn try_read(&mut self, fd: usize, out: &mut [u8]) -> feos_coreutils::Available {
+        use feos_coreutils::Available;
+        if self.poll() {
+            return Available::End;
+        }
+        let Self { fds, io, .. } = self;
+        match fds.resolve(fd) {
+            Some(OpenFile::Base(0)) => io.stdin.try_read(out),
+            Some(OpenFile::Stream(reader)) => reader.try_read(out),
+            _ => match self.read(fd, out) {
+                0 => Available::End,
+                count => Available::Bytes(count),
+            },
+        }
+    }
+
+    /// A terminal's keys, as they are. Anything else reads as it always does.
+    pub(crate) fn read_raw(&mut self, fd: usize, out: &mut [u8]) -> usize {
+        let Self { fds, io, .. } = self;
+        match fds.resolve(fd) {
+            Some(OpenFile::Base(0)) => io.stdin.read_raw(out),
+            _ => self.read(fd, out),
+        }
+    }
+
+    /// Keys that have already arrived, without waiting for more.
+    pub(crate) fn read_pending(&mut self, fd: usize, out: &mut [u8]) -> usize {
+        let Self { fds, io, .. } = self;
+        match fds.resolve(fd) {
+            Some(OpenFile::Base(0)) => io.stdin.read_pending(out),
+            _ => self.read(fd, out),
+        }
+    }
+
+    /// Raw mode is the terminal's, whatever this descriptor reads from.
+    pub(crate) fn set_raw(&mut self, raw: bool) {
+        self.io.stdin.set_raw(raw);
     }
 
     pub(crate) fn read_all(&mut self, fd: usize, limit: usize) -> Result<Vec<u8>, FsError> {
@@ -277,6 +321,7 @@ impl StreamView<'_, '_> {
                 Ok(all)
             }
             Some(OpenFile::Base(0)) => io.stdin.try_read_to_end(limit),
+            Some(OpenFile::Stream(reader)) => reader.try_read_to_end(limit),
             Some(OpenFile::Zero) => Err(FsError::NoSpace),
             _ => Ok(Vec::new()),
         }
@@ -311,6 +356,8 @@ impl StreamView<'_, '_> {
     }
 
     pub(crate) fn is_broken(&mut self, fd: usize) -> bool {
+        // A command asking this is at a safe stopping point, so always look.
+        self.calls |= POLL_INTERVAL - 1;
         if self.poll() {
             return true;
         }
@@ -347,8 +394,36 @@ impl Input for FdInput<'_, '_, '_> {
         self.view.borrow_mut().read(self.fd, out)
     }
 
+    fn try_read(&mut self, out: &mut [u8]) -> feos_coreutils::Available {
+        self.view.borrow_mut().try_read(self.fd, out)
+    }
+
     fn is_terminal(&self) -> bool {
         self.view.borrow_mut().is_terminal(self.fd)
+    }
+
+    fn read_raw(&mut self, out: &mut [u8]) -> usize {
+        self.view.borrow_mut().read_raw(self.fd, out)
+    }
+
+    fn read_pending(&mut self, out: &mut [u8]) -> usize {
+        self.view.borrow_mut().read_pending(self.fd, out)
+    }
+
+    fn set_raw(&mut self, raw: bool) {
+        self.view.borrow_mut().set_raw(raw);
+    }
+
+    fn read_tty(&mut self, out: &mut [u8]) -> usize {
+        self.view.borrow_mut().io.stdin.read_raw(out)
+    }
+
+    fn read_tty_pending(&mut self, out: &mut [u8]) -> usize {
+        self.view.borrow_mut().io.stdin.read_pending(out)
+    }
+
+    fn tty_is_terminal(&self) -> bool {
+        self.view.borrow_mut().io.stdin.is_terminal()
     }
 
     fn try_read_to_end(&mut self, limit: usize) -> Result<Vec<u8>, FsError> {

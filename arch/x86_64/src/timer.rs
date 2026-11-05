@@ -1,18 +1,26 @@
 //! Timekeeping and the scheduler's periodic tick.
 //!
-//! The monotonic clock is the TSC, calibrated once against PIT channel 0.
-//! The scheduler tick is a separate 100 Hz PIT interrupt routed through the
-//! boards' IOAPIC to vector 34.
+//! The monotonic clock is the TSC, calibrated once against the ACPI PM timer.
+//! Each CPU's scheduler timer is its own local APIC timer in one-shot mode,
+//! calibrated once against the TSC, on the vector the board publishes as its timer
+//! interrupt. The scheduler arms it for the next thing it has to do.
 
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use feos_port_io::{inl, outb};
+use feos_port_io::inl;
 
+use crate::lapic;
 use crate::smp::MAX_CPUS;
 
-/// PIT input clock.
-const PIT_HZ: u64 = 1_193_182;
+/// The tick's interrupt vector. The board's `TIMER_IRQ` names the same number.
+pub const TIMER_VECTOR: u32 = 34;
+/// LVT: masked.
+const LVT_MASKED: u32 = 1 << 16;
+/// Divide configuration: by 16.
+const DIVIDE_BY_16: u32 = 0b0011;
+/// Calibration window for the APIC timer.
+const APIC_CALIBRATION_MS: u64 = 10;
 
 /// ACPI PM timer I/O port (PM1a_EVT + 8 on QEMU's default PM base `0x600`).
 const ACPI_PM_TIMER: u16 = 0x608;
@@ -22,6 +30,10 @@ const ACPI_PM_HZ: u64 = 3_579_545;
 const CALIBRATION_TICKS: u32 = 100_000;
 
 static FREQUENCY: AtomicU64 = AtomicU64::new(0);
+/// APIC timer counts per second, measured once and shared: the timer runs from a
+/// clock common to every CPU.
+static APIC_HZ: AtomicU64 = AtomicU64::new(0);
+/// Counter units per scheduler tick, once started.
 static PERIOD: AtomicU64 = AtomicU64::new(0);
 static IDLE_HINTS: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 
@@ -101,8 +113,8 @@ pub fn spin_ms(ms: u64) {
 
 /// Waits for roughly `ms` milliseconds in a low-power state.
 ///
-/// The kernel's clock blocks the process instead once the scheduler is running,
-/// so this only serves code running before it starts.
+/// Interrupts are unmasked during the wait, so this must not be called from a
+/// critical section. The kernel's clock blocks the process instead of using this.
 pub fn idle_ms(ms: u64) {
     let frequency = frequency();
     let delta = frequency.saturating_mul(ms) / 1000;
@@ -127,41 +139,46 @@ pub fn take_idle_hint() -> bool {
     IDLE_HINTS[cpu].swap(false, Ordering::Relaxed)
 }
 
-/// Starts the PIT as a periodic scheduler tick at `hz` hertz.
-pub fn start_periodic(hz: u64) {
-    if hz == 0 {
-        stop();
-        return;
+/// Measures the APIC timer against the TSC.
+fn apic_timer_hz() -> u64 {
+    let known = APIC_HZ.load(Ordering::Relaxed);
+    if known != 0 {
+        return known;
     }
+    lapic::write(lapic::LVT_TIMER, LVT_MASKED);
+    lapic::write(lapic::TIMER_DIVIDE, DIVIDE_BY_16);
+    lapic::write(lapic::TIMER_INITIAL, u32::MAX);
+    spin_ms(APIC_CALIBRATION_MS);
+    let counted = u64::from(u32::MAX - lapic::read(lapic::TIMER_CURRENT));
+    lapic::write(lapic::TIMER_INITIAL, 0);
 
-    let divisor = (PIT_HZ / hz).clamp(1, 0xffff);
-    PERIOD.store(divisor, Ordering::Relaxed);
-
-    // SAFETY: channel 0, mode 3 (square wave), lobyte/hibyte.
-    unsafe {
-        outb(0x43, 0x36);
-        outb(0x40, divisor as u8);
-        outb(0x40, (divisor >> 8) as u8);
-    }
+    // A timer that doesn't count would never tick, so this is worth stopping for.
+    assert!(counted != 0, "the local APIC timer isn't counting");
+    let hz = counted * 1000 / APIC_CALIBRATION_MS;
+    APIC_HZ.store(hz, Ordering::Relaxed);
+    hz
 }
 
-/// Reprograms the timer after a tick and returns `true` when it was running.
-///
-/// PIT mode 3 reloads automatically, so this only reports whether the tick is
-/// active. The interrupt controller has already been acknowledged by the
-/// kernel before calling this.
-pub fn tick() -> bool {
-    PERIOD.load(Ordering::Relaxed) != 0
+/// Starts this CPU's timer, first firing a tick from now at `hz` hertz.
+pub fn start(hz: u64) {
+    let period = frequency() / hz.max(1);
+    PERIOD.store(period, Ordering::Relaxed);
+    apic_timer_hz();
+    lapic::write(lapic::TIMER_DIVIDE, DIVIDE_BY_16);
+    lapic::write(lapic::LVT_TIMER, TIMER_VECTOR);
+    arm(ticks().wrapping_add(period));
 }
 
-/// Stops the periodic tick.
-pub fn stop() {
-    PERIOD.store(0, Ordering::Relaxed);
+/// Counter units per scheduler tick.
+pub fn period() -> u64 {
+    PERIOD.load(Ordering::Relaxed)
+}
 
-    // SAFETY: channel 0, mode 0, count 0 (stops counting).
-    unsafe {
-        outb(0x43, 0x30);
-        outb(0x40, 0);
-        outb(0x40, 0);
-    }
+/// Has this CPU's timer interrupt fire at counter value `deadline`, replacing what
+/// was set before. One that's already passed fires at once.
+pub fn arm(deadline: u64) {
+    let wait = deadline.saturating_sub(ticks()) as u128;
+    let count = wait * apic_timer_hz() as u128 / frequency() as u128;
+    // Zero would stop the timer. A wait too long to count just wakes early.
+    lapic::write(lapic::TIMER_INITIAL, count.clamp(1, u128::from(u32::MAX)) as u32);
 }

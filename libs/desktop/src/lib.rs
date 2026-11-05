@@ -42,6 +42,7 @@
 pub mod config;
 pub mod keyboard;
 pub mod notify;
+pub mod volume;
 pub mod paint;
 pub mod start_menu;
 pub mod taskbar;
@@ -53,6 +54,7 @@ mod scripted;
 
 use core::fmt::Write as _;
 
+use feos_app::isolate;
 use feos_app::shell::{Level, Notification};
 use feos_app::{
     App, AppRegistry, Platform, ProcessInfo, ProcessState, Processes, SpawnError, WindowContext,
@@ -435,6 +437,7 @@ struct PaintedDesktop {
     window_menu: ContextMenuState,
     toasts: usize,
     unread: usize,
+    sound: volume::Sound,
     show_desktop: bool,
 }
 
@@ -480,8 +483,14 @@ pub struct Desktop<
     window_menu_target: usize,
     /// Whether the Display Properties dialog is open.
     settings_open: bool,
+    /// The user changed something that should outlive the session.
+    settings_changed: bool,
     /// Whether the notification history is open.
     notifications_open: bool,
+    /// The volume panel above the tray is showing.
+    volume_open: bool,
+    /// The volume and mute state shown in the tray.
+    sound: volume::Sound,
     /// Toasts and their history.
     notifications: Notifications,
     /// A path being dragged between apps.
@@ -546,7 +555,10 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             window_menu: ContextMenuState::CLOSED,
             window_menu_target: 0,
             settings_open: false,
+            settings_changed: false,
             notifications_open: false,
+            volume_open: false,
+            sound: volume::Sound::FULL,
             notifications: Notifications::new(),
             drag: None,
             pending_kill: [None; N],
@@ -651,6 +663,12 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
     /// Replaces the configuration and rebuilds the theme.
     ///
     /// Open windows are kept; the init restart policy is updated in place.
+    /// True once per change to something that should outlive the session, for
+    /// the caller to save. See [`DesktopConfig::settings_text`].
+    pub fn take_settings_changed(&mut self) -> bool {
+        core::mem::take(&mut self.settings_changed)
+    }
+
     pub fn set_config(&mut self, config: DesktopConfig) {
         if self.config != config {
             self.background_valid = false;
@@ -786,6 +804,7 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             || self.window_menu.open
             || self.settings_open
             || self.notifications_open
+            || self.volume_open
     }
 
     /// Closes a window, its app and any process started for it.
@@ -794,6 +813,17 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
     /// until the process has gone.
     ///
     /// [`tick_session`]: Self::tick_session
+    fn close_failed_window(&mut self, index: usize, runtime: &'static dyn App, status: i32, now_ms: u64) -> bool {
+        self.notify_failed(runtime.name(), status, now_ms);
+        self.close_window(index)
+    }
+
+    fn notify_failed(&mut self, name: &str, status: i32, now_ms: u64) {
+        let mut body = Text::<96>::new();
+        let _ = write!(body, "{name} failed (status {status}) and its window was closed.");
+        self.notify_text("Application failed", body.as_str(), Level::Error, now_ms);
+    }
+
     pub fn close_window(&mut self, index: usize) -> bool {
         let Some(window) = self.windows.get(index).copied() else {
             return false;
@@ -803,7 +833,9 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
         }
         if let Some(runtime) = window.runtime {
             if window.app_started {
-                runtime.close_window();
+                close_hosted(runtime, index);
+            } else {
+                isolate::finish(index);
             }
         }
         if let Some(pid) = window.pid {
@@ -880,6 +912,7 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
         self.window_menu.open = false;
         self.settings_open = false;
         self.notifications_open = false;
+        self.volume_open = false;
     }
 
     fn apply_window_action(&mut self, index: usize, action: WindowAction) {
@@ -1107,12 +1140,118 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
                     window.args.set(args);
                     if window.app_started {
                         if let Some(runtime) = window.runtime {
-                            runtime.close_window();
+                            close_hosted(runtime, slot);
                         }
                         window.app_started = false;
                     }
                 }
             }
+        }
+        Some(slot)
+    }
+
+    /// Tells apps which windows are open, for a task manager.
+    pub fn publish_windows(&self) {
+        let mut list = [feos_app::shell::WindowInfo::empty(); feos_app::shell::MAX_WINDOWS];
+        let mut count = 0;
+        for index in 0..N.min(list.len()) {
+            let Some(window) = self.windows.get(index).filter(|window| window.open) else {
+                continue;
+            };
+            let mut title = Text::new();
+            title.set(window.title.as_str());
+            list[count] = feos_app::shell::WindowInfo {
+                window: index as u16,
+                pid: window.pid,
+                hosted: window.runtime.is_some(),
+                title,
+                cpu_us: window.cpu_us,
+                minimized: window.state == WindowState::Minimized,
+                focused: self.windows.is_focused(index),
+            };
+            count += 1;
+        }
+        feos_app::shell::publish_windows(&list[..count]);
+    }
+
+    /// Brings a window forward, restoring it if it is minimized.
+    pub fn activate_window(&mut self, index: usize) -> bool {
+        let Some(window) = self.windows.get_mut(index).filter(|window| window.open) else {
+            return false;
+        };
+        if window.state == WindowState::Minimized {
+            window.state = window.restore_state;
+        }
+        window.suspended = false;
+        self.show_desktop = false;
+        let focused = self.windows.focus(index);
+        self.repaint_all = true;
+        focused
+    }
+
+    /// The shortest frame period any visible window currently asks for, or zero.
+    pub fn animation_period(&self) -> u32 {
+        let mut shortest = 0;
+        for index in 0..N {
+            let Some(window) = self.windows.get(index) else {
+                continue;
+            };
+            if !window.open || window.state == WindowState::Minimized {
+                continue;
+            }
+            if let Some(app) = window.runtime.filter(|app| app.animates()) {
+                let period = app.animation_period_ms().max(1);
+                if shortest == 0 || period < shortest {
+                    shortest = period;
+                }
+            }
+        }
+        shortest
+    }
+
+    /// Opens another window for catalog entry `index`, even if it has one.
+    fn open_app_instance(&mut self, index: usize, args: Option<&str>) -> Option<usize> {
+        let app = *self.catalog.get(index)?;
+        self.show_desktop = false;
+        // Clicking an icon opens a window before the launch reaches here. That
+        // one is this launch's, not a reason for another.
+        let fresh = (0..N).find(|&slot| {
+            self.windows
+                .get(slot)
+                .is_some_and(|window| window.open && window.app == index && window.runtime.is_none())
+        });
+        if let Some(slot) = fresh {
+            if let (Some(args), Some(window)) = (args, self.windows.get_mut(slot)) {
+                window.args.set(args);
+            }
+            return Some(slot);
+        }
+        let work_area = if self.work_area.is_empty() {
+            Rect::new(0, 0, 1024, 768)
+        } else {
+            self.work_area
+        };
+        let width = if app.manifest.window_width == 0 {
+            self.config.windows.default_width
+        } else {
+            app.manifest.window_width
+        };
+        let height = if app.manifest.window_height == 0 {
+            self.config.windows.default_height
+        } else {
+            app.manifest.window_height
+        };
+        let slot = self.windows.open_new(
+            index,
+            app.name(),
+            work_area,
+            width,
+            height,
+            self.config.windows.cascade,
+        )?;
+        if let Some(window) = self.windows.get_mut(slot) {
+            window.bundle.set(app.id());
+            window.args.set(args.unwrap_or(app.manifest.args.as_str()));
         }
         Some(slot)
     }
@@ -1141,7 +1280,15 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
         let Some(app) = self.catalog.get(index).copied() else {
             return LaunchOutcome::UnknownApp;
         };
-        let Some(window_index) = self.open_app_with(index, args) else {
+        let multi = registry
+            .find(app.manifest.entry.as_str())
+            .is_some_and(|runtime| runtime.multi_instance());
+        let opened = if multi {
+            self.open_app_instance(index, args)
+        } else {
+            self.open_app_with(index, args)
+        };
+        let Some(window_index) = opened else {
             return LaunchOutcome::NoWindowSlot;
         };
 
@@ -1347,7 +1494,18 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
     /// The same pass notices when a background process launched from a window
     /// has exited, so the window can report `Ready` and be launched again.
     pub fn tick_session(&mut self, processes: &dyn Processes) -> usize {
-        let mut changed = self.init.tick(processes);
+        let changed = self.init.tick(processes);
+        self.finish_session_tick(processes, changed)
+    }
+
+    /// [`Self::tick_session`] with the real clock, so restart backoff follows
+    /// wall time however often the session ticks.
+    pub fn tick_session_at(&mut self, processes: &dyn Processes, now_ms: u64) -> usize {
+        let changed = self.init.tick_at(processes, now_ms);
+        self.finish_session_tick(processes, changed)
+    }
+
+    fn finish_session_tick(&mut self, processes: &dyn Processes, mut changed: usize) -> usize {
 
         let mut live = [ProcessInfo::EMPTY; MAX_PROCESSES];
         let count = processes.snapshot(&mut live);
@@ -1394,7 +1552,13 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             };
             if window.open && window.app_started && window.state == WindowState::Minimized {
                 if let Some(runtime) = window.runtime {
-                    runtime.background_tick(platform, now_ms);
+                    let ran = isolate::call(platform, index, runtime.name(), || {
+                        runtime.background_tick(platform, now_ms);
+                    });
+                    if let Err(died) = ran {
+                        // Nothing's on screen, but the same goes for it.
+                        let _ = self.close_failed_window(index, runtime, died.status, now_ms);
+                    }
                 }
             }
         }
@@ -1447,7 +1611,12 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
     ) -> DesktopResponse {
         let theme = self.theme;
         let config = self.config;
-        let clock = paint::format_clock(uptime_ms, &config.taskbar);
+        // The real time, when the machine has a clock that knows it. A board
+        // without one keeps showing time since boot.
+        let wall_ms = platform
+            .and_then(|platform| platform.clock.unix_time())
+            .map_or(uptime_ms, |seconds| seconds.saturating_mul(1000));
+        let clock = paint::format_clock(wall_ms, &config.taskbar);
         let mut response = DesktopResponse::default();
 
         let canvas_rect = Rect::new(0, 0, canvas.width() as u32, canvas.height() as u32);
@@ -1464,6 +1633,7 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
         let input = &filtered;
 
         let run_dialog_open = self.run_dialog.open;
+        self.sound.sync();
         let modal_at_start = self.modal_open();
         let window_owns_keyboard = self
             .windows
@@ -1488,6 +1658,7 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
                 self.logoff_open = false;
                 self.settings_open = false;
                 self.notifications_open = false;
+                self.volume_open = false;
             }
         } else if self.drag.is_some() {
             if escape_pressed {
@@ -1678,6 +1849,7 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             &self.catalog,
             clock.as_str(),
             self.notifications.unread(),
+            self.sound,
         );
 
         ui.set_pointer_occluded(modal || drag_active || in_toast);
@@ -1778,6 +1950,18 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             }
         }
 
+        if self.volume_open {
+            let _blocker = ui.interact(
+                Id::from_name("desktop.volume.modal"),
+                ui.canvas_rect(),
+                Sense::click(),
+            );
+            let panel = volume::render_panel(&mut ui, &theme, &layout, self.work_area, &mut self.sound);
+            if pointer_pressed && !panel.contains(pointer) {
+                self.volume_open = false;
+            }
+        }
+
         if let Some(payload) = self.drag {
             paint::draw_drag_label(&mut ui.painter, &theme, pointer, payload.as_str());
         }
@@ -1803,6 +1987,15 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
 
         // State changes -------------------------------------------------------
         for (index, close) in close_after.iter().enumerate() {
+            if *close {
+                let failed = self.windows.get_mut(index).and_then(|window| {
+                    let status = window.failed.take()?;
+                    Some((window.runtime?, status))
+                });
+                if let Some((runtime, status)) = failed {
+                    self.notify_failed(runtime.name(), status, uptime_ms);
+                }
+            }
             if *close {
                 self.close_window(index);
             }
@@ -1892,6 +2085,16 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             response.tray_clicked = true;
         }
 
+        if taskbar_response.speaker_wheel != 0 {
+            let change = if taskbar_response.speaker_wheel > 0 { 5 } else { -5 };
+            self.sound.set_level(self.sound.level as i32 + change);
+        }
+
+        if taskbar_response.speaker_clicked {
+            self.start_menu.close();
+            self.volume_open = !self.volume_open;
+        }
+
         if taskbar_response.bell_clicked {
             self.start_menu.close();
             self.notifications.mark_read();
@@ -1948,11 +2151,15 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
 
         match settings_action {
             SettingsAction::None => {}
-            SettingsAction::Theme(name) => self.set_theme(name),
+            SettingsAction::Theme(name) => {
+                self.set_theme(name);
+                self.settings_changed = true;
+            }
             SettingsAction::Layout(layout) => {
                 let mut next = self.config;
                 next.keyboard_layout = layout;
                 self.set_config(next);
+                self.settings_changed = true;
             }
             SettingsAction::Close => self.settings_open = false,
         }
@@ -2127,6 +2334,7 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             window_menu: self.window_menu,
             toasts: self.notifications.visible_count(),
             unread: self.notifications.unread(),
+            sound: self.sound,
             show_desktop: self.show_desktop,
         }
     }
@@ -3763,6 +3971,43 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
     outcome
 }
 
+/// Lets a hosted app clean up. Its window's task does that too, a new one if the old one
+/// died, so that an app whose state is ruined can't take the desktop with it.
+fn close_hosted(runtime: &'static dyn App, index: usize) {
+    match feos_app::platform() {
+        Some(platform) => {
+            let closed = isolate::call(platform, index, runtime.name(), || runtime.close_instance(index));
+            if let Err(died) = closed {
+                feos_console::println!(
+                    "[desktop] {} failed while closing, with status {}",
+                    runtime.name(),
+                    died.status
+                );
+            }
+            isolate::finish(index);
+        }
+        None => runtime.close_instance(index),
+    }
+}
+
+/// A hosted app's task died in a call: its window closes, and that's all that happens.
+fn hosted_failed<const N: usize>(
+    runtime: &'static dyn App,
+    windows: &mut WindowManager<N>,
+    index: usize,
+    died: isolate::Died,
+) -> bool {
+    feos_console::println!(
+        "[desktop] {} failed with status {}; closing its window",
+        runtime.name(),
+        died.status
+    );
+    if let Some(slot) = windows.get_mut(index) {
+        slot.failed = Some(died.status);
+    }
+    true
+}
+
 /// Starts a hosted app if needed and runs one frame of it. Returns `true` when
 /// the app asked to close.
 #[allow(clippy::too_many_arguments)]
@@ -3781,6 +4026,7 @@ fn run_hosted_app<const N: usize>(
 ) -> bool {
     let mut context = WindowContext {
         args: window.args.as_str(),
+        instance: index,
         canvas,
         input,
         platform,
@@ -3791,7 +4037,10 @@ fn run_hosted_app<const N: usize>(
     };
     let mut started = window.app_started;
     if !started {
-        started = runtime.open_window(&context);
+        started = match isolate::call(platform, index, runtime.name(), || runtime.open_window(&context)) {
+            Ok(started) => started,
+            Err(died) => return hosted_failed(runtime, windows, index, died),
+        };
         if let Some(slot) = windows.get_mut(index) {
             slot.app_started = started;
             slot.status = if started {
@@ -3807,7 +4056,18 @@ fn run_hosted_app<const N: usize>(
     if let Some(slot) = windows.get_mut(index) {
         slot.last_frame_ms = now_ms;
     }
-    runtime.frame_window(&mut context) == WindowFrame::Close
+    let clock = platform.clock;
+    let started_at = clock.ticks();
+    let closed = match isolate::call(platform, index, runtime.name(), || runtime.frame_window(&mut context)) {
+        Ok(frame) => frame == WindowFrame::Close,
+        Err(died) => return hosted_failed(runtime, windows, index, died),
+    };
+    if let Some(slot) = windows.get_mut(index) {
+        let elapsed = clock.ticks().wrapping_sub(started_at) as u128;
+        let micros = elapsed * 1_000_000 / clock.frequency().max(1) as u128;
+        slot.cpu_us = slot.cpu_us.saturating_add(micros as u64);
+    }
+    closed
 }
 
 /// Registers the eight invisible resize grips around a normal window.
@@ -4180,7 +4440,9 @@ mod tests {
             "test app"
         }
 
-        fn run(&self, _context: &mut Context<'_>) {}
+        fn run(&self, _context: &mut Context<'_>) -> i32 {
+        0
+    }
     }
 
     static DUMMY: Dummy = Dummy;
@@ -4208,7 +4470,9 @@ mod tests {
             true
         }
 
-        fn run(&self, _context: &mut Context<'_>) {}
+        fn run(&self, _context: &mut Context<'_>) -> i32 {
+        0
+    }
     }
 
     static WINDOWED: WindowedDummy = WindowedDummy;
@@ -4243,7 +4507,9 @@ mod tests {
             WindowFrame::Continue
         }
 
-        fn run(&self, _context: &mut Context<'_>) {}
+        fn run(&self, _context: &mut Context<'_>) -> i32 {
+        0
+    }
     }
 
     static RECORDER: Recorder = Recorder;
@@ -4436,6 +4702,7 @@ mod tests {
             memory: None,
             apps: &Registry,
             filesystem: None,
+            net: None,
         };
 
         let mut pixels = std::vec![0u32; 1024 * 768];

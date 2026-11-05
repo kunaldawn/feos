@@ -3,9 +3,12 @@ name = "feos-coreutils"
 description = "POSIX-style core utilities for the feos shell"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
 feos-archive = { workspace = true }
+feos-bundle = { workspace = true }
 feos-compress = { workspace = true }
 feos-fs = { workspace = true }
+feos-hal = { workspace = true }

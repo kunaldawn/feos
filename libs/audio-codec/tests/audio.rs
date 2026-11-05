@@ -197,31 +197,6 @@ fn g711_matches_ffmpeg_for_every_code() {
     assert_eq!(alaw, s16le(include_bytes!("data/alaw_all.s16")));
 }
 
-/// Builds `count` MPEG-1 frames of the given layer, 128 kbit/s at 44.1 kHz.
-fn mpeg_frames(layer_bits: u8, frame_len: usize, count: usize) -> Vec<u8> {
-    let bitrate = if layer_bits == 0b11 { 0x40 } else { 0x90 };
-    let mut out = Vec::new();
-    for _ in 0..count {
-        let start = out.len();
-        out.extend_from_slice(&[0xff, 0xe0 | 0x18 | (layer_bits << 1) | 1, bitrate, 0xc0]);
-        out.resize(start + frame_len, 0);
-    }
-    out
-}
-
-#[test]
-fn mp3_layers_one_and_two_are_refused_consistently() {
-    let layer1 = mpeg_frames(0b11, 4 * 12 * 128_000 / 44_100 / 4 * 4, 16);
-    let layer2 = include_bytes!("data/tone.mp2").to_vec();
-    for file in [&layer1[..], &layer2[..]] {
-        assert_eq!(detect(file), Some(AudioFormat::Mp3));
-        let expected = Err(AudioError::UnsupportedFeature("MP3 layer"));
-        assert_eq!(info(file), expected);
-        let mut out = vec![0i16; 1 << 16];
-        assert_eq!(decode(file, &mut out, &mut []).map(|d| d.info), expected);
-    }
-}
-
 fn fnv1a(samples: &[i16]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for sample in samples {
@@ -411,6 +386,54 @@ fn vorbis_matches_ffmpeg_within_tolerance() {
         assert!(worst <= 2, "worst sample error {worst}");
         assert!(rms <= 0.5, "RMS error {rms}");
     }
+}
+
+#[test]
+fn mpeg_layers_1_and_2_match_ffmpeg() {
+    // Both decoders are float, and differ by rounding. See `make_layer1.py`.
+    for (name, file, reference) in [
+        (
+            "layer 2, MPEG-1",
+            &include_bytes!("data/tone.mp2")[..],
+            &include_bytes!("data/tone.mp2.s16")[..],
+        ),
+        (
+            "layer 2, MPEG-2",
+            &include_bytes!("data/mpeg2-stereo.mp2")[..],
+            &include_bytes!("data/mpeg2-stereo.mp2.s16")[..],
+        ),
+        (
+            "layer 1",
+            &include_bytes!("data/layer1.mp1")[..],
+            &include_bytes!("data/layer1.mp1.s16")[..],
+        ),
+    ] {
+        let reference = s16le(reference);
+        let stated = info(file).unwrap();
+        let mut out = vec![0i16; reference.len() + 8192];
+        let decoded = decode(file, &mut out, &mut []).unwrap();
+        out.truncate(decoded.frames * stated.channels as usize);
+        assert!(reference.iter().any(|&sample| sample.unsigned_abs() > 200), "{name}");
+        let shared = out.len().min(reference.len());
+        assert!(out.len().abs_diff(reference.len()) <= 4608, "{name}: {} and {}", out.len(), reference.len());
+        let (worst, rms) = compare(&out[..shared], &reference[..shared]);
+        assert!(worst <= 3 && rms <= 1.0, "{name}: worst {worst}, rms {rms}");
+    }
+}
+
+#[test]
+fn vorbis_floor_0_matches_ffmpeg() {
+    // No encoder makes these: see `make_floor0.py`.
+    let file = include_bytes!("data/floor0.ogg");
+    let reference = s16le(include_bytes!("data/floor0.ogg.s16"));
+    let mut out = vec![0i16; reference.len() + 4096];
+    let decoded = decode(file, &mut out, &mut []).unwrap();
+    assert_eq!(decoded.info.format, AudioFormat::OggVorbis);
+    out.truncate(decoded.frames);
+    assert_eq!(out.len(), reference.len());
+    assert!(reference.iter().any(|&sample| sample.unsigned_abs() > 200), "it isn't silence");
+    let (worst, rms) = compare(&out, &reference);
+    assert!(worst <= 3 && rms <= 1.0, "worst {worst}, rms {rms}");
 }
 
 #[test]

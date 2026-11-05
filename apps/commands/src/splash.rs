@@ -33,13 +33,21 @@ impl App for Splash {
         WindowFrame::Continue
     }
 
-    fn run(&self, context: &mut Context<'_>) {
+    fn needs_display(&self) -> bool {
+        true
+    }
+
+    fn run(&self, context: &mut Context<'_>) -> i32 {
         match context.display.as_mut() {
             Some(canvas) => {
                 crate::ui::splash(canvas, context.platform.board.arch);
                 println!("redrew the boot splash");
             }
-            None => println!("no framebuffer; restart QEMU with -device ramfb"),
+            None => {
+                println!("no framebuffer; restart QEMU with -device ramfb");
+                return 1;
+            }
         }
+        0
     }
 }

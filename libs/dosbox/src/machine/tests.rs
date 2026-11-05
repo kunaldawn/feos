@@ -223,7 +223,10 @@ fn a_mode_set_costs_guest_time() {
         sets += 1;
         assert!(sets < 100);
     }
-    assert!(sets < 15, "each frame must stop after a few mode sets: {sets}");
+    assert!(
+        sets < 15,
+        "each frame must stop after a few mode sets: {sets}"
+    );
 }
 
 // ----------------------------------------------------------------------
@@ -256,7 +259,8 @@ fn guest_fuzz_never_panics_and_frames_stay_bounded() {
         // Mix in many interrupt calls, with random register loads before them.
         for _ in 0..120 {
             let at = (rng.next() as usize) % (program.len() - 16);
-            let vector = [0x10u8, 0x16, 0x1A, 0x21, 0x33, 0x15, 0x2F, 0x67][rng.next() as usize % 8];
+            let vector =
+                [0x10u8, 0x16, 0x1A, 0x21, 0x33, 0x15, 0x2F, 0x67][rng.next() as usize % 8];
             let function = rng.next() as u8;
             let snippet = [
                 0xB8,
@@ -470,15 +474,17 @@ fn extended_keys_reach_dos_as_zero_then_scan_code() {
 #[test]
 fn ah_0c_flushes_once_and_then_waits_for_a_new_key() {
     // AX=0C01h: flush, then read with echo.
-    let program = [
-        0xB8, 0x01, 0x0C, 0xCD, 0x21, 0x88, 0xC2, 0xEB, 0xFE,
-    ];
+    let program = [0xB8, 0x01, 0x0C, 0xCD, 0x21, 0x88, 0xC2, 0xEB, 0xFE];
     let mut dos = boot(&program);
     dos.frame(0, 3);
     frames(&mut dos, 2);
     dos.push_key(b'z', 0x2C);
     frames(&mut dos, 2);
-    assert_eq!(dos.cpu.r[DX] & 0xFF, b'z' as u32, "the key survived retries");
+    assert_eq!(
+        dos.cpu.r[DX] & 0xFF,
+        b'z' as u32,
+        "the key survived retries"
+    );
 }
 
 #[test]
@@ -589,7 +595,16 @@ fn resizing_the_program_block_and_allocating_work() {
 }
 
 /// Builds a minimal MZ file with the given image and header values.
-fn make_exe(image: &[u8], relocs: &[(u16, u16)], min: u16, max: u16, cs: u16, ip: u16, ss: u16, sp: u16) -> Vec<u8> {
+fn make_exe(
+    image: &[u8],
+    relocs: &[(u16, u16)],
+    min: u16,
+    max: u16,
+    cs: u16,
+    ip: u16,
+    ss: u16,
+    sp: u16,
+) -> Vec<u8> {
     let header_paras = ((0x1C + relocs.len() * 4).div_ceil(16)) as u16;
     let total = header_paras as usize * 16 + image.len();
     let mut file = vec![0u8; header_paras as usize * 16];
@@ -738,7 +753,10 @@ fn exit_closes_handles_and_frees_memory() {
         b'A', b'.', b'T', b'X', b'T', 0,
     ];
     let root = dos.bus.dos.disk.root;
-    dos.bus.dos.disk.create_file(root, "T.COM", program.to_vec());
+    dos.bus
+        .dos
+        .disk
+        .create_file(root, "T.COM", program.to_vec());
     assert!(dos.run("T.COM"));
     frames(&mut dos, 2);
     assert!(!dos.is_running());
@@ -1106,13 +1124,19 @@ fn extended_open_temp_files_and_error_info() {
         c.r[DX] = path as u32;
     });
     assert!(!carry);
-    assert_ne!(dos.bus.mem.read8(((dos.bus.dos.psp as u32) << 4) + 0x400), 0);
+    assert_ne!(
+        dos.bus.mem.read8(((dos.bus.dos.psp as u32) << 4) + 0x400),
+        0
+    );
     let (_, carry) = dos_call(&mut dos, |c| {
         c.r[AX] = 0x3800;
         c.r[DX] = 0xA00;
     });
     assert!(!carry);
-    assert_eq!(dos.bus.mem.read8(((dos.bus.dos.psp as u32) << 4) + 0xA02), b'$');
+    assert_eq!(
+        dos.bus.mem.read8(((dos.bus.dos.psp as u32) << 4) + 0xA02),
+        b'$'
+    );
 }
 
 #[test]
@@ -1238,7 +1262,10 @@ fn bell_is_a_square_wave() {
     let samples = dos.take_audio();
     let beep = &samples[..2 * 48_000 * 40 / 1000];
     let left: Vec<i16> = beep.iter().step_by(2).copied().collect();
-    assert!(left.iter().all(|sample| sample.abs() >= 1000), "square, not impulses");
+    assert!(
+        left.iter().all(|sample| sample.abs() >= 1000),
+        "square, not impulses"
+    );
     let edges = left
         .windows(2)
         .filter(|pair| (pair[0] > 0) != (pair[1] > 0))
@@ -1262,10 +1289,26 @@ fn sound_blaster_transfer_raises_its_irq_in_guest_time() {
     let base = (dos.cpu.sregs[cpu::CS] as u32) << 4;
     frames(&mut dos, 1);
     // A DMA channel and a short block at 11 kHz: 100 samples is about 9 ms.
-    for (port, value) in [(0x0Cu16, 0u8), (0x0B, 0x49), (2, 0), (2, 0), (3, 99), (3, 0), (0x83, 3), (0x0A, 1)] {
+    for (port, value) in [
+        (0x0Cu16, 0u8),
+        (0x0B, 0x49),
+        (2, 0),
+        (2, 0),
+        (3, 99),
+        (3, 0),
+        (0x83, 3),
+        (0x0A, 1),
+    ] {
         dos.bus.out8(port, value);
     }
-    for (port, value) in [(0x22C, 0xD1), (0x22C, 0x40), (0x22C, 165), (0x22C, 0x14), (0x22C, 99), (0x22C, 0)] {
+    for (port, value) in [
+        (0x22C, 0xD1),
+        (0x22C, 0x40),
+        (0x22C, 165),
+        (0x22C, 0x14),
+        (0x22C, 99),
+        (0x22C, 0),
+    ] {
         dos.bus.out8(port, value);
     }
     assert_eq!(dos.bus.mem.read8(base + 0x200), 0);
@@ -1402,7 +1445,7 @@ fn mode_set_resets_the_range_but_other_video_calls_dont() {
     // Set a range, then AH=0Eh output; then a mode set.
     let program = [
         0xB8, 7, 0, 0xB9, 10, 0, 0xBA, 20, 0, 0xCD, 0x33, // range 10-20
-        0xB8, 0x41, 0x0E, 0xCD, 0x10,                     // teletype
+        0xB8, 0x41, 0x0E, 0xCD, 0x10, // teletype
         0xEB, 0xFE,
     ];
     let mut dos = boot(&program);
@@ -1418,7 +1461,11 @@ fn mode_set_resets_the_range_but_other_video_calls_dont() {
         flags: &mut flags,
     };
     dos.bus.interrupt(0x10, &mut regs);
-    assert_eq!((dos.bus.mouse.min_x, dos.bus.mouse.max_x), (0, 639), "mode 13h is 640 wide");
+    assert_eq!(
+        (dos.bus.mouse.min_x, dos.bus.mouse.max_x),
+        (0, 639),
+        "mode 13h is 640 wide"
+    );
     assert_eq!(dos.bus.mouse.max_y, 199);
 }
 
@@ -1555,22 +1602,18 @@ fn batch_language_runs_parameters_goto_if_for_call_and_shift() {
     type_line(&mut dos, "T a b");
     let text = dos.text();
     for wanted in [
-        "first=a",
-        "second=b",
-        "v=hello",
-        "nope",
-        "itemp",
-        "itemq",
-        "in-sub",
-        "back",
-        "level3",
+        "first=a", "second=b", "v=hello", "nope", "itemp", "itemq", "in-sub", "back", "level3",
         "%done",
     ] {
         assert!(text.contains(wanted), "{wanted} missing in:\n{text}");
     }
     assert!(!text.contains("wrong"));
     assert!(!text.contains("level4"));
-    assert!(dos.shell.env.iter().any(|(key, value)| key == "V" && value == "hello"));
+    assert!(dos
+        .shell
+        .env
+        .iter()
+        .any(|(key, value)| key == "V" && value == "hello"));
 }
 
 #[test]
@@ -1585,7 +1628,10 @@ fn environment_set_at_the_prompt_reaches_programs() {
         0xB4, 0x40, 0xCD, 0x21,             // write the block
         0xCD, 0x20,
     ];
-    dos.bus.dos.disk.create_file(root, "ENV.COM", program.to_vec());
+    dos.bus
+        .dos
+        .disk
+        .create_file(root, "ENV.COM", program.to_vec());
     type_line(&mut dos, "SET FOO=bar");
     type_line(&mut dos, "ENV > ENV.TXT");
     let node = dos.bus.dos.resolve("ENV.TXT").expect("redirected");
@@ -1629,10 +1675,11 @@ fn pause_waits_for_a_key() {
     let mut dos = DosBox::new(None);
     drain_batch(&mut dos);
     let root = dos.bus.dos.disk.root;
-    dos.bus
-        .dos
-        .disk
-        .create_file(root, "P.BAT", b"@ECHO OFF\r\nPAUSE\r\nECHO after\r\n".to_vec());
+    dos.bus.dos.disk.create_file(
+        root,
+        "P.BAT",
+        b"@ECHO OFF\r\nPAUSE\r\nECHO after\r\n".to_vec(),
+    );
     for byte in b"P\r" {
         dos.push_key(*byte, 0);
     }
@@ -1693,4 +1740,319 @@ fn state_after_a_killed_protected_mode_program_is_clean() {
     assert!(dos.run("HELLO.COM"));
     frames(&mut dos, 2);
     assert!(dos.text().contains("Hello from"));
+}
+
+#[test]
+fn fast_rep_paths_match_the_slow_ones() {
+    // REP MOVSB with an overlap propagates; a non-overlapping one copies; REP
+    // STOSW fills; and all of it stops at the video memory boundary correctly.
+    #[rustfmt::skip]
+    let program = [
+        0x1E, 0x07,                   // PUSH DS; POP ES
+        0xC6, 0x06, 0x00, 0x20, 0x41, // MOV BYTE [2000h],'A'
+        0xBE, 0x00, 0x20,             // MOV SI,2000h
+        0xBF, 0x01, 0x20,             // MOV DI,2001h
+        0xB9, 0x00, 0x01,             // MOV CX,100h
+        0xFC, 0xF3, 0xA4,             // CLD; REP MOVSB
+        0xBF, 0x00, 0x30,             // MOV DI,3000h
+        0xB8, 0x34, 0x12,             // MOV AX,1234h
+        0xB9, 0x00, 0x40,             // MOV CX,4000h
+        0xF3, 0xAB,                   // REP STOSW
+        0xBE, 0x00, 0x30,             // MOV SI,3000h
+        0xBF, 0x00, 0xB0,             // MOV DI,B000h
+        0xB9, 0x00, 0x10,             // MOV CX,1000h
+        0xF3, 0xA5,                   // REP MOVSW
+        0xEB, 0xFE,
+    ];
+    let mut dos = boot(&program);
+    let base = (dos.cpu.sregs[cpu::CS] as u32) << 4;
+    frames(&mut dos, 2);
+    assert_eq!(dos.bus.mem.read8(base + 0x2100), b'A', "overlap propagated");
+    assert_eq!(dos.bus.mem.read16(base + 0x3000 + 0x7FFE), 0x1234);
+    assert_eq!(dos.bus.mem.read16(base + 0xB000 + 0x1FFE), 0x1234);
+    assert_eq!(dos.cpu.r[CX] & 0xFFFF, 0);
+}
+
+#[test]
+fn machine_state_is_small_enough_to_move_on_a_kernel_stack() {
+    assert!(
+        core::mem::size_of::<DosBox>() < 16 * 1024,
+        "{}",
+        core::mem::size_of::<DosBox>()
+    );
+}
+
+// ----------------------------------------------------------------------
+// Real programs from the game library
+// ----------------------------------------------------------------------
+
+/// Starts a program from a game ZIP. Returns `None` when the library isn't there.
+fn boot_game(zip: &str, program: &str) -> Option<DosBox> {
+    let path = format!(
+        "{}/../../data/games/dos/{zip}.zip",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let data = std::fs::read(path).ok()?;
+    let mut dos = DosBox::new(None);
+    drain_batch(&mut dos);
+    dos.bus.dos.mount_zip_data(&data, "GAME").expect("extract");
+    let root = dos.bus.dos.disk.root;
+    dos.bus.dos.cwd = dos.bus.dos.disk.lookup(root, "GAME").expect("dir");
+    assert!(dos.run(program), "{program} didn't start");
+    Some(dos)
+}
+
+/// Runs until the program sets a video mode and draws something.
+fn reaches_graphics(
+    zip: &str,
+    program: &str,
+    mode: u8,
+    frames: usize,
+    budget: u32,
+) -> Option<DosBox> {
+    let mut dos = boot_game(zip, program)?;
+    for _ in 0..frames {
+        dos.frame(0, budget);
+        assert!(dos.is_running(), "{program} exited:\n{}", dos.text());
+    }
+    assert_eq!(dos.video_mode(), mode, "{program}:\n{}", dos.text());
+    let mut screen = vec![0u32; SCREEN_WIDTH * SCREEN_HEIGHT];
+    let SystemBus { vga, mem, .. } = &mut dos.bus;
+    vga.render(mem, &mut screen, false);
+    let first = screen[0];
+    assert!(
+        screen.iter().any(|pixel| *pixel != first),
+        "{program}: blank"
+    );
+    Some(dos)
+}
+
+#[test]
+fn wolfenstein_gets_past_its_retrace_loop_to_the_title_screen() {
+    reaches_graphics("wolfenstein-3d", "WOLF3D.EXE", 0x13, 200, 50_000);
+}
+
+#[test]
+fn mario_bros_reaches_its_title_screen() {
+    reaches_graphics("mario-bros-vga", "MARIO.EXE", 0x13, 100, 50_000);
+}
+
+#[test]
+fn digger_reaches_its_title_screen() {
+    reaches_graphics("digger-remastered", "DIGGER.EXE", 0x12, 100, 50_000);
+}
+
+#[test]
+fn tank_wars_reaches_its_title_screen() {
+    reaches_graphics("tank-wars", "BOMB.EXE", 0x13, 100, 50_000);
+}
+
+#[test]
+fn galacta_reaches_its_title_screen() {
+    reaches_graphics(
+        "galacta-the-battle-for-saturn",
+        "galacta.exe",
+        0x13,
+        300,
+        50_000,
+    );
+}
+
+#[test]
+fn doom_runs_under_dos4gw_in_protected_mode() {
+    if let Some(dos) = reaches_graphics("doom", "DOOM.EXE", 0x13, 400, 100_000) {
+        assert!(dos.cpu.protected_mode());
+    }
+}
+
+// ----------------------------------------------------------------------
+// The DPMI host and the memory manager, from a client's side
+// ----------------------------------------------------------------------
+
+/// Runs a program to its end: the exit code and the screen. The sources of the
+/// images are in `testdata`.
+fn run_to_exit(program: &[u8], setup: impl FnOnce(&mut DosBox)) -> (u16, String) {
+    let mut dos = DosBox::new(None);
+    drain_batch(&mut dos);
+    setup(&mut dos);
+    let root = dos.bus.dos.disk.root;
+    dos.bus
+        .dos
+        .disk
+        .create_file(root, "TEST.COM", program.to_vec());
+    assert!(dos.run("TEST.COM"));
+    for _ in 0..200 {
+        if !dos.is_running() {
+            break;
+        }
+        dos.frame(0, 100_000);
+    }
+    assert!(!dos.is_running(), "it should have ended by now: {}", dos.text());
+    (dos.bus.dos.last_return, dos.text())
+}
+
+#[test]
+fn a_16_bit_dpmi_client_uses_the_hosts_services() {
+    let (code, text) = run_to_exit(include_bytes!("testdata/dpmi16.com"), |_| {});
+    assert_eq!(code & 0xFF, 42, "stopped at stage {code}: {text}");
+    assert!(text.contains("OK"), "{text}");
+}
+
+#[test]
+fn a_32_bit_dpmi_client_uses_the_hosts_services() {
+    let (code, text) = run_to_exit(include_bytes!("testdata/dpmi32.com"), |_| {});
+    assert_eq!(code & 0xFF, 42, "stopped at stage {code}: {text}");
+    assert!(text.contains("OK"), "{text}");
+}
+
+#[test]
+fn the_host_is_not_offered_when_it_is_off() {
+    let (code, _) = run_to_exit(include_bytes!("testdata/dpmi16.com"), |dos| {
+        dos.bus.dpmi.mode = crate::dpmi::Mode::Off;
+    });
+    assert_eq!(code & 0xFF, 0xFE, "the client finds no host");
+}
+
+#[test]
+fn a_client_ending_gives_its_memory_back() {
+    let mut dos = DosBox::new(None);
+    drain_batch(&mut dos);
+    let before = dos.bus.xms.free_kb();
+    let root = dos.bus.dos.disk.root;
+    dos.bus.dos.disk.create_file(
+        root,
+        "TEST.COM",
+        include_bytes!("testdata/dpmi16.com").to_vec(),
+    );
+    assert!(dos.run("TEST.COM"));
+    for _ in 0..200 {
+        if !dos.is_running() {
+            break;
+        }
+        dos.frame(0, 100_000);
+    }
+    assert!(!dos.bus.dpmi.active());
+    assert_eq!(dos.bus.xms.free_kb(), before);
+}
+
+#[test]
+fn programs_that_bring_an_extender_are_passed_over_on_auto() {
+    assert!(crate::dpmi::brings_its_own_extender(b"MZ..DOS/4GW Professional"));
+    assert!(crate::dpmi::brings_its_own_extender(b"..32rtm error: no.."));
+    assert!(!crate::dpmi::brings_its_own_extender(b"MZ..go32 stub CWSDPMI.EXE"));
+}
+
+#[test]
+fn a_vcpi_client_crosses_to_protected_mode_and_back() {
+    let (code, text) = run_to_exit(include_bytes!("testdata/vcpi.com"), |dos| {
+        dos.bus.emm.enabled = true;
+    });
+    assert_eq!(code & 0xFF, 42, "stopped at stage {code}: {text}");
+}
+
+#[test]
+fn the_dpmi_host_works_under_the_memory_manager() {
+    let (code, text) = run_to_exit(include_bytes!("testdata/dpmi32.com"), |dos| {
+        dos.bus.emm.enabled = true;
+    });
+    assert_eq!(code & 0xFF, 42, "stopped at stage {code}: {text}");
+}
+
+#[test]
+fn the_monitor_stops_a_program_taking_the_cpu() {
+    let (code, text) = run_to_exit(include_bytes!("testdata/privileged.com"), |dos| {
+        dos.bus.emm.enabled = true;
+    });
+    assert_ne!(code & 0xFF, 42);
+    assert!(text.contains("EMM386: privileged"), "{text}");
+}
+
+#[test]
+fn vcpi_is_not_there_without_the_memory_manager() {
+    let program = [
+        0xB8, 0x00, 0xDE, // MOV AX,DE00h
+        0xCD, 0x67, // INT 67h
+        0x88, 0xE0, // MOV AL,AH
+        0xB4, 0x4C, // MOV AH,4Ch
+        0xCD, 0x21, // INT 21h
+    ];
+    let (code, _) = run_to_exit(&program, |_| {});
+    assert_ne!(code & 0xFF, 0, "AH says it isn't supported");
+    let (code, _) = run_to_exit(&program, |dos| dos.bus.emm.enabled = true);
+    assert_eq!(code & 0xFF, 0);
+}
+
+#[test]
+fn a_real_mode_program_runs_in_v86_under_the_monitor() {
+    let (code, text) = run_to_exit(&print_and_exit("Hi", 7), |dos| dos.bus.emm.enabled = true);
+    assert_eq!(code & 0xFF, 7);
+    assert!(text.contains("Hi"));
+}
+
+#[test]
+fn stray_jumps_into_the_hosts_rom_are_harmless() {
+    for offset in (0..0x40u16)
+        .step_by(4)
+        .chain([0x0400, 0x0420, 0x0800, 0x1000, 0x1084, 0x10C4, 0x1400, 0x14C4, 0x1800, 0x1834])
+    {
+        // JMP FAR F600:offset, then whatever follows.
+        let program = [0xEA, offset as u8, (offset >> 8) as u8, 0x00, 0xF6];
+        let mut dos = boot(&program);
+        for _ in 0..8 {
+            dos.frame(0, 10_000);
+        }
+        assert!(!dos.bus.dpmi.active());
+    }
+}
+
+/// Enters protected mode, then calls `INT 31h` with made-up registers for ever.
+const DPMI_FUZZER: &[u8] = include_bytes!("testdata/dpmifuzz.com");
+
+#[test]
+fn a_client_calling_int_31h_with_garbage_cannot_panic() {
+    for seed in [0x1234u16, 0xBEEF, 0x8001] {
+        let mut program = DPMI_FUZZER.to_vec();
+        program[3..5].copy_from_slice(&seed.to_le_bytes());
+        let mut dos = boot(&program);
+        for _ in 0..60 {
+            dos.frame(0, 20_000);
+            if !dos.is_running() {
+                break;
+            }
+        }
+    }
+}
+
+#[test]
+fn a_file_read_into_the_ems_frame_reaches_the_mapped_page() {
+    let mut dos = DosBox::new(None);
+    drain_batch(&mut dos);
+    let root = dos.bus.dos.disk.root;
+    dos.bus.dos.disk.create_file(root, "DATA.BIN", vec![0x5A; 16]);
+    let program: &[u8] = &[
+        // AH=43h: 1 page; AX=4400h: map it at physical page 3.
+        0xB4, 0x43, 0xBB, 0x01, 0x00, 0xCD, 0x67, // MOV AH,43h; MOV BX,1; INT 67h
+        0xB8, 0x03, 0x44, 0x31, 0xDB, 0xCD, 0x67, // MOV AX,4403h; XOR BX,BX; INT 67h
+        // Open and read into D000:C000.
+        0xB8, 0x00, 0x3D, 0xBA, 0x40, 0x01, 0xCD, 0x21, // MOV AX,3D00h; MOV DX,name; INT 21h
+        0x89, 0xC3, // MOV BX,AX
+        0xB8, 0x00, 0xD0, 0x1E, 0x8E, 0xD8, // MOV AX,D000h; PUSH DS; MOV DS,AX
+        0xB4, 0x3F, 0xB9, 0x10, 0x00, 0xBA, 0x00, 0xC0, 0xCD, 0x21, // read 16 bytes to DS:C000
+        // Read it back through the frame as the exit code.
+        0xA0, 0x00, 0xC0, // MOV AL,[C000h]
+        0x1F, // POP DS
+        0xB4, 0x4C, 0xCD, 0x21, // exit
+    ];
+    let mut image = program.to_vec();
+    image.resize(0x40, 0x90);
+    image.extend_from_slice(b"DATA.BIN\0");
+    dos.bus.dos.disk.create_file(root, "TEST.COM", image);
+    assert!(dos.run("TEST.COM"));
+    for _ in 0..16 {
+        if !dos.is_running() {
+            break;
+        }
+        dos.frame(0, 100_000);
+    }
+    assert_eq!(dos.bus.dos.last_return & 0xFF, 0x5A);
 }

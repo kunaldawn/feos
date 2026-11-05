@@ -1,5 +1,7 @@
 //! YAML configuration for the desktop.
 
+use core::fmt::Write as _;
+
 use feos_gfx::Color;
 use feos_init::Config as InitConfig;
 use feos_text::Text;
@@ -270,6 +272,43 @@ pub struct DesktopConfig {
 }
 
 impl DesktopConfig {
+    /// Applies what the user chose in Display Properties, saved by
+    /// [`settings_text`](Self::settings_text). It's untrusted: a file from
+    /// someone else's disk, or a damaged one, just leaves the defaults.
+    pub fn apply_settings(&mut self, text: &str) {
+        for line in text.lines() {
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            match key.trim() {
+                "theme" => {
+                    if let Some(theme) = ThemeName::parse(value.trim()) {
+                        self.theme = theme;
+                    }
+                }
+                "keyboard" => {
+                    if let Some(layout) = KeyboardLayout::parse(value.trim()) {
+                        self.keyboard_layout = layout;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The settings that survive a reboot, in the form
+    /// [`apply_settings`](Self::apply_settings) reads.
+    pub fn settings_text(&self) -> Text<96> {
+        let mut text = Text::new();
+        let _ = write!(
+            text,
+            "theme: {}\nkeyboard: {}\n",
+            self.theme.name(),
+            self.keyboard_layout.name()
+        );
+        text
+    }
+
     /// Default configuration for the bundled desktop session.
     pub const fn new() -> Self {
         Self {
@@ -458,7 +497,7 @@ impl DesktopConfig {
             config.extension_count = 2;
         }
 
-        config.init = InitConfig::parse(yaml).unwrap_or_default();
+        config.init = InitConfig::from_document(&document).map_err(ConfigError::Init)?;
         Ok(config)
     }
 
@@ -486,6 +525,8 @@ pub enum ConfigError {
     Yaml(feos_yaml::YamlError),
     /// The document root is not a mapping.
     NotMapping,
+    /// The `init:` section has too many services or an invalid id.
+    Init(feos_init::ConfigError),
 }
 
 impl From<feos_yaml::YamlError> for ConfigError {
@@ -673,5 +714,20 @@ mod tests {
             DesktopConfig::parse("- one\n- two\n"),
             Err(ConfigError::NotMapping)
         );
+    }
+
+    #[test]
+    fn settings_round_trip_and_junk_changes_nothing() {
+        let mut config = DesktopConfig::new();
+        config.apply_settings("theme: nonsense\nkeyboard: klingon\n\n:::\nother: 1\n");
+        assert_eq!(config, DesktopConfig::new());
+
+        config.keyboard_layout = KeyboardLayout::parse("de").unwrap();
+        config.theme = ThemeName::parse("xp-silver").unwrap_or(config.theme);
+        let saved = config.settings_text();
+        let mut restored = DesktopConfig::new();
+        restored.apply_settings(saved.as_str());
+        assert_eq!(restored.keyboard_layout, config.keyboard_layout);
+        assert_eq!(restored.theme, config.theme);
     }
 }

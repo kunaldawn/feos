@@ -1,7 +1,7 @@
 //! `spawn`: run a registered app as a background process.
 
-use feos_app::{App, Context};
-use feos_console::println;
+use feos_app::{App, Context, SpawnError, SpawnIo};
+use feos_console::{eprintln, println};
 
 /// Starts another app in its own process and returns to the prompt.
 pub struct Spawn;
@@ -19,37 +19,39 @@ impl App for Spawn {
         "run a command in the background"
     }
 
-    fn run(&self, context: &mut Context<'_>) {
-        let text = context.args.trim();
-        if text.is_empty() {
-            println!("usage: {}", self.usage());
-            println!("type 'help' to list commands");
-            return;
-        }
-
-        let (command, args) = match text.split_once(' ') {
-            Some((command, args)) => (command, args.trim()),
-            None => (text, ""),
+    fn run(&self, context: &mut Context<'_>) -> i32 {
+        let Some((command, args)) = context.argv.split_first() else {
+            eprintln!("usage: {}", self.usage());
+            eprintln!("type 'help' to list commands");
+            return 2;
         };
 
-        let Some(app) = crate::find(command) else {
-            println!("unknown command: {command} (type 'help')");
-            return;
+        let Some(app) = context.platform.apps.find(command) else {
+            eprintln!("unknown command: {command} (type 'help')");
+            return 127;
         };
 
-        match context.platform.processes.spawn(app, args) {
-            Ok(pid) => println!("started pid {pid}: {command}"),
-            Err(feos_app::SpawnError::NoFreeSlot) => {
-                println!(
-                    "no free process slot (at most {} background processes)",
-                    feos_app::MAX_PROCESSES - 1
-                );
+        let io = SpawnIo {
+            background: true,
+            ..SpawnIo::default()
+        };
+        match context.platform.processes.spawn_argv(app, args, io) {
+            Ok(pid) => {
+                println!("started pid {pid}: {command}");
+                0
             }
-            Err(feos_app::SpawnError::ArgsTooLong) => {
-                println!(
-                    "arguments too long (max {} bytes)",
-                    feos_app::PROCESS_ARGS_MAX
-                );
+            Err(error) => {
+                match error {
+                    SpawnError::NoFreeSlot => eprintln!(
+                        "no free process slot (at most {} background processes)",
+                        feos_app::MAX_PROCESSES - 1
+                    ),
+                    SpawnError::ArgsTooLong => {
+                        eprintln!("arguments too long (max {} bytes)", feos_app::PROCESS_ARGS_MAX)
+                    }
+                    SpawnError::Unsupported => eprintln!("spawn: not supported here"),
+                }
+                1
             }
         }
     }

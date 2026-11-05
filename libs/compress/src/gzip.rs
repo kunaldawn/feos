@@ -108,6 +108,81 @@ pub fn decompress(input: &[u8], out: &mut [u8]) -> Result<usize> {
     Ok(written)
 }
 
+/// Decompresses gzip from `input` to `output`, one or more members, verifying
+/// each one's CRC and size. See [`inflate::inflate_stream`] for the arguments.
+pub fn decompress_stream(
+    input: inflate::StreamInput<'_>,
+    window: &mut [u8],
+    output: inflate::StreamOutput<'_>,
+) -> Result<u64> {
+    let mut bits = inflate::StreamBits::new(input);
+    let mut total = 0u64;
+    let mut members = 0u32;
+    loop {
+        let Some(first) = bits.byte() else {
+            if members == 0 {
+                return Err(CompressError::UnexpectedEnd);
+            }
+            return Ok(total);
+        };
+        stream_header(&mut bits, first)?;
+        let mut crc = crate::Crc32::new();
+        let mut produced = 0u64;
+        let mut tracked = |chunk: &[u8]| -> Result<()> {
+            crc.update(chunk);
+            produced += chunk.len() as u64;
+            output(chunk)
+        };
+        inflate::inflate_bits(&mut bits, window, &mut tracked)?;
+        bits.align();
+        let mut trailer = [0u8; 8];
+        for byte in &mut trailer {
+            *byte = bits.byte().ok_or(CompressError::UnexpectedEnd)?;
+        }
+        let expected_crc = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+        let expected_size = u32::from_le_bytes([trailer[4], trailer[5], trailer[6], trailer[7]]);
+        if crc.finish() != expected_crc || produced as u32 != expected_size {
+            return Err(CompressError::Checksum);
+        }
+        total += produced;
+        members += 1;
+    }
+}
+
+/// Skips a member's header, whose first byte has been read.
+fn stream_header(bits: &mut inflate::StreamBits<'_>, first: u8) -> Result<()> {
+    let mut next = || bits.byte().ok_or(CompressError::UnexpectedEnd);
+    let mut fixed = [0u8; 10];
+    fixed[0] = first;
+    for byte in &mut fixed[1..] {
+        *byte = next()?;
+    }
+    if fixed[0] != 0x1f || fixed[1] != 0x8b {
+        return Err(CompressError::InvalidData("not a gzip stream"));
+    }
+    if fixed[2] != 8 {
+        return Err(CompressError::UnsupportedFeature("gzip compression method"));
+    }
+    let flags = fixed[3];
+    if flags & FEXTRA != 0 {
+        let extra = next()? as usize | (next()? as usize) << 8;
+        for _ in 0..extra {
+            next()?;
+        }
+    }
+    for flag in [FNAME, FCOMMENT] {
+        if flags & flag != 0 {
+            while next()? != 0 {}
+        }
+    }
+    // Its CRC covers a header this doesn't keep. The trailer's covers the data.
+    if flags & FHCRC != 0 {
+        next()?;
+        next()?;
+    }
+    Ok(())
+}
+
 /// Compresses `input` into a single gzip member, returning the number of bytes
 /// written.
 pub fn compress(input: &[u8], out: &mut [u8]) -> Result<usize> {

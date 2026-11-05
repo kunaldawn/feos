@@ -3,6 +3,7 @@ name = "feos-compress"
 description = "Dependency-free DEFLATE, zlib and gzip compression for the feos kernel"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

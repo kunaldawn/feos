@@ -111,6 +111,10 @@ fn stomp_length_or_dimension(rng: &mut Rng, data: &mut [u8]) {
         }
     };
     match detect(data) {
+        Some(ImageFormat::Ico) => {
+            // The directory and the DIB header are what can lie.
+            put_be16(rng.below(62.min(len)), data);
+        }
         Some(ImageFormat::Jpeg) => {
             // Walk segments, then stomp a random one's length or its contents.
             let mut segments = [0usize; 32];

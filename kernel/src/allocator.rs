@@ -1,9 +1,10 @@
-//! The kernel heap: one static arena behind [`feos_heap`].
+//! The kernel heap: one arena of physical frames behind [`feos_heap`].
 //!
 //! The `StaticFs` image and the GUI are allocation-free, but the H.264 decoder
 //! used by the video player and the writable FAT32/exFAT mounts use `alloc`
 //! collections. The algorithm lives in `feos-heap` so its tests run on the host;
-//! this file adds the arena, the lock and per-process accounting.
+//! this file adds the lock and per-process accounting. [`crate::memory`] decides
+//! how big the arena is, from the machine's RAM.
 //!
 //! The lock masks interrupts: a holder can't be preempted, so other tasks never
 //! burn their time slice waiting for a descheduled one, and a task can't be
@@ -17,30 +18,19 @@ use feos_sync::{IrqSpinLock, IrqSpinLockGuard};
 
 use crate::sched;
 
-/// Size of the static heap in bytes.
-///
-/// The default QEMU configuration boots with 512 MiB of RAM; the arena sits in
-/// `.bss`, so the boot CPU's BSS clear and the linker script bound its size.
-/// 64 MiB leaves room for several H.264 reference-picture sets while keeping
-/// boot fast and leaving the rest of guest RAM unused for now.
-const HEAP_SIZE: usize = 64 * 1024 * 1024;
-
-#[repr(align(16))]
-struct HeapStorage([u8; HEAP_SIZE]);
-
-static mut STORAGE: HeapStorage = HeapStorage([0; HEAP_SIZE]);
-
 static HEAP: IrqSpinLock<Heap> = IrqSpinLock::new(Heap::empty());
 
-/// Locks the heap, creating the free list on first use.
+/// Gives the heap its arena. Every allocation fails until this has run.
+///
+/// # Safety
+/// The range must be RAM that nothing else uses, for good.
+pub unsafe fn init(base: usize, size: usize) {
+    // SAFETY: as promised by the caller.
+    unsafe { HEAP.lock().init(base as *mut u8, size) };
+}
+
 fn locked() -> IrqSpinLockGuard<'static, Heap> {
-    let mut heap = HEAP.lock();
-    if !heap.is_initialized() {
-        // SAFETY: the arena is only reached through this heap, and taking the
-        // address of the static does not create a reference.
-        unsafe { heap.init(ptr::addr_of_mut!(STORAGE.0).cast::<u8>(), HEAP_SIZE) };
-    }
-    heap
+    HEAP.lock()
 }
 
 /// Returns the current heap usage.

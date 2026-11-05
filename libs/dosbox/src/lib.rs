@@ -2,8 +2,8 @@
 //!
 //! The crate implements the parts of a PC that DOS programs expect:
 //!
-//! * an 80386 interpreter ([`cpu`]) with real and protected mode, paging, task
-//!   switches and an x87 ([`fpu`]);
+//! * an 80386 interpreter ([`cpu`]) with real, protected and virtual-8086 mode,
+//!   paging, task switches and an x87 ([`fpu`]);
 //! * RAM with a real A20 gate ([`memory`]), 8259 PICs, an 8254 PIT, the keyboard
 //!   controller and 8237 DMA ([`hw`], [`keyboard`]);
 //! * a VGA adapter with its register core, and text, CGA, EGA and VGA modes
@@ -11,9 +11,10 @@
 //! * a ROM whose interrupt vectors enter the Rust BIOS through callbacks, so
 //!   programs can hook and chain them ([`bios`]);
 //! * a DOS kernel with an MCB arena, PSPs, handles, FCBs, `EXEC` and a writable
-//!   RAM drive ([`dos`], [`ramdisk`]), plus XMS and EMS ([`xms`]);
+//!   RAM drive ([`dos`], [`ramdisk`]), plus XMS and EMS ([`xms`]), a DPMI host
+//!   ([`dpmi`]) and a memory manager with VCPI ([`emm386`]);
 //! * a `COMMAND.COM`-style prompt with batch files ([`shell`]);
-//! * OPL3 FM, a PC speaker and a Sound Blaster 2.0 DSP ([`opl`], [`sb`]), and a
+//! * OPL3 FM, a PC speaker and a Sound Blaster 2.0, Pro or 16 ([`opl`], [`sb`]), and a
 //!   mouse driver ([`mouse`]).
 //!
 //! The machine is driven by [`DosBox::frame_paced`] or [`DosBox::frame`], which
@@ -41,6 +42,8 @@ pub mod bios;
 pub mod cpu;
 pub mod demo;
 pub mod dos;
+pub mod dpmi;
+pub mod emm386;
 pub mod f80;
 pub mod font;
 pub mod fpu;

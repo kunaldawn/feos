@@ -490,8 +490,13 @@ fn run_head_tail(args: &[String], ctx: &mut Ctx<'_>, head: bool) -> i32 {
     // The historic `head -5` spelling.
     let converted: Vec<String> = args
         .iter()
-        .map(|arg| match arg.strip_prefix('-') {
-            Some(rest) if !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit()) => {
+        .enumerate()
+        .map(|(index, arg)| match arg.strip_prefix('-') {
+            Some(rest)
+                if index == 0
+                    && !rest.is_empty()
+                    && rest.bytes().all(|byte| byte.is_ascii_digit()) =>
+            {
                 format!("-n{rest}")
             }
             _ => arg.clone(),

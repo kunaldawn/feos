@@ -1,11 +1,18 @@
 [package]
 name = "feos-keys"
-description = "Serial-console keyboard decoding for feos GUI apps"
+description = "Keyboard decoding for feos: terminal byte sequences and GUI input events"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = ["gui"]
+# The GUI event sources. The byte decoder needs none of this, so the shell
+# engine can use it without pulling in the GUI crates.
+gui = ["dep:feos-console", "dep:feos-gui", "dep:feos-hal"]
+
 [dependencies]
-feos-console = { workspace = true }
-feos-gui = { workspace = true }
-feos-hal = { workspace = true }
+feos-console = { workspace = true, optional = true }
+feos-gui = { workspace = true, optional = true }
+feos-hal = { workspace = true, optional = true }

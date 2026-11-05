@@ -3,6 +3,7 @@ name = "feos-driver-apic"
 description = "Local APIC and IOAPIC interrupt controller"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

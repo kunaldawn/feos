@@ -91,6 +91,11 @@ pub struct Heap {
     base: usize,
     size: usize,
     head: usize,
+    /// Bytes in live blocks, headers included, so [`stats`](Self::stats) needn't
+    /// walk anything with the lock held.
+    used: usize,
+    /// Entries on the free list.
+    free_blocks: usize,
 }
 
 impl Heap {
@@ -100,6 +105,8 @@ impl Heap {
             base: 0,
             size: 0,
             head: NONE,
+            used: 0,
+            free_blocks: 0,
         }
     }
 
@@ -121,8 +128,11 @@ impl Heap {
         self.base = aligned;
         self.size = size;
         self.head = NONE;
+        self.used = 0;
+        self.free_blocks = 0;
         if size >= HEADER * 2 {
             self.head = 0;
+            self.free_blocks = 1;
             // SAFETY: offset 0 is inside the arena and the list is empty.
             unsafe {
                 self.write(
@@ -235,6 +245,7 @@ impl Heap {
                 // A tail too small to ever satisfy a request stays in this
                 // block, so it isn't lost as an unusable free-list entry.
                 let (end, link) = if tail >= HEADER * 2 {
+                    self.free_blocks += 1;
                     // SAFETY: the tail lies inside the free block.
                     unsafe {
                         self.write(
@@ -263,10 +274,12 @@ impl Heap {
                         );
                     }
                 } else {
+                    self.free_blocks -= 1;
                     self.set_next(previous, link);
                 }
 
                 let block = end - header_offset;
+                self.used += block;
                 // SAFETY: the header lies inside the free block just split.
                 unsafe {
                     self.write(
@@ -300,6 +313,8 @@ impl Heap {
             current = header.word;
         }
 
+        self.used -= size;
+        self.free_blocks += 1;
         let mut merged = Header {
             size,
             word: current,
@@ -308,6 +323,7 @@ impl Heap {
             if let Some(next) = self.free_entry(current) {
                 merged.size += next.size;
                 merged.word = next.word;
+                self.free_blocks -= 1;
             }
         }
 
@@ -319,6 +335,7 @@ impl Heap {
                 before.word = merged.word;
                 // SAFETY: as above.
                 unsafe { self.write(previous, before) };
+                self.free_blocks -= 1;
                 return;
             }
         }
@@ -408,6 +425,7 @@ impl Heap {
 
         let tail = total - needed;
         let (size, link) = if tail >= HEADER * 2 {
+            self.free_blocks += 1;
             let tail_offset = offset + needed;
             // SAFETY: the tail lies inside the free neighbour being absorbed.
             unsafe {
@@ -423,6 +441,8 @@ impl Heap {
         } else {
             (total, next.word)
         };
+        self.free_blocks -= 1;
+        self.used += size - old_size;
         self.set_next(previous, link);
         // SAFETY: the block is live and owned by the caller.
         unsafe {
@@ -437,24 +457,13 @@ impl Heap {
         done(size)
     }
 
-    /// Walks the free list and returns the current usage.
+    /// The current usage, from counters kept as blocks change hands.
     pub fn stats(&self) -> Stats {
-        let mut free_bytes = 0usize;
-        let mut free_blocks = 0usize;
-        let mut current = self.head;
-        while current != NONE {
-            let Some(header) = self.free_entry(current) else {
-                break;
-            };
-            free_bytes += header.size;
-            free_blocks += 1;
-            current = header.word;
-        }
         Stats {
             total_bytes: self.size,
-            used_bytes: self.size.saturating_sub(free_bytes),
-            free_bytes,
-            free_blocks,
+            used_bytes: self.used,
+            free_bytes: self.size.saturating_sub(self.used),
+            free_blocks: self.free_blocks,
         }
     }
 
@@ -713,5 +722,63 @@ mod tests {
         let stats = heap.stats();
         assert_eq!(stats.free_bytes, total);
         assert_eq!(stats.free_blocks, 1);
+    }
+
+    /// The counters against the free list itself, through every kind of change.
+    #[test]
+    fn counters_agree_with_the_free_list() {
+        fn walked(heap: &Heap) -> (usize, usize) {
+            let (mut bytes, mut blocks) = (0, 0);
+            let mut current = heap.head;
+            while current != NONE {
+                let header = heap.free_entry(current).unwrap();
+                bytes += header.size;
+                blocks += 1;
+                current = header.word;
+            }
+            (bytes, blocks)
+        }
+
+        let mut arena = vec![0u128; 16 * 1024];
+        let mut heap = Heap::empty();
+        // SAFETY: the arena outlives the heap and nothing else uses it.
+        unsafe { heap.init(arena.as_mut_ptr().cast(), 16 * 1024 * 16) };
+
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as usize
+        };
+        let mut live: Vec<(*mut u8, usize)> = Vec::new();
+        for _ in 0..5_000 {
+            match next() % 4 {
+                0 | 1 => {
+                    let align = 1 << (next() % 8);
+                    let size = next() % 3000 + 1;
+                    let layout = Layout::from_size_align(size, align).unwrap();
+                    let block = heap.alloc(layout, 1);
+                    if !block.is_null() {
+                        live.push((block, size));
+                    }
+                }
+                2 if !live.is_empty() => {
+                    let (block, _) = live.swap_remove(next() % live.len());
+                    heap.free(block).unwrap();
+                }
+                3 if !live.is_empty() => {
+                    let index = next() % live.len();
+                    let size = next() % 4000 + 1;
+                    if heap.resize(live[index].0, size).unwrap().is_some() {
+                        live[index].1 = size;
+                    }
+                }
+                _ => {}
+            }
+            let stats = heap.stats();
+            assert_eq!((stats.free_bytes, stats.free_blocks), walked(&heap));
+            assert_eq!(stats.free_bytes + stats.used_bytes, stats.total_bytes);
+        }
     }
 }

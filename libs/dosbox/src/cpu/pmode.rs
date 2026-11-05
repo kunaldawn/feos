@@ -5,8 +5,8 @@ use super::*;
 /// A raw descriptor, as the two dwords stored in a table.
 #[derive(Clone, Copy)]
 pub(crate) struct Desc {
-    lo: u32,
-    hi: u32,
+    pub(crate) lo: u32,
+    pub(crate) hi: u32,
 }
 
 impl Desc {
@@ -174,6 +174,8 @@ impl Cpu {
         self.sregs[CS] = (selector & !3) | cpl as u16;
         self.seg[CS] = desc.to_seg();
         self.cpl = cpl;
+        // A change of level changes what a user page lets through.
+        self.fetch_page = u32::MAX;
     }
 
     /// The code-segment checks shared by far `JMP` and `CALL`.
@@ -327,7 +329,11 @@ impl Cpu {
         let w = if gate32 { 32 } else { 16 };
         let return_cs = self.sregs[CS] as u32;
         let return_ip = self.ip;
-        let new_cpl = if code.conforming() { self.cpl } else { code.dpl() };
+        let new_cpl = if code.conforming() {
+            self.cpl
+        } else {
+            code.dpl()
+        };
         if new_cpl < self.cpl {
             let old_ss = self.sregs[SS] as u32;
             let old_sp = self.r[SP];
@@ -505,19 +511,37 @@ impl Cpu {
         }
         let (target, offset, desc) = self.gate_target(bus, gate)?;
         let w = if kind & 8 != 0 { 32 } else { 16 };
-        let new_cpl = if desc.conforming() { self.cpl } else { desc.dpl() };
+        let new_cpl = if desc.conforming() {
+            self.cpl
+        } else {
+            desc.dpl()
+        };
         if offset > desc.limit() {
             return Err(Trap::FaultCode(13, 0));
+        }
+        let from_v86 = self.vm86;
+        if from_v86 && (new_cpl != 0 || w != 32) {
+            return Err(gp(target));
         }
         let flags = self.flags();
         let (old_ss, old_sp, old_stack, old_cpl) =
             (self.sregs[SS], self.r[SP], self.seg[SS], self.cpl);
+        let old_sregs = self.sregs;
         let pushes = |cpu: &mut Self, bus: &mut B| -> Exec {
+            if from_v86 {
+                cpu.vm86 = false;
+                cpu.pmode = true;
+            }
             if new_cpl < old_cpl {
                 let (new_ss, new_sp) = cpu.tss_stack(bus, new_cpl)?;
                 cpu.cpl = new_cpl;
                 if cpu.load_stack_for(bus, new_ss, new_sp).is_err() {
                     return Err(Trap::FaultCode(10, (new_ss & !3) as u32));
+                }
+                if from_v86 {
+                    for index in [GS, FS, DS, ES] {
+                        cpu.pushv(bus, old_sregs[index] as u32, 32)?;
+                    }
                 }
                 cpu.pushv(bus, old_ss as u32, w)?;
                 cpu.pushv(bus, old_sp, w)?;
@@ -537,12 +561,22 @@ impl Cpu {
             self.r[SP] = old_sp;
             self.seg[SS] = old_stack;
             self.cpl = old_cpl;
+            if from_v86 {
+                self.vm86 = true;
+                self.pmode = false;
+            }
             return Err(trap);
         }
         self.set_cs(target, desc, new_cpl);
         self.ip = offset;
         self.materialize();
-        self.eflags &= !(FLAG_TF | FLAG_NT | FLAG_RF);
+        self.eflags &= !(FLAG_TF | FLAG_NT | FLAG_RF | FLAG_VM);
+        if from_v86 {
+            for index in [ES, DS, FS, GS] {
+                self.sregs[index] = 0;
+                self.seg[index] = NULL_SEG;
+            }
+        }
         if kind & 1 == 0 {
             self.eflags &= !FLAG_IF;
         }
@@ -558,6 +592,9 @@ impl Cpu {
         let ip = self.rdv(bus, SS, base, w)?;
         let selector = self.rdv(bus, SS, base.wrapping_add(size), w)? as u16;
         let flags = self.rdv(bus, SS, base.wrapping_add(2 * size), w)?;
+        if w == 32 && flags & FLAG_VM != 0 && self.cpl == 0 {
+            return self.iret_to_v86(bus, base, ip, selector, flags);
+        }
         if selector & !3 == 0 {
             return Err(Trap::FaultCode(13, 0));
         }
@@ -598,6 +635,45 @@ impl Cpu {
         }
         self.ip = ip;
         Ok(())
+    }
+
+    /// `IRET` from level 0 with VM set in the image: the frame carries the stack
+    /// and all the data segments too.
+    fn iret_to_v86<B: Bus>(
+        &mut self,
+        bus: &mut B,
+        base: u32,
+        ip: u32,
+        cs: u16,
+        flags: u32,
+    ) -> Exec {
+        let word = |index: u32| base.wrapping_add(index * 4);
+        let sp = self.rdv(bus, SS, word(3), 32)?;
+        let ss = self.rdv(bus, SS, word(4), 32)? as u16;
+        let es = self.rdv(bus, SS, word(5), 32)? as u16;
+        let ds = self.rdv(bus, SS, word(6), 32)? as u16;
+        let fs = self.rdv(bus, SS, word(7), 32)? as u16;
+        let gs = self.rdv(bus, SS, word(8), 32)? as u16;
+        self.lazy = 0;
+        self.eflags = (flags & 0x0002_7FD7 | 2) & !FLAG_RF;
+        self.enter_v86_segments([es, cs, ss, ds, fs, gs]);
+        self.r[SP] = sp & 0xFFFF;
+        self.ip = ip & 0xFFFF;
+        Ok(())
+    }
+
+    /// Puts the CPU in virtual-8086 mode with these segments.
+    pub(crate) fn enter_v86_segments(&mut self, sregs: [u16; 6]) {
+        self.fetch_page = u32::MAX;
+        self.pmode = false;
+        self.vm86 = true;
+        self.cpl = 3;
+        self.eflags |= FLAG_VM;
+        for (index, selector) in sregs.into_iter().enumerate() {
+            self.sregs[index] = selector;
+            self.seg[index] = Seg::real(selector);
+        }
+        self.seg[CS].code = true;
     }
 
     fn task_gate<B: Bus>(&mut self, bus: &mut B, gate: Desc, kind: Switch) -> Exec {
@@ -653,7 +729,11 @@ impl Cpu {
             self.sys_wr32(bus, old_base.wrapping_add(0x20), self.ip)?;
             self.sys_wr32(bus, old_base.wrapping_add(0x24), flags)?;
             for index in 0..8 {
-                self.sys_wr32(bus, old_base.wrapping_add(0x28 + index * 4), self.r[index as usize])?;
+                self.sys_wr32(
+                    bus,
+                    old_base.wrapping_add(0x28 + index * 4),
+                    self.r[index as usize],
+                )?;
             }
             for index in 0..6 {
                 self.sys_wr16(
@@ -739,9 +819,15 @@ impl Cpu {
         self.cr0 |= 8;
         self.lazy = 0;
         self.eflags = (new_flags | 2) & !FLAG_VM;
+        self.pmode = true;
+        self.vm86 = false;
         // Selectors are loaded now that the new context is in place.
         self.cpl = (new_sregs[CS] & 3) as u8;
         self.load_ldt_raw(bus, new_ldt)?;
+        if new32 && new_flags & FLAG_VM != 0 {
+            self.enter_v86_segments(new_sregs);
+            return Ok(());
+        }
         let code = self.read_desc(bus, new_sregs[CS])?;
         if !code.is_code() {
             return Err(Trap::FaultCode(10, (new_sregs[CS] & !3) as u32));
@@ -780,6 +866,34 @@ impl Cpu {
 
     pub(crate) fn load_ldt<B: Bus>(&mut self, bus: &mut B, selector: u16) -> Exec {
         self.load_ldt_raw(bus, selector)
+    }
+
+    pub(crate) fn null_seg() -> Seg {
+        NULL_SEG
+    }
+
+    pub(crate) fn read_desc_for_host<B: Bus>(&mut self, bus: &mut B, selector: u16) -> Exec<Desc> {
+        if selector & !3 == 0 {
+            return Err(Trap::FaultCode(13, 0));
+        }
+        let desc = self.read_desc(bus, selector)?;
+        if !desc.is_code() {
+            return Err(gp(selector));
+        }
+        Ok(desc)
+    }
+
+    pub(crate) fn set_cs_for_host(&mut self, selector: u16, desc: Desc) {
+        let cpl = self.cpl;
+        self.set_cs(selector, desc, cpl);
+    }
+
+    /// Loads TR the way a task's owner re-entering it does: a busy TSS is fine.
+    pub(crate) fn load_tr_clearing_busy<B: Bus>(&mut self, bus: &mut B, selector: u16) -> Exec {
+        let at = self.desc_addr(selector)?.wrapping_add(4);
+        let hi = self.sys_rd32(bus, at)?;
+        self.sys_wr32(bus, at, hi & !0x200)?;
+        self.load_tr(bus, selector)
     }
 
     pub(crate) fn load_tr<B: Bus>(&mut self, bus: &mut B, selector: u16) -> Exec {

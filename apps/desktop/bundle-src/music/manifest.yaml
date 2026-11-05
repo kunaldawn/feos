@@ -1,0 +1,12 @@
+id: music
+name: Music
+version: 1.0.0
+entry: music
+category: Multimedia
+description: Play sound files from the filesystem
+icon: icon.ico
+icon_medium: icon-32.ico
+icon_small: icon-16.ico
+window:
+  width: 520
+  height: 420

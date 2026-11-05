@@ -15,6 +15,11 @@
 # FEOS_AUDIODEV selects the QEMU audio backend. The default writes a WAV file
 # under target/audio, which works on headless machines. Use `pa,id=snd0` for
 # PulseAudio/PipeWire or `alsa,id=snd0` for ALSA (and a sink, see `aplay -l`).
+#
+# FEOS_DISK names the disk image, target/feos-disk-arm.img by default. It's
+# created sparse at FEOS_DISK_SIZE (default 512M) if missing, and the kernel
+# formats a blank disk on first boot, so files survive reboots. Delete it to start
+# over, or set FEOS_DISK=none to boot with no disk and a root in RAM.
 set -eu
 
 KERNEL="${1:-target/aarch64-unknown-none/release/feos}"
@@ -32,10 +37,19 @@ fi
 
 mkdir -p target/audio
 
+DISK="${FEOS_DISK:-target/feos-disk-arm.img}"
+DISK_ARGS=""
+if [ "$DISK" != "none" ]; then
+    if [ ! -e "$DISK" ]; then
+        truncate -s "${FEOS_DISK_SIZE:-512M}" "$DISK"
+    fi
+    DISK_ARGS="-drive if=none,id=disk0,format=raw,file=$DISK -device virtio-blk-device,drive=disk0"
+fi
+
 # FEOS_QEMU_ARGS is deliberately word-split: it holds extra QEMU arguments.
 # shellcheck disable=SC2086
 exec "$QEMU" \
-    -machine virt \
+    -machine "${FEOS_MACHINE:-virt}" \
     -cpu cortex-a53 \
     -smp "$SMP" \
     -m "$MEM" \
@@ -47,4 +61,5 @@ exec "$QEMU" \
     -display "$DISPLAY_BACKEND" \
     -serial mon:stdio \
     -kernel "$KERNEL" \
+    $DISK_ARGS \
     ${FEOS_QEMU_ARGS:---device virtio-tablet-device -device virtio-keyboard-device}

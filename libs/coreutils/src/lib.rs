@@ -51,5 +51,5 @@ pub mod system;
 pub use commands::{command, is_command, run, CommandFn, CommandSpec, Ctx, COMMANDS};
 pub use env::{Env, Var, VarError};
 pub use fs::{base_name, join, normalize, parent, DirEntry, FsError, Kind, Meta, OverlayFs, Vfs};
-pub use io::{BytesInput, BytesOutput, Input, NullInput, NullOutput, Output, MAX_STREAM_BYTES};
+pub use io::{Available, BytesInput, BytesOutput, Input, NullInput, NullOutput, Output, MAX_STREAM_BYTES};
 pub use system::{MemoryInfo, NoSystem, System};

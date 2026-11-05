@@ -86,12 +86,7 @@ pub struct ImportStats {
 impl RamDisk {
     pub fn new() -> Self {
         Self {
-            nodes: alloc::vec![Node::new(
-                "\\".to_string(),
-                "\\".to_string(),
-                true,
-                None
-            )],
+            nodes: alloc::vec![Node::new("\\".to_string(), "\\".to_string(), true, None)],
             root: 0,
             used: 0,
             quota: DRIVE_QUOTA,
@@ -128,13 +123,10 @@ impl RamDisk {
         let wanted = normalize(name);
         let wanted_dos = dos_name(name);
         let node = self.node(dir)?;
-        node.children
-            .iter()
-            .copied()
-            .find(|&child| {
-                let child_node = &self.nodes[child];
-                child_node.short == wanted_dos || normalize(&child_node.name) == wanted
-            })
+        node.children.iter().copied().find(|&child| {
+            let child_node = &self.nodes[child];
+            child_node.short == wanted_dos || normalize(&child_node.name) == wanted
+        })
     }
 
     /// Resolves a DOS path relative to `from`.
@@ -566,9 +558,9 @@ pub fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name != "."
         && name != ".."
-        && name
-            .chars()
-            .all(|ch| !matches!(ch, '*' | '?' | '/' | '\\' | ':' | '<' | '>' | '|' | '"') && ch >= ' ')
+        && name.chars().all(|ch| {
+            !matches!(ch, '*' | '?' | '/' | '\\' | ':' | '<' | '>' | '|' | '"') && ch >= ' '
+        })
 }
 
 /// A character as it appears in an 8.3 name.
@@ -591,7 +583,12 @@ pub fn dos_name(name: &str) -> String {
         _ => (name, ""),
     };
     let mut out = String::new();
-    for ch in base.chars().filter_map(short_char).filter(|ch| *ch != '.').take(8) {
+    for ch in base
+        .chars()
+        .filter_map(short_char)
+        .filter(|ch| *ch != '.')
+        .take(8)
+    {
         out.push(ch);
     }
     let extension: String = extension.chars().filter_map(short_char).take(3).collect();
@@ -755,8 +752,12 @@ mod tests {
     #[test]
     fn long_names_get_unique_short_names() {
         let mut disk = RamDisk::new();
-        let first = disk.create_file(0, "longfilename1.txt", Vec::new()).expect("1");
-        let second = disk.create_file(0, "longfilename2.txt", Vec::new()).expect("2");
+        let first = disk
+            .create_file(0, "longfilename1.txt", Vec::new())
+            .expect("1");
+        let second = disk
+            .create_file(0, "longfilename2.txt", Vec::new())
+            .expect("2");
         assert_ne!(first, second);
         assert_eq!(disk.nodes[first].short, "LONGFI~1.TXT");
         assert_eq!(disk.nodes[second].short, "LONGFI~2.TXT");

@@ -13,8 +13,9 @@
 //! decode to the wrong sound: any object type but LC, AAC Main prediction, gain
 //! control, coupling channels, 960-sample frames, and streams whose channels are
 //! defined by a program config element (channel configuration 0). An HE-AAC
-//! stream that signals SBR only implicitly plays its LC core at the base rate,
-//! which is the behaviour the format was designed to allow.
+//! stream, however it signals SBR and PS, plays its LC core at the base rate,
+//! which is the behaviour the format was designed to allow. A rate that isn't in
+//! the standard's table uses the bands of the nearest one, as the standard says.
 //!
 //! # Fixed point
 //!
@@ -134,12 +135,25 @@ impl AudioSpecificConfig {
         if object_type == 31 {
             object_type = 32 + reader.read(6)?;
         }
-        let rate_index = reader.read(4)?;
+        let mut rate_index = reader.read(4)?;
+        let mut explicit_rate = None;
         if rate_index == 15 {
-            reader.read(24)?;
-            return Err(AudioError::UnsupportedFeature("AAC explicit sample rate"));
+            let rate = reader.read(24)?;
+            rate_index = nearest_rate_index(rate) as u32;
+            explicit_rate = Some(rate);
         }
         let channel_config = reader.read(4)?;
+        // Explicitly signalled HE-AAC: an extension rate, and then the core's
+        // object type. The core is plain LC and plays by itself at its base rate.
+        if object_type == 5 || object_type == 29 {
+            if reader.read(4)? == 15 {
+                reader.read(24)?;
+            }
+            object_type = reader.read(5)?;
+            if object_type == 31 {
+                object_type = 32 + reader.read(6)?;
+            }
+        }
         if object_type != 2 {
             return Err(AudioError::UnsupportedFeature("AAC object type"));
         }
@@ -151,7 +165,14 @@ impl AudioSpecificConfig {
         }
         // The extension flag: reserved for object type 2.
         reader.bit()?;
-        Self::new(rate_index as u8, channel_config as u8)
+        let mut config = Self::new(rate_index as u8, channel_config as u8)?;
+        if let Some(rate) = explicit_rate {
+            if rate == 0 {
+                return Err(AudioError::InvalidData("AAC sample rate of zero"));
+            }
+            config.sample_rate = rate;
+        }
+        Ok(config)
     }
 
     /// A config for AAC-LC with the given sampling index and channels.
@@ -181,6 +202,14 @@ impl AudioSpecificConfig {
             .get(self.channel_config as usize)
             .map_or(0, |order| order.len())
     }
+}
+
+/// The standard's mapping from any rate to the table that suits it.
+fn nearest_rate_index(rate: u32) -> usize {
+    const FROM: [u32; 12] = [
+        92017, 75132, 55426, 46009, 37566, 27713, 23004, 18783, 13856, 11502, 9391, 0,
+    ];
+    FROM.iter().position(|&low| rate >= low).unwrap_or(11)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -1388,11 +1417,13 @@ mod tests {
         let config = AudioSpecificConfig::parse(&[0x12, 0x10]).unwrap();
         assert_eq!(config.sample_rate, 44_100);
         assert_eq!(config.channels(), 2);
-        // HE-AAC, explicit.
-        assert!(matches!(
-            AudioSpecificConfig::parse(&[0x2b, 0x92, 0x08, 0x00]),
-            Err(AudioError::UnsupportedFeature(_))
-        ));
+        // Explicit HE-AAC: LC at 24 kHz, stereo, with SBR up to 48 kHz. Bits:
+        // 00101 0110 0010 0011 00010 000
+        let he = AudioSpecificConfig::parse(&[0x2b, 0x11, 0x88, 0x00]).unwrap();
+        assert_eq!((he.object_type, he.sample_rate, he.channel_config), (2, 24000, 2));
+        // An explicit rate: 00010 1111 <24 bits of 44000> 0010 000.
+        let explicit = AudioSpecificConfig::parse(&[0x17, 0x80, 0x55, 0xf0, 0x10]).unwrap();
+        assert_eq!((explicit.sample_rate, explicit.sample_rate_index), (44000, 4));
         // Channel configuration 0 needs a program config element.
         assert!(matches!(
             AudioSpecificConfig::parse(&[0x12, 0x00]),

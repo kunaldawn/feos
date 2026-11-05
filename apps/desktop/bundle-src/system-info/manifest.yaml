@@ -4,7 +4,9 @@ version: 1.0.0
 entry: info
 category: System
 description: Board, CPU, memory and kernel details
-icon: icon.bmp
+icon: icon.ico
+icon_medium: icon-32.ico
+icon_small: icon-16.ico
 window:
   width: 560
   height: 380

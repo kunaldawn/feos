@@ -729,7 +729,9 @@ mod tests {
             "test app"
         }
 
-        fn run(&self, _context: &mut Context<'_>) {}
+        fn run(&self, _context: &mut Context<'_>) -> i32 {
+        0
+    }
     }
 
     static DUMMY: Dummy = Dummy;
@@ -753,7 +755,9 @@ mod tests {
             true
         }
 
-        fn run(&self, _context: &mut Context<'_>) {}
+        fn run(&self, _context: &mut Context<'_>) -> i32 {
+        0
+    }
     }
 
     static WINDOWED: WindowedDummy = WindowedDummy;

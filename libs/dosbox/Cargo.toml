@@ -3,6 +3,7 @@ name = "feos-dosbox"
 description = "FEOS-DOS: a no_std x86 virtual machine and DOS prompt for feos"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license = "GPL-2.0-or-later"
 
 [features]

@@ -1,11 +1,12 @@
-//! A virtio-input pointer (tablet or mouse) on the virtio MMIO transport.
+//! A virtio-input pointer (tablet or mouse) or keyboard.
 //!
 //! QEMU's `virt` machine exposes 32 virtio MMIO slots starting at
 //! `0x0a00_0000`. Adding `-device virtio-tablet-device` gives the guest an
 //! absolute pointing device; `-device virtio-mouse-device` gives a relative
-//! one. This driver implements the modern (version 2) and legacy (version 1)
-//! transports, negotiates only the features it understands, and keeps a small
-//! pre-filled event queue so pointer reports arrive without interrupts.
+//! one. The transport comes from `feos-virtio-core`, so `virtio-tablet-pci`
+//! works the same way through [`VirtioInput::init_transport`]. The driver
+//! negotiates no optional features and keeps a small pre-filled event queue so
+//! pointer reports arrive without interrupts.
 //!
 //! The driver is polled. [`VirtioInput::poll`] decodes one SYN_REPORT-terminated
 //! group at a time and returns an absolute framebuffer position plus any button
@@ -15,6 +16,7 @@
 #![no_std]
 
 use feos_hal::{dma, KeyboardEvent, PointerEvent};
+use feos_virtio_core::{AnyTransport, MmioTransport, Queue, Segment, Transport};
 
 /// Number of descriptors in the event queue. Must be a power of two.
 ///
@@ -35,41 +37,7 @@ pub const VIRTIO_MMIO_STRIDE: usize = 0x200;
 /// Number of virtio MMIO slots exposed by QEMU's `virt` machine.
 pub const VIRTIO_MMIO_SLOTS: usize = 32;
 
-const MAGIC: u32 = 0x7472_6976;
-const DEVICE_ID_INPUT: u32 = 18;
-
-mod reg {
-    pub const MAGIC: usize = 0x000;
-    pub const VERSION: usize = 0x004;
-    pub const DEVICE_ID: usize = 0x008;
-    pub const DEVICE_FEATURES: usize = 0x010;
-    pub const DEVICE_FEATURES_SEL: usize = 0x014;
-    pub const DRIVER_FEATURES: usize = 0x020;
-    pub const DRIVER_FEATURES_SEL: usize = 0x024;
-    pub const GUEST_PAGE_SIZE: usize = 0x028;
-    pub const QUEUE_SEL: usize = 0x030;
-    pub const QUEUE_NUM_MAX: usize = 0x034;
-    pub const QUEUE_NUM: usize = 0x038;
-    pub const QUEUE_ALIGN: usize = 0x03c;
-    pub const QUEUE_PFN: usize = 0x040;
-    pub const QUEUE_READY: usize = 0x044;
-    pub const QUEUE_NOTIFY: usize = 0x050;
-    pub const STATUS: usize = 0x070;
-    pub const QUEUE_DESC_LOW: usize = 0x080;
-    pub const QUEUE_DESC_HIGH: usize = 0x084;
-    pub const QUEUE_DRIVER_LOW: usize = 0x090;
-    pub const QUEUE_DRIVER_HIGH: usize = 0x094;
-    pub const QUEUE_DEVICE_LOW: usize = 0x0a0;
-    pub const QUEUE_DEVICE_HIGH: usize = 0x0a4;
-    pub const CONFIG: usize = 0x100;
-}
-
-mod status {
-    pub const ACKNOWLEDGE: u32 = 1;
-    pub const DRIVER: u32 = 2;
-    pub const DRIVER_OK: u32 = 4;
-    pub const FEATURES_OK: u32 = 8;
-}
+const DEVICE_ID_INPUT: u32 = feos_virtio_core::device::INPUT;
 
 mod config {
     pub const SELECT: usize = 0;
@@ -105,8 +73,6 @@ mod input {
     pub const CFG_ABS_INFO: u8 = 0x12;
 }
 
-const DESC_F_WRITE: u16 = 2;
-
 /// What kind of pointing device was found.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PointerKind {
@@ -123,90 +89,6 @@ pub enum DeviceKind {
     Pointer(PointerKind),
     /// A keyboard.
     Keyboard,
-}
-
-/// One virtqueue descriptor.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Descriptor {
-    addr: u64,
-    len: u32,
-    flags: u16,
-    next: u16,
-}
-
-impl Descriptor {
-    const EMPTY: Self = Self {
-        addr: 0,
-        len: 0,
-        flags: 0,
-        next: 0,
-    };
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct AvailRing {
-    flags: u16,
-    idx: u16,
-    ring: [u16; QUEUE_SIZE],
-}
-
-const AVAIL_BYTES: usize = 4 + 2 * QUEUE_SIZE;
-const FIRST_PAD: usize = 4096 - 16 * QUEUE_SIZE - AVAIL_BYTES;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct UsedElement {
-    id: u32,
-    len: u32,
-}
-
-impl UsedElement {
-    const EMPTY: Self = Self { id: 0, len: 0 };
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct UsedRing {
-    flags: u16,
-    idx: u16,
-    ring: [UsedElement; QUEUE_SIZE],
-}
-
-const USED_BYTES: usize = 4 + 8 * QUEUE_SIZE;
-const SECOND_PAD: usize = 4096 - USED_BYTES;
-
-/// Legacy virtqueues are one page-aligned region: descriptors, then the
-/// available ring, then (at the next page) the used ring. Giving the modern
-/// layout the same shape keeps one buffer usable for both transports.
-#[repr(C, align(4096))]
-struct QueueMemory {
-    desc: [Descriptor; QUEUE_SIZE],
-    avail: AvailRing,
-    first_pad: [u8; FIRST_PAD],
-    used: UsedRing,
-    second_pad: [u8; SECOND_PAD],
-}
-
-impl QueueMemory {
-    const fn new() -> Self {
-        Self {
-            desc: [Descriptor::EMPTY; QUEUE_SIZE],
-            avail: AvailRing {
-                flags: 0,
-                idx: 0,
-                ring: [0; QUEUE_SIZE],
-            },
-            first_pad: [0; FIRST_PAD],
-            used: UsedRing {
-                flags: 0,
-                idx: 0,
-                ring: [UsedElement::EMPTY; QUEUE_SIZE],
-            },
-            second_pad: [0; SECOND_PAD],
-        }
-    }
 }
 
 #[repr(C, align(8))]
@@ -237,59 +119,36 @@ impl RawEvent {
     }
 }
 
-fn read32_at(base: usize, offset: usize) -> u32 {
-    // SAFETY: `base` is a virtio MMIO window supplied by the board.
-    unsafe { core::ptr::read_volatile((base + offset) as *const u32) }
-}
-
-fn write32_at(base: usize, offset: usize, value: u32) {
-    // SAFETY: see `read32_at`.
-    unsafe { core::ptr::write_volatile((base + offset) as *mut u32, value) }
-}
-
-fn read8_at(base: usize, offset: usize) -> u8 {
-    // SAFETY: see `read32_at`.
-    unsafe { core::ptr::read_volatile((base + offset) as *const u8) }
-}
-
-fn write8_at(base: usize, offset: usize, value: u8) {
-    // SAFETY: see `read32_at`.
-    unsafe { core::ptr::write_volatile((base + offset) as *mut u8, value) }
-}
-
-fn config_bit(base: usize, select: u8, subsel: u8, bit: u16) -> bool {
-    write8_at(base, reg::CONFIG + config::SELECT, select);
-    write8_at(base, reg::CONFIG + config::SUBSELL, subsel);
-    let size = read8_at(base, reg::CONFIG + config::SIZE) as usize;
+fn config_bit<T: Transport>(transport: &T, select: u8, subsel: u8, bit: u16) -> bool {
+    transport.config_write8(config::SELECT, select);
+    transport.config_write8(config::SUBSELL, subsel);
+    let size = transport.config_read8(config::SIZE) as usize;
     let byte = bit as usize / 8;
     if byte >= size {
         return false;
     }
-    read8_at(base, reg::CONFIG + config::UNION + byte) & (1 << (bit % 8)) != 0
+    transport.config_read8(config::UNION + byte) & (1 << (bit % 8)) != 0
 }
 
-/// Probes one MMIO slot and reports which kind of input device it contains.
-pub fn probe(base: usize) -> Option<DeviceKind> {
-    if read32_at(base, reg::MAGIC) != MAGIC {
+/// Reports which kind of input device `transport` reaches.
+pub fn probe_transport<T: Transport>(transport: &T) -> Option<DeviceKind> {
+    if transport.device_id() != DEVICE_ID_INPUT {
         return None;
     }
-    let version = read32_at(base, reg::VERSION);
-    if version != 1 && version != 2 {
-        return None;
-    }
-    if read32_at(base, reg::DEVICE_ID) != DEVICE_ID_INPUT {
-        return None;
-    }
-
-    if config_bit(base, input::CFG_EV_BITS, input::EV_ABS as u8, input::ABS_X) {
+    if config_bit(transport, input::CFG_EV_BITS, input::EV_ABS as u8, input::ABS_X) {
         Some(DeviceKind::Pointer(PointerKind::Absolute))
-    } else if config_bit(base, input::CFG_EV_BITS, input::EV_REL as u8, input::REL_X) {
+    } else if config_bit(transport, input::CFG_EV_BITS, input::EV_REL as u8, input::REL_X) {
         Some(DeviceKind::Pointer(PointerKind::Relative))
-    } else if config_bit(base, input::CFG_EV_BITS, input::EV_KEY as u8, input::KEY_A) {
+    } else if config_bit(transport, input::CFG_EV_BITS, input::EV_KEY as u8, input::KEY_A) {
         Some(DeviceKind::Keyboard)
     } else {
         None
     }
+}
+
+/// Probes one MMIO slot and reports which kind of input device it contains.
+pub fn probe(base: usize) -> Option<DeviceKind> {
+    probe_transport(&MmioTransport::probe(base)?)
 }
 
 /// Finds the first pointer in the QEMU virtio MMIO range.
@@ -316,8 +175,7 @@ pub fn find_keyboard(base: usize, stride: usize, slots: usize) -> Option<usize> 
 
 /// A virtio input device that exposes a pointer.
 pub struct VirtioInput {
-    base: usize,
-    version: u32,
+    transport: Option<AnyTransport>,
     kind: DeviceKind,
     width: u16,
     height: u16,
@@ -325,11 +183,8 @@ pub struct VirtioInput {
     abs_max_x: u32,
     abs_min_y: u32,
     abs_max_y: u32,
-    queue: QueueMemory,
+    queue: Queue<QUEUE_SIZE>,
     buffers: [EventBuffer; QUEUE_SIZE],
-    avail_idx: u16,
-    published_idx: u16,
-    used_seen: u16,
     ready: bool,
     x: u16,
     y: u16,
@@ -351,8 +206,7 @@ impl VirtioInput {
     /// Creates an uninitialised device.
     pub const fn new() -> Self {
         Self {
-            base: 0,
-            version: 0,
+            transport: None,
             kind: DeviceKind::Pointer(PointerKind::Absolute),
             width: 0,
             height: 0,
@@ -360,11 +214,8 @@ impl VirtioInput {
             abs_max_x: 32767,
             abs_min_y: 0,
             abs_max_y: 32767,
-            queue: QueueMemory::new(),
+            queue: Queue::new(),
             buffers: [EventBuffer::EMPTY; QUEUE_SIZE],
-            avail_idx: 0,
-            published_idx: 0,
-            used_seen: 0,
             ready: false,
             x: 0,
             y: 0,
@@ -383,11 +234,6 @@ impl VirtioInput {
         }
     }
 
-    /// Negotiated virtio transport version (1 = legacy, 2 = modern).
-    pub const fn version(&self) -> u32 {
-        self.version
-    }
-
     /// Kind of input device this instance represents.
     pub const fn kind(&self) -> DeviceKind {
         self.kind
@@ -403,23 +249,11 @@ impl VirtioInput {
         (self.x, self.y)
     }
 
-    fn read32(&self, offset: usize) -> u32 {
-        read32_at(self.base, offset)
-    }
-
-    fn write32(&self, offset: usize, value: u32) {
-        write32_at(self.base, offset, value)
-    }
-
-    fn write8(&self, offset: usize, value: u8) {
-        write8_at(self.base, offset, value)
-    }
-
-    fn read_abs_info(&self, axis: u8) -> (u32, u32) {
-        self.write8(reg::CONFIG + config::SELECT, input::CFG_ABS_INFO);
-        self.write8(reg::CONFIG + config::SUBSELL, axis);
-        let min = self.read32(reg::CONFIG + config::UNION);
-        let max = self.read32(reg::CONFIG + config::UNION + 4);
+    fn read_abs_info<T: Transport>(transport: &T, axis: u8) -> (u32, u32) {
+        transport.config_write8(config::SELECT, input::CFG_ABS_INFO);
+        transport.config_write8(config::SUBSELL, axis);
+        let min = transport.config_read32(config::UNION);
+        let max = transport.config_read32(config::UNION + 4);
         if max <= min {
             (0, 32767)
         } else {
@@ -427,153 +261,91 @@ impl VirtioInput {
         }
     }
 
-    /// Initialises `base` as a pointer sized for a `width` x `height` screen.
+    /// Initialises the MMIO slot at `base` as a pointer sized for a
+    /// `width` x `height` screen.
     ///
-    /// Returns `false` when the slot is not a virtio input pointer or the
+    /// Returns `false` when the slot is not a virtio input device or the
     /// device does not accept the queue.
     pub fn init(&mut self, base: usize, width: u16, height: u16) -> bool {
-        self.base = base;
+        match MmioTransport::probe(base) {
+            Some(transport) => self.init_transport(AnyTransport::Mmio(transport), width, height),
+            None => false,
+        }
+    }
+
+    /// Initialises the device behind `transport`, on either bus.
+    pub fn init_transport(&mut self, transport: AnyTransport, width: u16, height: u16) -> bool {
         self.width = width.max(1);
         self.height = height.max(1);
         self.x = self.width / 2;
         self.y = self.height / 2;
 
-        let Some(kind) = probe(base) else {
+        let Some(kind) = probe_transport(&transport) else {
             return false;
         };
         self.kind = kind;
-        self.version = self.read32(reg::VERSION);
         self.key_head = 0;
         self.key_tail = 0;
         self.keys = [None; KEY_QUEUE_SIZE];
 
-        // Reset, then announce the driver.
-        self.write32(reg::STATUS, 0);
-        self.write32(reg::STATUS, status::ACKNOWLEDGE);
-        self.write32(reg::STATUS, status::ACKNOWLEDGE | status::DRIVER);
-
-        if self.version == 2 {
-            // Accept VIRTIO_F_VERSION_1 (feature bit 32) and nothing else.
-            self.write32(reg::DEVICE_FEATURES_SEL, 1);
-            let high = self.read32(reg::DEVICE_FEATURES);
-            if high & 1 == 0 {
-                return false;
-            }
-            self.write32(reg::DRIVER_FEATURES_SEL, 1);
-            self.write32(reg::DRIVER_FEATURES, 1);
-            self.write32(reg::DRIVER_FEATURES_SEL, 0);
-            self.write32(reg::DRIVER_FEATURES, 0);
-
-            let status = status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK;
-            self.write32(reg::STATUS, status);
-            if self.read32(reg::STATUS) & status::FEATURES_OK == 0 {
-                return false;
-            }
-        } else {
-            // Legacy: no optional features are required for input.
-            self.write32(reg::DEVICE_FEATURES_SEL, 0);
-            let _ = self.read32(reg::DEVICE_FEATURES);
-            self.write32(reg::DRIVER_FEATURES_SEL, 0);
-            self.write32(reg::DRIVER_FEATURES, 0);
+        // No optional features are required for input.
+        if feos_virtio_core::negotiate(&transport, 0).is_none() {
+            return false;
         }
 
         if self.kind == DeviceKind::Pointer(PointerKind::Absolute) {
-            let (min, max) = self.read_abs_info(input::ABS_X as u8);
+            let (min, max) = Self::read_abs_info(&transport, input::ABS_X as u8);
             self.abs_min_x = min;
             self.abs_max_x = max;
-            let (min, max) = self.read_abs_info(input::ABS_Y as u8);
+            let (min, max) = Self::read_abs_info(&transport, input::ABS_Y as u8);
             self.abs_min_y = min;
             self.abs_max_y = max;
         }
 
-        if !self.setup_queue() {
+        if !self.setup_queue(&transport) {
             return false;
         }
-
-        let mut final_status = status::ACKNOWLEDGE | status::DRIVER | status::DRIVER_OK;
-        if self.version == 2 {
-            final_status |= status::FEATURES_OK;
-        }
-        self.write32(reg::STATUS, final_status);
-
+        feos_virtio_core::finish(&transport);
+        self.transport = Some(transport);
         self.ready = true;
         // The queue was filled before the device was told where it lives, so
-        // force the first notification even though the publish index already
-        // matches the available index.
-        self.published_idx = 0;
+        // the first notification tells it about all of them.
         self.publish();
         true
     }
 
-    fn setup_queue(&mut self) -> bool {
-        self.write32(reg::QUEUE_SEL, 0);
-        let max = self.read32(reg::QUEUE_NUM_MAX) as usize;
-        if max < QUEUE_SIZE {
+    fn setup_queue(&mut self, transport: &AnyTransport) -> bool {
+        if (transport.queue_max(0) as usize) < QUEUE_SIZE {
             return false;
         }
-        self.write32(reg::QUEUE_NUM, QUEUE_SIZE as u32);
 
         // Fill the queue before the device is told where it lives.
-        self.avail_idx = 0;
-        self.published_idx = 0;
-        self.used_seen = 0;
+        self.queue.reset();
         for index in 0..QUEUE_SIZE {
             let buffer = core::ptr::addr_of!(self.buffers[index]) as u64;
-            self.queue.desc[index] = Descriptor {
+            let segment = Segment {
                 addr: buffer,
                 len: 8,
-                flags: DESC_F_WRITE,
-                next: 0,
+                device_writes: true,
             };
-            self.queue.avail.ring[index] = index as u16;
+            if self.queue.add(&[segment]).is_none() {
+                return false;
+            }
         }
-        self.queue.avail.flags = 0;
-        self.queue.avail.idx = QUEUE_SIZE as u16;
-        self.avail_idx = QUEUE_SIZE as u16;
-        self.published_idx = QUEUE_SIZE as u16;
-        dma::wmb();
-
-        let desc = core::ptr::addr_of!(self.queue.desc) as u64;
-        let avail = core::ptr::addr_of!(self.queue.avail) as u64;
-        let used = core::ptr::addr_of!(self.queue.used) as u64;
-
-        if self.version == 2 {
-            self.write32(reg::QUEUE_DESC_LOW, desc as u32);
-            self.write32(reg::QUEUE_DESC_HIGH, (desc >> 32) as u32);
-            self.write32(reg::QUEUE_DRIVER_LOW, avail as u32);
-            self.write32(reg::QUEUE_DRIVER_HIGH, (avail >> 32) as u32);
-            self.write32(reg::QUEUE_DEVICE_LOW, used as u32);
-            self.write32(reg::QUEUE_DEVICE_HIGH, (used >> 32) as u32);
-            self.write32(reg::QUEUE_READY, 1);
-        } else {
-            self.write32(reg::QUEUE_ALIGN, 4096);
-            self.write32(reg::GUEST_PAGE_SIZE, 4096);
-            self.write32(reg::QUEUE_PFN, (desc >> 12) as u32);
-        }
-        true
+        let (desc, avail, used) = self.queue.addresses();
+        transport.queue_activate(0, QUEUE_SIZE as u16, desc, avail, used)
     }
 
     fn publish(&mut self) {
-        if self.published_idx == self.avail_idx {
-            return;
+        if self.queue.publish() {
+            if let Some(transport) = self.transport.as_ref() {
+                transport.queue_notify(0);
+            }
         }
-        self.published_idx = self.avail_idx;
-        dma::wmb();
-        // SAFETY: `avail.idx` is part of the queue owned by this driver.
-        unsafe {
-            core::ptr::write_volatile(
-                core::ptr::addr_of_mut!(self.queue.avail.idx),
-                self.avail_idx,
-            );
-        }
-        dma::wmb();
-        self.write32(reg::QUEUE_NOTIFY, 0);
     }
 
     fn release_descriptor(&mut self, id: u16) {
-        let slot = (self.avail_idx as usize) % QUEUE_SIZE;
-        self.queue.avail.ring[slot] = id;
-        self.avail_idx = self.avail_idx.wrapping_add(1);
+        self.queue.resubmit(id);
     }
 
     fn scale(value: u32, min: u32, max: u32, extent: u16) -> u16 {
@@ -763,38 +535,28 @@ impl VirtioInput {
             return None;
         }
 
-        // SAFETY: the device writes the used ring in the queue memory owned by
-        // this driver; the index is volatile because it changes asynchronously.
-        let used_idx =
-            unsafe { core::ptr::read_volatile(core::ptr::addr_of!(self.queue.used.idx)) };
-        if self.used_seen == used_idx {
-            return None;
-        }
-        // The ring entry and event buffer were written before the index.
+        let (id, len) = self.queue.pop_used()?;
+        // The event buffer was written before the used index, and `pop_used`
+        // ordered this read after it.
         dma::rmb();
 
-        let slot = (self.used_seen as usize) % QUEUE_SIZE;
-        // SAFETY: `slot` is inside the used ring.
-        let (id, len) = unsafe {
-            let element = core::ptr::addr_of!(self.queue.used.ring[slot]);
-            (
-                core::ptr::read_volatile(core::ptr::addr_of!((*element).id)),
-                core::ptr::read_volatile(core::ptr::addr_of!((*element).len)),
-            )
-        };
-        self.used_seen = self.used_seen.wrapping_add(1);
-
-        if (id as usize) < QUEUE_SIZE && len >= 8 {
-            let raw = RawEvent::from_bytes(&self.buffers[id as usize].bytes);
-            let report = self.handle_event(raw);
-            self.release_descriptor(id as u16);
-            self.publish();
-            Some(report)
-        } else {
-            self.release_descriptor(id as u16);
-            self.publish();
-            Some(None)
+        if (id as usize) >= QUEUE_SIZE {
+            // Not a buffer this driver offered, so there's nothing to give back.
+            return Some(None);
         }
+        let report = if len >= 8 {
+            // The device writes these bytes behind the compiler's back.
+            // SAFETY: `id` is in range, and the buffer is the device's no longer.
+            let bytes = unsafe {
+                core::ptr::read_volatile(core::ptr::addr_of!(self.buffers[id as usize].bytes))
+            };
+            self.handle_event(RawEvent::from_bytes(&bytes))
+        } else {
+            None
+        };
+        self.release_descriptor(id);
+        self.publish();
+        Some(report)
     }
 
     /// Returns the next complete pointer report.
@@ -832,25 +594,6 @@ impl Default for VirtioInput {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn queue_memory_keeps_the_legacy_page_layout() {
-        assert_eq!(core::mem::size_of::<QueueMemory>(), 8192);
-        assert_eq!(core::mem::align_of::<QueueMemory>(), 4096);
-        assert_eq!(core::mem::size_of::<Descriptor>(), 16);
-        assert_eq!(core::mem::size_of::<AvailRing>(), AVAIL_BYTES);
-        assert_eq!(core::mem::size_of::<UsedRing>(), USED_BYTES);
-    }
-
-    #[test]
-    fn absolute_coordinates_scale_to_the_framebuffer() {
-        assert_eq!(VirtioInput::scale(0, 0, 32767, 1024), 0);
-        assert_eq!(VirtioInput::scale(32767, 0, 32767, 1024), 1023);
-        assert_eq!(VirtioInput::scale(16384, 0, 32767, 1024), 511);
-        assert_eq!(VirtioInput::scale(500, 0, 1000, 101), 50);
-        assert_eq!(VirtioInput::scale(9, 0, 0, 100), 9);
-        assert_eq!(VirtioInput::scale(100, 0, 10, 0), 0);
-    }
 
     #[test]
     fn raw_events_are_little_endian() {

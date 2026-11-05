@@ -18,7 +18,7 @@ const EMS_POOL_BASE: u32 = EXTENDED_BASE + EXTENDED_KB * 1024 - EMS_PAGES as u32
 /// The EMS page frame segment.
 pub const EMS_FRAME: u32 = 0xD_0000;
 const XMS_TOP_KB: u32 = EMS_POOL_BASE / 1024;
-const MAX_XMS_HANDLES: usize = 64;
+const MAX_XMS_HANDLES: usize = 512;
 const MAX_EMS_HANDLES: usize = 32;
 
 #[derive(Clone, Copy)]
@@ -94,6 +94,91 @@ impl Xms {
             cursor = cursor.max(start + size);
         }
         (XMS_TOP_KB.saturating_sub(cursor) >= size_kb).then_some(cursor)
+    }
+
+    /// The largest free block and the total free, in KiB.
+    pub fn free_kb(&self) -> (u32, u32) {
+        self.largest_and_total()
+    }
+
+    /// The largest free block, in KiB.
+    pub fn largest_free_kb(&self) -> u32 {
+        self.largest_and_total().0
+    }
+
+    /// Takes a block for the machine's own use: its handle and physical address.
+    pub fn alloc_block(&mut self, size_kb: u32) -> Option<(u16, u32)> {
+        let slot = self.blocks.iter().position(Option::is_none)?;
+        let start_kb = self.find_gap(size_kb)?;
+        self.blocks[slot] = Some(XmsBlock {
+            start_kb,
+            size_kb,
+            locks: 0,
+        });
+        Some((slot as u16 + 1, start_kb * 1024))
+    }
+
+    /// Takes a block at a given address, if that's free.
+    pub fn alloc_block_at(&mut self, address: u32, size_kb: u32) -> Option<(u16, u32)> {
+        if address % 1024 != 0 {
+            return None;
+        }
+        let start_kb = address / 1024;
+        let free = start_kb >= XMS_BASE_KB
+            && start_kb.checked_add(size_kb)? <= XMS_TOP_KB
+            && self.blocks.iter().flatten().all(|other| {
+                other.start_kb + other.size_kb <= start_kb
+                    || other.start_kb >= start_kb + size_kb
+            });
+        if !free {
+            return None;
+        }
+        let slot = self.blocks.iter().position(Option::is_none)?;
+        self.blocks[slot] = Some(XmsBlock {
+            start_kb,
+            size_kb,
+            locks: 0,
+        });
+        Some((slot as u16 + 1, address))
+    }
+
+    /// Gives a block taken with [`Self::alloc_block`] back.
+    pub fn free_block(&mut self, handle: u16) {
+        if let Some(index) = self.handle(handle) {
+            self.blocks[index] = None;
+        }
+    }
+
+    /// Resizes a block, moving it if it must: its new address.
+    pub fn resize_block(&mut self, handle: u16, size_kb: u32, mem: &mut Memory) -> Option<u32> {
+        let index = self.handle(handle)?;
+        let block = self.blocks[index]?;
+        self.blocks[index] = None;
+        let same_place = self.blocks.iter().flatten().all(|other| {
+            other.start_kb + other.size_kb <= block.start_kb
+                || other.start_kb >= block.start_kb + size_kb
+        }) && block.start_kb + size_kb <= XMS_TOP_KB;
+        let start_kb = if same_place {
+            Some(block.start_kb)
+        } else {
+            self.find_gap(size_kb)
+        };
+        let Some(start_kb) = start_kb else {
+            self.blocks[index] = Some(block);
+            return None;
+        };
+        if start_kb != block.start_kb {
+            for offset in 0..block.size_kb.min(size_kb) * 1024 {
+                let byte = mem.read8(block.start_kb * 1024 + offset);
+                mem.write8(start_kb * 1024 + offset, byte);
+            }
+        }
+        self.blocks[index] = Some(XmsBlock {
+            start_kb,
+            size_kb,
+            locks: 0,
+        });
+        Some(start_kb * 1024)
     }
 
     fn handle(&self, handle: u16) -> Option<usize> {
@@ -244,15 +329,10 @@ impl Xms {
                     }
                     // Resize in place when it fits, otherwise move elsewhere.
                     self.blocks[index] = None;
-                    let same_place = self
-                        .blocks
-                        .iter()
-                        .flatten()
-                        .all(|other| {
-                            other.start_kb + other.size_kb <= block.start_kb
-                                || other.start_kb >= block.start_kb + new_size
-                        })
-                        && block.start_kb + new_size <= XMS_TOP_KB;
+                    let same_place = self.blocks.iter().flatten().all(|other| {
+                        other.start_kb + other.size_kb <= block.start_kb
+                            || other.start_kb >= block.start_kb + new_size
+                    }) && block.start_kb + new_size <= XMS_TOP_KB;
                     let start_kb = if same_place {
                         Some(block.start_kb)
                     } else {
@@ -411,6 +491,12 @@ impl Ems {
 
     /// Where an address in the page frame goes.
     #[inline]
+    /// Where the four pages of the frame are mapped now.
+    pub fn frame_map(&self) -> [Option<u32>; 4] {
+        self.map
+            .map(|page| page.map(|page| EMS_POOL_BASE + page as u32 * EMS_PAGE_SIZE))
+    }
+
     pub fn translate(&self, addr: u32) -> Option<u32> {
         let offset = addr.wrapping_sub(EMS_FRAME);
         if offset >= 0x1_0000 {
@@ -516,7 +602,11 @@ impl Ems {
             0x47 => {
                 if self.saved_maps.len() >= MAX_EMS_HANDLES {
                     regs.set_ah(0x8C);
-                } else if self.saved_maps.iter().any(|(saved, _)| *saved as usize == handle) {
+                } else if self
+                    .saved_maps
+                    .iter()
+                    .any(|(saved, _)| *saved as usize == handle)
+                {
                     regs.set_ah(0x8D);
                 } else {
                     self.saved_maps.push((handle as u16, self.map));
@@ -578,7 +668,12 @@ impl Ems {
 mod tests {
     use super::*;
 
-    fn with_regs<T>(ax: u16, bx: u16, dx: u16, run: impl FnOnce(&mut CpuRegs<'_>) -> T) -> ([u32; 8], T) {
+    fn with_regs<T>(
+        ax: u16,
+        bx: u16,
+        dx: u16,
+        run: impl FnOnce(&mut CpuRegs<'_>) -> T,
+    ) -> ([u32; 8], T) {
         let mut r = [0u32; 8];
         let mut sregs = [0u16; 6];
         let mut flags = 0u32;
@@ -604,7 +699,10 @@ mod tests {
         let handle = r[2] as u16;
         let (r, _) = with_regs(0x0C00, 0, handle, |regs| xms.call(regs, &mut mem, &mut vga));
         assert_eq!(r[0] & 0xFFFF, 1);
-        assert_eq!(((r[2] & 0xFFFF) << 16) | (r[3] & 0xFFFF), XMS_BASE_KB * 1024);
+        assert_eq!(
+            ((r[2] & 0xFFFF) << 16) | (r[3] & 0xFFFF),
+            XMS_BASE_KB * 1024
+        );
         let (r, _) = with_regs(0x0A00, 0, handle, |regs| xms.call(regs, &mut mem, &mut vga));
         assert_eq!(r[0] & 0xFFFF, 0, "locked blocks can't be freed");
         with_regs(0x0D00, 0, handle, |regs| xms.call(regs, &mut mem, &mut vga));
@@ -620,12 +718,21 @@ mod tests {
         let (r, _) = with_regs(0x4300, 2, 0, |regs| ems.int67(regs, &mut mem, &mut vga));
         assert_eq!((r[0] >> 8) & 0xFF, 0);
         let handle = r[2] as u16;
-        with_regs(0x4400, 1, handle, |regs| ems.int67(regs, &mut mem, &mut vga));
-        assert_eq!(ems.translate(0xD_0005), Some(EMS_POOL_BASE + EMS_PAGE_SIZE + 5));
+        with_regs(0x4400, 1, handle, |regs| {
+            ems.int67(regs, &mut mem, &mut vga)
+        });
+        assert_eq!(
+            ems.translate(0xD_0005),
+            Some(EMS_POOL_BASE + EMS_PAGE_SIZE + 5)
+        );
         assert_eq!(ems.translate(0xD_4000), None);
-        let (r, _) = with_regs(0x4400, 9, handle, |regs| ems.int67(regs, &mut mem, &mut vga));
+        let (r, _) = with_regs(0x4400, 9, handle, |regs| {
+            ems.int67(regs, &mut mem, &mut vga)
+        });
         assert_eq!((r[0] >> 8) & 0xFF, 0x8A);
-        with_regs(0x4500, 0, handle, |regs| ems.int67(regs, &mut mem, &mut vga));
+        with_regs(0x4500, 0, handle, |regs| {
+            ems.int67(regs, &mut mem, &mut vga)
+        });
         assert_eq!(ems.translate(0xD_0005), None);
     }
 }

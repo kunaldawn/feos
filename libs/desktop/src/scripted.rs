@@ -115,7 +115,9 @@ impl App for Probe {
         DROPPED.with(|cell| cell.set(payload.len()));
         true
     }
-    fn run(&self, _context: &mut Context<'_>) {}
+    fn run(&self, _context: &mut Context<'_>) -> i32 {
+        0
+    }
 }
 
 struct Animated;
@@ -146,7 +148,9 @@ impl App for Animated {
         context.canvas.clear(Color::rgb(10, 200, 30));
         WindowFrame::Continue
     }
-    fn run(&self, _context: &mut Context<'_>) {}
+    fn run(&self, _context: &mut Context<'_>) -> i32 {
+        0
+    }
 }
 
 struct Background;
@@ -161,7 +165,9 @@ impl App for Background {
     fn description(&self) -> &'static str {
         "runs as a process"
     }
-    fn run(&self, _context: &mut Context<'_>) {}
+    fn run(&self, _context: &mut Context<'_>) -> i32 {
+        0
+    }
 }
 
 struct Blocking;
@@ -179,7 +185,9 @@ impl App for Blocking {
     fn foreground(&self) -> bool {
         true
     }
-    fn run(&self, _context: &mut Context<'_>) {}
+    fn run(&self, _context: &mut Context<'_>) -> i32 {
+        0
+    }
 }
 
 static PROBE: Probe = Probe;
@@ -292,6 +300,7 @@ fn platform(processes: &'static FakeProcesses) -> Platform {
         memory: None,
         apps: &REGISTRY,
         filesystem: None,
+        net: None,
     }
 }
 
@@ -776,6 +785,52 @@ fn launching_with_arguments_reaches_the_app_and_a_new_path_restarts_it() {
         .launch_with(0, Some("/x"), &REGISTRY, rig.processes);
     rig.frame();
     assert_eq!(OPENED.with(Cell::get), (2, 2));
+}
+
+#[test]
+fn a_multi_instance_app_opens_a_window_per_launch_without_a_blank_one() {
+    struct Multi;
+    impl App for Multi {
+        fn name(&self) -> &'static str {
+            "probe"
+        }
+        fn usage(&self) -> &'static str {
+            "probe"
+        }
+        fn description(&self) -> &'static str {
+            "several windows"
+        }
+        fn windowed(&self) -> bool {
+            true
+        }
+        fn multi_instance(&self) -> bool {
+            true
+        }
+        fn open_window(&self, _context: &WindowContext<'_, '_>) -> bool {
+            true
+        }
+        fn frame_window(&self, _context: &mut WindowContext<'_, '_>) -> WindowFrame {
+            WindowFrame::Continue
+        }
+        fn run(&self, _context: &mut Context<'_>) -> i32 {
+            0
+        }
+    }
+    static MULTI: Multi = Multi;
+    struct Only;
+    impl AppRegistry for Only {
+        fn find(&self, _name: &str) -> Option<&'static dyn App> {
+            Some(&MULTI)
+        }
+    }
+    let mut rig = Rig::new(1024, 768, &APP);
+    // A click opens a window before the launch request arrives.
+    let opened = rig.desktop.open_app_with(0, None).unwrap();
+    let first = rig.desktop.launch(0, &Only, rig.processes);
+    assert_eq!(first, LaunchOutcome::Windowed { window: opened });
+    let second = rig.desktop.launch(0, &Only, rig.processes);
+    assert!(matches!(second, LaunchOutcome::Windowed { window } if window != opened));
+    assert_eq!(rig.desktop.windows().count(), 2);
 }
 
 #[test]
@@ -1319,12 +1374,20 @@ fn golden_hash(pixels: &[u32]) -> u64 {
     hash
 }
 
-/// Compares one frame with the checked-in hash. Run with `FEOS_UPDATE_GOLDEN=1`
-/// to refresh the file after an intended visual change, and inspect the PPMs
-/// the failure message points at.
-fn check_golden(results: &mut Vec<(std::string::String, u64)>, name: &str, rig: &Rig) {
+/// Records one frame's hash for the comparison with the checked-in file. Run
+/// with `FEOS_UPDATE_GOLDEN=1` to refresh the file after an intended visual
+/// change. A frame that differs is written out as a PPM to look at.
+fn check_golden(
+    expected: &str,
+    results: &mut Vec<(std::string::String, u64)>,
+    name: &str,
+    rig: &Rig,
+) {
     let hash = golden_hash(&rig.pixels);
     results.push((name.into(), hash));
+    if expected.contains(&format!("{name} {hash:016x}")) {
+        return;
+    }
     let mut bytes = format!("P6\n{} {}\n255\n", rig.width, rig.height).into_bytes();
     for pixel in &rig.pixels {
         bytes.extend_from_slice(&[(pixel >> 16) as u8, (pixel >> 8) as u8, *pixel as u8]);
@@ -1337,30 +1400,31 @@ fn check_golden(results: &mut Vec<(std::string::String, u64)>, name: &str, rig: 
 #[test]
 fn golden_desktop_frames() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/golden.txt");
+    let expected = std::fs::read_to_string(path).unwrap_or_default();
     let mut results = Vec::new();
 
     let mut rig = Rig::new(1024, 768, &APP);
     rig.frame();
-    check_golden(&mut results, "desktop_empty", &rig);
+    check_golden(&expected, &mut results, "desktop_empty", &rig);
 
     rig.key(Key::Space, Modifiers::NONE);
     rig.frame();
-    check_golden(&mut results, "desktop_start_menu", &rig);
+    check_golden(&expected, &mut results, "desktop_start_menu", &rig);
     rig.key(Key::Escape, Modifiers::NONE);
 
     let window = rig.launch(0);
     rig.place(window, Rect::new(200, 100, 400, 300));
     rig.frame();
-    check_golden(&mut results, "desktop_window", &rig);
+    check_golden(&expected, &mut results, "desktop_window", &rig);
 
     rig.desktop.settings_open = true;
     rig.frame();
-    check_golden(&mut results, "desktop_settings", &rig);
+    check_golden(&expected, &mut results, "desktop_settings", &rig);
     rig.desktop.settings_open = false;
 
     let mut tiny = Rig::new(320, 240, &APP);
     tiny.frame();
-    check_golden(&mut results, "desktop_tiny", &tiny);
+    check_golden(&expected, &mut results, "desktop_tiny", &tiny);
 
     let mut text = std::string::String::new();
     for (name, hash) in &results {
@@ -1371,7 +1435,6 @@ fn golden_desktop_frames() {
         std::fs::write(path, &text).unwrap();
         return;
     }
-    let expected = std::fs::read_to_string(path).expect("golden file: run with FEOS_UPDATE_GOLDEN=1");
     assert_eq!(
         expected,
         text,

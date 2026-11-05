@@ -1,0 +1,11 @@
+[package]
+name = "feos-virtio-core"
+description = "Virtio transports (MMIO and PCI) and split virtqueues"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+feos-driver-pci = { workspace = true }
+feos-hal = { workspace = true }

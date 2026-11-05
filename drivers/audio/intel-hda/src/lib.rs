@@ -116,6 +116,12 @@ const CORBRP_RESET: u16 = 1 << 15;
 const RIRB_RUN: u8 = 1 << 1;
 const RIRBWP_RESET: u16 = 1 << 15;
 const RIRBSTS_CLEAR: u8 = 0x05;
+/// RIRBCTL: interrupt on a response.
+const RIRB_INTERRUPT: u8 = 1 << 0;
+/// Interrupt control register, and its global and controller enables.
+const INTCTL: usize = 0x20;
+const INTCTL_GLOBAL: u32 = 1 << 31;
+const INTCTL_CONTROLLER: u32 = 1 << 30;
 const SD_RUN: u32 = 1 << 1;
 const SD_RESET: u32 = 1 << 0;
 const SD_INT_MASK: u8 = 0x1c;
@@ -427,6 +433,17 @@ impl Controller {
         None
     }
 
+    /// Asks for an interrupt on each response, and sends a command to get one.
+    fn enable_response_interrupts(&mut self) -> bool {
+        if !self.ready {
+            return false;
+        }
+        self.write16(RINTCNT, 1);
+        self.write32(INTCTL, INTCTL_GLOBAL | INTCTL_CONTROLLER);
+        self.write8(RIRBCTL, RIRB_RUN | RIRB_INTERRUPT);
+        self.parameter(0, PARAM_NODE_COUNT).is_some()
+    }
+
     fn parameter(&mut self, node: u8, parameter: u16) -> Option<u32> {
         self.command(node, VERB_GET_PARAMETER, parameter)
     }
@@ -732,6 +749,24 @@ impl IntelHda {
         let codec = self.state.lock().init(mmio, clock);
         self.ready.store(codec.is_some(), Ordering::Release);
         codec
+    }
+
+    /// Has each codec response raise the controller's interrupt. Playback stays
+    /// polled and doesn't depend on this. The board has wired the interrupt to
+    /// [`handle_interrupt`](Self::handle_interrupt). Returns `false` if the
+    /// controller isn't up.
+    pub fn enable_response_interrupts(&self) -> bool {
+        self.state.lock().enable_response_interrupts()
+    }
+
+    /// Quiets the controller's interrupt, from its handler. A task holding the
+    /// lock is sending a command, and clears the same status itself.
+    pub fn handle_interrupt(&self) {
+        if let Some(controller) = self.state.try_lock() {
+            if controller.ready {
+                controller.write8(RIRBSTS, RIRBSTS_CLEAR);
+            }
+        }
     }
 
     /// Stops playback and forgets the current stream.

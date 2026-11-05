@@ -95,6 +95,24 @@ pub fn decode(input: &[u8], out: &mut [i16]) -> Result<DecodedAudio> {
             available: out.len(),
         });
     }
+    read_frames(input, 0, out)?;
+    Ok(DecodedAudio {
+        info: AudioInfo {
+            sample_rate: format.sample_rate,
+            channels: format.channels,
+            frames: format.frames as u64,
+            format: AudioFormat::Au,
+        },
+        frames: format.frames,
+    })
+}
+
+/// Decodes as many frames as fit in `out`, from frame `start`, and returns how
+/// many that was.
+pub(crate) fn read_frames(input: &[u8], start: usize, out: &mut [i16]) -> Result<usize> {
+    let format = parse(input)?;
+    let channels = format.channels as usize;
+    let frame_count = format.frames.saturating_sub(start).min(out.len() / channels);
     let bytes = match format.encoding {
         1 | 2 | 27 => 1,
         3 => 2,
@@ -105,9 +123,9 @@ pub fn decode(input: &[u8], out: &mut [i16]) -> Result<DecodedAudio> {
     let align = bytes * channels;
     let data = &input[format.data_offset..format.data_offset + format.data_len];
 
-    for frame in 0..format.frames {
+    for frame in 0..frame_count {
         for channel in 0..channels {
-            let index = frame * align + channel * bytes;
+            let index = (start + frame) * align + channel * bytes;
             let sample = &data[index..index + bytes];
             let value = match format.encoding {
                 1 => pcm::mulaw_to_i16(sample[0]),
@@ -130,13 +148,5 @@ pub fn decode(input: &[u8], out: &mut [i16]) -> Result<DecodedAudio> {
         }
     }
 
-    Ok(DecodedAudio {
-        info: AudioInfo {
-            sample_rate: format.sample_rate,
-            channels: format.channels,
-            frames: format.frames as u64,
-            format: AudioFormat::Au,
-        },
-        frames: format.frames,
-    })
+    Ok(frame_count)
 }

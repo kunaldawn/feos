@@ -1,0 +1,25 @@
+[package]
+name = "feos-board-common"
+description = "What the QEMU boards share: bringing up virtio disks and wiring their interrupts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+feos-bootinfo = { workspace = true }
+feos-console = { workspace = true }
+feos-driver-fw-cfg = { workspace = true }
+feos-driver-intel-hda = { workspace = true }
+feos-driver-pci = { workspace = true }
+feos-driver-ramfb = { workspace = true }
+feos-driver-virtio-blk = { workspace = true }
+feos-driver-virtio-net = { workspace = true }
+feos-driver-xhci = { workspace = true }
+feos-driver-virtio-gpu = { workspace = true }
+feos-fs = { workspace = true }
+feos-gfx = { workspace = true }
+feos-hal = { workspace = true }
+feos-irq = { workspace = true }
+feos-sync = { workspace = true }
+feos-virtio-core = { workspace = true }

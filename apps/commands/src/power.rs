@@ -23,7 +23,7 @@ impl App for PowerOff {
         "power off the machine (exits QEMU)"
     }
 
-    fn run(&self, context: &mut Context<'_>) {
+    fn run(&self, context: &mut Context<'_>) -> i32 {
         println!("powering off...");
         context.platform.power.system_off()
     }
@@ -49,7 +49,7 @@ impl App for Reboot {
         "reset the machine"
     }
 
-    fn run(&self, context: &mut Context<'_>) {
+    fn run(&self, context: &mut Context<'_>) -> i32 {
         println!("resetting...");
         context.platform.power.system_reset()
     }

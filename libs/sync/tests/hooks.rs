@@ -26,9 +26,16 @@ static HOOKS: SchedHooks = SchedHooks {
         WAITS.fetch_add(1, Ordering::Relaxed);
         std::thread::yield_now();
     },
+    wait_ms: |_, _, _| {
+        WAITS.fetch_add(1, Ordering::Relaxed);
+        std::thread::yield_now();
+    },
     wake: |_, _| {
         WAKES.fetch_add(1, Ordering::Relaxed);
     },
+    // No IDs: nothing is recorded, as before the scheduler starts.
+    cpu_id: || 0,
+    task_id: || 0,
 };
 
 fn depth() -> u32 {

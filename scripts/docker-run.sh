@@ -10,13 +10,15 @@ FEOS_ARCH="${FEOS_ARCH:-arm}"
 
 case "$FEOS_ARCH" in
     arm|aarch64)
-        TARGET="aarch64-unknown-none"
-        KERNEL="target/$TARGET/release/feos"
+        KERNEL="target/aarch64-unknown-none/release/feos"
+        USER_BUILD="make user-arm"
+        BUILD="cargo build --release --target aarch64-unknown-none"
         RUNNER="./scripts/qemu.sh"
         ;;
     x64|x86_64)
-        TARGET="x86_64-unknown-none"
-        KERNEL="target/$TARGET/release/feos"
+        KERNEL="target/x86_64-feos/release/feos"
+        USER_BUILD="make user-x64"
+        BUILD="./scripts/cargo-x64.sh build --release"
         RUNNER="./scripts/qemu-x64.sh"
         ;;
     *)
@@ -44,5 +46,6 @@ else
     rm -f boards/qemu-virt/disk-fat32.img boards/qemu-virt/disk-exfat.img
 fi
 
-cargo build --release --target "$TARGET"
+$USER_BUILD
+$BUILD
 exec "$RUNNER" "$KERNEL"

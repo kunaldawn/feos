@@ -53,7 +53,7 @@ fn zip_reader_survives_mutated_archives() {
                 if entry.method == 0 {
                     assert_eq!(entry.compressed_size, entry.uncompressed_size);
                 }
-                assert!(entry.uncompressed_size as u64 <= (input.len() as u64 + 1) * 1032);
+                assert!(entry.uncompressed_size <= (input.len() as u64 + 1) * 1032);
                 let _ = entry.extract(&mut out);
             }
         });

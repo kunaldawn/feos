@@ -229,6 +229,11 @@ impl Opl3Device {
         samples
     }
 
+    /// The operators that still make sound: keyed on, or not yet fully released.
+    pub fn active_voice_count(&self) -> usize {
+        self.inner_chip.active_voice_count()
+    }
+
     /// Read a byte from the OPL3 device's Status register.
     /// The Nuked-OPL3 library does not natively provide emulation of the OPL3 status register.
     /// The status register contains bits that indicate the status of the OPL3's timers. To properly

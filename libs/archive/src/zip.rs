@@ -7,6 +7,7 @@
 use core::str;
 
 use feos_compress::checksum::crc32;
+use feos_compress::Crc32;
 use feos_compress::deflate;
 
 use crate::error::{buffer_error, need, ArchiveError, Result};
@@ -56,11 +57,11 @@ pub struct ZipEntry<'a> {
     /// CRC-32 of the uncompressed data.
     pub crc32: u32,
     /// Compressed size in bytes.
-    pub compressed_size: u32,
+    pub compressed_size: u64,
     /// Uncompressed size in bytes.
-    pub uncompressed_size: u32,
+    pub uncompressed_size: u64,
     /// Offset of the local header in the archive.
-    pub local_offset: u32,
+    pub local_offset: u64,
     /// Raw external attributes.
     pub external_attrs: u32,
     /// Raw name bytes from the central directory.
@@ -95,14 +96,14 @@ impl<'a> ZipEntry<'a> {
         if self.is_encrypted() {
             return Err(ArchiveError::UnsupportedFeature("encrypted zip entry"));
         }
-        let expected = self.uncompressed_size as usize;
+        let expected = usize::try_from(self.uncompressed_size).map_err(|_| ArchiveError::Overflow)?;
         if out.len() < expected {
             return Err(buffer_error(expected, out.len()));
         }
 
         let written = match self.method {
             METHOD_STORED => {
-                if self.compressed_size as usize != expected {
+                if self.compressed_size != self.uncompressed_size {
                     return Err(ArchiveError::InvalidData(
                         "stored zip entry has mismatched sizes",
                     ));
@@ -126,6 +127,68 @@ impl<'a> ZipEntry<'a> {
         }
         Ok(written)
     }
+
+    /// Extracts the member piece by piece, for one too large to hold in memory.
+    ///
+    /// `window` must be at least [`feos_compress::WINDOW_SIZE`] bytes. `sink` gets
+    /// the data in order, and the size and CRC-32 are verified at the end, so a
+    /// caller should treat what it received as unconfirmed until this returns.
+    pub fn extract_to(
+        &self,
+        window: &mut [u8],
+        sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<u64> {
+        if self.is_encrypted() {
+            return Err(ArchiveError::UnsupportedFeature("encrypted zip entry"));
+        }
+        let mut crc = Crc32::new();
+        let mut produced = 0u64;
+        let mut failure = None;
+        match self.method {
+            METHOD_STORED => {
+                crc.update(self.data);
+                produced = self.data.len() as u64;
+                sink(self.data)?;
+            }
+            METHOD_DEFLATE => {
+                let mut rest = self.data;
+                let mut input = |buffer: &mut [u8]| -> feos_compress::Result<usize> {
+                    let take = buffer.len().min(rest.len());
+                    buffer[..take].copy_from_slice(&rest[..take]);
+                    rest = &rest[take..];
+                    Ok(take)
+                };
+                let mut output = |chunk: &[u8]| -> feos_compress::Result<()> {
+                    crc.update(chunk);
+                    produced += chunk.len() as u64;
+                    match sink(chunk) {
+                        Ok(()) => Ok(()),
+                        Err(error) => {
+                            failure = Some(error);
+                            Err(feos_compress::CompressError::Overflow)
+                        }
+                    }
+                };
+                let result = feos_compress::inflate_stream(&mut input, window, &mut output);
+                if let Some(error) = failure {
+                    return Err(error);
+                }
+                result?;
+            }
+            _ => {
+                return Err(ArchiveError::UnsupportedFeature(
+                    "zip compression method (only stored and deflate are supported)",
+                ))
+            }
+        }
+        if produced != self.uncompressed_size {
+            return Err(ArchiveError::InvalidData("zip size mismatch"));
+        }
+        if crc.finish() != self.crc32 {
+            return Err(ArchiveError::Checksum);
+        }
+        Ok(produced)
+    }
 }
 
 /// Iterates over the central directory of a ZIP archive.
@@ -133,8 +196,8 @@ pub struct ZipReader<'a> {
     data: &'a [u8],
     central: usize,
     central_end: usize,
-    count: u16,
-    index: u16,
+    count: u64,
+    index: u64,
 }
 
 impl<'a> ZipReader<'a> {
@@ -160,16 +223,24 @@ impl<'a> ZipReader<'a> {
                 "zip entry counts disagree between disks",
             ));
         }
-        if total == 0xffff || central_size == 0xffff_ffff || central_offset == 0xffff_ffff {
-            return Err(ArchiveError::UnsupportedFeature("zip64 archive"));
-        }
+        let (total, central_size, central_offset, directory_end) =
+            if total == 0xffff || central_size == 0xffff_ffff || central_offset == 0xffff_ffff {
+                read_zip64_end(data, eocd)?
+            } else {
+                (total as u64, central_size as u64, central_offset as u64, eocd)
+            };
 
-        let central = central_offset as usize;
+        let central = usize::try_from(central_offset).map_err(|_| ArchiveError::Overflow)?;
+        let central_size = usize::try_from(central_size).map_err(|_| ArchiveError::Overflow)?;
         let central_end = central
-            .checked_add(central_size as usize)
+            .checked_add(central_size)
             .ok_or(ArchiveError::Overflow)?;
-        need(data.len(), central, central_size as usize)?;
-        if central_end > eocd {
+        need(data.len(), central, central_size)?;
+        // Every record takes room, so a count can't be believed past what fits.
+        if total > (central_size / CENTRAL_HEADER_LEN) as u64 {
+            return Err(ArchiveError::InvalidData("zip entry count exceeds its directory"));
+        }
+        if central_end > directory_end {
             return Err(ArchiveError::InvalidData(
                 "zip central directory overlaps its end record",
             ));
@@ -213,25 +284,40 @@ impl<'a> ZipReader<'a> {
         let flags = u16::from_le_bytes([header[8], header[9]]);
         let method = u16::from_le_bytes([header[10], header[11]]);
         let crc = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
-        let compressed_size = u32::from_le_bytes([header[20], header[21], header[22], header[23]]);
+        let compressed_size =
+            u32::from_le_bytes([header[20], header[21], header[22], header[23]]) as u64;
         let uncompressed_size =
-            u32::from_le_bytes([header[24], header[25], header[26], header[27]]);
+            u32::from_le_bytes([header[24], header[25], header[26], header[27]]) as u64;
         let name_len = u16::from_le_bytes([header[28], header[29]]) as usize;
         let extra_len = u16::from_le_bytes([header[30], header[31]]) as usize;
         let comment_len = u16::from_le_bytes([header[32], header[33]]) as usize;
         let disk_start = u16::from_le_bytes([header[34], header[35]]);
         let external_attrs = u32::from_le_bytes([header[38], header[39], header[40], header[41]]);
-        let local_offset = u32::from_le_bytes([header[42], header[43], header[44], header[45]]);
+        let local_offset =
+            u32::from_le_bytes([header[42], header[43], header[44], header[45]]) as u64;
 
         if disk_start != 0 {
             return Err(ArchiveError::UnsupportedFeature("multi-disk zip entry"));
         }
-        if compressed_size == 0xffff_ffff
-            || uncompressed_size == 0xffff_ffff
-            || local_offset == 0xffff_ffff
-        {
-            return Err(ArchiveError::UnsupportedFeature("zip64 entry"));
-        }
+
+        // The name's and extra field's positions don't depend on the sizes, and
+        // the record's bounds are checked below before anything uses them.
+        let extra_start = (self.central + CENTRAL_HEADER_LEN)
+            .checked_add(name_len)
+            .ok_or(ArchiveError::Overflow)?;
+        let extra = extra_start
+            .checked_add(extra_len)
+            .filter(|&end| end <= self.central_end)
+            .and_then(|end| self.data.get(extra_start..end))
+            .ok_or(ArchiveError::InvalidData(
+                "zip central directory record overruns directory",
+            ))?;
+        let (uncompressed_size, compressed_size, local_offset) =
+            if uncompressed_size == WIDE || compressed_size == WIDE || local_offset == WIDE {
+                wide_fields(extra, uncompressed_size, compressed_size, local_offset)?
+            } else {
+                (uncompressed_size, compressed_size, local_offset)
+            };
 
         // Callers size allocations from these fields, so an entry whose sizes
         // can't be true is rejected here rather than on extraction.
@@ -240,8 +326,8 @@ impl<'a> ZipReader<'a> {
             // A method this reader can't extract gets the same bound, since a
             // caller may allocate before it finds that out.
             _ => {
-                uncompressed_size as u64
-                    > (compressed_size as u64)
+                uncompressed_size
+                    > compressed_size
                         .saturating_mul(DEFLATE_MAX_RATIO)
                         .saturating_add(DEFLATE_RATIO_SLACK)
             }
@@ -272,7 +358,9 @@ impl<'a> ZipReader<'a> {
         }
         let name = &self.data[name_start..name_end];
 
-        let local = local_offset as usize;
+        let local = usize::try_from(local_offset).map_err(|_| ArchiveError::Overflow)?;
+        let compressed_len =
+            usize::try_from(compressed_size).map_err(|_| ArchiveError::Overflow)?;
         need(self.data.len(), local, LOCAL_HEADER_LEN)?;
         if self.data[local..local + 4] != LOCAL_SIGNATURE {
             return Err(ArchiveError::InvalidData("bad zip local header signature"));
@@ -285,9 +373,9 @@ impl<'a> ZipReader<'a> {
             .and_then(|value| value.checked_add(local_extra_len))
             .ok_or(ArchiveError::Overflow)?;
         let data_end = data_start
-            .checked_add(compressed_size as usize)
+            .checked_add(compressed_len)
             .ok_or(ArchiveError::Overflow)?;
-        need(self.data.len(), data_start, compressed_size as usize)?;
+        need(self.data.len(), data_start, compressed_len)?;
 
         self.central = record_end;
         self.index += 1;
@@ -304,6 +392,83 @@ impl<'a> ZipReader<'a> {
             data: &self.data[data_start..data_end],
         }))
     }
+}
+
+/// A central-directory field too large for 32 bits, with the value in the extra.
+const WIDE: u64 = 0xffff_ffff;
+/// `zip64 extended information`, the extra field that holds those values.
+const EXTRA_ZIP64: u16 = 0x0001;
+const ZIP64_LOCATOR_LEN: usize = 20;
+const ZIP64_LOCATOR_SIGNATURE: [u8; 4] = [b'P', b'K', 6, 7];
+const ZIP64_END_SIGNATURE: [u8; 4] = [b'P', b'K', 6, 6];
+const ZIP64_END_LEN: usize = 56;
+
+fn u64_at(data: &[u8], offset: usize) -> Result<u64> {
+    need(data.len(), offset, 8)?;
+    let low = u32_at(data, offset)? as u64;
+    let high = u32_at(data, offset + 4)? as u64;
+    Ok(low | high << 32)
+}
+
+/// Reads the ZIP64 end record: entries, directory size and offset, and where the
+/// directory has to end.
+fn read_zip64_end(data: &[u8], eocd: usize) -> Result<(u64, u64, u64, usize)> {
+    let locator = eocd
+        .checked_sub(ZIP64_LOCATOR_LEN)
+        .ok_or(ArchiveError::InvalidData("zip64 archive without a locator"))?;
+    if data[locator..locator + 4] != ZIP64_LOCATOR_SIGNATURE {
+        return Err(ArchiveError::InvalidData("zip64 archive without a locator"));
+    }
+    if u32_at(data, locator + 4)? != 0 || u32_at(data, locator + 16)? > 1 {
+        return Err(ArchiveError::UnsupportedFeature("multi-disk zip archive"));
+    }
+    let end = usize::try_from(u64_at(data, locator + 8)?).map_err(|_| ArchiveError::Overflow)?;
+    need(data.len(), end, ZIP64_END_LEN)?;
+    if end >= locator || data[end..end + 4] != ZIP64_END_SIGNATURE {
+        return Err(ArchiveError::InvalidData("bad zip64 end of central directory"));
+    }
+    if u32_at(data, end + 16)? != 0 || u32_at(data, end + 20)? != 0 {
+        return Err(ArchiveError::UnsupportedFeature("multi-disk zip archive"));
+    }
+    let on_disk = u64_at(data, end + 24)?;
+    let total = u64_at(data, end + 32)?;
+    if on_disk != total {
+        return Err(ArchiveError::InvalidData(
+            "zip entry counts disagree between disks",
+        ));
+    }
+    Ok((total, u64_at(data, end + 40)?, u64_at(data, end + 48)?, end))
+}
+
+/// Replaces saturated fields with their real values from the ZIP64 extra. Only
+/// saturated fields are present there, in this order.
+fn wide_fields(
+    mut extra: &[u8],
+    uncompressed: u64,
+    compressed: u64,
+    offset: u64,
+) -> Result<(u64, u64, u64)> {
+    while extra.len() >= 4 {
+        let id = u16::from_le_bytes([extra[0], extra[1]]);
+        let len = u16::from_le_bytes([extra[2], extra[3]]) as usize;
+        let body = extra
+            .get(4..4 + len)
+            .ok_or(ArchiveError::InvalidData("zip extra field overruns its record"))?;
+        if id == EXTRA_ZIP64 {
+            let mut at = 0usize;
+            let mut take = |value: u64| -> Result<u64> {
+                if value != WIDE {
+                    return Ok(value);
+                }
+                let wide = u64_at(body, at)?;
+                at += 8;
+                Ok(wide)
+            };
+            return Ok((take(uncompressed)?, take(compressed)?, take(offset)?));
+        }
+        extra = &extra[4 + len..];
+    }
+    Err(ArchiveError::InvalidData("zip64 entry without its extra field"))
 }
 
 fn find_eocd(data: &[u8]) -> Result<usize> {

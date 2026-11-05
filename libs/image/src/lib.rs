@@ -13,6 +13,7 @@
 //! | PNG    | yes (non-interlaced and Adam7; 1/2/4/8/16-bit; palette, gray, RGB, RGBA) | RGBA, uncompressed zlib |
 //! | JPEG   | baseline, extended sequential and progressive, 8-bit; gray, YCbCr, RGB, CMYK, YCCK | no |
 //! | BMP    | 1/4/8/16/24/32-bit uncompressed, bitfields, RLE8 and RLE4 | 24-bit |
+//! | ICO    | PNG and 1/4/8/24/32-bit DIB payloads, with the AND mask | no |
 //! | PNM    | P1-P6 ASCII and binary, 8/16-bit | P6 |
 //! | QOI    | yes | yes |
 //!
@@ -37,6 +38,7 @@ extern crate alloc;
 
 pub mod bmp;
 mod error;
+pub mod ico;
 pub mod jpeg;
 pub mod png;
 pub mod ppm;
@@ -53,6 +55,8 @@ pub enum ImageFormat {
     Jpeg,
     /// Windows bitmap.
     Bmp,
+    /// Windows icon.
+    Ico,
     /// Netpbm PBM, PGM and PPM (P1 to P6).
     Ppm,
     /// Quite OK Image format.
@@ -66,6 +70,7 @@ impl ImageFormat {
             Self::Png => "png",
             Self::Jpeg => "jpeg",
             Self::Bmp => "bmp",
+            Self::Ico => "ico",
             Self::Ppm => "ppm",
             Self::Qoi => "qoi",
         }
@@ -101,6 +106,8 @@ pub fn detect(input: &[u8]) -> Option<ImageFormat> {
         Some(ImageFormat::Jpeg)
     } else if input.starts_with(b"BM") {
         Some(ImageFormat::Bmp)
+    } else if ico::is_magic(input) {
+        Some(ImageFormat::Ico)
     } else if input.starts_with(b"qoif") {
         Some(ImageFormat::Qoi)
     } else if ppm::is_magic(input) {
@@ -116,6 +123,7 @@ pub fn info(input: &[u8]) -> Result<ImageInfo> {
         ImageFormat::Png => png::info(input),
         ImageFormat::Jpeg => jpeg::info(input),
         ImageFormat::Bmp => bmp::info(input),
+        ImageFormat::Ico => ico::info(input),
         ImageFormat::Ppm => ppm::info(input),
         ImageFormat::Qoi => qoi::info(input),
     }
@@ -130,6 +138,7 @@ pub fn scratch_len(input: &[u8]) -> Result<usize> {
         ImageFormat::Png => png::scratch_len(input),
         ImageFormat::Jpeg => jpeg::scratch_len(input),
         ImageFormat::Bmp => bmp::scratch_len(input),
+        ImageFormat::Ico => ico::scratch_len(input),
         ImageFormat::Ppm => ppm::scratch_len(input),
         ImageFormat::Qoi => qoi::scratch_len(input),
     }
@@ -144,6 +153,7 @@ pub fn decode<'a>(input: &[u8], out: &'a mut [u8], scratch: &mut [u8]) -> Result
         ImageFormat::Png => png::decode(input, out, scratch),
         ImageFormat::Jpeg => jpeg::decode(input, out),
         ImageFormat::Bmp => bmp::decode(input, out),
+        ImageFormat::Ico => ico::decode(input, out, scratch),
         ImageFormat::Ppm => ppm::decode(input, out),
         ImageFormat::Qoi => qoi::decode(input, out),
     }

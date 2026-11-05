@@ -12,6 +12,8 @@
 
 #![cfg_attr(not(test), no_std)]
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use feos_hal::{Keyboard, KeyboardEvent, Pointer, PointerEvent};
 use feos_port_io::{inb, outb};
 use feos_sync::SpinLock;
@@ -41,6 +43,10 @@ const ACK: u8 = 0xfa;
 const MOUSE_ID_WHEEL: u8 = 3;
 /// The sample-rate sequence that asks a mouse to enter IntelliMouse mode.
 const WHEEL_KNOCK: [u8; 3] = [200, 100, 80];
+
+/// A mouse sends a packet's bytes about a millisecond apart. A partial packet this
+/// much older than now lost a byte, and whatever comes next starts a new one.
+const STALE_PACKET_MS: u64 = 50;
 
 /// Mouse packet flag bits.
 const PACKET_ALWAYS_SET: u8 = 1 << 3;
@@ -79,6 +85,8 @@ struct State {
     pause_bytes: u8,
 
     mouse_packet: [u8; 4],
+    /// When the last byte of a partial packet arrived.
+    mouse_last_ms: u64,
     mouse_len: usize,
     /// Bytes in a mouse packet: 3, or 4 with a wheel.
     packet_size: usize,
@@ -106,6 +114,7 @@ impl State {
         extended: false,
         pause_bytes: 0,
         mouse_packet: [0; 4],
+        mouse_last_ms: 0,
         mouse_len: 0,
         packet_size: 3,
         left: false,
@@ -174,6 +183,18 @@ impl State {
         self.pointer_head = (self.pointer_head + 1) % POINTER_QUEUE;
         self.pointer_count -= 1;
         Some(event)
+    }
+
+    /// [`push_mouse`](Self::push_mouse), first dropping a partial packet that's
+    /// been waiting too long. The marker bit in a packet's first byte only catches
+    /// a lost byte by luck: the bytes after one can have that bit set too, and every
+    /// packet from there on would decode shifted.
+    fn push_mouse_at(&mut self, byte: u8, now_ms: u64) {
+        if self.mouse_len != 0 && now_ms.saturating_sub(self.mouse_last_ms) > STALE_PACKET_MS {
+            self.mouse_len = 0;
+        }
+        self.mouse_last_ms = now_ms;
+        self.push_mouse(byte);
     }
 
     fn push_mouse(&mut self, byte: u8) {
@@ -254,6 +275,12 @@ impl State {
 /// The i8042 controller and its decoded state.
 pub struct I8042 {
     state: SpinLock<State>,
+    /// Milliseconds since boot, for telling a slow packet from a broken one.
+    clock: AtomicUsize,
+}
+
+fn no_clock() -> u64 {
+    0
 }
 
 impl I8042 {
@@ -261,7 +288,24 @@ impl I8042 {
     pub const fn new() -> Self {
         Self {
             state: SpinLock::new(State::EMPTY),
+            clock: AtomicUsize::new(0),
         }
+    }
+
+    /// Gives the driver a clock, in milliseconds. Without one, a lost mouse byte is
+    /// only noticed when the marker bit happens to catch it.
+    pub fn set_clock(&self, clock: fn() -> u64) {
+        self.clock.store(clock as usize, Ordering::Release);
+    }
+
+    fn now_ms(&self) -> u64 {
+        let clock = match self.clock.load(Ordering::Acquire) {
+            0 => no_clock,
+            // SAFETY: only `set_clock` writes this, with a valid function pointer,
+            // and a function pointer is `usize`-sized.
+            address => unsafe { core::mem::transmute::<usize, fn() -> u64>(address) },
+        };
+        clock()
     }
 
     /// Initialises the controller and both devices.
@@ -389,7 +433,7 @@ impl I8042 {
             }
             let byte = read_data();
             if status & STATUS_AUX_DATA != 0 {
-                state.push_mouse(byte);
+                state.push_mouse_at(byte, self.now_ms());
             } else {
                 decode_keyboard(state, byte);
             }
@@ -565,6 +609,36 @@ mod tests {
         for &byte in bytes {
             state.push_mouse(byte);
         }
+    }
+
+    #[test]
+    fn a_lost_byte_stops_at_the_next_quiet_moment() {
+        // DRV-16: every byte here has the marker bit, so it can't catch this. The
+        // second packet has lost a byte, and would otherwise take the third's first
+        // and shift everything after it.
+        let mut state = state();
+        for (time, byte) in [(0, 0x08u8), (1, 8), (2, 0), (100, 0x08), (101, 8)] {
+            state.push_mouse_at(byte, time);
+        }
+        assert_eq!(state.mouse_len, 2);
+        for (time, byte) in [(200, 0x09u8), (201, 0), (202, 0)] {
+            state.push_mouse_at(byte, time);
+        }
+        let moved = state.pop_pointer().unwrap();
+        assert_eq!(moved.x, 108);
+        let pressed = state.pop_pointer().unwrap();
+        assert_eq!(pressed.left, Some(true));
+        assert_eq!(pressed.x, 108);
+        assert_eq!(state.pop_pointer(), None);
+    }
+
+    #[test]
+    fn slow_bytes_within_the_limit_still_make_a_packet() {
+        let mut state = state();
+        for (time, byte) in [(0, 0x08u8), (STALE_PACKET_MS, 3), (2 * STALE_PACKET_MS, 0)] {
+            state.push_mouse_at(byte, time);
+        }
+        assert_eq!(state.pop_pointer().unwrap().x, 103);
     }
 
     #[test]

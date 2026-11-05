@@ -2,8 +2,9 @@
  * Linker script for QEMU's x86_64 PC machine.
  *
  * QEMU's multiboot loader reads the load addresses from the multiboot header
- * in the first 8 KiB of the flat image. The image is linked at 1 MiB, the
- * traditional PC kernel load address.
+ * in the first 8 KiB of the flat image. The image is linked at 32 MiB, not the
+ * traditional 1 MiB, because UEFI firmware keeps memory of its own past that: OVMF
+ * has ACPI NVS at 8 MiB. Memory.rs still hands out what's below the image.
  */
 ENTRY(_start)
 
@@ -12,7 +13,7 @@ __early_uart = 0x3f8;
 
 SECTIONS
 {
-    . = 0x100000;
+    . = 0x2000000;
     __kernel_start = .;
 
     .multiboot : {
@@ -47,7 +48,7 @@ SECTIONS
         __bss_end = .;
     }
 
-    .stack (NOLOAD) : ALIGN(16) {
+    .stack (NOLOAD) : ALIGN(4K) {
         /* Never used. An overflow lands here first, which leaves the scheduler's
          * tick time to notice it before .bss is overwritten. */
         . += 0x40000;
@@ -65,7 +66,7 @@ SECTIONS
     }
 }
 
-ASSERT(__kernel_start == 0x100000, "the kernel must link at the multiboot load address")
+ASSERT(__kernel_start == 0x2000000, "the kernel must link at the multiboot load address")
 ASSERT(ADDR(.multiboot) - __kernel_start < 8192, "the multiboot header must be in the first 8 KiB")
 ASSERT(__load_end <= __bss_start, "file-backed data must end before .bss")
 ASSERT(__stack_top - __stack_bottom >= 0x40000, "the boot stack shrank")

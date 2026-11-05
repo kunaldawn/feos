@@ -16,7 +16,7 @@ use core::ops::Bound;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use feos_fs::FileSystem;
+use feos_fs::{FileKind, FileSystem, VfsTree};
 
 /// What a filesystem entry is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -68,6 +68,14 @@ pub enum FsError {
     NoSpace,
     /// The path is nested too deeply.
     TooDeep,
+    /// The filesystem or the file refuses writes.
+    ReadOnly,
+    /// The disk failed, or what's on it makes no sense.
+    Io,
+    /// Something is using it.
+    Busy,
+    /// Symbolic links went round too many times.
+    Loop,
 }
 
 impl FsError {
@@ -83,6 +91,10 @@ impl FsError {
             Self::NotSupported => "Operation not supported",
             Self::NoSpace => "No space left on device",
             Self::TooDeep => "Path is nested too deeply",
+            Self::ReadOnly => "Read-only file system",
+            Self::Io => "Input/output error",
+            Self::Busy => "Device or resource busy",
+            Self::Loop => "Too many levels of symbolic links",
         }
     }
 }
@@ -144,6 +156,41 @@ pub trait Vfs {
         self.meta(path)
             .map(|meta| meta.kind == Kind::Dir)
             .unwrap_or(false)
+    }
+
+    /// Timestamps of `path`, where the filesystem keeps them.
+    fn times(&self, _path: &str) -> Option<feos_fs::NodeTimes> {
+        None
+    }
+
+    /// Sets whichever timestamps are `Some`.
+    fn set_times(&mut self, _path: &str, _times: feos_fs::NodeTimes) -> Result<(), FsError> {
+        Err(FsError::NotSupported)
+    }
+
+    /// Size and free space of the filesystem holding `path`.
+    fn statfs(&self, _path: &str) -> Result<feos_fs::VolumeStats, FsError> {
+        Err(FsError::NotSupported)
+    }
+
+    /// Creates a symbolic link at `path` pointing at `target`.
+    fn symlink(&mut self, _target: &str, _path: &str) -> Result<(), FsError> {
+        Err(FsError::NotSupported)
+    }
+
+    /// The target of the symbolic link at `path`.
+    fn read_link(&self, _path: &str) -> Result<String, FsError> {
+        Err(FsError::NotSupported)
+    }
+
+    /// Makes every change so far durable.
+    fn sync(&mut self) -> Result<(), FsError> {
+        Ok(())
+    }
+
+    /// What's mounted, root first. Empty when there's no shared tree.
+    fn mounts(&self) -> Vec<feos_fs::vfs::MountInfo> {
+        Vec::new()
     }
 }
 
@@ -221,6 +268,8 @@ enum Node {
     Dir,
     /// A character device that reads as empty and discards writes.
     Null,
+    /// A character device that reads as endless zeros and discards writes.
+    Zero,
     Tombstone,
 }
 
@@ -252,7 +301,13 @@ fn copy_bytes(data: &[u8]) -> Result<Vec<u8>, FsError> {
 }
 
 /// An overlay filesystem with an optional read-only base image.
+///
+/// When `base` is the system's shared tree, the overlay holds no files of its
+/// own: every operation goes straight to the tree, and only the working
+/// directory stays per-shell. That's how every shell and Explorer see one set of
+/// files. See [`feos_fs::VfsTree`].
 pub struct OverlayFs {
+    shared: Option<&'static dyn VfsTree>,
     base: Option<&'static dyn FileSystem>,
     nodes: BTreeMap<String, Node>,
     cwd: String,
@@ -264,11 +319,26 @@ impl OverlayFs {
     /// Creates a filesystem backed by `base` when one is available.
     pub fn new(base: Option<&'static dyn FileSystem>) -> Self {
         Self {
+            shared: base.and_then(|base| base.tree()),
             base,
             nodes: BTreeMap::new(),
             cwd: String::from("/"),
             used: 0,
             quota: DEFAULT_QUOTA,
+        }
+    }
+
+    /// A view for another task, starting in the same directory. Over the shared
+    /// tree it sees the same files. An overlay of its own can only be copied, so
+    /// what the copy writes stays with the copy.
+    pub fn fork(&self) -> Self {
+        Self {
+            shared: self.shared,
+            base: self.base,
+            nodes: self.nodes.clone(),
+            cwd: self.cwd.clone(),
+            used: self.used,
+            quota: self.quota,
         }
     }
 
@@ -286,11 +356,28 @@ impl OverlayFs {
     /// how `/dev/null` exists on a filesystem with no device layer.
     pub fn add_null_device(&mut self, path: &str) -> Result<(), FsError> {
         let path = normalize(&self.cwd, path);
+        if let Some(tree) = self.shared {
+            return shared_device(tree, &path, feos_fs::vfs::DeviceKind::Null);
+        }
         if self.effective_meta(parent(&path))?.kind != Kind::Dir {
             return Err(FsError::NotDir);
         }
         self.drop_file_bytes(&path);
         self.nodes.insert(path, Node::Null);
+        Ok(())
+    }
+
+    /// Creates a device node that reads as endless zeros and discards writes.
+    pub fn add_zero_device(&mut self, path: &str) -> Result<(), FsError> {
+        let path = normalize(&self.cwd, path);
+        if let Some(tree) = self.shared {
+            return shared_device(tree, &path, feos_fs::vfs::DeviceKind::Zero);
+        }
+        if self.effective_meta(parent(&path))?.kind != Kind::Dir {
+            return Err(FsError::NotDir);
+        }
+        self.drop_file_bytes(&path);
+        self.nodes.insert(path, Node::Zero);
         Ok(())
     }
 
@@ -394,7 +481,7 @@ impl OverlayFs {
                     kind: Kind::Dir,
                     size: 0,
                 }),
-                Node::Null => Ok(Meta {
+                Node::Null | Node::Zero => Ok(Meta {
                     kind: Kind::File,
                     size: 0,
                 }),
@@ -464,7 +551,7 @@ impl Node {
     fn clone_kind(&self) -> NodeKind {
         match self {
             Node::File(data) => NodeKind::File(data.len()),
-            Node::Null => NodeKind::File(0),
+            Node::Null | Node::Zero => NodeKind::File(0),
             Node::Dir => NodeKind::Dir,
             Node::Tombstone => NodeKind::Tombstone,
         }
@@ -478,7 +565,10 @@ impl Vfs for OverlayFs {
 
     fn chdir(&mut self, path: &str) -> Result<(), FsError> {
         let path = normalize(&self.cwd, path);
-        let meta = self.effective_meta(&path)?;
+        let meta = match self.shared {
+            Some(tree) => shared_meta(tree, &path)?,
+            None => self.effective_meta(&path)?,
+        };
         if meta.kind != Kind::Dir {
             return Err(FsError::NotDir);
         }
@@ -489,7 +579,10 @@ impl Vfs for OverlayFs {
     fn meta(&self, path: &str) -> Result<Meta, FsError> {
         let insists_on_dir = wants_dir(path);
         let path = normalize(&self.cwd, path);
-        let meta = self.effective_meta(&path)?;
+        let meta = match self.shared {
+            Some(tree) => shared_meta(tree, &path)?,
+            None => self.effective_meta(&path)?,
+        };
         if insists_on_dir && meta.kind != Kind::Dir {
             return Err(FsError::NotDir);
         }
@@ -499,6 +592,12 @@ impl Vfs for OverlayFs {
     fn read_file(&mut self, path: &str) -> Result<Vec<u8>, FsError> {
         let insists_on_dir = wants_dir(path);
         let path = normalize(&self.cwd, path);
+        if let Some(tree) = self.shared {
+            if insists_on_dir && shared_meta(tree, &path)?.kind != Kind::Dir {
+                return Err(FsError::NotDir);
+            }
+            return shared_read_file(tree, &path);
+        }
         let meta = self.effective_meta(&path)?;
         if meta.kind != Kind::File {
             return Err(FsError::IsDir);
@@ -513,6 +612,8 @@ impl Vfs for OverlayFs {
         match self.nodes.get(&path) {
             Some(Node::File(data)) => return copy_bytes(data),
             Some(Node::Null) => return Ok(Vec::new()),
+            // Reading all of an endless file can only end one way.
+            Some(Node::Zero) => return Err(FsError::NoSpace),
             _ => {}
         }
 
@@ -542,6 +643,12 @@ impl Vfs for OverlayFs {
     fn read_at(&mut self, path: &str, offset: usize, out: &mut [u8]) -> Result<usize, FsError> {
         let insists_on_dir = wants_dir(path);
         let path = normalize(&self.cwd, path);
+        if let Some(tree) = self.shared {
+            if insists_on_dir && shared_meta(tree, &path)?.kind != Kind::Dir {
+                return Err(FsError::NotDir);
+            }
+            return tree.read_at(&path, offset as u64, out).map_err(shared_error);
+        }
         let meta = self.effective_meta(&path)?;
         if meta.kind != Kind::File {
             return Err(FsError::IsDir);
@@ -557,6 +664,10 @@ impl Vfs for OverlayFs {
                 return Ok(count);
             }
             Some(Node::Null) => return Ok(0),
+            Some(Node::Zero) => {
+                out.fill(0);
+                return Ok(out.len());
+            }
             _ => {}
         }
         let base = self.base.ok_or(FsError::NotFound)?;
@@ -569,6 +680,16 @@ impl Vfs for OverlayFs {
         let path = normalize(&self.cwd, path);
         if path == "/" {
             return Err(FsError::IsDir);
+        }
+        if let Some(tree) = self.shared {
+            if insists_on_dir {
+                return match shared_meta(tree, &path) {
+                    Ok(meta) if meta.kind == Kind::Dir => Err(FsError::IsDir),
+                    Ok(_) => Err(FsError::NotDir),
+                    Err(_) => Err(FsError::IsDir),
+                };
+            }
+            return tree.write_file(&path, data, append).map_err(shared_error);
         }
         let parent = parent(&path);
         if self.effective_meta(parent)?.kind != Kind::Dir {
@@ -589,7 +710,7 @@ impl Vfs for OverlayFs {
         }
 
         match self.nodes.get_mut(&path) {
-            Some(Node::Null) => return Ok(()),
+            Some(Node::Null | Node::Zero) => return Ok(()),
             // Appending grows the file in place, so a loop of `>>` is linear.
             Some(Node::File(contents)) if append => {
                 match self.used.checked_add(data.len()) {
@@ -630,6 +751,9 @@ impl Vfs for OverlayFs {
         if path == "/" {
             return Err(FsError::Exists);
         }
+        if let Some(tree) = self.shared {
+            return tree.create_dir(&path).map_err(shared_error);
+        }
         let parent = parent(&path);
         if self.effective_meta(parent)?.kind != Kind::Dir {
             return Err(FsError::NotDir);
@@ -647,6 +771,17 @@ impl Vfs for OverlayFs {
     fn remove_file(&mut self, path: &str) -> Result<(), FsError> {
         let insists_on_dir = wants_dir(path);
         let path = normalize(&self.cwd, path);
+        if let Some(tree) = self.shared {
+            if insists_on_dir {
+                let stat = tree.lstat(&path).map_err(shared_error)?;
+                return Err(if stat.kind == FileKind::Directory {
+                    FsError::IsDir
+                } else {
+                    FsError::NotDir
+                });
+            }
+            return tree.remove_file(&path).map_err(shared_error);
+        }
         let meta = self.effective_meta(&path)?;
         if meta.kind == Kind::Dir {
             return Err(FsError::IsDir);
@@ -667,6 +802,11 @@ impl Vfs for OverlayFs {
         let path = normalize(&self.cwd, path);
         if path == "/" {
             return Err(FsError::InvalidPath);
+        }
+        if let Some(tree) = self.shared {
+            tree.remove_dir(&path).map_err(shared_error)?;
+            self.leave_removed(&path);
+            return Ok(());
         }
         let meta = self.effective_meta(&path)?;
         if meta.kind != Kind::Dir {
@@ -708,6 +848,10 @@ impl Vfs for OverlayFs {
             return Err(FsError::InvalidPath);
         }
 
+        if let Some(tree) = self.shared {
+            return tree.rename(&from, &to).map_err(shared_error);
+        }
+
         self.effective_meta(&from)?;
         let parent = parent(&to);
         if self.effective_meta(parent)?.kind != Kind::Dir {
@@ -724,6 +868,9 @@ impl Vfs for OverlayFs {
 
     fn read_dir(&mut self, path: &str) -> Result<Vec<DirEntry>, FsError> {
         let path = normalize(&self.cwd, path);
+        if let Some(tree) = self.shared {
+            return shared_read_dir(tree, &path);
+        }
         let meta = self.effective_meta(&path)?;
         if meta.kind != Kind::Dir {
             return Err(FsError::NotDir);
@@ -774,12 +921,16 @@ impl Vfs for OverlayFs {
         // run, and a child's own subtree can be skipped by jumping past it.
         let prefix = join(&path, "");
         let mut start = prefix.clone();
-        let mut bound = Bound::Included(start.as_str());
-        let mut skip_to: Option<String> = None;
+        let mut inclusive = true;
         loop {
+            let lower = if inclusive {
+                Bound::Included(start.as_str())
+            } else {
+                Bound::Excluded(start.as_str())
+            };
             let found = self
                 .nodes
-                .range::<str, _>((bound, Bound::Unbounded))
+                .range::<str, _>((lower, Bound::Unbounded))
                 .next()
                 .map(|(key, node)| (key.clone(), node.clone_kind()));
             let Some((key, node)) = found else {
@@ -789,12 +940,12 @@ impl Vfs for OverlayFs {
                 break;
             }
             let rest = &key[prefix.len()..];
-            match rest.find('/') {
+            let skip_to = match rest.find('/') {
                 Some(slash) => {
                     // `/` + 1 is `0`, the first key after this child's subtree.
                     let mut next = String::from(&key[..prefix.len() + slash]);
                     next.push('0');
-                    skip_to = Some(next);
+                    Some(next)
                 }
                 None => {
                     if !matches!(node, NodeKind::Tombstone) && !self.hidden(&key) {
@@ -806,17 +957,265 @@ impl Vfs for OverlayFs {
                         };
                         entries.insert(name.clone(), DirEntry { name, kind, size });
                     }
-                    skip_to = None;
+                    None
+                }
+            };
+            match skip_to {
+                Some(next) => {
+                    start = next;
+                    inclusive = true;
+                }
+                None => {
                     start = key;
+                    inclusive = false;
                 }
             }
-            bound = match &skip_to {
-                Some(next) => Bound::Included(next.as_str()),
-                None => Bound::Excluded(start.as_str()),
-            };
         }
 
         Ok(entries.into_iter().map(|(_, entry)| entry).collect())
+    }
+
+    fn times(&self, path: &str) -> Option<feos_fs::NodeTimes> {
+        let path = normalize(&self.cwd, path);
+        self.shared?.stat(&path).ok().map(|stat| stat.times)
+    }
+
+    fn set_times(&mut self, path: &str, times: feos_fs::NodeTimes) -> Result<(), FsError> {
+        let path = normalize(&self.cwd, path);
+        let tree = self.shared.ok_or(FsError::NotSupported)?;
+        tree.set_times(&path, times).map_err(shared_error)
+    }
+
+    fn statfs(&self, path: &str) -> Result<feos_fs::VolumeStats, FsError> {
+        let path = normalize(&self.cwd, path);
+        let tree = self.shared.ok_or(FsError::NotSupported)?;
+        tree.statfs(&path).map_err(shared_error)
+    }
+
+    fn symlink(&mut self, target: &str, path: &str) -> Result<(), FsError> {
+        let path = normalize(&self.cwd, path);
+        let tree = self.shared.ok_or(FsError::NotSupported)?;
+        tree.symlink(target, &path).map_err(shared_error)
+    }
+
+    fn read_link(&self, path: &str) -> Result<String, FsError> {
+        let path = normalize(&self.cwd, path);
+        let tree = self.shared.ok_or(FsError::NotSupported)?;
+        tree.read_link(&path).map_err(shared_error)
+    }
+
+    fn sync(&mut self) -> Result<(), FsError> {
+        match self.shared {
+            Some(tree) => tree.sync().map_err(shared_error),
+            None => Ok(()),
+        }
+    }
+
+    fn mounts(&self) -> Vec<feos_fs::vfs::MountInfo> {
+        self.shared.map_or_else(Vec::new, |tree| tree.mounts())
+    }
+}
+
+/// Maps the shared tree's errors onto the ones utilities report.
+fn shared_error(error: feos_fs::FsError) -> FsError {
+    use feos_fs::FsError as Tree;
+    match error {
+        Tree::NotFound | Tree::StaleHandle => FsError::NotFound,
+        Tree::NotDirectory => FsError::NotDir,
+        Tree::IsDirectory | Tree::NotFile => FsError::IsDir,
+        Tree::NameExists => FsError::Exists,
+        Tree::NotEmpty => FsError::NotEmpty,
+        Tree::InvalidName => FsError::InvalidPath,
+        Tree::Unsupported => FsError::NotSupported,
+        Tree::NoSpace | Tree::OutOfMemory | Tree::TooManyNodes => FsError::NoSpace,
+        Tree::TooDeep => FsError::TooDeep,
+        Tree::ReadOnly => FsError::ReadOnly,
+        Tree::Busy => FsError::Busy,
+        Tree::SymlinkLoop => FsError::Loop,
+        _ => FsError::Io,
+    }
+}
+
+fn shared_meta(tree: &dyn VfsTree, path: &str) -> Result<Meta, FsError> {
+    let stat = tree.stat(path).map_err(shared_error)?;
+    Ok(match stat.kind {
+        FileKind::Directory => Meta {
+            kind: Kind::Dir,
+            size: 0,
+        },
+        _ => Meta {
+            kind: Kind::File,
+            size: stat.size as usize,
+        },
+    })
+}
+
+fn shared_device(
+    tree: &dyn VfsTree,
+    path: &str,
+    kind: feos_fs::vfs::DeviceKind,
+) -> Result<(), FsError> {
+    if tree.stat(path).is_ok() {
+        return Ok(());
+    }
+    tree.make_device(path, kind).map_err(shared_error)
+}
+
+fn shared_read_file(tree: &dyn VfsTree, path: &str) -> Result<Vec<u8>, FsError> {
+    let meta = shared_meta(tree, path)?;
+    if meta.kind != Kind::File {
+        return Err(FsError::IsDir);
+    }
+    if meta.size > MAX_READ_BYTES {
+        return Err(FsError::NoSpace);
+    }
+    // Reading all of an endless file can only end one way.
+    if path == "/dev/zero" {
+        return Err(FsError::NoSpace);
+    }
+    let mut data = Vec::new();
+    data.try_reserve_exact(meta.size).map_err(|_| FsError::NoSpace)?;
+    data.resize(meta.size, 0);
+    let mut done = 0usize;
+    while done < meta.size {
+        let count = tree
+            .read_at(path, done as u64, &mut data[done..])
+            .map_err(shared_error)?;
+        if count == 0 {
+            // Someone truncated it meanwhile.
+            data.truncate(done);
+            break;
+        }
+        done += count;
+    }
+    Ok(data)
+}
+
+fn shared_read_dir(tree: &dyn VfsTree, path: &str) -> Result<Vec<DirEntry>, FsError> {
+    let listing = tree.read_dir(path).map_err(shared_error)?;
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(listing.len())
+        .map_err(|_| FsError::NoSpace)?;
+    for entry in listing {
+        // Utilities treat a link as what it points at, or a file if it's dangling.
+        let stat = match entry.stat.kind {
+            FileKind::Symlink => tree.stat(&join(path, &entry.name)).unwrap_or(entry.stat),
+            _ => entry.stat,
+        };
+        let (kind, size) = match stat.kind {
+            FileKind::Directory => (Kind::Dir, 0),
+            _ => (Kind::File, stat.size as usize),
+        };
+        entries.push(DirEntry {
+            name: entry.name,
+            kind,
+            size,
+        });
+    }
+    Ok(entries)
+}
+
+#[cfg(test)]
+mod shared_tests {
+    use super::*;
+    use feos_fs::vfs::RamFs;
+    use feos_fs::Vfs as Tree;
+
+    fn tree() -> &'static Tree {
+        Box::leak(Box::new(Tree::in_memory(1024 * 1024)))
+    }
+
+    #[test]
+    fn two_shells_and_a_reader_share_one_tree() {
+        let tree = tree();
+        let mut first = OverlayFs::new(Some(tree));
+        let mut second = OverlayFs::new(Some(tree));
+
+        first.write_file("/note", b"from the first", false).unwrap();
+        assert_eq!(second.read_file("/note").unwrap(), b"from the first");
+        second.write_file("/note", b" and second", true).unwrap();
+        assert_eq!(first.read_file("/note").unwrap(), b"from the first and second");
+
+        // What Explorer holds: the read-only face of the same tree.
+        let reader: &dyn FileSystem = tree;
+        let node = reader.resolve("/note").unwrap();
+        assert_eq!(reader.size(node), 25);
+
+        // Working directories stay each shell's own.
+        first.create_dir("/d").unwrap();
+        first.chdir("/d").unwrap();
+        assert_eq!(first.cwd(), "/d");
+        assert_eq!(second.cwd(), "/");
+        first.write_file("relative", b"x", false).unwrap();
+        assert!(second.exists("/d/relative"));
+
+        second.remove_file("/note").unwrap();
+        assert!(!first.exists("/note"));
+        assert!(reader.resolve("/note").is_none());
+    }
+
+    #[test]
+    fn behaves_like_the_overlay_for_the_errors_utilities_print() {
+        let mut fs = OverlayFs::new(Some(tree()));
+        fs.create_dir("/d").unwrap();
+        fs.write_file("/f", b"1", false).unwrap();
+        assert_eq!(fs.read_file("/missing"), Err(FsError::NotFound));
+        assert_eq!(fs.read_file("/d"), Err(FsError::IsDir));
+        assert_eq!(fs.read_file("/f/"), Err(FsError::NotDir));
+        assert_eq!(fs.meta("/f/").unwrap_err(), FsError::NotDir);
+        assert!(fs.meta("/d/").is_ok());
+        assert_eq!(fs.write_file("/d", b"x", false), Err(FsError::IsDir));
+        assert_eq!(fs.write_file("/new/", b"x", false), Err(FsError::IsDir));
+        assert_eq!(fs.write_file("/", b"x", false), Err(FsError::IsDir));
+        assert_eq!(fs.create_dir("/d"), Err(FsError::Exists));
+        assert_eq!(fs.create_dir("/"), Err(FsError::Exists));
+        assert_eq!(fs.remove_file("/d"), Err(FsError::IsDir));
+        assert_eq!(fs.remove_dir("/f"), Err(FsError::NotDir));
+        assert_eq!(fs.remove_dir("/"), Err(FsError::InvalidPath));
+        assert_eq!(fs.rename("/d", "/d/x"), Err(FsError::InvalidPath));
+        assert_eq!(fs.rename("/f", "/d"), Err(FsError::Exists));
+        assert_eq!(fs.chdir("/f"), Err(FsError::NotDir));
+        fs.write_file("/d/in", b"", false).unwrap();
+        assert_eq!(fs.remove_dir("/d"), Err(FsError::NotEmpty));
+
+        let names: Vec<String> = fs.read_dir("/").unwrap().into_iter().map(|e| e.name).collect();
+        assert_eq!(names, ["d", "f"]);
+    }
+
+    #[test]
+    fn devices_on_the_tree_act_like_the_overlays() {
+        let tree = tree();
+        let mut dev = RamFs::new(0);
+        dev.add_device(feos_fs::NodeId::ROOT, "null", feos_fs::vfs::DeviceKind::Null)
+            .unwrap();
+        feos_fs::VfsTree::mount(tree, "/dev", Box::new(dev), false, "dev").unwrap();
+        let mut fs = OverlayFs::new(Some(tree));
+        fs.add_null_device("/dev/null").unwrap();
+        fs.add_zero_device("/dev/zero").unwrap();
+        fs.write_file("/dev/null", b"gone", false).unwrap();
+        assert_eq!(fs.read_file("/dev/null").unwrap(), b"");
+        assert_eq!(fs.read_file("/dev/zero"), Err(FsError::NoSpace));
+        let mut out = [1u8; 3];
+        assert_eq!(fs.read_at("/dev/zero", 0, &mut out).unwrap(), 3);
+        assert_eq!(out, [0; 3]);
+    }
+
+    #[test]
+    fn a_link_lists_as_what_it_points_at() {
+        let mut fs = OverlayFs::new(Some(tree()));
+        fs.create_dir("/d").unwrap();
+        fs.write_file("/f", b"abc", false).unwrap();
+        fs.symlink("/d", "/to-dir").unwrap();
+        fs.symlink("/f", "/to-file").unwrap();
+        fs.symlink("/gone", "/dangling").unwrap();
+        let listing = fs.read_dir("/").unwrap();
+        let entry = |name: &str| listing.iter().find(|entry| entry.name == name).unwrap();
+        assert_eq!(entry("to-dir").kind, Kind::Dir);
+        assert_eq!((entry("to-file").kind, entry("to-file").size), (Kind::File, 3));
+        assert_eq!(entry("dangling").kind, Kind::File);
+        assert_eq!(fs.read_link("/to-file").unwrap(), "/f");
+        fs.remove_file("/dangling").unwrap();
     }
 }
 
