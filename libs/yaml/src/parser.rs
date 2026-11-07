@@ -400,14 +400,8 @@ impl<'a> Parser<'a> {
                     self.expect_end(text, used)?;
                     return Ok(id);
                 }
-                b'\'' => {
-                    let (scalar, used) = scan_single(text, 0, self.base_of(text))?;
-                    self.expect_end(text, used)?;
-                    return self.scalar_node(nodes, scalar);
-                }
-                b'"' => {
-                    let (scalar, used) = scan_double(text, 0, self.base_of(text))?;
-                    self.expect_end(text, used)?;
+                b'\'' | b'"' => {
+                    let scalar = self.scan_quoted(text, parent)?;
                     return self.scalar_node(nodes, scalar);
                 }
                 b'|' | b'>' => {
@@ -416,7 +410,93 @@ impl<'a> Parser<'a> {
                 _ => {}
             }
         }
-        self.scalar_node(nodes, YamlScalar::plain(text))
+        let scalar = self.scan_plain(text, parent)?;
+        self.scalar_node(nodes, scalar)
+    }
+
+    /// A quoted scalar that starts `text`, which may go on over the following lines. Those
+    /// have to be indented further than the collection it's in.
+    fn scan_quoted(&mut self, text: &'a str, parent: Option<usize>) -> Result<YamlScalar<'a>> {
+        let base = self.base_of(text);
+        let double = text.as_bytes()[0] == b'"';
+        // The rest of the document, as the closing quote can be anywhere in it.
+        let whole = &self.input[base..];
+        let (scalar, used) = if double {
+            scan_double(whole, 0, base)?
+        } else {
+            scan_single(whole, 0, base)?
+        };
+        if used <= text.len() {
+            self.expect_end(text, used)?;
+            return Ok(scalar);
+        }
+
+        // Each line it took has to belong here. The first is the line already consumed.
+        let end = base + used;
+        let mut start = self.pos;
+        while start < end {
+            let line_end = self.input[start..].find('\n').map_or(self.input.len(), |at| start + at);
+            let raw = &self.input[start..line_end];
+            let indent = raw.bytes().take_while(|byte| *byte == b' ').count();
+            if !raw.trim().is_empty() {
+                if parent.is_some_and(|parent| indent <= parent) {
+                    return Err(YamlError::InvalidIndentation { offset: start });
+                }
+                if parent.is_none() && indent == 0 && is_document_marker(raw.trim_end()) {
+                    return Err(YamlError::UnterminatedQuote { offset: base });
+                }
+            }
+            start = if line_end < self.input.len() { line_end + 1 } else { line_end };
+        }
+
+        // After the closing quote, only a comment can be on its line.
+        let line_end = self.input[end..].find('\n').map_or(self.input.len(), |at| end + at);
+        let tail = strip_comment(self.input[end..line_end].trim_start_matches([' ', '\t']));
+        let tail = tail.trim_end_matches('\r');
+        if !tail.is_empty() {
+            return Err(YamlError::UnexpectedToken {
+                offset: self.base_of(tail),
+                byte: tail.as_bytes()[0],
+            });
+        }
+        self.pos = if line_end < self.input.len() { line_end + 1 } else { line_end };
+        Ok(scalar)
+    }
+
+    /// A plain scalar that starts with `text`, taking in the more indented lines that
+    /// follow it, unless a comment has ended it. One that looks like a mapping entry
+    /// isn't taken, and whatever's reading the block rejects it: it's not valid here.
+    fn scan_plain(&mut self, text: &'a str, parent: Option<usize>) -> Result<YamlScalar<'a>> {
+        let base = self.base_of(text);
+        let first_line_end = self.input[base..].find('\n').map_or(self.input.len(), |at| base + at);
+        let first_line = self.input[base..first_line_end].trim_end();
+        if first_line.len() != text.len() {
+            // A comment, which ends the scalar.
+            return Ok(YamlScalar::plain(text));
+        }
+        let mut end = base + text.len();
+        loop {
+            let saved = self.pos;
+            let Some(line) = self.peek_line()? else {
+                break;
+            };
+            let deep_enough = parent.map_or(true, |parent| line.indent > parent);
+            let content = strip_comment(line.content);
+            if !deep_enough
+                || find_mapping_colon(content).is_some()
+                || (line.indent == 0 && is_document_marker(content))
+            {
+                // `peek_line` may have stepped over blank lines, which aren't ours now.
+                self.pos = saved;
+                break;
+            }
+            self.consume(line);
+            end = self.base_of(content) + content.len();
+            if content.len() != line.content.len() {
+                break;
+            }
+        }
+        Ok(YamlScalar::plain(&self.input[base..end]))
     }
 
     fn expect_end(&self, text: &str, used: usize) -> Result<()> {

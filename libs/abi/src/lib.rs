@@ -111,12 +111,62 @@ pub mod nr {
     pub const SURFACE_PRESENT: usize = 19;
     /// `poll_event(event: *mut Event) -> 0 or 1`: the window's next input event.
     pub const POLL_EVENT: usize = 20;
+    /// `getuid() -> uid`
+    pub const GETUID: usize = 21;
+    /// `getgid() -> gid`
+    pub const GETGID: usize = 22;
+    /// `setuid(uid, gid) -> 0`: only root may, and it's for good. A process and what it
+    /// starts have the same user.
+    pub const SETUID: usize = 23;
+    /// `stat(path, length, out: *mut Stat) -> 0`
+    pub const STAT: usize = 24;
+    /// `chmod(path, length, mode) -> 0`: the owner or root.
+    pub const CHMOD: usize = 25;
+    /// `chown(path, length, uid, gid) -> 0`: root, and [`KEEP`](crate::KEEP) leaves one as it is.
+    pub const CHOWN: usize = 26;
+    /// `mkdir(path, length) -> 0`
+    pub const MKDIR: usize = 27;
+    /// `unlink(path, length) -> 0`: a file, link or empty directory.
+    pub const UNLINK: usize = 28;
+    /// `link(existing, length, path, length) -> 0`: another name for a file.
+    pub const LINK: usize = 29;
+}
+
+/// Leaves the owner or group as it is, in [`nr::CHOWN`].
+pub const KEEP: usize = usize::MAX;
+
+/// What [`nr::STAT`] fills in.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct Stat {
+    /// Type and permission bits. On a filesystem with no owners, made up.
+    pub mode: u32,
+    /// Owner.
+    pub uid: u32,
+    /// Group.
+    pub gid: u32,
+    /// Names this has.
+    pub nlink: u32,
+    /// Size in bytes.
+    pub size: u64,
+    /// A number for this file, on its filesystem.
+    pub ino: u64,
+    /// One when the filesystem keeps owners and modes, and they're enforced.
+    pub posix: u32,
+    /// Always zero.
+    pub reserved: u32,
 }
 
 /// Error codes, returned negated.
 pub mod errno {
+    /// Only the owner or root may do that.
+    pub const EPERM: isize = 1;
     /// No such file or directory.
     pub const ENOENT: isize = 2;
+    /// The file's permissions say no.
+    pub const EACCES: isize = 13;
+    /// This filesystem can't do that.
+    pub const ENOTSUP: isize = 95;
     /// Input or output failed.
     pub const EIO: isize = 5;
     /// A bad file descriptor.

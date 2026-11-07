@@ -17,12 +17,14 @@
 //!   records who opened each stream, and closes those whose owner has gone.
 //! - The task exits when nothing has been open for a while, and any stream's
 //!   writes keep the device fed if someone kills it.
+//! - [`Capture`] is the other direction: one recorder at a time, in the device's format.
 
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
 
 pub mod core_mixer;
+pub mod wsola;
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -132,6 +134,57 @@ impl Drop for Stream {
     }
 }
 
+/// The task recording, or 0. There's one input, and one reader of it.
+static CAPTURE_OWNER: AtomicU32 = AtomicU32::new(0);
+
+/// Sound coming in from the device, in its format, [`feos_audio::DRIVER_FORMAT`].
+/// Dropping it stops recording. If its owner is killed, the mixer's task does that.
+pub struct Capture {
+    device: &'static dyn Audio,
+}
+
+impl Capture {
+    /// Starts recording. There's only the one input, so this fails with
+    /// [`OpenError::NoFreeStream`] while something else has it.
+    pub fn open(platform: &Platform) -> Result<Self, OpenError> {
+        let device = platform
+            .audio
+            .filter(|device| device.is_ready())
+            .ok_or(OpenError::NoDevice)?;
+        let owner = platform.processes.current();
+        let holder = CAPTURE_OWNER.load(Ordering::Acquire);
+        if holder != 0 && platform.processes.detail(holder).is_some() {
+            return Err(OpenError::NoFreeStream);
+        }
+        CAPTURE_OWNER.store(owner.max(1), Ordering::Release);
+        device.capture_stop();
+        if !device.capture_start() {
+            CAPTURE_OWNER.store(0, Ordering::Release);
+            return Err(OpenError::NoDevice);
+        }
+        ensure_task(platform);
+        Ok(Self { device })
+    }
+
+    /// Moves what's been recorded to `out` as whole frames, without blocking, and says how
+    /// many samples. The device holds about a second, so call this more often than that.
+    pub fn read(&self, out: &mut [i16]) -> usize {
+        self.device.capture_read(out)
+    }
+
+    /// Frames recorded so far, read or not.
+    pub fn position(&self) -> u64 {
+        self.device.capture_position()
+    }
+}
+
+impl Drop for Capture {
+    fn drop(&mut self) {
+        self.device.capture_stop();
+        CAPTURE_OWNER.store(0, Ordering::Release);
+    }
+}
+
 /// The master volume, 0 to [`MAX_VOLUME`].
 pub fn volume() -> u8 {
     MIXER.lock().volume()
@@ -208,8 +261,13 @@ impl App for MixerTask {
                         MIXER.lock().close(id);
                     }
                 }
+                let holder = CAPTURE_OWNER.load(Ordering::Acquire);
+                if holder != 0 && processes.detail(holder).is_none() {
+                    device.capture_stop();
+                    CAPTURE_OWNER.store(0, Ordering::Release);
+                }
             }
-            if active > 0 {
+            if active > 0 || CAPTURE_OWNER.load(Ordering::Acquire) != 0 {
                 idle_since = None;
             } else {
                 let since = *idle_since.get_or_insert(now);

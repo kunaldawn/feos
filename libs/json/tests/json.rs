@@ -206,3 +206,123 @@ fn kinds_are_queryable() {
         Some(Kind::Null)
     ));
 }
+
+
+mod builder {
+    use feos_json::{BuildError, JsonBuilder, JsonDocument, JsonNode, SliceOutput};
+
+    #[test]
+    fn what_it_writes_parses_back_to_the_same_values() {
+        let mut text = String::new();
+        let mut json = JsonBuilder::new(&mut text);
+        json.begin_object().unwrap();
+        json.field_str("name", "a \"quoted\"\n\t\\ h\u{e9}llo \u{1}").unwrap();
+        json.field_uint("big", u64::MAX).unwrap();
+        json.key("neg").unwrap();
+        json.int(i64::MIN).unwrap();
+        json.key("float").unwrap();
+        json.float(1.5).unwrap();
+        json.field_bool("yes", true).unwrap();
+        json.key("nothing").unwrap();
+        json.null().unwrap();
+        json.key("list").unwrap();
+        json.begin_array().unwrap();
+        json.begin_object().unwrap();
+        json.end_object().unwrap();
+        json.begin_array().unwrap();
+        json.end_array().unwrap();
+        json.uint(3).unwrap();
+        json.end_array().unwrap();
+        json.end_object().unwrap();
+        json.finish().unwrap();
+
+        let mut nodes = [JsonNode::EMPTY; 32];
+        let document = JsonDocument::parse(&text, &mut nodes).unwrap();
+        let root = document.root();
+        let mut buffer = [0u8; 64];
+        assert_eq!(
+            document.as_str(document.get(root, "name").unwrap(), &mut buffer),
+            Some("a \"quoted\"\n\t\\ h\u{e9}llo \u{1}")
+        );
+        assert_eq!(document.as_bool(document.get(root, "yes").unwrap()), Some(true));
+        assert_eq!(document.array_iter(document.get(root, "list").unwrap()).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn pretty_output_matches_the_document_writer() {
+        let mut built = String::new();
+        let mut json = JsonBuilder::pretty(&mut built);
+        json.begin_object().unwrap();
+        json.key("a").unwrap();
+        json.begin_array().unwrap();
+        json.uint(1).unwrap();
+        json.uint(2).unwrap();
+        json.end_array().unwrap();
+        json.key("b").unwrap();
+        json.begin_object().unwrap();
+        json.end_object().unwrap();
+        json.end_object().unwrap();
+        json.finish().unwrap();
+        let mut nodes = [JsonNode::EMPTY; 16];
+        let document = JsonDocument::parse(&built, &mut nodes).unwrap();
+        let mut written = String::new();
+        feos_json::write_json_pretty(&document, document.root(), &mut written).unwrap();
+        assert_eq!(built, written);
+    }
+
+    #[test]
+    fn invalid_sequences_are_errors() {
+        let mut text = String::new();
+        let mut json = JsonBuilder::new(&mut text);
+        assert_eq!(json.key("x"), Err(BuildError::Misplaced));
+        json.begin_object().unwrap();
+        assert_eq!(json.uint(1), Err(BuildError::Misplaced));
+        assert_eq!(json.end_array(), Err(BuildError::Misplaced));
+        json.key("x").unwrap();
+        assert_eq!(json.key("y"), Err(BuildError::Misplaced));
+        assert_eq!(json.end_object(), Err(BuildError::Misplaced));
+        assert_eq!(json.float(f64::NAN), Err(BuildError::NotANumber));
+        json.uint(1).unwrap();
+        assert_eq!(json.finish(), Err(BuildError::Unfinished));
+
+        let mut text = String::new();
+        let mut json = JsonBuilder::new(&mut text);
+        json.uint(1).unwrap();
+        assert_eq!(json.uint(2), Err(BuildError::Misplaced));
+        json.finish().unwrap();
+
+        let mut text = String::new();
+        let json = JsonBuilder::new(&mut text);
+        assert_eq!(json.finish(), Err(BuildError::Unfinished));
+    }
+
+    #[test]
+    fn depth_is_limited_to_what_the_parser_reads() {
+        let mut text = String::new();
+        let mut json = JsonBuilder::new(&mut text);
+        for _ in 0..feos_json::MAX_DEPTH {
+            json.begin_array().unwrap();
+        }
+        assert_eq!(json.begin_array(), Err(BuildError::TooDeep));
+        for _ in 0..feos_json::MAX_DEPTH {
+            json.end_array().unwrap();
+        }
+        json.finish().unwrap();
+        let mut nodes = [JsonNode::EMPTY; 128];
+        JsonDocument::parse(&text, &mut nodes).unwrap();
+    }
+
+    #[test]
+    fn a_full_buffer_is_an_error_and_not_a_truncation() {
+        let mut buffer = [0u8; 8];
+        let mut output = SliceOutput::new(&mut buffer);
+        let mut json = JsonBuilder::new(&mut output);
+        assert_eq!(json.string("far too long for it"), Err(BuildError::Output));
+        let mut buffer = [0u8; 8];
+        let mut output = SliceOutput::new(&mut buffer);
+        let mut json = JsonBuilder::new(&mut output);
+        json.string("fits").unwrap();
+        json.finish().unwrap();
+        assert_eq!(output.as_str(), "\"fits\"");
+    }
+}

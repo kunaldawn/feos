@@ -321,7 +321,8 @@ impl Walk<'_> {
         }
         let matched = self.eval(self.expr, ctx, path, meta, prune, status);
         if matched && self.print_by_default {
-            write_out(ctx.stdout, format_args!("{path}\n"));
+            let shown = super::files::listed_name(ctx, path);
+            write_out(ctx.stdout, format_args!("{shown}\n"));
         }
         Ok(())
     }

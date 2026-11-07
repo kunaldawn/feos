@@ -1,0 +1,9 @@
+[package]
+name = "feos-source"
+description = "Random-access byte sources for media files too large to hold in memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]

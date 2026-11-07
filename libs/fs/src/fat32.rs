@@ -36,7 +36,7 @@ use alloc::vec::Vec;
 use feos_hal::time::DateTime;
 
 use crate::block::{BlockDevice, WritableBlockDevice, WriteClass};
-use crate::tree::{sanitize_name, try_push, try_zeroed, ClusterSet, EntryLocation, NodeTable};
+use crate::tree::{path_component, try_push, try_zeroed, ClusterSet, EntryLocation, NodeTable};
 use crate::volume::Volume;
 use crate::{
     attr, CheckReport, EntryKind, FileSystem, FsError, NodeId, NodeTimes, TimeSource, VolumeStats,
@@ -2193,14 +2193,14 @@ impl LfnState {
             if end > 0 {
                 let name = String::from_utf16_lossy(&self.units[..end]);
                 if !name.is_empty() {
-                    return Some((sanitize_name(name), location));
+                    return Some((path_component(name), location));
                 }
             }
         }
 
         short
             .as_ref()
-            .map(|name| (sanitize_name(name.clone()), location))
+            .map(|name| (path_component(name.clone()), location))
             .filter(|(name, _)| !name.is_empty())
     }
 }

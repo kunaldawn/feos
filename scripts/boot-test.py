@@ -182,7 +182,7 @@ def persistence_test(arch, kernel):
     guest.boot_to_shell()
     guest.run("mount | grep -c fat32 | tr 1 Y", "\nY")
     guest.run("cat /README.txt | wc -l | tr 0-9 N; echo seeded-$?", "seeded-0")
-    guest.run("mkdir -p /keep/deep && echo clean-$((6 * 7)) > /keep/deep/note.txt", "$ ")
+    guest.run("mkdir -p /keep/deep && echo clean-$((6 * 7)) > /keep/deep/note.txt", "# ")
     guest.run("cat /keep/deep/note.txt", "clean-42")
     guest.send("poweroff\r")
     guest.wait_exit()
@@ -227,19 +227,23 @@ def persistence_test(arch, kernel):
     os.remove(disk)
 
 
-def open_terminal(guest):
-    """Opens the Terminal from the Start menu, with real key presses."""
+def open_bundle(guest, bundle):
+    """Opens a bundle from the Start menu, with real key presses."""
     bundles = sorted(name for name in os.listdir("apps/desktop/apps") if name.endswith(".fapp"))
     guest.monitor("sendkey ctrl-esc")
     time.sleep(1)
     guest.monitor("sendkey tab")
     time.sleep(0.5)
-    for _ in range(bundles.index("terminal.fapp")):
+    for _ in range(bundles.index(bundle + ".fapp")):
         guest.monitor("sendkey right")
         time.sleep(0.2)
     guest.monitor("sendkey ret")
-    # The window takes a moment to start its shell.
+    # The window takes a moment to start.
     time.sleep(5)
+
+
+def open_terminal(guest):
+    open_bundle(guest, "terminal")
 
 
 def milestone_test(arch, kernel):
@@ -925,6 +929,13 @@ def net_exercise(arch, kernel, transport, size, machine="virt", smp=None):
     guest.send(f"nc -s via-host 10.0.2.2 {peer.echo_port}\r")
     guest.expect("VIA-HOST")
     guest.expect("nc: done")
+    # With no text to send, `nc` sends what's typed, and Ctrl-D is its end.
+    guest.send(f"nc 10.0.2.2 {peer.echo_port}\r")
+    time.sleep(1)
+    guest.send("typed-into-nc\r")
+    guest.expect("TYPED-INTO-NC")
+    guest.send("\x04")
+    guest.expect("nc: done")
     guest.send(f"wget -O /tmp/hello.txt http://10.0.2.2:{peer.http_port}/hello.txt\r")
     guest.expect("saved 16 bytes")
     guest.run("cat /tmp/hello.txt", "hello over http")
@@ -988,6 +999,8 @@ def net_exercise(arch, kernel, transport, size, machine="virt", smp=None):
     connection.recv(16)
     connection.close()
     guest.expect(f"received {len(blob)} bytes", 300)
+    # It reads standard input until it's done, so what's typed before then goes to it.
+    guest.expect("nc: done")
     guest.send("sha256sum /tmp/in.bin\r")
     guest.expect(peer.blob_sum, 120)
     print(f"net {arch} {transport}: {len(blob)} bytes from outside, sha256 matches", flush=True)
@@ -1078,10 +1091,19 @@ class Qmp:
                   f'{{"type":"abs","data":{{"axis":"x","value":{x}}}}},'
                   f'{{"type":"abs","data":{{"axis":"y","value":{y}}}}}]}}}}')
 
-    def button(self, down):
+    def button(self, down, button="left"):
         state = "true" if down else "false"
         self.send('{"execute":"input-send-event","arguments":{"events":['
-                  f'{{"type":"btn","data":{{"down":{state},"button":"left"}}}}]}}}}')
+                  f'{{"type":"btn","data":{{"down":{state},"button":"{button}"}}}}]}}}}')
+
+    def click(self, x, y, button="left", width=1024, height=768):
+        """A click at a screen position, with time for a frame or two around it."""
+        self.pointer(x * 32767 // width, y * 32767 // height)
+        time.sleep(0.5)
+        self.button(True, button)
+        time.sleep(0.3)
+        self.button(False, button)
+        time.sleep(0.5)
 
 
 def usb_stats(guest):
@@ -1588,6 +1610,669 @@ def input_test(arch, kernel):
     guest.wait_exit()
 
 
+def pointer_devices(arch, control):
+    """A QMP socket and an absolute pointer: a PC's PS/2 mouse is relative."""
+    if os.path.exists(control):
+        os.remove(control)
+    args = ["-qmp", f"unix:{control},server=on,wait=off"]
+    return args if arch == "arm" else args + ["-device", "virtio-tablet-pci", "-device", "virtio-keyboard-pci"]
+
+
+def wallpaper_pixel(guest, kernel, name):
+    """The colour at a place on the screen that only the wallpaper reaches."""
+    path = work_path(kernel, name)
+    guest.monitor(f"screendump {path}")
+    time.sleep(1)
+    width, height, pixels = read_ppm(path)
+    at = (height // 2 * width + width - 8) * 3
+    return tuple(pixels[at:at + 3])
+
+
+def settings_test(arch, kernel):
+    """Settings changed in the UI, in both places that can, survive the power going."""
+    disk = blank_disk(kernel, "disk-settings.img")
+    control = work_path(kernel, "qmp-settings.sock")
+    args = disk_device(arch, disk) + pointer_devices(arch, control)
+
+    # Display Properties: right-click the desktop, and Up, for the last item: Properties.
+    guest = Guest(qemu_command(arch, kernel, args))
+    qmp = Qmp(control)
+    guest.expect("[desktop] session started", BOOT_TIMEOUT)
+    time.sleep(3)
+    before = wallpaper_pixel(guest, kernel, "settings-before.ppm")
+    qmp.click(700, 300, "right")
+    guest.monitor("sendkey up")
+    time.sleep(0.5)
+    guest.monitor("sendkey ret")
+    time.sleep(1)
+    # Where the dialog puts its rows, centred in the work area of a 1024x768 screen.
+    panel_x, panel_y = (1024 - 420) // 2, (768 - 40 - 256) // 2
+    rows_y = panel_y + 28 + 8 + 20
+    qmp.click(panel_x + 12 + 95, rows_y + 3 * 24 + 12)
+    guest.expect("[desktop] settings saved: theme=dark keyboard=us")
+    qmp.click(panel_x + 212 + 95, rows_y + 2 * 24 + 12)
+    guest.expect("[desktop] settings saved: theme=dark keyboard=de")
+    qmp.click(panel_x + 420 - 88 + 36, panel_y + 256 - 34 + 12)
+    time.sleep(1)
+    dark = wallpaper_pixel(guest, kernel, "settings-dark.ppm")
+    if dark == before:
+        fail(guest, f"the wallpaper stayed {before} through a change of scheme")
+    # The save has returned before it says so: no time for a flusher.
+    guest.crash()
+
+    guest = Guest(qemu_command(arch, kernel, args))
+    qmp = Qmp(control)
+    guest.expect("settings restored: theme=dark keyboard=de wallpaper=scheme clock=24", BOOT_TIMEOUT)
+    guest.expect("[desktop] session started", BOOT_TIMEOUT)
+    time.sleep(3)
+    restored = wallpaper_pixel(guest, kernel, "settings-restored.ppm")
+    if restored != dark:
+        fail(guest, f"the wallpaper came back as {restored}, not {dark}")
+    print(f"settings {arch}: Display Properties survived a kill: wallpaper {dark}", flush=True)
+
+    # The Settings app, with keys: Right on the first row, then two rows down, and so on.
+    open_bundle(guest, "settings")
+    guest.send("\x1b[C")
+    guest.expect("[desktop] settings saved: theme=light keyboard=de")
+    time.sleep(0.5)
+    guest.send("\x1b[B\x1b[B\x1b[C")
+    # `scheme` is the first preset, and `sky` the next.
+    guest.expect("wallpaper=sky clock=24")
+    time.sleep(0.5)
+    guest.send("\x1b[A\x1b[C")
+    guest.expect("[desktop] settings saved: theme=light keyboard=fr wallpaper=sky")
+    time.sleep(0.5)
+    guest.send("\x1b[B\x1b[B\x1b[C")
+    guest.expect("wallpaper=sky clock=12")
+    # Minimise it, by the taskbar's own logic, so the wallpaper can be seen.
+    guest.monitor(f"screendump {work_path(kernel, 'settings-app.ppm')}")
+    time.sleep(1)
+    guest.crash()
+
+    guest = Guest(qemu_command(arch, kernel, args))
+    qmp = Qmp(control)
+    guest.expect("settings restored: theme=light keyboard=fr wallpaper=sky clock=12", BOOT_TIMEOUT)
+    guest.expect("[desktop] session started", BOOT_TIMEOUT)
+    time.sleep(3)
+    sky = wallpaper_pixel(guest, kernel, "settings-sky.ppm")
+    if not (sky[2] > 190 and sky[0] < 120):
+        fail(guest, f"expected the sky wallpaper at the middle of the screen, found {sky}")
+    # The window shows what was restored, and a pointer can change it too.
+    open_bundle(guest, "settings")
+    guest.send("\x1c")
+    guest.expect("entering the serial shell")
+    guest.run("cat /etc/desktop.conf", "clock: 12")
+    guest.send("poweroff\r")
+    guest.wait_exit()
+    fsck(disk)
+    os.remove(disk)
+    print(f"settings {arch}: the Settings app survived a kill: wallpaper {sky}", flush=True)
+
+
+def window_with_colour(path, colour):
+    """Where the box filled with this colour is: the top left corner of a window's content."""
+    width, height, pixels = read_ppm(path)
+    wanted = bytes(colour)
+    for y in range(height):
+        row = pixels[y * width * 3:(y + 1) * width * 3]
+        for x in range(width):
+            if row[x * 3:x * 3 + 3] == wanted:
+                return x, y
+    return None
+
+
+def terminal_test(arch, kernel):
+    """Select with the pointer, copy, and paste back; wide characters keep their columns."""
+    control = work_path(kernel, "qmp-terminal.sock")
+    guest = Guest(qemu_command(arch, kernel, pointer_devices(arch, control)))
+    qmp = Qmp(control)
+    guest.expect("[desktop] session started", BOOT_TIMEOUT)
+    time.sleep(3)
+    open_terminal(guest)
+    guest.send("clear\r")
+    time.sleep(1)
+    guest.send("printf 'SELECT-ME-%d x\\n' 42\r")
+    time.sleep(2)
+    shot = work_path(kernel, "terminal-select.ppm")
+    guest.monitor(f"screendump {shot}")
+    time.sleep(1)
+    corner = window_with_colour(shot, (8, 12, 16))
+    if corner is None:
+        fail(guest, "no Terminal window on the screen")
+    # Row 1 is the output, under the command. Cells are 8 by 10, four pixels in.
+    x = corner[0] + 4
+    y = corner[1] + 4 + 10 + 5
+    qmp.pointer((x + 2) * 32767 // 1024, y * 32767 // 768)
+    time.sleep(0.5)
+    qmp.button(True)
+    time.sleep(0.5)
+    # SELECT-ME-42: twelve cells.
+    qmp.pointer((x + 11 * 8 + 2) * 32767 // 1024, y * 32767 // 768)
+    time.sleep(0.5)
+    qmp.button(False)
+    time.sleep(1)
+    guest.monitor(f"screendump {work_path(kernel, 'terminal-selected.ppm')}")
+    time.sleep(1)
+    guest.monitor("sendkey ctrl-shift-c")
+    time.sleep(1)
+    guest.send("echo got-")
+    time.sleep(1)
+    guest.monitor("sendkey ctrl-shift-v")
+    time.sleep(1)
+    guest.send(" > /tmp/pasted\r")
+    time.sleep(2)
+    guest.send("\x1c")
+    guest.expect("entering the serial shell")
+    guest.run("cat /tmp/pasted", "got-SELECT-ME-42")
+    guest.send("poweroff\r")
+    guest.wait_exit()
+    print(f"terminal {arch}: a drag copied and pasted back through the clipboard", flush=True)
+
+
+def search_test(arch, kernel):
+    """A search of file contents leaves the desktop drawing while it reads the disk."""
+    disk = blank_disk(kernel, "disk-search.img", 512 * 1024 * 1024)
+    subprocess.run(["mkfs.vfat", "-F", "32", disk], check=True, capture_output=True)
+    source = work_path(kernel, "search-source")
+    size = 192 * 1024 * 1024
+    with open(source, "wb") as out:
+        out.truncate(size)
+        out.seek(size - 64)
+        out.write(b"the end holds NEEDLE-XYZ and nothing else")
+    subprocess.run(["mcopy", "-i", disk, source, "::/BIG.BIN"], check=True, capture_output=True)
+    with open(source, "wb") as out:
+        out.write(b"nothing to find here\n")
+    subprocess.run(["mcopy", "-i", disk, source, "::/PLAIN.TXT"], check=True, capture_output=True)
+    os.remove(source)
+
+    guest = Guest(qemu_command(arch, kernel, disk_device(arch, disk)))
+    guest.expect("[desktop] session started", BOOT_TIMEOUT)
+    time.sleep(3)
+    open_terminal(guest)
+    guest.send("files --search-contents\r")
+    time.sleep(3)
+    guest.send("needle-xyz\r")
+    taken = int(guest.capture(r"\[explorer\] search done in (\d+) ms", 300))
+    guest.expect("BIG.BIN")
+    time.sleep(1)
+    guest.send("\x1c")
+    longest = int(guest.capture(r"\[desktop\] longest frame (\d+) ms"))
+    print(f"search {arch}: {size >> 20} MiB read in {taken} ms; the longest desktop frame was {longest} ms", flush=True)
+    if taken <= longest * 2:
+        fail(guest, "the search was too quick to say anything about frames")
+    if longest > 1000:
+        fail(guest, f"a frame took {longest} ms")
+    guest.expect("entering the serial shell")
+    guest.send("poweroff\r")
+    guest.wait_exit()
+    os.remove(disk)
+
+
+def resolution_exercise(arch, kernel, label, display, boot_mode, target):
+    """Maximises a Terminal, changes the screen size in Settings, keeps it, tries another
+    and lets that go back, cycles sizes to see nothing leaks, and restarts."""
+    disk = blank_disk(kernel, f"disk-resolution-{label}.img", 64 * 1024 * 1024)
+    control = work_path(kernel, f"qmp-resolution-{label}.sock")
+    args = disk_device(arch, disk) + pointer_devices(arch, control)
+    modes = [(640, 480), (800, 600), (1024, 768), (1280, 720), (1280, 1024), (1600, 1200), (1920, 1080)]
+
+    def shot(guest, name, wanted):
+        path = work_path(kernel, f"resolution-{label}-{name}.ppm")
+        guest.monitor(f"screendump {path}")
+        time.sleep(1)
+        width, height, pixels = read_ppm(path)
+        if (width, height) != wanted:
+            fail(guest, f"{name}: the screen is {width}x{height}, not {wanted}")
+        return width, height, pixels
+
+    def pixel(picture, x, y):
+        width, _, pixels = picture
+        at = (y * width + x) * 3
+        return tuple(pixels[at:at + 3])
+
+    guest = Guest(qemu_command(arch, kernel, args, display))
+    qmp = Qmp(control)
+    guest.expect("[desktop] session started", BOOT_TIMEOUT)
+    time.sleep(3)
+    open_terminal(guest)
+    first = work_path(kernel, f"resolution-{label}-first.ppm")
+    shot(guest, "first", boot_mode)
+    corner = window_with_colour(first, (8, 12, 16))
+    if corner is None:
+        fail(guest, "no Terminal window on the screen")
+    # A double click on the title bar maximises it.
+    qmp.pointer((corner[0] + 150) * 32767 // boot_mode[0], (corner[1] - 14) * 32767 // boot_mode[1])
+    time.sleep(0.5)
+    qmp.button(True)
+    time.sleep(0.1)
+    qmp.button(False)
+    time.sleep(0.1)
+    qmp.button(True)
+    time.sleep(0.1)
+    qmp.button(False)
+    time.sleep(1)
+
+    # Settings: the last row. Stepping doesn't try each size; Enter applies one.
+    guest.send("settings\r")
+    time.sleep(3)
+    guest.send("\x1b[B" * 4)
+    time.sleep(0.5)
+    guest.send("\x1b[C" * (modes.index(target) - modes.index(boot_mode)))
+    time.sleep(0.5)
+    guest.send("\r")
+    guest.expect(f"[desktop] display now {target[0]}x{target[1]}")
+    time.sleep(2)
+    picture = shot(guest, "prompt", target)
+    time.sleep(0.5)
+    # Enter on the prompt keeps it.
+    guest.send("\r")
+    guest.expect(f"[desktop] display size kept: {target[0]}x{target[1]}")
+    guest.expect("[desktop] settings saved")
+    time.sleep(2)
+    picture = shot(guest, "kept", target)
+    # The maximised window reached the new corner, above a taskbar now along the bottom.
+    # The Settings window may be anywhere, so that corner is what's looked at.
+    if pixel(picture, target[0] - 20, target[1] - 60) != (8, 12, 16):
+        fail(guest, f"a maximised Terminal doesn't reach the new corner: {pixel(picture, target[0] - 20, target[1] - 60)}")
+    if pixel(picture, target[0] // 2, target[1] - 10) == (8, 12, 16):
+        fail(guest, "no taskbar along the new bottom of the screen")
+
+    # A size nobody answers for goes back by itself.
+    other = (1280, 720)
+    guest.send("\x1b[D" * (modes.index(target) - modes.index(other)))
+    time.sleep(0.5)
+    guest.send("\r")
+    guest.expect(f"[desktop] display now {other[0]}x{other[1]}")
+    time.sleep(2)
+    shot(guest, "unanswered", other)
+    guest.expect(f"[desktop] display size back to {target[0]}x{target[1]}", 30)
+    time.sleep(2)
+    shot(guest, "reverted", target)
+
+    # Round and round, each a full set of buffers. A leak would run out of heap.
+    for round_number in range(12):
+        guest.send("\x1b[D" * (modes.index(target) - modes.index(other)))
+        time.sleep(0.3)
+        guest.send("\r")
+        guest.expect(f"[desktop] display now {other[0]}x{other[1]}")
+        time.sleep(0.6)
+        guest.send("\x1b")
+        guest.expect(f"[desktop] display size back to {target[0]}x{target[1]}")
+        time.sleep(0.6)
+    print(f"resolution {arch} {label}: 12 rounds of mode changes, nothing ran out", flush=True)
+
+    # The pointer's range is the new screen's.
+    guest.send("\x1c")
+    guest.expect("entering the serial shell")
+    guest.send("ktest input\r")
+    guest.expect("input: start")
+    time.sleep(0.3)
+    qmp.pointer(16384, 16384)
+    position = guest.capture(r"input: pointer (\d+ \d+)")
+    x, y = map(int, position.split())
+    if abs(x - target[0] // 2) > 8 or abs(y - target[1] // 2) > 8:
+        fail(guest, f"the middle of the tablet is {x} {y} on a {target} screen")
+    guest.expect("input: done")
+    guest.crash()
+
+    # It's still there after the power goes.
+    guest = Guest(qemu_command(arch, kernel, args, display))
+    qmp = Qmp(control)
+    guest.expect(f"resolution=Some(({target[0]}, {target[1]}))", BOOT_TIMEOUT)
+    guest.expect("[desktop] session started", BOOT_TIMEOUT)
+    guest.expect(f"[desktop] display now {target[0]}x{target[1]}", BOOT_TIMEOUT)
+    time.sleep(3)
+    shot(guest, "restarted", target)
+    guest.send("\x1c")
+    guest.expect("entering the serial shell")
+    guest.send("poweroff\r")
+    guest.wait_exit()
+    fsck(disk)
+    os.remove(disk)
+    print(f"resolution {arch} {label}: {boot_mode} to {target}, kept across a kill", flush=True)
+
+
+def resolution_test(arch, kernel):
+    resolution_exercise(arch, kernel, "ramfb", ("-device", "ramfb"), (1024, 768), (1600, 1200))
+    gpu = ("-device", "virtio-gpu-pci,xres=800,yres=600")
+    resolution_exercise(arch, kernel, "gpu", gpu, (800, 600), (1920, 1080))
+
+
+def fonts_test(arch, kernel):
+    """Mixed scripts in a Terminal and in Explorer, from names on a real FAT disk."""
+    disk = blank_disk(kernel, "disk-fonts.img", 64 * 1024 * 1024)
+    guest = Guest(qemu_command(arch, kernel, disk_device(arch, disk)))
+    guest.expect("[desktop] session started", BOOT_TIMEOUT)
+    time.sleep(3)
+    open_terminal(guest)
+    guest.send("clear\r")
+    time.sleep(1)
+    samples = [
+        "Latin-1: caf\u00e9 na\u00efve \u00fcber \u00c5ngstr\u00f6m \u00a3\u00a9\u00b5",
+        "Extended-A: \u0141\u00f3d\u017a \u0160koda \u0115\u014f\u0174\u0177 \u0132\u0133 \u0149",
+        "Greek: \u0391\u03b8\u03ae\u03bd\u03b1 \u03b1\u03b2\u03b3\u03b4 \u03a9\u03c3\u03c2",
+        "Cyrillic: \u041c\u043e\u0441\u043a\u0432\u0430 \u0416\u0443\u043a \u042f\u0449\u0438\u043a \u0400\u045d",
+        "Box: \u250c\u2500\u252c\u2500\u2510 \u2502 \u2551 \u2554\u2550\u2557 \u2514\u2500\u2534\u2500\u2518",
+        "Wide: \u4e2d\u6587|x (no glyphs, two cells each)",
+    ]
+    def as_octal(text):
+        return "".join(f"\\{byte:03o}" for byte in text.encode())
+    guest.send("printf '" + as_octal("\n".join(samples)) + "\\n'\r")
+    time.sleep(3)
+    terminal = work_path(kernel, "fonts-terminal.ppm")
+    guest.monitor(f"screendump {terminal}")
+    time.sleep(1)
+    # Files with such names, on the disk's FAT, and typed in as UTF-8 this time.
+    names = ["\u0391\u03b8\u03ae\u03bd\u03b1.txt", "\u041c\u043e\u0441\u043a\u0432\u0430.txt", "caf\u00e9-\u0141\u00f3d\u017a.txt"]
+    guest.send("mkdir /fonts; for n in " + " ".join(names) + "; do echo hi > /fonts/$n; done\r")
+    time.sleep(3)
+    guest.send("files /fonts\r")
+    listing = guest.capture(r"\[explorer\] /fonts:([^\r\n]*)")
+    time.sleep(3)
+    explorer = work_path(kernel, "fonts-explorer.ppm")
+    guest.monitor(f"screendump {explorer}")
+    time.sleep(1)
+    for name in names:
+        if name not in listing:
+            fail(guest, f"{name} isn't in the listing:{listing}")
+    guest.send("\x1c")
+    guest.expect("entering the serial shell")
+    guest.send("poweroff\r")
+    guest.wait_exit()
+    fsck(disk)
+    os.remove(disk)
+    print(f"fonts {arch}: screenshots at {terminal} and {explorer}", flush=True)
+
+
+def native_test(arch, kernel):
+    """The native filesystem on real virtio disks: never the root, surviving kills, with
+    owners and modes enforced on user programs."""
+    def native_disk(name, size=128 * 1024 * 1024):
+        path = blank_disk(kernel, name, size)
+        subprocess.run([sys.executable, "scripts/mkfs-feos.py", path], check=True)
+        return path
+
+    def drive(path, label, iops=None):
+        limit = f",throttling.iops-total={iops}" if iops else ""
+        args = ["-drive", f"if=none,id={label},format=raw,file={path}{limit}"]
+        device = "virtio-blk-device" if arch == "arm" else "virtio-blk-pci"
+        return args + ["-device", f"{device},drive={label}"]
+
+    # Alone, it doesn't become the root.
+    native = native_disk("disk-native-alone.img")
+    guest = Guest(qemu_command(arch, kernel, drive(native, "n0")))
+    guest.expect("native filesystem mounted at /native0", BOOT_TIMEOUT)
+    guest.boot_to_shell()
+    guest.run("mount | grep -c native0 | tr 1 Y", "\nY")
+    guest.run("fsck /native0", "/native0: clean")
+    guest.send("poweroff\r")
+    guest.wait_exit()
+    if b"root is in RAM" not in guest.log:
+        fail(guest, "a native disk on its own was made the root")
+    os.remove(native)
+
+    # Beside a FAT disk, whichever comes first, FAT is the root.
+    root = blank_disk(kernel, "disk-native-root.img", 64 * 1024 * 1024)
+    native = native_disk("disk-native.img")
+    args = drive(native, "n0") + drive(root, "r0")
+    guest = Guest(qemu_command(arch, kernel, args))
+    guest.expect("native filesystem mounted at /native0", BOOT_TIMEOUT)
+    guest.boot_to_shell()
+    for line in (b"mounted at /\r", b"mounted at /\n"):
+        if line in guest.log:
+            break
+    else:
+        fail(guest, "nothing was mounted at /")
+    guest.run("df -h / | grep -c . ; echo df-$?", "df-0")
+
+    # Everything it's for.
+    guest.run("mkdir /native0/d; echo hello-native > /native0/d/a; echo made-$?", "made-0")
+    guest.run("chmod 640 /native0/d/a; chown 1000:100 /native0/d/a; echo owned-$?", "owned-0")
+    guest.run("ln /native0/d/a /native0/hard; ln -s /native0/d/a /native0/soft; echo linked-$?", "linked-0")
+    guest.run("ls -l /native0/d", "-rw-r----- 2 1000 100")
+    guest.run("seq 1 100000 > /native0/big; echo big-$?", "big-0")
+    guest.send("sha256sum /native0/big\r")
+    digest = guest.capture(r"([0-9a-f]{64})")
+    guest.run("cat /native0/soft", "hello-native")
+    guest.run("stat /native0/d/a", "Mode: 0640 -rw-r-----  Uid: 1000  Gid: 100  Links: 2")
+    guest.send("stat / | grep Mode\r")
+    guest.expect("made up: this filesystem has no owners")
+    guest.run("chmod 600 /d-not-there 2>&1; chmod 600 /rom 2>&1 | tr a-z A-Z; echo fat-chmod", "fat-chmod")
+    guest.run("ln /native0/big /big-across 2>&1 | grep -c . | tr 1 Y; echo across", "across")
+    guest.run("sync; echo synced-$?", "synced-0")
+
+    # Pull the plug during writes. A commit is over in moments on a fast disk, so here the
+    # disk is slow, for a kill to land in one. It goes on until one has been seen to.
+    slow = drive(native, "n0", 60) + drive(root, "r0")
+    guest.run("sync; echo before-kills-$?", "before-kills-0")
+    guest.crash()
+    guest = Guest(qemu_command(arch, kernel, slow))
+    guest.expect("native filesystem mounted at /native0", BOOT_TIMEOUT)
+    guest.boot_to_shell()
+    replays = 0
+    kills = 0
+    delays = (0.3, 1.1, 2.3, 0.7, 1.6, 0.9, 1.9, 0.5, 1.3, 2.1, 0.4, 1.7, 0.8, 1.2, 2.5, 0.6)
+    for round_number, wait in enumerate(delays):
+        # Short: a long line is still being echoed when the kill comes.
+        guest.send("(while :; do for i in 1 2 3 4 5; do echo x > /native0/t-$i; done; "
+                   "mv /native0/t-1 /native0/m; ln /native0/m /native0/l; sync; rm /native0/l; done) &\r")
+        time.sleep(wait)
+        guest.crash()
+        kills += 1
+
+        guest = Guest(qemu_command(arch, kernel, slow))
+        guest.expect("native filesystem mounted at /native0", BOOT_TIMEOUT)
+        guest.boot_to_shell()
+        guest.run("fsck /native0", "/native0: clean")
+        guest.send("sha256sum /native0/big\r")
+        guest.expect(digest)
+        guest.run("cat /native0/d/a", "hello-native")
+        guest.run("stat /native0/hard", "Links: 2")
+        guest.run("readlink /native0/soft", "/native0/d/a")
+        replays += b"was not cleanly unmounted" in guest.log
+        if kills >= 5 and replays >= 1:
+            break
+    print(f"native {arch}: {kills} kills during writes, all clean; {replays} interrupted a commit, and were replayed", flush=True)
+    if replays == 0:
+        fail(guest, "no kill ever landed in a journal commit, so replay wasn't shown on a real disk")
+
+    # Permissions, from user mode: nothing in the kernel is on the program's side here.
+    guest.run("mkdir /native0/perm; echo dir-$?", "dir-0")
+    guest.send("/bin/permtest /native0/perm; echo perm-status-$?\r")
+    checks = guest.capture(r"permtest: native: (\d+ checks, \d+ failed)")
+    guest.expect("perm-status-0")
+    print(f"native {arch}: as user 1000 at EL0/ring 3: {checks}", flush=True)
+    guest.run("mkdir /tmp/open; /bin/permtest --permissionless /tmp/open; echo open-status-$?", "open-status-0")
+    guest.run("mkdir /loose; /bin/permtest --permissionless /loose; echo fat-status-$?", "fat-status-0")
+    # A kernel-linked command runs as root, and isn't checked. A program is.
+    guest.run("cat /native0/perm/secret; id | tr a-z A-Z", "UID=0(ROOT)")
+    guest.send("/bin/runas 1000 100 /bin/cat /native0/perm/secret; echo denied-$?\r")
+    guest.expect("denied-1")
+    guest.send("/bin/runas 0 0 /bin/cat /native0/perm/secret; echo allowed-$?\r")
+    guest.expect("top secret")
+    guest.expect("allowed-0")
+    guest.run("fsck /native0; sync", "/native0: clean")
+    guest.send("poweroff\r")
+    guest.wait_exit()
+
+    # And once more after a clean shutdown, with what those programs left.
+    guest = Guest(qemu_command(arch, kernel, args))
+    guest.expect("native filesystem mounted at /native0", BOOT_TIMEOUT)
+    guest.boot_to_shell()
+    guest.run("stat /native0/perm/secret", "Mode: 0600")
+    guest.run("stat /native0/perm/shared/mine", "Uid: 1000  Gid: 100")
+    guest.run("fsck /native0", "/native0: clean")
+    guest.send("poweroff\r")
+    guest.wait_exit()
+    fsck(root)
+    os.remove(native)
+    os.remove(root)
+
+
+def jobs_test(arch, kernel):
+    """`time`, signals to traps, Ctrl-Z, and standard input for external commands."""
+    guest = Guest(qemu_command(arch, kernel))
+    guest.expect("[desktop] session started", BOOT_TIMEOUT)
+    time.sleep(2)
+
+    # First in a Terminal window. Serial keys go to the focused window.
+    open_terminal(guest)
+    # A user program reading the terminal gets cooked lines, and Ctrl-D ends them.
+    guest.send("/bin/cat > /tmp/w-cat; echo \"cat-$?\" > /tmp/w-cat-status\r")
+    time.sleep(2)
+    guest.send("line-one\r")
+    time.sleep(1)
+    guest.send("wron\x7fng\r")
+    time.sleep(1)
+    guest.send("\x04")
+    time.sleep(2)
+    # Ctrl-Z stops a foreground command, and `fg` brings it back.
+    guest.send("sleep 100000\r")
+    time.sleep(2)
+    guest.send("\x1a")
+    time.sleep(2)
+    guest.send("echo \"z-$?\" > /tmp/w-z; jobs > /tmp/w-jobs; ps > /tmp/w-ps\r")
+    time.sleep(2)
+    guest.send("fg\r")
+    time.sleep(2)
+    guest.send("\x03")
+    time.sleep(2)
+    guest.send("echo \"fg-$?\" > /tmp/w-fg\r")
+    time.sleep(1)
+    # Closing the window hangs up on its shell.
+    guest.send("trap 'echo bye > /tmp/w-exit' EXIT; trap 'echo hup-$((20+1)) > /tmp/w-hup' HUP\r")
+    time.sleep(1)
+    guest.send("trap 'echo term-$((30+1)) > /tmp/w-term' TERM; kill -TERM $$\r")
+    time.sleep(2)
+    guest.monitor("sendkey alt-f4")
+    time.sleep(3)
+
+    guest.send("\x1c")
+    guest.expect("entering the serial shell")
+    guest.run("cat /tmp/w-cat | tr a-z A-Z", "LINE-ONE\r\nWRONG")
+    guest.run("cat /tmp/w-cat-status", "cat-0")
+    guest.run("cat /tmp/w-z", "z-148")
+    guest.run("cat /tmp/w-jobs", "Stopped")
+    guest.run("grep -c stopped /tmp/w-ps", "\n1")
+    guest.run("cat /tmp/w-fg", "fg-130")
+    guest.run("cat /tmp/w-term", "term-31")
+    guest.run("cat /tmp/w-hup", "hup-21")
+    guest.run("cat /tmp/w-exit", "bye")
+    print(f"jobs {arch}: Terminal window: stdin, Ctrl-Z, fg, TERM and HUP traps", flush=True)
+
+    # On the serial console: `time`.
+    guest.send("time sleep 1000\r")
+    real = guest.capture(r"real\s+0m(\d+\.\d+)s")
+    if not 0.9 <= float(real) < 5:
+        fail(guest, f"time said a one second sleep took {real}")
+    guest.expect("sys")
+    guest.send("time -p seq 1 3 | wc -l\r")
+    guest.expect("real ")
+    guest.run("x=1; time { x=$((x + 1)); } 2>&1; echo timed-$x", "timed-2")
+    # A busy command's CPU time comes back from its child.
+    guest.send("time /bin/spin 7 1500\r")
+    busy = guest.capture(r"user\s+0m(\d+\.\d+)s")
+    print(f"jobs {arch}: `time` of a busy program: user {busy}", flush=True)
+    if float(busy) < 0.5:
+        fail(guest, f"time saw only {busy}s of a busy program's CPU")
+
+    # Traps, from a process other than the shell, and with the shell idle at its prompt.
+    guest.run("trap 'echo got-hup-$((1+1))' HUP; kill -HUP $$; echo after-hup", "got-hup-2")
+    guest.expect("after-hup")
+    guest.run("trap 'echo got-quit-$((2+1))' QUIT; kill -QUIT $$", "got-quit-3")
+    guest.run("trap 'echo got-term-$((3+1))' TERM; kill -TERM $$", "got-term-4")
+    guest.send("(sleep 1000; kill -TERM 1) &\r")
+    guest.expect("got-term-4")
+    print(f"jobs {arch}: TERM reached the idle serial prompt's trap", flush=True)
+    # Ctrl-\\ ends the foreground command, and the QUIT trap then runs.
+    guest.send("sleep 100000\r")
+    time.sleep(1)
+    guest.send("\x1c")
+    guest.expect("got-quit-3")
+    guest.run("echo quit-$?", "quit-131")
+    guest.run("trap - HUP QUIT TERM; echo cleared-$((4+4))", "cleared-8")
+    # With no trap a process is killed by TERM, the shell excepted.
+    guest.send("sleep 100000 &\r")
+    job = guest.capture(r"\[\d+\] (\d+)")
+    guest.run(f"kill -TERM {job}", f"killed pid {job}")
+
+    # Ctrl-Z on a kernel-linked app and a user program; `fg`, `bg` and `kill`.
+    guest.send("sleep 100000\r")
+    time.sleep(1)
+    guest.send("\x1a")
+    guest.expect("Stopped  sleep 100000")
+    guest.run("echo stopped-$?", "stopped-148")
+    guest.run("jobs | tr a-z A-Z", "STOPPED")
+    guest.send("fg\r")
+    guest.expect("sleep 100000")
+    time.sleep(1)
+    guest.send("\x1a")
+    guest.expect("Stopped  sleep 100000")
+    guest.send("fg\r")
+    time.sleep(1)
+    guest.send("\x03")
+    guest.run("echo killed-$?", "killed-130")
+
+    # A program whose output has to keep flowing across a stop and `bg`.
+    guest.send("tick 300 100\r")
+    guest.expect("tick 2/300")
+    guest.send("\x1a")
+    guest.expect("Stopped  tick")
+    time.sleep(1)
+    guest.send("bg\r")
+    guest.expect("&")
+    guest.send("echo bg-alive\r")
+    guest.expect("bg-alive")
+    guest.expect("/300")
+    guest.run("kill %%; echo killed-job", "killed-job")
+
+    guest.send("/bin/spin 7 0\r")
+    time.sleep(2)
+    guest.send("\x1a")
+    guest.expect("Stopped  /bin/spin")
+    guest.send("ps | grep -c stopped\r")
+    guest.expect("\n1")
+    guest.run("kill %%; wait; echo reaped-$?", "reaped-")
+    guest.run("ps | grep -c spin; echo none", "none")
+    print(f"jobs {arch}: Ctrl-Z, fg, bg and kill on an app and a user program", flush=True)
+
+    # Standard input on the serial console. What's typed ahead of a command that doesn't
+    # read stays for the shell.
+    guest.send("/bin/cat\r")
+    time.sleep(1)
+    guest.send("typed-to-cat\r")
+    guest.expect("typed-to-cat\r\ntyped-to-cat")
+    guest.send("\x04")
+    guest.run("echo cat-done-$?", "cat-done-0")
+    guest.send("sleep 1000; echo first\r")
+    time.sleep(0.3)
+    guest.send("echo typed-ahead-$((6*7))\r")
+    guest.expect("typed-ahead-42")
+    guest.run("printf 'piped\\n' | /bin/cat | tr a-z A-Z", "PIPED")
+
+    guest.send("poweroff\r")
+    guest.wait_exit()
+
+
+def names_test(arch, kernel):
+    """A name with control characters stays raw on disk, and is escaped wherever it's shown."""
+    guest = Guest(qemu_command(arch, kernel))
+    guest.expect("[desktop] session started", BOOT_TIMEOUT)
+    time.sleep(2)
+    open_terminal(guest)
+    guest.send("mkdir /tmp/n; touch \"/tmp/n/$(printf 'x\\033[31my\\tz')\"; files /tmp/n\r")
+    guest.expect("[explorer] /tmp/n: x\\e[31my\\tz")
+    time.sleep(1)
+    guest.send("\x1c")
+    guest.expect("entering the serial shell")
+    guest.run("ls /tmp/n", "x\\e[31my\\tz")
+    # A program reading the listing gets the name as it is.
+    guest.run("ls /tmp/n | od -c | head -1 | tr -d ' '", "x033[31my\\tz")
+    guest.run("cd \"$(find /tmp/n -type d | head -1)\"; find . -type f", "x\\e[31my\\tz")
+    guest.send("poweroff\r")
+    guest.wait_exit()
+
+
 def efi_path(arch, kernel):
     """The loader, built next to the kernel in the same target directory."""
     target = "x86_64-unknown-uefi" if arch == "x64" else "aarch64-unknown-uefi"
@@ -1710,7 +2395,7 @@ def main():
         sys.exit(__doc__)
     arch, kernel = sys.argv[1:]
     only = os.environ.get("FEOS_BOOT_TEST_ONLY")
-    if only in ("milestone", "partition", "format", "install", "persistence", "gpu", "transport", "smp", "irq", "ram", "fault", "sched", "gicv3", "net", "usb", "efi", "el", "input", "user", "hosted"):
+    if only in ("milestone", "partition", "format", "install", "persistence", "gpu", "transport", "smp", "irq", "ram", "fault", "sched", "gicv3", "net", "usb", "efi", "el", "input", "user", "hosted", "jobs", "names", "settings", "terminal", "search", "resolution", "fonts", "native"):
         globals()[only + "_test"](arch, kernel)
         print(f"{only} boot test passed: {arch}")
         return
@@ -1734,6 +2419,14 @@ def main():
     input_test(arch, kernel)
     user_test(arch, kernel)
     hosted_test(arch, kernel)
+    jobs_test(arch, kernel)
+    names_test(arch, kernel)
+    settings_test(arch, kernel)
+    terminal_test(arch, kernel)
+    search_test(arch, kernel)
+    resolution_test(arch, kernel)
+    fonts_test(arch, kernel)
+    native_test(arch, kernel)
     print(f"storage boot test passed: {arch}")
     if os.environ.get("FEOS_BOOT_TEST_ONLY") == "storage":
         return

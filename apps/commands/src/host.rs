@@ -18,8 +18,8 @@ use core::sync::atomic::{AtomicPtr, Ordering};
 
 use feos_app::pipe::{self, PipeReader, PipeWriter, Transfer};
 use feos_app::{
-    shell, App, ArgBlock, Context, Platform, ProcessInfo, SpawnError, SpawnIo, WaitStatus, MAX_ARGC,
-    MAX_PROCESSES, PROCESS_ARGS_MAX,
+    shell, App, ArgBlock, Context, Platform, ProcessInfo, Processes, SpawnError, SpawnIo, WaitStatus,
+    MAX_ARGC, MAX_PROCESSES, PROCESS_ARGS_MAX,
 };
 use feos_coreutils::{Available, Input, MemoryInfo, Output, System};
 use feos_gfx::Canvas;
@@ -57,16 +57,19 @@ impl System for PlatformSystem {
         self.platform.board.arch
     }
 
+    // Kernel-linked code is all of one privilege, and enforcing nothing on itself. It says
+    // so here. User programs are who permissions apply to: `/bin/runas` starts one as
+    // somebody else.
     fn username(&self) -> &'static str {
-        "feos"
+        "root"
     }
 
     fn uid(&self) -> u32 {
-        1000
+        0
     }
 
     fn gid(&self) -> u32 {
-        1000
+        0
     }
 
     fn unix_time(&self) -> Option<u64> {
@@ -87,6 +90,10 @@ impl System for PlatformSystem {
 
     fn pid(&self) -> u32 {
         self.platform.processes.current()
+    }
+
+    fn cpu_ms(&self) -> u64 {
+        self.platform.processes.cpu_ms()
     }
 
     fn memory(&self) -> Option<MemoryInfo> {
@@ -224,6 +231,16 @@ impl Output for PipeOutput {
 pub trait ConsoleSource: Send + Sync {
     /// Standard input, output and error for another task.
     fn streams(&self) -> ConsoleStreams;
+
+    /// Takes a Ctrl-Z waiting to stop the foreground command.
+    fn take_suspend(&self) -> bool {
+        false
+    }
+
+    /// Takes a Ctrl-\\ waiting to quit the foreground command.
+    fn take_quit(&self) -> bool {
+        false
+    }
 }
 
 /// The serial console's streams, which any task can use.
@@ -237,6 +254,31 @@ impl ConsoleSource for SerialConsole {
             Box::new(feos_sh::ConsoleOutput),
         )
     }
+
+    fn take_suspend(&self) -> bool {
+        feos_sh::console::take_suspend()
+    }
+
+    fn take_quit(&self) -> bool {
+        feos_sh::console::take_quit()
+    }
+}
+
+/// A command running in the foreground, or stopped by Ctrl-Z: its process and what
+/// connects it to the shell's streams.
+struct ForegroundJob {
+    pid: u32,
+    output: PipeReader,
+    errors: PipeReader,
+    output_open: bool,
+    errors_open: bool,
+    /// Where its standard input is fed. `None` once that has ended.
+    feed: Option<PipeWriter>,
+    /// The same pipe's read end, to take back what it never read when it ends.
+    unread: PipeReader,
+    /// Read from the shell's standard input and not yet taken by the pipe.
+    waiting: Vec<u8>,
+    input_ended: bool,
 }
 
 /// A shell's route to processes.
@@ -245,6 +287,21 @@ pub struct ProcessHost<'d> {
     display: Option<DisplayAccess<'d>>,
     stop: Stop,
     console: Arc<dyn ConsoleSource>,
+    /// The shell's own host, not a fork's: only it can have a foreground command.
+    foreground: bool,
+    /// Commands Ctrl-Z stopped.
+    suspended: Vec<ForegroundJob>,
+    /// The one that has stopped just now, for the shell to take.
+    just_suspended: Option<u32>,
+}
+
+impl Drop for ProcessHost<'_> {
+    /// A stopped command has nothing left to show its output on, or to resume it.
+    fn drop(&mut self) {
+        for job in &self.suspended {
+            let _ = self.platform.processes.try_kill(job.pid);
+        }
+    }
 }
 
 impl<'d> ProcessHost<'d> {
@@ -263,6 +320,9 @@ impl<'d> ProcessHost<'d> {
                 serial: true,
             },
             console: Arc::new(SerialConsole),
+            foreground: true,
+            suspended: Vec::new(),
+            just_suspended: None,
         }
     }
 
@@ -281,6 +341,9 @@ impl<'d> ProcessHost<'d> {
                 serial: false,
             },
             console,
+            foreground: true,
+            suspended: Vec::new(),
+            just_suspended: None,
         }
     }
 
@@ -331,73 +394,21 @@ impl<'d> ProcessHost<'d> {
         app.run(&mut context)
     }
 
-    /// Starts `app` in its own process and copies its output until it ends.
+    /// Starts `app` in its own process and looks after its streams until it ends.
     fn run_process(
         &mut self,
         app: &'static dyn App,
         args: &[String],
+        stdin: &mut dyn Input,
         stdout: &mut dyn Output,
         stderr: &mut dyn Output,
     ) -> Result<i32, SpawnError> {
-        let processes = self.platform.processes;
-        let (Some((out_reader, out_writer)), Some((err_reader, err_writer))) =
-            (pipe::create(), pipe::create())
-        else {
-            return Err(SpawnError::NoFreeSlot);
-        };
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-        let io = SpawnIo {
-            stdout: Some(&out_writer),
-            stderr: Some(&err_writer),
-            ..SpawnIo::default()
-        };
-        let pid = processes.spawn_argv(app, &argv, io)?;
-        drop(out_writer);
-        drop(err_writer);
-
-        let mut buffer = [0u8; 2048];
-        let mut out_open = true;
-        let mut err_open = true;
-        let mut killed = false;
-        let mut interrupted = false;
-        let mut idle = 0u32;
-        loop {
-            let moved = copy(&out_reader, &mut out_open, &mut buffer, stdout)
-                | copy(&err_reader, &mut err_open, &mut buffer, stderr);
-            let exited = processes.try_wait(pid) != WaitStatus::Running;
-            if !out_open && !err_open || (exited && !moved) {
-                break;
-            }
-            if !killed {
-                interrupted = self.poll_cancel();
-                if interrupted || stdout.is_broken() {
-                    killed = true;
-                    let _ = processes.try_kill(pid);
-                }
-            }
-            if moved {
-                idle = 0;
-            } else {
-                idle += 1;
-                if idle <= SPINS {
-                    processes.yield_now();
-                } else {
-                    processes.sleep_ms(IDLE_MS);
-                }
-            }
-        }
-        let status = processes.wait(pid).unwrap_or(feos_app::EXIT_KILLED);
-        Ok(if interrupted { 130 } else { status })
+        let processes = self.platform.processes;
+        self.start_foreground(stdin, stdout, stderr, |io| processes.spawn_argv(app, &argv, io))
     }
-}
 
-impl ProcessHost<'_> {
     /// Starts a user program and looks after its streams until it ends.
-    ///
-    /// The program's standard input is a pipe too, fed from the shell's stream as it
-    /// has room. A program's reads of a terminal aren't provided for: there's no line
-    /// discipline to give it, and the shell's Ctrl-C polling reads the same bytes. It
-    /// sees end of file.
     fn run_user(
         &mut self,
         path: &str,
@@ -408,72 +419,97 @@ impl ProcessHost<'_> {
         stderr: &mut dyn Output,
     ) -> Result<i32, SpawnError> {
         let processes = self.platform.processes;
-        let (Some((out_reader, out_writer)), Some((err_reader, err_writer)), Some((in_reader, in_writer))) =
+        self.start_foreground(stdin, stdout, stderr, |io| processes.spawn_user(path, argv, cwd, io))
+    }
+
+    fn start_foreground(
+        &mut self,
+        stdin: &mut dyn Input,
+        stdout: &mut dyn Output,
+        stderr: &mut dyn Output,
+        spawn: impl FnOnce(SpawnIo<'_>) -> Result<u32, SpawnError>,
+    ) -> Result<i32, SpawnError> {
+        let (Some((output, out_writer)), Some((errors, err_writer)), Some((in_reader, in_writer))) =
             (pipe::create(), pipe::create(), pipe::create())
         else {
             return Err(SpawnError::NoFreeSlot);
         };
-        let io = SpawnIo {
+        let pid = spawn(SpawnIo {
             stdin: Some(&in_reader),
             stdout: Some(&out_writer),
             stderr: Some(&err_writer),
             ..SpawnIo::default()
-        };
-        let pid = processes.spawn_user(path, argv, cwd, io)?;
+        })?;
         drop(out_writer);
         drop(err_writer);
-        drop(in_reader);
+        let job = ForegroundJob {
+            pid,
+            unread: in_reader,
+            output,
+            errors,
+            output_open: true,
+            errors_open: true,
+            feed: Some(in_writer),
+            waiting: Vec::new(),
+            input_ended: false,
+        };
+        Ok(self.supervise(job, stdin, stdout, stderr))
+    }
 
-        let mut feed = if stdin.is_terminal() { None } else { Some(in_writer) };
+    /// Feeds a process's standard input and copies its output until it ends, or until
+    /// Ctrl-Z stops it. Returns its status.
+    ///
+    /// A terminal is only read while the process is asking for input, so what's typed
+    /// ahead of a command that never reads stays for the next reader, and isn't echoed.
+    /// Only a command with nothing between it and the terminal can be stopped: anything
+    /// else has a shell waiting for it that a stopped command would hang.
+    fn supervise(
+        &mut self,
+        mut job: ForegroundJob,
+        stdin: &mut dyn Input,
+        stdout: &mut dyn Output,
+        stderr: &mut dyn Output,
+    ) -> i32 {
+        let processes = self.platform.processes;
+        let terminal = stdin.is_terminal();
+        let stoppable =
+            self.foreground && terminal && stdout.is_terminal() && stderr.is_terminal();
+        // Only keys pressed for this command count.
+        let _ = self.console.take_suspend();
+        let _ = self.console.take_quit();
         let mut buffer = [0u8; 2048];
-        let mut waiting = [0u8; 2048];
-        let (mut waiting_from, mut waiting_to) = (0, 0);
-        let mut input_ended = false;
-        let mut out_open = true;
-        let mut err_open = true;
         let mut killed = false;
         let mut interrupted = false;
+        let mut quit = false;
         let mut idle = 0u32;
         loop {
-            let mut moved = copy(&out_reader, &mut out_open, &mut buffer, stdout)
-                | copy(&err_reader, &mut err_open, &mut buffer, stderr);
+            let (exited, mut moved) = copy_streams(
+                processes,
+                job.pid,
+                [(&job.output, &mut job.output_open), (&job.errors, &mut job.errors_open)],
+                &mut buffer,
+                [&mut *stdout, &mut *stderr],
+            );
+            moved |= feed_stdin(&mut job, stdin, terminal, &mut buffer);
 
-            if let Some(writer) = feed.as_ref() {
-                if waiting_from == waiting_to && !input_ended {
-                    match stdin.try_read(&mut waiting) {
-                        Available::Bytes(count) => {
-                            waiting_from = 0;
-                            waiting_to = count;
-                        }
-                        Available::Pending => {}
-                        Available::End => input_ended = true,
-                    }
-                }
-                let mut gone = false;
-                if waiting_from < waiting_to {
-                    match writer.try_write(&waiting[waiting_from..waiting_to]) {
-                        Transfer::Moved(count) => {
-                            waiting_from += count;
-                            moved = true;
-                        }
-                        Transfer::WouldBlock => {}
-                        Transfer::Closed => gone = true,
-                    }
-                }
-                if gone || (input_ended && waiting_from == waiting_to) {
-                    feed = None;
-                }
-            }
-
-            let exited = processes.try_wait(pid) != WaitStatus::Running;
-            if (!out_open && !err_open) && exited || (exited && !moved) {
+            if (!job.output_open && !job.errors_open) && exited || (exited && !moved) {
                 break;
             }
             if !killed {
                 interrupted = self.poll_cancel();
-                if interrupted || stdout.is_broken() {
+                if self.console.take_quit() {
+                    quit = true;
+                }
+                if interrupted || quit || stdout.is_broken() {
                     killed = true;
-                    let _ = processes.try_kill(pid);
+                    let _ = processes.try_kill(job.pid);
+                } else if self.console.take_suspend() && stoppable {
+                    self.for_tree(job.pid, |member| {
+                        processes.set_stopped(member, true);
+                    });
+                    self.just_suspended = Some(job.pid);
+                    self.suspended.push(job);
+                    return 148;
                 }
             }
             if moved {
@@ -487,9 +523,115 @@ impl ProcessHost<'_> {
                 }
             }
         }
-        let status = processes.wait(pid).unwrap_or(feos_app::EXIT_KILLED);
-        Ok(if interrupted { 130 } else { status })
+        // Keys it was given and didn't read belong to whoever reads next. Only a
+        // terminal keeps them: a pipe's reader could never see them anyway.
+        if terminal {
+            let mut rest = core::mem::take(&mut job.waiting);
+            let mut taken = Vec::new();
+            while let Transfer::Moved(count) = job.unread.try_read(&mut buffer) {
+                taken.extend_from_slice(&buffer[..count]);
+            }
+            taken.append(&mut rest);
+            stdin.unread(&taken);
+        }
+        let status = processes.wait(job.pid).unwrap_or(feos_app::EXIT_KILLED);
+        if quit {
+            // The shell's QUIT trap, if there is one, sees this next.
+            processes.signal(processes.current(), feos_app::signal::QUIT);
+            return 131;
+        }
+        if interrupted {
+            130
+        } else {
+            status
+        }
     }
+
+    /// Forgets a stopped job that has ended.
+    fn forget_job(&mut self, pid: u32) {
+        self.suspended.retain(|job| job.pid != pid);
+    }
+}
+
+/// Moves a chunk of standard input towards a process. Returns `true` if any moved.
+fn feed_stdin(
+    job: &mut ForegroundJob,
+    stdin: &mut dyn Input,
+    terminal: bool,
+    buffer: &mut [u8],
+) -> bool {
+    let Some(writer) = job.feed.as_ref() else {
+        return false;
+    };
+    if job.waiting.is_empty() && !job.input_ended && (!terminal || writer.reader_wants()) {
+        match stdin.try_read(buffer) {
+            Available::Bytes(count) => job.waiting.extend_from_slice(&buffer[..count]),
+            Available::Pending => {}
+            Available::End => job.input_ended = true,
+        }
+    }
+    let mut moved = false;
+    let mut gone = false;
+    if !job.waiting.is_empty() {
+        match writer.try_write(&job.waiting) {
+            Transfer::Moved(count) => {
+                job.waiting.drain(..count);
+                moved = true;
+            }
+            Transfer::WouldBlock => {}
+            Transfer::Closed => gone = true,
+        }
+    }
+    if gone || (job.input_ended && job.waiting.is_empty()) {
+        job.feed = None;
+    }
+    moved
+}
+
+/// The body of a task that shows a job's output after `bg`, when no shell's there to.
+fn copy_job_output(
+    processes: &'static dyn Processes,
+    output: PipeReader,
+    errors: PipeReader,
+    mut stdout: Box<dyn Output + Send>,
+    mut stderr: Box<dyn Output + Send>,
+) -> i32 {
+    output.adopt();
+    errors.adopt();
+    stdout.adopt();
+    stderr.adopt();
+    let mut buffer = [0u8; 2048];
+    let (mut output_open, mut errors_open) = (true, true);
+    while output_open || errors_open {
+        let mut moved = copy(&output, &mut output_open, &mut buffer, &mut *stdout);
+        moved |= copy(&errors, &mut errors_open, &mut buffer, &mut *stderr);
+        if !moved {
+            processes.sleep_ms(5);
+        }
+    }
+    0
+}
+
+/// Copies a chunk from each of a process's streams, and says whether it had already
+/// exited, and whether anything moved.
+///
+/// The order matters: it has to look at the process first. All it wrote is in the pipes
+/// by the time it has exited, so an exited process with nothing moved has nothing more
+/// to come. The other way round, its last write and its exit can both land between
+/// finding the pipe empty and finding it gone, and that output would never be read.
+fn copy_streams(
+    processes: &dyn Processes,
+    pid: u32,
+    streams: [(&PipeReader, &mut bool); 2],
+    buffer: &mut [u8],
+    outputs: [&mut dyn Output; 2],
+) -> (bool, bool) {
+    let exited = processes.try_wait(pid) != WaitStatus::Running;
+    let mut moved = false;
+    for ((reader, open), output) in streams.into_iter().zip(outputs) {
+        moved |= copy(reader, open, buffer, output);
+    }
+    (exited, moved)
 }
 
 /// Moves one chunk from `reader` to `output`. Returns `true` if any moved.
@@ -520,7 +662,7 @@ impl Host for ProcessHost<'_> {
         &mut self,
         name: &str,
         args: &[String],
-        _stdin: &mut dyn Input,
+        stdin: &mut dyn Input,
         stdout: &mut dyn Output,
         stderr: &mut dyn Output,
         background: bool,
@@ -554,7 +696,7 @@ impl Host for ProcessHost<'_> {
             });
         }
 
-        Some(match self.run_process(app, args, stdout, stderr) {
+        Some(match self.run_process(app, args, stdin, stdout, stderr) {
             Ok(status) => status,
             Err(error) => report_spawn(name, error, stderr),
         })
@@ -609,6 +751,58 @@ impl Host for ProcessHost<'_> {
         self.stop.requested()
     }
 
+    fn poll_suspend(&mut self) -> bool {
+        // The serial console's keys are only seen by looking.
+        if self.foreground && self.stop.requested() {
+            return false;
+        }
+        self.foreground && self.console.take_suspend()
+    }
+
+    fn take_suspended(&mut self) -> Option<u32> {
+        self.just_suspended.take()
+    }
+
+    fn resume_job(
+        &mut self,
+        pid: u32,
+        stdin: &mut dyn Input,
+        stdout: &mut dyn Output,
+        stderr: &mut dyn Output,
+    ) -> Option<i32> {
+        let index = self.suspended.iter().position(|job| job.pid == pid)?;
+        let job = self.suspended.remove(index);
+        Some(self.supervise(job, stdin, stdout, stderr))
+    }
+
+    fn continue_job(&mut self, pid: u32) {
+        let Some(index) = self.suspended.iter().position(|job| job.pid == pid) else {
+            return;
+        };
+        let job = self.suspended.remove(index);
+        let (_, stdout, stderr) = self.console.streams();
+        let processes = self.platform.processes;
+        let (output, errors) = (job.output, job.errors);
+        let io = SpawnIo {
+            background: true,
+            ..SpawnIo::default()
+        };
+        // With no task to show it, its output stays in the pipes until they fill.
+        let _ = processes.spawn_task(
+            "job-io",
+            io,
+            Box::new(move || copy_job_output(processes, output, errors, stdout, stderr)),
+        );
+    }
+
+    fn catch_signals(&mut self, mask: u32) {
+        self.platform.processes.catch_signals(mask);
+    }
+
+    fn take_signals(&mut self) -> u32 {
+        self.platform.processes.take_signals()
+    }
+
     fn tasks(&mut self) -> Option<&mut dyn TaskHost> {
         Some(self)
     }
@@ -644,6 +838,9 @@ impl TaskHost for ProcessHost<'_> {
                 serial: false,
             },
             console: self.console.clone(),
+            foreground: false,
+            suspended: Vec::new(),
+            just_suspended: None,
         })
     }
 
@@ -667,8 +864,14 @@ impl TaskHost for ProcessHost<'_> {
                 Some(detail) if detail.stopped => JobStatus::Stopped,
                 _ => JobStatus::Running,
             },
-            WaitStatus::Exited(code) => JobStatus::Exited(code),
-            WaitStatus::Unknown => JobStatus::Unknown,
+            WaitStatus::Exited(code) => {
+                self.forget_job(pid);
+                JobStatus::Exited(code)
+            }
+            WaitStatus::Unknown => {
+                self.forget_job(pid);
+                JobStatus::Unknown
+            }
         }
     }
 
@@ -702,4 +905,82 @@ fn report_spawn(name: &str, error: SpawnError, stderr: &mut dyn Output) -> i32 {
     let _ = writeln!(message, "{name}: {detail}");
     stderr.write(message.as_bytes());
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::vec;
+
+    /// A process that does its last write and exits while the copy loop looks at it:
+    /// the moment a CPU can be taken away from the loop for.
+    struct ExitsWhileWatched {
+        last_words: std::sync::Mutex<Option<PipeWriter>>,
+    }
+
+    impl Processes for ExitsWhileWatched {
+        fn spawn(&self, _app: &'static dyn App, _args: &str) -> Result<u32, SpawnError> {
+            Err(SpawnError::Unsupported)
+        }
+
+        fn kill(&self, _pid: u32) -> bool {
+            false
+        }
+
+        fn current(&self) -> u32 {
+            0
+        }
+
+        fn snapshot(&self, _out: &mut [ProcessInfo]) -> usize {
+            0
+        }
+
+        fn try_wait(&self, _pid: u32) -> WaitStatus {
+            if let Some(writer) = self.last_words.lock().unwrap().take() {
+                assert_eq!(writer.try_write(b"last line\n"), Transfer::Moved(10));
+                drop(writer);
+            }
+            WaitStatus::Exited(0)
+        }
+    }
+
+    #[derive(Default)]
+    struct Collected(RefCell<Vec<u8>>);
+
+    impl Output for &Collected {
+        fn write(&mut self, bytes: &[u8]) {
+            self.0.borrow_mut().extend_from_slice(bytes);
+        }
+    }
+
+    #[test]
+    fn output_written_just_before_exit_is_not_lost() {
+        let (out_reader, out_writer) = pipe::create().unwrap();
+        let (err_reader, err_writer) = pipe::create().unwrap();
+        // Holding this end open means the stream can't report end of file instead,
+        // which is how a child with the same stream would look.
+        let processes = ExitsWhileWatched {
+            last_words: std::sync::Mutex::new(Some(out_writer.try_clone().unwrap())),
+        };
+        let collected = Collected::default();
+        let (mut stdout, mut stderr) = (&collected, &collected);
+        let (mut out_open, mut err_open) = (true, true);
+        let mut buffer = vec![0u8; 256];
+        loop {
+            let (exited, moved) = copy_streams(
+                &processes,
+                1,
+                [(&out_reader, &mut out_open), (&err_reader, &mut err_open)],
+                &mut buffer,
+                [&mut stdout, &mut stderr],
+            );
+            // As in the loops above: an exited process with nothing moved is finished.
+            if exited && !moved {
+                break;
+            }
+        }
+        drop((out_writer, err_writer));
+        assert_eq!(collected.0.borrow().as_slice(), b"last line\n");
+    }
 }

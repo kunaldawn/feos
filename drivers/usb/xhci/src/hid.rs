@@ -295,6 +295,14 @@ pub struct PointerState {
 }
 
 impl PointerState {
+    /// The screen has changed size, and the cursor stays on it.
+    pub fn set_screen(&mut self, width: u16, height: u16) {
+        self.width = i32::from(width.max(1));
+        self.height = i32::from(height.max(1));
+        self.x = self.x.min(self.width - 1);
+        self.y = self.y.min(self.height - 1);
+    }
+
     /// A pointer on a screen of this size, starting from the middle.
     pub fn new(layout: ReportLayout, width: u16, height: u16) -> Self {
         Self {

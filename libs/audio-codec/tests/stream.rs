@@ -107,16 +107,6 @@ fn a_short_buffer_is_reported_rather_than_overrun() {
 }
 
 #[test]
-fn opus_says_why_it_cannot_play() {
-    let (_, input) = data!("tone.opus");
-    assert!(matches!(
-        AudioStream::open(input),
-        Err(AudioError::UnsupportedFeature(_))
-    ));
-    assert_eq!(info(input).unwrap().format, AudioFormat::OggOpus);
-}
-
-#[test]
 fn the_stream_fits_on_a_task_stack() {
     // A worker keeps this in a local, on a 128 KiB stack.
     assert!(std::mem::size_of::<AudioStream<'_>>() < 32 * 1024);
@@ -141,5 +131,123 @@ fn hostile_truncations_do_not_panic() {
             }
             let _ = name;
         }
+    }
+}
+
+// ---- The same files through a `Source`.
+
+mod source {
+    use feos_audio_codec::{AudioStream, Source, SourceStream};
+
+    const SOUND: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../boards/qemu-virt/fs/media/sound");
+
+    /// A file that hands over a little at a time.
+    struct Slow(Vec<u8>);
+
+    impl Source for Slow {
+        fn len(&self) -> u64 {
+            self.0.len() as u64
+        }
+
+        fn read_at(&self, offset: u64, out: &mut [u8]) -> usize {
+            let at = (offset as usize).min(self.0.len());
+            let count = out.len().min(self.0.len() - at).min(3000);
+            out[..count].copy_from_slice(&self.0[at..at + count]);
+            count
+        }
+    }
+
+    fn drain_file(stream: &mut SourceStream, chunk: &mut Vec<i16>) -> Vec<i16> {
+        let channels = stream.info().channels as usize;
+        let mut all = Vec::new();
+        let mut errors = 0;
+        loop {
+            match stream.next_chunk(chunk) {
+                Ok(Some(frames)) => all.extend_from_slice(&chunk[..frames * channels]),
+                Ok(None) => return all,
+                Err(error) => {
+                    errors += 1;
+                    assert!(errors < 8, "{error:?}");
+                }
+            }
+        }
+    }
+
+    fn drain_memory(stream: &mut AudioStream<'_>, chunk: &mut Vec<i16>) -> Vec<i16> {
+        let channels = stream.info().channels as usize;
+        let mut all = Vec::new();
+        let mut errors = 0;
+        loop {
+            match stream.next_chunk(chunk) {
+                Ok(Some(frames)) => all.extend_from_slice(&chunk[..frames * channels]),
+                Ok(None) => return all,
+                Err(error) => {
+                    errors += 1;
+                    assert!(errors < 8, "{error:?}");
+                }
+            }
+        }
+    }
+
+    fn compare(name: &str, exact_length: bool) {
+        let data = std::fs::read(format!("{SOUND}/{name}")).unwrap();
+        let mut memory = AudioStream::open(&data).unwrap();
+        let mut file = SourceStream::open(Box::new(Slow(data.clone()))).unwrap();
+        assert_eq!(memory.info().sample_rate, file.info().sample_rate, "{name}");
+        assert_eq!(memory.info().channels, file.info().channels, "{name}");
+        if exact_length {
+            assert_eq!(memory.info().frames, file.info().frames, "{name}");
+        } else {
+            let (a, b) = (memory.info().frames as f64, file.info().frames as f64);
+            assert!((a - b).abs() / a < 0.1, "{name}: {a} against an estimated {b}");
+        }
+        let mut chunk = vec![0i16; 1 << 18];
+        let a = drain_memory(&mut memory, &mut chunk);
+        let b = drain_file(&mut file, &mut chunk);
+        assert_eq!(a.len(), b.len(), "{name}");
+        assert!(a == b, "{name}: the samples differ");
+
+        // Seek: to a third of the way in, which should give the same sound again.
+        let channels = file.info().channels as usize;
+        let target = file.info().frames / 3;
+        file.seek(target).unwrap();
+        let again = drain_file(&mut file, &mut chunk);
+        let want = &a[target as usize * channels..];
+        if exact_length {
+            assert_eq!(again.len(), want.len(), "{name} after a seek");
+            // Past the first packets, whose overlap a seek loses for Vorbis.
+            let settle = want.len() / 4;
+            assert!(again[settle..] == want[settle..], "{name}: wrong sound after a seek");
+        } else {
+            let difference = (again.len() as i64 - want.len() as i64).unsigned_abs() as usize;
+            assert!(difference < a.len() / 10, "{name}: landed {difference} samples away");
+        }
+    }
+
+    #[test]
+    fn pcm_formats() {
+        compare("tone.wav", true);
+        compare("tone.aiff", true);
+        compare("tone.au", true);
+    }
+
+    #[test]
+    fn flac() {
+        compare("tone.flac", true);
+    }
+
+    #[test]
+    fn vorbis() {
+        compare("tone.ogg", true);
+    }
+
+    #[test]
+    fn mp3() {
+        compare("tone.mp3", false);
+    }
+
+    #[test]
+    fn adts() {
+        compare("tone.aac", false);
     }
 }

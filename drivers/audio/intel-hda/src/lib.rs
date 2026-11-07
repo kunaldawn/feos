@@ -147,8 +147,18 @@ const PARAM_PIN_CAP: u16 = 0x0c;
 const PARAM_OUT_AMP_CAP: u16 = 0x12;
 
 const WIDGET_AUDIO_OUTPUT: u32 = 0;
+const WIDGET_AUDIO_INPUT: u32 = 1;
 const WIDGET_PIN_COMPLEX: u32 = 4;
 const PIN_CAP_OUTPUT: u32 = 1 << 4;
+const PIN_CAP_INPUT: u32 = 1 << 5;
+const PIN_INPUT_ENABLE: u16 = 1 << 5;
+const PARAM_IN_AMP_CAP: u16 = 0x0d;
+/// `Set Amplifier Gain/Mute`: the input amp, both sides.
+const AMP_SET_INPUT: u16 = 0x7000;
+/// The capture stream's tag, on the link. The output stream has 1.
+const CAPTURE_TAG: u32 = 2;
+/// The global capabilities register: its bits 8 to 11 count input streams.
+const GCAP: usize = 0x00;
 
 const COMMAND_TIMEOUT: usize = 1_000_000;
 /// Polls of a register that the controller should change promptly.
@@ -291,10 +301,20 @@ struct Controller {
     /// Counts stream stops, so a blocked `play` can tell its stream has ended.
     generation: u32,
     ring: Ring,
+    /// The input converter and pin, or 0 for a codec with no input.
+    adc: u8,
+    in_pin: u8,
+    capturing: bool,
+    /// `read` is how far the hardware has written. `capture_taken` is how far anyone has
+    /// read from that.
+    capture: Ring,
+    capture_taken: u64,
     corb: Corb,
     rirb: Rirb,
     bdl: Bdl,
     pcm: Pcm,
+    capture_bdl: Bdl,
+    capture_pcm: Pcm,
 }
 
 impl Controller {
@@ -464,20 +484,27 @@ impl Controller {
 
         let mut dac = None;
         let mut pin = None;
+        let (mut adc, mut in_pin) = (0, 0);
         for node in start..start + count {
             let node = node as u8;
             let capabilities = self.parameter(node, PARAM_AUDIO_WIDGET_CAP)?;
             match (capabilities >> 20) & 0xf {
                 WIDGET_AUDIO_OUTPUT if dac.is_none() => dac = Some(node),
-                WIDGET_PIN_COMPLEX if pin.is_none() => {
+                WIDGET_AUDIO_INPUT if adc == 0 => adc = node,
+                WIDGET_PIN_COMPLEX => {
                     let pin_capabilities = self.parameter(node, PARAM_PIN_CAP)?;
-                    if pin_capabilities & PIN_CAP_OUTPUT != 0 {
+                    if pin.is_none() && pin_capabilities & PIN_CAP_OUTPUT != 0 {
                         pin = Some(node);
+                    }
+                    if in_pin == 0 && pin_capabilities & PIN_CAP_INPUT != 0 {
+                        in_pin = node;
                     }
                 }
                 _ => {}
             }
         }
+        self.adc = adc;
+        self.in_pin = in_pin;
 
         self.afg = afg;
         self.dac = dac?;
@@ -662,6 +689,146 @@ impl Controller {
             dac: self.dac,
             pin: self.pin,
         })
+    }
+
+    fn capture_base(&self) -> usize {
+        // Input streams come first, so this is the first of them.
+        self.mmio + 0x80
+    }
+
+    fn capture_control(&self) -> u32 {
+        // SAFETY: stream control register inside the controller BAR.
+        unsafe { read_volatile((self.capture_base() + SD_CTL) as *const u32) }
+    }
+
+    fn set_capture_control(&self, value: u32) {
+        // SAFETY: stream control register inside the controller BAR.
+        unsafe { write_volatile((self.capture_base() + SD_CTL) as *mut u32, value) }
+    }
+
+    /// Starts the input stream. `false` if this codec or controller has no input.
+    fn start_capture(&mut self) -> bool {
+        if self.capturing {
+            return true;
+        }
+        if !self.ready || self.adc == 0 || self.in_pin == 0 || (self.read16(GCAP) >> 8) & 0xf == 0 {
+            return false;
+        }
+        let path = (|| -> Option<()> {
+            self.command(self.adc, VERB_SET_POWER_STATE, 0)?;
+            self.command(self.in_pin, VERB_SET_POWER_STATE, 0)?;
+            self.command(self.adc, VERB_SET_STREAM_FORMAT, FMT_48K_16_STEREO)?;
+            self.command(self.adc, VERB_SET_CONVERTER_STREAM, (CAPTURE_TAG as u16) << 4)?;
+            self.command(self.in_pin, VERB_SET_PIN_CONTROL, PIN_INPUT_ENABLE)?;
+            // Unmuted, at the amp's 0 dB. A widget with no amp of its own has the group's.
+            let mut amp = self.parameter(self.adc, PARAM_IN_AMP_CAP)?;
+            if amp == 0 {
+                amp = self.parameter(self.afg, PARAM_IN_AMP_CAP)?;
+            }
+            let gain = amp_payload(amp) & AMP_GAIN_MAX;
+            self.command(self.adc, VERB_SET_AMP_GAIN_MUTE, AMP_SET_INPUT | gain)?;
+            Some(())
+        })();
+        if path.is_none() {
+            return false;
+        }
+
+        // Stopped, reset and out of reset, as for the output stream.
+        self.set_capture_control(0);
+        for _ in 0..REGISTER_POLLS {
+            if self.capture_control() & SD_RUN == 0 {
+                break;
+            }
+        }
+        self.set_capture_control(SD_RESET);
+        for _ in 0..REGISTER_POLLS {
+            if self.capture_control() & SD_RESET != 0 {
+                break;
+            }
+        }
+        self.set_capture_control(0);
+        for _ in 0..REGISTER_POLLS {
+            if self.capture_control() & SD_RESET == 0 {
+                break;
+            }
+        }
+
+        let start = addr_of!(self.capture_pcm.0) as u64;
+        for index in 0..BDL_ENTRIES {
+            let entry = BdlEntry {
+                address: start + (index * BDL_ENTRY_BYTES) as u64,
+                length: BDL_ENTRY_BYTES as u32,
+                flags: 0,
+            };
+            // SAFETY: a static buffer the controller only reads while the stream runs.
+            unsafe { write_volatile(addr_of_mut!(self.capture_bdl.0[index]), entry) };
+        }
+        let base = self.capture_base();
+        // SAFETY: stream position register inside the controller BAR.
+        let position = unsafe { read_volatile((base + SD_LPIB) as *const u32) };
+        self.capture = Ring::new(position);
+        self.capture_taken = 0;
+        let bdl_address = addr_of!(self.capture_bdl.0) as u64;
+        dma::wmb();
+        // SAFETY: stream descriptor registers inside the controller BAR.
+        unsafe {
+            write_volatile((base + SD_BDLPL) as *mut u32, bdl_address as u32);
+            write_volatile((base + SD_BDLPU) as *mut u32, (bdl_address >> 32) as u32);
+            // As for the output stream: see `Ring::observe`.
+            write_volatile((base + SD_CBL) as *mut u32, RING_BYTES as u32 + position);
+            write_volatile((base + SD_LVI) as *mut u16, BDL_ENTRIES as u16 - 1);
+            write_volatile((base + SD_FMT) as *mut u16, FMT_48K_16_STEREO);
+            write_volatile((base + SD_STS) as *mut u8, SD_INT_MASK);
+        }
+        dma::wmb();
+        self.set_capture_control((CAPTURE_TAG << 20) | SD_RUN);
+        self.capturing = true;
+        true
+    }
+
+    fn stop_capture(&mut self) {
+        if self.capturing {
+            self.set_capture_control(0);
+            self.capturing = false;
+        }
+    }
+
+    /// Notes how far the hardware has got.
+    fn poll_capture(&mut self) {
+        if self.capturing {
+            // SAFETY: stream position register inside the controller BAR.
+            let position = unsafe { read_volatile((self.capture_base() + SD_LPIB) as *const u32) };
+            self.capture.observe(position);
+        }
+    }
+
+    /// Moves recorded whole frames to `out`, and returns how many samples. If the reader
+    /// has fallen a whole ring behind, the oldest is gone.
+    fn read_capture(&mut self, out: &mut [i16]) -> usize {
+        self.poll_capture();
+        let written = self.capture.read;
+        if written.saturating_sub(self.capture_taken) > RING_BYTES as u64 {
+            self.capture_taken = written - RING_BYTES as u64;
+        }
+        let waiting = (written - self.capture_taken) as usize;
+        let bytes = waiting.min(out.len() * 2) / FRAME_BYTES * FRAME_BYTES;
+        if bytes == 0 {
+            return 0;
+        }
+        dma::rmb();
+        let mut at = 0;
+        for (offset, length) in Ring::spans(self.capture_taken, bytes) {
+            let count = length / 2;
+            for index in 0..count {
+                // SAFETY: inside a static buffer. Volatile, as the device writes it.
+                out[at + index] = unsafe {
+                    read_volatile(addr_of!(self.capture_pcm.0[offset / 2 + index]))
+                };
+            }
+            at += count;
+        }
+        self.capture_taken += bytes as u64;
+        bytes / 2
     }
 
     /// Queues as many whole frames as fit and returns how many samples that was.
@@ -861,6 +1028,24 @@ impl Audio for IntelHda {
             }
             clock.idle_ms(PLAY_POLL_MS);
         }
+    }
+
+    fn capture_start(&self) -> bool {
+        self.state.lock().start_capture()
+    }
+
+    fn capture_read(&self, out: &mut [i16]) -> usize {
+        self.state.lock().read_capture(out)
+    }
+
+    fn capture_position(&self) -> u64 {
+        let mut controller = self.state.lock();
+        controller.poll_capture();
+        controller.capture.read / FRAME_BYTES as u64
+    }
+
+    fn capture_stop(&self) {
+        self.state.lock().stop_capture();
     }
 
     fn stop(&self) {

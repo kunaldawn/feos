@@ -17,7 +17,7 @@ impl App for Kill {
     }
 
     fn usage(&self) -> &'static str {
-        "kill [-STOP|-CONT] <pid>..."
+        "kill [-KILL|-TERM|-HUP|-QUIT|-INT|-STOP|-CONT] <pid>..."
     }
 
     fn description(&self) -> &'static str {
@@ -43,7 +43,13 @@ impl App for Kill {
                 continue;
             };
             let done = match signal.trim_start_matches('-') {
-                "9" | "15" | "KILL" | "TERM" | "SIGKILL" | "SIGTERM" => kill(processes, pid),
+                "9" | "KILL" | "SIGKILL" => kill(processes, pid),
+                // A shell with a trap for one of these sees it; for anything else, they
+                // end the process, and SIGKILL's the only way the kernel has of doing that.
+                "1" | "HUP" | "SIGHUP" => catchable(processes, pid, feos_app::signal::HUP),
+                "2" | "INT" | "SIGINT" => catchable(processes, pid, feos_app::signal::INT),
+                "3" | "QUIT" | "SIGQUIT" => catchable(processes, pid, feos_app::signal::QUIT),
+                "15" | "TERM" | "SIGTERM" => catchable(processes, pid, feos_app::signal::TERM),
                 "19" | "STOP" | "SIGSTOP" => change(processes, pid, true),
                 "18" | "CONT" | "SIGCONT" => change(processes, pid, false),
                 _ => {
@@ -57,6 +63,10 @@ impl App for Kill {
         }
         status
     }
+}
+
+fn catchable(processes: &dyn Processes, pid: u32, number: u32) -> bool {
+    processes.signal(pid, number) || kill(processes, pid)
 }
 
 fn change(processes: &dyn Processes, pid: u32, stopped: bool) -> bool {

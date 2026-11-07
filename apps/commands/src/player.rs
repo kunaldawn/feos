@@ -14,6 +14,8 @@
 
 use core::fmt::Write;
 
+use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -31,8 +33,9 @@ use feos_text::Text;
 use feos_video::{info as video_info, ContainerFormat, DecodedFrame, VideoError, VideoInfo};
 
 use crate::audio_worker::{AudioFailure, AudioTask, Source, TrackInfo, PLAYER_PIPE};
+use crate::playlist::{self, PLAYLIST_FILES};
 use crate::decode_worker::{
-    read_file, DecodeTask, Failure, Opened, Pipe, Seek, Step, Worker, MAX_MEDIA_BYTES, PIPE,
+    read_file, DecodeTask, Failure, Opened, Pipe, Seek, Step, Worker, PIPE,
 };
 use crate::files::format_size;
 
@@ -79,6 +82,15 @@ struct Preview {
     info: Option<VideoInfo>,
 }
 
+/// Whether sound is played at this speed. Past these, a time-stretched voice isn't
+/// worth hearing, and the picture runs on with no sound, as it does for scrubbing.
+fn can_stretch(speed: f32) -> bool {
+    (0.5..=2.0).contains(&speed)
+}
+
+/// The largest file the information dialog looks inside.
+const PREVIEW_BYTES: usize = 1024 * 1024;
+
 /// Reads a file's details for the information dialog.
 fn preview_of(fs: &dyn FileSystem, node: NodeId) -> Preview {
     let mut name = Text::new();
@@ -87,7 +99,11 @@ fn preview_of(fs: &dyn FileSystem, node: NodeId) -> Preview {
     let mut path_buffer = [0u8; MAX_PATH];
     path.set(fs.path(node, &mut path_buffer).unwrap_or("/"));
     let size = fs.size(node);
-    let info = read_file(fs, node, size).and_then(|data| video_info(&data).ok());
+    // This runs on the window's task, where a large read is a stuck desktop.
+    let info = (size <= PREVIEW_BYTES)
+        .then(|| read_file(fs, node, size))
+        .flatten()
+        .and_then(|data| video_info(&data).ok());
     Preview {
         name,
         path,
@@ -446,6 +462,8 @@ impl MenuKind {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Action {
+    SavePlaylist,
+    LoadPlaylist,
     VolumeUp,
     VolumeDown,
     ToggleMute,
@@ -532,7 +550,8 @@ const MEDIA_MENU: &[MenuItem] = &[
     disabled("Open Disc...", ""),
     disabled("Open Network...", ""),
     sep(),
-    disabled("Save Playlist...", ""),
+    item("Save Playlist", "Ctrl+S", Action::SavePlaylist),
+    item("Load Playlist", "Ctrl+L", Action::LoadPlaylist),
     sep(),
     item("Quit", "Esc", Action::Quit),
 ];
@@ -868,8 +887,12 @@ impl PlayerState {
             }
         } else if let Some(node) = fs.resolve(args.trim()) {
             if fs.is_file(node) {
-                state.ensure_in_playlist(node);
-                state.open_node(fs, node, now, true);
+                if fs.name(node).is_some_and(playlist::is_playlist) {
+                    state.load_playlist(fs, node, now, true);
+                } else {
+                    state.ensure_in_playlist(node);
+                    state.open_node(fs, node, now, true);
+                }
             } else {
                 state.set_notice("Open File", "The path does not point to a file.", now);
             }
@@ -900,6 +923,70 @@ impl PlayerState {
         collect_media(fs, fs.root(), 0, &mut self.open_results, &mut self.open_len);
         self.open_cursor = self.open_cursor.min(self.open_len.saturating_sub(1));
         self.open_scroll = 0;
+    }
+
+    /// Writes the list to the first of [`PLAYLIST_FILES`] that will take it.
+    fn save_playlist(&mut self, fs: &dyn FileSystem, now: u64) {
+        let Some(tree) = fs.tree() else {
+            self.set_notice("Save Playlist", "This filesystem can't be written.", now);
+            return;
+        };
+        let mut paths = Vec::new();
+        for &node in &self.playlist[..self.playlist_len] {
+            let mut buffer = [0u8; MAX_PATH];
+            if let Some(path) = fs.path(node, &mut buffer) {
+                paths.push(String::from(path));
+            }
+        }
+        let text = playlist::format(paths.iter().map(String::as_str));
+        for path in PLAYLIST_FILES {
+            if tree.write_file_atomic(path, text.as_bytes()).is_ok() {
+                let mut message = Text::<96>::new();
+                let _ = write!(message, "Saved {} entries to {path}", paths.len());
+                self.show_osd(message.as_str(), now);
+                println!("[player] saved {} entries to {path}", paths.len());
+                return;
+            }
+        }
+        self.set_notice("Save Playlist", "The playlist could not be written.", now);
+    }
+
+    /// Replaces the list with what a playlist file names, and plays the first.
+    /// Entries that aren't there are left out, and the count of them is reported.
+    fn load_playlist(&mut self, fs: &dyn FileSystem, file: NodeId, now: u64, play: bool) {
+        let size = fs.size(file);
+        let data = (size <= playlist::MAX_BYTES).then(|| read_file(fs, file, size)).flatten();
+        let Some(text) = data.as_deref().and_then(|data| core::str::from_utf8(data).ok()) else {
+            self.set_notice("Load Playlist", "The playlist could not be read.", now);
+            return;
+        };
+        let mut buffer = [0u8; MAX_PATH];
+        let directory = fs
+            .parent(file)
+            .and_then(|parent| fs.path(parent, &mut buffer))
+            .unwrap_or("/");
+        let (mut loaded, mut missing) = (0, 0);
+        let mut nodes = [NodeId::ROOT; MAX_PLAYLIST];
+        playlist::entries(text, directory, |path| match fs.resolve(path) {
+            Some(node) if fs.is_file(node) && loaded < MAX_PLAYLIST => {
+                nodes[loaded] = node;
+                loaded += 1;
+            }
+            _ => missing += 1,
+        });
+        if loaded == 0 {
+            self.set_notice("Load Playlist", "Nothing in that playlist could be found.", now);
+            return;
+        }
+        self.playlist = nodes;
+        self.playlist_len = loaded;
+        self.playlist_cursor = 0;
+        self.playlist_scroll = 0;
+        let mut message = Text::<96>::new();
+        let _ = write!(message, "Loaded {loaded} entries, {missing} missing");
+        println!("[player] loaded {loaded} entries, {missing} missing");
+        self.open_node(fs, nodes[0], now, play);
+        self.show_osd(message.as_str(), now);
     }
 
     fn ensure_in_playlist(&mut self, node: NodeId) {
@@ -935,10 +1022,6 @@ impl PlayerState {
         self.playing = false;
         self.last_tick = now;
 
-        if self.media_size > MAX_MEDIA_BYTES {
-            self.fail_open("The file is larger than the player's 16 MiB limit.", now);
-            return;
-        }
         if self.media_size == 0 {
             self.fail_open("The file is empty.", now);
             return;
@@ -958,7 +1041,7 @@ impl PlayerState {
         self.waiting_frame = true;
         self.playing = play;
         self.sent_playing = play;
-        self.sent_hear = play && self.speed == 1.0;
+        self.sent_hear = play && can_stretch(self.speed);
         self.engine.pipe.open(node, play);
         self.engine.pump();
         self.receive(now);
@@ -1043,7 +1126,7 @@ impl PlayerState {
 
     /// Whether the sound sets the time right now.
     fn audio_is_clock(&self) -> bool {
-        self.audio_info.is_some() && !self.audio_done && self.speed == 1.0 && !self.audio_stale
+        self.audio_info.is_some() && !self.audio_done && can_stretch(self.speed) && !self.audio_stale
     }
 
     /// Forgets the open file and everything derived from it.
@@ -1121,9 +1204,6 @@ impl PlayerState {
                 self.media_open = false;
             }
             Failure::Unreadable => self.fail_open("The file could not be read.", now),
-            Failure::TooLarge => {
-                self.fail_open("The file is larger than the player's 16 MiB limit.", now)
-            }
             Failure::FrameTooLarge => {
                 self.fail_open("The video is larger than the player's 1080p limit.", now)
             }
@@ -1203,8 +1283,8 @@ impl PlayerState {
     }
 
     fn sync_playing(&mut self) {
-        // The sound only keeps up at normal speed.
-        let hear = self.playing && self.speed == 1.0;
+        // The sound only follows within a limit, past which it's silent.
+        let hear = self.playing && can_stretch(self.speed);
         if self.sent_playing != self.playing || self.sent_hear != hear {
             self.sent_playing = self.playing;
             self.sent_hear = hear;
@@ -1442,6 +1522,9 @@ impl PlayerState {
 
     fn set_speed(&mut self, speed: f32, now: u64) {
         self.speed = speed.clamp(0.25, 4.0);
+        if can_stretch(self.speed) {
+            PLAYER_PIPE.set_tempo(self.speed);
+        }
         self.last_tick = now;
         let mut text = Text::<48>::new();
         let _ = write!(text, "Speed {:.2}x", self.speed);
@@ -1648,6 +1731,8 @@ impl PlayerState {
             Action::None => false,
             Action::VolumeUp | Action::VolumeDown | Action::ToggleMute => true,
             Action::Open | Action::Quit | Action::TogglePlaylist | Action::Fullscreen => true,
+            Action::LoadPlaylist => true,
+            Action::SavePlaylist => self.playlist_len > 0,
             Action::PlayPause => self.current.is_some() || self.playlist_len > 0,
             Action::PlayItem | Action::ItemInfo => true,
             Action::PlayAll => self.playlist_len > 0,
@@ -1698,6 +1783,14 @@ impl PlayerState {
         match action {
             Action::None => {}
             Action::Open => self.open_dialog(fs, now),
+            Action::SavePlaylist => self.save_playlist(fs, now),
+            Action::LoadPlaylist => {
+                let saved = PLAYLIST_FILES.iter().find_map(|path| fs.resolve(path));
+                match saved {
+                    Some(node) => self.load_playlist(fs, node, now, true),
+                    None => self.set_notice("Load Playlist", "No playlist has been saved.", now),
+                }
+            }
             Action::Quit => self.exit = true,
             Action::PlayPause => {
                 let _ = self.toggle_play(fs, now);
@@ -2326,6 +2419,12 @@ impl PlayerState {
             Key::Enter => {
                 let _ = self.open_selected_playlist(fs, now);
             }
+            Key::Character('s' | 'S') if modifiers.contains(Modifiers::CTRL) => {
+                self.perform(fs, Action::SavePlaylist, None, now)
+            }
+            Key::Character('l' | 'L') if modifiers.contains(Modifiers::CTRL) => {
+                self.perform(fs, Action::LoadPlaylist, None, now)
+            }
             Key::Character('s') | Key::Character('S') => self.stop(now),
             Key::Character('b') | Key::Character('B') => {
                 self.previous_media(fs, now, true);
@@ -2948,7 +3047,11 @@ fn open_row_at(state: &PlayerState, layout: DialogLayout, point: Point) -> Optio
 
 /// Runs FEOS Media Player.
 /// State of a media player hosted inside a desktop window.
-static WINDOW: SpinLock<Option<PlayerState>> = SpinLock::new(None);
+///
+/// A frame takes it out of the lock, because a failure with a lock held stops the whole
+/// machine. A window whose task died never puts it back, and [`close_player`] copes.
+static WINDOW: SpinLock<Option<Box<PlayerState>>> = SpinLock::new(None);
+static TEST_STARTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 pub(super) fn open_player(fs: &dyn FileSystem, context: &WindowContext<'_, '_>) -> bool {
     let screen = Rect::new(
@@ -2958,12 +3061,13 @@ pub(super) fn open_player(fs: &dyn FileSystem, context: &WindowContext<'_, '_>) 
         context.canvas.height() as u32,
     );
     let engine = Engine::task(context.platform.processes);
-    let mut state = PlayerState::new(fs, screen, context.args, context.now_ms, engine);
+    let (args, _) = crate::audio_worker::strip_test_failure(context.args);
+    let mut state = PlayerState::new(fs, screen, args, context.now_ms, engine);
     state.has_pointer = true;
     state.pointer = context.pointer();
     state.show_cursor = false;
     state.embedded = true;
-    *WINDOW.lock() = Some(state);
+    *WINDOW.lock() = Some(Box::new(state));
     true
 }
 
@@ -2971,11 +3075,12 @@ pub(super) fn frame_player(
     fs: &dyn FileSystem,
     context: &mut WindowContext<'_, '_>,
 ) -> WindowFrame {
-    let mut guard = WINDOW.lock();
-    let Some(state) = guard.as_mut() else {
+    let Some(mut boxed) = WINDOW.lock().take() else {
         return WindowFrame::Close;
     };
+    let state = &mut *boxed;
     let now = context.now_ms;
+    crate::audio_worker::fail_for_test(context.args, &TEST_STARTED, now);
 
     context.dispatch_pointer(|report| {
         if state.handle_pointer(fs, report, now) {
@@ -2992,13 +3097,19 @@ pub(super) fn frame_player(
     state.tick(fs, now);
 
     if state.exit {
+        *WINDOW.lock() = Some(boxed);
         return WindowFrame::Close;
     }
     render(context.canvas, fs, state, now);
+    *WINDOW.lock() = Some(boxed);
     WindowFrame::Continue
 }
 
 pub(super) fn close_player() {
+    // The state's own `Drop`s say this too, but a window that crashed took the state
+    // with it, and its tasks would otherwise play on.
+    PIPE.shut_down();
+    PLAYER_PIPE.shut_down();
     *WINDOW.lock() = None;
 }
 
@@ -5020,11 +5131,14 @@ mod tests {
         state.tick(&MEDIA, 1850);
         assert_eq!(state.frame_index, 5);
 
-        // At another speed the sound can't keep up, so the timer takes over.
+        // Within a limit, the sound keeps its pitch and stays in charge.
         state.set_speed(2.0, 1850);
+        assert!(state.audio_is_clock());
+        // Past that it goes quiet, and the timer takes over.
+        state.set_speed(4.0, 1850);
         assert!(!state.audio_is_clock());
         state.tick(&MEDIA, 1950);
-        assert_eq!(state.position_ms, 700);
+        assert_eq!(state.position_ms, 900);
     }
 
     #[test]

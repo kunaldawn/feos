@@ -67,6 +67,10 @@ pub trait Input {
     /// tasks. It closes with its owner, whichever way that ends.
     fn adopt(&self) {}
 
+    /// Puts bytes back to be read next: what a program was given that it never read.
+    /// A stream that can't just loses them.
+    fn unread(&mut self, _bytes: &[u8]) {}
+
     /// Reads what's already here, for something that has other streams to look after.
     /// The default is for a stream that never has to wait.
     fn try_read(&mut self, out: &mut [u8]) -> Available {

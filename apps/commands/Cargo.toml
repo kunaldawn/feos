@@ -12,6 +12,7 @@ feos-audio = { workspace = true }
 feos-audio-codec = { workspace = true }
 feos-console = { workspace = true }
 feos-coreutils = { workspace = true }
+feos-desktop = { workspace = true }
 feos-desktop-app = { workspace = true }
 feos-dosbox-app = { workspace = true }
 feos-fs = { workspace = true }
@@ -29,4 +30,3 @@ feos-video = { workspace = true }
 
 [dev-dependencies]
 feos-bundle = { workspace = true }
-feos-desktop = { workspace = true }

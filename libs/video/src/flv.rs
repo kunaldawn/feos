@@ -2,6 +2,8 @@
 
 use alloc::vec::Vec;
 
+use feos_source::Window;
+
 use crate::bitstream::{u24_be_at, u32_at};
 use crate::codec::Codec;
 use crate::audio::{push_packet, AudioCodec, AudioTrack};
@@ -382,26 +384,7 @@ pub(crate) fn audio_track(input: &[u8]) -> Option<AudioTrack> {
         }
         let flags = body[0];
         let format = flags >> 4;
-        let rate = [5512, 11025, 22050, 44100][(flags as usize >> 2) & 3];
-        let wide = flags & 2 != 0;
-        let channels = if flags & 1 != 0 { 2 } else { 1 };
-        let (codec, header) = match format {
-            // 16-bit PCM here is little-endian. 8-bit is unsigned, which is not
-            // worth a variant for a format nobody has used in decades.
-            0 | 3 if wide => (
-                AudioCodec::Pcm {
-                    bytes: 2,
-                    big_endian: false,
-                    float: false,
-                },
-                1,
-            ),
-            2 | 14 => (AudioCodec::Mp3, 1),
-            7 => (AudioCodec::ALaw, 1),
-            8 => (AudioCodec::MuLaw, 1),
-            10 => (AudioCodec::Aac, 2),
-            _ => (AudioCodec::Other, 1),
-        };
+        let (codec, header, rate, channels) = audio_flags(flags);
         let start = body.as_ptr() as usize - input.as_ptr() as usize;
         let current = track.get_or_insert(AudioTrack {
             codec,
@@ -435,4 +418,213 @@ pub(crate) fn audio_track(input: &[u8]) -> Option<AudioTrack> {
         return None;
     }
     track
+}
+
+/// How much of a tag to look at for its headers.
+const TAG_PEEK: usize = 16;
+/// The most of a file to hold for its first tags, and the sequence headers it finds.
+const HEAD_BYTES: u64 = 64 * 1024;
+/// The largest sequence header worth keeping.
+const MAX_CONFIG: usize = 256 * 1024;
+
+/// A tag in a file.
+#[derive(Clone, Copy)]
+struct FileTag {
+    kind: u8,
+    timestamp: u32,
+    body: u64,
+    size: usize,
+}
+
+/// Walks a file's tags, without reading their bodies.
+fn for_each_file_tag<F>(window: &mut Window<'_>, mut f: F) -> Result<()>
+where
+    F: FnMut(&mut Window<'_>, FileTag) -> Result<bool>,
+{
+    let file_len = window.file_len();
+    let header = window.bytes(0, 9);
+    if header.len() < 9 || &header[..3] != b"FLV" {
+        return Err(VideoError::UnknownFormat);
+    }
+    let offset = u32::from_be_bytes([header[5], header[6], header[7], header[8]]) as u64;
+    if offset < 9 || offset > file_len {
+        return Err(VideoError::InvalidData("FLV data offset"));
+    }
+    let mut pos = offset + 4;
+    while pos + 11 <= file_len {
+        let tag = window.bytes(pos, 11);
+        if tag.len() < 11 {
+            break;
+        }
+        let kind = tag[0];
+        let size = u32::from_be_bytes([0, tag[1], tag[2], tag[3]]) as usize;
+        let timestamp = u32::from_be_bytes([tag[7], tag[4], tag[5], tag[6]]);
+        let body = pos + 11;
+        if body + size as u64 > file_len {
+            break;
+        }
+        if f(window, FileTag { kind, timestamp, body, size })? {
+            break;
+        }
+        pos = body + size as u64 + 4;
+    }
+    Ok(())
+}
+
+/// The start of a file, which holds the tags [`info`] wants.
+pub(crate) fn source_head(window: &mut Window<'_>) -> Result<Vec<u8>> {
+    let want = HEAD_BYTES.min(window.file_len()) as usize;
+    let mut head = Vec::new();
+    head.try_reserve_exact(want).map_err(|_| VideoError::OutOfMemory)?;
+    while head.len() < want {
+        let chunk = window.bytes(head.len() as u64, want - head.len());
+        if chunk.is_empty() {
+            break;
+        }
+        head.extend_from_slice(chunk);
+    }
+    Ok(head)
+}
+
+/// Copies a tag's bytes onto the head, and says where they went.
+fn keep(
+    window: &mut Window<'_>,
+    head: &mut Vec<u8>,
+    at: u64,
+    size: usize,
+) -> Result<core::ops::Range<usize>> {
+    if size > MAX_CONFIG {
+        return Err(VideoError::LimitExceeded("FLV sequence header"));
+    }
+    let start = head.len();
+    head.try_reserve(size).map_err(|_| VideoError::OutOfMemory)?;
+    let mut done = 0;
+    while done < size {
+        let chunk = window.bytes(at + done as u64, size - done);
+        if chunk.is_empty() {
+            return Err(VideoError::UnexpectedEnd);
+        }
+        head.extend_from_slice(chunk);
+        done = head.len() - start;
+    }
+    Ok(start..start + size)
+}
+
+/// [`build_index`] for a file that stays on disk. Sequence headers go on the end of
+/// `head`, where the ranges returned point.
+pub(crate) fn build_index_source(
+    head: &mut Vec<u8>,
+    window: &mut Window<'_>,
+    limits: &DecoderLimits,
+) -> Result<FlvIndex> {
+    let file_len = window.file_len() as usize;
+    let mut index = Index::default();
+    let mut configs = Vec::new();
+    for_each_file_tag(window, |window, tag| {
+        if tag.kind != 9 {
+            return Ok(false);
+        }
+        let peek = window.bytes(tag.body, tag.size.min(TAG_PEEK));
+        let Some(video) = video_tag(peek) else {
+            return Ok(false);
+        };
+        if video.codec != Codec::H264 {
+            return Ok(false);
+        }
+        let skip = peek.len() - video.body.len();
+        let (offset, size) = (tag.body + skip as u64, tag.size - skip);
+        let (packet_type, frame_type, composition) =
+            (video.packet_type, video.frame_type, video.composition_ms);
+        match packet_type {
+            0 => {
+                if configs.len() >= MAX_SEQUENCE_HEADERS {
+                    return Err(VideoError::LimitExceeded("too many AVC sequence headers"));
+                }
+                let range = keep(window, head, offset, size)?;
+                try_push(&mut configs, (index.samples.len() as u32, range))?;
+            }
+            1 if frame_type != 5 => {
+                let pts = tag.timestamp as i32 as i64 + composition as i64;
+                let flags = if frame_type == 1 { FLAG_KEY } else { 0 };
+                index.push(limits, file_len, offset as usize, size, pts, flags)?;
+            }
+            _ => {}
+        }
+        Ok(false)
+    })?;
+    Ok(FlvIndex { index, configs })
+}
+
+/// [`audio_track`] for a file that stays on disk. The config range is in the head.
+pub(crate) fn audio_track_source(window: &mut Window<'_>) -> Option<(Vec<u8>, AudioTrack)> {
+    let file_len = window.file_len() as usize;
+    let mut head = Vec::new();
+    let mut track: Option<AudioTrack> = None;
+    let mut full = false;
+    for_each_file_tag(window, |window, tag| {
+        if tag.kind != 8 || tag.size == 0 {
+            return Ok(false);
+        }
+        let peek = window.bytes(tag.body, tag.size.min(2));
+        let flags = peek[0];
+        let second = peek.get(1).copied();
+        let (codec, skip, rate, channels) = audio_flags(flags);
+        let current = track.get_or_insert(AudioTrack {
+            codec,
+            sample_rate: rate,
+            channels,
+            config: 0..0,
+            packets: Vec::new(),
+        });
+        if tag.size < skip {
+            return Ok(false);
+        }
+        if flags >> 4 == 10 && second == Some(0) {
+            current.config = keep(window, &mut head, tag.body + 2, tag.size - 2)?;
+            return Ok(false);
+        }
+        let added = push_packet(
+            &mut current.packets,
+            file_len,
+            (tag.body + skip as u64) as usize,
+            tag.size - skip,
+            tag.timestamp as u64,
+        );
+        if added.is_none() {
+            full = true;
+            return Ok(true);
+        }
+        Ok(false)
+    })
+    .ok()?;
+    if full {
+        return None;
+    }
+    Some((head, track?))
+}
+
+/// What an audio tag's first byte says: codec, header bytes, rate and channels.
+fn audio_flags(flags: u8) -> (AudioCodec, usize, u32, u16) {
+    let format = flags >> 4;
+    let rate = [5512, 11025, 22050, 44100][(flags as usize >> 2) & 3];
+    let wide = flags & 2 != 0;
+    let channels = if flags & 1 != 0 { 2 } else { 1 };
+    let (codec, header) = match format {
+        // 16-bit PCM here is little-endian. 8-bit is unsigned, which is not
+        // worth a variant for a format nobody has used in decades.
+        0 | 3 if wide => (
+            AudioCodec::Pcm {
+                bytes: 2,
+                big_endian: false,
+                float: false,
+            },
+            1,
+        ),
+        2 | 14 => (AudioCodec::Mp3, 1),
+        7 => (AudioCodec::ALaw, 1),
+        8 => (AudioCodec::MuLaw, 1),
+        10 => (AudioCodec::Aac, 2),
+        _ => (AudioCodec::Other, 1),
+    };
+    (codec, header, rate, channels)
 }

@@ -158,6 +158,8 @@ pub enum VolumeKind {
     Fat16,
     /// Extended File Allocation Table.
     Exfat,
+    /// FEOS's own, with inodes and a journal: see [`crate::native`].
+    Native,
 }
 
 pub(crate) struct Volume<D: BlockDevice> {
@@ -381,6 +383,9 @@ pub fn detect<D: BlockDevice>(device: &D) -> Result<VolumeKind, FsError> {
 
     if &boot[3..11] == b"EXFAT   " {
         return Ok(VolumeKind::Exfat);
+    }
+    if &boot[..8] == crate::native::MAGIC {
+        return Ok(VolumeKind::Native);
     }
 
     let signature = u16::from_le_bytes([boot[510], boot[511]]);

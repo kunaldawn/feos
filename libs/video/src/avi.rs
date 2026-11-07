@@ -2,6 +2,8 @@
 
 use alloc::vec::Vec;
 
+use feos_source::Window;
+
 use crate::audio::{push_packet, AudioCodec, AudioTrack};
 use crate::bitstream::{fourcc_at, u16_le_at, u32_le_at};
 use crate::codec::Codec;
@@ -350,9 +352,13 @@ fn apply_idx1(input: &[u8], number: u8, index: &mut Index) -> bool {
     let Some((start, len)) = find_chunk(input, 12, end, b"idx1") else {
         return false;
     };
+    apply_idx1_entries(&input[start..start + len], number, index)
+}
+
+fn apply_idx1_entries(entries: &[u8], number: u8, index: &mut Index) -> bool {
     const AVIIF_KEYFRAME: u32 = 0x10;
     let mut at = 0usize;
-    for entry in input[start..start + len].chunks_exact(16) {
+    for entry in entries.chunks_exact(16) {
         let id = [entry[0], entry[1], entry[2], entry[3]];
         if !is_video_chunk(&id, number) {
             continue;
@@ -408,6 +414,39 @@ fn is_audio_chunk(id: &[u8; 4], number: u8) -> bool {
 
 /// Finds the first audio stream of a file.
 pub(crate) fn audio_track(input: &[u8]) -> Option<AudioTrack> {
+    audio_track_in(input, input.len()).map(|(track, _)| track)
+}
+
+/// When an audio chunk starts. Constant bit rates count bytes; anything else chunks.
+#[derive(Clone, Copy)]
+struct AudioTiming {
+    sample_size: u32,
+    bytes_per_second: u32,
+    stream_rate: u64,
+    scale: u64,
+    bytes: u64,
+    count: u64,
+}
+
+impl AudioTiming {
+    fn next(&mut self, size: usize) -> u64 {
+        let ms = if self.sample_size != 0 && self.bytes_per_second != 0 {
+            self.bytes * 1000 / self.bytes_per_second as u64
+        } else if self.stream_rate != 0 {
+            self.count * self.scale * 1000 / self.stream_rate
+        } else {
+            0
+        };
+        self.bytes += size as u64;
+        self.count += 1;
+        ms
+    }
+}
+
+fn audio_track_in(
+    input: &[u8],
+    file_len: usize,
+) -> Option<(AudioTrack, (u8, AudioTiming))> {
     let end = riff_end(input).ok()?;
     let (hdrl_start, hdrl_len) = find_list(input, 12, end, b"hdrl")?;
     let hdrl_end = hdrl_start + hdrl_len;
@@ -468,22 +507,23 @@ pub(crate) fn audio_track(input: &[u8]) -> Option<AudioTrack> {
             _ => AudioCodec::Other,
         };
         let mut packets = Vec::new();
-        let mut bytes = 0u64;
-        let mut count = 0u64;
+        let mut timing = AudioTiming {
+            sample_size,
+            bytes_per_second,
+            stream_rate,
+            scale,
+            bytes: 0,
+            count: 0,
+        };
         let mut full = false;
-        let (movi, movi_len) = find_list(input, 12, end, b"movi")?;
+        let (movi, movi_len) = match find_list(input, 12, end, b"movi") {
+            Some(found) => found,
+            None if file_len != input.len() => (0, 0),
+            None => return None,
+        };
         let mut visit = |offset: usize, size: usize| {
-            // Constant bit rates count bytes; anything else counts chunks.
-            let ms = if sample_size != 0 && bytes_per_second != 0 {
-                bytes * 1000 / bytes_per_second as u64
-            } else if stream_rate != 0 {
-                count * scale * 1000 / stream_rate
-            } else {
-                0
-            };
-            bytes += size as u64;
-            count += 1;
-            if push_packet(&mut packets, input.len(), offset, size, ms).is_none() {
+            let ms = timing.next(size);
+            if push_packet(&mut packets, file_len, offset, size, ms).is_none() {
                 full = true;
             }
         };
@@ -505,13 +545,205 @@ pub(crate) fn audio_track(input: &[u8]) -> Option<AudioTrack> {
         if full {
             return None;
         }
-        return Some(AudioTrack {
-            codec,
-            sample_rate: rate,
-            channels,
-            config,
-            packets,
-        });
+        return Some((
+            AudioTrack {
+                codec,
+                sample_rate: rate,
+                channels,
+                config,
+                packets,
+            },
+            (this, timing),
+        ));
     }
     None
+}
+
+/// The most header to keep from before the first `movi`.
+const MAX_HEAD: u64 = 8 * 1024 * 1024;
+/// The largest `idx1` read, for its key-frame flags: about 500 000 chunks.
+const MAX_IDX1: u64 = 8 * 1024 * 1024;
+
+/// A file's bytes up to its `movi` list, which is all the header there is.
+pub(crate) fn source_head(window: &mut Window<'_>) -> Result<Vec<u8>> {
+    let mut pos = 12u64;
+    let mut stop = None;
+    loop {
+        let header = window.bytes(pos, 12);
+        if header.len() < 12 {
+            break;
+        }
+        let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as u64;
+        if &header[..4] == b"LIST" && &header[8..12] == b"movi" {
+            stop = Some(pos);
+            break;
+        }
+        pos += 8 + size + (size & 1);
+    }
+    let stop = stop.ok_or(VideoError::InvalidData("AVI file has no movi list"))?;
+    if stop > MAX_HEAD {
+        return Err(VideoError::LimitExceeded("AVI header is too large"));
+    }
+    let mut head = Vec::new();
+    head.try_reserve_exact(stop as usize).map_err(|_| VideoError::OutOfMemory)?;
+    while (head.len() as u64) < stop {
+        let chunk = window.bytes(head.len() as u64, (stop - head.len() as u64) as usize);
+        if chunk.is_empty() {
+            return Err(VideoError::UnexpectedEnd);
+        }
+        head.extend_from_slice(chunk);
+    }
+    Ok(head)
+}
+
+/// Walks a file's chunks in order, across `RIFF AVIX` extensions, without reading their
+/// data. Returns where its `idx1` is, if it has one.
+fn walk_file<F>(window: &mut Window<'_>, mut f: F) -> Result<Option<(u64, u64)>>
+where
+    F: FnMut(&[u8; 4], u64, usize) -> Result<bool>,
+{
+    let file_len = window.file_len();
+    let mut idx1 = None;
+    let mut riff = 0u64;
+    while riff + 12 <= file_len {
+        let header = window.bytes(riff, 12);
+        if header.len() < 12 || &header[..4] != b"RIFF" {
+            break;
+        }
+        let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as u64;
+        let end = (riff + 8 + size).min(file_len);
+        let mut pos = riff + 12;
+        while pos + 8 <= end {
+            let chunk = window.bytes(pos, 12);
+            if chunk.len() < 8 {
+                break;
+            }
+            let id = [chunk[0], chunk[1], chunk[2], chunk[3]];
+            let size = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]) as u64;
+            if &id == b"LIST" && chunk.len() == 12 && &chunk[8..12] == b"movi" {
+                if !walk_list(window, pos + 12, (pos + 8 + size).min(end), &mut f)? {
+                    return Ok(idx1);
+                }
+            } else if &id == b"idx1" && idx1.is_none() {
+                idx1 = Some((pos + 8, size));
+            }
+            pos += 8 + size + (size & 1);
+        }
+        riff = riff + 8 + size + (size & 1);
+    }
+    Ok(idx1)
+}
+
+fn walk_list<F>(window: &mut Window<'_>, start: u64, end: u64, f: &mut F) -> Result<bool>
+where
+    F: FnMut(&[u8; 4], u64, usize) -> Result<bool>,
+{
+    let mut pos = start;
+    while pos + 8 <= end {
+        let chunk = window.bytes(pos, 12);
+        if chunk.len() < 8 {
+            break;
+        }
+        let id = [chunk[0], chunk[1], chunk[2], chunk[3]];
+        let size = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]) as u64;
+        // Cut off by the end of the file: what came before still plays.
+        if pos + 8 + size > end {
+            break;
+        }
+        if &id == b"LIST" && chunk.len() == 12 && &chunk[8..12] == b"rec " {
+            // rec lists don't nest.
+            let mut inner = pos + 12;
+            let inner_end = pos + 8 + size;
+            while inner + 8 <= inner_end {
+                let chunk = window.bytes(inner, 8);
+                if chunk.len() < 8 {
+                    break;
+                }
+                let id = [chunk[0], chunk[1], chunk[2], chunk[3]];
+                let inner_size = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]) as u64;
+                if inner + 8 + inner_size > inner_end {
+                    break;
+                }
+                if !f(&id, inner + 8, inner_size as usize)? {
+                    return Ok(false);
+                }
+                inner += 8 + inner_size + (inner_size & 1);
+            }
+        } else if !f(&id, pos + 8, size as usize)? {
+            return Ok(false);
+        }
+        pos += 8 + size + (size & 1);
+    }
+    Ok(true)
+}
+
+/// [`build_index`] for a file that stays on disk. `head` is its [`source_head`].
+pub(crate) fn build_index_source(
+    head: &[u8],
+    window: &mut Window<'_>,
+    limits: &DecoderLimits,
+) -> Result<AviIndex> {
+    let stream = video_stream(head)?;
+    let file_len = window.file_len() as usize;
+    let number = stream.number;
+    let mut index = Index::default();
+    let idx1 = walk_file(window, |id, offset, size| {
+        if is_video_chunk(id, number) {
+            let flags = if index.samples.is_empty() { FLAG_KEY } else { 0 };
+            index.push(limits, file_len, offset as usize, size, 0, flags)?;
+        }
+        Ok(true)
+    })?;
+    if let Some((at, size)) = idx1.filter(|&(_, size)| size <= MAX_IDX1) {
+        if let Some(mut entries) = feos_source::zeroed(size as usize) {
+            let mut done = 0;
+            while done < entries.len() {
+                let chunk = window.bytes(at + done as u64, entries.len() - done);
+                if chunk.is_empty() {
+                    break;
+                }
+                entries[done..done + chunk.len()].copy_from_slice(chunk);
+                done += chunk.len();
+            }
+            entries.truncate(done);
+            apply_idx1_entries(&entries, number, &mut index);
+        }
+    }
+    if let Some(first) = index.samples.first_mut() {
+        first.flags |= FLAG_KEY;
+    }
+    let frame_rate = if stream.scale != 0 && stream.rate != 0 {
+        crate::reduce_fraction(stream.rate, stream.scale)
+    } else {
+        None
+    };
+    index.set_uniform_timing(frame_rate);
+    Ok(AviIndex {
+        index,
+        extra: stream.extra,
+        dib: stream.dib.then_some(stream.bottom_up),
+    })
+}
+
+/// [`audio_track`] for a file that stays on disk. The config range is in the head.
+pub(crate) fn audio_track_source(window: &mut Window<'_>) -> Option<(Vec<u8>, AudioTrack)> {
+    let head = source_head(window).ok()?;
+    let file_len = window.file_len() as usize;
+    let (mut track, (number, mut timing)) = audio_track_in(&head, file_len)?;
+    let mut full = false;
+    walk_file(window, |id, offset, size| {
+        if is_audio_chunk(id, number) {
+            let ms = timing.next(size);
+            if push_packet(&mut track.packets, file_len, offset as usize, size, ms).is_none() {
+                full = true;
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    })
+    .ok()?;
+    if full {
+        return None;
+    }
+    Some((head, track))
 }

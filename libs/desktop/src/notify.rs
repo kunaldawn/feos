@@ -256,7 +256,7 @@ fn draw_entry<const N: usize>(
         .fill_rect(Rect::new(rect.x + 1, rect.y + 1, 5, rect.height - 2), accent);
     ui.painter.draw_text_ellipsis(
         Rect::new(rect.x + 14, rect.y + 6, rect.width.saturating_sub(22), 18),
-        entry.title.as_str(),
+        &feos_text::display_name(entry.title.as_str()),
         theme.menu_text,
         1,
         Align::Start,
@@ -269,7 +269,7 @@ fn draw_entry<const N: usize>(
             rect.width.saturating_sub(22),
             18,
         ),
-        entry.body.as_str(),
+        &feos_text::display_name(entry.body.as_str()),
         theme.menu_muted,
         1,
         Align::Start,

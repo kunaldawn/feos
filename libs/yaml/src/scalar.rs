@@ -77,8 +77,13 @@ impl<'a> YamlScalar<'a> {
     /// Returns the value when it needs no decoding.
     pub const fn as_borrowed(self) -> Option<&'a str> {
         match self.style {
-            ScalarStyle::Plain => Some(self.raw),
-            ScalarStyle::SingleQuoted if !contains(self.raw.as_bytes(), b'\'') => Some(self.raw),
+            // A line break in the source folds, so the source isn't the value.
+            ScalarStyle::Plain if !contains(self.raw.as_bytes(), b'\n') => Some(self.raw),
+            ScalarStyle::SingleQuoted
+                if !contains(self.raw.as_bytes(), b'\'') && !contains(self.raw.as_bytes(), b'\n') =>
+            {
+                Some(self.raw)
+            }
             _ => None,
         }
     }
@@ -91,7 +96,7 @@ impl<'a> YamlScalar<'a> {
     pub fn decode_into<'b>(self, out: &'b mut [u8]) -> Option<&'b str> {
         let mut writer = Writer { out, written: 0 };
         match self.style {
-            ScalarStyle::Plain => writer.bytes(self.raw.as_bytes())?,
+            ScalarStyle::Plain => writer.plain(self.raw.as_bytes())?,
             ScalarStyle::SingleQuoted => writer.single_quoted(self.raw.as_bytes())?,
             ScalarStyle::DoubleQuoted => writer.double_quoted(self.raw.as_bytes())?,
             ScalarStyle::Literal => writer.block(self.raw, self.indent, false)?,
@@ -136,14 +141,56 @@ impl<'b> Writer<'b> {
         self.bytes(character.encode_utf8(&mut buffer).as_bytes())
     }
 
-    fn single_quoted(&mut self, bytes: &[u8]) -> Option<()> {
+    /// Folds a line break in a flow scalar: white space around it goes, a single break
+    /// is a space, and each blank line after it is a break. `*i` is at the break, and
+    /// nothing written before `floor` can be trimmed, as escapes wrote it.
+    fn fold_break(&mut self, bytes: &[u8], i: &mut usize, floor: usize) -> Option<()> {
+        while self.written > floor && matches!(self.out[self.written - 1], b' ' | b'\t' | b'\r') {
+            self.written -= 1;
+        }
+        let mut breaks = 0usize;
+        while let Some(&byte) = bytes.get(*i) {
+            match byte {
+                b'\n' => breaks += 1,
+                b' ' | b'\t' | b'\r' => {}
+                _ => break,
+            }
+            *i += 1;
+        }
+        if breaks == 1 {
+            self.byte(b' ')
+        } else {
+            self.newlines(breaks - 1)
+        }
+    }
+
+    fn plain(&mut self, bytes: &[u8]) -> Option<()> {
         let mut i = 0;
         while i < bytes.len() {
+            if bytes[i] == b'\n' {
+                self.fold_break(bytes, &mut i, 0)?;
+                continue;
+            }
+            self.byte(bytes[i])?;
+            i += 1;
+        }
+        Some(())
+    }
+
+    fn single_quoted(&mut self, bytes: &[u8]) -> Option<()> {
+        let mut i = 0;
+        let mut floor = 0;
+        while i < bytes.len() {
             let byte = bytes[i];
+            if byte == b'\n' {
+                self.fold_break(bytes, &mut i, floor)?;
+                continue;
+            }
             if byte == b'\'' {
                 if bytes.get(i + 1) == Some(&b'\'') {
                     self.byte(b'\'')?;
                     i += 2;
+                    floor = self.written;
                     continue;
                 }
                 return None;
@@ -156,8 +203,13 @@ impl<'b> Writer<'b> {
 
     fn double_quoted(&mut self, bytes: &[u8]) -> Option<()> {
         let mut i = 0;
+        let mut floor = 0;
         while i < bytes.len() {
             let byte = bytes[i];
+            if byte == b'\n' {
+                self.fold_break(bytes, &mut i, floor)?;
+                continue;
+            }
             if byte != b'\\' {
                 self.byte(byte)?;
                 i += 1;
@@ -169,6 +221,8 @@ impl<'b> Writer<'b> {
                 Escape::Char(value) => self.char(value)?,
                 Escape::LineBreak => {}
             }
+            // An escaped space or tab, or what's before an escaped break, stays.
+            floor = self.written;
         }
         Some(())
     }

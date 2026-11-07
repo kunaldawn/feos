@@ -157,6 +157,7 @@ impl Codec {
                 | Self::RawUyvy
                 | Self::Rle8
                 | Self::Rle4
+                | Self::Vp8
                 | Self::H264
         )
     }

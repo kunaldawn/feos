@@ -53,6 +53,8 @@ pub enum FsError {
     IsDirectory,
     /// Following symbolic links went round too many times.
     SymlinkLoop,
+    /// This user isn't allowed to.
+    PermissionDenied,
 }
 
 impl fmt::Display for FsError {
@@ -81,6 +83,7 @@ impl fmt::Display for FsError {
             Self::StaleHandle => "stale file handle",
             Self::IsDirectory => "is a directory",
             Self::SymlinkLoop => "too many levels of symbolic links",
+            Self::PermissionDenied => "permission denied",
         };
         f.write_str(message)
     }

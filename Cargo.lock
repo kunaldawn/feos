@@ -76,6 +76,10 @@ version = "0.1.0"
 [[package]]
 name = "feos-audio-codec"
 version = "0.1.0"
+dependencies = [
+ "feos-opus",
+ "feos-source",
+]
 
 [[package]]
 name = "feos-board-common"
@@ -182,6 +186,7 @@ dependencies = [
  "feos-compress",
  "feos-fs",
  "feos-hal",
+ "feos-text",
 ]
 
 [[package]]
@@ -519,6 +524,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "feos-opus"
+version = "0.1.0"
+
+[[package]]
 name = "feos-port-io"
 version = "0.1.0"
 
@@ -536,6 +545,7 @@ dependencies = [
  "feos-fs",
  "feos-keys",
  "feos-sync",
+ "feos-text",
 ]
 
 [[package]]
@@ -551,6 +561,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "feos-source"
+version = "0.1.0"
+
+[[package]]
 name = "feos-sync"
 version = "0.1.0"
 
@@ -562,9 +576,11 @@ version = "0.1.0"
 name = "feos-video"
 version = "0.1.0"
 dependencies = [
+ "feos-audio-codec",
  "feos-compress",
  "feos-h264",
  "feos-image",
+ "feos-source",
 ]
 
 [[package]]

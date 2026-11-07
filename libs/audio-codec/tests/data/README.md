@@ -67,3 +67,7 @@ each codebook is a complete prefix code (its Kraft sum is exactly 1), and decodi
 matches ffmpeg as above at each sampling rate from 8 to 96 kHz. The windows are
 computed from the standard's
 formula for the Kaiser-Bessel-derived window (alpha 4 long, alpha 6 short).
+
+`lc-pce.aac` is 5.1 AAC-LC with a program config element, from FFmpeg's encoder with
+`-aac_pce 1`, and `lc-pce.aac.s16` is FFmpeg's decoding of it. `opus/` is explained by
+`make_opus.sh`, beside this folder.

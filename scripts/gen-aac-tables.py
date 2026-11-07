@@ -62,13 +62,25 @@ def book_text(name, codes):
     return "\n".join(out)
 
 
-def swb_text(name, widths):
+def swb_offsets(widths):
     """Band offsets, from widths ending in -1, one past the last band."""
     offsets = [0]
     for width in widths:
         if width < 0:
             break
         offsets.append(offsets[-1] + width)
+    return offsets
+
+
+def truncated(offsets, end):
+    """A 960-sample frame's bands are the 1024-sample ones, stopping where it does."""
+    return [value for value in offsets if value < end] + [end]
+
+
+def swb_text(name, widths, end=None):
+    offsets = swb_offsets(widths)
+    if end is not None:
+        offsets = truncated(offsets, end)
     out = [f"pub(crate) static {name}: [u16; {len(offsets)}] = ["]
     for at in range(0, len(offsets), 14):
         out.append("    " + " ".join(f"{value}," for value in offsets[at : at + 14]))
@@ -161,6 +173,9 @@ def main():
         ("SWB_S8", "ixheaacd_sfb_8_128[16]"),
     ]:
         parts.append(swb_text(name, lists_after(source, marker)))
+        # What the 960-sample frames use.
+        end = 960 if name[4] == "L" else 120
+        parts.append(swb_text(name + "_FEW", lists_after(source, marker), end))
     parts.append(
         "/// Long and short scalefactor band offsets by sampling frequency index.\n"
         "pub(crate) static SWB_LONG: [&[u16]; 13] = [\n"
@@ -170,10 +185,21 @@ def main():
         "pub(crate) static SWB_SHORT: [&[u16]; 13] = [\n"
         "    &SWB_S96, &SWB_S96, &SWB_S96, &SWB_S48, &SWB_S48, &SWB_S48, &SWB_S24, &SWB_S24, &SWB_S16,\n"
         "    &SWB_S16, &SWB_S16, &SWB_S8, &SWB_S8,\n"
+        "];\n"
+        "/// The same for 960-sample frames: the same bands, up to where the frame ends.\n"
+        "pub(crate) static SWB_LONG_960: [&[u16]; 13] = [\n"
+        "    &SWB_L96_FEW, &SWB_L96_FEW, &SWB_L64_FEW, &SWB_L48_FEW, &SWB_L48_FEW, &SWB_L32_FEW, &SWB_L24_FEW,\n"
+        "    &SWB_L24_FEW, &SWB_L16_FEW, &SWB_L16_FEW, &SWB_L16_FEW, &SWB_L8_FEW, &SWB_L8_FEW,\n"
+        "];\n"
+        "pub(crate) static SWB_SHORT_120: [&[u16]; 13] = [\n"
+        "    &SWB_S96_FEW, &SWB_S96_FEW, &SWB_S96_FEW, &SWB_S48_FEW, &SWB_S48_FEW, &SWB_S48_FEW, &SWB_S24_FEW,\n"
+        "    &SWB_S24_FEW, &SWB_S16_FEW, &SWB_S16_FEW, &SWB_S16_FEW, &SWB_S8_FEW, &SWB_S8_FEW,\n"
         "];"
     )
     parts.append("/// The rising half of the Kaiser-Bessel-derived window, alpha 4, in Q31.\n" + kbd_text("KBD_LONG", 1024, 4))
     parts.append("/// The rising half of the Kaiser-Bessel-derived window, alpha 6, in Q31.\n" + kbd_text("KBD_SHORT", 128, 6))
+    parts.append("/// Those windows for 960-sample frames.\n" + kbd_text("KBD_LONG_960", 960, 4))
+    parts.append(kbd_text("KBD_SHORT_120", 120, 6))
     print("\n\n".join(parts))
 
 

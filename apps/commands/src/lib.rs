@@ -27,9 +27,12 @@ pub mod net;
 pub mod netd;
 pub mod play;
 pub mod player;
+pub mod playlist;
 pub mod power;
 pub mod ps;
+pub mod rec;
 pub mod renice;
+pub mod settings;
 pub mod sleep;
 pub mod spawn;
 pub mod splash;
@@ -46,6 +49,7 @@ use feos_app::App;
 pub static REGISTRY: &[&dyn App] = &[
     &coreutils::CoreUtils,
     &terminal::Terminal,
+    &settings::Settings,
     &info::Info,
     &ps::Ps,
     &taskmgr::TaskManager,
@@ -61,6 +65,7 @@ pub static REGISTRY: &[&dyn App] = &[
     &music::Music,
     &image_viewer::ImageViewer,
     &play::Play,
+    &rec::Rec,
     &splash::Splash,
     &tone::Tone,
     &sleep::Sleep,

@@ -461,6 +461,14 @@ impl Pointer for I8042 {
     fn position(&self) -> (u16, u16) {
         I8042::position(self)
     }
+
+    fn set_screen(&self, width: u16, height: u16) {
+        let mut state = self.state.lock();
+        state.width = width.max(1);
+        state.height = height.max(1);
+        state.x = state.x.min(state.width - 1);
+        state.y = state.y.min(state.height - 1);
+    }
 }
 
 fn decode_keyboard(state: &mut State, byte: u8) {

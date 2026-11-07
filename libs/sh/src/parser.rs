@@ -58,6 +58,10 @@ pub enum Logic {
 pub struct Pipeline {
     /// `!` negates the pipeline status.
     pub negate: bool,
+    /// `time` reports how long the pipeline took.
+    pub timed: bool,
+    /// `time -p`: the report in POSIX's format.
+    pub timed_posix: bool,
     /// Commands joined by `|`.
     pub commands: Vec<Command>,
 }
@@ -492,12 +496,24 @@ impl Parser<'_> {
 
     fn parse_pipeline(&mut self) -> Result<Pipeline, ParseError> {
         let mut negate = false;
-        while self.peek_word()? == Some("!") {
+        let mut timed = false;
+        let mut timed_posix = false;
+        // `time` is a reserved word here, not a command, so it covers a whole pipeline.
+        while let Some(word) = self.peek_word()? {
+            match word {
+                "!" => negate = !negate,
+                "time" if !timed => timed = true,
+                "-p" if timed && !timed_posix => timed_posix = true,
+                _ => break,
+            }
             self.advance();
-            negate = !negate;
         }
 
         let mut commands = Vec::new();
+        // `time` on its own times nothing, as it does in Bash.
+        if timed && matches!(self.peek()?, None | Some(Token::Newline | Token::Seq)) {
+            return Ok(Pipeline { negate, timed, timed_posix, commands });
+        }
         commands.push(self.parse_command()?);
         loop {
             let both = match self.peek()? {
@@ -521,7 +537,7 @@ impl Parser<'_> {
             }
             commands.push(self.parse_command()?);
         }
-        Ok(Pipeline { negate, commands })
+        Ok(Pipeline { negate, timed, timed_posix, commands })
     }
 
     /// Replaces an alias at the front of the queue with its tokens.

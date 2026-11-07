@@ -232,13 +232,13 @@ impl ClusterSet {
     }
 }
 
-/// Replaces characters that can't appear in a path component or that would be
-/// interpreted by a terminal listing the name.
-pub(crate) fn sanitize_name(name: String) -> String {
-    let unsafe_character =
-        |character: char| matches!(character, '/' | '\\') || character.is_control();
-    if name.contains(unsafe_character) {
-        name.replace(unsafe_character, "_")
+/// Makes a name found on disk usable as a path component, and nothing else: a name is
+/// kept as it is, control characters and all, and escaped by whatever shows it (see
+/// `feos_text::display_name`). A separator or NUL would mean something else in a path.
+pub(crate) fn path_component(name: String) -> String {
+    let separator = |character: char| matches!(character, '/' | '\0');
+    if name.contains(separator) {
+        name.replace(separator, "_")
     } else {
         name
     }

@@ -424,7 +424,7 @@ fn name_fragments_with_no_owner_are_cleared() {
 }
 
 #[test]
-fn exfat_recovers_or_refuses_writes_at_every_cut() {
+fn exfat_recovers_at_every_cut_with_writes_in_order_or_not() {
     const SIZE: usize = 8 * 1024 * 1024;
     let mut disk = RamDisk::new(SIZE, BLOCK).unwrap();
     feos_fs::format_exfat(&mut disk, "CRASH").unwrap();
@@ -462,31 +462,154 @@ fn exfat_recovers_or_refuses_writes_at_every_cut() {
 
     let mut rng = Rng(11);
     let mut repaired = 0;
-    let step = (run.log.len() / 120).max(1);
-    for cut in (0..=run.log.len()).step_by(step) {
-        for keep_all in [true, false] {
+    // Every cut, in order and with the writes since the last flush landing at random.
+    for cut in 0..=run.log.len() {
+        for keep_all in [true, false, false] {
             let disk = disk_at(&run, cut, &mut rng, keep_all);
             let mut fs = feos_fs::Exfat::mount(disk).unwrap();
             let context = format!("exFAT cut {cut}/{} in-order {keep_all}", run.log.len());
+            assert!(!fs.is_damaged(), "{context}: a crash left it read-only");
+            let report = fs.check().unwrap_or_else(|error| panic!("{context}: {error}"));
+            repaired += u32::from(!report.found_nothing());
+            assert!(!fs.is_read_only(), "{context}");
             walk(&fs, NodeId::ROOT, &context);
             if cut >= promised_from {
                 let node = fs.resolve("/docs/stable");
                 let node = node.unwrap_or_else(|| panic!("{context}: lost a synced file"));
                 assert_eq!(fs.read_to_vec(node).unwrap(), [5; 9000], "{context}");
             }
-            // A torn entry set is left read-only, as documented. Otherwise the
-            // check must leave a volume that accepts writes and needs no more.
-            if fs.is_damaged() {
-                continue;
-            }
-            fs.check().unwrap_or_else(|error| panic!("{context}: {error}"));
-            repaired += 1;
+            // It accepts writes, the check has nothing more to say, and a new mount
+            // agrees with what this one thinks is free.
             let probe = fs.create_file(NodeId::ROOT, "probe").unwrap();
             fs.write(probe, 0, &[7; 10_000]).unwrap();
             fs.flush().unwrap();
+            let free = fs.stats().free_blocks;
+            let disk = fs.into_device();
+            let mut again = feos_fs::Exfat::mount(disk).unwrap();
+            assert!(!again.is_damaged(), "{context}");
+            assert!(!again.check().unwrap().was_dirty, "{context}: flush left it dirty");
+            assert_eq!(again.stats().free_blocks, free, "{context}: free count wrong");
+            let node = again.resolve("/probe").unwrap();
+            assert_eq!(again.read_to_vec(node).unwrap(), [7; 10_000], "{context}");
         }
     }
     assert!(repaired > 0);
+}
+
+/// Tearing a set by hand, in the ways a crash could if writes reach the disk out of order.
+mod torn_sets {
+    use super::*;
+    use feos_fs::{CheckReport, Exfat};
+
+    const SIZE: usize = 8 * 1024 * 1024;
+
+    /// A dirty volume with a file, and where that file's set is on disk.
+    fn volume() -> (Vec<u8>, usize) {
+        let mut disk = RamDisk::new(SIZE, BLOCK).unwrap();
+        feos_fs::format_exfat(&mut disk, "TORN").unwrap();
+        let mut fs = Exfat::mount(disk).unwrap();
+        let kept = fs.create_file(NodeId::ROOT, "kept.txt").unwrap();
+        fs.write(kept, 0, &[4; 5000]).unwrap();
+        let file = fs.create_file(NodeId::ROOT, "torn.txt").unwrap();
+        fs.write(file, 0, &[9; 5000]).unwrap();
+        fs.flush().unwrap();
+        let mut image = fs.into_device().into_data();
+        // The volume flags are at offset 106 of the boot sector; bit 1 is dirty.
+        image[106] |= 2;
+        let at = find_set(&image, "torn.txt");
+        (image, at)
+    }
+
+    fn find_set(image: &[u8], name: &str) -> usize {
+        let units: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let found = image
+            .chunks(32)
+            .position(|entry| entry[0] == 0xc1 && entry[2..].starts_with(&units))
+            .expect("the set is on disk");
+        (found - 2) * 32
+    }
+
+    fn repaired(image: Vec<u8>) -> (Exfat<RamDisk>, CheckReport) {
+        let mut fs = Exfat::mount(RamDisk::from_bytes(image, BLOCK).unwrap()).unwrap();
+        assert!(!fs.is_damaged());
+        let report = fs.check().unwrap();
+        (fs, report)
+    }
+
+    fn still_fine(fs: &mut Exfat<RamDisk>) {
+        let kept = fs.resolve("/kept.txt").unwrap();
+        assert_eq!(fs.read_to_vec(kept).unwrap(), [4; 5000]);
+        assert!(!fs.is_read_only());
+        let probe = fs.create_file(NodeId::ROOT, "probe").unwrap();
+        fs.write(probe, 0, &[1; 100]).unwrap();
+        fs.flush().unwrap();
+    }
+
+    #[test]
+    fn only_the_checksum_wrong_keeps_the_file_and_its_data() {
+        let (mut image, at) = volume();
+        image[at + 2] ^= 0xff;
+        let (mut fs, report) = repaired(image);
+        assert_eq!(report.repaired_sets, 1);
+        let node = fs.resolve("/torn.txt").unwrap();
+        assert_eq!(fs.read_to_vec(node).unwrap(), [9; 5000]);
+        still_fine(&mut fs);
+        // The fix reached the disk.
+        let image = fs.into_device().into_data();
+        let fs = Exfat::mount(RamDisk::from_bytes(image, BLOCK).unwrap()).unwrap();
+        assert!(!fs.is_damaged());
+        assert!(fs.resolve("/torn.txt").is_some());
+    }
+
+    #[test]
+    fn a_stream_entry_that_never_landed_clears_the_set() {
+        let (mut image, at) = volume();
+        image[at + 32] = 0;
+        let (mut fs, report) = repaired(image.clone());
+        assert_eq!(report.removed_entries, 1);
+        assert_eq!(fs.resolve("/torn.txt"), None);
+        assert!(report.lost_clusters > 0);
+        still_fine(&mut fs);
+
+        // Likewise a name that doesn't match its hash.
+        let (mut image, at) = volume();
+        image[at + 64 + 2] ^= 0x01;
+        let (mut fs, report) = repaired(image);
+        assert_eq!(report.removed_entries, 1);
+        assert_eq!(fs.resolve("/torn.txt"), None);
+        still_fine(&mut fs);
+    }
+
+    #[test]
+    fn a_set_cut_short_clears_what_there_is() {
+        let (mut image, at) = volume();
+        image[at + 64] &= 0x7f;
+        let (mut fs, report) = repaired(image);
+        assert_eq!(report.removed_entries, 1);
+        assert_eq!(fs.resolve("/torn.txt"), None);
+        still_fine(&mut fs);
+    }
+
+    #[test]
+    fn secondaries_with_no_primary_are_cleared() {
+        let (mut image, at) = volume();
+        image[at] &= 0x7f;
+        let (mut fs, report) = repaired(image);
+        assert_eq!(report.orphan_names, 2);
+        assert_eq!(fs.resolve("/torn.txt"), None);
+        still_fine(&mut fs);
+    }
+
+    #[test]
+    fn on_a_clean_volume_a_torn_set_is_damage_and_stays_read_only() {
+        let (mut image, at) = volume();
+        image[106] &= !2;
+        image[at + 2] ^= 0xff;
+        let mut fs = Exfat::mount(RamDisk::from_bytes(image, BLOCK).unwrap()).unwrap();
+        assert!(fs.is_damaged());
+        assert!(fs.is_read_only());
+        assert!(fs.create_file(NodeId::ROOT, "no").is_err());
+    }
 }
 
 /// FAT12 and FAT16 are read-only, so these are built by hand here.

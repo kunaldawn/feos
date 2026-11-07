@@ -91,6 +91,43 @@ pub struct Stat {
     pub times: NodeTimes,
     /// Writes here would be refused, by the mount or the file's attribute.
     pub read_only: bool,
+    /// Type and permission bits. On a filesystem that doesn't keep them, these are made up
+    /// from what it does say: see [`posix`](Self::posix).
+    pub mode: u16,
+    /// Owner.
+    pub uid: u32,
+    /// Group.
+    pub gid: u32,
+    /// Names this has.
+    pub nlink: u32,
+    /// A number for this file, unique on its filesystem.
+    pub ino: u64,
+    /// The filesystem keeps the owner and mode, and they're enforced. FAT, exFAT and RAM
+    /// mounts don't, and everyone may do anything there that the mount allows.
+    pub posix: bool,
+}
+
+/// Asking for read access, to [`VfsTree::check_access`].
+pub const ACCESS_READ: u8 = 4;
+/// Asking for write access.
+pub const ACCESS_WRITE: u8 = 2;
+/// Asking to run a file, or to go through a directory.
+pub const ACCESS_EXECUTE: u8 = 1;
+
+/// Whether these permission bits let this user do what's asked. Root may do anything,
+/// except run a file with no execute bit at all, as on any Unix.
+pub fn permits(mode: u16, is_directory: bool, owner: u32, group: u32, uid: u32, gid: u32, want: u8) -> bool {
+    if uid == 0 {
+        return want & ACCESS_EXECUTE == 0 || is_directory || mode & 0o111 != 0;
+    }
+    let bits = if uid == owner {
+        mode >> 6
+    } else if gid == group {
+        mode >> 3
+    } else {
+        mode
+    };
+    (bits as u8 & 7) & want == want
 }
 
 /// One entry of a directory listing.
@@ -294,6 +331,33 @@ pub trait VfsTree: Sync {
 
     /// Creates a device node. Only a RAM mount can hold one.
     fn make_device(&self, path: &str, kind: DeviceKind) -> Result<(), FsError>;
+
+    /// Sets permission bits. `Unsupported` on a filesystem that doesn't keep them.
+    fn chmod(&self, _path: &str, _mode: u16) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    /// Sets whichever of the owner and group are `Some`.
+    fn chown(&self, _path: &str, _uid: Option<u32>, _gid: Option<u32>) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    /// Gives the file at `existing` another name, `path`, on the same filesystem.
+    fn link(&self, _existing: &str, _path: &str) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    /// Whether a user may do `want` (`ACCESS_*`) to `path`, having to be able to go through
+    /// every directory on the way. Only filesystems with owners say no. It's for the system
+    /// call boundary: kernel-linked apps run as root and aren't checked at all.
+    fn check_access(&self, _path: &str, _uid: u32, _gid: u32, _want: u8) -> Result<(), FsError> {
+        Ok(())
+    }
+
+    /// Checks the filesystem holding `path` through and through, if it has a checker.
+    fn fsck(&self, _path: &str, _repair: bool) -> Result<crate::native::FsckReport, FsError> {
+        Err(FsError::Unsupported)
+    }
 }
 
 /// An open file that closes itself.
@@ -443,6 +507,55 @@ struct State {
     handles: Vec<Option<OpenFile>>,
     next_serial: u32,
     now: Option<TimeSource>,
+}
+
+/// The part of a [`Stat`] about ownership.
+struct PosixFields {
+    mode: u16,
+    uid: u32,
+    gid: u32,
+    nlink: u32,
+    ino: u64,
+    posix: bool,
+}
+
+impl PosixFields {
+    /// A whole `Stat` to fill the rest of in, with `..`.
+    fn into_stat(self) -> Stat {
+        Stat {
+            kind: FileKind::File,
+            size: 0,
+            attributes: 0,
+            times: NodeTimes::NONE,
+            read_only: false,
+            mode: self.mode,
+            uid: self.uid,
+            gid: self.gid,
+            nlink: self.nlink,
+            ino: self.ino,
+            posix: self.posix,
+        }
+    }
+}
+
+/// What a file on a filesystem with no such idea reports: owned by root, and as open as
+/// the attribute bits allow.
+fn synthesised(kind: FileKind, attributes: u8, node: NodeId) -> PosixFields {
+    use crate::native::{S_IFDIR, S_IFLNK, S_IFREG};
+    let writable = attributes & attr::READ_ONLY == 0;
+    let mode = match kind {
+        FileKind::Directory => S_IFDIR | if writable { 0o755 } else { 0o555 },
+        FileKind::Symlink => S_IFLNK | 0o777,
+        FileKind::File => S_IFREG | if writable { 0o644 } else { 0o444 },
+    };
+    PosixFields {
+        mode,
+        uid: 0,
+        gid: 0,
+        nlink: 1,
+        ino: u64::from(node.0) + 1,
+        posix: false,
+    }
 }
 
 /// Where a path ended up.
@@ -607,6 +720,18 @@ impl State {
             read_only: mount.read_only
                 || fs.is_read_only()
                 || attributes & attr::READ_ONLY != 0,
+            ..match fs.posix(location.node) {
+                Some(meta) => PosixFields {
+                    mode: meta.mode,
+                    uid: meta.uid,
+                    gid: meta.gid,
+                    nlink: meta.nlink,
+                    ino: meta.ino,
+                    posix: true,
+                }
+                .into_stat(),
+                None => synthesised(file_kind, attributes, location.node).into_stat(),
+            }
         })
     }
 
@@ -1208,6 +1333,86 @@ impl VfsTree for Vfs {
         drop(state);
         self.changed();
         Ok(())
+    }
+
+    fn chmod(&self, path: &str, mode: u16) -> Result<(), FsError> {
+        let mut state = self.state.lock();
+        let (location, _) = state.walk(path, true)?;
+        let mount = &mut state.mounts[location.mount];
+        if mount.read_only {
+            return Err(FsError::ReadOnly);
+        }
+        mount.fs.set_mode(location.node, mode)?;
+        mount.dirty = true;
+        drop(state);
+        self.changed();
+        Ok(())
+    }
+
+    fn chown(&self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<(), FsError> {
+        let mut state = self.state.lock();
+        let (location, _) = state.walk(path, true)?;
+        let mount = &mut state.mounts[location.mount];
+        if mount.read_only {
+            return Err(FsError::ReadOnly);
+        }
+        mount.fs.set_owner(location.node, uid, gid)?;
+        mount.dirty = true;
+        drop(state);
+        self.changed();
+        Ok(())
+    }
+
+    fn link(&self, existing: &str, path: &str) -> Result<(), FsError> {
+        let mut state = self.state.lock();
+        let (from, _) = state.walk(existing, false)?;
+        let (parent, _, name) = state.walk_parent(path)?;
+        if from.mount != parent.mount {
+            return Err(FsError::Unsupported);
+        }
+        let mount = &mut state.mounts[from.mount];
+        if mount.read_only {
+            return Err(FsError::ReadOnly);
+        }
+        mount.fs.hard_link(from.node, parent.node, name)?;
+        mount.dirty = true;
+        drop(state);
+        self.changed();
+        Ok(())
+    }
+
+    fn check_access(&self, path: &str, uid: u32, gid: u32, want: u8) -> Result<(), FsError> {
+        let state = self.state.lock();
+        // A step at a time, each directory judged before anything past it is looked at.
+        // Otherwise whether a name exists in a closed directory would show in the answer.
+        // A link is judged by what it leads to.
+        let mut here = state.walk("/", true)?.0;
+        let mut prefix = String::new();
+        for part in path.split('/').filter(|part| !part.is_empty() && *part != ".") {
+            let fs = &state.mounts[here.mount].fs;
+            if let Some(meta) = fs.posix(here.node) {
+                if !permits(meta.mode, true, meta.uid, meta.gid, uid, gid, ACCESS_EXECUTE) {
+                    return Err(FsError::PermissionDenied);
+                }
+            }
+            prefix.push('/');
+            prefix.push_str(part);
+            here = state.walk(&prefix, true)?.0;
+        }
+        let fs = &state.mounts[here.mount].fs;
+        if let Some(meta) = fs.posix(here.node) {
+            let is_directory = fs.kind(here.node) == Some(EntryKind::Directory);
+            if !permits(meta.mode, is_directory, meta.uid, meta.gid, uid, gid, want) {
+                return Err(FsError::PermissionDenied);
+            }
+        }
+        Ok(())
+    }
+
+    fn fsck(&self, path: &str, repair: bool) -> Result<crate::native::FsckReport, FsError> {
+        let mut state = self.state.lock();
+        let (location, _) = state.walk(path, true)?;
+        state.mounts[location.mount].fs.fsck(repair)
     }
 
     fn read_link(&self, path: &str) -> Result<String, FsError> {

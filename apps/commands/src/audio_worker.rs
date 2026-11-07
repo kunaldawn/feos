@@ -15,13 +15,16 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use feos_app::{App, Context, Platform};
 use feos_audio::AudioFormat as MixFormat;
 use feos_audio_codec::packet::grow_samples;
-use feos_audio_codec::{AudioError, AudioFormat, AudioStream, PacketDecoder, PacketFormat};
+use feos_audio_codec::{
+    AudioError, AudioFormat, AudioStream, PacketDecoder, PacketFormat, SourceStream,
+};
 use feos_fs::{FileSystem, NodeId};
+use feos_mixer::wsola::Wsola;
 use feos_mixer::{OpenError, Stream};
 use feos_sync::Mutex;
-use feos_video::{audio_track, AudioCodec, AudioTrack};
+use feos_video::{audio_track, audio_track_from_source, AudioCodec, AudioTrack};
 
-use crate::decode_worker::read_file;
+use crate::decode_worker::{read_file, FileSource, MAX_MEDIA_BYTES};
 
 /// How long the task sleeps with the mixer full, or with nothing to do.
 const SLEEP_MS: u64 = 5;
@@ -33,6 +36,39 @@ const MAX_CHUNK_SAMPLES: usize = 1 << 20;
 const PRIME_FRAMES: usize = 8_000;
 /// The mixer's rate, which finished frames are counted in.
 const OUTPUT_RATE: u64 = 48_000;
+
+/// For the media boot test: a window asked to fail does so here, a few seconds into
+/// playback and with the same locks a real failure would have, and the test then
+/// listens for what stops. `args` are the window's; the rest of a command line goes
+/// to it without the flag.
+pub fn strip_test_failure(args: &str) -> (&str, bool) {
+    match args.trim().strip_prefix("--test-host-fault") {
+        Some(rest) => (rest.trim(), true),
+        None => (args.trim(), false),
+    }
+}
+
+/// Faults if `args` asked for it and `started` is long enough ago. See
+/// [`strip_test_failure`].
+pub fn fail_for_test(args: &str, started: &AtomicU64, now_ms: u64) {
+    if !strip_test_failure(args).1 {
+        return;
+    }
+    let first = match started.compare_exchange(0, now_ms.max(1), Ordering::Relaxed, Ordering::Relaxed) {
+        Ok(_) => now_ms,
+        Err(first) => first,
+    };
+    if now_ms.saturating_sub(first) >= 6000 {
+        feos_console::println!("[media] a window is about to fault, for a test");
+        // SAFETY: not at all, and that's the point: no port maps this address.
+        unsafe { core::ptr::write_volatile(core::hint::black_box(0x70_0000_0000usize) as *mut u32, 1) };
+    }
+}
+
+/// A tempo as a percentage, for working out where in the file the output is.
+fn tempo_percent(tempo: f32) -> u64 {
+    (tempo * 100.0) as u64
+}
 
 /// A short description of what's playing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -75,6 +111,8 @@ struct Inner {
     open: Option<(NodeId, Source)>,
     paused: bool,
     seek: Option<u64>,
+    /// How fast to play, with the pitch kept.
+    tempo: f32,
     info: Option<TrackInfo>,
     failure: Option<AudioFailure>,
     ended: bool,
@@ -107,6 +145,7 @@ impl AudioPipe {
                 open: None,
                 paused: false,
                 seek: None,
+                tempo: 1.0,
                 info: None,
                 failure: None,
                 ended: false,
@@ -122,6 +161,7 @@ impl AudioPipe {
         inner.owner = inner.owner.wrapping_add(1).max(1);
         inner.media = inner.media.wrapping_add(1);
         inner.open = None;
+        inner.tempo = 1.0;
         inner.owner
     }
 
@@ -168,6 +208,11 @@ impl AudioPipe {
         self.position_ms.store(ms, Ordering::Relaxed);
     }
 
+    /// Plays at this many times normal speed, without changing the pitch.
+    pub fn set_tempo(&self, tempo: f32) {
+        self.inner.lock().tempo = tempo;
+    }
+
     /// Pauses or resumes.
     pub fn set_paused(&self, paused: bool) {
         self.inner.lock().paused = paused;
@@ -212,6 +257,9 @@ fn format_name(format: AudioFormat) -> &'static str {
 /// Audio out of a video container, decoded one packet at a time.
 struct TrackSource<'a> {
     input: &'a [u8],
+    /// Where packets are, when the file isn't in `input`.
+    file: Option<&'a FileSource>,
+    packet: Vec<u8>,
     track: AudioTrack,
     decoder: PacketDecoder<'a>,
     next: usize,
@@ -222,10 +270,19 @@ struct TrackSource<'a> {
 impl<'a> TrackSource<'a> {
     fn open(input: &'a [u8]) -> Result<Self, AudioFailure> {
         let track = audio_track(input).ok_or(AudioFailure::NoTrack)?;
+        Self::with_track(input, None, track)
+    }
+
+    fn with_track(
+        input: &'a [u8],
+        file: Option<&'a FileSource>,
+        track: AudioTrack,
+    ) -> Result<Self, AudioFailure> {
         let config = input.get(track.config.clone()).unwrap_or(&[]);
         let format = match track.codec {
             AudioCodec::Aac => PacketFormat::Aac(config),
             AudioCodec::Mp3 => PacketFormat::Mp3,
+            AudioCodec::MpegSplit => PacketFormat::Mp3Split,
             AudioCodec::Vorbis => PacketFormat::Vorbis(config),
             AudioCodec::Flac => PacketFormat::Flac(config),
             AudioCodec::Pcm {
@@ -239,12 +296,15 @@ impl<'a> TrackSource<'a> {
             },
             AudioCodec::MuLaw => PacketFormat::MuLaw,
             AudioCodec::ALaw => PacketFormat::ALaw,
-            AudioCodec::Opus | AudioCodec::Other => return Err(AudioFailure::NoTrack),
+            AudioCodec::Opus => PacketFormat::Opus(config),
+            AudioCodec::Other => return Err(AudioFailure::NoTrack),
         };
         let decoder = PacketDecoder::new(format, track.sample_rate, track.channels)
             .map_err(AudioFailure::Codec)?;
         Ok(Self {
             input,
+            file,
+            packet: Vec::new(),
             track,
             decoder,
             next: 0,
@@ -270,8 +330,21 @@ impl<'a> TrackSource<'a> {
     }
 
     fn next_chunk(&mut self, out: &mut [i16]) -> Result<Option<usize>, AudioError> {
-        let Some(packet) = self.track.packet(self.input, self.next) else {
-            return Ok(None);
+        let packet = match self.file {
+            Some(file) => {
+                if self.next >= self.track.packets.len() {
+                    return Ok(None);
+                }
+                if !self.track.read_packet(file, self.next, &mut self.packet) {
+                    self.next += 1;
+                    return Err(AudioError::InvalidData("the file could not be read"));
+                }
+                self.packet.as_slice()
+            }
+            None => match self.track.packet(self.input, self.next) {
+                Some(packet) => packet,
+                None => return Ok(None),
+            },
         };
         let frames = self.decoder.decode(packet, out);
         // A short buffer leaves the packet to be tried again.
@@ -292,6 +365,8 @@ impl<'a> TrackSource<'a> {
 /// Anything the playback loop can pull audio from.
 enum Puller<'a> {
     File(AudioStream<'a>),
+    /// A file too large to read, played from where it is.
+    OnDisk(SourceStream),
     Track(TrackSource<'a>),
 }
 
@@ -299,6 +374,10 @@ impl Puller<'_> {
     fn format(&self) -> Option<MixFormat> {
         match self {
             Self::File(stream) => {
+                let info = stream.info();
+                MixFormat::new(info.sample_rate, info.channels)
+            }
+            Self::OnDisk(stream) => {
                 let info = stream.info();
                 MixFormat::new(info.sample_rate, info.channels)
             }
@@ -311,6 +390,7 @@ impl Puller<'_> {
     fn channels(&self) -> usize {
         match self {
             Self::File(stream) => stream.info().channels as usize,
+            Self::OnDisk(stream) => stream.info().channels as usize,
             Self::Track(track) => track.decoder.channels() as usize,
         }
     }
@@ -318,6 +398,7 @@ impl Puller<'_> {
     fn chunk_samples(&self) -> usize {
         match self {
             Self::File(stream) => stream.max_chunk_samples(),
+            Self::OnDisk(stream) => stream.max_chunk_samples(),
             Self::Track(track) => track.decoder.typical_samples(),
         }
     }
@@ -325,6 +406,15 @@ impl Puller<'_> {
     fn info(&self) -> TrackInfo {
         match self {
             Self::File(stream) => {
+                let info = stream.info();
+                TrackInfo {
+                    codec: format_name(info.format),
+                    sample_rate: info.sample_rate,
+                    channels: info.channels,
+                    duration_ms: info.duration_ms(),
+                }
+            }
+            Self::OnDisk(stream) => {
                 let info = stream.info();
                 TrackInfo {
                     codec: format_name(info.format),
@@ -348,6 +438,10 @@ impl Puller<'_> {
                 let rate = stream.info().sample_rate as u64;
                 stream.seek(ms.saturating_mul(rate) / 1000)
             }
+            Self::OnDisk(stream) => {
+                let rate = stream.info().sample_rate as u64;
+                stream.seek(ms.saturating_mul(rate) / 1000)
+            }
             Self::Track(track) => track.seek(ms),
         }
     }
@@ -355,6 +449,7 @@ impl Puller<'_> {
     fn next_chunk(&mut self, out: &mut [i16]) -> Result<Option<usize>, AudioError> {
         match self {
             Self::File(stream) => stream.next_chunk(out),
+            Self::OnDisk(stream) => stream.next_chunk(out),
             Self::Track(track) => track.next_chunk(out),
         }
     }
@@ -377,7 +472,7 @@ pub enum Finished {
 pub fn play_media(
     pipe: &AudioPipe,
     platform: &Platform,
-    fs: &dyn FileSystem,
+    fs: &'static dyn FileSystem,
     node: NodeId,
     source: Source,
     identity: u32,
@@ -391,19 +486,44 @@ pub fn play_media(
         }
         Finished::Failed(failure)
     };
-    let Some(data) = read_file(fs, node, fs.size(node)) else {
-        return fail(AudioFailure::Unreadable);
-    };
-    // A sound-only MP4 is a video container with no picture in it.
-    let source = match source {
-        Source::File if feos_video::detect(&data).is_some() => Source::Track,
-        other => other,
-    };
-    let puller = match source {
-        Source::File => AudioStream::open(&data)
-            .map(Puller::File)
-            .map_err(AudioFailure::Codec),
-        Source::Track => TrackSource::open(&data).map(Puller::Track),
+    let size = fs.size(node);
+    let file = FileSource::new(fs, node);
+    let whole;
+    let head;
+    let puller = if size > MAX_MEDIA_BYTES {
+        // Too large to read: only what describes it comes into memory.
+        let mut first = [0u8; 4096];
+        let got = fs.read(node, 0, &mut first);
+        match source {
+            Source::File if feos_video::detect(&first[..got]).is_none() => {
+                SourceStream::open(alloc::boxed::Box::new(FileSource::new(fs, node)))
+                    .map(Puller::OnDisk)
+                    .map_err(AudioFailure::Codec)
+            }
+            _ => match audio_track_from_source(&file) {
+                Some((bytes, track)) => {
+                    head = bytes;
+                    TrackSource::with_track(&head, Some(&file), track).map(Puller::Track)
+                }
+                None => Err(AudioFailure::NoTrack),
+            },
+        }
+    } else {
+        let Some(data) = read_file(fs, node, size) else {
+            return fail(AudioFailure::Unreadable);
+        };
+        whole = data;
+        // A sound-only MP4 is a video container with no picture in it.
+        let source = match source {
+            Source::File if feos_video::detect(&whole).is_some() => Source::Track,
+            other => other,
+        };
+        match source {
+            Source::File => AudioStream::open(&whole)
+                .map(Puller::File)
+                .map_err(AudioFailure::Codec),
+            Source::Track => TrackSource::open(&whole).map(Puller::Track),
+        }
     };
     let mut puller = match puller {
         Ok(puller) => puller,
@@ -438,18 +558,39 @@ pub fn play_media(
     let mut finished = false;
     let mut reported_end = false;
     let mut bad_packets = 0u32;
+    let mut tempo = 1.0f32;
+    let mut stretch: Option<Wsola> = None;
     loop {
         if processes.kill_requested() {
             return Finished::Interrupted;
         }
-        let (want_pause, seek) = {
+        let (want_pause, seek, want_tempo) = {
             let mut inner = pipe.inner.lock();
             if inner.owner != identity || inner.media != media {
                 return Finished::Interrupted;
             }
-            (inner.paused, inner.seek.take())
+            (inner.paused, inner.seek.take(), inner.tempo)
         };
+        let here = base_ms + stream.played_frames() * 1000 / OUTPUT_RATE * tempo_percent(tempo) / 100;
+        // A new tempo is a seek to where it's got to, as what's queued has the old one.
+        let seek = match seek {
+            None if want_tempo != tempo => Some(here),
+            other => other,
+        };
+        if want_tempo != tempo {
+            tempo = want_tempo;
+            stretch = if tempo == 1.0 {
+                None
+            } else {
+                puller
+                    .format()
+                    .and_then(|format| Wsola::new(format.sample_rate(), format.channels(), tempo))
+            };
+        }
         if let Some(ms) = seek {
+            if let Some(stretch) = stretch.as_mut() {
+                stretch.reset();
+            }
             stream.flush();
             priming = true;
             stream.set_paused(true);
@@ -473,12 +614,21 @@ pub fn play_media(
             }
         }
         let played = stream.played_frames();
-        pipe.position_ms
-            .store(base_ms + played * 1000 / OUTPUT_RATE, Ordering::Relaxed);
+        pipe.position_ms.store(
+            base_ms + played * 1000 / OUTPUT_RATE * tempo_percent(tempo) / 100,
+            Ordering::Relaxed,
+        );
 
         if paused {
             processes.sleep_ms(SLEEP_MS);
             continue;
+        }
+        // What the stretcher already made comes first.
+        if at == len {
+            if let Some(stretch) = stretch.as_mut() {
+                at = 0;
+                len = stretch.pull(&mut chunk);
+            }
         }
         if at == len && !finished {
             match puller.next_chunk(&mut chunk) {
@@ -486,6 +636,10 @@ pub fn play_media(
                     bad_packets = 0;
                     at = 0;
                     len = frames * puller.channels();
+                    if let Some(stretch) = stretch.as_mut() {
+                        let _ = stretch.push(&chunk[..len]);
+                        len = stretch.pull(&mut chunk);
+                    }
                     // A file can change its layout partway. Follow it.
                     if let Some(now) = puller.format() {
                         if now != format && len > 0 {

@@ -62,7 +62,7 @@ Generated from `vnext.md`. `[x]` means fixed and verified, `[~]` means partly do
 - [x] `virtio-blk`, MBR/GPT parsing and a buffer cache.
 - [x] A shared, locked, writable VFS across the serial shell, Terminal and Explorer. Fix FS-4, FS-5, FS-13 and FS-14 first.
 - [x] A real-time clock (PL031 and CMOS), and then file timestamps.
-- [~] Settings that survive a reboot, and Explorer write operations. (partial: Explorer writes done; the settings restore is boot-tested, the Display Properties save path isn't)
+- [x] Settings that survive a reboot, and Explorer write operations. (`FEOS_BOOT_TEST_ONLY=settings`, both ports: Display Properties and the Settings app each changed through the UI, QEMU killed, restored)
 
 ### M5: Make the headline features real
 
@@ -344,31 +344,31 @@ Generated from `vnext.md`. `[x]` means fixed and verified, `[~]` means partly do
 - [x] RTC: PL031 and CMOS
 - [x] DTB parsing (AArch64)
 - [x] ACPI and multiboot memory map (x86)
-- [x] `virtio-net` and a TCP/IP stack (boot-tested on both ports over slirp; no IP fragment reassembly, window scaling, SACK or IPv6; `nc` has no stdin; predictable sequence numbers: see `docs/networking.md`)
+- [x] `virtio-net` and a TCP/IP stack (boot-tested on both ports over slirp; no IP fragment reassembly, window scaling, SACK or IPv6; predictable sequence numbers: see `docs/networking.md`)
 - [x] GICv3
 - [x] xHCI, USB HID and storage (root ports only: no hubs, no hot plug; disks up to 2 TiB)
 - [x] UEFI boot and firmware framebuffer (boot-tested from a FAT ESP on Debian's OVMF and AAVMF: `boot/efi` loader, GOP framebuffer, memory map, RSDP or DTB; AArch64 with ACPI reads QEMU's device tree at the start of RAM; no Secure Boot)
 
 ### Filesystem and data formats
 
-- [~] `virtio-blk` plus a multi-block, async `BlockDevice` (partial: multi-block done, and a waiting task now blocks on the device's interrupt; one request at a time, no async API)
+- [~] `virtio-blk` plus a multi-block, async `BlockDevice` (partial: multi-block done, and a waiting task blocks on the device's interrupt. One request at a time is kept on purpose: every filesystem operation holds the one `Vfs` state mutex across its disk I/O, so nothing can submit a second request, and the cache already coalesces contiguous writes into one multi-block request, with metadata ordered by flushes. An async API would have no caller until the VFS lock is split)
 - [x] MBR and GPT parsing
 - [x] Buffer cache with write-back
 - [x] Real VFS: mount/unmount, writable, handles, stat, unified with the coreutils overlay
 - [x] Writable on-disk root
-- [~] Crash consistency: dirty bit, ordered updates, mount-time check (partial: dirty bit, ordered updates and check done; a torn exFAT entry set mounts read-only instead of being repaired)
+- [x] Crash consistency: dirty bit, ordered updates, mount-time check (a torn exFAT entry set on a dirty volume is now repaired: `libs/fs/tests/crash.rs` cuts at every write, in order and with unflushed writes landing at random, and every cut mounts writable with synced files intact. On a clean volume a torn set is damage and stays read-only)
 - [x] Timestamps
-- [~] Attributes, then permissions (partial: attributes done; no permissions)
+- [x] Attributes, then permissions (uid/gid per task, `chmod`, `chown`, enforced at the VFS and system call boundary for user programs: `/bin/permtest` at EL0/ring 3, 45 checks on both ports. Kernel-linked apps run as root, unchecked, and `id` says so. FAT, exFAT and RAM mounts stay permissionless and report made-up modes. No user names, supplementary groups, setuid programs or sticky directories; checked at open, not on each read)
 - [x] Symlinks in VFS
 - [x] FAT12/16 read
 - [x] Runtime `format()`
 - [x] Streaming inflate and extract-to-sink
 - [x] ZIP64, tar.gz helper, `safe_path()`
 - [x] Runtime `.fapp` install with an integrity hash
-- [ ] Native filesystem with POSIX metadata
-- [~] YAML multi-line forms, compact block forms (partial: block scalars and compact forms done; no multi-line plain or quoted scalars)
-- [ ] JSON builder API
-- [~] `init`: exit status, one-shot type, ordering, backoff (partial: backoff done; no exit status, one-shot type or ordering)
+- [x] Native filesystem with POSIX metadata (`feos_fs::native`: redo journal for metadata, ordered data, inodes, mode/uid/gid, mtime, symlinks, hard links, `fsck [-r]`. `libs/fs/tests/native.rs` crashes at every write, in order and at random. `FEOS_BOOT_TEST_ONLY=native`, both ports: real virtio disk, QEMU killed during writes until commits were caught and replayed, 5 kills and 3 replays each. Never the root; mounted at `/native<n>`. Formatting is host-side only, by `native::format` or `scripts/mkfs-feos.py`: the guest has no raw devices to format. Overwrites in place aren't journalled)
+- [x] YAML multi-line forms, compact block forms (multi-line plain, single- and double-quoted scalars with folding. Flow collections spanning lines still aren't read)
+- [x] JSON builder API (`JsonBuilder`, streaming and allocation-free, invalid sequences are errors; `SliceOutput` for a caller's buffer)
+- [x] `init`: exit status, one-shot type, ordering, backoff (host-tested; `autostart` entries can be mappings with `type`, `after`, `args`. No shipped configuration uses them yet, so not boot-tested)
 
 ### Shell and terminal
 
@@ -383,11 +383,11 @@ Generated from `vnext.md`. `[x]` means fixed and verified, `[~]` means partly do
 - [x] Full arithmetic, `(( ))`, `let`, `[[ ]]`
 - [x] Real subshells
 - [x] Backticks, `$'…'`, `$!`, `+=`, IFS
-- [~] `set -e/-u/-x`, `pipefail`, `trap`, `wait`, `getopts`, `readonly`, `time` (partial: no `time`; `trap` only fires EXIT, INT and ERR, not HUP, TERM or QUIT)
+- [x] `set -e/-u/-x`, `pipefail`, `trap`, `wait`, `getopts`, `readonly`, `time` (`FEOS_BOOT_TEST_ONLY=jobs`, both ports: HUP, TERM, QUIT traps from another process and at an idle prompt, HUP on closing a Terminal. Signals are for shells only: anything else is killed by them. `time`'s CPU figure is all reported as user, with sys 0, as the kernel doesn't tell them apart)
 - [x] Script execution by path and PATH lookup
 - [x] `App::run -> i32` and argv
 - [x] Capturing app output
-- [~] `jobs`, `fg`, `bg`, `wait` (docs admit) (partial: no Ctrl-Z to stop a foreground job)
+- [~] `jobs`, `fg`, `bg`, `wait` (docs admit) (partial: Ctrl-Z stops a foreground process, kernel-linked app or user program, and `fg`/`bg` resume it, boot-tested on both ports. Not stoppable: coreutils and builtins, which run on the shell's own task, and pipelines or commands with redirected streams. Ctrl-Z is ignored for those)
 - [x] Streaming pipelines
 - [x] Utilities (S each): `which`, `od`, `fold`, `comm`, `split`, `dd`, `strings`, `realpath`, `mktemp`, `file`, `date`, `timeout`, more `grep`, `ls`, `sort`, `uniq` flags
 - [x] `xargs`, `diff`, fuller `find`, `tar`, `gzip`
@@ -397,27 +397,27 @@ Generated from `vnext.md`. `[x]` means fixed and verified, `[~]` means partly do
 - [x] Text editor
 - [x] Pager
 - [x] Multiple Terminal instances
-- [~] Selection, copy, paste, Unicode width (partial: paste only; no selection, copy or Unicode width)
+- [x] Selection, copy, paste, Unicode width (`FEOS_BOOT_TEST_ONLY=terminal`, both ports: drag, Ctrl+Shift+C, Ctrl+Shift+V through the clipboard. Wide characters take two cells; combining marks are dropped, as a cell holds one character)
 
 ### Desktop and GUI
 
-- [~] Console capture window (partial: output opens in a Terminal window; external apps get no stdin)
+- [x] Console capture window (output opens in a Terminal window; external apps read stdin through `Context::read_stdin`, and user programs reading a terminal get cooked lines, Ctrl-C still working)
 - [x] Alt+Tab, Alt+F4, window menu
 - [x] Launch with arguments and file associations
 - [x] Image preview and thumbnails
 - [x] Streaming file viewer
 - [x] Clipboard
 - [x] Explorer write operations
-- [ ] Content search on a background worker
-- [~] Settings app, persisted (partial: Display Properties dialog saves theme and keyboard; no separate app, and the save path isn't boot-tested)
+- [x] Content search on a background worker (`FEOS_BOOT_TEST_ONLY=search`: 192 MiB read in 2.6 s on AArch64 with a longest frame of 82 ms, 3.1 s and 89 ms on x86_64)
+- [x] Settings app, persisted (`settings` bundle: colour scheme, keyboard, wallpaper, clock; survives a QEMU kill on both ports)
 - [x] Notifications and tray
 - [x] Volume control
 - [x] Keyboard layouts
 - [~] Hosted-app isolation (partial: each window's app runs on its own task, so a fault, panic or hang in one closes that window and the desktop lives, boot-tested on both ports. It's containment, not isolation: kernel-linked apps still share memory and privilege, a fault with a lock held still stops the machine, a stuck app freezes the desktop for up to 30 s, and foreground apps stay on the boot task. A user program in a window, `wdemo`, is fully isolated)
 - [x] Background ticks for minimized windows
 - [x] Drag and drop
-- [ ] Resolution changes
-- [ ] Unicode fonts
+- [x] Resolution changes (`FEOS_BOOT_TEST_ONLY=resolution`, both ports: live through Settings on ramfb to 1600x1200 and virtio-gpu to 1920x1080, neither of which fits the static buffers, with screenshots; maximised windows and the pointer's range follow, a confirm-or-revert prompt, 12 rounds with no leak, kept across a QEMU kill. A firmware framebuffer can't change mode, so it offers none)
+- [x] Unicode fonts (`font_extended.rs`, about 590 glyphs, 6 KiB: Latin-1, Latin Extended-A, Greek, Cyrillic, box drawing and blocks. `FEOS_BOOT_TEST_ONLY=fonts`, both ports, screenshots in Terminal and Explorer from real FAT long names. Greek and box drawing are this project's, as the console fonts' tables were wrong there; the rest rests on Debian's statement that they're public domain, see LICENSING.md. Out: CJK and everything else, as an empty box, combining marks, right-to-left, and Latin Extended-B)
 
 ### Media
 
@@ -425,18 +425,18 @@ Generated from `vnext.md`. `[x]` means fixed and verified, `[~]` means partly do
 - [x] Decode worker with a frame queue
 - [x] Mixer, resampler, channel conversion to 48 kHz stereo
 - [x] Music playback app or `play` command
-- [ ] Streaming from disk via a `Source` trait
+- [~] Streaming from disk via a `Source` trait (partial: `feos-source`, with video from MP4, Matroska/WebM, AVI, FLV and IVF, and sound from WAV, AIFF, AU, MP3, ADTS, FLAC and Ogg. Boot-tested with files up to 148 MiB, over twice the heap, seeking included. Not streamed, and still refused above 16 MiB: fragmented MP4, MPEG program streams, raw H.264, MJPEG and GIF. MP3 and ADTS lengths and seeks are estimates unless the rate is constant or an Xing header is there)
 - [x] PTS timing: ctts, stts, edit lists, MKV and FLV timestamps
 - [x] A/V sync with audio-clock master
-- [~] AAC-LC decoder (partial: refuses Main prediction, gain control, coupling channels, 960-sample frames and program config elements; HE-AAC plays its LC core only)
-- [~] FLAC (S-M), Vorbis (M), Opus (L) (partial: FLAC and Vorbis done; Opus refused)
+- [~] AAC-LC decoder (partial: Main prediction, coupling channels and program config elements done and compared with FFmpeg on real ISO conformance streams, within 3 of 16 bits, or 257 for Main at 88.2 kHz. 960-sample frames, gain control, LTP and SBR/PS not done: HE-AAC still plays its LC core. Real 960-sample and SBR streams exist in FATE, and no gain control stream was found)
+- [~] FLAC (S-M), Vorbis (M), Opus (L) (partial: FLAC and Vorbis done. Opus SILK, CELT and hybrid done, in Ogg, Matroska and MP4, for one or two channels with mapping family 0, and compared with libopus: SILK narrow and wide band identical, the rest within 1 of 16 bits. All 12 RFC 8251 vectors have no final range errors, but 4 differ in PCM by up to 242 in SILK and hybrid switching. Multichannel refused; PLC and FEC not compared. Under QEMU's TCG, 256 kbit/s stereo Opus plays right but with 67% to 99% of it silent gaps: thought to be speed, as the same decoder manages only about 10x real time natively, but not measured in the guest)
 - [x] Larger frame budget, level-based DPB limits
 - [x] Colour and display: VUI range, BT.709, SAR, rotation
 - [x] Image viewer, MJPEG default Huffman tables (S), multi-scan and progressive JPEG (M)
-- [~] More video codecs: MPEG-1 or MPEG-4 ASP (M), VP8 (M-L) (partial: MPEG-1 done; no VP8)
+- [x] More video codecs: MPEG-1 or MPEG-4 ASP (M), VP8 (M-L) (notes: VP8 identical to FFmpeg on all 9 fixtures, in WebM and IVF, covering inter frames, golden, hidden alternate references, partitions, segmentation and profiles 1 to 3. MPEG-4 ASP was the alternative and isn't built)
 - [x] Container gaps: fMP4, `wide`-first MOV, AVI `rec` and OpenDML, MKV compression
-- [~] Volume and mute (S), recording (M), SRT subtitles (S-M), playlist save (S) (partial: volume, mute and SRT done; no recording, and Save Playlist is a disabled menu item)
-- [ ] H.264 error concealment (M), real interlace, High10, 4:2:2 (L)
+- [x] Volume and mute (S), recording (M), SRT subtitles (S-M), playlist save (S) (notes: `rec` boot-tested with real samples, by QEMU's ALSA backend and ALSA's `file` plugin; 440 and 660 Hz came through exactly. Playlists save to M3U and load back)
+- [~] H.264 error concealment (M), real interlace, High10, 4:2:2 (L) (partial: concealment done and tested by breaking clean clips; the bit-exact fixtures are unchanged. Interlace, High10 and 4:2:2 not started: all still refused. The decode paths assume 8-bit 4:2:0 frame macroblocks throughout, and MBAFF's existing paths are known not to match a reference decoder)
 - [x] SSE on x86_64 for decoders
 
 ### FEOS-DOS
@@ -452,7 +452,7 @@ Generated from `vnext.md`. `[x]` means fixed and verified, `[~]` means partly do
 - [x] FCB calls, `6Ch`, `5Ah`, `59h`, `38h`, `65h`, device names
 - [x] 386 real-mode ISA: `66`/`67`, `0F xx`, FS, GS
 - [x] 386 protected mode, DPMI, DOS/4GW. All 13 titles run in the host harness; see `docs/dosbox.md` for what each reaches. (notes as above)
-- [~] Sound Blaster DSP and 8237 DMA (docs admit) (partial: Sound Blaster 2.0 and 8237 DMA done; no Pro stereo or SB16)
+- [x] Sound Blaster DSP and 8237 DMA (docs admit)
 - [x] XMS, EMS, A20, HMA (docs admit)
 - [x] Mouse callbacks, hide counter, joystick
 - [x] x87 transcendentals (docs admit), true 80-bit mul and div, exception flags
@@ -485,9 +485,9 @@ Generated from `vnext.md`. `[x]` means fixed and verified, `[~]` means partly do
 - [x] Use one error policy: fallible allocation in parsers, a `DecodeError::OutOfMemory`, and `FsError::NoSpace`.
 - [x] Don't let one bad directory fail a whole mount (`libs/fs/src/fat32.rs:258`, `libs/fs/src/exfat.rs:233`). Skip it and flag the volume.
 - [x] Free the chain after deleting the entry, not before (`libs/fs/src/fat32.rs:1053-1056`, `libs/fs/src/exfat.rs:1432-1433`).
-- [ ] Keep names raw at the scanner, and escape control characters at display.
+- [x] Keep names raw at the scanner, and escape control characters at display. (`FEOS_BOOT_TEST_ONLY=names`. Only `/` and NUL are still replaced at the scanner, as they'd mean something else in a path. Escaped in `ls`, `tree`, `find`, tab completion, the prompt, Explorer and desktop titles and toasts when writing to a terminal or window; piped output stays raw. Error messages quoting a typed path aren't escaped)
 - [x] Replace silent truncation with errors where it changes behaviour: `Manifest` fields, and `Text`'s `fmt::Write`, which reports `Ok` on truncation (`libs/text/src/lib.rs:210-213`).
-- [~] Validate header counts against the file (`stsz`, `dwTotalFrames`), since they feed duration directly. (partial: AVI counts its chunks; MP4 `info()` still reports `stsz`'s count unchecked)
+- [x] Validate header counts against the file (`stsz`, `dwTotalFrames`), since they feed duration directly.
 - [x] Add a `DmaBuf<T>` built on `UnsafeCell`, with `phys()` and `dma_wmb`/`dma_rmb` in the HAL, before the MMU work. (virtio-blk uses it; the other drivers still use raw statics)
 
 ### Design
@@ -503,7 +503,7 @@ Generated from `vnext.md`. `[x]` means fixed and verified, `[~]` means partly do
 - [x] **Make the `gui` gallery a real windowed bundle.** It's unreachable from the desktop, and it would exercise `libs/gui` with real input.
 - [x] **Separate `info()` from per-frame decode** in `libs/video`.
 - [x] **DOS:** a refcounted RAM drive with a quota, a `last_error` value for `AH=59h`, stop clobbering AX where it must be preserved (`1Ah`, `25h`, `35h`, `2Fh`, `51h`, `62h`), and a versioned, validated save-state.
-- [~] **Record provenance** for both vendored decoders: upstream SHA, local patches and licence notices. (partial: `libs/h264/UPSTREAM.md` exists but records the SHA as unknown; the MP3 port has no SHA or patch list)
+- [x] **Record provenance** for both vendored decoders: upstream SHA, local patches and licence notices. (notes: `libs/h264/UPSTREAM.md` and `libs/audio-codec/src/mp3/UPSTREAM.md`. Both SHAs were established by comparing against upstream's history, not recorded at import. The `rust_h264` version under z264 is still only known as 0.4.x)
 
 ### Performance
 

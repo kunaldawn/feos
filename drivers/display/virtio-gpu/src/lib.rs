@@ -25,6 +25,7 @@ const POLL_LIMIT: u64 = 1 << 30;
 mod command {
     pub const GET_DISPLAY_INFO: u32 = 0x0100;
     pub const RESOURCE_CREATE_2D: u32 = 0x0101;
+    pub const RESOURCE_UNREF: u32 = 0x0102;
     pub const SET_SCANOUT: u32 = 0x0103;
     pub const RESOURCE_FLUSH: u32 = 0x0104;
     pub const TRANSFER_TO_HOST_2D: u32 = 0x0105;
@@ -90,6 +91,8 @@ pub struct VirtioGpu<T: Transport> {
     height: u32,
     /// A command was lost: the device may still write to its buffers.
     failed: bool,
+    /// The resource on the scanout.
+    resource: u32,
 }
 
 impl<T: Transport> VirtioGpu<T> {
@@ -119,6 +122,7 @@ impl<T: Transport> VirtioGpu<T> {
             width: 0,
             height: 0,
             failed: false,
+            resource: RESOURCE_ID,
         })
     }
 
@@ -202,8 +206,36 @@ impl<T: Transport> VirtioGpu<T> {
     /// The memory must stay where it is for good: the device reads it on each
     /// [`flush`](Self::flush).
     pub fn attach(&mut self, address: u64, width: u32, height: u32) -> Result<(), GpuError> {
+        self.show(RESOURCE_ID, address, width, height)?;
+        self.resource = RESOURCE_ID;
+        Ok(())
+    }
+
+    /// Changes to a `width` x `height` framebuffer at `address`, live. The old memory
+    /// isn't the device's any more once this has returned `Ok`, and is still in use if it
+    /// returned anything else.
+    pub fn change_mode(&mut self, address: u64, width: u32, height: u32) -> Result<(), GpuError> {
+        let old = self.resource;
+        let (old_width, old_height) = (self.width, self.height);
+        let new = if old == RESOURCE_ID { RESOURCE_ID + 1 } else { RESOURCE_ID };
+        if let Err(error) = self.show(new, address, width, height) {
+            // Whatever did happen, the old resource is what's still meant to be up. If the
+            // device refused the new one, it stays on the scanout anyway.
+            self.width = old_width;
+            self.height = old_height;
+            self.resource = old;
+            let _ = self.unreference(new);
+            return Err(error);
+        }
+        self.resource = new;
+        // Nothing's on it now. It can't be left: 2D resources count against a host limit.
+        self.unreference(old)
+    }
+
+    /// Creates a resource with `address` as its backing, and shows it.
+    fn show(&mut self, resource: u32, address: u64, width: u32, height: u32) -> Result<(), GpuError> {
         let request = &mut self.memory.request;
-        put_u32(request, HEADER_LEN, RESOURCE_ID);
+        put_u32(request, HEADER_LEN, resource);
         put_u32(request, HEADER_LEN + 4, FORMAT_XRGB);
         put_u32(request, HEADER_LEN + 8, width);
         put_u32(request, HEADER_LEN + 12, height);
@@ -211,7 +243,7 @@ impl<T: Transport> VirtioGpu<T> {
 
         let bytes = width.saturating_mul(height).saturating_mul(4);
         let request = &mut self.memory.request;
-        put_u32(request, HEADER_LEN, RESOURCE_ID);
+        put_u32(request, HEADER_LEN, resource);
         put_u32(request, HEADER_LEN + 4, 1);
         put_u32(request, HEADER_LEN + 8, address as u32);
         put_u32(request, HEADER_LEN + 12, (address >> 32) as u32);
@@ -229,16 +261,25 @@ impl<T: Transport> VirtioGpu<T> {
         put_u32(request, HEADER_LEN + 8, width);
         put_u32(request, HEADER_LEN + 12, height);
         put_u32(request, HEADER_LEN + 16, SCANOUT_ID);
-        put_u32(request, HEADER_LEN + 20, RESOURCE_ID);
+        put_u32(request, HEADER_LEN + 20, resource);
         self.execute(command::SET_SCANOUT, HEADER_LEN + 24, command::OK_NODATA)?;
         self.width = width;
         self.height = height;
+        self.resource = resource;
         self.flush(Rect {
             x: 0,
             y: 0,
             width,
             height,
         })
+    }
+
+    /// Destroys a resource, and with it the device's hold on its memory.
+    fn unreference(&mut self, resource: u32) -> Result<(), GpuError> {
+        let request = &mut self.memory.request;
+        put_u32(request, HEADER_LEN, resource);
+        put_u32(request, HEADER_LEN + 4, 0);
+        self.execute(command::RESOURCE_UNREF, HEADER_LEN + 8, command::OK_NODATA)
     }
 
     /// Clips a rectangle to the screen. `None` when nothing of it is left.
@@ -258,6 +299,7 @@ impl<T: Transport> VirtioGpu<T> {
 
     /// Shows what's changed in `rect`.
     pub fn flush(&mut self, rect: Rect) -> Result<(), GpuError> {
+        let resource = self.resource;
         let Some(rect) = self.clip(rect) else {
             return Ok(());
         };
@@ -270,7 +312,7 @@ impl<T: Transport> VirtioGpu<T> {
         put_u32(request, HEADER_LEN + 12, rect.height);
         put_u32(request, HEADER_LEN + 16, offset as u32);
         put_u32(request, HEADER_LEN + 20, (offset >> 32) as u32);
-        put_u32(request, HEADER_LEN + 24, RESOURCE_ID);
+        put_u32(request, HEADER_LEN + 24, resource);
         put_u32(request, HEADER_LEN + 28, 0);
         self.execute(
             command::TRANSFER_TO_HOST_2D,
@@ -283,7 +325,7 @@ impl<T: Transport> VirtioGpu<T> {
         put_u32(request, HEADER_LEN + 4, rect.y);
         put_u32(request, HEADER_LEN + 8, rect.width);
         put_u32(request, HEADER_LEN + 12, rect.height);
-        put_u32(request, HEADER_LEN + 16, RESOURCE_ID);
+        put_u32(request, HEADER_LEN + 16, resource);
         put_u32(request, HEADER_LEN + 20, 0);
         self.execute(command::RESOURCE_FLUSH, HEADER_LEN + 24, command::OK_NODATA)
     }
@@ -472,6 +514,53 @@ mod tests {
         fake.reject.set(command::SET_SCANOUT);
         let mut gpu = VirtioGpu::new(fake).unwrap();
         assert_eq!(gpu.attach(0x1000, 800, 600), Err(GpuError::CommandFailed(0x1200)));
+    }
+
+    #[test]
+    fn a_mode_change_makes_a_new_resource_and_drops_the_old() {
+        let fake = FakeGpu::new((800, 600));
+        let mut gpu = VirtioGpu::new(fake).unwrap();
+        gpu.attach(0x1000, 800, 600).unwrap();
+        fake.log.borrow_mut().clear();
+
+        gpu.change_mode(0x2000, 1600, 1200).unwrap();
+        {
+            let log = fake.log.borrow();
+            let commands: std::vec::Vec<u32> = log.iter().map(|entry| entry.0).collect();
+            assert_eq!(
+                commands,
+                [
+                    command::RESOURCE_CREATE_2D,
+                    command::RESOURCE_ATTACH_BACKING,
+                    command::SET_SCANOUT,
+                    command::TRANSFER_TO_HOST_2D,
+                    command::RESOURCE_FLUSH,
+                    command::RESOURCE_UNREF
+                ]
+            );
+            assert_eq!(log[0].1, [RESOURCE_ID + 1, FORMAT_XRGB, 1600, 1200]);
+            assert_eq!(log[2].1, [0, 0, 1600, 1200, SCANOUT_ID, RESOURCE_ID + 1]);
+            assert_eq!(log[5].1[0], RESOURCE_ID);
+        }
+        // Flushes go to the new one, at its size.
+        fake.log.borrow_mut().clear();
+        gpu.flush(Rect { x: 1500, y: 1100, width: 900, height: 900 }).unwrap();
+        assert_eq!(fake.log.borrow()[1].1[..4], [1500, 1100, 100, 100]);
+
+        // And back: the ids take turns.
+        fake.log.borrow_mut().clear();
+        gpu.change_mode(0x3000, 640, 480).unwrap();
+        assert_eq!(fake.log.borrow()[0].1[0], RESOURCE_ID);
+    }
+
+    #[test]
+    fn a_refused_mode_change_keeps_the_mode() {
+        let fake = FakeGpu::new((800, 600));
+        let mut gpu = VirtioGpu::new(fake).unwrap();
+        gpu.attach(0x1000, 800, 600).unwrap();
+        fake.reject.set(command::SET_SCANOUT);
+        assert!(gpu.change_mode(0x2000, 1600, 1200).is_err());
+        assert_eq!((gpu.width, gpu.height, gpu.resource), (800, 600, RESOURCE_ID));
     }
 
     #[test]

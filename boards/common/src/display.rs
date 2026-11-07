@@ -35,12 +35,133 @@ static DISPLAY_SIZE: AtomicU64 =
     AtomicU64::new(((DISPLAY_WIDTH as u64) << 32) | DISPLAY_HEIGHT as u64);
 /// Address of the scanout, when it isn't the static one.
 static GPU_SCANOUT: AtomicUsize = AtomicUsize::new(0);
+/// Address of ramfb's scanout, once it has left the static one.
+static RAMFB_SCANOUT: AtomicUsize = AtomicUsize::new(0);
 /// The largest mode kept to. Two buffers of this come out of a 64 MiB heap.
 const MAX_GPU_WIDTH: u32 = 1920;
 const MAX_GPU_HEIGHT: u32 = 1200;
 /// The smallest the desktop lays out sensibly.
 const MIN_GPU_WIDTH: u32 = 640;
 const MIN_GPU_HEIGHT: u32 = 480;
+
+/// What a display that isn't the firmware's can be set to.
+const MODES: [(u32, u32); 7] = [
+    (640, 480),
+    (800, 600),
+    (1024, 768),
+    (1280, 720),
+    (1280, 1024),
+    (1600, 1200),
+    (1920, 1080),
+];
+
+/// ramfb, when that's what's showing.
+static RAMFB: SpinLock<Option<Ramfb>> = SpinLock::new(None);
+
+/// A mode's buffers, from the heap. Page aligned, as ramfb wants.
+#[derive(Clone, Copy)]
+struct OwnedPixels {
+    address: usize,
+    pixels: usize,
+}
+
+// SAFETY: it's an address, not access: whoever has the matching canvas is who touches it.
+unsafe impl Send for OwnedPixels {}
+
+impl OwnedPixels {
+    fn layout(pixels: usize) -> Option<core::alloc::Layout> {
+        core::alloc::Layout::from_size_align(pixels.checked_mul(4)?, 4096).ok()
+    }
+
+    fn allocate(pixels: usize) -> Option<Self> {
+        let layout = Self::layout(pixels)?;
+        // SAFETY: the layout isn't empty, as modes aren't.
+        let address = unsafe { alloc::alloc::alloc_zeroed(layout) } as usize;
+        (address != 0).then_some(Self { address, pixels })
+    }
+
+    fn free(self) {
+        if let Some(layout) = Self::layout(self.pixels) {
+            // SAFETY: from `allocate`, with this layout, and only ever freed once.
+            unsafe { alloc::alloc::dealloc(self.address as *mut u8, layout) };
+        }
+    }
+
+    /// The pixels, for good. Whoever calls this has to give them up before `free`.
+    fn slice(self) -> &'static mut [u32] {
+        // SAFETY: allocated for this many pixels, zeroed, and aligned for `u32`. There's
+        // one mode change at a time, and its buffers go to one owner: the desktop session.
+        unsafe { core::slice::from_raw_parts_mut(self.address as *mut u32, self.pixels) }
+    }
+}
+
+/// The buffers of the mode that's up, and of the one that was.
+struct ModeStore {
+    current: Option<[OwnedPixels; 2]>,
+    retired: Option<[OwnedPixels; 2]>,
+}
+
+static MODE_STORE: SpinLock<ModeStore> = SpinLock::new(ModeStore {
+    current: None,
+    retired: None,
+});
+
+/// Points the device at a new framebuffer.
+fn switch_device(address: usize, width: u32, height: u32) -> bool {
+    if let Some(gpu) = GPU.lock().as_mut() {
+        return gpu.change_mode(address as u64, width, height).is_ok();
+    }
+    let ramfb = *RAMFB.lock();
+    ramfb.is_some_and(|ramfb| ramfb.configure(address as u64, width as usize, height as usize, width as usize))
+}
+
+/// Changes mode: see [`feos_hal::display::set_mode`].
+fn set_mode(width: u32, height: u32) -> Option<feos_hal::display::ModeBuffers> {
+    if !MODES.contains(&(width, height)) {
+        return None;
+    }
+    let pixels = (width as usize).checked_mul(height as usize)?;
+    let front = OwnedPixels::allocate(pixels)?;
+    let Some(back) = OwnedPixels::allocate(pixels) else {
+        front.free();
+        return None;
+    };
+    if !switch_device(front.address, width, height) {
+        front.free();
+        back.free();
+        return None;
+    }
+    let gpu = GPU.lock().is_some();
+    if gpu {
+        GPU_SCANOUT.store(front.address, Ordering::Release);
+        feos_hal::display::set_flush(gpu_flush, width, height);
+    } else {
+        RAMFB_SCANOUT.store(front.address, Ordering::Release);
+    }
+    DISPLAY_SIZE.store(((width as u64) << 32) | height as u64, Ordering::Release);
+    let mut store = MODE_STORE.lock();
+    let old = store.current.replace([front, back]);
+    // The one before is free already, if the session did as it's told. If not, keep it
+    // rather than free what could be in use: a leak is the worst of that.
+    if store.retired.is_none() {
+        store.retired = old;
+    }
+    drop(store);
+    Some(feos_hal::display::ModeBuffers {
+        front: front.slice(),
+        back: back.slice(),
+    })
+}
+
+/// Frees the buffers of the mode before this one.
+fn release_old_mode() {
+    let retired = MODE_STORE.lock().retired.take();
+    if let Some(buffers) = retired {
+        for buffer in buffers {
+            buffer.free();
+        }
+    }
+}
 
 /// What firmware left us, if it did.
 static FIRMWARE: SpinLock<Option<Framebuffer>> = SpinLock::new(None);
@@ -57,6 +178,10 @@ pub fn set_firmware_framebuffer(framebuffer: Framebuffer) {
 /// Physical address of the scanout buffer.
 pub fn framebuffer_addr() -> usize {
     let scanout = GPU_SCANOUT.load(Ordering::Acquire);
+    if scanout != 0 {
+        return scanout;
+    }
+    let scanout = RAMFB_SCANOUT.load(Ordering::Acquire);
     if scanout != 0 {
         return scanout;
     }
@@ -122,6 +247,7 @@ fn init_gpu(transport: AnyTransport) -> Option<Canvas<'static>> {
     GPU_SCANOUT.store(address, Ordering::Release);
     DISPLAY_SIZE.store(((width as u64) << 32) | height as u64, Ordering::Release);
     feos_hal::display::set_flush(gpu_flush, width, height);
+    feos_hal::display::set_mode_support(set_mode, release_old_mode, &MODES);
     Canvas::new(pixels, width as usize, height as usize, width as usize)
 }
 
@@ -135,6 +261,7 @@ pub fn display_name() -> &'static str {
         "ramfb"
     }
 }
+
 
 /// Uses the framebuffer firmware has set up. It needs no telling about changes, so
 /// this is the same to everything above as ramfb.
@@ -176,6 +303,8 @@ pub fn init(fw_cfg: FwCfg, find_gpu: fn() -> Option<AnyTransport>) -> Option<Can
     ) {
         return None;
     }
+    *RAMFB.lock() = Some(ramfb);
+    feos_hal::display::set_mode_support(set_mode, release_old_mode, &MODES);
 
     // SAFETY: taking the address of a `static mut` does not create a
     // reference; the buffer is only exposed once, here.

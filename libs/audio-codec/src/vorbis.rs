@@ -1333,6 +1333,18 @@ impl<'a> VorbisDecoder<'a> {
         Self::from_headers(None, ident, setup, u64::MAX)
     }
 
+    /// Reads the identification and setup headers, for a caller with its own packets.
+    pub(crate) fn from_packets(ident: &[u8], setup: &[u8]) -> Result<Self> {
+        let ident = parse_ident(ident)?;
+        let setup = parse_setup(setup, ident.channels)?;
+        Self::from_headers(None, ident, setup, u64::MAX)
+    }
+
+    /// Forgets the last packet's overlap, for a seek. The next packet makes no sound.
+    pub(crate) fn forget_overlap(&mut self) {
+        self.previous = 0;
+    }
+
     fn from_headers(
         packets: Option<PacketReader<'a>>,
         ident: Ident,

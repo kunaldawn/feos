@@ -103,7 +103,7 @@ impl Shell<'_> {
             "fg" => self.builtin_fg(args, io, host),
             "bg" => self.builtin_bg(args, io, host),
             "wait" => self.builtin_wait(args, io, host),
-            "trap" => self.builtin_trap(args, io),
+            "trap" => self.builtin_trap(args, io, host),
             "kill" => return self.builtin_kill(args, io, host),
             "clear" => {
                 self.write_out(io, "\x1b[2J\x1b[H");

@@ -279,6 +279,10 @@ impl Pointer for BoardPointer {
     fn position(&self) -> (u16, u16) {
         VIRTIO_POINTER.lock().position()
     }
+
+    fn set_screen(&self, width: u16, height: u16) {
+        VIRTIO_POINTER.lock().set_screen(width, height);
+    }
 }
 
 static BOARD_POINTER: BoardPointer = BoardPointer;

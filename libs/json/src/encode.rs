@@ -85,6 +85,36 @@ fn write_value<W: Write>(
     }
 }
 
+/// Writes `text` as a JSON string, with what JSON needs escaped.
+pub(crate) fn write_string<W: Write>(out: &mut W, text: &str) -> fmt::Result {
+    out.write_char('"')?;
+    let mut clean = 0;
+    for (index, byte) in text.bytes().enumerate() {
+        let short = match byte {
+            b'"' => Some("\\\""),
+            b'\\' => Some("\\\\"),
+            b'\n' => Some("\\n"),
+            b'\r' => Some("\\r"),
+            b'\t' => Some("\\t"),
+            0x08 => Some("\\b"),
+            0x0c => Some("\\f"),
+            _ => None,
+        };
+        if short.is_none() && byte >= 0x20 {
+            continue;
+        }
+        // Everything escaped is ASCII, so these are always character boundaries.
+        out.write_str(&text[clean..index])?;
+        clean = index + 1;
+        match short {
+            Some(escape) => out.write_str(escape)?,
+            None => write!(out, "\\u{byte:04x}")?,
+        }
+    }
+    out.write_str(&text[clean..])?;
+    out.write_char('"')
+}
+
 fn newline<W: Write>(out: &mut W, indent: Option<usize>, depth: usize) -> fmt::Result {
     let Some(step) = indent else {
         return Ok(());

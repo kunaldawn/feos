@@ -17,7 +17,9 @@ use alloc::vec::Vec;
 
 use feos_coreutils::{BytesInput, Input, NullInput, NullOutput, Output};
 
-use crate::fds::OpenFile;
+use core::cell::RefCell;
+
+use crate::fds::{FdInput, FdOutput, OpenFile, StreamView};
 use crate::lexer::Word;
 use crate::parser::{Command, List};
 use crate::{CancelToken, Flow, Host, Io, JobStatus, Shell, TaskHost};
@@ -328,12 +330,20 @@ impl Shell<'_> {
         let mut killed = false;
         loop {
             let interrupted = self.checkpoint(host);
+            // `wait` gives way to a trap, and so does a job in the foreground.
+            self.deliver_signals(io, host);
+            let suspend = self.foreground_wait && !interrupted && !killed && host.poll_suspend();
             let Some(tasks) = host.tasks() else {
                 return 1;
             };
             if interrupted && !killed {
                 killed = true;
                 tasks.kill(pid);
+            }
+            if suspend {
+                tasks.set_stopped(pid, true);
+                self.suspended_task = true;
+                return SUSPENDED_STATUS;
             }
             match tasks.status(pid) {
                 JobStatus::Exited(code) => return code,
@@ -479,8 +489,51 @@ impl Shell<'_> {
             return 1;
         };
         tasks.set_stopped(pid, false);
+        self.jobs[index].stopped = false;
         self.write_out(io, &format!("{text}\n"));
-        let status = self.wait_for_task(pid, io, host);
+        // A command Ctrl-Z stopped comes back to the host, which has its streams. A job
+        // that was started with `&` is a task with streams of its own.
+        let result = {
+            let view = RefCell::new(StreamView {
+                fds: &mut self.fds,
+                io,
+                cancel: &self.cancel,
+                host: None,
+                system: self.system,
+                deadline: None,
+                timed_out: &mut self.timed_out,
+                calls: 0,
+            });
+            let mut stdin = FdInput { view: &view, fd: 0 };
+            let mut stdout = FdOutput { view: &view, fd: 1 };
+            let mut stderr = FdOutput { view: &view, fd: 2 };
+            host.resume_job(pid, &mut stdin, &mut stdout, &mut stderr)
+        };
+        let status = match result {
+            Some(status) => {
+                if status == 130 {
+                    self.cancel.cancel();
+                    self.flow = Flow::Interrupted;
+                }
+                status
+            }
+            None => {
+                self.foreground_wait = true;
+                let status = self.wait_for_task(pid, io, host);
+                self.foreground_wait = false;
+                status
+            }
+        };
+        // Stopped again: it stays a job.
+        let again = host.take_suspended().is_some() || core::mem::take(&mut self.suspended_task);
+        if again {
+            if let Some(job) = self.jobs.iter_mut().find(|job| job.pid == pid) {
+                job.stopped = true;
+                let line = format!("\n[{}]+  Stopped  {}\n", job.id, job.text);
+                self.write_err(io, &line);
+            }
+            return SUSPENDED_STATUS;
+        }
         self.jobs.retain(|job| job.pid != pid);
         status
     }
@@ -498,8 +551,10 @@ impl Shell<'_> {
         let Some(tasks) = host.tasks() else {
             return 1;
         };
-        tasks.set_stopped(self.jobs[index].pid, false);
+        let pid = self.jobs[index].pid;
+        tasks.set_stopped(pid, false);
         self.jobs[index].stopped = false;
+        host.continue_job(pid);
         let line = format!("[{}]+ {} &\n", self.jobs[index].id, self.jobs[index].text);
         self.write_out(io, &line);
         0
@@ -567,7 +622,102 @@ impl Shell<'_> {
         Some(self.run_external("kill", &mapped, io, host, false))
     }
 
-    pub(crate) fn builtin_trap(&mut self, args: &[String], io: &mut Io<'_>) -> i32 {
+    /// Adds a command Ctrl-Z stopped to the job table, as Bash reports it.
+    pub(crate) fn note_suspended(
+        &mut self,
+        pid: u32,
+        name: &str,
+        args: &[String],
+        io: &mut Io<'_>,
+    ) -> i32 {
+        let mut text = String::from(name);
+        for arg in args {
+            text.push(' ');
+            text.push_str(arg);
+        }
+        self.next_job += 1;
+        let id = self.next_job;
+        self.jobs.push(Job {
+            id,
+            pid,
+            text: text.clone(),
+            stopped: true,
+        });
+        self.last_background = Some(pid);
+        self.write_err(io, &format!("\n[{id}]+  Stopped  {text}\n"));
+        SUSPENDED_STATUS
+    }
+
+    /// Runs the traps for the signals that have arrived. A signal this shell has no trap
+    /// for never gets here, since it's only asked for the ones it has.
+    pub(crate) fn deliver_signals(&mut self, io: &mut Io<'_>, host: &mut dyn Host) {
+        let pending = host.take_signals();
+        if pending == 0 {
+            return;
+        }
+        for (number, name) in CAUGHT_SIGNALS {
+            if pending & (1 << number) != 0 {
+                self.run_trap(name, io, host);
+            }
+        }
+    }
+
+    /// Whether a trap covers a signal, which the prompt then has to look out for.
+    pub(crate) fn catches_signals(&self) -> bool {
+        CAUGHT_SIGNALS.iter().any(|(_, name)| self.traps.contains_key(*name))
+    }
+
+    /// Tells the host which signals this shell's traps cover.
+    pub(crate) fn sync_signal_mask(&self, host: &mut dyn Host) {
+        let mut mask = 0;
+        for (number, name) in CAUGHT_SIGNALS {
+            if self.traps.contains_key(*name) {
+                mask |= 1 << number;
+            }
+        }
+        host.catch_signals(mask);
+    }
+
+    /// Runs what a terminal going away means: the HUP trap and then the EXIT trap.
+    pub fn hang_up(&mut self, io: &mut Io<'_>, host: &mut dyn Host) {
+        self.note_stack_base();
+        self.run_trap("HUP", io, host);
+        self.flow = Flow::None;
+        self.run_exit_trap(io, host);
+    }
+
+    /// Fires what has arrived while no command runs, between lines at a prompt.
+    pub fn poll_signals(&mut self, io: &mut Io<'_>, host: &mut dyn Host) {
+        self.note_stack_base();
+        self.deliver_signals(io, host);
+        if let Flow::Exit(code) = core::mem::replace(&mut self.flow, Flow::None) {
+            self.exit_requested = Some(code);
+            self.last_status = code;
+            self.run_exit_trap(io, host);
+        }
+    }
+
+    /// When a `time` started: the clock and the CPU used so far.
+    pub(crate) fn start_timing(&self) -> (u64, u64) {
+        (self.system.uptime_ms(), self.system.cpu_ms())
+    }
+
+    /// Prints `time`'s report on standard error. All FEOS time in a command is either
+    /// kernel-thread time or isn't told apart from it, so it's all called user time.
+    pub(crate) fn report_timing(&mut self, start: (u64, u64), posix: bool, io: &mut Io<'_>) {
+        let real = self.system.uptime_ms().saturating_sub(start.0);
+        let user = self.system.cpu_ms().saturating_sub(start.1);
+        let text = if posix {
+            let short = |ms: u64| format!("{}.{:02}", ms / 1000, ms % 1000 / 10);
+            format!("real {}\nuser {}\nsys {}\n", short(real), short(user), short(0))
+        } else {
+            let long = |ms: u64| format!("{}m{}.{:03}s", ms / 60_000, ms / 1000 % 60, ms % 1000);
+            format!("\nreal\t{}\nuser\t{}\nsys\t{}\n", long(real), long(user), long(0))
+        };
+        self.write_err(io, &text);
+    }
+
+    pub(crate) fn builtin_trap(&mut self, args: &[String], io: &mut Io<'_>, host: &mut dyn Host) -> i32 {
         let listing = args.is_empty() || args[0] == "-p";
         if listing {
             let names = if args.len() > 1 { &args[1..] } else { &[] };
@@ -606,6 +756,7 @@ impl Shell<'_> {
                 self.traps.insert(String::from(name), action.to_string());
             }
         }
+        self.sync_signal_mask(host);
         status
     }
 
@@ -650,6 +801,12 @@ impl Shell<'_> {
     }
 
 }
+
+/// What a stopped job's status reads as: 128 plus SIGTSTP.
+pub(crate) const SUSPENDED_STATUS: i32 = 148;
+
+/// The signals a trap can catch, and what the trap table calls them.
+const CAUGHT_SIGNALS: &[(u32, &str)] = &[(1, "HUP"), (2, "INT"), (3, "QUIT"), (15, "TERM")];
 
 /// A trap's name from any of the ways to write it.
 fn signal_name(text: &str) -> Option<&'static str> {
@@ -933,6 +1090,82 @@ mod tests {
         };
         let status = shell.execute_line("set -o pipefail; (:; :) | true", &mut io, &mut host);
         assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn a_signal_fires_its_trap_before_the_next_command() {
+        let mut shell = Shell::new(None, &NoSystem);
+        let mut host = SignalHost { pending: 0, mask: 0 };
+        let mut out = BytesOutput::new();
+        let mut err = BytesOutput::new();
+        let mut input = NullInput;
+        let mut io = Io { stdin: &mut input, stdout: &mut out, stderr: &mut err };
+        shell.execute_line("trap 'echo got-term' TERM; trap 'echo got-hup' HUP; trap 'echo got-quit' 3", &mut io, &mut host);
+        assert_eq!(host.mask, 1 << 15 | 1 << 1 | 1 << 3);
+        host.pending = 1 << 15 | 1 << 3;
+        shell.execute_line("echo next", &mut io, &mut host);
+        assert_eq!(host.pending, 0);
+        shell.execute_line("trap - TERM HUP QUIT", &mut io, &mut host);
+        assert_eq!(host.mask, 0);
+        assert_eq!(String::from_utf8_lossy(out.bytes()), "got-quit\ngot-term\nnext\n");
+    }
+
+    #[test]
+    fn a_hang_up_runs_the_hup_and_exit_traps() {
+        let mut shell = Shell::new(None, &NoSystem);
+        let mut host = SignalHost { pending: 0, mask: 0 };
+        let mut out = BytesOutput::new();
+        let mut err = BytesOutput::new();
+        let mut input = NullInput;
+        let mut io = Io { stdin: &mut input, stdout: &mut out, stderr: &mut err };
+        shell.execute_line("trap 'echo hup' HUP; trap 'echo bye' EXIT", &mut io, &mut host);
+        shell.hang_up(&mut io, &mut host);
+        assert_eq!(String::from_utf8_lossy(out.bytes()), "hup\nbye\n");
+    }
+
+    struct SignalHost {
+        pending: u32,
+        mask: u32,
+    }
+
+    impl Host for SignalHost {
+        fn run_external(
+            &mut self,
+            _name: &str,
+            _args: &[String],
+            _stdin: &mut dyn Input,
+            _stdout: &mut dyn Output,
+            _stderr: &mut dyn Output,
+            _background: bool,
+        ) -> Option<i32> {
+            None
+        }
+
+        fn catch_signals(&mut self, mask: u32) {
+            self.mask = mask;
+        }
+
+        fn take_signals(&mut self) -> u32 {
+            core::mem::take(&mut self.pending)
+        }
+    }
+
+    #[test]
+    fn time_reports_on_standard_error_in_either_format() {
+        let mut shell = Shell::new(None, &NoSystem);
+        let mut host = SignalHost { pending: 0, mask: 0 };
+        let mut out = BytesOutput::new();
+        let mut err = BytesOutput::new();
+        let mut input = NullInput;
+        let mut io = Io { stdin: &mut input, stdout: &mut out, stderr: &mut err };
+        assert_eq!(shell.execute_line("time false", &mut io, &mut host), 1);
+        assert_eq!(shell.execute_line("time -p echo hi | cat", &mut io, &mut host), 0);
+        assert_eq!(shell.execute_line("time", &mut io, &mut host), 0);
+        assert_eq!(shell.execute_line("! time true", &mut io, &mut host), 1);
+        assert_eq!(String::from_utf8_lossy(out.bytes()), "hi\n");
+        let report = String::from_utf8_lossy(err.bytes()).into_owned();
+        assert!(report.starts_with("\nreal\t0m0.000s\nuser\t0m0.000s\nsys\t0m0.000s\n"), "{report}");
+        assert!(report.contains("real 0.00\nuser 0.00\nsys 0.00\n"), "{report}");
     }
 
     #[test]

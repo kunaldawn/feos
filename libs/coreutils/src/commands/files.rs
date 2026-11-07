@@ -127,7 +127,8 @@ fn ls_directory(
             kind: entry.kind,
             size: entry.size,
         };
-        print_entry(ctx, &entry.name, meta, options);
+        let full = fs_join(path, &entry.name);
+        print_entry_at(ctx, &full, &entry.name, meta, options);
     }
 
     if options.recursive {
@@ -147,7 +148,40 @@ fn ls_directory(
     Ok(())
 }
 
+/// A name for a listing: escaped for a terminal, and as it is for anything reading it.
+pub(super) fn listed_name<'a>(ctx: &Ctx<'_>, name: &'a str) -> alloc::borrow::Cow<'a, str> {
+    if ctx.stdout.is_terminal() {
+        feos_text::display_name(name)
+    } else {
+        alloc::borrow::Cow::Borrowed(name)
+    }
+}
+
+/// `-rwxr-x---` from a mode.
+fn mode_text(mode: u16) -> String {
+    let kind = match mode & feos_fs::native::S_IFMT {
+        feos_fs::native::S_IFDIR => 'd',
+        feos_fs::native::S_IFLNK => 'l',
+        _ => '-',
+    };
+    let mut text = String::new();
+    text.push(kind);
+    for shift in [6, 3, 0] {
+        let bits = mode >> shift;
+        text.push(if bits & 4 != 0 { 'r' } else { '-' });
+        text.push(if bits & 2 != 0 { 'w' } else { '-' });
+        text.push(if bits & 1 != 0 { 'x' } else { '-' });
+    }
+    text
+}
+
 fn print_entry(ctx: &mut Ctx<'_>, name: &str, meta: Meta, options: &LsOptions) {
+    print_entry_at(ctx, name, name, meta, options);
+}
+
+fn print_entry_at(ctx: &mut Ctx<'_>, path: &str, name: &str, meta: Meta, options: &LsOptions) {
+    let full = if options.long { ctx.fs.stat_full(path) } else { None };
+    let name = listed_name(ctx, name);
     let suffix = if options.classify && meta.kind == Kind::Dir {
         "/"
     } else {
@@ -165,10 +199,21 @@ fn print_entry(ctx: &mut Ctx<'_>, name: &str, meta: Meta, options: &LsOptions) {
         } else {
             format!("{}", meta.size)
         };
-        write_line(
-            ctx.stdout,
-            format_args!("{mode} 1 feos feos {size:>8} Jan  1 00:00 {name}{suffix}"),
-        );
+        match full {
+            // Real owners, where there are such things.
+            Some(stat) if stat.posix => {
+                let mode = mode_text(stat.mode);
+                let (links, uid, gid) = (stat.nlink, stat.uid, stat.gid);
+                write_line(
+                    ctx.stdout,
+                    format_args!("{mode} {links} {uid} {gid} {size:>8} Jan  1 00:00 {name}{suffix}"),
+                );
+            }
+            _ => write_line(
+                ctx.stdout,
+                format_args!("{mode} 1 root root {size:>8} Jan  1 00:00 {name}{suffix}"),
+            ),
+        }
     } else {
         write_line(ctx.stdout, format_args!("{name}{suffix}"));
     }
@@ -743,6 +788,21 @@ pub(super) fn stat(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
             "regular file"
         };
         write_line(ctx.stdout, format_args!("  File: {absolute}"));
+        if let Some(full) = ctx.fs.stat_full(path) {
+            let made_up = if full.posix { "" } else { " (made up: this filesystem has no owners)" };
+            write_line(
+                ctx.stdout,
+                format_args!(
+                    "  Mode: {:04o} {}  Uid: {}  Gid: {}  Links: {}  Inode: {}{made_up}",
+                    full.mode & 0o7777,
+                    mode_text(full.mode),
+                    full.uid,
+                    full.gid,
+                    full.nlink,
+                    full.ino,
+                ),
+            );
+        }
         write_line(
             ctx.stdout,
             format_args!("  Size: {:<10} Type: {kind}", meta.size),
@@ -766,10 +826,7 @@ pub(super) fn stat(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
                 Err(_) => {}
             }
         }
-        write_line(
-            ctx.stdout,
-            format_args!("  Mode: 0755       Uid: 1000       Gid: 1000"),
-        );
+
     }
     status
 }
@@ -846,7 +903,8 @@ fn tree_walk(
         let branch = if last { "`-- " } else { "|-- " };
         if entry.kind == Kind::Dir {
             *dirs += 1;
-            write_line(ctx.stdout, format_args!("{prefix}{branch}{}/", entry.name));
+            let shown = listed_name(ctx, &entry.name);
+            write_line(ctx.stdout, format_args!("{prefix}{branch}{shown}/"));
             let next = if last {
                 format!("{prefix}    ")
             } else {
@@ -856,7 +914,8 @@ fn tree_walk(
             tree_walk(ctx, &child, &next, depth + 1, max_depth, all, dirs, files)?;
         } else {
             *files += 1;
-            write_line(ctx.stdout, format_args!("{prefix}{branch}{}", entry.name));
+            let shown = listed_name(ctx, &entry.name);
+            write_line(ctx.stdout, format_args!("{prefix}{branch}{shown}"));
         }
     }
     Ok(())
@@ -962,7 +1021,7 @@ pub(super) fn mount(_args: &[String], ctx: &mut Ctx<'_>) -> i32 {
     0
 }
 
-/// `ln -s TARGET LINK`. Links must be symbolic: FAT has no hard links.
+/// `ln [-s] TARGET LINK`. A hard link takes a filesystem with inodes: FAT has none.
 pub(super) fn ln(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
     let mut symbolic = false;
     let mut opts = Opts::new(args, "s");
@@ -974,17 +1033,155 @@ pub(super) fn ln(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
     }
     let operands = core::mem::take(&mut opts.operands);
     let [target, link] = operands.as_slice() else {
-        return usage(ctx.stderr, "ln", "ln -s TARGET LINK");
+        return usage(ctx.stderr, "ln", "ln [-s] TARGET LINK");
     };
-    if !symbolic {
-        error(ctx.stderr, "ln", "hard links are not supported; use -s");
-        return 1;
-    }
-    match ctx.fs.symlink(target, link) {
+    let result = if symbolic {
+        ctx.fs.symlink(target, link)
+    } else {
+        ctx.fs.hard_link(target, link)
+    };
+    match result {
         Ok(()) => 0,
         Err(err) => {
             path_error(ctx.stderr, "ln", link, err);
             1
+        }
+    }
+}
+
+/// A mode from `chmod`'s argument: octal, or `[ugoa]*[+-=][rwx]*`, in terms of the old one.
+fn parse_mode(text: &str, old: u16) -> Option<u16> {
+    if text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return u16::from_str_radix(text, 8).ok().filter(|mode| *mode <= 0o7777);
+    }
+    let mut mode = old & 0o7777;
+    for clause in text.split(',') {
+        let at = clause.find(['+', '-', '='])?;
+        let (who, rest) = clause.split_at(at);
+        let mut mask = 0u16;
+        for ch in who.chars() {
+            mask |= match ch {
+                'u' => 0o700,
+                'g' => 0o070,
+                'o' => 0o007,
+                'a' => 0o777,
+                _ => return None,
+            };
+        }
+        if who.is_empty() {
+            mask = 0o777;
+        }
+        let mut chars = rest.chars();
+        let op = chars.next()?;
+        let mut bits = 0u16;
+        for ch in chars {
+            bits |= match ch {
+                'r' => 0o444,
+                'w' => 0o222,
+                'x' => 0o111,
+                _ => return None,
+            };
+        }
+        match op {
+            '+' => mode |= bits & mask,
+            '-' => mode &= !(bits & mask),
+            _ => mode = (mode & !mask) | (bits & mask),
+        }
+    }
+    Some(mode)
+}
+
+/// `chmod MODE FILE...`.
+pub(super) fn chmod(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
+    let [mode, files @ ..] = args else {
+        return usage(ctx.stderr, "chmod", "chmod MODE FILE...");
+    };
+    if files.is_empty() {
+        return usage(ctx.stderr, "chmod", "chmod MODE FILE...");
+    }
+    let mut status = 0;
+    for file in files {
+        let old = ctx.fs.stat_full(file).map_or(0, |stat| stat.mode);
+        let Some(new) = parse_mode(mode, old) else {
+            error(ctx.stderr, "chmod", &format!("invalid mode: {mode}"));
+            return 1;
+        };
+        if let Err(err) = ctx.fs.chmod(file, new) {
+            path_error(ctx.stderr, "chmod", file, err);
+            status = 1;
+        }
+    }
+    status
+}
+
+/// `chown OWNER[:GROUP] FILE...`, by number: there's no user database.
+pub(super) fn chown(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
+    let [owner, files @ ..] = args else {
+        return usage(ctx.stderr, "chown", "chown UID[:GID] FILE...");
+    };
+    if files.is_empty() {
+        return usage(ctx.stderr, "chown", "chown UID[:GID] FILE...");
+    }
+    let (uid, gid) = owner.split_once(':').unwrap_or((owner, ""));
+    let number = |text: &str| -> Result<Option<u32>, ()> {
+        if text.is_empty() {
+            Ok(None)
+        } else {
+            text.parse().map(Some).map_err(|_| ())
+        }
+    };
+    let (Ok(uid), Ok(gid)) = (number(uid), number(gid)) else {
+        error(ctx.stderr, "chown", &format!("not numbers: {owner}"));
+        return 1;
+    };
+    let mut status = 0;
+    for file in files {
+        if let Err(err) = ctx.fs.chown(file, uid, gid) {
+            path_error(ctx.stderr, "chown", file, err);
+            status = 1;
+        }
+    }
+    status
+}
+
+/// `fsck [-r] PATH`: checks the filesystem holding a path, on one that has a checker.
+pub(super) fn fsck(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
+    let mut repair = false;
+    let mut opts = Opts::new(args, "r");
+    while let Some(opt) = opts.next() {
+        match opt {
+            Opt::Flag('r') => repair = true,
+            other => return bad_option(ctx, "fsck", other),
+        }
+    }
+    let operands = core::mem::take(&mut opts.operands);
+    let [path] = operands.as_slice() else {
+        return usage(ctx.stderr, "fsck", "fsck [-r] PATH");
+    };
+    match ctx.fs.fsck(path, repair) {
+        Ok(report) => {
+            for problem in &report.errors {
+                write_line(ctx.stdout, format_args!("fsck: {problem}"));
+            }
+            let verdict = if report.errors.is_empty() {
+                "clean"
+            } else if report.clean() {
+                "repaired"
+            } else {
+                "errors"
+            };
+            write_line(
+                ctx.stdout,
+                format_args!(
+                    "fsck: {path}: {verdict}: {} files, {} directories, {} of {} blocks used, {} repaired",
+                    report.files, report.directories, report.used_blocks, report.total_blocks, report.repaired
+                ),
+            );
+            i32::from(!report.clean())
+        }
+        Err(err) => {
+            path_error(ctx.stderr, "fsck", path, err);
+            8
         }
     }
 }
@@ -1072,4 +1269,25 @@ pub(super) fn df(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
         format_args!("feos         {total:>8}  {used:>8}  {free:>8}  {percent:>3}% /"),
     );
     0
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::*;
+
+    #[test]
+    fn modes_parse_both_ways() {
+        assert_eq!(parse_mode("640", 0), Some(0o640));
+        assert_eq!(parse_mode("0755", 0), Some(0o755));
+        assert_eq!(parse_mode("9", 0), None);
+        assert_eq!(parse_mode("u+x", 0o644), Some(0o744));
+        assert_eq!(parse_mode("go-r", 0o644), Some(0o600));
+        assert_eq!(parse_mode("a=r", 0o777), Some(0o444));
+        assert_eq!(parse_mode("+x", 0o644), Some(0o755));
+        assert_eq!(parse_mode("u+r,g-r", 0o040), Some(0o400));
+        assert_eq!(parse_mode("q+x", 0), None);
+        assert_eq!(mode_text(0o100644), "-rw-r--r--");
+        assert_eq!(mode_text(0o040750), "drwxr-x---");
+        assert_eq!(mode_text(0o120777), "lrwxrwxrwx");
+    }
 }

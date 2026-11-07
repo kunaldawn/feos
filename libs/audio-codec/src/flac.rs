@@ -16,6 +16,8 @@
 
 use alloc::vec::Vec;
 
+use feos_source::{Cache, Source};
+
 use crate::bits::{try_vec, MsbReader};
 use crate::error::{AudioError, Result};
 use crate::ogg::{self, PacketReader, Page};
@@ -167,6 +169,10 @@ struct FrameHeader {
     bits: u32,
     /// Bytes up to and including the header's CRC-8.
     len: usize,
+    /// The frame's number, or for a stream with blocks of varying sizes, its first
+    /// sample's.
+    number: u64,
+    variable: bool,
 }
 
 /// Parses the frame header at the start of `data`. `Ok(None)` means the bytes
@@ -197,11 +203,17 @@ fn parse_frame_header(data: &[u8], stream: &StreamInfo) -> Result<Option<FrameHe
         _ => return Ok(None),
     };
     let mut pos = 5;
+    let mut number = match lead {
+        0x00..=0x7f => lead as u64,
+        0xfe => 0,
+        _ => (lead & (0x3f >> extra)) as u64,
+    };
     for _ in 0..extra {
         let byte = *data.get(pos).ok_or(AudioError::UnexpectedEnd)?;
         if byte & 0xc0 != 0x80 {
             return Ok(None);
         }
+        number = (number << 6) | (byte & 0x3f) as u64;
         pos += 1;
     }
 
@@ -262,6 +274,8 @@ fn parse_frame_header(data: &[u8], stream: &StreamInfo) -> Result<Option<FrameHe
         ));
     }
     Ok(Some(FrameHeader {
+        number,
+        variable: head[1] & 1 != 0,
         block,
         channel_code,
         bits,
@@ -868,6 +882,101 @@ pub(crate) fn ogg_decode(input: &[u8], page: &Page<'_>, out: &mut [i16]) -> Resu
         info: audio_info(&stream, count as u64, AudioFormat::OggFlac),
         frames: count,
     })
+}
+
+/// One frame's worth of a native stream on disk: see [`crate::source`].
+pub(crate) struct FileFrames {
+    frames: FrameDecoder,
+    /// Where the first frame is.
+    pub audio_start: u64,
+}
+
+impl FileFrames {
+    /// Walks the metadata blocks, which can be far too large to hold, such as pictures.
+    pub(crate) fn open(file: &dyn Source, cache: &mut Cache, start: u64) -> Result<Self> {
+        let mut pos = start + 4;
+        let mut stream = None;
+        loop {
+            let header = cache.bytes(file, pos, 4 + 34);
+            if header.len() < 4 {
+                return Err(AudioError::UnexpectedEnd);
+            }
+            let last = header[0] & 0x80 != 0;
+            let kind = header[0] & 0x7f;
+            let len = u32::from_be_bytes([0, header[1], header[2], header[3]]) as u64;
+            if stream.is_none() {
+                if kind != 0 {
+                    return Err(AudioError::InvalidData("FLAC stream has no STREAMINFO"));
+                }
+                stream = Some(parse_stream_info(&header[4..])?);
+            }
+            pos += 4 + len;
+            if last {
+                break;
+            }
+        }
+        match stream {
+            Some(stream) => Ok(Self {
+                frames: FrameDecoder::new(stream),
+                audio_start: pos,
+            }),
+            None => Err(AudioError::InvalidData("FLAC stream has no STREAMINFO")),
+        }
+    }
+
+    pub(crate) fn stream_info(&self) -> StreamInfo {
+        self.frames.stream
+    }
+
+    /// Decodes the frame at the start of `data` if there is one, or skips to the next
+    /// byte that could be. Returns `(bytes consumed, sample frames)`.
+    pub(crate) fn decode(&mut self, data: &[u8], at_end: bool, out: &mut [i16]) -> Result<(usize, usize)> {
+        let stream = self.frames.stream;
+        let mut skipped = 0;
+        loop {
+            let rest = &data[skipped..];
+            if rest.len() < 2 {
+                return Ok((data.len(), 0));
+            }
+            match parse_frame_header(rest, &stream) {
+                Ok(Some(header)) => {
+                    let required = header.block * stream.channels as usize;
+                    if out.len() < required {
+                        return Err(AudioError::BufferTooSmall {
+                            required,
+                            available: out.len(),
+                        });
+                    }
+                    return match self.frames.decode(rest, &header, Some(&mut out[..required])) {
+                        Ok(len) => Ok((skipped + len, header.block)),
+                        Err(AudioError::UnexpectedEnd) if !at_end && skipped > 0 => Ok((skipped, 0)),
+                        Err(AudioError::UnexpectedEnd) if at_end => Ok((data.len(), 0)),
+                        Err(_) => Ok((skipped + header.len, 0)),
+                    };
+                }
+                Ok(None) => skipped += 1,
+                Err(AudioError::UnexpectedEnd) => return Ok((data.len().max(1), 0)),
+                Err(_) => skipped += 1,
+            }
+        }
+    }
+
+    /// The first frame header at or after the start of `data`, as `(offset, first
+    /// sample of the frame)`.
+    pub(crate) fn find_frame(&self, data: &[u8]) -> Option<(usize, u64)> {
+        let stream = &self.frames.stream;
+        for at in 0..data.len().saturating_sub(1) {
+            if let Ok(Some(header)) = parse_frame_header(&data[at..], stream) {
+                let sample = if header.variable {
+                    header.number
+                } else {
+                    header.number * stream.min_block_size.max(1) as u64
+                };
+                return Some((at, sample));
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]

@@ -31,6 +31,27 @@ fn le_u32(input: &[u8], offset: usize) -> Result<u32> {
 }
 
 fn parse(input: &[u8]) -> Result<Format> {
+    parse_sized(input, input.len())
+}
+
+/// Where the sound in a file of `file_len` bytes is, given its first bytes, and what it
+/// comes to: `(info, data offset, data bytes, bytes in a frame)`.
+pub(crate) fn layout(head: &[u8], file_len: usize) -> Result<(AudioInfo, usize, usize, usize)> {
+    let format = parse_sized(head, file_len)?;
+    Ok((
+        AudioInfo {
+            sample_rate: format.sample_rate,
+            channels: format.channels,
+            frames: frames(&format) as u64,
+            format: AudioFormat::Wav,
+        },
+        format.data_offset,
+        format.data_len,
+        format.block_align,
+    ))
+}
+
+fn parse_sized(input: &[u8], file_len: usize) -> Result<Format> {
     if input.len() < 12 || &input[..4] != b"RIFF" || &input[8..12] != b"WAVE" {
         return Err(AudioError::UnknownFormat);
     }
@@ -58,7 +79,7 @@ fn parse(input: &[u8]) -> Result<Format> {
             }
             format = Some((tag, channels, sample_rate, block_align, bits));
         } else if id == b"data" {
-            data = Some((start, size.min(input.len().saturating_sub(start))));
+            data = Some((start, size.min(file_len.saturating_sub(start))));
         }
         pos = end + (size & 1);
     }

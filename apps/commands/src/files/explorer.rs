@@ -9,8 +9,10 @@
 
 use core::cmp::Ordering;
 use core::fmt::Write;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -33,6 +35,10 @@ use super::{format_size, PATH_MAX};
 
 const MAX_ENTRIES: usize = 256;
 const MAX_SEARCH: usize = 128;
+/// A search reads files this much at a time.
+const SEARCH_CHUNK: usize = 64 * 1024;
+/// Lower than the desktop's, but it still gets its turn.
+const SEARCH_PRIORITY: u8 = 4;
 const MAX_TREE: usize = 256;
 const MAX_HISTORY: usize = 32;
 /// Words of the selection bitset, one bit per listing row.
@@ -517,6 +523,10 @@ struct ExplorerState {
     search: TextBuffer<64>,
     search_dirty: bool,
     include_subfolders: bool,
+    /// Look inside files too, not only at names.
+    search_contents: bool,
+    /// The search running on a task of its own, while there is one.
+    search_job: Option<Arc<SearchJob>>,
     search_results: [NodeId; MAX_SEARCH],
     search_count: usize,
     /// The search stopped at `MAX_SEARCH` with matches still to find.
@@ -618,6 +628,8 @@ impl ExplorerState {
             search: TextBuffer::new(),
             search_dirty: false,
             include_subfolders: true,
+            search_contents: false,
+            search_job: None,
             search_results: [NodeId::ROOT; MAX_SEARCH],
             search_count: 0,
             search_truncated: false,
@@ -840,7 +852,14 @@ impl ExplorerState {
     fn listing_summary(&self) -> Text<160> {
         let mut text = Text::new();
         if self.searching() {
-            if self.search_truncated {
+            if let Some(job) = self.search_job.as_ref() {
+                let _ = write!(
+                    text,
+                    "Searching... {} item(s) found, {} MiB read",
+                    self.entry_count,
+                    job.scanned.load(AtomicOrdering::Relaxed) >> 20
+                );
+            } else if self.search_truncated {
                 let _ = write!(text, "First {} matches shown; refine the search", self.entry_count);
             } else {
                 let _ = write!(text, "{} item(s) found", self.entry_count);
@@ -865,6 +884,7 @@ impl ExplorerState {
                 self.focus = Focus::List;
             }
         }
+        self.cancel_search();
         self.search.clear();
         self.search_count = 0;
         self.search_truncated = false;
@@ -1000,10 +1020,14 @@ impl ExplorerState {
     fn log_listing(&self, fs: &dyn FileSystem) {
         let mut path = [0u8; PATH_MAX];
         let mut line = Text::<512>::new();
-        let _ = write!(line, "[explorer] {}:", fs.path(self.current, &mut path).unwrap_or("?"));
+        let _ = write!(
+            line,
+            "[explorer] {}:",
+            feos_text::Escaped(fs.path(self.current, &mut path).unwrap_or("?"))
+        );
         for node in &self.entries[..self.entry_count] {
             if let Some(name) = fs.name(*node) {
-                let _ = write!(line, " {name}");
+                let _ = write!(line, " {}", feos_text::Escaped(name));
             }
         }
         #[cfg(not(test))]
@@ -1181,14 +1205,34 @@ impl ExplorerState {
         }
     }
 
+    /// Starts a search of the current folder. On a task of its own if there can be one:
+    /// a walk can take as long as the disk does, and this is the desktop's thread. Without
+    /// one (host tests), it runs here.
     fn run_search(&mut self, fs: &dyn FileSystem) {
+        self.cancel_search();
         self.search_count = 0;
         self.search_truncated = false;
         let mut query = Text::<64>::new();
         query.set(self.search.as_str());
+        let job = Arc::new(SearchJob::new());
+        let mut started = false;
         if !query.is_empty() {
-            self.search_dir(fs, self.current, query.as_str(), self.include_subfolders, 0);
+            let spec = SearchSpec {
+                root: self.current,
+                query,
+                recurse: self.include_subfolders,
+                contents: self.search_contents,
+            };
+            started = spawn_search(&job, spec);
+            if !started {
+                search_walk(fs, &spec, &job);
+                job.done.store(true, AtomicOrdering::Release);
+            }
         }
+        if started {
+            self.search_job = Some(job.clone());
+        }
+        self.take_search_results(&job);
         self.clear_selection();
         self.cursor = 0;
         self.anchor = 0;
@@ -1198,36 +1242,36 @@ impl ExplorerState {
         self.sync_preview(fs);
     }
 
-    fn search_dir(
-        &mut self,
-        fs: &dyn FileSystem,
-        directory: NodeId,
-        query: &str,
-        recurse: bool,
-        depth: usize,
-    ) {
-        if depth > 12 || self.search_truncated {
-            return;
+    fn cancel_search(&mut self) {
+        if let Some(job) = self.search_job.take() {
+            job.cancel.store(true, AtomicOrdering::Release);
         }
-        for index in 0..fs.child_count(directory) {
-            if self.search_truncated {
-                return;
-            }
-            let Some(child) = fs.child_at(directory, index) else {
-                continue;
-            };
-            let name = fs.name(child).unwrap_or("");
-            if contains_ignore_ascii_case(name, query) {
-                if self.search_count == MAX_SEARCH {
-                    self.search_truncated = true;
-                    return;
-                }
-                self.search_results[self.search_count] = child;
-                self.search_count += 1;
-            }
-            if recurse && fs.is_dir(child) {
-                self.search_dir(fs, child, query, recurse, depth + 1);
-            }
+    }
+
+    /// Copies what a job has found so far. Returns `true` if there's more than there was.
+    fn take_search_results(&mut self, job: &SearchJob) -> bool {
+        let results = job.results.lock();
+        let count = results.len().min(MAX_SEARCH);
+        let more = count != self.search_count;
+        self.search_results[..count].copy_from_slice(&results[..count]);
+        self.search_count = count;
+        self.search_truncated = job.truncated.load(AtomicOrdering::Acquire);
+        more
+    }
+
+    /// Takes in what the running search has found since the last frame.
+    fn poll_search(&mut self, fs: &dyn FileSystem) {
+        let Some(job) = self.search_job.clone() else {
+            return;
+        };
+        let done = job.done.load(AtomicOrdering::Acquire);
+        if self.take_search_results(&job) {
+            self.rebuild(fs);
+            self.sync_preview(fs);
+        }
+        if done {
+            self.search_job = None;
+            log_search(fs, &job, self);
         }
     }
 
@@ -1308,6 +1352,11 @@ impl ExplorerState {
             return;
         }
         if args == "--search" {
+            self.perform(fs, Action::Search, None, now);
+            return;
+        }
+        if args == "--search-contents" {
+            self.search_contents = true;
             self.perform(fs, Action::Search, None, now);
             return;
         }
@@ -2500,6 +2549,11 @@ impl ExplorerState {
                     self.search_dirty = true;
                     return false;
                 }
+                if search_contents_rect(sidebar).contains(point) {
+                    self.search_contents = !self.search_contents;
+                    self.search_dirty = true;
+                    return false;
+                }
                 if search_button_rect(sidebar).contains(point) {
                     self.run_search(fs);
                     return false;
@@ -3207,6 +3261,15 @@ impl ExplorerState {
 }
 
 /// `parent/name`, however deep `parent` is.
+/// A node's name to show: names are kept raw, and escaped here for the window.
+fn shown_name<'a>(
+    fs: &'a dyn FileSystem,
+    node: NodeId,
+    fallback: &'a str,
+) -> alloc::borrow::Cow<'a, str> {
+    feos_text::display_name(fs.name(node).unwrap_or(fallback))
+}
+
 fn child_path(parent: &str, name: &str) -> String {
     let mut path = String::from(parent);
     if !path.ends_with('/') {
@@ -4024,12 +4087,16 @@ fn search_check_rect(sidebar: Rect) -> Rect {
     Rect::new(sidebar.x + 9, sidebar.y + 84, 13, 13)
 }
 
+fn search_contents_rect(sidebar: Rect) -> Rect {
+    Rect::new(sidebar.x + 9, sidebar.y + 102, 13, 13)
+}
+
 fn search_button_rect(sidebar: Rect) -> Rect {
-    Rect::new(sidebar.x + 8, sidebar.y + 106, 82, 23)
+    Rect::new(sidebar.x + 8, sidebar.y + 124, 82, 23)
 }
 
 fn search_clear_rect(sidebar: Rect) -> Rect {
-    Rect::new(sidebar.x + 96, sidebar.y + 106, 66, 23)
+    Rect::new(sidebar.x + 96, sidebar.y + 124, 66, 23)
 }
 
 fn option_check_rect(layout: DialogLayout, index: usize) -> Rect {
@@ -4148,6 +4215,7 @@ pub(super) fn frame_window(
     };
     let now = context.now_ms;
     state.follow_tree(fs);
+    state.poll_search(fs);
 
     context.dispatch_pointer(|report| {
         if state.handle_pointer(fs, report, now) {
@@ -4178,7 +4246,201 @@ pub(super) fn frame_window(
 }
 
 pub(super) fn close_window() {
-    *WINDOW.lock() = None;
+    let mut guard = WINDOW.lock();
+    if let Some(state) = guard.as_mut() {
+        state.cancel_search();
+    }
+    *guard = None;
+}
+
+/// What one search looks for, and where.
+#[derive(Clone, Copy)]
+struct SearchSpec {
+    root: NodeId,
+    query: Text<64>,
+    recurse: bool,
+    contents: bool,
+}
+
+/// Between a search's task and the window. The results only ever grow, and the window
+/// takes what's new each frame.
+struct SearchJob {
+    results: SpinLock<Vec<NodeId>>,
+    truncated: AtomicBool,
+    cancel: AtomicBool,
+    done: AtomicBool,
+    /// Bytes read from files so far.
+    scanned: AtomicU64,
+    /// Files looked at so far.
+    files: AtomicU64,
+    started_ms: AtomicU64,
+    finished_ms: AtomicU64,
+}
+
+impl SearchJob {
+    fn new() -> Self {
+        Self {
+            results: SpinLock::new(Vec::new()),
+            truncated: AtomicBool::new(false),
+            cancel: AtomicBool::new(false),
+            done: AtomicBool::new(false),
+            scanned: AtomicU64::new(0),
+            files: AtomicU64::new(0),
+            started_ms: AtomicU64::new(0),
+            finished_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.load(AtomicOrdering::Acquire)
+    }
+
+    /// Records a match. `false` once there's no room for more.
+    fn found(&self, node: NodeId) -> bool {
+        let mut results = self.results.lock();
+        if results.len() >= MAX_SEARCH {
+            self.truncated.store(true, AtomicOrdering::Release);
+            return false;
+        }
+        results.push(node);
+        true
+    }
+}
+
+/// Runs a search on a task of its own. `false` when that can't be done.
+fn spawn_search(job: &Arc<SearchJob>, spec: SearchSpec) -> bool {
+    let Some(platform) = feos_app::platform() else {
+        return false;
+    };
+    let Some(fs) = platform.filesystem else {
+        return false;
+    };
+    let job = job.clone();
+    let io = feos_app::SpawnIo {
+        background: true,
+        ..feos_app::SpawnIo::default()
+    };
+    platform
+        .processes
+        .spawn_task(
+            "search",
+            io,
+            alloc::boxed::Box::new(move || {
+                // Behind whatever anyone's actually looking at.
+                let processes = platform.processes;
+                processes.set_priority(processes.current(), SEARCH_PRIORITY);
+                let clock = platform.clock;
+                job.started_ms.store(clock.uptime_ms(), AtomicOrdering::Relaxed);
+                search_walk(fs, &spec, &job);
+                job.finished_ms.store(clock.uptime_ms(), AtomicOrdering::Relaxed);
+                job.done.store(true, AtomicOrdering::Release);
+                0
+            }),
+        )
+        .is_ok()
+}
+
+/// The walk itself, on whichever thread has been given it.
+fn search_walk(fs: &dyn FileSystem, spec: &SearchSpec, job: &SearchJob) {
+    let mut chunk = Vec::new();
+    if spec.contents && chunk.try_reserve_exact(SEARCH_CHUNK).is_ok() {
+        chunk.resize(SEARCH_CHUNK, 0);
+    }
+    search_directory(fs, spec.root, spec, job, &mut chunk, 0);
+}
+
+fn search_directory(
+    fs: &dyn FileSystem,
+    directory: NodeId,
+    spec: &SearchSpec,
+    job: &SearchJob,
+    chunk: &mut [u8],
+    depth: usize,
+) -> bool {
+    if depth > 12 {
+        return true;
+    }
+    let query = spec.query.as_str();
+    for index in 0..fs.child_count(directory) {
+        if job.cancelled() {
+            return false;
+        }
+        let Some(child) = fs.child_at(directory, index) else {
+            continue;
+        };
+        let name_matches = contains_ignore_ascii_case(fs.name(child).unwrap_or(""), query);
+        let is_dir = fs.is_dir(child);
+        let matched = name_matches || (!is_dir && !chunk.is_empty() && file_contains(fs, child, query, job, chunk));
+        if matched && !job.found(child) {
+            return false;
+        }
+        if spec.recurse && is_dir && !search_directory(fs, child, spec, job, chunk, depth + 1) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether a file holds `query`, in any case of ASCII. It goes through a chunk at a time,
+/// keeping what a match across two chunks would need.
+fn file_contains(fs: &dyn FileSystem, node: NodeId, query: &str, job: &SearchJob, chunk: &mut [u8]) -> bool {
+    let needle = query.as_bytes();
+    if needle.is_empty() || needle.len() > chunk.len() / 2 {
+        return false;
+    }
+    job.files.fetch_add(1, AtomicOrdering::Relaxed);
+    let size = fs.size(node);
+    let keep = needle.len() - 1;
+    let mut offset = 0usize;
+    let mut held = 0usize;
+    while offset < size {
+        if job.cancelled() {
+            return false;
+        }
+        let want = (size - offset).min(chunk.len() - held);
+        let got = fs.read(node, offset, &mut chunk[held..held + want]);
+        if got == 0 {
+            return false;
+        }
+        job.scanned.fetch_add(got as u64, AtomicOrdering::Relaxed);
+        offset += got;
+        let filled = held + got;
+        if contains_bytes_ignore_case(&chunk[..filled], needle) {
+            return true;
+        }
+        held = keep.min(filled);
+        chunk.copy_within(filled - held..filled, 0);
+    }
+    false
+}
+
+fn contains_bytes_ignore_case(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+/// What a finished search found, on the serial console: a window can't be read from out
+/// here, and how long it took is what the desktop's responsiveness is measured against.
+fn log_search(fs: &dyn FileSystem, job: &SearchJob, state: &ExplorerState) {
+    let mut line = Text::<256>::new();
+    let taken = job.finished_ms.load(AtomicOrdering::Relaxed).saturating_sub(job.started_ms.load(AtomicOrdering::Relaxed));
+    let _ = write!(
+        line,
+        "[explorer] search done in {taken} ms: {} files, {} MiB read, {} found:",
+        job.files.load(AtomicOrdering::Relaxed),
+        job.scanned.load(AtomicOrdering::Relaxed) >> 20,
+        state.search_count,
+    );
+    for node in &state.search_results[..state.search_count.min(8)] {
+        if let Some(name) = fs.name(*node) {
+            let _ = write!(line, " {}", feos_text::Escaped(name));
+        }
+    }
+    #[cfg(not(test))]
+    feos_console::println!("{}", line.as_str());
+    #[cfg(test)]
+    let _ = line;
 }
 
 /// Hands a dropped path to the open window, if there is one.
@@ -4196,7 +4458,9 @@ pub(super) fn needs_frames() -> bool {
     let changed = WATCHED_TREE.lock().map(|tree| tree.generation());
     WINDOW.try_lock().is_some_and(|guard| {
         guard.as_ref().is_some_and(|state| {
-            state.thumbs_pending || changed.is_some_and(|now| now != state.seen_generation)
+            state.thumbs_pending
+                || state.search_job.is_some()
+                || changed.is_some_and(|now| now != state.seen_generation)
         })
     })
 }
@@ -4499,7 +4763,7 @@ fn draw_window(
             let _ = write!(
                 title,
                 "{} - File Explorer",
-                fs.name(state.current).unwrap_or("/")
+                &shown_name(fs, state.current, "/")
             );
         }
         let buttons_left = title_button_rect(layout, 0).x - 6;
@@ -4935,7 +5199,7 @@ fn draw_tree(
         let label = if node == fs.root() {
             "My Computer"
         } else {
-            fs.name(node).unwrap_or("?")
+            &shown_name(fs, node, "?")
         };
         painter.draw_text_ellipsis(
             Rect::new(
@@ -5056,6 +5320,21 @@ fn draw_search_pane(
         Align::Start,
         VerticalAlign::Middle,
     );
+    let contents = search_contents_rect(sidebar);
+    draw_checkbox(painter, contents, state.search_contents, false);
+    painter.draw_text_ellipsis(
+        Rect::new(
+            contents.right_i32() + 5,
+            contents.y - 2,
+            sidebar.width.saturating_sub(50),
+            18,
+        ),
+        "Look inside files",
+        TEXT,
+        1,
+        Align::Start,
+        VerticalAlign::Middle,
+    );
     let search = search_button_rect(sidebar);
     let clear = search_clear_rect(sidebar);
     draw_push_button(
@@ -5075,7 +5354,7 @@ fn draw_search_pane(
     painter.fill_rect(
         Rect::new(
             sidebar.x + 8,
-            sidebar.y + 138,
+            sidebar.y + 156,
             sidebar.width.saturating_sub(16),
             1,
         ),
@@ -5085,6 +5364,9 @@ fn draw_search_pane(
     match state.search_count {
         0 if state.search.is_empty() => {
             let _ = write!(summary, "Type a name to search this folder.");
+        }
+        _ if state.search_job.is_some() => {
+            let _ = write!(summary, "Searching... {} so far.", state.search_count);
         }
         0 => {
             let _ = write!(summary, "No items matched.");
@@ -5099,7 +5381,7 @@ fn draw_search_pane(
     painter.draw_text_ellipsis(
         Rect::new(
             sidebar.x + 8,
-            sidebar.y + 146,
+            sidebar.y + 164,
             sidebar.width.saturating_sub(16),
             20,
         ),
@@ -5112,7 +5394,7 @@ fn draw_search_pane(
     painter.draw_text_ellipsis(
         Rect::new(
             sidebar.x + 8,
-            sidebar.y + 168,
+            sidebar.y + 186,
             sidebar.width.saturating_sub(16),
             20,
         ),
@@ -5124,11 +5406,11 @@ fn draw_search_pane(
     );
     let mut path = Text::<PATH_MAX>::new();
     let mut buffer = [0u8; PATH_MAX];
-    path.set(fs.path(state.current, &mut buffer).unwrap_or("/"));
+    path.set(&feos_text::display_name(fs.path(state.current, &mut buffer).unwrap_or("/")));
     painter.draw_text_ellipsis(
         Rect::new(
             sidebar.x + 8,
-            sidebar.y + 184,
+            sidebar.y + 202,
             sidebar.width.saturating_sub(16),
             20,
         ),
@@ -5332,7 +5614,7 @@ fn draw_detail_row(
     draw_entry_icon(painter, info, Rect::new(row.x + 4, row.y + 2, 16, 16));
     painter.draw_text_ellipsis(
         Rect::new(row.x + 25, row.y, (name_w - 28).max(10) as u32, row.height),
-        fs.name(node).unwrap_or("?"),
+        &shown_name(fs, node, "?"),
         fg,
         1,
         Align::Start,
@@ -5427,7 +5709,7 @@ fn draw_icons(
         }
         painter.draw_text_ellipsis(
             label,
-            fs.name(node).unwrap_or("?"),
+            &shown_name(fs, node, "?"),
             if selected { Color::WHITE } else { TEXT },
             1,
             Align::Center,
@@ -5488,7 +5770,7 @@ fn draw_list(
                 cell.width.saturating_sub(27),
                 cell.height,
             ),
-            fs.name(node).unwrap_or("?"),
+            &shown_name(fs, node, "?"),
             if selected { Color::WHITE } else { TEXT },
             1,
             Align::Start,
@@ -5531,7 +5813,7 @@ fn draw_tiles(
         draw_entry_icon(painter, info, Rect::new(cell.x + 5, cell.y + 8, 30, 30));
         painter.draw_text_ellipsis(
             Rect::new(cell.x + 42, cell.y + 6, cell.width.saturating_sub(46), 18),
-            fs.name(node).unwrap_or("?"),
+            &shown_name(fs, node, "?"),
             if selected { Color::WHITE } else { TEXT },
             1,
             Align::Start,
@@ -5610,7 +5892,7 @@ fn draw_thumbnails(
         }
         painter.draw_text_ellipsis(
             label,
-            fs.name(node).unwrap_or("?"),
+            &shown_name(fs, node, "?"),
             if selected { Color::WHITE } else { TEXT },
             1,
             Align::Center,
@@ -5690,7 +5972,7 @@ fn draw_preview(
     draw_node_icon(painter, node, fs, Rect::new(body.x + 8, body.y + 8, 32, 30));
     painter.draw_text_ellipsis(
         Rect::new(body.x + 48, body.y + 7, body.width.saturating_sub(54), 18),
-        fs.name(node).unwrap_or("My Computer"),
+        &shown_name(fs, node, "My Computer"),
         TEXT,
         1,
         Align::Start,
@@ -5765,7 +6047,7 @@ fn draw_preview_content(
             draw_node_icon(painter, child, fs, Rect::new(rect.x, y, 16, 16));
             painter.draw_text_ellipsis(
                 Rect::new(rect.x + 17, y, rect.width.saturating_sub(17), 15),
-                fs.name(child).unwrap_or("?"),
+                &shown_name(fs, child, "?"),
                 TEXT,
                 1,
                 Align::Start,
@@ -6213,10 +6495,10 @@ fn dialog_title(dialog: Dialog, state: &ExplorerState, fs: &dyn FileSystem) -> T
             title.set("Folder Options");
         }
         Dialog::Properties(node) => {
-            let _ = write!(title, "{} Properties", fs.name(node).unwrap_or("Item"));
+            let _ = write!(title, "{} Properties", shown_name(fs, node, "Item"));
         }
         Dialog::Viewer(node) => {
-            let _ = write!(title, "{} - Viewer", fs.name(node).unwrap_or("File"));
+            let _ = write!(title, "{} - Viewer", shown_name(fs, node, "File"));
         }
         Dialog::Notice => {
             title.set(state.notice_title.as_str());
@@ -6246,6 +6528,7 @@ fn draw_confirm_delete(
     let count = state.selected_paths(fs).len();
     if count == 1 {
         let name = state.focused_node().and_then(|node| fs.name(node)).unwrap_or("this item");
+        let name = feos_text::display_name(name);
         let _ = write!(line, "Delete '{name}' and everything in it?");
     } else {
         let _ = write!(line, "Delete these {count} items and everything in them?");
@@ -6359,7 +6642,7 @@ fn draw_properties(
     painter.draw_text(
         body.x + 70,
         body.y + 10,
-        fs.name(node).unwrap_or("/"),
+        &shown_name(fs, node, "/"),
         TEXT,
         2,
     );
@@ -7085,6 +7368,54 @@ mod tests {
         assert!(!state.searching());
         assert_eq!(state.current, fs.root());
         assert_eq!(state.entry_count, fs.child_count(fs.root()));
+    }
+
+    #[test]
+    fn a_content_search_looks_inside_files_across_chunk_boundaries() {
+        let mut fs = FakeFs::empty();
+        let root = NodeId::ROOT.0;
+        // The match straddles two chunks of the reader.
+        let mut across = vec![b'.'; SEARCH_CHUNK - 3];
+        across.extend_from_slice(b"NeEdLe");
+        fs.file(root, "across.bin", &across);
+        fs.file(root, "plain.txt", b"nothing to see");
+        let sub = fs.dir(root, "sub");
+        fs.file(sub, "inner.txt", b"a needle in here");
+        fs.file(root, "needle-named.txt", b"");
+
+        let mut state = ExplorerState::new(&fs, Rect::new(0, 0, 800, 600));
+        state.bar = ExplorerBar::Search;
+        state.search.set("needle");
+
+        state.run_search(&fs);
+        let names = |state: &ExplorerState| -> Vec<String> {
+            state.search_results[..state.search_count]
+                .iter()
+                .map(|node| String::from(fs.name(*node).unwrap()))
+                .collect()
+        };
+        assert_eq!(names(&state), ["needle-named.txt"]);
+
+        state.search_contents = true;
+        state.run_search(&fs);
+        let mut found = names(&state);
+        found.sort();
+        assert_eq!(found, ["across.bin", "inner.txt", "needle-named.txt"]);
+    }
+
+    #[test]
+    fn a_cancelled_search_stops_and_keeps_what_it_found() {
+        let mut fs = FakeFs::empty();
+        let root = NodeId::ROOT.0;
+        fs.file(root, "a-match", b"");
+        fs.file(root, "b-match", b"");
+        let job = SearchJob::new();
+        job.cancel.store(true, AtomicOrdering::Release);
+        let mut query = Text::<64>::new();
+        query.set("match");
+        let spec = SearchSpec { root: NodeId::ROOT, query, recurse: true, contents: false };
+        search_walk(&fs, &spec, &job);
+        assert!(job.results.lock().is_empty());
     }
 
     #[test]

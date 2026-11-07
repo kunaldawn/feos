@@ -285,7 +285,7 @@ impl Lexer {
                 false
             }
             Some("if" | "then" | "elif" | "else" | "while" | "until" | "do" | "{" | "!" | "}"
-                | "fi" | "done" | "esac") => true,
+                | "fi" | "done" | "esac" | "time") => true,
             _ => false,
         };
     }

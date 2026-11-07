@@ -293,6 +293,15 @@ pub fn _eprint(args: fmt::Arguments) {
     sink.flush();
 }
 
+/// Keeps everything else that takes the console's lock off it until the guard goes.
+///
+/// For a report of a failure a task alone pays for, which writes straight to the UART,
+/// so that it and another task's output don't come out in each other's lines. A task
+/// failing with this held stops the machine, and that report doesn't take the lock.
+pub fn hold() -> impl Sized {
+    PRINT_LOCK.lock()
+}
+
 /// Lock-free console output for panic and exception handlers.
 ///
 /// # Safety

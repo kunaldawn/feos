@@ -69,6 +69,14 @@ pub enum Request {
     Activate(u16),
     /// Close this window, as its title bar's button would.
     CloseWindow(u16),
+    /// Change a setting, as `key: value` in the form the session saves them in. It's
+    /// applied and saved, and [`settings`] then shows it.
+    Setting {
+        /// Which setting.
+        key: Text<16>,
+        /// Its new value.
+        value: Text<32>,
+    },
 }
 
 /// Most windows [`publish_windows`] keeps.
@@ -153,6 +161,71 @@ pub fn request_activate(window: u16) -> bool {
 /// Asks the session to close a window.
 pub fn request_close(window: u16) -> bool {
     REQUESTS.lock().push(Request::CloseWindow(window))
+}
+
+/// Most bytes of settings text the session publishes.
+pub const SETTINGS_MAX: usize = 256;
+
+struct SettingsText {
+    settings: [u8; SETTINGS_MAX],
+    settings_len: usize,
+    modes: [u8; SETTINGS_MAX],
+    modes_len: usize,
+}
+
+static SETTINGS: SpinLock<SettingsText> = SpinLock::new(SettingsText {
+    settings: [0; SETTINGS_MAX],
+    settings_len: 0,
+    modes: [0; SETTINGS_MAX],
+    modes_len: 0,
+});
+
+/// Asks the session to change a setting. Returns `false` when it didn't fit, or the
+/// queue was full.
+pub fn request_setting(key: &str, value: &str) -> bool {
+    let mut request_key = Text::new();
+    let mut request_value = Text::new();
+    if !request_key.set(key) || !request_value.set(value) {
+        return false;
+    }
+    REQUESTS.lock().push(Request::Setting {
+        key: request_key,
+        value: request_value,
+    })
+}
+
+/// The session publishes its current settings here, as `key: value` lines.
+pub fn publish_settings(text: &str) {
+    let mut store = SETTINGS.lock();
+    let len = text.len().min(SETTINGS_MAX);
+    store.settings[..len].copy_from_slice(&text.as_bytes()[..len]);
+    store.settings_len = len;
+}
+
+/// The session publishes the screen sizes it can set here, separated by spaces.
+pub fn publish_display_modes(text: &str) {
+    let mut store = SETTINGS.lock();
+    let len = text.len().min(SETTINGS_MAX);
+    store.modes[..len].copy_from_slice(&text.as_bytes()[..len]);
+    store.modes_len = len;
+}
+
+/// The settings as last published.
+pub fn settings(out: &mut [u8; SETTINGS_MAX]) -> &str {
+    let store = SETTINGS.lock();
+    out[..store.settings_len].copy_from_slice(&store.settings[..store.settings_len]);
+    let len = store.settings_len;
+    drop(store);
+    core::str::from_utf8(&out[..len]).unwrap_or("")
+}
+
+/// The screen sizes the session can set, as last published.
+pub fn display_modes(out: &mut [u8; SETTINGS_MAX]) -> &str {
+    let store = SETTINGS.lock();
+    out[..store.modes_len].copy_from_slice(&store.modes[..store.modes_len]);
+    let len = store.modes_len;
+    drop(store);
+    core::str::from_utf8(&out[..len]).unwrap_or("")
 }
 
 struct Queue<T: Copy, const N: usize> {
@@ -366,6 +439,15 @@ pub fn association_for(path: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_round_trip_through_the_store() {
+        publish_settings("theme: dark\n");
+        let mut out = [0u8; SETTINGS_MAX];
+        assert_eq!(settings(&mut out), "theme: dark\n");
+        publish_display_modes("800x600 1024x768");
+        assert_eq!(display_modes(&mut out), "800x600 1024x768");
+    }
 
     #[test]
     fn associations_follow_the_extension_case_insensitively() {

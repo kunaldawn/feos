@@ -18,7 +18,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::cell::Cell;
 
-use feos_app::shell::{Level, Request};
+use feos_app::shell::{self, Level, Request};
 use feos_app::{App, Context, Platform};
 use feos_bundle::install;
 use feos_console::println;
@@ -43,7 +43,7 @@ pub use folder::FOLDER;
 pub use session::{run_session, SessionExit};
 
 /// Maximum windows, applications and services in a desktop session.
-type Session = Desktop<8, 12, 12>;
+type Session = Desktop<8, 16, 12>;
 
 /// The configuration shipped with the QEMU desktop.
 pub const CONFIG_YAML: &str = include_str!("../desktop.yaml");
@@ -175,6 +175,17 @@ fn provide_buffers(desktop: &mut Session, width: usize, height: usize) {
     if !desktop.has_buffers() {
         desktop.set_buffers(allocate_pixels(width, height), allocate_pixels(width, height));
     }
+}
+
+/// Replaces the session's caches with some of a new size, and frees the old ones.
+fn replace_buffers(desktop: &mut Session, width: usize, height: usize) {
+    let (background, scratch) = desktop.take_buffers();
+    for buffer in [background, scratch].into_iter().flatten() {
+        // SAFETY: `allocate_pixels` made these from a `Vec` of exactly this length, and
+        // the session has just given up the only reference.
+        drop(unsafe { alloc::boxed::Box::from_raw(buffer as *mut [u32]) });
+    }
+    desktop.set_buffers(allocate_pixels(width, height), allocate_pixels(width, height));
 }
 
 /// What's in the application folder, so that a change can be noticed cheaply.
@@ -316,9 +327,12 @@ fn restore_settings(config: &mut DesktopConfig, platform: &Platform) {
     if let Ok(text) = core::str::from_utf8(&bytes) {
         config.apply_settings(text);
         println!(
-            "[desktop] settings restored: theme={} keyboard={}",
+            "[desktop] settings restored: theme={} keyboard={} wallpaper={} clock={} resolution={:?}",
             config.theme.name(),
-            config.keyboard_layout.name()
+            config.keyboard_layout.name(),
+            config.wallpaper_preset.name(),
+            if config.taskbar.clock_24h { 24 } else { 12 },
+            config.resolution,
         );
     }
 }
@@ -332,8 +346,19 @@ fn save_settings(config: &DesktopConfig, platform: &Platform) {
     // `/etc` is only there if the image put it there.
     let _ = tree.create_dir("/etc");
     let text = config.settings_text();
-    if let Err(error) = tree.write_file_atomic(SETTINGS_PATH, text.as_str().as_bytes()) {
-        println!("[desktop] couldn't save settings: {error}");
+    shell::publish_settings(text.as_str());
+    match tree.write_file_atomic(SETTINGS_PATH, text.as_str().as_bytes()) {
+        Ok(()) => {
+            // Durable now, not at the flusher's next pass: this is a promise to the user.
+            let _ = tree.sync();
+            println!("[desktop] settings saved: theme={} keyboard={} wallpaper={} clock={}",
+                config.theme.name(),
+                config.keyboard_layout.name(),
+                config.wallpaper_preset.name(),
+                if config.taskbar.clock_24h { 24 } else { 12 },
+            );
+        }
+        Err(error) => println!("[desktop] couldn't save settings: {error}"),
     }
 }
 
@@ -479,6 +504,13 @@ fn apply_request(
         }
         Request::CloseWindow(window) => {
             desktop.close_window(usize::from(window));
+            false
+        }
+        Request::Setting { key, value } => {
+            // The session changes the screen itself, as it has the canvases.
+            if key.as_str() != "resolution" {
+                desktop.apply_setting(key.as_str(), value.as_str());
+            }
             false
         }
     }

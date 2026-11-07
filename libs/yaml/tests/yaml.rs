@@ -437,3 +437,97 @@ fn emitter_output_reparses_with_the_same_shape() {
         .unwrap();
     assert_eq!(doc.as_i64(doc.get(inner, "deep").unwrap()), Some(1));
 }
+
+
+mod multi_line {
+    use feos_yaml::{YamlDocument, YamlError, YamlNode};
+
+    fn value(text: &str, key: &str) -> String {
+        let mut nodes = [YamlNode::EMPTY; 32];
+        let document = YamlDocument::parse(text, &mut nodes).unwrap();
+        let node = document.get(document.root(), key).unwrap();
+        let mut buffer = [0u8; 256];
+        document.as_str(node, &mut buffer).unwrap().to_string()
+    }
+
+    #[test]
+    fn plain_scalars_fold_over_more_indented_lines() {
+        assert_eq!(value("a: one\n  two\n  three\nb: 2\n", "a"), "one two three");
+        assert_eq!(value("a: one\n  two\nb: 2\n", "b"), "2");
+        // A blank line is a line break; lines don't have to line up.
+        assert_eq!(value("a: one\n\n      two\n\n\n  three\n", "a"), "one\ntwo\n\nthree");
+        // A dash in one isn't a sequence, or a colon without a space a key.
+        assert_eq!(value("a: one\n  - two\n  x:y\n", "a"), "one - two x:y");
+        // A comment ends it.
+        assert_eq!(value("a: one # done\nb: 2\n", "a"), "one");
+        assert_eq!(value("a: one\n  two # done\nb: 2\n", "a"), "one two");
+    }
+
+    #[test]
+    fn a_mapping_entry_cannot_continue_a_plain_scalar() {
+        let mut nodes = [YamlNode::EMPTY; 32];
+        assert!(matches!(
+            YamlDocument::parse("a: one\n  b: two\n", &mut nodes),
+            Err(YamlError::InvalidIndentation { .. })
+        ));
+        assert!(YamlDocument::parse("a: one\n  two\n# c\n  b: three\n", &mut nodes).is_err());
+    }
+
+    #[test]
+    fn a_comment_stops_a_plain_scalar_going_on() {
+        let mut nodes = [YamlNode::EMPTY; 32];
+        assert!(YamlDocument::parse("a: one # c\n  two\n", &mut nodes).is_err());
+    }
+
+    #[test]
+    fn plain_scalars_at_the_top_and_in_sequences() {
+        let mut nodes = [YamlNode::EMPTY; 32];
+        let document = YamlDocument::parse("hello\nworld\n", &mut nodes).unwrap();
+        let mut buffer = [0u8; 64];
+        assert_eq!(document.as_str(document.root(), &mut buffer), Some("hello world"));
+        let mut nodes = [YamlNode::EMPTY; 32];
+        let document = YamlDocument::parse("- one\n  two\n- three\n", &mut nodes).unwrap();
+        let items: Vec<String> = document
+            .sequence_iter(document.root())
+            .unwrap()
+            .map(|node| {
+                let mut buffer = [0u8; 64];
+                document.as_str(node, &mut buffer).unwrap().to_string()
+            })
+            .collect();
+        assert_eq!(items, ["one two", "three"]);
+    }
+
+    #[test]
+    fn quoted_scalars_fold_and_keep_their_rules() {
+        assert_eq!(value("a: \"one\n  two\"\nb: 2\n", "a"), "one two");
+        assert_eq!(value("a: 'one\n  two'\nb: 2\n", "a"), "one two");
+        assert_eq!(value("a: 'it''s\n\n   two'\n", "a"), "it's\ntwo");
+        assert_eq!(value("a: \"x\\ty \n     z\"\n", "a"), "x\ty z");
+        // An escaped line break joins with nothing, and an escaped space survives.
+        assert_eq!(value("a: \"one\\\n    two\"\n", "a"), "onetwo");
+        assert_eq!(value("a: \"one\\ \n   two\"\n", "a"), "one  two");
+        // What looks like structure inside one isn't, and a comment after one is fine.
+        assert_eq!(value("a: \"b: c\n  # d\n  - e\" # note\nf: 1\n", "a"), "b: c # d - e");
+        assert_eq!(value("a: \"b: c\n  # d\n  - e\" # note\nf: 1\n", "f"), "1");
+        // Blank first and last lines.
+        assert_eq!(value("a: \"\n  x\n  \"\n", "a"), " x ");
+    }
+
+    #[test]
+    fn quoted_scalars_must_stay_inside_their_block_and_end() {
+        let mut nodes = [YamlNode::EMPTY; 32];
+        assert!(matches!(
+            YamlDocument::parse("a:\n  b: \"one\n  two\"\n", &mut nodes),
+            Err(YamlError::InvalidIndentation { .. })
+        ));
+        assert!(matches!(
+            YamlDocument::parse("a: \"one\n  two\n", &mut nodes),
+            Err(YamlError::UnterminatedQuote { .. })
+        ));
+        assert!(matches!(
+            YamlDocument::parse("a: \"one\n  two\" junk\n", &mut nodes),
+            Err(YamlError::UnexpectedToken { .. })
+        ));
+    }
+}

@@ -10,3 +10,7 @@ license.workspace = true
 feos-compress.workspace = true
 feos-h264.workspace = true
 feos-image.workspace = true
+feos-source.workspace = true
+
+[dev-dependencies]
+feos-audio-codec.workspace = true

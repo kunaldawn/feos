@@ -255,6 +255,38 @@ changes, a launch needs a new frame, or an animating windowed app (media
 playback, live task-manager graphs) asks for another frame. An idle desktop
 leaves the scanout buffer alone.
 
+## Settings
+
+The `settings` bundle (`apps/commands/src/settings.rs`) sets the colour scheme, keyboard layout,
+wallpaper, clock and screen resolution: Up and Down pick a row, Left and Right change it, or the
+arrows with the pointer. The app holds no settings. It posts `shell::request_setting`, the session
+applies and saves them, and publishes the result with `shell::publish_settings`, which is what
+the window shows, whoever changed it. Right-click, Properties opens the older Display Properties
+dialog, for the scheme and keyboard, and it saves the same way.
+
+They're saved in `/etc/desktop.conf` by `write_file_atomic`, and synced before the session says
+so, as `[desktop] settings saved: ...`. So a setting survives the power going straight afterwards.
+`FEOS_BOOT_TEST_ONLY=settings` changes settings in both places through the UI, kills QEMU, and looks at
+the log and the screen.
+
+## Screen resolution
+
+`feos_hal::display` has the modes a display can be set to, from 640x480 to 1920x1080, and sets one
+live: ramfb by writing its configuration again, virtio-gpu by creating a new resource, showing it and
+destroying the old. A firmware framebuffer offers none, as boot services have gone, and Settings
+then has no resolution row. The session's boot buffers stay static; each later mode's two buffers
+come from the heap, page aligned, and the old ones are freed once the session has moved its canvases.
+
+The session then fits itself (`Desktop::screen_changed`): maximised windows take the new work area,
+the rest are moved and cut to stay on the screen, the wallpaper's redrawn, and the pointer learns the new
+range (`Pointer::set_screen`).
+
+In Settings, Left and Right step through sizes without trying them, and Enter applies one. A prompt
+then counts down from 15 seconds: Enter or Keep keeps it, Esc or Revert or silence goes back. Only a
+kept size is saved. At the next boot the session sets it again, if the display still can.
+`FEOS_BOOT_TEST_ONLY=resolution` does all this on ramfb to 1600x1200 and virtio-gpu to 1920x1080, neither of
+which fits the static buffers, with screenshots, 12 rounds of changes to catch a leak, and a kill.
+
 ## Init process manager
 
 `libs/init` supplies `Init<N>`, a fixed-capacity supervisor:
@@ -262,8 +294,13 @@ leaves the scanout buffer alone.
 - register services by id with an `App` and arguments,
 - start, stop and restart by id,
 - record ids that have no app as `missing`,
-- restart according to `never`, `on-failure` or `always`,
+- restart according to `never`, `on-failure` or `always`, going by the exit status: `on-failure`
+  leaves a process alone that exited with zero, and counts one killed from outside as failed,
 - stop retrying after `max_restarts`,
+- run one-shot services (`type: oneshot`), which end as `done` and aren't run again,
+- start services in order: `after:` names what a service waits for, a simple service counting
+  once it's running and a one-shot once it's done. A service whose dependency has failed, doesn't
+  exist or waits for it in turn is `blocked`,
 - expose `ServiceStatus` snapshots for a `ps`-style table.
 
 The desktop creates one supervisor from the `init` section, registers

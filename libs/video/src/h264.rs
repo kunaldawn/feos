@@ -130,6 +130,22 @@ pub(crate) fn framing(config: &[u8]) -> Result<Framing> {
 /// Classifies samples from their NAL headers. A frame is a usable seek point
 /// only if the container offered it and it starts with an IDR: a non-IDR
 /// "key frame" can't be decoded without what came before it.
+/// Whether a sample's first picture is an IDR picture.
+pub(crate) fn first_picture_is_idr(bytes: &[u8], framing: Framing) -> bool {
+    let mut first_vcl = None;
+    let mut visit = |nal: &[u8]| {
+        let kind = nal.first().map(|header| header & 0x1f);
+        if first_vcl.is_none() && matches!(kind, Some(1 | 5)) {
+            first_vcl = kind;
+        }
+    };
+    match framing {
+        Framing::AnnexB => annex_b_ranges(bytes).for_each(|r| visit(&bytes[r])),
+        Framing::Length(n) => avcc_ranges(bytes, n).for_each(|r| visit(&bytes[r])),
+    }
+    first_vcl == Some(5)
+}
+
 pub(crate) fn mark_samples(index: &mut Index, input: &[u8], framing: Framing) {
     for i in 0..index.samples.len() {
         let bytes = index.bytes(input, i);
@@ -224,6 +240,10 @@ impl H264Stream {
     ///
     /// Feeds at most `budget` samples before returning `Ok(None)`, so a caller
     /// can spread a long catch-up across several calls.
+    pub(crate) fn framing(&self) -> Framing {
+        self.framing
+    }
+
     pub(crate) fn advance(
         &mut self,
         input: &[u8],

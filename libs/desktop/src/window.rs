@@ -516,6 +516,30 @@ impl<const N: usize> WindowManager<N> {
         true
     }
 
+    /// Fits every window to a new work area, after the screen changed size. A maximised
+    /// one takes all of it, and the rest stay reachable and no larger than it is.
+    pub fn fit_to(&mut self, work_area: Rect) {
+        let fit = |rect: Rect| {
+            let width = rect.width.min(work_area.width).max(1);
+            let height = rect.height.min(work_area.height).max(1);
+            let max_x = (work_area.right_i32() - width as i32).max(work_area.x);
+            let max_y = (work_area.bottom_i32() - height as i32).max(work_area.y);
+            Rect::new(
+                rect.x.clamp(work_area.x, max_x),
+                rect.y.clamp(work_area.y, max_y),
+                width,
+                height,
+            )
+        };
+        for window in self.windows.iter_mut().filter(|window| window.open) {
+            window.restore = fit(window.restore);
+            let maximized = window.state == WindowState::Maximized
+                || (window.state == WindowState::Minimized
+                    && window.restore_state == WindowState::Maximized);
+            window.rect = if maximized { work_area } else { fit(window.rect) };
+        }
+    }
+
     /// Moves a normal window, keeping at least part of it visible.
     pub fn move_by(&mut self, index: usize, dx: i32, dy: i32, work_area: Rect) -> bool {
         let Some(window) = self.windows.get_mut(index) else {
@@ -675,6 +699,35 @@ impl<const N: usize> WindowManager<N> {
 impl<const N: usize> Default for WindowManager<N> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::*;
+
+    #[test]
+    fn windows_follow_the_screen_size() {
+        let mut windows = WindowManager::<4>::new();
+        let large = Rect::new(0, 0, 1600, 1160);
+        let normal = windows.open_new(1, "normal", large, 500, 300, 0).unwrap();
+        let wide = windows.open_new(2, "wide", large, 1500, 1000, 0).unwrap();
+        let maximized = windows.open_new(3, "max", large, 500, 300, 0).unwrap();
+        assert!(windows.toggle_maximize(maximized, large));
+        assert_eq!(windows.get(maximized).unwrap().rect, large);
+
+        let small = Rect::new(0, 0, 800, 560);
+        windows.fit_to(small);
+        assert_eq!(windows.get(maximized).unwrap().rect, small);
+        let rect = windows.get(wide).unwrap().rect;
+        assert!(rect.width <= small.width && rect.height <= small.height);
+        assert!(rect.x >= 0 && rect.y >= 0);
+        let rect = windows.get(normal).unwrap().rect;
+        assert!(rect.x + rect.width as i32 <= 800 && rect.y + rect.height as i32 <= 560);
+        // Its restored size is on the screen too.
+        assert!(windows.toggle_maximize(maximized, small));
+        let rect = windows.get(maximized).unwrap().rect;
+        assert!(rect.x + rect.width as i32 <= 800);
     }
 }
 

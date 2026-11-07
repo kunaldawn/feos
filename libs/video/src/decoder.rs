@@ -2,18 +2,25 @@
 //! table and codec state, and decodes each next frame in constant time instead
 //! of restarting from frame 0.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
+
+use feos_source::{Source, Window};
 
 use crate::codec::Codec;
 use crate::error::{require_rgba, Result, VideoError};
 use crate::gif::GifStream;
 use crate::h264::{self, Framing, H264Stream};
-use crate::index::{DecoderLimits, Index, FLAG_KEY};
+use crate::index::{DecoderLimits, Index, FLAG_CHECKED, FLAG_KEY};
 use crate::matroska::Compression;
 use crate::pixel::{matrix_for, YuvCoefficients};
-use crate::{avi, flv, gif, matroska, mjpeg, mp4, mpeg1, raw, rle};
+use crate::vp8::Vp8Stream;
+use crate::{avi, flv, gif, ivf, matroska, mjpeg, mp4, mpeg1, raw, rle};
 use crate::{detect, info, ContainerFormat, DecodedFrame, VideoInfo};
 
+/// What a walk through a file on disk reads at a time. Most steps are a few bytes, close
+/// to the last.
+pub(crate) const STREAM_WINDOW: usize = 16 * 1024;
 /// Frame rate assumed for streams with no timing at all.
 const DEFAULT_FPS: (u32, u32) = (25, 1);
 /// Largest decompressed frame accepted from a zlib-compressed Matroska track.
@@ -36,6 +43,7 @@ enum State {
     Gif(GifStream),
     Rle(RleStream),
     Mpeg1(mpeg1::Mpeg1Stream),
+    Vp8(Vp8Stream),
     /// No decoder for this codec. The file can still be inspected.
     None,
 }
@@ -65,7 +73,11 @@ struct RleStream {
 /// }
 /// ```
 pub struct VideoDecoder<S> {
+    /// The file, or for a [`from_source`](VideoDecoder::from_source) decoder, the
+    /// part of it that holds metadata.
     source: S,
+    /// Where samples come from when they aren't in `source`.
+    file: Option<Box<dyn Source>>,
     info: VideoInfo,
     index: Index,
     state: State,
@@ -75,7 +87,119 @@ pub struct VideoDecoder<S> {
     palette: core::ops::Range<usize>,
 }
 
+impl VideoDecoder<Vec<u8>> {
+    /// Opens a video that stays where it is, with only its metadata and sample table in
+    /// memory. A sample is read when it's decoded.
+    ///
+    /// This walks the container, so it takes as long as the disk does. MP4 (not
+    /// fragmented), Matroska and WebM, AVI and FLV can do this. Anything that has to be
+    /// searched for its frames can't, and comes back as
+    /// [`VideoError::LimitExceeded`].
+    pub fn from_source(file: Box<dyn Source>, limits: DecoderLimits) -> Result<Self> {
+        let mut compression = Compression::None;
+        let mut dib = None;
+        let mut palette = 0..0;
+        let mut configs = Vec::new();
+        let len = file.len();
+        if len > usize::MAX as u64 {
+            return Err(VideoError::Overflow);
+        }
+        let mut window = Window::new(&*file, STREAM_WINDOW).ok_or(VideoError::OutOfMemory)?;
+        let format = detect(window.bytes(0, 4096)).ok_or(VideoError::UnknownFormat)?;
+        let (head, mut index) = match format {
+            ContainerFormat::Mp4 => {
+                let head = mp4::source_head(&mut window)?;
+                let (index, config) = mp4::build_index_sized(&head, len as usize, &limits)?;
+                push_config(&mut configs, config)?;
+                (head, index)
+            }
+            ContainerFormat::Matroska => {
+                let (head, segment_end) = matroska::source_head(&mut window)?;
+                let built = matroska::build_index_source(&head, &mut window, segment_end, &limits)?;
+                compression = built.compression;
+                dib = built.dib;
+                palette = built.palette;
+                push_config(&mut configs, built.config)?;
+                (head, built.index)
+            }
+            ContainerFormat::Avi => {
+                let head = avi::source_head(&mut window)?;
+                let built = avi::build_index_source(&head, &mut window, &limits)?;
+                dib = built.dib;
+                palette = built.extra.clone();
+                push_config(&mut configs, built.extra)?;
+                (head, built.index)
+            }
+            ContainerFormat::Flv => {
+                let mut head = flv::source_head(&mut window)?;
+                let built = flv::build_index_source(&mut head, &mut window, &limits)?;
+                configs = built.configs;
+                (head, built.index)
+            }
+            ContainerFormat::Ivf => {
+                let (head, mut index) = ivf::build_index_source(&mut window, &limits)?;
+                let rate = ivf::info(&head)?.frame_rate;
+                index.set_uniform_timing(Some(rate.unwrap_or(DEFAULT_FPS)));
+                (head, index)
+            }
+            _ => return Err(VideoError::LimitExceeded("this kind of file can't be streamed")),
+        };
+        drop(window);
+        let mut info = info(&head)?;
+        if info.width > limits.max_width || info.height > limits.max_height {
+            return Err(VideoError::LimitExceeded("frame size"));
+        }
+        index.finish_timing(delay_for(info.frame_rate.unwrap_or(DEFAULT_FPS)))?;
+        info.frame_count = index.samples.len() as u32;
+        Self::assemble(
+            head,
+            Some(file),
+            format,
+            info,
+            index,
+            configs,
+            compression,
+            dib,
+            palette,
+            None,
+            &limits,
+        )
+    }
+}
+
 impl<S: AsRef<[u8]>> VideoDecoder<S> {
+    /// A key frame of a file on disk is only what the container calls one, and H.264
+    /// decoding can only start from an IDR picture. Reads the one before `target`
+    /// to see, and looks further back if it isn't.
+    fn check_key(&mut self, target: u32) {
+        let Some(file) = self.file.as_deref() else {
+            return;
+        };
+        let State::H264(stream) = &self.state else {
+            return;
+        };
+        let framing = stream.framing();
+        loop {
+            let at = key_at_or_before(&self.index, target);
+            let Some(sample) = self.index.samples.get(at).copied() else {
+                return;
+            };
+            if at == 0 || sample.flags & FLAG_CHECKED != 0 || !sample.is_key() {
+                return;
+            }
+            let Ok(bytes) = read_sample(file, &self.index, at) else {
+                return;
+            };
+            let idr = h264::first_picture_is_idr(&bytes, framing);
+            let entry = &mut self.index.samples[at];
+            entry.flags |= FLAG_CHECKED;
+            if idr {
+                return;
+            }
+            entry.flags &= !FLAG_KEY;
+        }
+    }
+
     /// Opens a video with the default limits.
     pub fn open(source: S) -> Result<Self> {
         Self::with_limits(source, DecoderLimits::default())
@@ -139,6 +263,10 @@ impl<S: AsRef<[u8]>> VideoDecoder<S> {
                 uniform = true;
                 mjpeg::build_index(input, &limits)?
             }
+            ContainerFormat::Ivf if info.codec == Codec::Vp8 => {
+                uniform = true;
+                ivf::build_index(input, &limits)?
+            }
             ContainerFormat::Ivf => Index::default(),
         };
         if uniform {
@@ -149,10 +277,41 @@ impl<S: AsRef<[u8]>> VideoDecoder<S> {
         if format == ContainerFormat::Gif {
             index.last_delay_ms = gif_last_delay;
         }
-        if format != ContainerFormat::Ivf {
+        if format != ContainerFormat::Ivf || !index.samples.is_empty() {
             info.frame_count = index.samples.len() as u32;
         }
 
+        Self::assemble(
+            source,
+            None,
+            format,
+            info,
+            index,
+            configs,
+            compression,
+            dib,
+            palette,
+            mpeg1_stream,
+            &limits,
+        )
+    }
+
+    /// Everything that doesn't care how the index was found.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        source: S,
+        file: Option<Box<dyn Source>>,
+        format: ContainerFormat,
+        info: VideoInfo,
+        mut index: Index,
+        configs: Vec<(u32, core::ops::Range<usize>)>,
+        compression: Compression,
+        dib: Option<bool>,
+        palette: core::ops::Range<usize>,
+        mpeg1_stream: Option<mpeg1::Mpeg1Stream>,
+        limits: &DecoderLimits,
+    ) -> Result<Self> {
+        let input = source.as_ref();
         let state = match info.codec {
             Codec::Mpeg1 if mpeg1_stream.is_some() => {
                 mpeg1_stream.map_or(State::None, State::Mpeg1)
@@ -169,12 +328,19 @@ impl<S: AsRef<[u8]>> VideoDecoder<S> {
                 } else {
                     h264::framing(config)?
                 };
-                if compression == Compression::None {
+                // That reads every sample, so a file on disk checks its key frames as
+                // it gets to them, in `check_key`.
+                if compression == Compression::None && file.is_none() {
                     h264::mark_samples(&mut index, input, framing);
                 }
                 let matrix = matrix_for(info.colour.matrix, info.height);
                 let coefficients = YuvCoefficients::new(matrix, info.colour.full_range);
-                State::H264(H264Stream::new(framing, configs, coefficients, &limits))
+                State::H264(H264Stream::new(framing, configs, coefficients, limits))
+            }
+            Codec::Vp8 => {
+                let matrix = matrix_for(info.colour.matrix, info.height);
+                let coefficients = YuvCoefficients::new(matrix, info.colour.full_range);
+                State::Vp8(Vp8Stream::new(limits.max_memory, coefficients))
             }
             Codec::Rle8 | Codec::Rle4 => {
                 let len = info.rgba_len()?;
@@ -195,6 +361,7 @@ impl<S: AsRef<[u8]>> VideoDecoder<S> {
         };
         Ok(Self {
             source,
+            file,
             info,
             index,
             state,
@@ -281,7 +448,9 @@ impl<S: AsRef<[u8]>> VideoDecoder<S> {
         budget: u32,
     ) -> Result<Option<DecodedFrame>> {
         let count = self.frame_count();
+        self.check_key(index);
         let input = self.source.as_ref();
+        let file = self.file.as_deref();
         let codec = self.info.codec;
         if matches!(self.state, State::None) {
             return Err(VideoError::UnsupportedCodec(codec.name()));
@@ -301,7 +470,7 @@ impl<S: AsRef<[u8]>> VideoDecoder<S> {
                     .iter()
                     .rposition(|sample| sample.size > 0)
                     .ok_or(VideoError::InvalidData("video starts with an empty frame"))?;
-                let expanded = expand_sample(input, table, at, &compression)?;
+                let expanded = expand_sample(input, file, table, at, &compression)?;
                 let sample = expanded.as_deref().unwrap_or(table.bytes(input, at));
                 if codec == Codec::Mjpeg {
                     (width, height) = mjpeg::decode_sample(sample, out)?;
@@ -320,7 +489,7 @@ impl<S: AsRef<[u8]>> VideoDecoder<S> {
                 }
             }
             State::H264(stream) => {
-                let mut expand = |at: usize| expand_sample(input, table, at, &compression);
+                let mut expand = |at: usize| expand_sample(input, file, table, at, &compression);
                 match stream.advance(input, table, &mut expand, index, budget, out)? {
                     Some(size) => (width, height, shown) = size,
                     None => return Ok(None),
@@ -329,6 +498,13 @@ impl<S: AsRef<[u8]>> VideoDecoder<S> {
             State::Mpeg1(stream) => {
                 if !stream.advance(input, index, budget, out)? {
                     return Ok(None);
+                }
+            }
+            State::Vp8(stream) => {
+                let mut expand = |at: usize| expand_sample(input, file, table, at, &compression);
+                match stream.advance(table, &mut expand, input, index, budget, out)? {
+                    Some(size) => (width, height) = size,
+                    None => return Ok(None),
                 }
             }
             State::Gif(stream) => {
@@ -354,7 +530,7 @@ impl<S: AsRef<[u8]>> VideoDecoder<S> {
                     fed += 1;
                     let at = stream.next as usize;
                     stream.next += 1;
-                    let expanded = expand_sample(input, table, at, &compression)?;
+                    let expanded = expand_sample(input, file, table, at, &compression)?;
                     let sample = expanded.as_deref().unwrap_or(table.bytes(input, at));
                     let palette = &input[self.palette.clone()];
                     // A damaged delta only loses its own changes; the next
@@ -378,6 +554,19 @@ impl<S: AsRef<[u8]>> VideoDecoder<S> {
     }
 }
 
+/// One sample's bytes from a file on disk.
+fn read_sample(file: &dyn Source, table: &Index, at: usize) -> Result<Vec<u8>> {
+    let Some(sample) = table.samples.get(at) else {
+        return Ok(Vec::new());
+    };
+    let mut bytes = feos_source::zeroed(sample.size as usize).ok_or(VideoError::OutOfMemory)?;
+    let read = file.read_full(sample.offset, &mut bytes);
+    if read < bytes.len() {
+        return Err(VideoError::InvalidData("the file could not be read"));
+    }
+    Ok(bytes)
+}
+
 fn delay_for((num, den): (u32, u32)) -> u32 {
     if num == 0 {
         return 40;
@@ -399,13 +588,18 @@ fn push_config(
 /// as it is.
 fn expand_sample(
     input: &[u8],
+    file: Option<&dyn Source>,
     table: &Index,
     at: usize,
     compression: &Compression,
 ) -> Result<Option<Vec<u8>>> {
-    let sample = table.bytes(input, at);
+    let loaded = match file {
+        Some(file) => Some(read_sample(file, table, at)?),
+        None => None,
+    };
+    let sample = loaded.as_deref().unwrap_or_else(|| table.bytes(input, at));
     match compression {
-        Compression::None => Ok(None),
+        Compression::None => Ok(loaded),
         Compression::HeaderStrip(prefix) => {
             let prefix = &input[prefix.clone()];
             let mut bytes = Vec::new();

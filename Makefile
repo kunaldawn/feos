@@ -60,14 +60,14 @@ DOCKER_DISPLAY ?= gtk
 # filesystem image, so these come first. RUSTFLAGS replaces the kernel's rustflags
 # from .cargo/config.toml, which are for linking a kernel.
 USER_TARGET_DIR ?= $(or $(CARGO_TARGET_DIR),$(CURDIR)/target)/user
-USER_BINS       := hello cat vmcheck spin utest wdemo malicious
+USER_BINS       := hello cat vmcheck spin utest wdemo malicious permtest runas
 USER_FLAGS      := -C linker=rust-lld -C link-arg=-T$(CURDIR)/user/link.ld -C link-arg=-z -C link-arg=max-page-size=4096
 
 .PHONY: all build build-arm build-x64 build-efi check check-arm check-x64 run run-arm run-x64 clean \
         test test-firmware test-frames test-irq test-gfx test-gui test-audio test-mixer test-iconset test-sync \
         test-heap test-sched test-hal test-console test-app test-pci test-i8042 test-apic test-gicv2 test-gicv3 test-uart16550 test-intel-hda \
         test-json test-yaml test-image test-audio-codec test-compress test-archive \
-        test-h264 test-video test-text test-bundle test-init test-fs test-keys \
+        test-h264 test-source test-opus test-video test-text test-bundle test-init test-fs test-keys \
         test-coreutils test-sh test-abi test-elf test-vm user user-arm user-x64 \
         test-desktop test-desktop-app test-virtio-input test-virtio-core test-virtio-blk test-virtio-net test-virtio-gpu test-rtc test-net test-xhci test-bootinfo test-dosbox test-dosbox-app test-apps \
         boot-test boot-test-arm boot-test-x64 docker-boot-test \
@@ -155,7 +155,7 @@ docker-boot-test: docker-build
 	docker run --rm --network none --entrypoint sh $(IMAGE) \
 		-c 'echo nameserver 127.0.0.1 > /etc/resolv.conf; make boot-test'
 
-test: test-firmware test-frames test-irq test-gfx test-gui test-audio test-mixer test-iconset test-sync test-heap test-sched test-hal test-console test-app test-pci test-i8042 test-apic test-gicv2 test-gicv3 test-uart16550 test-intel-hda test-json test-yaml test-image test-audio-codec test-compress test-archive test-h264 test-video test-text test-bundle test-init test-fs test-keys test-coreutils test-sh test-abi test-elf test-vm test-desktop test-desktop-app test-virtio-input test-dosbox test-dosbox-app test-apps test-virtio-core test-virtio-blk test-virtio-net test-virtio-gpu test-rtc test-net test-xhci test-bootinfo
+test: test-firmware test-frames test-irq test-gfx test-gui test-audio test-mixer test-iconset test-sync test-heap test-sched test-hal test-console test-app test-pci test-i8042 test-apic test-gicv2 test-gicv3 test-uart16550 test-intel-hda test-json test-yaml test-image test-audio-codec test-compress test-archive test-h264 test-source test-opus test-video test-text test-bundle test-init test-fs test-keys test-coreutils test-sh test-abi test-elf test-vm test-desktop test-desktop-app test-virtio-input test-dosbox test-dosbox-app test-apps test-virtio-core test-virtio-blk test-virtio-net test-virtio-gpu test-rtc test-net test-xhci test-bootinfo
 
 # Host-side tests. Architecture and board crates contain AArch64 assembly or
 # MMIO, so the test set is explicit rather than `--workspace`.
@@ -248,6 +248,12 @@ test-compress:
 
 test-archive:
 	cargo test -p feos-archive --target $(HOST_TARGET)
+
+test-source:
+	cargo test -p feos-source --target $(HOST_TARGET)
+
+test-opus:
+	cargo test -p feos-opus --target $(HOST_TARGET)
 
 test-h264:
 	cargo test -p feos-h264 --target $(HOST_TARGET)

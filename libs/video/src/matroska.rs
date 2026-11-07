@@ -7,6 +7,8 @@
 
 use alloc::vec::Vec;
 
+use feos_source::Window;
+
 use crate::audio::{push_packet, AudioCodec, AudioTrack};
 use crate::codec::Codec;
 use crate::error::{Result, VideoError};
@@ -852,6 +854,26 @@ fn read_float(data: &[u8], elem: Elem) -> Option<f64> {
 /// Finds the first audio track.
 pub(crate) fn audio_track(input: &[u8]) -> Option<AudioTrack> {
     let seg = segment(input).ok()?;
+    let (mut track, number, scale_ns) = audio_header(input, seg)?;
+    let mut full = false;
+    let walked = visit_clusters(input, seg, number, |cluster_time, frame| {
+        let ticks = cluster_time as i128 + frame.relative_time as i128;
+        let ms = (ticks * scale_ns as i128 / 1_000_000).max(0) as u64;
+        if push_packet(&mut track.packets, input.len(), frame.offset, frame.size, ms).is_none() {
+            full = true;
+            return Ok(false);
+        }
+        Ok(true)
+    });
+    if walked.is_err() || full {
+        return None;
+    }
+    Some(track)
+}
+
+/// The first audio track's description, with no packets yet, and its number and the
+/// file's time scale.
+fn audio_header(input: &[u8], seg: Elem) -> Option<(AudioTrack, u64, u64)> {
     let tracks = find_in_segment(input, seg, ID_TRACKS)?;
     let scale_ns = find_in_segment(input, seg, ID_INFO)
         .and_then(|element| {
@@ -925,27 +947,290 @@ pub(crate) fn audio_track(input: &[u8]) -> Option<AudioTrack> {
             },
             _ => AudioCodec::Other,
         };
-        let mut packets = Vec::new();
-        let mut full = false;
-        let walked = visit_clusters(input, seg, number, |cluster_time, frame| {
-            let ticks = cluster_time as i128 + frame.relative_time as i128;
-            let ms = (ticks * scale_ns as i128 / 1_000_000).max(0) as u64;
-            if push_packet(&mut packets, input.len(), frame.offset, frame.size, ms).is_none() {
-                full = true;
-                return Ok(false);
-            }
-            Ok(true)
-        });
-        if walked.is_err() || full {
-            return None;
-        }
-        return Some(AudioTrack {
-            codec,
-            sample_rate: rate,
-            channels,
-            config,
-            packets,
-        });
+        return Some((
+            AudioTrack {
+                codec,
+                sample_rate: rate,
+                channels,
+                config,
+                packets: Vec::new(),
+            },
+            number,
+            scale_ns,
+        ));
     }
     None
+}
+
+/// How much of a block's start to look at for its header and any lacing.
+const BLOCK_PEEK: usize = 4096;
+/// The most metadata to keep from before the first cluster.
+const MAX_HEAD: u64 = 16 * 1024 * 1024;
+
+/// One element in a file, as [`Elem`] is in a slice.
+#[derive(Clone, Copy)]
+struct FileElem {
+    id: u32,
+    payload: u64,
+    end: u64,
+    unknown_size: bool,
+}
+
+fn elem_at(window: &mut Window<'_>, pos: u64, limit: u64) -> Option<FileElem> {
+    let data = window.bytes(pos, 12);
+    let (id, id_len) = read_id(data, 0, data.len()).ok()?;
+    let (size, size_len, unknown) = read_size(data, id_len, data.len()).ok()?;
+    let payload = pos + (id_len + size_len) as u64;
+    if payload > limit {
+        return None;
+    }
+    let end = if unknown {
+        limit
+    } else {
+        payload.saturating_add(size).min(limit)
+    };
+    Some(FileElem {
+        id,
+        payload,
+        end,
+        unknown_size: unknown,
+    })
+}
+
+/// A file's bytes up to its first cluster, which is where the parsers above find the
+/// tracks and everything else about it. Returns those, and the segment's end.
+pub(crate) fn source_head(window: &mut Window<'_>) -> Result<(Vec<u8>, u64)> {
+    let file_len = window.file_len();
+    let mut pos = 0u64;
+    let mut segment = None;
+    while let Some(elem) = elem_at(window, pos, file_len) {
+        if elem.id == ID_SEGMENT {
+            segment = Some(elem);
+            break;
+        }
+        if elem.unknown_size {
+            break;
+        }
+        pos = elem.end;
+    }
+    let segment = segment.ok_or(VideoError::UnknownFormat)?;
+    let mut pos = segment.payload;
+    while let Some(elem) = elem_at(window, pos, segment.end) {
+        if elem.id == ID_CLUSTER || elem.unknown_size {
+            break;
+        }
+        pos = elem.end;
+    }
+    if pos > MAX_HEAD {
+        return Err(VideoError::LimitExceeded("Matroska metadata is too large"));
+    }
+    let mut head = Vec::new();
+    head.try_reserve_exact(pos as usize).map_err(|_| VideoError::OutOfMemory)?;
+    while (head.len() as u64) < pos {
+        let want = (pos - head.len() as u64) as usize;
+        let chunk = window.bytes(head.len() as u64, want);
+        if chunk.is_empty() {
+            return Err(VideoError::UnexpectedEnd);
+        }
+        head.extend_from_slice(chunk);
+    }
+    Ok((head, segment.end))
+}
+
+/// [`visit_clusters`], from a file, starting where its [`source_head`] ended. Frame
+/// offsets are the file's.
+fn visit_file_clusters<F>(
+    window: &mut Window<'_>,
+    start: u64,
+    segment_end: u64,
+    track: u64,
+    mut f: F,
+) -> Result<()>
+where
+    F: FnMut(u64, u64, BlockFrame) -> Result<bool>,
+{
+    let mut pos = start;
+    while let Some(elem) = elem_at(window, pos, segment_end) {
+        if elem.id != ID_CLUSTER {
+            if elem.unknown_size {
+                return Ok(());
+            }
+            pos = elem.end;
+            continue;
+        }
+        let mut cluster_time = 0u64;
+        let mut child_pos = elem.payload;
+        while child_pos < elem.end {
+            let Some(child) = elem_at(window, child_pos, elem.end) else {
+                break;
+            };
+            if elem.unknown_size && ends_unknown_size(child.id) {
+                break;
+            }
+            child_pos = child.end;
+            match child.id {
+                ID_CLUSTER_TIMESTAMP => {
+                    let len = (child.end - child.payload) as usize;
+                    if len <= 8 {
+                        let data = window.bytes(child.payload, len);
+                        cluster_time = data.iter().fold(0, |value, &b| (value << 8) | b as u64);
+                    }
+                }
+                ID_SIMPLE_BLOCK => {
+                    if !visit_file_block(window, child, track, None, cluster_time, &mut f)? {
+                        return Ok(());
+                    }
+                }
+                ID_BLOCK_GROUP => {
+                    let mut block = None;
+                    let mut key = true;
+                    let mut inner = child.payload;
+                    while let Some(part) = elem_at(window, inner, child.end) {
+                        inner = part.end;
+                        match part.id {
+                            ID_BLOCK => block = Some(part),
+                            ID_REFERENCE_BLOCK => key = false,
+                            _ => {}
+                        }
+                        if inner >= child.end {
+                            break;
+                        }
+                    }
+                    if let Some(block) = block {
+                        if !visit_file_block(window, block, track, Some(key), cluster_time, &mut f)? {
+                            return Ok(());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        pos = if elem.unknown_size { child_pos } else { elem.end };
+        if pos >= segment_end {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn visit_file_block<F>(
+    window: &mut Window<'_>,
+    block: FileElem,
+    track: u64,
+    group_key: Option<bool>,
+    cluster_time: u64,
+    f: &mut F,
+) -> Result<bool>
+where
+    F: FnMut(u64, u64, BlockFrame) -> Result<bool>,
+{
+    let size = (block.end - block.payload) as usize;
+    let peek = size.min(BLOCK_PEEK);
+    let data = window.bytes(block.payload, peek);
+    // Cut off by the end of the file.
+    if data.len() < peek || peek < 4 {
+        return Ok(true);
+    }
+    // Lacing tables are read from the block's start, and could run past what's here.
+    if size > peek {
+        let (_, track_len, _) = read_size(data, 0, peek)?;
+        if data.get(track_len + 2).is_none_or(|flags| flags & 0x06 != 0) {
+            return Ok(true);
+        }
+    }
+    let base = block.payload;
+    let view = Elem {
+        id: block.id,
+        payload: 0,
+        end: size,
+        next: size,
+        unknown_size: false,
+    };
+    let mut visit = |frame: BlockFrame| f(base, cluster_time, frame);
+    match visit_block(data, view, track, group_key, &mut visit) {
+        Ok(more) => Ok(more),
+        Err(error) if error.is_fatal() => Err(error),
+        Err(_) => Ok(true),
+    }
+}
+
+/// [`build_index`] for a file that stays on disk. `head` is its [`source_head`].
+pub(crate) fn build_index_source(
+    head: &[u8],
+    window: &mut Window<'_>,
+    segment_end: u64,
+    limits: &DecoderLimits,
+) -> Result<MatroskaIndex> {
+    let seg = segment(head)?;
+    let track = video_track(head, seg)?;
+    let scale_ns = time_scale(head, seg);
+    let frame_step_ns = track.default_duration;
+    let file_len = window.file_len() as usize;
+    let number = track.number;
+    let mut index = Index::default();
+    visit_file_clusters(window, head.len() as u64, segment_end, number, |base, cluster_time, frame| {
+        let ticks = cluster_time as i128 + frame.relative_time as i128;
+        let ns = ticks * scale_ns as i128 + (frame.lace_index as i128 * frame_step_ns as i128);
+        let ms = (ns / 1_000_000).clamp(i32::MIN as i128, i32::MAX as i128) as i64;
+        let flags = if frame.key { FLAG_KEY } else { 0 };
+        index.push(limits, file_len, base as usize + frame.offset, frame.size, ms, flags)?;
+        Ok(true)
+    })?;
+    let offset_of = |slice: &[u8]| slice.as_ptr() as usize - head.as_ptr() as usize;
+    let config = if track.config.is_empty() {
+        0..0
+    } else {
+        let start = offset_of(track.config);
+        start..start + track.config.len()
+    };
+    let palette = if track.dib.is_some() {
+        match crate::avi::parse_bitmap_info(track.config) {
+            Ok(bih) => config.start + bih.palette.start..config.start + bih.palette.end,
+            Err(_) => 0..0,
+        }
+    } else {
+        0..0
+    };
+    Ok(MatroskaIndex {
+        index,
+        config,
+        compression: track.compression,
+        dib: track.dib,
+        palette,
+    })
+}
+
+fn time_scale(input: &[u8], seg: Elem) -> u64 {
+    find_in_segment(input, seg, ID_INFO)
+        .and_then(|element| {
+            find_elem(input, element.payload, element.end, ID_TIMESTAMP_SCALE)
+                .ok()
+                .flatten()
+                .and_then(|e| read_uint(input, e).ok())
+        })
+        .filter(|&scale| scale != 0)
+        .unwrap_or(1_000_000)
+}
+
+/// [`audio_track`] for a file that stays on disk. The config range is in the head,
+/// which comes back with it.
+pub(crate) fn audio_track_source(window: &mut Window<'_>) -> Option<(Vec<u8>, AudioTrack)> {
+    let (head, segment_end) = source_head(window).ok()?;
+    let seg = segment(&head).ok()?;
+    let (mut track, number, scale_ns) = audio_header(&head, seg)?;
+    let file_len = window.file_len() as usize;
+    let mut full = false;
+    let walked = visit_file_clusters(window, head.len() as u64, segment_end, number, |base, cluster_time, frame| {
+        let ticks = cluster_time as i128 + frame.relative_time as i128;
+        let ms = (ticks * scale_ns as i128 / 1_000_000).max(0) as u64;
+        if push_packet(&mut track.packets, file_len, base as usize + frame.offset, frame.size, ms).is_none() {
+            full = true;
+            return Ok(false);
+        }
+        Ok(true)
+    });
+    if walked.is_err() || full {
+        return None;
+    }
+    Some((head, track))
 }

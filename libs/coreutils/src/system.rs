@@ -15,6 +15,11 @@ pub struct MemoryInfo {
 ///
 /// The board and kernel implement this; unit tests use [`NoSystem`].
 pub trait System: Sync {
+    /// CPU time of the calling task and the children it has outlived, in milliseconds.
+    fn cpu_ms(&self) -> u64 {
+        0
+    }
+
     /// Operating system name (`uname -s`).
     fn sysname(&self) -> &'static str {
         "FEOS"

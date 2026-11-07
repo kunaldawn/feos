@@ -282,6 +282,14 @@ impl StreamView<'_, '_> {
         }
     }
 
+    /// Bytes for the terminal's next reader. Only a terminal keeps them.
+    pub(crate) fn unread(&mut self, fd: usize, bytes: &[u8]) {
+        let Self { fds, io, .. } = self;
+        if let Some(OpenFile::Base(0)) = fds.resolve(fd) {
+            io.stdin.unread(bytes);
+        }
+    }
+
     /// A terminal's keys, as they are. Anything else reads as it always does.
     pub(crate) fn read_raw(&mut self, fd: usize, out: &mut [u8]) -> usize {
         let Self { fds, io, .. } = self;
@@ -412,6 +420,10 @@ impl Input for FdInput<'_, '_, '_> {
 
     fn set_raw(&mut self, raw: bool) {
         self.view.borrow_mut().set_raw(raw);
+    }
+
+    fn unread(&mut self, bytes: &[u8]) {
+        self.view.borrow_mut().unread(self.fd, bytes);
     }
 
     fn read_tty(&mut self, out: &mut [u8]) -> usize {

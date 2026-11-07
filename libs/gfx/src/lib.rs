@@ -25,6 +25,7 @@
 pub mod canvas;
 pub mod color;
 pub mod font;
+mod font_extended;
 pub mod geometry;
 
 pub use canvas::Canvas;

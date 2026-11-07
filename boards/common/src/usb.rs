@@ -166,6 +166,15 @@ impl Pointer for JoinedPointer {
             _ => controller().map_or((0, 0), Xhci::pointer_position),
         }
     }
+
+    fn set_screen(&self, width: u16, height: u16) {
+        if let Some(other) = *OTHER_POINTER.lock() {
+            other.set_screen(width, height);
+        }
+        if let Some(controller) = controller() {
+            controller.set_screen(width, height);
+        }
+    }
 }
 
 /// The pointer to give apps: `other`, with a USB pointer added when there is one.

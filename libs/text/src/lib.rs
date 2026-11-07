@@ -16,9 +16,88 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+extern crate alloc;
+
+use alloc::borrow::Cow;
+use alloc::string::String;
 use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::ops::Deref;
+
+/// Whether a character does something to whatever shows it, instead of being shown.
+pub fn is_control(ch: char) -> bool {
+    ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// How many terminal cells a character takes: 0 for a combining mark or other character
+/// with no width of its own, 2 for East Asian wide characters and emoji, 1 for the rest.
+///
+/// This is the usual `wcwidth` by ranges, not a full table: enough that columns line up for
+/// what's common, and for a run of wide text that this system has no glyphs for.
+pub fn char_width(ch: char) -> usize {
+    let code = ch as u32;
+    if code < 0x300 {
+        return 1;
+    }
+    let zero = matches!(code,
+        0x300..=0x36f | 0x483..=0x489 | 0x591..=0x5bd | 0x5bf | 0x5c1..=0x5c2 | 0x5c4..=0x5c5
+        | 0x610..=0x61a | 0x64b..=0x65f | 0x670 | 0x6d6..=0x6dc | 0x1ab0..=0x1aff | 0x1dc0..=0x1dff
+        | 0x200b..=0x200f | 0x202a..=0x202e | 0x2060..=0x2064 | 0x20d0..=0x20f0 | 0xfe00..=0xfe0f
+        | 0xfe20..=0xfe2f | 0xfeff | 0xe0100..=0xe01ef);
+    if zero {
+        return 0;
+    }
+    let wide = matches!(code,
+        0x1100..=0x115f | 0x2e80..=0x303e | 0x3041..=0x33ff | 0x3400..=0x4dbf | 0x4e00..=0x9fff
+        | 0xa000..=0xa4cf | 0xac00..=0xd7a3 | 0xf900..=0xfaff | 0xfe30..=0xfe6f | 0xff00..=0xff60
+        | 0xffe0..=0xffe6 | 0x1f300..=0x1f64f | 0x1f680..=0x1f6ff | 0x1f900..=0x1f9ff
+        | 0x20000..=0x3fffd);
+    if wide {
+        2
+    } else {
+        1
+    }
+}
+
+/// A name, a piece of text from outside such as a file's, ready to be shown.
+///
+/// Filesystems keep names as they are, and whatever shows one escapes it here, so a name
+/// can't move a terminal's cursor, set its colours or break a line of a listing:
+///
+/// ```
+/// assert_eq!(feos_text::Escaped("a\x1b[2Jb\nc").to_string(), "a\\e[2Jb\\nc");
+/// assert_eq!(feos_text::Escaped("plain h\u{e9}llo").to_string(), "plain h\u{e9}llo");
+/// ```
+pub struct Escaped<'a>(pub &'a str);
+
+impl fmt::Display for Escaped<'_> {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use fmt::Write as _;
+        for ch in self.0.chars() {
+            match ch {
+                '\n' => out.write_str("\\n")?,
+                '\r' => out.write_str("\\r")?,
+                '\t' => out.write_str("\\t")?,
+                '\u{1b}' => out.write_str("\\e")?,
+                ch if !is_control(ch) => out.write_char(ch)?,
+                ch if (ch as u32) < 0x100 => write!(out, "\\x{:02x}", ch as u32)?,
+                ch => write!(out, "\\u{{{:x}}}", ch as u32)?,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// [`Escaped`] as text, which only costs anything for a name that needs it.
+pub fn display_name(name: &str) -> Cow<'_, str> {
+    if !name.chars().any(is_control) {
+        return Cow::Borrowed(name);
+    }
+    use fmt::Write as _;
+    let mut shown = String::with_capacity(name.len() + 8);
+    let _ = write!(shown, "{}", Escaped(name));
+    Cow::Owned(shown)
+}
 
 /// A UTF-8 string with a fixed maximum byte length.
 ///
@@ -252,6 +331,29 @@ impl<const N: usize> PartialEq<&str> for Text<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn widths_are_what_a_terminal_expects() {
+        assert_eq!(char_width('a'), 1);
+        assert_eq!(char_width('\u{e9}'), 1);
+        assert_eq!(char_width('\u{3b1}'), 1);
+        assert_eq!(char_width('\u{416}'), 1);
+        assert_eq!(char_width('\u{2500}'), 1);
+        assert_eq!(char_width('\u{301}'), 0);
+        assert_eq!(char_width('\u{200b}'), 0);
+        assert_eq!(char_width('\u{4e2d}'), 2);
+        assert_eq!(char_width('\u{ac00}'), 2);
+        assert_eq!(char_width('\u{1f600}'), 2);
+    }
+
+    #[test]
+    fn names_are_escaped_only_where_it_matters() {
+        assert!(matches!(display_name("fine.txt"), Cow::Borrowed("fine.txt")));
+        assert!(matches!(display_name("Gr\u{fc}\u{df}e \u{3b1}"), Cow::Borrowed(_)));
+        assert_eq!(display_name("a\x07b\x7f\u{85}"), "a\\x07b\\x7f\\x85");
+        assert_eq!(display_name("\u{202e}evil"), "\\u{202e}evil");
+        assert_eq!(display_name("x\ty\rz\n"), "x\\ty\\rz\\n");
+    }
     use core::fmt::Write;
 
     #[test]

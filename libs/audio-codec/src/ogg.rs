@@ -121,7 +121,7 @@ fn ogg_crc_update(mut crc: u32, data: &[u8]) -> u32 {
     crc
 }
 
-fn parse_page(input: &[u8], pos: usize) -> Result<(Page<'_>, usize)> {
+pub(crate) fn parse_page(input: &[u8], pos: usize) -> Result<(Page<'_>, usize)> {
     need(input.len(), pos, 27)?;
     if &input[pos..pos + 4] != b"OggS" {
         return Err(AudioError::InvalidData("missing Ogg capture pattern"));
@@ -176,13 +176,13 @@ fn parse_page(input: &[u8], pos: usize) -> Result<(Page<'_>, usize)> {
     ))
 }
 
-const FLAG_CONTINUED: u8 = 0x01;
+pub(crate) const FLAG_CONTINUED: u8 = 0x01;
 const FLAG_BOS: u8 = 0x02;
-const FLAG_EOS: u8 = 0x04;
+pub(crate) const FLAG_EOS: u8 = 0x04;
 
 /// The largest packet [`PacketReader`] reassembles. Real packets are far
 /// smaller; a Vorbis setup header is the largest, at tens of kilobytes.
-const MAX_PACKET: usize = 8 << 20;
+pub(crate) const MAX_PACKET: usize = 8 << 20;
 
 /// The codec of a logical stream, from the first packet on its first page.
 fn codec_of(data: &[u8]) -> Option<AudioFormat> {
@@ -418,11 +418,7 @@ pub fn scratch_len(_input: &[u8]) -> Result<usize> {
     Ok(0)
 }
 
-/// Decodes an Ogg Vorbis or Ogg FLAC stream.
-///
-/// Opus packet decoding is not implemented, so an Opus stream returns
-/// [`AudioError::UnsupportedFeature`] after validating its header. Use
-/// [`opus_head`] and [`Pages`] to inspect one.
+/// Decodes an Ogg Vorbis, FLAC or Opus stream.
 pub fn decode(input: &[u8], out: &mut [i16]) -> Result<DecodedAudio> {
     let Some((format, page)) = find_stream(input)? else {
         return Err(AudioError::UnsupportedFormat);
@@ -431,10 +427,81 @@ pub fn decode(input: &[u8], out: &mut [i16]) -> Result<DecodedAudio> {
         AudioFormat::OggVorbis => crate::vorbis::decode(input, out),
         AudioFormat::OggFlac => crate::flac::ogg_decode(input, &page, out),
         _ => {
-            let _ = opus_head(input)?;
-            Err(AudioError::UnsupportedFeature(
-                "Opus packet decoding is not implemented",
-            ))
+            let mut stream = OggOpusDecoder::new(input)?;
+            let info = opus_info(input, page.serial)?;
+            let channels = info.channels as usize;
+            let needed = info.frames as usize * channels;
+            if out.len() < needed {
+                return Err(AudioError::BufferTooSmall {
+                    required: needed,
+                    available: out.len(),
+                });
+            }
+            let mut chunk = alloc::vec::Vec::new();
+            chunk
+                .try_reserve_exact(stream.max_chunk_samples())
+                .map_err(|_| AudioError::OutOfMemory)?;
+            chunk.resize(stream.max_chunk_samples(), 0);
+            let mut frames = 0usize;
+            let mut damaged = 0;
+            loop {
+                let count = match stream.next_chunk(&mut chunk) {
+                    Ok(Some(count)) => {
+                        damaged = 0;
+                        count
+                    }
+                    Ok(None) => break,
+                    // Damage loses a packet, as for the other formats. A reader that's stuck
+                    // on it says the same thing every time.
+                    Err(AudioError::InvalidData(_)) if damaged < 16 => {
+                        damaged += 1;
+                        continue;
+                    }
+                    Err(AudioError::InvalidData(_)) => break,
+                    Err(error) => return Err(error),
+                };
+                let keep = count.min((info.frames as usize).saturating_sub(frames));
+                out[frames * channels..(frames + keep) * channels]
+                    .copy_from_slice(&chunk[..keep * channels]);
+                frames += keep;
+            }
+            Ok(DecodedAudio { info, frames })
+        }
+    }
+}
+
+/// A stateful decoder for Opus in Ogg, one packet at a time.
+pub struct OggOpusDecoder<'a> {
+    reader: PacketReader<'a>,
+    decoder: crate::opus::OpusPacketDecoder,
+}
+
+impl<'a> OggOpusDecoder<'a> {
+    /// Finds the Ogg Opus stream in `input`.
+    pub fn new(input: &'a [u8]) -> Result<Self> {
+        let page = match find_stream(input)? {
+            Some((AudioFormat::OggOpus, page)) => page,
+            _ => return Err(AudioError::InvalidData("not an Ogg Opus stream")),
+        };
+        let mut reader = PacketReader::new(input, page.serial);
+        let head = reader.next_packet()?.ok_or(AudioError::UnexpectedEnd)?;
+        let decoder = crate::opus::OpusPacketDecoder::new(head)?;
+        // The tags.
+        let _ = reader.next_packet()?;
+        Ok(Self { reader, decoder })
+    }
+
+    /// How many interleaved samples [`next_chunk`](Self::next_chunk) needs room for.
+    pub fn max_chunk_samples(&self) -> usize {
+        self.decoder.max_packet_samples()
+    }
+
+    /// Decodes the next packet to `out`. Returns the sample frames written, or `None` at
+    /// the end of the stream.
+    pub fn next_chunk(&mut self, out: &mut [i16]) -> Result<Option<usize>> {
+        match self.reader.next_packet()? {
+            Some(packet) => self.decoder.decode(packet, out).map(Some),
+            None => Ok(None),
         }
     }
 }

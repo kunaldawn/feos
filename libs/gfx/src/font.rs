@@ -1,9 +1,12 @@
-//! An 8x8 bitmap font for basic Latin (U+0000..U+007F).
+//! An 8x8 bitmap font: basic Latin, and Latin-1, Latin Extended, Greek, Cyrillic and box
+//! drawing from `font_extended`.
 //!
 //! The glyph data is the public-domain `font8x8_basic` table by Daniel Hepper
 //! (<https://github.com/dhepper/font8x8>), based on Marcel Sondaar's
 //! public-domain IBM VGA font. Each glyph is stored as eight rows; bit 0 of a
 //! row is the leftmost pixel.
+
+use crate::font_extended::GLYPHS;
 
 /// Font glyph width in pixels.
 pub const GLYPH_WIDTH: usize = 8;
@@ -143,12 +146,127 @@ pub const FONT8X8: [[u8; 8]; 128] = [
     [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // U+007F
 ];
 
-/// Returns the glyph for `ch`, falling back to `?` for non-ASCII characters.
+/// What's drawn for a character with no glyph: an empty box, so that it's plainly missing
+/// and not some other character.
+pub const MISSING: [u8; 8] = [0x7e, 0x42, 0x42, 0x42, 0x42, 0x42, 0x7e, 0x00];
+
+/// Returns the glyph for `ch`: ASCII from font8x8, what's beyond it from the table in
+/// `font_extended`, and [`MISSING`] for the rest, control characters included, so that
+/// nothing in a piece of text can be invisible. CJK and other wide scripts aren't there.
 pub fn glyph(ch: char) -> &'static [u8; 8] {
     let code = ch as u32;
     if code < 128 {
-        &FONT8X8[code as usize]
-    } else {
-        &FONT8X8[b'?' as usize]
+        if code < 0x20 || code == 0x7f {
+            return &MISSING;
+        }
+        return &FONT8X8[code as usize];
+    }
+    let Ok(code) = u16::try_from(code) else {
+        return &MISSING;
+    };
+    match GLYPHS.binary_search_by_key(&code, |entry| entry.0) {
+        Ok(index) => &GLYPHS[index].1,
+        Err(_) => &MISSING,
+    }
+}
+
+/// Whether a character has a glyph of its own.
+pub fn has_glyph(ch: char) -> bool {
+    !core::ptr::eq(glyph(ch), &MISSING)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    extern crate alloc;
+
+    #[test]
+    fn the_promised_blocks_have_every_glyph() {
+        let blocks = [
+            (0x20u32, 0x7eu32, "ASCII"),
+            (0xa0, 0xff, "Latin-1"),
+            (0x100, 0x17f, "Latin Extended-A"),
+            (0x391, 0x3a1, "Greek capitals"),
+            (0x3a3, 0x3a9, "Greek capitals"),
+            (0x3b1, 0x3c9, "Greek small"),
+            (0x400, 0x45f, "Cyrillic"),
+            (0x2500, 0x257f, "box drawing"),
+        ];
+        for (first, last, name) in blocks {
+            for code in first..=last {
+                let ch = char::from_u32(code).unwrap();
+                assert!(has_glyph(ch), "{name}: U+{code:04X} has no glyph");
+            }
+        }
+    }
+
+    #[test]
+    fn the_table_is_sorted_with_no_duplicates() {
+        assert!(GLYPHS.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    }
+
+    #[test]
+    fn letters_differ_from_their_neighbours() {
+        // Different letters of each script draw differently, and aren't blank.
+        for text in ["\u{3b1}\u{3b2}\u{3b3}", "\u{416}\u{434}\u{44f}", "\u{e9}\u{f1}\u{df}", "\u{114}\u{115}\u{174}"] {
+            let glyphs: [&[u8; 8]; 3] = core::array::from_fn(|index| glyph(text.chars().nth(index).unwrap()));
+            assert_ne!(glyphs[0], glyphs[1], "{text}");
+            assert_ne!(glyphs[1], glyphs[2], "{text}");
+            assert!(glyphs.iter().all(|glyph| glyph.iter().any(|row| *row != 0)), "{text}");
+        }
+    }
+
+    /// A letter of the block `first..=last`, by glyph, has to be unique within what it's
+    /// listed with. The source fonts this came from had most of Greek pointing at the wrong
+    /// bitmaps and every kind of box line the same, which having a glyph doesn't catch.
+    fn all_distinct(text: &str) {
+        let glyphs: alloc::vec::Vec<(char, &[u8; 8])> = text.chars().map(|ch| (ch, glyph(ch))).collect();
+        for (index, (ch, one)) in glyphs.iter().enumerate() {
+            for (other, two) in &glyphs[index + 1..] {
+                assert_ne!(one, two, "{ch} and {other} draw the same");
+            }
+        }
+    }
+
+    #[test]
+    fn scripts_have_a_glyph_each_and_box_weights_differ() {
+        all_distinct("\u{3b1}\u{3b2}\u{3b3}\u{3b4}\u{3b5}\u{3b6}\u{3b7}\u{3b8}\u{3b9}\u{3ba}\u{3bb}\u{3bc}\u{3bd}\u{3be}\u{3bf}\u{3c0}\u{3c1}\u{3c2}\u{3c3}\u{3c4}\u{3c5}\u{3c6}\u{3c7}\u{3c8}\u{3c9}");
+        all_distinct("\u{393}\u{394}\u{398}\u{39b}\u{39e}\u{3a0}\u{3a3}\u{3a6}\u{3a8}\u{3a9}ABEZHIKMNOPTYX");
+        all_distinct("\u{410}\u{411}\u{412}\u{413}\u{414}\u{415}\u{416}\u{417}\u{418}\u{419}\u{41a}\u{41b}\u{41c}\u{41d}\u{41e}\u{41f}\u{420}\u{421}\u{422}\u{423}\u{424}\u{425}\u{426}\u{427}\u{428}\u{429}\u{42a}\u{42b}\u{42c}\u{42d}\u{42e}\u{42f}");
+        all_distinct("\u{2500}\u{2501}\u{2550}\u{2502}\u{2503}\u{2551}\u{250c}\u{250f}\u{2554}\u{2552}\u{2553}\u{253c}\u{254b}\u{256c}\u{256a}\u{256b}");
+        // What's meant to look like a Latin letter does.
+        assert_eq!(glyph('\u{391}'), glyph('A'));
+        assert_eq!(glyph('\u{3bf}'), glyph('o'));
+    }
+
+    #[test]
+    fn box_lines_reach_the_edges_they_should_and_no_others() {
+        let row_has = |glyph: &[u8; 8], row: usize| glyph[row] != 0;
+        let column_has = |glyph: &[u8; 8], column: usize| glyph.iter().any(|row| row >> column & 1 != 0);
+        // Up, right, down, left. Bit 0 of a row is its leftmost pixel.
+        for (ch, up, right, down, left) in [
+            ('\u{2500}', false, true, false, true),
+            ('\u{2502}', true, false, true, false),
+            ('\u{250c}', false, true, true, false),
+            ('\u{2518}', true, false, false, true),
+            ('\u{2554}', false, true, true, false),
+            ('\u{255d}', true, false, false, true),
+            ('\u{253c}', true, true, true, true),
+            ('\u{2566}', false, true, true, true),
+        ] {
+            let glyph = glyph(ch);
+            assert_eq!(row_has(glyph, 0), up, "{ch} up");
+            assert_eq!(column_has(glyph, 7), right, "{ch} right");
+            assert_eq!(row_has(glyph, 7), down, "{ch} down");
+            assert_eq!(column_has(glyph, 0), left, "{ch} left");
+        }
+    }
+
+    #[test]
+    fn what_has_no_glyph_shows_as_missing() {
+        assert_eq!(glyph('\u{4e2d}'), &MISSING);
+        assert_eq!(glyph('\u{1f600}'), &MISSING);
+        assert_eq!(glyph('\u{1b}'), &MISSING);
+        assert_eq!(glyph(' '), &[0u8; 8]);
     }
 }

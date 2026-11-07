@@ -74,8 +74,10 @@ mod mpeg1_tables;
 pub mod pixel;
 mod raw;
 mod rle;
+pub mod vp8;
 
-pub use audio::{audio_track, AudioCodec, AudioPacket, AudioTrack};
+pub use audio::{audio_track, audio_track_from_source, AudioCodec, AudioPacket, AudioTrack};
+pub use feos_source::Source;
 pub use codec::Codec;
 pub use decoder::VideoDecoder;
 pub use error::{Result, VideoError};

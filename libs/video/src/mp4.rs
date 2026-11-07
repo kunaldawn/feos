@@ -234,12 +234,22 @@ fn parse_stbl<'a>(data: &'a [u8], stbl: BoxHeader) -> Result<Track<'a>> {
         if stsz.payload + 12 > stsz.end {
             return Err(VideoError::UnexpectedEnd);
         }
-        u32_at(data, stsz.payload + 8)?
+        // A count is only as good as what could hold it, as it goes straight into the
+        // duration: the table's entries, or for a fixed size, what the file has room for.
+        let fixed = u32_at(data, stsz.payload + 4)? as usize;
+        let room = if fixed != 0 {
+            (data.len() / fixed).max(1)
+        } else {
+            (stsz.end - stsz.payload - 12) / 4
+        };
+        u32_at(data, stsz.payload + 8)?.min(room.min(u32::MAX as usize) as u32)
     } else if let Some(stz2) = find_box(data, stbl.payload, stbl.end, b"stz2")? {
         if stz2.payload + 12 > stz2.end {
             return Err(VideoError::UnexpectedEnd);
         }
-        u32_at(data, stz2.payload + 8)?
+        let bits = (u32_at(data, stz2.payload + 4)? & 0xff).max(1) as usize;
+        let room = (stz2.end - stz2.payload - 12).saturating_mul(8) / bits;
+        u32_at(data, stz2.payload + 8)?.min(room.min(u32::MAX as usize) as u32)
     } else {
         0
     };
@@ -565,10 +575,20 @@ pub(crate) fn build_index(
     input: &[u8],
     limits: &DecoderLimits,
 ) -> Result<(Index, core::ops::Range<usize>)> {
+    build_index_sized(input, input.len(), limits)
+}
+
+/// [`build_index`] with only the metadata in memory: `input` is what
+/// [`source_head`] made of a file of `file_len` bytes.
+pub(crate) fn build_index_sized(
+    input: &[u8],
+    file_len: usize,
+    limits: &DecoderLimits,
+) -> Result<(Index, core::ops::Range<usize>)> {
     let track = find_video_track(input)?;
     let mut index = Index::default();
     if track.frame_count > 0 && !(track.fragmented && track.stbl_samples_absent(input)) {
-        index_stbl(input, &track, limits, &mut index)?;
+        index_stbl(input, file_len, &track, limits, &mut index)?;
     }
     if track.fragmented {
         let mut stats = FragmentStats::default();
@@ -618,6 +638,7 @@ impl Track<'_> {
 
 fn index_stbl(
     input: &[u8],
+    file_len: usize,
     track: &Track<'_>,
     limits: &DecoderLimits,
     index: &mut Index,
@@ -718,7 +739,7 @@ fn index_stbl(
             }
             let size = sample_size(sample)?;
             // Tolerate a file cut off inside its media data.
-            if offset.checked_add(size).map_or(true, |e| e > input.len()) {
+            if offset.checked_add(size).map_or(true, |e| e > file_len) {
                 break 'chunks;
             }
             let delta = stts.next(input);
@@ -745,7 +766,7 @@ fn index_stbl(
             }
             index.push(
                 limits,
-                input.len(),
+                file_len,
                 offset,
                 size,
                 ticks_to_ms(pts, track.timescale) + track.edit_delay_ms,
@@ -1001,6 +1022,7 @@ fn parse_esds(data: &[u8], esds: BoxHeader) -> Option<(u8, core::ops::Range<usiz
 /// `chunk_frame_bytes` says each sample is one PCM frame.
 fn audio_packets(
     input: &[u8],
+    file_len: usize,
     stbl: BoxHeader,
     timescale: u32,
     start_ticks: i64,
@@ -1050,7 +1072,7 @@ fn audio_packets(
                 break;
             }
             let size = count.checked_mul(frame_bytes)?;
-            push_packet(&mut packets, input.len(), offset, size, pts(ticks))?;
+            push_packet(&mut packets, file_len, offset, size, pts(ticks))?;
             for _ in 0..count {
                 ticks = ticks.saturating_add(times.next(input) as i64);
             }
@@ -1066,7 +1088,7 @@ fn audio_packets(
             } else {
                 u32_at(input, stsz.payload + 12 + sample * 4).ok()? as usize
             };
-            push_packet(&mut packets, input.len(), offset, size, pts(ticks))?;
+            push_packet(&mut packets, file_len, offset, size, pts(ticks))?;
             offset = offset.checked_add(size)?;
             ticks = ticks.saturating_add(times.next(input) as i64);
             sample += 1;
@@ -1077,6 +1099,11 @@ fn audio_packets(
 
 /// Finds the first audio track.
 pub(crate) fn audio_track(input: &[u8]) -> Option<AudioTrack> {
+    audio_track_sized(input, input.len())
+}
+
+/// [`audio_track`] with only the metadata in memory, as [`build_index_sized`].
+pub(crate) fn audio_track_sized(input: &[u8], file_len: usize) -> Option<AudioTrack> {
     let mut moov = None;
     let mut pos = 0;
     while let Some(header) = read_top_box(input, pos) {
@@ -1146,7 +1173,12 @@ pub(crate) fn audio_track(input: &[u8]) -> Option<AudioTrack> {
             b"fl64" => pcm(8, true, true),
             b"ulaw" => AudioCodec::MuLaw,
             b"alaw" => AudioCodec::ALaw,
-            b"Opus" => AudioCodec::Opus,
+            b"Opus" => {
+                if let Ok(Some(dops)) = find_box(input, first_child, entry.end, b"dOps") {
+                    config = dops.payload..dops.end;
+                }
+                AudioCodec::Opus
+            }
             _ => AudioCodec::Other,
         };
         // Edit lists delay or trim: an AAC encoder's priming is usually in there.
@@ -1168,7 +1200,7 @@ pub(crate) fn audio_track(input: &[u8]) -> Option<AudioTrack> {
             AudioCodec::MuLaw | AudioCodec::ALaw => Some(channels as usize),
             _ => None,
         };
-        let packets = audio_packets(input, stbl, timescale, start_ticks, frame_bytes)?;
+        let packets = audio_packets(input, file_len, stbl, timescale, start_ticks, frame_bytes)?;
         return Some(AudioTrack {
             codec,
             sample_rate: rate,
@@ -1178,4 +1210,81 @@ pub(crate) fn audio_track(input: &[u8]) -> Option<AudioTrack> {
         });
     }
     None
+}
+
+/// The largest `moov` read into memory. A sample table is about 10 bytes a frame.
+const MAX_HEAD: u64 = 24 * 1024 * 1024;
+
+/// A file's metadata, for one too large to read: its `ftyp` and `moov`, one after the
+/// other. Offsets in the sample tables are the file's, so they don't care where this
+/// `moov` ended up. Fragments keep their tables all over the file, and aren't handled.
+pub(crate) fn source_head(window: &mut feos_source::Window<'_>) -> Result<alloc::vec::Vec<u8>> {
+    let file_len = window.file_len();
+    let mut head = alloc::vec::Vec::new();
+    let mut pos = 0u64;
+    let mut read_box_into = |window: &mut feos_source::Window<'_>, at: u64, size: u64| -> Result<()> {
+        if (head.len() as u64).saturating_add(size) > MAX_HEAD {
+            return Err(VideoError::LimitExceeded("MP4 metadata is too large"));
+        }
+        let start = head.len();
+        head.try_reserve_exact(size as usize).map_err(|_| VideoError::OutOfMemory)?;
+        head.resize(start + size as usize, 0);
+        let mut done = 0u64;
+        while done < size {
+            let chunk = window.bytes(at + done, (size - done) as usize);
+            if chunk.is_empty() {
+                return Err(VideoError::UnexpectedEnd);
+            }
+            let count = chunk.len();
+            head[start + done as usize..start + done as usize + count].copy_from_slice(chunk);
+            done += count as u64;
+        }
+        Ok(())
+    };
+    let mut found = false;
+    while pos + 8 <= file_len {
+        let header = window.bytes(pos, 16);
+        if header.len() < 8 {
+            break;
+        }
+        let short = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as u64;
+        let kind = [header[4], header[5], header[6], header[7]];
+        let size = match short {
+            0 => file_len - pos,
+            1 => {
+                if header.len() < 16 {
+                    break;
+                }
+                u64::from_be_bytes(header[8..16].try_into().unwrap_or([0; 8]))
+            }
+            size => size,
+        };
+        if size < 8 || pos.saturating_add(size) > file_len && &kind != b"mdat" {
+            break;
+        }
+        match &kind {
+            b"ftyp" => read_box_into(window, pos, size)?,
+            b"moov" => {
+                read_box_into(window, pos, size)?;
+                found = true;
+            }
+            _ => {}
+        }
+        if found {
+            break;
+        }
+        pos = pos.saturating_add(size);
+    }
+    if !found {
+        return Err(VideoError::InvalidData("MP4 file has no moov"));
+    }
+    if is_fragmented(&head) {
+        return Err(VideoError::UnsupportedCodec("fragmented MP4 this large"));
+    }
+    Ok(head)
+}
+
+/// Whether a head's `moov` says the samples are in fragments.
+fn is_fragmented(head: &[u8]) -> bool {
+    find_video_track(head).is_ok_and(|track| track.fragmented)
 }

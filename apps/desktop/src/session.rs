@@ -10,7 +10,11 @@
 //! The console and pointer are polled, so this loop never blocks: the
 //! scheduler keeps running background applications while the desktop redraws.
 
+use core::fmt::Write as _;
+
+use feos_app::shell::Request;
 use feos_app::{shell, Platform};
+use feos_text::Text;
 use feos_console::println;
 use feos_desktop::{paint, CursorShape, DesktopResponse, StartMenuCommand};
 use feos_gfx::{Canvas, Point, Rect};
@@ -61,6 +65,7 @@ pub fn run_session(
 
     let mut config = super::load_config();
     super::restore_settings(&mut config, platform);
+    shell::publish_settings(config.settings_text().as_str());
 
     let mut input = Input::new();
     let mut keys = SerialKeys::new().with_ctrl_d_passthrough();
@@ -75,9 +80,18 @@ pub fn run_session(
         "[desktop] click Start, double-click desktop icons, drag windows; Ctrl-\\ returns to the shell"
     );
     super::prepare(&mut session, config, platform, true);
+    // A size chosen in an earlier session, if this display can still do it.
+    if let Some((width, height)) = config.resolution {
+        let current = display.as_ref().map(|front| (front.width(), front.height()));
+        if current != Some((usize::from(width), usize::from(height))) {
+            change_mode(&mut session, display, back, platform, width, height);
+        }
+    }
     if let Some(front) = display.as_ref() {
         super::provide_buffers(&mut session, front.width(), front.height());
     }
+    publish_modes();
+    publish_settings(&session, display, 0);
     // A retained session keeps the last frame in `back` and leaves the pointer
     // out of it. Drawing straight to the scanout has nowhere to keep a frame.
     session.set_retained(back.is_some());
@@ -98,11 +112,26 @@ pub fn run_session(
     }
     let mut cursor = SoftCursor::new();
     let mut scratch = Input::new();
+    // A new screen size waiting to be kept: the size to go back to, and when.
+    let mut pending_mode: Option<PendingMode> = None;
+    // Bumped when the published settings have to be read again though they read the same.
+    let mut settings_revision = 0u32;
+    let mut pending_mode_seconds = 0u32;
 
+    // The longest one frame took, and a stuck desktop is what it's reported for: the
+    // media boot test looks at it after reading large files from disk.
+    let mut longest_frame_ms = 0;
+    let mut frame_start = 0;
     loop {
+        let begun = platform.clock.uptime_ms();
+        if frame_start != 0 {
+            longest_frame_ms = longest_frame_ms.max(begun.saturating_sub(frame_start));
+        }
+        frame_start = begun;
         let now = platform.clock.uptime_ms();
         if keys.poll(now, &mut input) {
             println!();
+            println!("[desktop] longest frame {longest_frame_ms} ms");
             println!("[desktop] log off - returning to the serial shell");
             shell::set_session_active(false);
             return SessionExit::LogOff;
@@ -167,8 +196,60 @@ pub fn run_session(
         }
         let mut ran_foreground = false;
         while let Some(request) = shell::take_request() {
+            if let Request::Setting { key, value } = &request {
+                if key.as_str() == "resolution" {
+                    let previous = display.as_ref().map(|front| (front.width() as u16, front.height() as u16));
+                    if let (Some(previous), Some((width, height)), None) =
+                        (previous, parse_mode(value.as_str()), pending_mode)
+                    {
+                        if (width, height) != previous && change_mode(&mut session, display, back, platform, width, height) {
+                            cursor.forget();
+                            pending_mode = Some(PendingMode {
+                                previous,
+                                wanted: (width, height),
+                                deadline_ms: now + MODE_CONFIRM_MS,
+                            });
+                        } else {
+                            settings_revision += 1;
+                            publish_settings(&session, display, settings_revision);
+                        }
+                    }
+                }
+            }
             ran_foreground |= super::apply_request(&mut session, request, platform, display);
             dirty = true;
+        }
+
+        if let Some(pending) = pending_mode {
+            // The prompt goes on counting whether or not anyone's there to see it.
+            let left = pending.deadline_ms.saturating_sub(now).div_ceil(1000) as u32;
+            session.set_resolution_prompt(Some(left));
+            let answer = session.take_resolution_answer();
+            let expired = now >= pending.deadline_ms;
+            if answer == Some(true) {
+                pending_mode = None;
+                session.set_resolution_prompt(None);
+                let (width, height) = pending.wanted;
+                let mut value = Text::<16>::new();
+                let _ = write!(value, "{width}x{height}");
+                session.apply_setting("resolution", value.as_str());
+                println!("[desktop] display size kept: {width}x{height}");
+                dirty = true;
+            } else if answer == Some(false) || expired {
+                pending_mode = None;
+                session.set_resolution_prompt(None);
+                let (width, height) = pending.previous;
+                if change_mode(&mut session, display, back, platform, width, height) {
+                    cursor.forget();
+                    println!("[desktop] display size back to {width}x{height}");
+                }
+                settings_revision += 1;
+                publish_settings(&session, display, settings_revision);
+                dirty = true;
+            } else if left != pending_mode_seconds {
+                pending_mode_seconds = left;
+                dirty = true;
+            }
         }
 
         if !input.is_empty() {
@@ -233,6 +314,7 @@ pub fn run_session(
             };
             if session.take_settings_changed() {
                 super::save_settings(session.config(), platform);
+                publish_settings(&session, display, settings_revision);
             }
 
             // A foreground app paints directly into the scanout and only the
@@ -313,6 +395,71 @@ fn wants_exit(input: &Input, app_has_keyboard: bool) -> bool {
                 _ => false,
             }
     })
+}
+
+/// How long a new screen size has to be kept before it goes back by itself.
+const MODE_CONFIRM_MS: u64 = 15_000;
+
+/// A new screen size that hasn't been kept yet.
+#[derive(Clone, Copy)]
+struct PendingMode {
+    previous: (u16, u16),
+    wanted: (u16, u16),
+    deadline_ms: u64,
+}
+
+fn parse_mode(text: &str) -> Option<(u16, u16)> {
+    let (width, height) = text.split_once('x')?;
+    Some((width.parse().ok()?, height.parse().ok()?))
+}
+
+/// Tells the Settings app what this display can be set to.
+fn publish_modes() {
+    let mut text = Text::<128>::new();
+    for (width, height) in feos_hal::display::modes() {
+        let _ = write!(text, "{width}x{height} ");
+    }
+    shell::publish_display_modes(text.as_str());
+}
+
+/// Tells the Settings app what's set: the size that's on the screen, whatever was saved.
+fn publish_settings(session: &super::Session, display: &Option<Canvas<'static>>, revision: u32) {
+    let mut text = Text::<256>::new();
+    let mut config = *session.config();
+    if let Some(front) = display.as_ref() {
+        config.resolution = Some((front.width() as u16, front.height() as u16));
+    }
+    let _ = write!(text, "{}revision: {revision}\n", config.settings_text().as_str());
+    shell::publish_settings(text.as_str());
+}
+
+/// Changes the screen size: the mode, the two canvases, the pointer's range, and what the
+/// session thinks. `false`, with nothing changed, when the display can't.
+fn change_mode(
+    session: &mut super::Session,
+    display: &mut Option<Canvas<'static>>,
+    back: &mut Option<Canvas<'static>>,
+    platform: &Platform,
+    width: u16,
+    height: u16,
+) -> bool {
+    let Some(buffers) = feos_hal::display::set_mode(u32::from(width), u32::from(height)) else {
+        println!("[desktop] can't set the display to {width}x{height}");
+        return false;
+    };
+    let (columns, rows) = (usize::from(width), usize::from(height));
+    *display = Canvas::new(buffers.front, columns, rows, columns);
+    *back = Canvas::new(buffers.back, columns, rows, columns);
+    // Nothing's looking at the old pixels now.
+    feos_hal::display::release_old_mode();
+    if let Some(pointer) = platform.pointer {
+        pointer.set_screen(width, height);
+    }
+    session.screen_changed(columns, rows);
+    super::replace_buffers(session, columns, rows);
+    feos_hal::display::flush(0, 0, u32::from(width), u32::from(height));
+    println!("[desktop] display now {width}x{height}");
+    true
 }
 
 /// The pointer, drawn on the scanout over the composed frame.

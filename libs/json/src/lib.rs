@@ -33,12 +33,14 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+mod builder;
 mod document;
 mod encode;
 mod error;
 mod parser;
 mod string;
 
+pub use builder::{BuildError, JsonBuilder, SliceOutput};
 pub use document::{JsonDocument, JsonNode};
 pub use encode::{write_json, write_json_pretty};
 pub use error::{JsonError, Result};

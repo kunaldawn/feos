@@ -1,0 +1,9 @@
+[package]
+name = "feos-opus"
+description = "An Opus decoder: the pure-Rust opus-decoder crate, adapted for no_std"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]

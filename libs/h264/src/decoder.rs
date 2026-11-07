@@ -59,6 +59,8 @@ pub struct Frame {
     /// The value of [`Decoder::set_tag`] when this picture's first slice was
     /// decoded. Lets a demuxer tie output frames back to container samples.
     pub tag: u64,
+    /// Macroblocks that no slice delivered, filled in from an earlier picture.
+    pub concealed_mbs: u32,
 }
 
 impl Frame {
@@ -197,6 +199,8 @@ struct MbScratch {
     mb_chroma_pred: Vec<u8>,
     mb_is_8x8dct: Vec<bool>,
     mb_skip: Vec<bool>,
+    /// Macroblocks that decoded, so that the rest can be concealed.
+    mb_done: Vec<bool>,
     mb_is_direct: Vec<bool>,
     blk_is_direct: Vec<bool>,
     is_i16x16: Vec<bool>,
@@ -221,6 +225,7 @@ impl MbScratch {
         refill(&mut self.mb_chroma_pred, 0u8, total_mbs)?;
         refill(&mut self.mb_is_8x8dct, false, total_mbs)?;
         refill(&mut self.mb_skip, false, total_mbs)?;
+        refill(&mut self.mb_done, false, total_mbs)?;
         refill(&mut self.mb_is_direct, false, total_mbs)?;
         refill(&mut self.blk_is_direct, false, total_mbs * 16)?;
         refill(&mut self.is_i16x16, false, total_mbs)?;
@@ -257,6 +262,8 @@ struct PictureState {
     /// Luma columns and rows hidden by the SPS crop.
     crop_x: u32,
     crop_y: u32,
+    /// Where the last slice started.
+    last_first_mb: u32,
     /// True if this picture uses MBAFF (mb_adaptive_frame_field_flag && !field_pic_flag).
     mbaff_frame_flag: bool,
     tag: u64,
@@ -397,7 +404,9 @@ impl Decoder {
                 // Check if this is a new picture: first_mb==0 means first
                 // slice of a new picture. Continuation slices (first_mb > 0)
                 // belong to the same picture even for IDR NALs.
-                let is_new_picture = first_mb == 0;
+                // A lost first slice mustn't merge what's left of this picture into the
+                // last one, so frame_num and the rest of 7.4.1.2.4's easy tests count too.
+                let is_new_picture = first_mb == 0 || self.starts_new_picture(nal, first_mb);
 
                 // Finalize pending frame if a new picture starts
                 let prev_frame = if is_new_picture {
@@ -471,8 +480,88 @@ impl Decoder {
     }
 
     /// Finalize the pending picture: apply deblocking, insert into DPB, return frame.
+    /// Whether a slice that doesn't start at the first macroblock belongs to a picture
+    /// other than the one in progress.
+    fn starts_new_picture(&self, nal: &NalUnit, first_mb: u32) -> bool {
+        let Some(pending) = self.pending.as_ref() else {
+            return true;
+        };
+        if first_mb <= pending.last_first_mb {
+            return true;
+        }
+        let mut peek = BitstreamReader::new(&nal.rbsp);
+        let _ = peek.read_ue();
+        let _ = peek.read_ue();
+        let Ok(pps_id) = peek.read_ue() else {
+            return false;
+        };
+        let Some(pps) = self.pps_table.get(&pps_id) else {
+            return false;
+        };
+        let Some(sps) = self.sps_table.get(&pps.seq_parameter_set_id) else {
+            return false;
+        };
+        let Ok(frame_num) = peek.read_bits(sps.log2_max_frame_num_minus4 as u8 + 4) else {
+            return false;
+        };
+        frame_num != pending.frame_num
+            || (nal.nal_ref_idc == 0) != (pending.nal_ref_idc == 0)
+            || (nal.nal_unit_type == NalUnitType::SliceIdr)
+                != (pending.nal_unit_type == NalUnitType::SliceIdr)
+    }
+
+    /// Fills in the macroblocks no slice delivered, from the most recent reference
+    /// picture, so that damage looks like a moment's stutter in part of the picture. With
+    /// nothing to copy from, it's mid-grey. Later pictures predict from this as they would
+    /// from anything else, so the damage fades only as they replace it.
+    fn conceal_missing(&mut self, ps: &mut PictureState) -> u32 {
+        let total = ps.mb_width as usize * ps.mb_height as usize;
+        let missing = ps.scratch.mb_done.iter().take(total).filter(|&&done| !done).count();
+        if missing == 0 {
+            return 0;
+        }
+        let (width, height) = (ps.mb_width as usize * 16, ps.mb_height as usize * 16);
+        let max_frame_num = self.dpb.max_frame_num();
+        let source = self
+            .dpb
+            .short_term_ref_list(ps.frame_num, max_frame_num)
+            .into_iter()
+            .find(|picture| picture.width as usize == width && picture.height as usize == height);
+        for mb in 0..total {
+            if ps.scratch.mb_done[mb] {
+                continue;
+            }
+            let (x, y) = (mb % ps.mb_width as usize, mb / ps.mb_width as usize);
+            for row in 0..16 {
+                let at = (y * 16 + row) * width + x * 16;
+                let out = &mut ps.frame.y[at..at + 16];
+                match &source {
+                    Some(picture) => out.copy_from_slice(&picture.y[at..at + 16]),
+                    None => out.fill(128),
+                }
+            }
+            for row in 0..8 {
+                let at = (y * 8 + row) * (width / 2) + x * 8;
+                for (out, from) in [
+                    (&mut ps.frame.u, source.as_ref().map(|picture| &picture.u)),
+                    (&mut ps.frame.v, source.as_ref().map(|picture| &picture.v)),
+                ] {
+                    let out = &mut out[at..at + 8];
+                    match from {
+                        Some(from) => out.copy_from_slice(&from[at..at + 8]),
+                        None => out.fill(128),
+                    }
+                }
+            }
+            // No filtering across what never decoded: its edges aren't block edges.
+            ps.scratch.mb_info[mb] = deblock::MbInfo::concealed();
+        }
+        missing as u32
+    }
+
     fn finalize_pending(&mut self) -> Option<Frame> {
         let mut ps = self.pending.take()?;
+        let concealed = self.conceal_missing(&mut ps);
 
         // Apply deblocking filter
         deblock::filter_frame(
@@ -557,6 +646,7 @@ impl Decoder {
             poc_reset,
             is_idr,
             tag: ps.tag,
+            concealed_mbs: concealed,
         };
         let pic = Arc::new(DecodedPicture {
             y: full_y,
@@ -849,6 +939,7 @@ impl Decoder {
                 crop_y: sps.crop_top(),
                 mbaff_frame_flag: header.mbaff_frame_flag,
                 tag: self.tag,
+                last_first_mb: 0,
             }
         };
 
@@ -876,6 +967,7 @@ impl Decoder {
             mb_chroma_pred,
             mb_is_8x8dct,
             mb_skip,
+            mb_done,
             mb_is_direct,
             blk_is_direct,
             is_i16x16,
@@ -1020,6 +1112,10 @@ impl Decoder {
                 break;
             }
 
+            // The macroblock before this one in the slice finished, or this wouldn't be here.
+            if mb_idx > 0 && mb_slice_id[mb_idx - 1] == this_slice_id {
+                mb_done[mb_idx - 1] = true;
+            }
             // Stamp this MB with the current slice ID for boundary detection
             mb_slice_id[mb_idx] = this_slice_id;
             // Compute pixel position
@@ -1143,6 +1239,10 @@ impl Decoder {
 
             Ok(())
         })();
+        // The slice's last macroblock, if it ended cleanly.
+        if slice_result.is_ok() && mb_idx > 0 && mb_slice_id[mb_idx - 1] == this_slice_id {
+            mb_done[mb_idx - 1] = true;
+        }
 
         // Post-loop: fill deblock info and ref POC table
         let first_mb = if mbaff {
@@ -1155,6 +1255,7 @@ impl Decoder {
         }
 
         // Deblocking and DPB insertion happen in finalize_pending().
+        ps.last_first_mb = header.first_mb_in_slice;
         ps.frame_num = header.frame_num;
         ps.poc = current_poc;
         ps.nal_unit_type = nal.nal_unit_type;
@@ -1174,13 +1275,9 @@ impl Decoder {
                 Ok(())
             }
             Err(e) => {
-                // A continuation slice keeps the macroblocks earlier slices
-                // decoded; a failed first slice leaves nothing worth showing.
-                if is_continuation {
-                    self.pending = Some(ps);
-                } else {
-                    self.scratch_pool = Some(ps.scratch);
-                }
+                // What's decoded so far stays, and the rest gets concealed. A failed first
+                // slice leaves all of it to conceal, which is still a picture on time.
+                self.pending = Some(ps);
                 Err(e)
             }
         }

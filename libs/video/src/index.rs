@@ -37,11 +37,13 @@ impl Default for DecoderLimits {
 pub(crate) const FLAG_KEY: u8 = 1;
 /// The sample carries H.264 parameter sets that later frames may rely on.
 pub(crate) const FLAG_PARAMS: u8 = 2;
+/// A stream's key frame that has been read, and found to really be one.
+pub(crate) const FLAG_CHECKED: u8 = 4;
 
 /// One coded frame.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Sample {
-    pub offset: u32,
+    pub offset: u64,
     pub size: u32,
     /// Presentation time in milliseconds, or a raw value before
     /// [`Index::finish_timing`].
@@ -90,7 +92,7 @@ impl Index {
         if end > input_len {
             return Err(VideoError::UnexpectedEnd);
         }
-        let (Ok(offset), Ok(size)) = (u32::try_from(offset), u32::try_from(size)) else {
+        let (offset, Ok(size)) = (offset as u64, u32::try_from(size)) else {
             return Err(VideoError::LimitExceeded("file too large"));
         };
         let pts_ms = pts_ms.clamp(i32::MIN as i64, i32::MAX as i64) as i32;

@@ -65,6 +65,26 @@ fn extended_rate(bytes: &[u8]) -> u32 {
 }
 
 fn parse(input: &[u8]) -> Result<Format> {
+    parse_sized(input, input.len())
+}
+
+/// See [`crate::wav::layout`].
+pub(crate) fn layout(head: &[u8], file_len: usize) -> Result<(AudioInfo, usize, usize, usize)> {
+    let format = parse_sized(head, file_len)?;
+    Ok((
+        AudioInfo {
+            sample_rate: format.sample_rate,
+            channels: format.channels,
+            frames: format.frames as u64,
+            format: AudioFormat::Aiff,
+        },
+        format.data_offset,
+        format.data_len,
+        (format.channels as usize * (format.bits as usize).div_ceil(8)).max(1),
+    ))
+}
+
+fn parse_sized(input: &[u8], file_len: usize) -> Result<Format> {
     if input.len() < 12 || &input[..4] != b"FORM" {
         return Err(AudioError::UnknownFormat);
     }
@@ -119,7 +139,7 @@ fn parse(input: &[u8]) -> Result<Format> {
             }
             let data_len = size
                 .saturating_sub(8 + offset)
-                .min(input.len() - data_start);
+                .min(file_len - data_start);
             ssnd = Some((data_start, data_len));
         }
         pos = end + (size & 1);

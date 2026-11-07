@@ -83,6 +83,8 @@ feos-shell = { path = "apps/shell" }
 feos-sync = { path = "libs/sync" }
 feos-text = { path = "libs/text" }
 feos-video = { path = "libs/video" }
+feos-source = { path = "libs/source" }
+feos-opus = { path = "libs/opus" }
 feos-yaml = { path = "libs/yaml" }
 
 # A kernel cannot unwind. These profiles apply to every workspace crate.
@@ -117,6 +119,12 @@ opt-level = 3
 opt-level = 3
 
 [profile.release.package.feos-mixer]
+opt-level = 3
+
+[profile.release.package.feos-opus]
+opt-level = 3
+
+[profile.release.package.feos-video]
 opt-level = 3
 
 [profile.release.package.feos-h264]

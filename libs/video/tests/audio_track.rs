@@ -109,3 +109,92 @@ fn garbage_in_a_container_gives_no_track_and_no_panic() {
         }
     }
 }
+
+/// An MPEG-1 program stream's sound, against ffmpeg's decoding of the same file.
+#[test]
+fn program_stream_mp2() {
+    use feos_audio_codec::{PacketDecoder, PacketFormat};
+    const MPG: &[u8] = include_bytes!("data/av-mp2.mpg");
+    const REFERENCE: &[u8] = include_bytes!("data/av-mp2.mpg.s16");
+
+    checked(MPG, AudioCodec::MpegSplit, 44_100, 2, 2000);
+    let track = audio_track(MPG).unwrap();
+    let mut decoder = PacketDecoder::new(PacketFormat::Mp3Split, 44_100, 2).unwrap();
+    let mut out = vec![0i16; decoder.typical_samples()];
+    let mut pcm = Vec::new();
+    for index in 0..track.packets.len() {
+        let frames = decoder.decode(track.packet(MPG, index).unwrap(), &mut out).unwrap();
+        pcm.extend_from_slice(&out[..frames * 2]);
+    }
+    let reference: Vec<i16> = REFERENCE
+        .chunks_exact(2)
+        .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]))
+        .collect();
+    assert!(
+        pcm.len().abs_diff(reference.len()) <= 2304,
+        "{} samples against {}",
+        pcm.len(),
+        reference.len()
+    );
+    let mut worst = 0;
+    for (a, b) in pcm.iter().zip(&reference) {
+        worst = worst.max((*a as i32 - *b as i32).abs());
+    }
+    assert!(worst <= 2, "differs from ffmpeg by up to {worst}");
+}
+
+/// A packet that doesn't fit is asked about again, and gives what it would have.
+#[test]
+fn split_frames_survive_a_short_buffer() {
+    use feos_audio_codec::{AudioError, PacketDecoder, PacketFormat};
+    const MPG: &[u8] = include_bytes!("data/av-mp2.mpg");
+    let track = audio_track(MPG).unwrap();
+    let mut decoder = PacketDecoder::new(PacketFormat::Mp3Split, 44_100, 2).unwrap();
+    let mut tiny = vec![0i16; 16];
+    let mut enough = vec![0i16; 1 << 16];
+    let mut total = 0;
+    for index in 0..track.packets.len() {
+        let packet = track.packet(MPG, index).unwrap();
+        match decoder.decode(packet, &mut tiny) {
+            Err(AudioError::BufferTooSmall { .. }) => {
+                total += decoder.decode(packet, &mut enough).unwrap();
+            }
+            Ok(frames) => total += frames,
+            Err(error) => panic!("{error:?}"),
+        }
+    }
+    assert!(total > 80_000);
+}
+
+#[test]
+fn an_elementary_stream_has_no_sound() {
+    assert!(audio_track(include_bytes!("../../../boards/qemu-virt/fs/media/mpeg1-sample.mpg")).is_none());
+}
+
+/// Opus in WebM, against libopus: the packet path a video's sound goes down.
+#[test]
+fn webm_opus() {
+    use feos_audio_codec::{PacketDecoder, PacketFormat};
+    const WEBM: &[u8] = include_bytes!("data/av-opus.webm");
+    const REFERENCE: &[u8] = include_bytes!("data/av-opus.webm.s16");
+    let track = audio_track(WEBM).unwrap();
+    assert_eq!(track.codec, AudioCodec::Opus);
+    assert!(WEBM[track.config.clone()].starts_with(b"OpusHead"));
+    let mut decoder =
+        PacketDecoder::new(PacketFormat::Opus(&WEBM[track.config.clone()]), 48_000, 1).unwrap();
+    assert_eq!(decoder.sample_rate(), 48_000);
+    let channels = decoder.channels() as usize;
+    let mut out = vec![0i16; decoder.typical_samples()];
+    let mut pcm = Vec::new();
+    for index in 0..track.packets.len() {
+        let frames = decoder.decode(track.packet(WEBM, index).unwrap(), &mut out).unwrap();
+        pcm.extend_from_slice(&out[..frames * channels]);
+    }
+    let reference: Vec<i16> = REFERENCE
+        .chunks_exact(2)
+        .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]))
+        .collect();
+    assert!(pcm.len().abs_diff(reference.len()) <= 960 * channels, "{} and {}", pcm.len(), reference.len());
+    let worst = pcm.iter().zip(&reference).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
+    assert!(worst <= 1, "differs from libopus by up to {worst}");
+}

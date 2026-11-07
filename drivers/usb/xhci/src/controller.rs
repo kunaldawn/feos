@@ -577,6 +577,18 @@ impl Xhci {
         POINTER_QUEUE.lock().pop()
     }
 
+    /// The screen has changed size.
+    pub fn set_screen(&self, width: u16, height: u16) {
+        let mut inner = self.inner.lock();
+        for hid in inner.hid.iter_mut() {
+            if let HidKind::Pointer(state) = &mut hid.kind {
+                state.set_screen(width, height);
+            }
+        }
+        let (x, y) = inner.pointer_at;
+        inner.pointer_at = (x.min(width.max(1) - 1), y.min(height.max(1) - 1));
+    }
+
     /// Where the cursor is.
     pub fn pointer_position(&self) -> (u16, u16) {
         self.inner.lock().pointer_at

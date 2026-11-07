@@ -117,6 +117,17 @@ pub fn read_line(shell: &mut Shell<'_>, host: &mut dyn Host, io: &mut Io<'_>) ->
             1
         } else if decoder.is_pending() {
             io.stdin.read_pending(&mut byte)
+        } else if shell.catches_signals() && io.stdin.is_terminal() {
+            // A trap has to fire at the prompt too, so this can't sleep until a key.
+            let got = io.stdin.read_pending(&mut byte);
+            if got == 0 {
+                shell.poll_signals(io, host);
+                if shell.exit_requested.is_some() {
+                    return ReadResult::Eof;
+                }
+                continue;
+            }
+            got
         } else {
             io.stdin.read_raw(&mut byte)
         };
@@ -166,7 +177,7 @@ pub fn read_line(shell: &mut Shell<'_>, host: &mut dyn Host, io: &mut Io<'_>) ->
                 EditEvent::Candidates(candidates) => {
                     finish_line(io, &editor, shell, cols, row);
                     for candidate in &candidates {
-                        io.stdout.write(candidate.as_bytes());
+                        io.stdout.write(feos_text::display_name(candidate).as_bytes());
                         io.stdout.write(b"  ");
                     }
                     io.stdout.write(b"\n");

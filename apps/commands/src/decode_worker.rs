@@ -16,16 +16,18 @@
 //!   discarded when it next looks. A window can also reopen while an old worker
 //!   is still on its way out: the old one no longer owns the pipe and leaves.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use feos_app::{App, Context};
 use feos_fs::{FileSystem, NodeId};
 use feos_sync::Mutex;
 use feos_video::{
-    info as video_info, DecodedFrame, DecoderLimits, VideoDecoder, VideoError, VideoInfo,
+    info as video_info, DecodedFrame, DecoderLimits, Source, VideoDecoder, VideoError, VideoInfo,
 };
 
-/// Largest file the player reads into memory.
+/// Largest file the player reads into memory. One larger stays where it is, and is
+/// read a sample at a time: see [`FileSource`].
 pub const MAX_MEDIA_BYTES: usize = 16 * 1024 * 1024;
 /// Largest decoded frame: 1920x1088 in RGBA.
 pub const MAX_FRAME_BYTES: usize = 1920 * 1088 * 4;
@@ -73,8 +75,6 @@ pub enum Failure {
     Video(VideoError),
     /// The file couldn't be read, or memory for it ran out.
     Unreadable,
-    /// The file is larger than [`MAX_MEDIA_BYTES`].
-    TooLarge,
     /// The file's first frame is larger than [`MAX_FRAME_BYTES`].
     FrameTooLarge,
     /// The codec is known, but no decoder exists for it.
@@ -333,6 +333,8 @@ pub struct Worker {
     requested: bool,
     buffer: Vec<u8>,
     rgba_len: usize,
+    /// A frame of this file has been decoded, which the boot test looks for.
+    first_shown: bool,
 }
 
 impl Worker {
@@ -347,11 +349,12 @@ impl Worker {
             requested: false,
             buffer: Vec::new(),
             rgba_len: 0,
+            first_shown: false,
         }
     }
 
     /// Does one short piece of work: at most one file open or one sample.
-    pub fn step(&mut self, pipe: &Pipe, fs: &dyn FileSystem) -> Step {
+    pub fn step(&mut self, pipe: &Pipe, fs: &'static dyn FileSystem) -> Step {
         let mut to_open = None;
         let mut stale = None;
         let mut skip_to = None;
@@ -407,9 +410,18 @@ impl Worker {
         self.decode_next(pipe, skip_to)
     }
 
-    fn open(&mut self, pipe: &Pipe, fs: &dyn FileSystem, node: NodeId) {
+    fn open(&mut self, pipe: &Pipe, fs: &'static dyn FileSystem, node: NodeId) {
         match open_file(fs, node) {
             Ok((decoder, opened)) => {
+                feos_console::println!(
+                    "[player] opened {} {}x{}, {} frames, {} ms",
+                    opened.info.codec.name(),
+                    opened.info.width,
+                    opened.info.height,
+                    opened.frame_count,
+                    opened.duration_ms
+                );
+                self.first_shown = false;
                 self.rgba_len = opened.rgba_len;
                 self.decoder = Some(decoder);
                 let mut inner = pipe.inner.lock();
@@ -454,6 +466,10 @@ impl Worker {
         };
         match decoder.advance(target, &mut self.buffer, 1) {
             Ok(Some(frame)) => {
+                if !self.first_shown {
+                    self.first_shown = true;
+                    feos_console::println!("[player] first frame decoded");
+                }
                 self.next = frame.index.saturating_add(1);
                 let requested = core::mem::take(&mut self.requested);
                 let rgba = core::mem::take(&mut self.buffer);
@@ -523,15 +539,26 @@ impl Worker {
 }
 
 fn open_file(
-    fs: &dyn FileSystem,
+    fs: &'static dyn FileSystem,
     node: NodeId,
 ) -> Result<(VideoDecoder<Vec<u8>>, Opened), Failure> {
     let size = fs.size(node);
-    if size > MAX_MEDIA_BYTES {
-        return Err(Failure::TooLarge);
-    }
-    let data = read_file(fs, node, size).ok_or(Failure::Unreadable)?;
-    let info = video_info(&data).map_err(Failure::Video)?;
+    let decoder = if size > MAX_MEDIA_BYTES {
+        let file = Box::new(FileSource::new(fs, node));
+        VideoDecoder::from_source(file, DECODER_LIMITS).map_err(Failure::Video)?
+    } else {
+        let data = read_file(fs, node, size).ok_or(Failure::Unreadable)?;
+        // Checked before the index is built, which is all that's needed to refuse it.
+        let info = video_info(&data).map_err(Failure::Video)?;
+        if !info.can_decode() {
+            return Err(Failure::NoDecoder(info));
+        }
+        if info.rgba_len().map_err(Failure::Video)? > MAX_FRAME_BYTES {
+            return Err(Failure::FrameTooLarge);
+        }
+        VideoDecoder::with_limits(data, DECODER_LIMITS).map_err(Failure::Video)?
+    };
+    let info = *decoder.info();
     if !info.can_decode() {
         return Err(Failure::NoDecoder(info));
     }
@@ -539,7 +566,6 @@ fn open_file(
     if rgba_len > MAX_FRAME_BYTES {
         return Err(Failure::FrameTooLarge);
     }
-    let decoder = VideoDecoder::with_limits(data, DECODER_LIMITS).map_err(Failure::Video)?;
     let opened = Opened {
         info,
         frame_count: decoder.frame_count(),
@@ -547,6 +573,42 @@ fn open_file(
         rgba_len,
     };
     Ok((decoder, opened))
+}
+
+/// Reads a file where it lies, for one too large to hold.
+pub struct FileSource {
+    fs: &'static dyn FileSystem,
+    node: NodeId,
+    len: u64,
+}
+
+impl FileSource {
+    /// How much a read asks for at once. Filesystem locks are held for a read, so
+    /// this also bounds what anything else on the disk waits for.
+    const MAX_READ: usize = 256 * 1024;
+
+    /// The file at `node`.
+    pub fn new(fs: &'static dyn FileSystem, node: NodeId) -> Self {
+        Self {
+            fs,
+            node,
+            len: fs.size(node) as u64,
+        }
+    }
+}
+
+impl Source for FileSource {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> usize {
+        let Ok(offset) = usize::try_from(offset) else {
+            return 0;
+        };
+        let count = out.len().min(Self::MAX_READ);
+        self.fs.read(self.node, offset, &mut out[..count])
+    }
 }
 
 /// Reads a whole file, or returns `None` if it's too large or memory is short.

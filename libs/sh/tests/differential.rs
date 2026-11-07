@@ -70,10 +70,14 @@ fn available(shell: &str) -> bool {
 }
 
 fn compare(shell: &str, scripts: &[&str]) {
+    // Tests run in parallel and may pick the same shell, so the directory name
+    // must be unique per script run, not per shell and index.
+    static NEXT_DIRECTORY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let mut failures = Vec::new();
-    for (index, script) in scripts.iter().enumerate() {
+    for script in scripts {
+        let unique = NEXT_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let directory = std::env::temp_dir().join(format!(
-            "feos-diff-{}-{shell}-{index}",
+            "feos-diff-{}-{shell}-{unique}",
             std::process::id()
         ));
         std::fs::create_dir_all(&directory).unwrap();

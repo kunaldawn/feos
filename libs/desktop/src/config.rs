@@ -43,6 +43,72 @@ impl WallpaperStyle {
     }
 }
 
+/// A wallpaper the Settings app can choose.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum WallpaperPreset {
+    /// Whatever goes with the colour scheme.
+    #[default]
+    Scheme,
+    /// A blue sky gradient.
+    Sky,
+    /// A plain teal, as a classic desktop.
+    Teal,
+    /// A dark grey gradient.
+    Graphite,
+    /// A dark grid.
+    Grid,
+}
+
+impl WallpaperPreset {
+    /// Every preset, in menu order.
+    pub const ALL: [Self; 5] = [Self::Scheme, Self::Sky, Self::Teal, Self::Graphite, Self::Grid];
+
+    /// The name saved and shown.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Scheme => "scheme",
+            Self::Sky => "sky",
+            Self::Teal => "teal",
+            Self::Graphite => "graphite",
+            Self::Grid => "grid",
+        }
+    }
+
+    /// Parses [`name`](Self::name).
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|preset| preset.name() == value)
+    }
+
+    /// What it looks like, given the colour scheme.
+    pub fn wallpaper(self, theme: ThemeName) -> WallpaperConfig {
+        match self {
+            Self::Scheme => {
+                let palette = theme.palette();
+                WallpaperConfig {
+                    style: WallpaperStyle::Gradient,
+                    top: palette.wallpaper_top,
+                    bottom: palette.wallpaper_bottom,
+                    grid: palette.wallpaper_grid,
+                }
+            }
+            Self::Sky => WallpaperConfig::xp_blue(),
+            Self::Teal => WallpaperConfig {
+                style: WallpaperStyle::Solid,
+                top: Color::rgb(0, 128, 128),
+                bottom: Color::rgb(0, 128, 128),
+                grid: Color::rgb(0, 128, 128),
+            },
+            Self::Graphite => WallpaperConfig {
+                style: WallpaperStyle::Gradient,
+                top: Color::rgb(70, 74, 80),
+                bottom: Color::rgb(28, 30, 34),
+                grid: Color::rgb(70, 74, 80),
+            },
+            Self::Grid => WallpaperConfig::dark(),
+        }
+    }
+}
+
 /// Wallpaper colours and style.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct WallpaperConfig {
@@ -269,6 +335,10 @@ pub struct DesktopConfig {
     pub init: InitConfig,
     /// Layout applied to the virtio keyboard.
     pub keyboard_layout: KeyboardLayout,
+    /// The wallpaper chosen in Settings.
+    pub wallpaper_preset: WallpaperPreset,
+    /// The screen size chosen in Settings, when it isn't what the board starts with.
+    pub resolution: Option<(u16, u16)>,
 }
 
 impl DesktopConfig {
@@ -284,11 +354,31 @@ impl DesktopConfig {
                 "theme" => {
                     if let Some(theme) = ThemeName::parse(value.trim()) {
                         self.theme = theme;
+                        // The scheme brings its wallpaper unless one was chosen.
+                        self.wallpaper = self.wallpaper_preset.wallpaper(theme);
                     }
                 }
                 "keyboard" => {
                     if let Some(layout) = KeyboardLayout::parse(value.trim()) {
                         self.keyboard_layout = layout;
+                    }
+                }
+                "wallpaper" => {
+                    if let Some(preset) = WallpaperPreset::parse(value.trim()) {
+                        self.wallpaper_preset = preset;
+                        self.wallpaper = preset.wallpaper(self.theme);
+                    }
+                }
+                "clock" => match value.trim() {
+                    "24" => self.taskbar.clock_24h = true,
+                    "12" => self.taskbar.clock_24h = false,
+                    _ => {}
+                },
+                "resolution" => {
+                    if let Some((width, height)) = value.trim().split_once('x') {
+                        if let (Ok(width), Ok(height)) = (width.parse(), height.parse()) {
+                            self.resolution = Some((width, height));
+                        }
                     }
                 }
                 _ => {}
@@ -298,14 +388,19 @@ impl DesktopConfig {
 
     /// The settings that survive a reboot, in the form
     /// [`apply_settings`](Self::apply_settings) reads.
-    pub fn settings_text(&self) -> Text<96> {
+    pub fn settings_text(&self) -> Text<160> {
         let mut text = Text::new();
         let _ = write!(
             text,
-            "theme: {}\nkeyboard: {}\n",
+            "theme: {}\nkeyboard: {}\nwallpaper: {}\nclock: {}\n",
             self.theme.name(),
-            self.keyboard_layout.name()
+            self.keyboard_layout.name(),
+            self.wallpaper_preset.name(),
+            if self.taskbar.clock_24h { 24 } else { 12 },
         );
+        if let Some((width, height)) = self.resolution {
+            let _ = write!(text, "resolution: {width}x{height}\n");
+        }
         text
     }
 
@@ -324,6 +419,8 @@ impl DesktopConfig {
             extension_count: 0,
             init: InitConfig::new(),
             keyboard_layout: KeyboardLayout::Us,
+            wallpaper_preset: WallpaperPreset::Scheme,
+            resolution: None,
         }
     }
 

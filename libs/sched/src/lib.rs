@@ -467,6 +467,20 @@ impl<const TASKS: usize, const CPUS: usize> Table<TASKS, CPUS> {
         }
     }
 
+    /// Wakes `pid` if it's blocked, whatever for: waits may always wake spuriously.
+    pub fn wake_pid(&mut self, pid: u32) -> bool {
+        let Some(slot) = self.find_pid(pid) else {
+            return false;
+        };
+        let task = &mut self.tasks[slot];
+        if task.state != State::Blocked {
+            return false;
+        }
+        task.state = State::Ready;
+        task.wait = Wait::Nothing;
+        true
+    }
+
     /// Wakes up to `count` tasks blocked on `key` and returns how many woke.
     pub fn wake_key(&mut self, key: usize, count: usize) -> usize {
         let mut woken = 0;

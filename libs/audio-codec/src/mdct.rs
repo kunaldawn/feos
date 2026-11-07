@@ -67,7 +67,7 @@ fn mul_q31(a: i32, b: i32) -> i32 {
 /// `(ar + i ai)(br + i bi)` in Q31. The twiddle `b` has magnitude at most one,
 /// so the sums of products cannot overflow an `i64`.
 #[inline]
-fn cmul(ar: i32, ai: i32, br: i32, bi: i32) -> (i32, i32) {
+pub(crate) fn cmul(ar: i32, ai: i32, br: i32, bi: i32) -> (i32, i32) {
     let (ar, ai, br, bi) = (ar as i64, ai as i64, br as i64, bi as i64);
     (
         ((ar * br - ai * bi + (1 << 30)) >> 31) as i32,
@@ -82,25 +82,29 @@ pub(crate) struct Imdct {
     rotate: Vec<(i32, i32)>,
     /// FFT twiddles, `n/8` entries.
     twiddle: Vec<(i32, i32)>,
-    /// Bit reversal, `n/4` entries.
+    /// Bit reversal, `n/4` entries. Empty if `n/4` isn't a power of two, when `twiddle` has
+    /// `n/4` entries instead, and the transform is the general one below.
     reverse: Vec<u16>,
     /// FFT working space, `n/4` entries.
     z: Vec<(i32, i32)>,
+    /// The general transform's other working space.
+    scratch: Vec<(i32, i32)>,
 }
 
 impl Imdct {
-    /// `n` is a power of two from 16 to 8192; the callers guarantee it.
+    /// `n` is from 16 to 8192, a multiple of 8 with no factor but 2, 3 and 5; the callers
+    /// guarantee it.
     pub(crate) fn new(n: usize) -> Result<Self> {
-        debug_assert!(n.is_power_of_two() && (16..=8192).contains(&n));
+        debug_assert!((16..=8192).contains(&n) && n % 8 == 0);
         let n4 = n / 4;
         let bits = n4.trailing_zeros();
+        let general = !n.is_power_of_two();
         let mut rotate = try_vec(n4, (0, 0))?;
-        let mut twiddle = try_vec(n4 / 2, (0, 0))?;
-        let mut reverse = try_vec(n4, 0u16)?;
+        let mut twiddle = try_vec(if general { n4 } else { n4 / 2 }, (0, 0))?;
+        let mut reverse = try_vec(if general { 0 } else { n4 }, 0u16)?;
         for (k, slot) in rotate.iter_mut().enumerate() {
             // (k + 1/8) / n of a turn, in 2^64 per turn.
-            let phase = ((8 * k as u64 + 1) as u128) << (64 - 3 - n.trailing_zeros());
-            let phase = phase as u64;
+            let phase = ((((8 * k as u64 + 1) as u128) << 61) / n as u128) as u64;
             // -cos(a + pi/2), -sin(a + pi/2): the signs that make this
             // transform equal to the formula in the module comment.
             *slot = (
@@ -109,7 +113,7 @@ impl Imdct {
             );
         }
         for (k, slot) in twiddle.iter_mut().enumerate() {
-            let phase = ((k as u128) << (64 - bits)) as u64;
+            let phase = (((k as u128) << 64) / n4 as u128) as u64;
             *slot = (q62_to_q31(cos_turn(phase)), q62_to_q31(sin_turn(phase)));
         }
         for (k, slot) in reverse.iter_mut().enumerate() {
@@ -121,6 +125,7 @@ impl Imdct {
             twiddle,
             reverse,
             z: try_vec(n4, (0, 0))?,
+            scratch: try_vec(if general { n4 } else { 0 }, (0, 0))?,
         })
     }
 
@@ -133,14 +138,22 @@ impl Imdct {
         };
         let z = &mut self.z[..n4];
 
-        for k in 0..n4 {
-            let (tc, ts) = self.rotate[k];
-            z[self.reverse[k] as usize] = cmul(input[n2 - 1 - 2 * k], input[2 * k], tc, ts);
+        if self.reverse.is_empty() {
+            for k in 0..n4 {
+                let (tc, ts) = self.rotate[k];
+                z[k] = cmul(input[n2 - 1 - 2 * k], input[2 * k], tc, ts);
+            }
+            general_fft(z, &self.twiddle, &mut self.scratch);
+        } else {
+            for k in 0..n4 {
+                let (tc, ts) = self.rotate[k];
+                z[self.reverse[k] as usize] = cmul(input[n2 - 1 - 2 * k], input[2 * k], tc, ts);
+            }
         }
 
         // In-place inverse FFT (positive exponent, no scaling).
         let mut size = 2;
-        while size <= n4 {
+        while size <= n4 && !self.reverse.is_empty() {
             let half = size / 2;
             let step = n4 / size;
             for block in z.chunks_exact_mut(size) {
@@ -175,6 +188,43 @@ impl Imdct {
     }
 }
 
+/// An inverse FFT of any size made of 2s, 3s and 5s, without scaling: Stockham's, going
+/// back and forth between `z` and `scratch`. `twiddle` is `z.len()` entries, a whole turn.
+fn general_fft(z: &mut [(i32, i32)], twiddle: &[(i32, i32)], scratch: &mut [(i32, i32)]) {
+    let total = z.len();
+    let mut in_z = true;
+    let mut size = total;
+    let mut stride = 1;
+    while size > 1 {
+        let radix = [2usize, 3, 5].into_iter().find(|p| size % p == 0).unwrap_or(size).min(5);
+        let m = size / radix;
+        let (from, to): (&[(i32, i32)], &mut [(i32, i32)]) =
+            if in_z { (&*z, &mut *scratch) } else { (&*scratch, &mut *z) };
+        for p in 0..m {
+            for q in 0..stride {
+                for t in 0..radix {
+                    let (mut sum_r, mut sum_i) = (0i64, 0i64);
+                    for i in 0..radix {
+                        let (ar, ai) = from[q + stride * (p + i * m)];
+                        let (wr, wi) = twiddle[(i * t * total / radix) % total];
+                        let (r, im) = cmul(ar, ai, wr, wi);
+                        sum_r += r as i64;
+                        sum_i += im as i64;
+                    }
+                    let (wr, wi) = twiddle[(p * t * stride) % total];
+                    to[q + stride * (radix * p + t)] = cmul(sum_r as i32, sum_i as i32, wr, wi);
+                }
+            }
+        }
+        in_z = !in_z;
+        size = m;
+        stride *= radix;
+    }
+    if !in_z {
+        z.copy_from_slice(scratch);
+    }
+}
+
 /// Multiplies a Q24-ish sample by a Q31 window value.
 #[inline]
 pub(crate) fn window(sample: i32, weight: i32) -> i32 {
@@ -206,7 +256,7 @@ mod tests {
     /// Compares with the defining sum, using the same integer cosine.
     #[test]
     fn matches_the_direct_formula() {
-        for n in [16usize, 64, 256, 1024] {
+        for n in [16usize, 64, 240, 256, 1024, 1920] {
             let mut seed = 0x1234_5678u32;
             let input: Vec<i32> = (0..n / 2)
                 .map(|_| {
@@ -221,7 +271,7 @@ mod tests {
                 for (k, &x) in input.iter().enumerate() {
                     // (2m + 1 + n/2)(2k + 1) / (4n) of a turn, in 2^64 per turn.
                     let product = ((2 * m + 1 + n / 2) * (2 * k + 1)) as u128;
-                    let phase = (product << (64 - 2 - n.trailing_zeros())) as u64;
+                    let phase = ((product << 62) / n as u128) as u64;
                     sum += x as i128 * cos_turn(phase) as i128;
                 }
                 let expected = (sum >> 62) as i64;

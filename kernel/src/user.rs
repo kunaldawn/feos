@@ -27,7 +27,7 @@ use feos_abi::{errno, nr, open as open_flags, seek as seek_whence, Event, UserSt
 use feos_app::pipe::{self, PipeId};
 use feos_app::{ArgBlock, SpawnIo, MAX_PROCESSES, PROCESS_ARGS_MAX};
 use feos_elf::Limits;
-use feos_fs::vfs::VfsTree;
+use feos_fs::vfs::{VfsTree, ACCESS_EXECUTE, ACCESS_READ, ACCESS_WRITE};
 use feos_fs::{FileKind, FsError};
 use feos_hal::{Arch, Clock, PageAccess};
 use feos_vm::{AddressSpace, FrameSource, MapError, PAGE_SIZE};
@@ -207,6 +207,12 @@ fn load(slot: usize, path: &str, args: &ArgBlock) -> Result<(usize, Frame), i32>
         say(format_args!("{path}: no filesystem"));
         return Err(feos_abi::EXIT_NOT_FOUND);
     };
+    // Running it takes the execute bit, for this user, and getting there.
+    let (uid, gid) = sched::credentials(slot);
+    if let Err(FsError::PermissionDenied) = tree.check_access(path, uid, gid, ACCESS_EXECUTE) {
+        say(format_args!("{path}: permission denied"));
+        return Err(feos_abi::EXIT_NOT_EXECUTABLE);
+    }
     let size = match tree.stat(path) {
         Ok(stat) if stat.kind == FileKind::File => stat.size,
         Ok(_) => {
@@ -370,6 +376,9 @@ fn fs_errno(error: FsError) -> isize {
         FsError::OutOfMemory => errno::ENOMEM,
         FsError::IsDirectory => errno::EISDIR,
         FsError::NotDirectory | FsError::InvalidName => errno::EINVAL,
+        FsError::PermissionDenied => errno::EACCES,
+        FsError::Unsupported => errno::ENOTSUP,
+        FsError::NotEmpty | FsError::Busy => errno::EBUSY,
         _ => errno::EIO,
     }
 }
@@ -553,6 +562,180 @@ fn free_fd(table: &Files) -> Option<usize> {
     table.fds.iter().position(|fd| matches!(fd, Fd::Closed))
 }
 
+/// May this user add to or take from the directory `path` is in?
+fn check_parent(tree: &dyn VfsTree, path: &str, uid: u32, gid: u32) -> Result<(), isize> {
+    let trimmed = path.trim_end_matches('/');
+    let parent = match trimmed.rfind('/') {
+        Some(0) | None => "/",
+        Some(at) => &trimmed[..at],
+    };
+    tree.check_access(parent, uid, gid, ACCESS_WRITE | ACCESS_EXECUTE).map_err(fs_errno)
+}
+
+/// A new file belongs to who made it. A filesystem with no owners has nothing to say.
+fn give_to(tree: &dyn VfsTree, path: &str, uid: u32, gid: u32) {
+    if uid != 0 || gid != 0 {
+        let _ = tree.chown(path, Some(uid), Some(gid));
+    }
+}
+
+fn sys_setuid(slot: usize, uid: usize, gid: usize) -> isize {
+    // Only down, and only from root: there's nothing to raise a process's rights again.
+    if sched::credentials(slot).0 != 0 {
+        return -errno::EPERM;
+    }
+    let (Ok(uid), Ok(gid)) = (u32::try_from(uid), u32::try_from(gid)) else {
+        return -errno::EINVAL;
+    };
+    sched::set_credentials(slot, uid, gid);
+    0
+}
+
+fn sys_stat(slot: usize, process: &Process, pointer: usize, length: usize, out: usize) -> isize {
+    let mut buffer = [0u8; feos_abi::PATH_MAX];
+    let path = match user_path(slot, process, pointer, length, &mut buffer) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let Some(tree) = tree() else {
+        return -errno::EIO;
+    };
+    let (uid, gid) = sched::credentials(slot);
+    // Looking takes getting there, and nothing of the file itself.
+    if let Err(error) = tree.check_access(path, uid, gid, 0) {
+        return fs_errno(error);
+    }
+    let stat = match tree.stat(path) {
+        Ok(stat) => stat,
+        Err(error) => return fs_errno(error),
+    };
+    let result = feos_abi::Stat {
+        mode: u32::from(stat.mode),
+        uid: stat.uid,
+        gid: stat.gid,
+        nlink: stat.nlink,
+        size: stat.size,
+        ino: stat.ino,
+        posix: u32::from(stat.posix),
+        reserved: 0,
+    };
+    // SAFETY: a plain `repr(C)` struct of integers with no padding, read as bytes.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(&result as *const feos_abi::Stat as *const u8, mem::size_of::<feos_abi::Stat>())
+    };
+    match process.space.copy_out(out, bytes) {
+        Ok(()) => 0,
+        Err(_) => -errno::EFAULT,
+    }
+}
+
+fn sys_chmod(slot: usize, process: &Process, pointer: usize, length: usize, mode: usize) -> isize {
+    let mut buffer = [0u8; feos_abi::PATH_MAX];
+    let path = match user_path(slot, process, pointer, length, &mut buffer) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let Some(tree) = tree() else {
+        return -errno::EIO;
+    };
+    let (uid, gid) = sched::credentials(slot);
+    if let Err(error) = tree.check_access(path, uid, gid, 0) {
+        return fs_errno(error);
+    }
+    let stat = match tree.stat(path) {
+        Ok(stat) => stat,
+        Err(error) => return fs_errno(error),
+    };
+    // Where nothing has an owner, there's no one to say no: only the filesystem to say it can't.
+    if stat.posix && uid != 0 && stat.uid != uid {
+        return -errno::EPERM;
+    }
+    match tree.chmod(path, mode as u16) {
+        Ok(()) => 0,
+        Err(error) => fs_errno(error),
+    }
+}
+
+fn sys_chown(slot: usize, process: &Process, args: [usize; 6]) -> isize {
+    let [pointer, length, owner, group, ..] = args;
+    let mut buffer = [0u8; feos_abi::PATH_MAX];
+    let path = match user_path(slot, process, pointer, length, &mut buffer) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    if sched::credentials(slot).0 != 0 {
+        return -errno::EPERM;
+    }
+    let Some(tree) = tree() else {
+        return -errno::EIO;
+    };
+    let id = |value: usize| (value != feos_abi::KEEP).then_some(value as u32);
+    match tree.chown(path, id(owner), id(group)) {
+        Ok(()) => 0,
+        Err(error) => fs_errno(error),
+    }
+}
+
+fn sys_make_or_remove(slot: usize, process: &Process, pointer: usize, length: usize, make: bool) -> isize {
+    let mut buffer = [0u8; feos_abi::PATH_MAX];
+    let path = match user_path(slot, process, pointer, length, &mut buffer) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let Some(tree) = tree() else {
+        return -errno::EIO;
+    };
+    let (uid, gid) = sched::credentials(slot);
+    if let Err(error) = check_parent(tree, path, uid, gid) {
+        return error;
+    }
+    let result = if make {
+        let result = tree.create_dir(path);
+        if result.is_ok() {
+            give_to(tree, path, uid, gid);
+        }
+        result
+    } else {
+        match tree.lstat(path) {
+            Ok(stat) if stat.kind == FileKind::Directory => tree.remove_dir(path),
+            Ok(_) => tree.remove_file(path),
+            Err(error) => Err(error),
+        }
+    };
+    match result {
+        Ok(()) => 0,
+        Err(error) => fs_errno(error),
+    }
+}
+
+fn sys_link(slot: usize, process: &Process, args: [usize; 6]) -> isize {
+    let [from_pointer, from_length, to_pointer, to_length, ..] = args;
+    let mut from_buffer = [0u8; feos_abi::PATH_MAX];
+    let from = match user_path(slot, process, from_pointer, from_length, &mut from_buffer) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let mut to_buffer = [0u8; feos_abi::PATH_MAX];
+    let to = match user_path(slot, process, to_pointer, to_length, &mut to_buffer) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let Some(tree) = tree() else {
+        return -errno::EIO;
+    };
+    let (uid, gid) = sched::credentials(slot);
+    if let Err(error) = check_parent(tree, to, uid, gid) {
+        return error;
+    }
+    if let Err(error) = tree.check_access(from, uid, gid, 0) {
+        return fs_errno(error);
+    }
+    match tree.link(from, to) {
+        Ok(()) => 0,
+        Err(error) => fs_errno(error),
+    }
+}
+
 fn sys_open(slot: usize, process: &Process, pointer: usize, length: usize, flags: usize) -> isize {
     if flags & !open_flags::ALL != 0 || flags & (open_flags::READ | open_flags::WRITE) == 0 {
         return -errno::EINVAL;
@@ -570,13 +753,29 @@ fn sys_open(slot: usize, process: &Process, pointer: usize, length: usize, flags
         return -errno::EMFILE;
     };
     let writable = flags & open_flags::WRITE != 0;
+    let (uid, gid) = sched::credentials(slot);
+    let mut want = 0;
+    if flags & open_flags::READ != 0 {
+        want |= ACCESS_READ;
+    }
+    if writable {
+        want |= ACCESS_WRITE;
+    }
     match tree.stat(path) {
         Ok(stat) if stat.kind == FileKind::Directory => return -errno::EISDIR,
-        Ok(_) => {}
+        Ok(_) => {
+            if let Err(error) = tree.check_access(path, uid, gid, want) {
+                return fs_errno(error);
+            }
+        }
         Err(FsError::NotFound) if flags & open_flags::CREATE != 0 && writable => {
+            if let Err(error) = check_parent(tree, path, uid, gid) {
+                return error;
+            }
             if let Err(error) = tree.create_file(path) {
                 return fs_errno(error);
             }
+            give_to(tree, path, uid, gid);
         }
         Err(error) => return fs_errno(error),
     }
@@ -938,6 +1137,15 @@ pub fn syscall(slot: usize, number: usize, args: [usize; 6]) -> isize {
             0
         }
         nr::GETPID => current_pid() as isize,
+        nr::GETUID => sched::credentials(slot).0 as isize,
+        nr::GETGID => sched::credentials(slot).1 as isize,
+        nr::SETUID => sys_setuid(slot, args[0], args[1]),
+        nr::STAT => sys_stat(slot, process, args[0], args[1], args[2]),
+        nr::CHMOD => sys_chmod(slot, process, args[0], args[1], args[2]),
+        nr::CHOWN => sys_chown(slot, process, args),
+        nr::MKDIR => sys_make_or_remove(slot, process, args[0], args[1], true),
+        nr::UNLINK => sys_make_or_remove(slot, process, args[0], args[1], false),
+        nr::LINK => sys_link(slot, process, args),
         nr::GETCPU => sched::current_cpu() as isize,
         nr::UPTIME => sched::CLOCK.uptime_ms() as isize,
         nr::MMAP => sys_mmap(slot, process, args[0], args[1]),

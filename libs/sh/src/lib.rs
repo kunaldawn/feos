@@ -159,6 +159,44 @@ pub trait Host {
         false
     }
 
+    /// Asked as a command runs whether the user pressed Ctrl-Z. A host that takes this
+    /// to mean the command it's running has stopped reports that through
+    /// [`take_suspended`](Self::take_suspended) instead.
+    fn poll_suspend(&mut self) -> bool {
+        false
+    }
+
+    /// The command that has just been stopped by Ctrl-Z: its process, which the host
+    /// keeps the streams of until [`resume_job`](Self::resume_job) or
+    /// [`continue_job`](Self::continue_job).
+    fn take_suspended(&mut self) -> Option<u32> {
+        None
+    }
+
+    /// Puts a stopped command back in the foreground, looking after its streams until
+    /// it ends or stops again. `None` when this host isn't keeping one by that number.
+    fn resume_job(
+        &mut self,
+        _pid: u32,
+        _stdin: &mut dyn Input,
+        _stdout: &mut dyn Output,
+        _stderr: &mut dyn Output,
+    ) -> Option<i32> {
+        None
+    }
+
+    /// Lets a stopped command go on in the background, with its output on the terminal.
+    fn continue_job(&mut self, _pid: u32) {}
+
+    /// Says which signals this shell has traps for, as `1 << number`: the rest take
+    /// their default action, which is to end it.
+    fn catch_signals(&mut self, _mask: u32) {}
+
+    /// Takes the signals that arrived for this shell, as `1 << number`.
+    fn take_signals(&mut self) -> u32 {
+        0
+    }
+
     /// Concurrent tasks, when this host has them. Without them pipelines buffer
     /// and `&` runs in the foreground.
     fn tasks(&mut self) -> Option<&mut dyn TaskHost> {
@@ -305,6 +343,10 @@ pub(crate) struct Snapshot {
 
 /// A shell instance with its own filesystem overlay, variables and history.
 pub struct Shell<'a> {
+    /// A job being waited for in the foreground stopped, by Ctrl-Z.
+    pub(crate) suspended_task: bool,
+    /// `fg` is what's waiting: a Ctrl-Z meanwhile stops the job.
+    pub(crate) foreground_wait: bool,
     /// Writable filesystem view.
     pub fs: OverlayFs,
     /// Shell variables.
@@ -366,6 +408,8 @@ impl<'a> Shell<'a> {
         aliases.insert(String::from("h"), String::from("history"));
 
         let mut shell = Self {
+            suspended_task: false,
+            foreground_wait: false,
             fs,
             env: Env::feos(),
             aliases,
@@ -496,8 +540,11 @@ impl<'a> Shell<'a> {
                 continue;
             }
             match chars.next() {
-                Some('w') => prompt.push_str(&self.display_cwd()),
-                Some('W') => prompt.push_str(feos_coreutils::base_name(self.fs.cwd())),
+                // A directory's name mustn't get to drive the terminal.
+                Some('w') => prompt.push_str(&feos_text::display_name(&self.display_cwd())),
+                Some('W') => {
+                    prompt.push_str(&feos_text::display_name(feos_coreutils::base_name(self.fs.cwd())))
+                }
                 Some('u') => prompt.push_str(self.env.get("USER").unwrap_or("feos")),
                 Some('h') => prompt.push_str(self.env.get("HOSTNAME").unwrap_or("feos")),
                 Some('$') => {
@@ -738,6 +785,10 @@ pub fn interactive(shell: &mut Shell<'_>, host: &mut dyn Host, io: &mut Io<'_>) 
                 }
             }
             editor::ReadResult::Eof => {
+                // A trap at the prompt may have asked to leave.
+                if let Some(status) = shell.exit_requested.take() {
+                    return status;
+                }
                 io.stdout.write(b"\n");
                 return 0;
             }

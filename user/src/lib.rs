@@ -148,6 +148,47 @@ pub fn open(path: &str, flags: usize) -> isize {
     syscall(nr::OPEN, [path.as_ptr() as usize, path.len(), flags, 0, 0, 0])
 }
 
+pub fn getuid() -> isize {
+    syscall(nr::GETUID, [0; 6])
+}
+
+pub fn getgid() -> isize {
+    syscall(nr::GETGID, [0; 6])
+}
+
+/// Becomes this user, for good. Only root can.
+pub fn setuid(uid: usize, gid: usize) -> isize {
+    syscall(nr::SETUID, [uid, gid, 0, 0, 0, 0])
+}
+
+pub fn stat(path: &str) -> Result<abi::Stat, isize> {
+    let mut out = abi::Stat::default();
+    match syscall(nr::STAT, [path.as_ptr() as usize, path.len(), &mut out as *mut abi::Stat as usize, 0, 0, 0]) {
+        0 => Ok(out),
+        error => Err(error),
+    }
+}
+
+pub fn chmod(path: &str, mode: usize) -> isize {
+    syscall(nr::CHMOD, [path.as_ptr() as usize, path.len(), mode, 0, 0, 0])
+}
+
+pub fn chown(path: &str, uid: usize, gid: usize) -> isize {
+    syscall(nr::CHOWN, [path.as_ptr() as usize, path.len(), uid, gid, 0, 0])
+}
+
+pub fn mkdir(path: &str) -> isize {
+    syscall(nr::MKDIR, [path.as_ptr() as usize, path.len(), 0, 0, 0, 0])
+}
+
+pub fn unlink(path: &str) -> isize {
+    syscall(nr::UNLINK, [path.as_ptr() as usize, path.len(), 0, 0, 0, 0])
+}
+
+pub fn link(existing: &str, path: &str) -> isize {
+    syscall(nr::LINK, [existing.as_ptr() as usize, existing.len(), path.as_ptr() as usize, path.len(), 0, 0])
+}
+
 pub fn close(fd: usize) -> isize {
     syscall(nr::CLOSE, [fd, 0, 0, 0, 0, 0])
 }

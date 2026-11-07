@@ -441,7 +441,7 @@ pub fn render<const N: usize, const W: usize, const A: usize>(
                     (rect.right_i32() - text_x - 4).max(0) as u32,
                     rect.height,
                 ),
-                window.title.as_str(),
+                &feos_text::display_name(window.title.as_str()),
                 if window.state == crate::window::WindowState::Minimized {
                     theme.task_text.lerp(theme.taskbar_bottom, 80)
                 } else {

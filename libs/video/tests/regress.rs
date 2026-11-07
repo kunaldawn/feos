@@ -759,3 +759,14 @@ fn limits_refuse_a_video_before_it_allocates() {
     let mut out = vec![0u8; decoder.info().rgba_len().unwrap()];
     assert_eq!(decoder.decode(0, &mut out), Err(VideoError::OutOfMemory));
 }
+
+/// `stsz`'s count goes straight into the duration. It can't say more than its table holds.
+#[test]
+fn mp4_sample_count_is_checked_against_the_file() {
+    let mut file = include_bytes!("data/bframes.mp4").to_vec();
+    let honest = feos_video::info(&file).unwrap().frame_count;
+    let at = file.windows(4).position(|w| w == b"stsz").unwrap();
+    file[at + 12..at + 16].copy_from_slice(&0x7fff_ffffu32.to_be_bytes());
+    assert_eq!(feos_video::info(&file).unwrap().frame_count, honest);
+}
+

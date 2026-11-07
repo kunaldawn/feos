@@ -6,6 +6,7 @@ use crate::aac::{AacDecoder, AudioSpecificConfig};
 use crate::error::{AudioError, Result};
 use crate::flac::FlacPacketDecoder;
 use crate::mp3_decode::Mp3Decoder;
+use crate::opus::OpusPacketDecoder;
 use crate::pcm;
 use crate::vorbis::VorbisDecoder;
 
@@ -16,8 +17,12 @@ pub enum PacketFormat<'a> {
     Aac(&'a [u8]),
     /// MPEG audio.
     Mp3,
+    /// MPEG audio, in packets that split frames.
+    Mp3Split,
     /// Vorbis, with its headers as Matroska stores them.
     Vorbis(&'a [u8]),
+    /// Opus, with an `OpusHead` or the contents of an MP4 `dOps` box. Comes out at 48 kHz.
+    Opus(&'a [u8]),
     /// FLAC, with its metadata.
     Flac(&'a [u8]),
     /// Linear PCM. Eight-bit samples are signed.
@@ -38,7 +43,15 @@ pub enum PacketFormat<'a> {
 enum Kind<'a> {
     Aac(AacDecoder),
     Mp3(Mp3Decoder),
+    /// Frames split across packets: what's left of the last, and whether the packet
+    /// being asked about has already gone in.
+    Mp3Split {
+        decoder: Mp3Decoder,
+        carry: Vec<u8>,
+        added: bool,
+    },
     Vorbis(VorbisDecoder<'a>),
+    Opus(OpusPacketDecoder),
     Flac(FlacPacketDecoder),
     Pcm {
         bytes: u8,
@@ -47,6 +60,67 @@ enum Kind<'a> {
     },
     MuLaw,
     ALaw,
+}
+
+/// The most held over from one packet to the next, which only a stream with no valid
+/// frames would reach.
+const MAX_CARRY: usize = 64 * 1024;
+
+/// Finds the next whole MPEG audio frame: `(bytes before it, its length)`. `None`
+/// when more is needed.
+fn whole_frame(data: &[u8]) -> Option<(usize, usize)> {
+    let mut at = 0;
+    while at + 4 <= data.len() {
+        if let Some(len) = mpeg_frame_len(&data[at..at + 4]) {
+            return (at + len <= data.len()).then_some((at, len));
+        }
+        at += 1;
+    }
+    None
+}
+
+/// The length of the frame a header starts, or `None` if it isn't a header.
+fn mpeg_frame_len(head: &[u8]) -> Option<usize> {
+    const BITRATES: [[u16; 16]; 5] = [
+        [0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448, 0],
+        [0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0],
+        [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0],
+        [0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256, 0],
+        [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0],
+    ];
+    if head[0] != 0xff || head[1] & 0xe0 != 0xe0 {
+        return None;
+    }
+    let version = (head[1] >> 3) & 3;
+    let layer = (head[1] >> 1) & 3;
+    let rate_index = ((head[2] >> 2) & 3) as usize;
+    let padding = ((head[2] >> 1) & 1) as usize;
+    if version == 1 || layer == 0 || rate_index == 3 {
+        return None;
+    }
+    let mpeg1 = version == 3;
+    let table = match (mpeg1, layer) {
+        (true, 3) => 0,
+        (true, 2) => 1,
+        (true, _) => 2,
+        (false, 3) => 3,
+        (false, _) => 4,
+    };
+    let bitrate = BITRATES[table][(head[2] >> 4) as usize] as usize * 1000;
+    if bitrate == 0 {
+        return None;
+    }
+    let base = [44_100, 48_000, 32_000][rate_index];
+    let rate = match version {
+        3 => base,
+        2 => base / 2,
+        _ => base / 4,
+    };
+    Some(match layer {
+        3 => (12 * bitrate / rate + padding) * 4,
+        2 => 144 * bitrate / rate + padding,
+        _ => (if mpeg1 { 144 } else { 72 }) * bitrate / rate + padding,
+    })
 }
 
 /// A decoder for packets. Its properties come from the codec's own headers when
@@ -64,7 +138,13 @@ fn open_kind<'a>(format: PacketFormat<'a>) -> Result<Kind<'a>> {
             Kind::Aac(AacDecoder::new(AudioSpecificConfig::parse(config)?)?)
         }
         PacketFormat::Mp3 => Kind::Mp3(Mp3Decoder::new()),
+        PacketFormat::Mp3Split => Kind::Mp3Split {
+            decoder: Mp3Decoder::new(),
+            carry: Vec::new(),
+            added: false,
+        },
         PacketFormat::Vorbis(private) => Kind::Vorbis(VorbisDecoder::from_private(private)?),
+        PacketFormat::Opus(head) => Kind::Opus(OpusPacketDecoder::new(head)?),
         PacketFormat::Flac(private) => Kind::Flac(FlacPacketDecoder::new(private)?),
         PacketFormat::Pcm {
             bytes,
@@ -97,9 +177,10 @@ impl<'a> PacketDecoder<'a> {
         let (sample_rate, channels) = match &kind {
             Kind::Aac(decoder) => {
                 let config = decoder.config();
-                (config.sample_rate, config.channels() as u16)
+                (config.output_rate(), config.output_channels() as u16)
             }
             Kind::Vorbis(decoder) => (decoder.sample_rate(), decoder.channels() as u16),
+            Kind::Opus(decoder) => (48_000, decoder.channels()),
             Kind::Flac(decoder) => {
                 let stream = decoder.stream_info();
                 (stream.sample_rate, stream.channels)
@@ -130,6 +211,10 @@ impl<'a> PacketDecoder<'a> {
     /// Forgets all decoder state, for a seek.
     pub fn reset(&mut self) -> Result<()> {
         self.kind = open_kind(self.format)?;
+        // A seek's lands past what the stream's start says to drop.
+        if let Kind::Opus(decoder) = &mut self.kind {
+            decoder.forget();
+        }
         Ok(())
     }
 
@@ -140,7 +225,9 @@ impl<'a> PacketDecoder<'a> {
         match &self.kind {
             Kind::Aac(_) => 4096 * self.channels as usize,
             Kind::Mp3(_) => 2304 * 2,
+            Kind::Mp3Split { .. } => 2304 * 8,
             Kind::Vorbis(decoder) => decoder.max_packet_samples(),
+            Kind::Opus(decoder) => decoder.max_packet_samples(),
             Kind::Flac(decoder) => {
                 let stream = decoder.stream_info();
                 stream.max_block_size as usize * stream.channels as usize
@@ -153,8 +240,16 @@ impl<'a> PacketDecoder<'a> {
     pub fn decode(&mut self, packet: &[u8], out: &mut [i16]) -> Result<usize> {
         let channels = self.channels as usize;
         match &mut self.kind {
-            Kind::Aac(decoder) => decoder.decode_raw_frame(packet, out),
+            Kind::Aac(decoder) => {
+                let frames = decoder.decode_raw_frame(packet, out)?;
+                // A first frame can show SBR the config didn't mention.
+                let config = decoder.config();
+                self.sample_rate = config.output_rate();
+                self.channels = config.output_channels() as u16;
+                Ok(frames)
+            }
             Kind::Vorbis(decoder) => decoder.decode_packet(packet, out),
+            Kind::Opus(decoder) => decoder.decode(packet, out),
             Kind::Flac(decoder) => decoder.decode(packet, out),
             Kind::Mp3(decoder) => {
                 let mut pos = 0;
@@ -166,6 +261,39 @@ impl<'a> PacketDecoder<'a> {
                     }
                     pos += consumed;
                 }
+                if decoder.channels() != 0 {
+                    self.channels = decoder.channels() as u16;
+                    self.sample_rate = decoder.sample_rate() as u32;
+                }
+                Ok(written / (self.channels as usize).max(1))
+            }
+            Kind::Mp3Split { decoder, carry, added } => {
+                if !*added {
+                    if carry.len() + packet.len() > MAX_CARRY {
+                        carry.clear();
+                    }
+                    carry.try_reserve(packet.len()).map_err(|_| AudioError::OutOfMemory)?;
+                    carry.extend_from_slice(packet);
+                    *added = true;
+                }
+                let mut pos = 0;
+                let mut written = 0;
+                while let Some(len) = whole_frame(&carry[pos..]) {
+                    let (skip, frame) = len;
+                    pos += skip;
+                    match decoder.decode_frame(&carry[pos..pos + frame], out, &mut written) {
+                        Ok(_) => pos += frame,
+                        // Nothing of this frame is lost: it stays for the next call.
+                        Err(AudioError::BufferTooSmall { .. }) if written > 0 => break,
+                        Err(error @ AudioError::BufferTooSmall { .. }) => {
+                            carry.drain(..pos);
+                            return Err(error);
+                        }
+                        Err(_) => pos += frame,
+                    }
+                }
+                carry.drain(..pos);
+                *added = false;
                 if decoder.channels() != 0 {
                     self.channels = decoder.channels() as u16;
                     self.sample_rate = decoder.sample_rate() as u32;

@@ -229,6 +229,24 @@ pub trait Power: Sync {
 /// [`available`]: Audio::available
 /// [`play`]: Audio::play
 pub trait Audio: Sync {
+    /// Starts recording at the playback format. `false` if there's nothing to record from.
+    fn capture_start(&self) -> bool {
+        false
+    }
+
+    /// Moves recorded samples, whole frames, to `out`, without blocking. Returns how many.
+    fn capture_read(&self, _out: &mut [i16]) -> usize {
+        0
+    }
+
+    /// Frames the device has recorded since [`capture_start`](Audio::capture_start).
+    fn capture_position(&self) -> u64 {
+        0
+    }
+
+    /// Stops recording.
+    fn capture_stop(&self) {}
+
     /// Playback sample rate in Hz.
     fn sample_rate(&self) -> u32;
 
@@ -330,6 +348,10 @@ pub trait Pointer: Sync {
 
     /// Current cursor position in framebuffer pixels.
     fn position(&self) -> (u16, u16);
+
+    /// The screen has changed size. Reports from now on are in its pixels, and a cursor
+    /// that's off it moves back on.
+    fn set_screen(&self, _width: u16, _height: u16) {}
 }
 
 /// A programmable interrupt controller.

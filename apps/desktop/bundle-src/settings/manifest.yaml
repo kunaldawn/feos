@@ -1,0 +1,12 @@
+id: settings
+name: Settings
+version: 1.0.0
+entry: settings
+category: System
+description: Colour scheme, keyboard layout, wallpaper, clock and screen resolution
+icon: icon.ico
+icon_medium: icon-32.ico
+icon_small: icon-16.ico
+window:
+  width: 460
+  height: 320

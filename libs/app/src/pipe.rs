@@ -13,7 +13,7 @@
 //! Without installed hooks (host tests), holders are not tracked and handles
 //! only close on `Drop`.
 
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use feos_sync::{futex_wait, futex_wake, IrqSpinLock};
 
@@ -137,6 +137,10 @@ impl Ring {
 
 struct Slot {
     ring: IrqSpinLock<Ring>,
+    /// A reader found the pipe empty and nothing has reached it since. Lets a feeder
+    /// tell a program that wants input from one that isn't asking, so that keys typed
+    /// ahead of a program that never reads them stay for whoever does.
+    wanted: AtomicBool,
     /// Changes whenever a blocked reader or writer should look again.
     wakes: AtomicU32,
 }
@@ -152,6 +156,7 @@ static POOL: [Slot; PIPE_COUNT] = [const {
             generation: 0,
             holders: [NO_HOLDER; HOLDERS],
         }),
+        wanted: AtomicBool::new(false),
         wakes: AtomicU32::new(0),
     }
 }; PIPE_COUNT];
@@ -250,6 +255,7 @@ pub fn try_read_id(id: PipeId, out: &mut [u8]) -> Transfer {
         return if ring.writers == 0 {
             Transfer::Closed
         } else {
+            slot.wanted.store(true, Ordering::Release);
             Transfer::WouldBlock
         };
     }
@@ -285,6 +291,7 @@ pub fn try_write_id(id: PipeId, bytes: &[u8]) -> Transfer {
     ring.bytes[tail..tail + first].copy_from_slice(&bytes[..first]);
     ring.bytes[..count - first].copy_from_slice(&bytes[first..count]);
     ring.len += count;
+    slot.wanted.store(false, Ordering::Release);
     drop(ring);
     notify(slot);
     Transfer::Moved(count)
@@ -409,6 +416,7 @@ pub fn create() -> Option<(PipeReader, PipeWriter)> {
         ring.holders = [NO_HOLDER; HOLDERS];
         ring.hold(pid, End::Read, 1);
         ring.hold(pid, End::Write, 1);
+        slot.wanted.store(false, Ordering::Release);
         let id = PipeId::new(index, ring.generation);
         return Some((PipeReader { id }, PipeWriter { id }));
     }
@@ -540,6 +548,12 @@ impl PipeWriter {
         try_write_id(self.id, bytes)
     }
 
+    /// Whether a reader has come up empty since anything was last written: that is,
+    /// it's waiting for input, or polling for some.
+    pub fn reader_wants(&self) -> bool {
+        self.id.slot().wanted.load(Ordering::Acquire)
+    }
+
     /// True when nobody can ever read what this end writes.
     pub fn is_broken(&self) -> bool {
         let ring = self.id.slot().ring.lock();
@@ -646,6 +660,17 @@ mod tests {
         drop(second);
         assert_eq!(reader.read(&mut out), 0);
         assert_eq!(reader.try_read(&mut out), Transfer::Closed);
+    }
+
+    #[test]
+    fn a_writer_can_see_that_its_reader_wants_input() {
+        let (reader, writer) = create().unwrap();
+        assert!(!writer.reader_wants());
+        let mut out = [0u8; 4];
+        assert_eq!(reader.try_read(&mut out), Transfer::WouldBlock);
+        assert!(writer.reader_wants());
+        assert_eq!(writer.try_write(b"x"), Transfer::Moved(1));
+        assert!(!writer.reader_wants());
     }
 
     #[test]

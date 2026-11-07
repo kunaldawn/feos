@@ -563,6 +563,14 @@ impl VirtioInput {
     ///
     /// Call this repeatedly until it returns `None`; each call processes at
     /// least one descriptor when input is pending.
+    pub fn set_screen(&mut self, width: u16, height: u16) {
+        self.width = width.max(1);
+        self.height = height.max(1);
+        self.x = self.x.min(self.width - 1);
+        self.y = self.y.min(self.height - 1);
+    }
+
+    /// Returns the next pointer report, if any.
     pub fn poll(&mut self) -> Option<PointerEvent> {
         loop {
             match self.process_next()? {

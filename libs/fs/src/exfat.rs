@@ -23,7 +23,7 @@ use alloc::vec::Vec;
 
 use crate::block::{BlockDevice, WritableBlockDevice, WriteClass};
 use crate::fat32::{fat_time_to_unix, fat_timestamp};
-use crate::tree::{sanitize_name, try_push, try_zeroed, ClusterSet, EntryLocation, NodeTable};
+use crate::tree::{path_component, try_push, try_zeroed, ClusterSet, EntryLocation, NodeTable};
 use crate::volume::Volume;
 use crate::{
     attr, CheckReport, EntryKind, FileSystem, FsError, NodeId, NodeTimes, TimeSource, VolumeStats,
@@ -77,6 +77,12 @@ pub struct Exfat<D: BlockDevice> {
     /// Directories that share a start with another, seen while the volume was
     /// dirty: the two names of an interrupted rename.
     suspects: Vec<u32>,
+    /// Entry sets a crash tore, found at mount on a dirty volume: see [`Exfat::repair`].
+    torn: Vec<TornSet>,
+    /// Secondary entries in use with no primary entry, likewise.
+    orphans: Vec<u64>,
+    /// Files whose set is whole but for its checksum, likewise.
+    bad_checksums: Vec<u32>,
     /// `(start, length)` of the bitmap and up-case table, which no node owns.
     system_streams: Vec<(u32, u64)>,
     now: Option<TimeSource>,
@@ -184,6 +190,9 @@ impl<D: BlockDevice> Exfat<D> {
             dirty: volume_flags & VOLUME_DIRTY != 0,
             damaged: selected.used_backup,
             suspects: Vec::new(),
+            torn: Vec::new(),
+            orphans: Vec::new(),
+            bad_checksums: Vec::new(),
             system_streams: Vec::new(),
             now: None,
         };
@@ -218,6 +227,11 @@ impl<D: BlockDevice> Exfat<D> {
         }
 
         Ok(fs)
+    }
+
+    /// Gives the device back, as it stands. Whatever hasn't been flushed is lost.
+    pub fn into_device(self) -> D {
+        self.volume.into_device()
     }
 
     fn max_cluster(&self) -> u32 {
@@ -295,14 +309,14 @@ impl<D: BlockDevice> Exfat<D> {
                 let offset = cluster_start + entry_index as u64 * 32;
                 let entry_type = entry[0];
                 if entry_type == ENTRY_END {
-                    self.damaged |= pending.is_some();
+                    self.note_torn(pending.take())?;
                     return Ok(());
                 }
                 if entry_type == ENTRY_FILE {
-                    self.damaged |= pending.is_some();
+                    self.note_torn(pending.take())?;
                     let set = FileSet::new(entry, offset);
                     if set.remaining == 0 {
-                        self.damaged = true;
+                        self.note_torn(Some(set))?;
                     } else {
                         pending = Some(set);
                     }
@@ -311,12 +325,16 @@ impl<D: BlockDevice> Exfat<D> {
                 if entry_type & 0xc0 != 0xc0 {
                     // Not a secondary entry, so an open set was cut short. This
                     // covers deleted entries and other primaries like the label.
-                    self.damaged |= pending.is_some();
-                    pending = None;
+                    self.note_torn(pending.take())?;
                     continue;
                 }
 
                 let Some(set) = pending.as_mut() else {
+                    // A delete clears the primary first, and a create writes it last,
+                    // so these are what a crash in either leaves.
+                    if self.dirty {
+                        try_push(&mut self.orphans, offset)?;
+                    }
                     continue;
                 };
                 if set.push(entry, offset) {
@@ -330,7 +348,7 @@ impl<D: BlockDevice> Exfat<D> {
 
             if task.contiguous && contiguous_clusters > 0 {
                 if index >= contiguous_clusters {
-                    self.damaged |= pending.is_some();
+                    self.note_torn(pending.take())?;
                     return Ok(());
                 }
                 let Some(next) = task.cluster.checked_add(index as u32) else {
@@ -341,11 +359,34 @@ impl<D: BlockDevice> Exfat<D> {
                 match self.next_cluster(cluster)? {
                     Some(next) => cluster = next,
                     None => {
-                        self.damaged |= pending.is_some();
+                        self.note_torn(pending.take())?;
                         return Ok(());
                     }
                 }
             }
+        }
+    }
+
+    /// Records a set that isn't whole. On a dirty volume that's what a crash leaves, and
+    /// it's for the check. On a clean one, nothing explains it but damage.
+    fn note_torn(&mut self, set: Option<FileSet>) -> Result<(), FsError> {
+        let Some(set) = set else {
+            return Ok(());
+        };
+        if self.dirty {
+            try_push(&mut self.torn, TornSet::of(&set))?;
+        } else {
+            self.damaged = true;
+        }
+        Ok(())
+    }
+
+    fn note_torn_set(&mut self, torn: TornSet) -> Result<(), FsError> {
+        if self.dirty {
+            try_push(&mut self.torn, torn)
+        } else {
+            self.damaged = true;
+            Ok(())
         }
     }
 
@@ -356,11 +397,18 @@ impl<D: BlockDevice> Exfat<D> {
         queue: &mut Vec<DirTask>,
         visited: &mut ClusterSet,
     ) -> Result<(), FsError> {
+        let torn = TornSet::of(&set);
+        let checksum_good = set.stored_checksum == set.checksum;
         let Some(info) = set.finish() else {
-            self.damaged = true;
-            return Ok(());
+            return self.note_torn_set(torn);
         };
         if self.name_hash(&info.name_units) != info.name_hash || !self.stream_is_plausible(&info) {
+            return self.note_torn_set(torn);
+        }
+        // Everything but the checksum holds together. A stream entry and a primary in
+        // different sectors can reach the disk one without the other when a set changes,
+        // and either way the set says what a file was, so only the checksum is wrong.
+        if !checksum_good && !self.dirty {
             self.damaged = true;
             return Ok(());
         }
@@ -370,7 +418,7 @@ impl<D: BlockDevice> Exfat<D> {
             return Ok(());
         }
         // Stored raw above, because the hash covers what's on disk.
-        let name = sanitize_name(name);
+        let name = path_component(name);
 
         let node = self.nodes.add(
             parent.node,
@@ -393,6 +441,10 @@ impl<D: BlockDevice> Exfat<D> {
             entry.valid_size = info.valid_length.min(info.data_length);
             entry.attributes = info.attributes as u8 & attr::SETTABLE;
             entry.times = info.times;
+        }
+
+        if !checksum_good {
+            try_push(&mut self.bad_checksums, node)?;
         }
 
         if info.kind == EntryKind::Directory && info.data_length > 0 {
@@ -1567,9 +1619,13 @@ impl<D: WritableBlockDevice> Exfat<D> {
         }
         entries[0][2..4].copy_from_slice(&checksum.to_le_bytes());
 
-        for (offset, entry) in offsets.iter().zip(entries.iter()) {
+        // The primary goes last, so that until the set is whole there's only orphaned
+        // secondaries, which mean nothing. The cache keeps sectors in order, so a crash
+        // can only tear it if something reorders them anyway, and the check handles that.
+        for (offset, entry) in offsets.iter().zip(entries.iter()).skip(1) {
             self.volume.write_bytes(*offset, entry)?;
         }
+        self.volume.write_bytes(offsets[0], &entries[0])?;
 
         Ok(EntryLocation {
             first: offsets[0],
@@ -1959,9 +2015,16 @@ impl<D: WritableBlockDevice> WritableFileSystem for Exfat<D> {
 }
 
 /// The mount-time check, for what ordered updates can leave after a crash: lost
-/// clusters, a second name from an interrupted rename, and a file whose chain is
-/// short. A torn entry set fails its checksum at mount, flagging the volume
-/// damaged and so read-only, because guessing what it held could lose more.
+/// clusters, a second name from an interrupted rename, a file whose chain is short, and
+/// a torn entry set.
+///
+/// A set is only rewritten at two times, and that's what makes repairing one safe. When
+/// created, it has no data yet, and a set that isn't whole never named anything, so it's
+/// cleared. After that only its stream entry and the primary's checksum and times change:
+/// if those land apart, the name still matches its hash and the stream is either the old
+/// one or the new, so the set is kept and its checksum recomputed. All this only on a
+/// dirty volume. On a clean one a torn set is damage nothing explains, so the volume
+/// stays read-only rather than guess. `libs/fs/tests/crash.rs` tries every write.
 impl<D: WritableBlockDevice> Exfat<D> {
     fn repair(&mut self) -> Result<CheckReport, FsError> {
         let mut report = CheckReport {
@@ -1973,6 +2036,24 @@ impl<D: WritableBlockDevice> Exfat<D> {
         }
         for node in core::mem::take(&mut self.suspects) {
             self.drop_entry(NodeId(node), &mut report)?;
+        }
+        self.volume.class = WriteClass::Dir;
+        for set in core::mem::take(&mut self.torn) {
+            for offset in &set.offsets[..set.count] {
+                self.clear_entry(*offset)?;
+            }
+            report.removed_entries += 1;
+        }
+        for offset in core::mem::take(&mut self.orphans) {
+            self.clear_entry(offset)?;
+            report.orphan_names += 1;
+        }
+        for node in core::mem::take(&mut self.bad_checksums) {
+            let entry = self.nodes.get(NodeId(node)).ok_or(FsError::Corrupt)?;
+            let parent = NodeId(entry.parent.ok_or(FsError::Corrupt)?);
+            let location = entry.entry.ok_or(FsError::Corrupt)?;
+            self.update_set_checksum(parent, location)?;
+            report.repaired_sets += 1;
         }
 
         let mut used = ClusterSet::new(self.cluster_count)?;
@@ -2034,6 +2115,13 @@ impl<D: WritableBlockDevice> Exfat<D> {
         self.set_dirty(false)?;
         self.volume.commit()?;
         Ok(report)
+    }
+
+    /// Marks one directory entry unused, keeping the rest of it.
+    fn clear_entry(&mut self, offset: u64) -> Result<(), FsError> {
+        let mut entry_type = [0u8; 1];
+        self.volume.read_bytes(offset, &mut entry_type)?;
+        self.volume.write_bytes(offset, &[entry_type[0] & 0x7f])
     }
 
     fn drop_entry(&mut self, node: NodeId, report: &mut CheckReport) -> Result<(), FsError> {
@@ -2205,7 +2293,28 @@ fn entry_times(entry: &[u8]) -> NodeTimes {
     }
 }
 
+/// Where the entries of a set that isn't whole are.
+struct TornSet {
+    /// A set has at most 18 secondaries: a stream entry, and names of 255 units.
+    offsets: [u64; MAX_SET_ENTRIES],
+    count: usize,
+}
+
+impl TornSet {
+    fn of(set: &FileSet) -> Self {
+        Self {
+            offsets: set.offsets,
+            count: set.seen,
+        }
+    }
+}
+
+/// Entries of a set we track for repair. A hostile set that claims more just isn't whole.
+const MAX_SET_ENTRIES: usize = 20;
+
 struct FileSet {
+    offsets: [u64; MAX_SET_ENTRIES],
+    seen: usize,
     remaining: u8,
     attributes: u16,
     times: NodeTimes,
@@ -2229,7 +2338,11 @@ struct FileSet {
 
 impl FileSet {
     fn new(entry: &[u8], offset: u64) -> Self {
+        let mut offsets = [0; MAX_SET_ENTRIES];
+        offsets[0] = offset;
         Self {
+            offsets,
+            seen: 1,
             remaining: entry[1],
             attributes: u16::from_le_bytes([entry[4], entry[5]]),
             times: entry_times(entry),
@@ -2253,6 +2366,10 @@ impl FileSet {
 
     /// Consumes one secondary entry and reports whether the set is complete.
     fn push(&mut self, entry: &[u8], offset: u64) -> bool {
+        if self.seen < MAX_SET_ENTRIES {
+            self.offsets[self.seen] = offset;
+            self.seen += 1;
+        }
         self.checksum = checksum_entry(self.checksum, entry, false);
         if !self.has_stream && entry[0] != ENTRY_STREAM {
             self.misordered = true;
@@ -2300,9 +2417,6 @@ impl FileSet {
             return None;
         }
         if self.name_len > self.name_count || self.name_len > MAX_NAME_UNITS {
-            return None;
-        }
-        if self.checksum != self.stored_checksum {
             return None;
         }
 

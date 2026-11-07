@@ -26,6 +26,9 @@ pub const MAX_SCROLLBACK: usize = 1000;
 const MAX_PARAMS: usize = 8;
 const TAB_WIDTH: usize = 8;
 
+/// What the second cell of a wide character holds.
+pub const CONTINUATION: char = '\0';
+
 /// One character cell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cell {
@@ -88,6 +91,9 @@ pub struct Vt {
     rows: usize,
     cells: Vec<Cell>,
     scrollback: VecDeque<Vec<Cell>>,
+    /// Lines that have ever gone into the scrollback: what gives a line a number that
+    /// stays the same as it moves up the window.
+    scrolled: u64,
     x: usize,
     y: usize,
     /// The last column was written, and the next character wraps.
@@ -118,6 +124,7 @@ impl Vt {
             rows,
             cells: alloc::vec![Cell::BLANK; cols * rows],
             scrollback: VecDeque::new(),
+            scrolled: 0,
             x: 0,
             y: 0,
             wrap_pending: false,
@@ -165,6 +172,47 @@ impl Vt {
     /// Number of lines stored above the screen.
     pub fn scrollback_len(&self) -> usize {
         self.scrollback.len()
+    }
+
+    /// A number for the line at `row` of the window, `scroll` lines back from the live
+    /// screen. It stays with that line as output scrolls it up.
+    pub fn line_number(&self, row: usize, scroll: usize) -> u64 {
+        let scroll = scroll.min(self.scrollback.len());
+        self.scrolled + row as u64 - scroll as u64
+    }
+
+    /// The line with this [`line_number`](Self::line_number), if it's still there.
+    pub fn line_cells(&self, number: u64) -> Option<&[Cell]> {
+        if number >= self.scrolled {
+            let row = (number - self.scrolled) as usize;
+            return (row < self.rows).then(|| self.row_slice(row));
+        }
+        let back = (self.scrolled - number) as usize;
+        let index = self.scrollback.len().checked_sub(back)?;
+        self.scrollback.get(index).map(Vec::as_slice)
+    }
+
+    /// The text between two positions, each `(line number, column)`, whichever way round
+    /// they are: the columns from the first to the end of its line, whole lines between,
+    /// and up to and including the last. Trailing blanks don't count, and lines that have
+    /// gone from the scrollback since are skipped.
+    pub fn text_between(&self, a: (u64, usize), b: (u64, usize)) -> String {
+        let (first, last) = if a <= b { (a, b) } else { (b, a) };
+        let mut text = String::new();
+        for number in first.0..=last.0 {
+            if number != first.0 {
+                text.push('\n');
+            }
+            let Some(cells) = self.line_cells(number) else {
+                continue;
+            };
+            let from = if number == first.0 { first.1 } else { 0 };
+            let to = if number == last.0 { (last.1 + 1).min(cells.len()) } else { cells.len() };
+            if from < to {
+                text.push_str(&line_text(&cells[from..to]));
+            }
+        }
+        text
     }
 
     /// Changes the screen size. Rows pushed off the top go to the scrollback,
@@ -332,7 +380,13 @@ impl Vt {
     }
 
     fn print(&mut self, ch: char) {
-        if self.wrap_pending {
+        // A combining mark has no cell, and there's no way to draw one on top of what's
+        // in the last: it's left out.
+        let width = match feos_text::char_width(ch) {
+            0 => return,
+            width => width.min(self.cols),
+        };
+        if self.wrap_pending || self.x + width > self.cols {
             self.x = 0;
             self.wrap_pending = false;
             self.index();
@@ -344,13 +398,31 @@ impl Vt {
             attrs: self.pen.attrs,
         };
         let at = self.y * self.cols + self.x;
+        // What this overwrites may be half of a wide character.
+        if self.x > 0 && self.cells.get(at).is_some_and(|old| old.ch == CONTINUATION) {
+            self.cells[at - 1].ch = ' ';
+        }
+        if self.x + width < self.cols
+            && self.cells.get(at + width).is_some_and(|next| next.ch == CONTINUATION)
+        {
+            self.cells[at + width].ch = ' ';
+        }
         if let Some(slot) = self.cells.get_mut(at) {
             *slot = cell;
         }
-        if self.x + 1 >= self.cols {
+        if width == 2 {
+            if let Some(slot) = self.cells.get_mut(at + 1) {
+                *slot = Cell {
+                    ch: CONTINUATION,
+                    ..cell
+                };
+            }
+        }
+        if self.x + width >= self.cols {
             self.wrap_pending = true;
+            self.x = self.cols - 1;
         } else {
-            self.x += 1;
+            self.x += width;
         }
     }
 
@@ -380,6 +452,7 @@ impl Vt {
             self.scrollback.pop_front();
         }
         self.scrollback.push_back(line);
+        self.scrolled += 1;
     }
 
     /// Scrolls the region up, with text off the top of the main screen going to
@@ -736,7 +809,11 @@ impl Vt {
 }
 
 fn line_text(cells: &[Cell]) -> String {
-    let mut line: String = cells.iter().map(|cell| cell.ch).collect();
+    let mut line: String = cells
+        .iter()
+        .map(|cell| cell.ch)
+        .filter(|ch| *ch != CONTINUATION)
+        .collect();
     let kept = line.trim_end_matches(' ').len();
     line.truncate(kept);
     line
@@ -800,6 +877,61 @@ mod tests {
 
     fn screen(vt: &Vt) -> Vec<String> {
         vt.text_lines()
+    }
+
+    #[test]
+    fn wide_characters_take_two_cells_and_wrap_whole() {
+        let mut vt = Vt::new(5, 3);
+        vt.feed("a\u{4e2d}b".as_bytes());
+        assert_eq!(vt.cursor(), (4, 0));
+        assert_eq!(vt.visible_row(0, 0)[1].ch, '\u{4e2d}');
+        assert_eq!(vt.visible_row(0, 0)[2].ch, CONTINUATION);
+        assert_eq!(vt.visible_row(0, 0)[3].ch, 'b');
+        // One cell left: it wraps rather than split.
+        vt.feed("\u{4e2d}".as_bytes());
+        assert_eq!(vt.cursor(), (2, 1));
+        assert_eq!(screen(&vt), ["a\u{4e2d}b", "\u{4e2d}"]);
+    }
+
+    #[test]
+    fn overwriting_half_a_wide_character_clears_the_other_half() {
+        let mut vt = Vt::new(8, 2);
+        vt.feed("\u{4e2d}\u{6587}".as_bytes());
+        vt.feed(b"\x1b[1;2HX");
+        assert_eq!(screen(&vt), [" X\u{6587}"]);
+        vt.feed(b"\x1b[1;3HY");
+        assert_eq!(screen(&vt), [" XY"]);
+    }
+
+    #[test]
+    fn combining_marks_and_ordinary_scripts_keep_their_columns() {
+        let mut vt = Vt::new(20, 2);
+        vt.feed("e\u{301}\u{3b1}\u{416}\u{2500}x".as_bytes());
+        assert_eq!(vt.cursor(), (5, 0));
+        assert_eq!(screen(&vt), ["e\u{3b1}\u{416}\u{2500}x"]);
+    }
+
+    #[test]
+    fn a_wide_character_on_a_one_column_screen_does_not_panic() {
+        let mut vt = Vt::new(1, 2);
+        vt.feed("\u{4e2d}\u{4e2d}".as_bytes());
+        assert_eq!(vt.visible_row(0, 0)[0].ch, '\u{4e2d}');
+    }
+
+    #[test]
+    fn line_numbers_stay_with_their_lines_as_they_scroll() {
+        let mut vt = Vt::new(10, 2);
+        vt.feed(b"one\r\ntwo");
+        let line = vt.line_number(1, 0);
+        assert_eq!(vt.text_between((line, 0), (line, 2)), "two");
+        vt.feed(b"\r\nthree\r\nfour");
+        assert_eq!(vt.text_between((line, 0), (line, 2)), "two");
+        assert_eq!(vt.line_number(0, 2), line - 1);
+        assert_eq!(vt.text_between((line, 1), (line + 2, 1)), "wo\nthree\nfo");
+        // Either way round, past the end, and past what's still kept.
+        assert_eq!(vt.text_between((line + 2, 1), (line, 1)), "wo\nthree\nfo");
+        assert_eq!(vt.text_between((line, 2), (line, 99)), "o");
+        assert_eq!(vt.line_cells(line + 99), None);
     }
 
     #[test]

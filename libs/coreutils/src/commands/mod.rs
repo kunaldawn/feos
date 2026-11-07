@@ -323,9 +323,30 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "ln",
         aliases: &[],
-        usage: "ln -s TARGET LINK",
-        description: "make a symbolic link",
+        usage: "ln [-s] TARGET LINK",
+        description: "make a link; a hard one takes a filesystem with inodes",
         run: files::ln,
+    },
+    CommandSpec {
+        name: "chmod",
+        aliases: &[],
+        usage: "chmod MODE FILE...",
+        description: "set permission bits, on a filesystem that keeps them",
+        run: files::chmod,
+    },
+    CommandSpec {
+        name: "chown",
+        aliases: &[],
+        usage: "chown UID[:GID] FILE...",
+        description: "set a file's owner and group, by number",
+        run: files::chown,
+    },
+    CommandSpec {
+        name: "fsck",
+        aliases: &[],
+        usage: "fsck [-r] PATH",
+        description: "check the native filesystem holding PATH, and repair it with -r",
+        run: files::fsck,
     },
     CommandSpec {
         name: "readlink",

@@ -245,6 +245,20 @@ pub struct ProcessDetail {
     pub affinity: u32,
 }
 
+/// Signals a process can catch, as numbers on the usual scheme. There's no general
+/// delivery: a process that hasn't asked for one with [`Processes::catch_signals`] is
+/// simply killed by it, and only a shell asks.
+pub mod signal {
+    /// The terminal went away.
+    pub const HUP: u32 = 1;
+    /// Ctrl-C.
+    pub const INT: u32 = 2;
+    /// Ctrl-\\.
+    pub const QUIT: u32 = 3;
+    /// A polite request to end.
+    pub const TERM: u32 = 15;
+}
+
 /// The priority of a process nobody has said anything about.
 pub const PRIORITY_NORMAL: u8 = 8;
 /// The highest priority.
@@ -267,8 +281,8 @@ pub const EXIT_KILLED: i32 = 137;
 /// The console a new process gets. A field left `None` inherits the parent's.
 #[derive(Clone, Copy, Default)]
 pub struct SpawnIo<'a> {
-    /// Where a user program's standard input comes from. Kernel-linked apps are given
-    /// their streams some other way, and don't look at this.
+    /// Where the process's standard input comes from: see [`Context::read_stdin`]. A
+    /// user program reads it through its system call.
     pub stdin: Option<&'a pipe::PipeReader>,
     /// Where the process's standard output goes.
     pub stdout: Option<&'a pipe::PipeWriter>,
@@ -364,6 +378,31 @@ pub trait Processes: Sync {
     /// `false` when there's no such process, or it may not be stopped.
     fn set_stopped(&self, _pid: u32, _stopped: bool) -> bool {
         false
+    }
+
+    /// The calling process's standard input, when it was given one.
+    fn stdin(&self) -> Option<pipe::PipeId> {
+        None
+    }
+
+    /// Says which signals the calling process handles itself, as `1 << number`.
+    fn catch_signals(&self, _mask: u32) {}
+
+    /// Offers a signal to a process. `true` when it catches that signal, and will see it
+    /// in [`take_signals`](Self::take_signals), with anything blocking it woken. On
+    /// `false` the signal's default applies, and that's up to the caller.
+    fn signal(&self, _pid: u32, _number: u32) -> bool {
+        false
+    }
+
+    /// Takes the signals waiting for the calling process, as `1 << number`.
+    fn take_signals(&self) -> u32 {
+        0
+    }
+
+    /// CPU time of the calling process and the children it has outlived, in ms.
+    fn cpu_ms(&self) -> u64 {
+        0
     }
 
     /// Stops the process with `pid`. Returns `false` when it does not exist or
@@ -516,6 +555,32 @@ pub struct Context<'a> {
     pub suspend_area: Option<Rect>,
     /// Board facts and kernel services.
     pub platform: &'a Platform,
+}
+
+impl Context<'_> {
+    /// Whether this process has a standard input to read: a shell gives every command
+    /// it runs one, and a process started some other way has none.
+    pub fn has_stdin(&self) -> bool {
+        self.platform.processes.stdin().is_some()
+    }
+
+    /// Reads standard input, blocking until something's there. Zero means end of file,
+    /// no standard input at all, or that this process is being killed. A terminal
+    /// behind it delivers cooked lines, and Ctrl-C kills the process, as ever.
+    pub fn read_stdin(&self, out: &mut [u8]) -> usize {
+        match self.platform.processes.stdin() {
+            Some(id) => pipe::read_id(id, out),
+            None => 0,
+        }
+    }
+
+    /// Reads what's already on standard input, without waiting.
+    pub fn try_read_stdin(&self, out: &mut [u8]) -> pipe::Transfer {
+        match self.platform.processes.stdin() {
+            Some(id) => pipe::try_read_id(id, out),
+            None => pipe::Transfer::Closed,
+        }
+    }
 }
 
 /// Result of one windowed application frame.

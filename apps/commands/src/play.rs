@@ -14,7 +14,7 @@ impl App for Play {
     }
 
     fn usage(&self) -> &'static str {
-        "play <file>"
+        "play [--at seconds] <file>"
     }
 
     fn description(&self) -> &'static str {
@@ -22,7 +22,13 @@ impl App for Play {
     }
 
     fn run(&self, context: &mut Context<'_>) -> i32 {
-        let path = context.args.trim();
+        let mut path = context.args.trim();
+        let mut start_ms = None;
+        if let Some(rest) = path.strip_prefix("--at ") {
+            let (seconds, rest) = rest.trim().split_once(' ').unwrap_or((rest, ""));
+            start_ms = seconds.parse::<u64>().ok().map(|seconds| seconds * 1000);
+            path = rest.trim();
+        }
         if path.is_empty() {
             eprintln!("usage: {}", self.usage());
             return 2;
@@ -41,6 +47,9 @@ impl App for Play {
         pipe.open(node, Source::File, false);
         let media = pipe.media();
         let _ = pipe.take_open();
+        if let Some(ms) = start_ms {
+            pipe.seek(ms);
+        }
         println!("playing {path}");
         let finished = play_media(
             &pipe,

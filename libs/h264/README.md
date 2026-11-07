@@ -16,7 +16,8 @@ patents are separate matters. See `docs/LICENSE-MIT` and `docs/LICENSE-APACHE`.
 The decoder targets 8-bit progressive 4:2:0 Baseline, Main, and High-profile
 streams, including CAVLC/CABAC, P/B pictures, reference pictures, and
 display-order reordering. High 10, 4:2:2, 4:4:4, monochrome, lossless, MBAFF,
-field pictures, FMO and SP/SI slices return an error.
+field pictures, FMO and SP/SI slices return an error. Macroblocks a damaged stream doesn't
+deliver are copied from the latest reference picture, and `Frame::concealed_mbs` counts them.
 
 It uses `alloc` under `Limits`: a stream is refused with
 `DecodeError::OutOfMemory` if it can't fit, and picture allocation is fallible.

@@ -278,13 +278,23 @@ impl Shell<'_> {
         host: &mut dyn Host,
         background: bool,
     ) -> i32 {
+        // Traps run between commands: one that arrived during a command waits for it.
+        self.deliver_signals(io, host);
+        if self.flow.is_active() {
+            return self.last_status;
+        }
         if pipeline.negate {
             self.errexit_off += 1;
         }
+        let timing = pipeline.timed.then(|| self.start_timing());
         let mut status = match pipeline.commands.as_slice() {
+            [] => 0,
             [command] => self.run_command(command, io, host, background),
             commands => self.run_stages(commands, io, host),
         };
+        if let Some(start) = timing {
+            self.report_timing(start, pipeline.timed_posix, io);
+        }
         if pipeline.negate {
             self.errexit_off -= 1;
             if !self.flow.is_active() {
@@ -390,6 +400,7 @@ impl Shell<'_> {
         self.finish_redirects(saved, io);
         let flow = core::mem::replace(&mut self.flow, Flow::None);
         self.restore_snapshot(snapshot);
+        self.sync_signal_mask(host);
         self.leave_nested();
         match flow {
             Flow::Exit(code) | Flow::Return(code) => code,
@@ -1245,6 +1256,9 @@ impl Shell<'_> {
             host.run_external(name, args, &mut stdin, &mut stdout, &mut stderr, background)
         };
         if let Some(status) = result {
+            if let Some(pid) = host.take_suspended() {
+                return self.note_suspended(pid, name, args, io);
+            }
             // The host stopped the command for an interrupt. That ends the line,
             // as if the shell had seen it itself.
             if status == 130 {
@@ -1313,6 +1327,9 @@ impl Shell<'_> {
             self.error(io, &format!("{path}: cannot execute binary file"));
             return 126;
         };
+        if let Some(pid) = host.take_suspended() {
+            return self.note_suspended(pid, path, args, io);
+        }
         if status == 130 {
             self.cancel.cancel();
         }

@@ -20,7 +20,7 @@
 //! | FLAC, native and in Ogg | yes, to 16 bits | no |
 //! | Ogg Vorbis | yes | no |
 //! | AAC-LC, in ADTS or raw frames | yes | no |
-//! | Ogg Opus | headers, pages and packet TOC only | no |
+//! | Ogg Opus | SILK, CELT and hybrid, by `feos-opus`, in one or two channels | yes |
 //!
 //! ```
 //! use feos_audio_codec::{decode, detect, AudioFormat};
@@ -44,6 +44,9 @@ extern crate alloc;
 
 pub mod aac;
 mod aac_tables;
+mod ps;
+mod sbr;
+mod sbr_tables;
 pub mod aiff;
 pub mod au;
 mod bits;
@@ -56,6 +59,7 @@ pub mod ogg;
 pub mod opus;
 pub mod packet;
 mod pcm;
+pub mod source;
 pub mod stream;
 pub mod vorbis;
 pub mod wav;
@@ -63,6 +67,8 @@ pub mod wav;
 pub use error::{AudioError, Result};
 pub use mp3_decode::Mp3Decoder;
 pub use packet::{PacketDecoder, PacketFormat};
+pub use feos_source::Source;
+pub use source::SourceStream;
 pub use stream::AudioStream;
 
 /// Audio container formats understood by this crate.
@@ -76,7 +82,7 @@ pub enum AudioFormat {
     Au,
     /// MPEG-1/2/2.5 audio, in any layer.
     Mp3,
-    /// Ogg container with an Opus stream. Headers only: packets do not decode.
+    /// Ogg container with an Opus stream.
     OggOpus,
     /// Ogg container with a Vorbis stream.
     OggVorbis,
@@ -227,8 +233,6 @@ pub fn scratch_len(input: &[u8]) -> Result<usize> {
 
 /// Decodes any supported stream into interleaved signed 16-bit samples.
 ///
-/// Ogg Opus is detected but its packets cannot be decoded yet; this returns
-/// [`AudioError::UnsupportedFeature`].
 pub fn decode(input: &[u8], out: &mut [i16], _scratch: &mut [u8]) -> Result<DecodedAudio> {
     match detect_or_err(input)? {
         AudioFormat::Wav => wav::decode(input, out),

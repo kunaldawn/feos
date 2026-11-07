@@ -438,7 +438,14 @@ fn advance(mut column: usize, mut row: usize, text: &[char], cols: usize) -> (us
             column = 0;
             row += 1;
         } else {
-            column += 1;
+            let width = feos_text::char_width(*ch);
+            // A wide character that won't fit goes to the next row whole, as a terminal
+            // puts it.
+            if width == 2 && column + 1 >= cols && column > 0 {
+                column = 0;
+                row += 1;
+            }
+            column += width;
             if column >= cols {
                 column = 0;
                 row += 1;
@@ -462,7 +469,7 @@ pub fn prompt_width(prompt: &str) -> usize {
                 }
             }
         } else {
-            width += 1;
+            width += feos_text::char_width(ch);
         }
     }
     width

@@ -7,3 +7,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+feos-source.workspace = true
+feos-opus.workspace = true
+
+[dev-dependencies]
+feos-opus.workspace = true

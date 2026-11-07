@@ -57,6 +57,7 @@ mod fat16;
 mod fat32;
 mod format;
 mod mount;
+pub mod native;
 mod partition;
 mod tree;
 pub mod vfs;
@@ -73,6 +74,7 @@ pub use exfat::Exfat;
 pub use fat16::Fat16;
 pub use fat32::Fat32;
 pub use format::{format, format_exfat, format_fat32};
+pub use native::{FsckReport, Native, PosixMeta};
 pub use vfs::{File, FileKind, OpenOptions, Seek, Stat, TreeEntry, Vfs, VfsTree};
 pub use mount::MountTable;
 pub use volume::{detect, VolumeKind};
@@ -93,6 +95,8 @@ pub fn mount<'a, D: BlockDevice + 'a>(device: D) -> Result<Box<dyn FileSystem + 
         VolumeKind::Fat32 => Ok(Box::new(Fat32::mount(device)?)),
         VolumeKind::Fat16 => Ok(Box::new(Fat16::mount(device)?)),
         VolumeKind::Exfat => Ok(Box::new(Exfat::mount(device)?)),
+        // Mounting it can mean replaying its journal, which takes a writable device.
+        VolumeKind::Native => Err(FsError::UnsupportedVolume),
     }
 }
 
@@ -109,6 +113,7 @@ pub fn mount_writable<'a, D: WritableBlockDevice + 'a>(
         VolumeKind::Fat32 => Ok(Box::new(Fat32::mount(device)?)),
         VolumeKind::Fat16 => Err(FsError::ReadOnly),
         VolumeKind::Exfat => Ok(Box::new(Exfat::mount(device)?)),
+        VolumeKind::Native => Ok(Box::new(native::Native::mount(device)?)),
     }
 }
 
@@ -228,12 +233,15 @@ pub struct CheckReport {
     pub removed_entries: u32,
     /// Long-name fragments with no entry to belong to, now cleared.
     pub orphan_names: u32,
+    /// Entry sets kept, as their parts agree, with their checksum put right.
+    pub repaired_sets: u32,
 }
 
 impl CheckReport {
     /// True when the check changed nothing but the dirty flag.
     pub const fn found_nothing(&self) -> bool {
-        self.lost_clusters == 0
+        self.repaired_sets == 0
+            && self.lost_clusters == 0
             && self.truncated_files == 0
             && self.removed_entries == 0
             && self.orphan_names == 0
@@ -510,6 +518,32 @@ pub trait WritableFileSystem: FileSystem + Send {
 
     /// Turns an empty file into a device node, on a filesystem that can.
     fn make_device(&mut self, _node: NodeId, _kind: vfs::DeviceKind) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    /// Owner, group, mode and links, on a filesystem that keeps them. `None` means it
+    /// doesn't, as FAT doesn't, and that nothing about a file's owner should be enforced.
+    fn posix(&self, _node: NodeId) -> Option<native::PosixMeta> {
+        None
+    }
+
+    /// Sets the permission bits.
+    fn set_mode(&mut self, _node: NodeId, _mode: u16) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    /// Sets whichever of the owner and group are `Some`.
+    fn set_owner(&mut self, _node: NodeId, _uid: Option<u32>, _gid: Option<u32>) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    /// Gives a file another name in `new_parent`.
+    fn hard_link(&mut self, _node: NodeId, _new_parent: NodeId, _name: &str) -> Result<NodeId, FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    /// Checks the volume through and through, on a filesystem with a checker of its own.
+    fn fsck(&mut self, _repair: bool) -> Result<native::FsckReport, FsError> {
         Err(FsError::Unsupported)
     }
 }

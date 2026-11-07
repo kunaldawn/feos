@@ -242,6 +242,26 @@ static STDOUT: [AtomicU32; MAX_TASKS] = [const { AtomicU32::new(0) }; MAX_TASKS]
 /// The pipe behind each slot's standard input, or zero for none. Only user programs
 /// read through this; kernel-linked apps are handed their streams.
 static STDIN: [AtomicU32; MAX_TASKS] = [const { AtomicU32::new(0) }; MAX_TASKS];
+/// Who each task is. Everything starts as root, and only a user program can stop being.
+static TASK_UID: [AtomicU32; MAX_TASKS] = [const { AtomicU32::new(0) }; MAX_TASKS];
+static TASK_GID: [AtomicU32; MAX_TASKS] = [const { AtomicU32::new(0) }; MAX_TASKS];
+
+/// Who the task in `slot` is.
+pub fn credentials(slot: usize) -> (u32, u32) {
+    (TASK_UID[slot].load(Ordering::Relaxed), TASK_GID[slot].load(Ordering::Relaxed))
+}
+
+/// Sets who the task in `slot` is, and what it starts from now on.
+pub fn set_credentials(slot: usize, uid: u32, gid: u32) {
+    TASK_UID[slot].store(uid, Ordering::Relaxed);
+    TASK_GID[slot].store(gid, Ordering::Relaxed);
+}
+
+/// Signals each task handles itself, and those waiting for it, as `1 << number`.
+static CAUGHT: [AtomicU32; MAX_TASKS] = [const { AtomicU32::new(0) }; MAX_TASKS];
+static PENDING_SIGNALS: [AtomicU32; MAX_TASKS] = [const { AtomicU32::new(0) }; MAX_TASKS];
+/// CPU ticks of each task's children that have gone, and of theirs.
+static CHILD_TICKS: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_TASKS];
 static STDERR: [AtomicU32; MAX_TASKS] = [const { AtomicU32::new(0) }; MAX_TASKS];
 
 /// The terminal each slot belongs to, which a background child prints to even
@@ -713,6 +733,15 @@ fn collect_exits(scheduler: &mut Scheduler, gone: &mut GoneTasks) {
         if !scheduler.tasks[slot].live || scheduler.table.tasks()[slot].state != State::Free {
             continue;
         }
+        // Its CPU time passes to its parent, for `time`. The table keeps the count until
+        // the slot is next reserved.
+        let spent = scheduler.table.tasks()[slot].cpu_ticks.wrapping_add(CHILD_TICKS[slot].load(Ordering::Relaxed));
+        let parent = scheduler.tasks[slot].parent;
+        if let Some(parent_slot) = (0..MAX_TASKS).find(|other| {
+            *other != slot && (*other == 0 || scheduler.tasks[*other].live) && SLOT_PID[*other].load(Ordering::Relaxed) == parent
+        }) {
+            CHILD_TICKS[parent_slot].fetch_add(spent, Ordering::Relaxed);
+        }
         let task = &mut scheduler.tasks[slot];
         task.live = false;
         let record = ExitRecord {
@@ -852,6 +881,44 @@ pub fn current_cpu() -> usize {
     let cpu = this_cpu();
     Port::irq_restore(flags);
     cpu
+}
+
+/// The calling task's slot's standard input.
+fn current_stdin() -> Option<PipeId> {
+    let slot = with_current_slot()?;
+    PipeId::from_raw(STDIN[slot].load(Ordering::Acquire))
+}
+
+fn with_current_slot() -> Option<usize> {
+    let flags = Port::irq_save_and_disable();
+    let slot = current_slot();
+    Port::irq_restore(flags);
+    slot
+}
+
+/// Offers a signal to `pid`: see [`Processes::signal`].
+fn offer_signal(pid: u32, number: u32) -> bool {
+    if number >= 32 {
+        return false;
+    }
+    let bit = 1u32 << number;
+    let idle = {
+        let mut scheduler = SCHEDULER.lock();
+        let found = scheduler.table.tasks().iter().position(|task| {
+            task.pid == pid && !matches!(task.state, State::Free | State::Spawning)
+        });
+        let Some(slot) = found else {
+            return false;
+        };
+        if CAUGHT[slot].load(Ordering::Relaxed) & bit == 0 {
+            return false;
+        }
+        PENDING_SIGNALS[slot].fetch_or(bit, Ordering::Release);
+        let woken = scheduler.table.wake_pid(pid);
+        woken.then(|| scheduler.table.idle_cpu(this_cpu())).flatten()
+    };
+    kick(idle);
+    true
 }
 
 /// Reads a user program's standard input. Zero at end of file, or if it has none.
@@ -1047,9 +1114,17 @@ fn spawn_entry(
     LOCK_DEPTH[slot].store(0, Ordering::Release);
     HEAP_BYTES[slot].store(0, Ordering::Release);
     FAULTED[slot].store(false, Ordering::Release);
+    CAUGHT[slot].store(0, Ordering::Release);
+    PENDING_SIGNALS[slot].store(0, Ordering::Release);
+    CHILD_TICKS[slot].store(0, Ordering::Release);
     SLOT_PID[slot].store(pid, Ordering::Release);
 
     let flags = Port::irq_save_and_disable();
+    // A new task is whoever started it.
+    let creator = current_slot();
+    let (uid, gid) = creator.map_or((0, 0), credentials);
+    TASK_UID[slot].store(uid, Ordering::Release);
+    TASK_GID[slot].store(gid, Ordering::Release);
     let (parent, mut inherited_out, mut inherited_err, inherited_console, inherited_in) = match current_slot() {
         Some(parent) => (
             SLOT_PID[parent].load(Ordering::Relaxed),
@@ -1456,6 +1531,35 @@ impl Processes for ProcessManager {
 
     fn try_wait(&self, pid: u32) -> WaitStatus {
         try_wait(pid)
+    }
+
+    fn stdin(&self) -> Option<PipeId> {
+        current_stdin()
+    }
+
+    fn catch_signals(&self, mask: u32) {
+        if let Some(slot) = with_current_slot() {
+            CAUGHT[slot].store(mask, Ordering::Release);
+        }
+    }
+
+    fn signal(&self, pid: u32, number: u32) -> bool {
+        offer_signal(pid, number)
+    }
+
+    fn take_signals(&self) -> u32 {
+        with_current_slot().map_or(0, |slot| PENDING_SIGNALS[slot].swap(0, Ordering::AcqRel))
+    }
+
+    fn cpu_ms(&self) -> u64 {
+        let Some(slot) = with_current_slot() else {
+            return 0;
+        };
+        let (own, hz) = {
+            let scheduler = SCHEDULER.lock();
+            (scheduler.table.tasks()[slot].cpu_ticks, scheduler.ticks_per_second.max(1))
+        };
+        own.wrapping_add(CHILD_TICKS[slot].load(Ordering::Acquire)).saturating_mul(1000) / hz
     }
 
     fn set_stopped(&self, pid: u32, stopped: bool) -> bool {

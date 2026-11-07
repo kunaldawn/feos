@@ -7,6 +7,7 @@
 
 use alloc::vec::Vec;
 
+use crate::audio::{push_packet, AudioCodec, AudioPacket, AudioTrack};
 use crate::error::{Result, VideoError};
 use crate::index::{DecoderLimits, Index, FLAG_KEY};
 use crate::mpeg1_tables::*;
@@ -102,6 +103,115 @@ fn demux_program(input: &[u8]) -> Result<Vec<u8>> {
         }
     }
     Ok(out)
+}
+
+/// A packet's time stamp and where its data starts, in MPEG-1 system syntax: stuffing,
+/// perhaps a buffer size, and then perhaps time stamps.
+fn pes_body(input: &[u8], at: usize, end: usize) -> Option<(usize, Option<u64>)> {
+    let mut body = at;
+    while input.get(body) == Some(&0xff) {
+        body += 1;
+    }
+    if input.get(body)? & 0xc0 == 0x40 {
+        body += 2;
+    }
+    let marker = *input.get(body)? & 0xf0;
+    let pts = match marker {
+        0x20 | 0x30 => {
+            let bytes = input.get(body..body + 5)?;
+            Some(
+                ((bytes[0] as u64 >> 1) & 7) << 30
+                    | (bytes[1] as u64) << 22
+                    | (bytes[2] as u64 >> 1) << 15
+                    | (bytes[3] as u64) << 7
+                    | bytes[4] as u64 >> 1,
+            )
+        }
+        _ => None,
+    };
+    body += match marker {
+        0x20 => 5,
+        0x30 => 10,
+        _ => 1,
+    };
+    (body <= end).then_some((body, pts))
+}
+
+/// The first audio stream of a program stream. Its packets don't keep to the audio's
+/// frames, hence [`AudioCodec::MpegSplit`].
+pub(crate) fn audio_track(input: &[u8]) -> Option<AudioTrack> {
+    if input.get(3) != Some(&PACK) {
+        return None;
+    }
+    let mut packets = Vec::new();
+    let mut stream = None;
+    let mut first_video = None;
+    let mut pos = 0;
+    let mut last_pts = None;
+    let mut header = None;
+    while let Some(at) = next_start_code(input, pos) {
+        let code = input[at];
+        match code {
+            PACK => pos = at + 9,
+            SYSTEM_HEADER | 0xbc..=0xff => {
+                let length = input.get(at + 1..at + 3)?;
+                let length = u16::from_be_bytes([length[0], length[1]]) as usize;
+                let end = (at + 3 + length).min(input.len());
+                pos = end;
+                if code == VIDEO_STREAM && first_video.is_none() {
+                    first_video = pes_body(input, at + 3, end).and_then(|(_, pts)| pts);
+                } else if (0xc0..=0xdf).contains(&code) && *stream.get_or_insert(code) == code {
+                    let Some((body, pts)) = pes_body(input, at + 3, end) else {
+                        continue;
+                    };
+                    if body == end {
+                        continue;
+                    }
+                    let pts = pts.or(last_pts);
+                    last_pts = pts;
+                    header = header.or_else(|| first_frame_format(&input[body..end]));
+                    // Times are the picture's until the track knows what its first is.
+                    push_packet(&mut packets, input.len(), body, end - body, pts.unwrap_or(0))?;
+                }
+            }
+            _ => pos = at + 1,
+        }
+    }
+    let (sample_rate, channels) = header?;
+    // A stream's clock doesn't start at zero, and the picture's frames do.
+    let base = first_video.or_else(|| packets.first().map(|packet: &AudioPacket| packet.pts_ms))?;
+    for packet in &mut packets {
+        packet.pts_ms = packet.pts_ms.saturating_sub(base) / 90;
+    }
+    Some(AudioTrack {
+        codec: AudioCodec::MpegSplit,
+        sample_rate,
+        channels,
+        config: 0..0,
+        packets,
+    })
+}
+
+/// The rate and channels of the first MPEG audio frame header in a packet.
+fn first_frame_format(data: &[u8]) -> Option<(u32, u16)> {
+    data.windows(4).find_map(|head| {
+        if head[0] != 0xff || head[1] & 0xe0 != 0xe0 {
+            return None;
+        }
+        let version = (head[1] >> 3) & 3;
+        let layer = (head[1] >> 1) & 3;
+        let rate = (head[2] >> 2) & 3;
+        if version == 1 || layer == 0 || rate == 3 || head[2] >> 4 == 15 {
+            return None;
+        }
+        let base = [44_100, 48_000, 32_000][rate as usize];
+        let rate = match version {
+            3 => base,
+            2 => base / 2,
+            _ => base / 4,
+        };
+        Some((rate, if head[3] >> 6 == 3 { 1 } else { 2 }))
+    })
 }
 
 /// Properties from a sequence header.

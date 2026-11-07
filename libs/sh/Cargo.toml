@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+feos-text = { workspace = true }
 feos-console = { workspace = true }
 feos-coreutils = { workspace = true }
 feos-fs = { workspace = true }

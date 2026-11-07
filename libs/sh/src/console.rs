@@ -8,7 +8,7 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use feos_console::read_byte;
-use feos_coreutils::{Input, Output};
+use feos_coreutils::{Available, Input, Output};
 use feos_sync::SpinLock;
 
 const LINE_BYTES: usize = 1024;
@@ -40,6 +40,8 @@ static TTY: SpinLock<Tty> = SpinLock::new(Tty {
 });
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+static SUSPENDED: AtomicBool = AtomicBool::new(false);
+static QUIT: AtomicBool = AtomicBool::new(false);
 
 /// The next byte: first any that arrived while a command ran, then the console's.
 ///
@@ -69,6 +71,14 @@ pub fn poll_interrupt() -> bool {
             tty.ready = false;
             continue;
         }
+        if byte == 0x1a {
+            SUSPENDED.store(true, Ordering::Relaxed);
+            continue;
+        }
+        if byte == 0x1c {
+            QUIT.store(true, Ordering::Relaxed);
+            continue;
+        }
         if tty.count < TYPE_AHEAD_BYTES {
             let tail = (tty.head + tty.count) % TYPE_AHEAD_BYTES;
             tty.type_ahead[tail] = byte;
@@ -77,6 +87,16 @@ pub fn poll_interrupt() -> bool {
     }
     drop(tty);
     INTERRUPTED.swap(false, Ordering::Relaxed)
+}
+
+/// Takes a Ctrl-Z that [`poll_interrupt`] saw.
+pub fn take_suspend() -> bool {
+    SUSPENDED.swap(false, Ordering::Relaxed)
+}
+
+/// Takes a Ctrl-\\ that [`poll_interrupt`] saw.
+pub fn take_quit() -> bool {
+    QUIT.swap(false, Ordering::Relaxed)
 }
 
 fn echo(bytes: &[u8]) {
@@ -218,6 +238,25 @@ impl Input for ConsoleInput {
         }
     }
 
+    fn try_read(&mut self, out: &mut [u8]) -> Available {
+        if out.is_empty() {
+            return Available::Pending;
+        }
+        loop {
+            let taken = take_cooked(out);
+            if taken > 0 {
+                return Available::Bytes(taken);
+            }
+            let Some(byte) = next_raw() else {
+                return Available::Pending;
+            };
+            match cook(byte) {
+                Cooked::Continue | Cooked::Ready => {}
+                Cooked::EndOfFile | Cooked::Interrupted => return Available::End,
+            }
+        }
+    }
+
     fn read_raw(&mut self, out: &mut [u8]) -> usize {
         if out.is_empty() {
             return 0;
@@ -243,6 +282,19 @@ impl Input for ConsoleInput {
             feos_console::wait_for_input();
         }
         0
+    }
+
+    fn unread(&mut self, bytes: &[u8]) {
+        let mut tty = TTY.lock();
+        for byte in bytes.iter().rev() {
+            if tty.count == TYPE_AHEAD_BYTES {
+                break;
+            }
+            tty.head = (tty.head + TYPE_AHEAD_BYTES - 1) % TYPE_AHEAD_BYTES;
+            let head = tty.head;
+            tty.type_ahead[head] = *byte;
+            tty.count += 1;
+        }
     }
 
     fn is_terminal(&self) -> bool {
@@ -344,6 +396,40 @@ mod tests {
         assert_eq!(input.read_to_end(), b"");
         assert!(poll_interrupt());
         assert!(!poll_interrupt());
+    }
+
+    #[test]
+    fn job_control_keys_are_seen_while_polling() {
+        let _guard = CONSOLE_LOCK.lock().unwrap();
+        INTERRUPTED.store(false, Ordering::Relaxed);
+        take_suspend();
+        take_quit();
+        feed(b"a\x1ab\x1c");
+        assert!(!poll_interrupt());
+        assert!(take_suspend());
+        assert!(!take_suspend());
+        assert!(take_quit());
+        let mut input = ConsoleInput;
+        let mut byte = [0u8; 1];
+        assert_eq!(input.read_raw(&mut byte), 1);
+        assert_eq!(&byte, b"a");
+        assert_eq!(input.read_raw(&mut byte), 1);
+        assert_eq!(&byte, b"b");
+    }
+
+    #[test]
+    fn a_non_blocking_read_cooks_what_has_arrived() {
+        let _guard = CONSOLE_LOCK.lock().unwrap();
+        feed(b"hi");
+        let mut input = ConsoleInput;
+        let mut out = [0u8; 8];
+        assert_eq!(input.try_read(&mut out), Available::Pending);
+        feed(b"!\r");
+        assert_eq!(input.try_read(&mut out), Available::Bytes(4));
+        assert_eq!(&out[..4], b"hi!\n");
+        feed(b"\x04");
+        assert_eq!(input.try_read(&mut out), Available::End);
+        feed(b"");
     }
 
     #[test]

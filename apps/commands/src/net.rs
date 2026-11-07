@@ -4,6 +4,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use feos_app::pipe::{self, Transfer};
 use feos_app::{App, Context, Platform};
 use feos_console::{eprintln, print, println};
 use feos_hal::net::{Endpoint, Ipv4Addr, NetError, Network, SocketId, SocketInfo};
@@ -557,6 +558,12 @@ impl Nc {
             }
         }
 
+        // What's typed or piped goes out, when no text or file was given to send.
+        let stdin = if options.text.is_none() && source.is_none() {
+            platform.processes.stdin()
+        } else {
+            None
+        };
         let mut outgoing = vec![0u8; CHUNK];
         let mut text = options.text.map_or(&[][..], str::as_bytes);
         let mut pending_range = (0usize, 0usize);
@@ -605,6 +612,24 @@ impl Nc {
                             Err(error) => return Self::report(error),
                         }
                     }
+                } else if let Some(id) = stdin {
+                    if pending_range.0 == pending_range.1 {
+                        match pipe::try_read_id(id, &mut outgoing) {
+                            Transfer::Moved(count) => pending_range = (0, count),
+                            Transfer::WouldBlock => {}
+                            Transfer::Closed => sending = false,
+                        }
+                    }
+                    if pending_range.0 != pending_range.1 {
+                        match net.tcp_send(socket, &outgoing[pending_range.0..pending_range.1], 0) {
+                            Ok(count) => {
+                                pending_range.0 += count;
+                                moved = true;
+                            }
+                            Err(NetError::TimedOut) => {}
+                            Err(error) => return Self::report(error),
+                        }
+                    }
                 } else {
                     sending = false;
                 }
@@ -618,7 +643,11 @@ impl Nc {
             // A short wait for data when there's nothing else to do.
             match net.tcp_recv(socket, &mut incoming, if moved { 0 } else { 20 }) {
                 Ok(0) => {
-                    if sending {
+                    // Standard input may never end, as a terminal's doesn't, so a peer
+                    // that has finished ends this too.
+                    if sending && stdin.is_some() {
+                        break;
+                    } else if sending {
                         // The peer's done, and this end may not be.
                         if !moved {
                             platform.processes.yield_now();

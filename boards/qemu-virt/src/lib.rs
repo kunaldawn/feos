@@ -423,6 +423,10 @@ impl Pointer for BoardPointer {
     fn position(&self) -> (u16, u16) {
         POINTER.lock().position()
     }
+
+    fn set_screen(&self, width: u16, height: u16) {
+        POINTER.lock().set_screen(width, height);
+    }
 }
 
 static BOARD_POINTER: BoardPointer = BoardPointer;

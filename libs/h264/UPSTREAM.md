@@ -6,10 +6,13 @@ This decoder is a vendored port of [`z264`](https://github.com/p14c31355/z264)
 by p14c31355, which adapts the pure-Rust `rust_h264` 0.4.x implementation. Both
 are under MIT OR Apache-2.0; see `docs/LICENSE-MIT` and `docs/LICENSE-APACHE`.
 
-**Upstream commit: unknown.** The code was imported into this repository without
-recording a `z264` revision or `rust_h264` patch version, and the git history
-here doesn't contain one, so no SHA can be stated. Comparing against upstream's
-history would be needed to establish it.
+**Upstream commit: `35a7cece2653890ca910f1cf56635f6559bc97cb`** (z264, 2026-07-31, "Merge pull
+request #1"), or its parent `6024001bf80c373e75550c11c525c61fe3919f51`, whose `src/` is the
+same. This was established by comparing rather than recorded at the time: of the commits in
+z264's history that have a decoder, those two are nearest to this repository's first
+import (`f924245`), differing in 46 lines, all of them the crate's name in documentation and
+edits to one NEON kernel. The next nearest differs in 202. The `rust_h264` version z264
+adapted remains unknown beyond the 0.4.x its note states.
 
 ## Inherited adaptation
 
@@ -48,6 +51,8 @@ decoding behaviour are these:
 - **POC.** FrameNumOffset for types 1 and 2; IDR uses its coded LSB for type 0.
 - **Output order.** `OrderedDecoder`'s depth follows the SPS (VUI or level),
   and treats MMCO 5 as a GOP boundary. Frames carry a caller tag.
+- **Concealment.** A picture's missing macroblocks come from the latest reference picture,
+  and frame_num and friends find a new picture when its first slice was lost.
 - **Performance.** The bit reader borrows the RBSP; `more_rbsp_data` no longer
   rescans trailing zeros; working state is recycled between pictures; a continuation
   slice no longer deep-copies the picture state; no allocation per residual block.

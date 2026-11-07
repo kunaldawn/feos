@@ -142,6 +142,9 @@ fn report_task() {
 pub fn on_exception(info: &Fault, frame: &mut Frame) -> bool {
     let overflow = info.fault_address().and_then(sched::stack_overflow_at);
     if info.is_task_fault() && frame.interrupts_were_enabled() && sched::contain_failure() {
+        // The task holds no lock, so this one can be waited for, and the machine carries
+        // on: what others are printing shouldn't end up in the middle of this, or this in it.
+        let console = feos_console::hold();
         report_task();
         match info.fault_address() {
             Some(address) if overflow.is_some() => {
@@ -159,6 +162,7 @@ pub fn on_exception(info: &Fault, frame: &mut Frame) -> bool {
                 let _ = writeln!(Report, "{}, ip={:#x}; ended", info.syndrome_name(), info.instruction());
             }
         }
+        drop(console);
         sched::end_task_from_trap(frame);
         return true;
     }
@@ -178,8 +182,10 @@ pub fn on_exception(info: &Fault, frame: &mut Frame) -> bool {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     if Port::irqs_enabled() && sched::contain_failure() {
+        let console = feos_console::hold();
         report_task();
         let _ = writeln!(Report, "{info}; ended");
+        drop(console);
         sched::end_task();
     }
     begin();

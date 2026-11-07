@@ -8,7 +8,9 @@
 use alloc::vec::Vec;
 use core::ops::Range;
 
-use crate::{avi, detect, flv, matroska, mp4, ContainerFormat};
+use feos_source::{Source, Window};
+
+use crate::{avi, detect, flv, matroska, mp4, mpeg1, ContainerFormat};
 
 /// Most packets an audio track may have, which bounds its table at about 6 MiB.
 pub(crate) const MAX_PACKETS: usize = 1 << 18;
@@ -18,8 +20,10 @@ pub(crate) const MAX_PACKETS: usize = 1 << 18;
 pub enum AudioCodec {
     /// AAC, with an AudioSpecificConfig in [`AudioTrack::config`].
     Aac,
-    /// MPEG audio.
+    /// MPEG audio, whole frames to a packet.
     Mp3,
+    /// MPEG audio, where packets split frames: a program stream's.
+    MpegSplit,
     /// Vorbis, with its headers in [`AudioTrack::config`] as Matroska stores
     /// them.
     Vorbis,
@@ -50,6 +54,7 @@ impl AudioCodec {
         match self {
             Self::Aac => "AAC",
             Self::Mp3 => "MP3",
+            Self::MpegSplit => "MPEG audio",
             Self::Vorbis => "Vorbis",
             Self::Flac => "FLAC",
             Self::Opus => "Opus",
@@ -134,7 +139,45 @@ pub fn audio_track(input: &[u8]) -> Option<AudioTrack> {
         ContainerFormat::Matroska => matroska::audio_track(input),
         ContainerFormat::Flv => flv::audio_track(input),
         ContainerFormat::Avi => avi::audio_track(input),
+        ContainerFormat::Mpeg1 => mpeg1::audio_track(input),
         _ => None,
     }?;
     (!track.packets.is_empty()).then_some(track)
+}
+
+/// [`audio_track`] for a file that stays on disk. Packet offsets are the file's, and
+/// [`AudioTrack::config`] is a range of the bytes that come back with it. Read a
+/// packet from the file with [`AudioTrack::read_packet`].
+pub fn audio_track_from_source(file: &dyn Source) -> Option<(Vec<u8>, AudioTrack)> {
+    let mut window = Window::new(file, crate::decoder::STREAM_WINDOW)?;
+    let format = detect(window.bytes(0, 4096))?;
+    let found = match format {
+        ContainerFormat::Mp4 => {
+            let head = mp4::source_head(&mut window).ok()?;
+            let track = mp4::audio_track_sized(&head, file.len() as usize)?;
+            Some((head, track))
+        }
+        ContainerFormat::Matroska => matroska::audio_track_source(&mut window),
+        ContainerFormat::Flv => flv::audio_track_source(&mut window),
+        ContainerFormat::Avi => avi::audio_track_source(&mut window),
+        _ => None,
+    }?;
+    (!found.1.packets.is_empty()).then_some(found)
+}
+
+impl AudioTrack {
+    /// Reads a packet from a file on disk into `out`, which it sizes. `false` if
+    /// there's no such packet, or it can't be read.
+    pub fn read_packet(&self, file: &dyn Source, index: usize, out: &mut Vec<u8>) -> bool {
+        let Some(packet) = self.packets.get(index) else {
+            return false;
+        };
+        let size = packet.size as usize;
+        out.clear();
+        if out.try_reserve(size).is_err() {
+            return false;
+        }
+        out.resize(size, 0);
+        file.read_full(packet.offset as u64, out) == size
+    }
 }

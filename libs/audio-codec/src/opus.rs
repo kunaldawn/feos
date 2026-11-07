@@ -1,7 +1,6 @@
-//! Minimal Opus packet parsing.
-//!
-//! This module understands the TOC (table of contents) byte and the frame
-//! count encoding. It does not perform SILK/CELT decoding.
+//! Opus: packet parsing here, and decoding by `feos-opus`.
+
+use feos_opus::{OpusDecoder, OpusError};
 
 use crate::error::{AudioError, Result};
 
@@ -79,4 +78,146 @@ pub fn parse_packet(packet: &[u8]) -> Result<PacketInfo> {
         frame_count,
         frame_samples: frame_samples(config),
     })
+}
+
+/// What a stream's header says that decoding needs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct OpusConfig {
+    pub channels: u16,
+    /// Samples at 48 kHz at the start that are the decoder settling, not the sound.
+    pub pre_skip: u16,
+    /// A gain to apply, in 256ths of a decibel.
+    pub gain: i16,
+}
+
+impl OpusConfig {
+    /// Reads an `OpusHead` packet, as Ogg and Matroska have it, or the body of an MP4
+    /// `dOps` box, which has the same fields big-endian after no magic.
+    pub(crate) fn parse(data: &[u8]) -> Result<Self> {
+        let (channels, pre_skip, gain, family) = match data.strip_prefix(b"OpusHead") {
+            Some(rest) => {
+                let head = rest.get(..11).ok_or(AudioError::UnexpectedEnd)?;
+                (
+                    head[1],
+                    u16::from_le_bytes([head[2], head[3]]),
+                    i16::from_le_bytes([head[8], head[9]]),
+                    head[10],
+                )
+            }
+            None => {
+                let head = data.get(..11).ok_or(AudioError::UnexpectedEnd)?;
+                (
+                    head[1],
+                    u16::from_be_bytes([head[2], head[3]]),
+                    i16::from_be_bytes([head[8], head[9]]),
+                    head[10],
+                )
+            }
+        };
+        if channels == 0 {
+            return Err(AudioError::InvalidData("Opus stream has no channels"));
+        }
+        if channels > 2 || family != 0 {
+            return Err(AudioError::UnsupportedFeature("Opus with more than two channels"));
+        }
+        Ok(Self {
+            channels: channels as u16,
+            pre_skip,
+            gain,
+        })
+    }
+}
+
+/// `10^(gain / 5120)`, by its series: gains are rare, and small when they're not.
+fn gain_factor(gain: i16) -> f32 {
+    let x = gain as f32 * core::f32::consts::LN_10 / 5120.0;
+    let halves = (x.abs() / 0.5) as i32 + 1;
+    let step = x / halves as f32;
+    let mut term = 1.0;
+    let mut sum = 1.0;
+    for n in 1..10 {
+        term *= step / n as f32;
+        sum += term;
+    }
+    let mut value = 1.0;
+    for _ in 0..halves {
+        value *= sum;
+    }
+    value
+}
+
+/// Decodes the packets of one Opus stream to 16-bit samples at 48 kHz, the rate Opus
+/// streams come back at here.
+pub struct OpusPacketDecoder {
+    decoder: OpusDecoder,
+    channels: u16,
+    /// Samples still to be dropped from the start.
+    skip: usize,
+    factor: Option<f32>,
+}
+
+impl OpusPacketDecoder {
+    /// Takes the stream's `OpusHead`, or an MP4 `dOps` box's contents.
+    pub fn new(head: &[u8]) -> Result<Self> {
+        let config = OpusConfig::parse(head)?;
+        Ok(Self {
+            decoder: OpusDecoder::new(48_000, config.channels as usize).map_err(map_error)?,
+            channels: config.channels,
+            skip: config.pre_skip as usize,
+            factor: (config.gain != 0).then(|| gain_factor(config.gain)),
+        })
+    }
+
+    /// The number of interleaved channels.
+    pub fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    /// The most interleaved samples one packet can make.
+    pub fn max_packet_samples(&self) -> usize {
+        OpusDecoder::MAX_FRAME_SIZE_48K * self.channels as usize
+    }
+
+    /// Forgets what it was decoding, for a seek. Nothing more gets dropped from the start.
+    pub fn forget(&mut self) {
+        self.decoder.reset();
+        self.skip = 0;
+    }
+
+    /// Decodes a packet to `out`, and returns the sample frames written.
+    pub fn decode(&mut self, packet: &[u8], out: &mut [i16]) -> Result<usize> {
+        let channels = self.channels as usize;
+        let needed = self.max_packet_samples();
+        if out.len() < needed {
+            return Err(AudioError::BufferTooSmall {
+                required: needed,
+                available: out.len(),
+            });
+        }
+        let frames = self.decoder.decode(packet, out, false).map_err(map_error)?;
+        let samples = frames * channels;
+        if let Some(factor) = self.factor {
+            for sample in &mut out[..samples] {
+                *sample = (*sample as f32 * factor).clamp(-32768.0, 32767.0) as i16;
+            }
+        }
+        let dropped = self.skip.min(frames);
+        self.skip -= dropped;
+        if dropped > 0 {
+            out.copy_within(dropped * channels..samples, 0);
+        }
+        Ok(frames - dropped)
+    }
+}
+
+fn map_error(error: OpusError) -> AudioError {
+    match error {
+        OpusError::InvalidPacket => AudioError::InvalidData("bad Opus packet"),
+        OpusError::InternalError => AudioError::InvalidData("bad Opus packet"),
+        OpusError::BufferTooSmall => AudioError::BufferTooSmall {
+            required: 0,
+            available: 0,
+        },
+        OpusError::InvalidArgument(_) => AudioError::InvalidData("bad Opus parameters"),
+    }
 }

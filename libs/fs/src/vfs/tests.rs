@@ -1,6 +1,6 @@
 use super::*;
 use crate::{format_fat32, Fat32, RamDisk, StaticFs, StaticNode, BufferCache};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::Ordering as AtomicOrdering;
 
 fn vfs() -> Vfs {
     Vfs::in_memory(1024 * 1024)
@@ -424,16 +424,20 @@ fn an_atomic_file_can_be_read_back_from_either_name() {
     assert_eq!(read_atomic(&vfs, "/s").unwrap(), b"two");
 }
 
-static NOW: AtomicU64 = AtomicU64::new(1_700_000_000);
+// A clock for each thread, as tests run side by side: with one between them, one test
+// moving it forward landed in another's stamps.
+std::thread_local! {
+    static NOW: core::cell::Cell<u64> = const { core::cell::Cell::new(1_700_000_000) };
+}
 
 fn fake_now() -> Option<u64> {
-    Some(NOW.load(AtomicOrdering::Relaxed))
+    Some(NOW.get())
 }
 
 #[test]
 fn timestamps_are_stored_and_updated_on_every_backend() {
     for vfs in [fat_vfs(40 * 1024 * 1024), vfs()] {
-        NOW.store(1_700_000_000, AtomicOrdering::Relaxed);
+        NOW.set(1_700_000_000);
         vfs.set_time_source(fake_now);
         vfs.write_file("/f", b"x", false).unwrap();
         vfs.create_dir("/d").unwrap();
@@ -442,7 +446,7 @@ fn timestamps_are_stored_and_updated_on_every_backend() {
         assert_eq!(times.modified, Some(1_700_000_000));
         assert_eq!(vfs.stat("/d").unwrap().times.created, Some(1_700_000_000));
 
-        NOW.store(1_700_000_100, AtomicOrdering::Relaxed);
+        NOW.set(1_700_000_100);
         vfs.write_at("/f", 1, b"y").unwrap();
         let times = vfs.stat("/f").unwrap().times;
         assert_eq!(times.created, Some(1_700_000_000));
@@ -465,7 +469,7 @@ fn timestamps_survive_a_remount_on_fat() {
     let disk = SharedDisk::formatted(40 * 1024 * 1024);
     {
         let vfs = Vfs::new(Box::new(Fat32::mount(disk.clone()).unwrap()), false, "d");
-        NOW.store(1_700_000_000, AtomicOrdering::Relaxed);
+        NOW.set(1_700_000_000);
         vfs.set_time_source(fake_now);
         vfs.write_file("/f", b"x", false).unwrap();
         vfs.set_attributes("/f", attr::HIDDEN).unwrap();
@@ -478,6 +482,15 @@ fn timestamps_survive_a_remount_on_fat() {
     assert_eq!(stat.attributes & attr::HIDDEN, attr::HIDDEN);
     // The date alone, for the access time.
     assert_eq!(stat.times.accessed, Some(1_700_000_000 / 86_400 * 86_400));
+}
+
+#[test]
+fn timestamp_tests_can_run_at_the_same_time() {
+    // Sharing a clock made these fail within a few dozen rounds.
+    let moving = std::thread::spawn(|| (0..64).for_each(|_| timestamps_are_stored_and_updated_on_every_backend()));
+    let remount = std::thread::spawn(|| (0..64).for_each(|_| timestamps_survive_a_remount_on_fat()));
+    moving.join().unwrap();
+    remount.join().unwrap();
 }
 
 #[test]

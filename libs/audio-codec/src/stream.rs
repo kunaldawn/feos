@@ -9,6 +9,7 @@ use crate::aac::AdtsDecoder;
 use crate::error::{AudioError, Result};
 use crate::flac::{FlacDecoder, OggFlacDecoder};
 use crate::mp3_decode::Mp3Decoder;
+use crate::ogg::OggOpusDecoder;
 use crate::vorbis::VorbisDecoder;
 use crate::{aiff, au, wav, AudioFormat, AudioInfo};
 
@@ -28,6 +29,7 @@ enum Inner<'a> {
     OggFlac(OggFlacDecoder<'a>),
     Vorbis(VorbisDecoder<'a>),
     Aac(AdtsDecoder<'a>),
+    Opus(OggOpusDecoder<'a>),
 }
 
 fn open_inner(input: &[u8], format: AudioFormat) -> Result<Inner<'_>> {
@@ -52,11 +54,7 @@ fn open_inner(input: &[u8], format: AudioFormat) -> Result<Inner<'_>> {
         AudioFormat::OggFlac => Inner::OggFlac(OggFlacDecoder::new(input)?),
         AudioFormat::OggVorbis => Inner::Vorbis(VorbisDecoder::new(input)?),
         AudioFormat::Aac => Inner::Aac(AdtsDecoder::new(input)?),
-        AudioFormat::OggOpus => {
-            return Err(AudioError::UnsupportedFeature(
-                "Opus packet decoding is not implemented",
-            ))
-        }
+        AudioFormat::OggOpus => Inner::Opus(OggOpusDecoder::new(input)?),
     })
 }
 
@@ -122,6 +120,7 @@ impl<'a> AudioStream<'a> {
             }
             Inner::Vorbis(decoder) => decoder.max_packet_samples(),
             Inner::Aac(decoder) => decoder.max_frame_samples(),
+            Inner::Opus(decoder) => decoder.max_chunk_samples(),
         }
     }
 
@@ -181,9 +180,19 @@ impl<'a> AudioStream<'a> {
                 Some(frames) => frames,
                 None => return Ok(None),
             },
+            Inner::Opus(decoder) => match decoder.next_chunk(out)? {
+                Some(frames) => frames,
+                None => return Ok(None),
+            },
         };
         let start = self.position;
         self.position += frames as u64;
+        // An Opus stream states its end, cutting off the last packet's padding.
+        let mut frames = frames;
+        if matches!(self.inner, Inner::Opus(_)) && self.position > self.info.frames {
+            frames = frames.saturating_sub((self.position - self.info.frames) as usize);
+            self.position = self.info.frames;
+        }
         if self.position <= self.skip_to {
             return Ok(Some(0));
         }

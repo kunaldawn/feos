@@ -419,6 +419,15 @@ fn blk_idx(col: usize, row: usize) -> usize {
 /// `mb_p`/`mb_q`: macroblock info for each side of the edge.
 /// `blk_p`/`blk_q`: 4x4 block index (0-15 raster) within each MB.
 /// `is_mb_edge`: true if the edge is on a macroblock boundary.
+impl MbInfo {
+    /// A macroblock that never decoded: nothing to filter on, with its slice's filter off.
+    pub(crate) fn concealed() -> Self {
+        let mut info = Self::default();
+        info.deblock.filter_idc = 1;
+        info
+    }
+}
+
 fn derive_bs(mb_p: &MbInfo, mb_q: &MbInfo, blk_p: usize, blk_q: usize, is_mb_edge: bool) -> i32 {
     let intra_p = mb_p.mb_type == MbType::Intra || mb_p.mb_type == MbType::Ipcm;
     let intra_q = mb_q.mb_type == MbType::Intra || mb_q.mb_type == MbType::Ipcm;

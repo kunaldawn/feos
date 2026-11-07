@@ -57,6 +57,8 @@ struct Found {
     fs: Box<dyn WritableFileSystem>,
     source: String,
     fresh: bool,
+    /// FEOS's own filesystem, which is never the root.
+    native: bool,
 }
 
 fn is_blank<D: BlockDevice>(device: &D) -> Result<bool, FsError> {
@@ -109,7 +111,7 @@ fn mount_volume<T: BlockIo + 'static>(
     if fs.is_damaged() {
         log.push(format!("[fs] {source}: damaged, mounted read-only"));
     }
-    Ok(Found { fs, source, fresh })
+    Ok(Found { fs, source, fresh, native: false })
 }
 
 /// A disk that isn't the system's own, whatever kind of device it is.
@@ -194,6 +196,15 @@ fn open_disk<T: BlockIo + 'static>(driver: T, name: String, may_format: bool, lo
             Err(_) => continue,
         };
         match detect(&view) {
+            Ok(VolumeKind::Native) => {
+                match mount_volume(device, info.start, info.count, source.clone(), false, log) {
+                    Ok(mut volume) => {
+                        volume.native = true;
+                        found.push(volume);
+                    }
+                    Err(error) => log.push(format!("[fs] {source}: not mounted: {error}")),
+                }
+            }
             Ok(VolumeKind::Fat32 | VolumeKind::Exfat) => {
                 match mount_volume(device, info.start, info.count, source.clone(), false, log) {
                     Ok(volume) => found.push(volume),
@@ -209,6 +220,7 @@ fn open_disk<T: BlockIo + 'static>(driver: T, name: String, may_format: bool, lo
                             fs: Box::new(ram),
                             source,
                             fresh: false,
+                            native: false,
                         }),
                         Err(error) => log.push(format!("[fs] {source}: not mounted: {error}")),
                     }
@@ -280,6 +292,9 @@ pub fn assemble<T: BlockIo + 'static>(
         volumes.extend(open_disk(driver, format!("virtio{index}"), true, &mut log));
     }
 
+    // The native filesystem is never the root: existing systems boot from FAT, or from the
+    // embedded image. Each one found goes at `/native<n>`.
+    let (native, volumes): (Vec<Found>, Vec<Found>) = volumes.into_iter().partition(|volume| volume.native);
     let mut volumes = volumes.into_iter();
     let vfs: Vfs = match volumes.next() {
         Some(root) => {
@@ -322,6 +337,14 @@ pub fn assemble<T: BlockIo + 'static>(
         let path = format!("/disk{}", number + 1);
         match vfs.mount(&path, volume.fs, false, &volume.source) {
             Ok(()) => log.push(format!("[fs] {}: mounted at {path}", volume.source)),
+            Err(error) => log.push(format!("[fs] {}: not mounted: {error}", volume.source)),
+        }
+    }
+
+    for (number, volume) in native.into_iter().enumerate() {
+        let path = format!("/native{number}");
+        match vfs.mount(&path, volume.fs, false, &volume.source) {
+            Ok(()) => log.push(format!("[fs] {}: native filesystem mounted at {path}", volume.source)),
             Err(error) => log.push(format!("[fs] {}: not mounted: {error}", volume.source)),
         }
     }

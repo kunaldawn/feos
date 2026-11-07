@@ -32,7 +32,7 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 use feos_app::pipe::{self, PipeReader, PipeWriter, Transfer};
 use feos_app::{shell as session, App, Context, Platform, SpawnIo, WindowContext, WindowFrame};
-use feos_coreutils::{BytesInput, Input, NoSystem, Output, System};
+use feos_coreutils::{Available, BytesInput, Input, NoSystem, Output, System};
 use feos_gfx::{Canvas, Color, Rect};
 use feos_gui::{Event, Key, Modifiers};
 use feos_hal::Clock;
@@ -137,6 +137,10 @@ struct Link {
     closing: AtomicBool,
     /// The running command asked for raw keys.
     raw: AtomicBool,
+    /// Ctrl-Z was pressed, for whoever's running a command.
+    suspend: AtomicBool,
+    /// Ctrl-\\ was pressed, likewise.
+    quit: AtomicBool,
     /// The shell asked to exit, and with what, offset by one: 0 means it hasn't.
     exit: AtomicI32,
 }
@@ -149,6 +153,8 @@ impl Link {
             busy: AtomicBool::new(false),
             closing: AtomicBool::new(false),
             raw: AtomicBool::new(false),
+            suspend: AtomicBool::new(false),
+            quit: AtomicBool::new(false),
             exit: AtomicI32::new(0),
         }
     }
@@ -206,6 +212,10 @@ struct KeyInput {
     cancel: CancelToken,
     line: Vec<u8>,
     position: usize,
+    /// `line` is complete, for [`Input::try_read`], which builds it a piece at a time.
+    finished: bool,
+    /// Put back by [`Input::unread`], to read before anything else.
+    returned: Vec<u8>,
 }
 
 impl KeyInput {
@@ -213,49 +223,88 @@ impl KeyInput {
         self.cancel.is_cancelled() || self.link.closing.load(Ordering::Acquire)
     }
 
+    /// One typed byte's effect on the line being read.
+    fn cook_byte(&mut self, byte: u8) -> Cooked {
+        match byte {
+            b'\r' | b'\n' => {
+                self.line.push(b'\n');
+                let _ = self.echo.write(b"\n");
+                Cooked::Ready
+            }
+            0x04 if self.line.is_empty() => Cooked::End,
+            0x04 => Cooked::Ready,
+            0x7f | 0x08 => {
+                let mut removed = false;
+                while let Some(last) = self.line.pop() {
+                    removed = true;
+                    if last & 0xc0 != 0x80 {
+                        break;
+                    }
+                }
+                if removed {
+                    let _ = self.echo.write(b"\x08 \x08");
+                }
+                Cooked::More
+            }
+            0x15 => {
+                while let Some(last) = self.line.pop() {
+                    if last & 0xc0 != 0x80 {
+                        let _ = self.echo.write(b"\x08 \x08");
+                    }
+                }
+                Cooked::More
+            }
+            byte if byte >= 0x20 && self.line.len() < 4096 => {
+                self.line.push(byte);
+                let _ = self.echo.write(&[byte]);
+                Cooked::More
+            }
+            _ => Cooked::More,
+        }
+    }
+
     fn cook(&mut self) -> bool {
         self.line.clear();
         self.position = 0;
+        self.finished = false;
         let mut byte = [0u8; 1];
         loop {
             if self.read_raw(&mut byte) == 0 {
                 return !self.line.is_empty();
             }
-            match byte[0] {
-                b'\r' | b'\n' => {
-                    self.line.push(b'\n');
-                    let _ = self.echo.write(b"\n");
-                    return true;
-                }
-                0x04 if self.line.is_empty() => return false,
-                0x04 => return true,
-                0x7f | 0x08 => {
-                    let mut removed = false;
-                    while let Some(last) = self.line.pop() {
-                        removed = true;
-                        if last & 0xc0 != 0x80 {
-                            break;
-                        }
-                    }
-                    if removed {
-                        let _ = self.echo.write(b"\x08 \x08");
-                    }
-                }
-                0x15 => {
-                    while let Some(last) = self.line.pop() {
-                        if last & 0xc0 != 0x80 {
-                            let _ = self.echo.write(b"\x08 \x08");
-                        }
-                    }
-                }
-                byte if byte >= 0x20 && self.line.len() < 4096 => {
-                    self.line.push(byte);
-                    let _ = self.echo.write(&[byte]);
-                }
-                _ => {}
+            match self.cook_byte(byte[0]) {
+                Cooked::More => {}
+                Cooked::Ready => return true,
+                Cooked::End => return false,
             }
         }
     }
+
+    fn take_returned(&mut self, out: &mut [u8]) -> usize {
+        let count = self.returned.len().min(out.len());
+        out[..count].copy_from_slice(&self.returned[..count]);
+        self.returned.drain(..count);
+        count
+    }
+
+    /// Hands over from a finished line.
+    fn take_line(&mut self, out: &mut [u8]) -> usize {
+        let rest = &self.line[self.position..];
+        let count = rest.len().min(out.len());
+        out[..count].copy_from_slice(&rest[..count]);
+        self.position += count;
+        count
+    }
+}
+
+/// What a typed byte did to a line.
+enum Cooked {
+    /// Keep reading.
+    More,
+    /// The line is finished.
+    Ready,
+    /// Ctrl-D on an empty line.
+    End,
 }
 
 impl Input for KeyInput {
@@ -263,14 +312,49 @@ impl Input for KeyInput {
         if self.position >= self.line.len() && !self.cook() {
             return 0;
         }
-        let rest = &self.line[self.position..];
-        let count = rest.len().min(out.len());
-        out[..count].copy_from_slice(&rest[..count]);
-        self.position += count;
-        count
+        self.take_line(out)
+    }
+
+    fn try_read(&mut self, out: &mut [u8]) -> Available {
+        loop {
+            if self.finished {
+                let count = self.take_line(out);
+                if self.position >= self.line.len() {
+                    self.finished = false;
+                    self.line.clear();
+                    self.position = 0;
+                }
+                if count > 0 {
+                    return Available::Bytes(count);
+                }
+            }
+            let mut byte = [0u8; 1];
+            let got = if self.returned.is_empty() {
+                self.reader.try_read(&mut byte)
+            } else {
+                Transfer::Moved(self.take_returned(&mut byte))
+            };
+            match got {
+                Transfer::Moved(_) => match self.cook_byte(byte[0]) {
+                    Cooked::More => {}
+                    Cooked::Ready => self.finished = true,
+                    Cooked::End => return Available::End,
+                },
+                Transfer::Closed => return Available::End,
+                Transfer::WouldBlock if self.stopped() => return Available::End,
+                Transfer::WouldBlock => return Available::Pending,
+            }
+        }
+    }
+
+    fn unread(&mut self, bytes: &[u8]) {
+        self.returned.splice(0..0, bytes.iter().copied());
     }
 
     fn read_raw(&mut self, out: &mut [u8]) -> usize {
+        if !self.returned.is_empty() {
+            return self.take_returned(out);
+        }
         loop {
             let seen = self.reader.change_count();
             match self.reader.try_read(out) {
@@ -286,6 +370,9 @@ impl Input for KeyInput {
     }
 
     fn read_pending(&mut self, out: &mut [u8]) -> usize {
+        if !self.returned.is_empty() {
+            return self.take_returned(out);
+        }
         match self.reader.try_read(out) {
             Transfer::Moved(count) => count,
             _ => 0,
@@ -333,10 +420,20 @@ impl ConsoleSource for WindowConsole {
                 cancel: self.cancel.clone(),
                 line: Vec::new(),
                 position: 0,
+                finished: false,
+                returned: Vec::new(),
             }),
             _ => alloc::boxed::Box::new(feos_coreutils::NullInput),
         };
         (input, output(), output())
+    }
+
+    fn take_suspend(&self) -> bool {
+        self.link.suspend.swap(false, Ordering::AcqRel)
+    }
+
+    fn take_quit(&self) -> bool {
+        self.link.quit.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -363,13 +460,35 @@ fn worker_task(
         link: link.clone(),
         cancel: cancel.clone(),
     });
-    let mut host = ProcessHost::detached(platform, cancel, console);
+    let mut host = ProcessHost::detached(platform, cancel.clone(), console);
     loop {
         let seen = link.jobs.load(Ordering::Acquire);
         if link.closing.load(Ordering::Acquire) || platform.processes.kill_requested() {
+            // The window has gone. Its traps get to run, for what they leave on disk.
+            cancel.clear();
+            let mut shell = shell.lock();
+            let mut io = Io {
+                stdin: &mut stdin,
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            };
+            shell.hang_up(&mut io, &mut host);
             return 0;
         }
         let Some(line) = link.job.lock().take() else {
+            // A signal wakes this, and its trap runs at once if a prompt is all that's up.
+            {
+                let mut shell = shell.lock();
+                let mut io = Io {
+                    stdin: &mut stdin,
+                    stdout: &mut stdout,
+                    stderr: &mut stderr,
+                };
+                shell.poll_signals(&mut io, &mut host);
+                if let Some(code) = shell.take_exit_status() {
+                    link.exit.store(code.wrapping_add(1).max(1), Ordering::Release);
+                }
+            }
             futex_wait(&link.jobs, seen);
             continue;
         };
@@ -408,7 +527,37 @@ struct TerminalState {
     size_changed: bool,
     /// Counted in [`ACTIVE`].
     active: bool,
+    /// What's selected, if anything.
+    selection: Option<Selection>,
+    /// When the left button last went down, and where, to tell a double click.
+    last_press: Option<(u64, (u64, usize))>,
 }
+
+/// Selected text, by line numbers that stay with the text as it scrolls.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Selection {
+    /// Where the button went down, as `(line number, column)`.
+    anchor: (u64, usize),
+    /// Where it is now.
+    head: (u64, usize),
+    /// The button's still down.
+    dragging: bool,
+}
+
+impl Selection {
+    /// Whether a cell is in it.
+    fn contains(&self, line: u64, column: usize) -> bool {
+        let (first, last) = if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        };
+        (line, column) >= first && (line, column) <= last
+    }
+}
+
+/// How long a second click has to count as a double one.
+const DOUBLE_CLICK_MS: u64 = 400;
 
 impl TerminalState {
     fn new(filesystem: Option<&'static dyn feos_fs::FileSystem>) -> Self {
@@ -434,12 +583,14 @@ impl TerminalState {
             running: false,
             size_changed: false,
             active: false,
+            selection: None,
+            last_press: None,
         };
         state.set_screen_variables();
         state.vt.feed(b"FEOS terminal - Bash-compatible shell\n");
         state
             .vt
-            .feed(b"Type 'help' for commands. Ctrl+/- zooms, Ctrl+Shift+V pastes, Ctrl-D closes.\n\n");
+            .feed(b"Type 'help'. Ctrl+/- zooms, drag selects, Ctrl+Shift+C/V copy and paste.\n\n");
         state.print_prompt();
         state
     }
@@ -468,6 +619,8 @@ impl TerminalState {
             cancel: cancel.clone(),
             line: Vec::new(),
             position: 0,
+            finished: false,
+            returned: Vec::new(),
         };
         let stdout = PipeOutput { writer: out_writer };
         let stderr = PipeOutput { writer: err_writer };
@@ -522,12 +675,16 @@ impl TerminalState {
     /// Notices that the task finished the command, and shows a new prompt.
     fn poll_worker(&mut self) {
         self.drain();
-        if !self.running {
-            return;
-        }
         let Some(worker) = self.worker.as_ref() else {
             return;
         };
+        if !self.running {
+            // A trap at the prompt can end the shell, too.
+            if worker.link.exit.load(Ordering::Acquire) != 0 {
+                self.close_requested = true;
+            }
+            return;
+        }
         if worker.link.busy.load(Ordering::Acquire) {
             return;
         }
@@ -678,6 +835,16 @@ impl TerminalState {
                 .is_some_and(|worker| worker.link.raw.load(Ordering::Acquire));
             if !raw && key == KeyPress::ctrl('c') {
                 self.interrupt();
+            } else if !raw && key == KeyPress::ctrl('z') {
+                if let Some(worker) = self.worker.as_ref() {
+                    worker.link.suspend.store(true, Ordering::Release);
+                }
+                self.vt.feed(b"^Z");
+            } else if !raw && key == KeyPress::ctrl('\\') {
+                if let Some(worker) = self.worker.as_ref() {
+                    worker.link.quit.store(true, Ordering::Release);
+                }
+                self.vt.feed(b"^\\\n");
             } else if let Some(bytes) = key_bytes(key) {
                 self.send_keys(bytes.as_str().as_bytes());
             }
@@ -721,7 +888,7 @@ impl TerminalState {
                     if !line.is_empty() {
                         line.push_str("  ");
                     }
-                    line.push_str(&candidate);
+                    line.push_str(&feos_text::display_name(&candidate));
                 }
                 line.push('\n');
                 self.vt.feed(line.as_bytes());
@@ -768,6 +935,106 @@ impl TerminalState {
                 '\t' => self.press(KeyPress::plain(KeyCode::Tab), clock),
                 ch if ch.is_control() => {}
                 ch => self.press(KeyPress::plain(KeyCode::Char(ch)), clock),
+            }
+        }
+    }
+
+    /// Puts what's selected on the clipboard. `false` when nothing is selected.
+    fn copy_selection(&mut self) -> bool {
+        let Some(selection) = self.selection else {
+            return false;
+        };
+        session::clipboard_set(&self.vt.text_between(selection.anchor, selection.head));
+        true
+    }
+
+    /// The cell under a point in the window, as `(line number, column)`.
+    fn cell_at(&self, x: i32, y: i32) -> (u64, usize) {
+        let cell_width = BASE_CELL_WIDTH * self.scale as i32;
+        let line_height = BASE_LINE_HEIGHT * self.scale as i32;
+        let column = ((x - 4).max(0) / cell_width) as usize;
+        let row = ((y - 4).max(0) / line_height) as usize;
+        let row = row.min(self.vt.rows() - 1);
+        let line = self.vt.line_number(row, self.scroll);
+        let mut column = column.min(self.vt.cols() - 1);
+        // The right half of a wide character is the character.
+        if let Some(cells) = self.vt.line_cells(line) {
+            if column > 0 && cells.get(column).is_some_and(|cell| cell.ch == vt::CONTINUATION) {
+                column -= 1;
+            }
+        }
+        (line, column)
+    }
+
+    /// The word around a cell, for a double click.
+    fn word_at(&self, at: (u64, usize)) -> Selection {
+        let cells = self.vt.line_cells(at.0).unwrap_or(&[]);
+        let is_word = |cell: &vt::Cell| !cell.ch.is_whitespace();
+        let mut first = at.1;
+        let mut last = at.1;
+        if cells.get(at.1).is_some_and(is_word) {
+            while first > 0 && cells.get(first - 1).is_some_and(is_word) {
+                first -= 1;
+            }
+            while cells.get(last + 1).is_some_and(is_word) {
+                last += 1;
+            }
+        }
+        Selection {
+            anchor: (at.0, first),
+            head: (at.0, last),
+            dragging: false,
+        }
+    }
+
+    /// One report from the pointer, in window coordinates.
+    fn pointer_event(&mut self, event: feos_hal::PointerEvent, now_ms: u64, clock: Option<&'static dyn Clock>) {
+        let at = self.cell_at(event.x as i32, event.y as i32);
+        match event.left {
+            Some(true) => {
+                let double = self.last_press.is_some_and(|(when, where_)| {
+                    where_ == at && now_ms.saturating_sub(when) < DOUBLE_CLICK_MS
+                });
+                if double {
+                    self.selection = Some(self.word_at(at));
+                    self.last_press = None;
+                } else {
+                    self.selection = Some(Selection {
+                        anchor: at,
+                        head: at,
+                        dragging: true,
+                    });
+                    self.last_press = Some((now_ms, at));
+                }
+                return;
+            }
+            Some(false) => {
+                if let Some(selection) = self.selection.as_mut() {
+                    if selection.dragging {
+                        selection.head = at;
+                        selection.dragging = false;
+                        // A click with no drag selects nothing.
+                        if selection.anchor == selection.head {
+                            self.selection = None;
+                        }
+                    }
+                }
+                return;
+            }
+            None => {}
+        }
+        // The right button copies a selection, or pastes when there's none.
+        if event.right == Some(true) {
+            if self.copy_selection() {
+                self.selection = None;
+            } else {
+                self.paste(clock);
+            }
+            return;
+        }
+        if let Some(selection) = self.selection.as_mut() {
+            if selection.dragging {
+                selection.head = at;
             }
         }
     }
@@ -924,6 +1191,15 @@ impl App for Terminal {
                 handle_event(state, event, context, has_text);
             }
         }
+        let mut reports = Vec::new();
+        context.dispatch_pointer(|report| {
+            if report.wheel == 0 {
+                reports.push(report);
+            }
+        });
+        for report in reports {
+            state.pointer_event(report, context.now_ms, Some(context.platform.clock));
+        }
         if context.pointer_active {
             for event in context.input.events() {
                 if let Event::PointerWheel(delta) = event {
@@ -1003,6 +1279,14 @@ fn handle_event(
                     Key::Character('V') => return state.paste(clock),
                     Key::Character('v') if modifiers.contains(Modifiers::SHIFT) => {
                         return state.paste(clock)
+                    }
+                    Key::Character('C') => {
+                        state.copy_selection();
+                        return;
+                    }
+                    Key::Character('c') if modifiers.contains(Modifiers::SHIFT) => {
+                        state.copy_selection();
+                        return;
                     }
                     _ => {}
                 }
@@ -1088,19 +1372,28 @@ fn render(state: &TerminalState, canvas: &mut Canvas<'_>) {
             let first = cells[index];
             let start = index;
             run.clear();
+            let line = state.vt.line_number(row, state.scroll);
+            let selected_at = |column: usize| {
+                state.selection.is_some_and(|selection| selection.contains(line, column))
+            };
+            let selected = selected_at(start);
             while index < cells.len()
                 && cells[index].fg == first.fg
                 && cells[index].bg == first.bg
                 && cells[index].attrs == first.attrs
+                && selected_at(index) == selected
             {
-                run.push(cells[index].ch);
+                // A wide character's glyph takes the first of its cells, so the
+                // columns after it stay where they belong.
+                let ch = cells[index].ch;
+                run.push(if ch == vt::CONTINUATION { ' ' } else { ch });
                 index += 1;
             }
 
             let bold = first.attrs & ATTR_BOLD != 0;
             let mut fg = cell_color(first.fg, FOREGROUND, bold);
             let mut bg = cell_color(first.bg, BACKGROUND, false);
-            let inverse = first.attrs & ATTR_INVERSE != 0;
+            let inverse = (first.attrs & ATTR_INVERSE != 0) != selected;
             if inverse {
                 core::mem::swap(&mut fg, &mut bg);
             }
@@ -1115,6 +1408,28 @@ fn render(state: &TerminalState, canvas: &mut Canvas<'_>) {
             let text = run.trim_end_matches(' ');
             if !text.is_empty() {
                 canvas.draw_text(x, y, text, fg, scale);
+            }
+            // A row is taller than a glyph. Box lines and blocks carry on through the gap,
+            // or a vertical line would be dashed.
+            for (offset, cell) in cells[start..index].iter().enumerate() {
+                if !matches!(cell.ch as u32, 0x2500..=0x259f) {
+                    continue;
+                }
+                let bits = feos_gfx::font::glyph(cell.ch)[feos_gfx::font::GLYPH_HEIGHT - 1];
+                let left = x + offset as i32 * cell_width;
+                for column in 0..feos_gfx::font::GLYPH_WIDTH as i32 {
+                    if bits >> column & 1 != 0 {
+                        canvas.fill_rect(
+                            Rect::new(
+                                left + column * scale as i32,
+                                y + feos_gfx::font::GLYPH_HEIGHT as i32 * scale as i32,
+                                scale,
+                                (line_height - feos_gfx::font::GLYPH_HEIGHT as i32 * scale as i32) as u32,
+                            ),
+                            fg,
+                        );
+                    }
+                }
             }
             if first.attrs & ATTR_UNDERLINE != 0 {
                 canvas.fill_rect(
@@ -1481,6 +1796,47 @@ mod tests {
             .iter()
             .any(|line| line.contains("stopped")));
         assert_eq!(state.shell.lock().last_status, 130);
+    }
+
+    #[test]
+    fn dragging_selects_and_copying_reaches_the_clipboard() {
+        let mut state = TerminalState::new(None);
+        state.vt.clear_all();
+        state.vt.feed(b"hello world\r\nsecond \xce\xb1\xce\xb2 line\r\n");
+        let press = |x: i32, y: i32, left: Option<bool>| feos_hal::PointerEvent {
+            x: x as u16,
+            y: y as u16,
+            left,
+            ..Default::default()
+        };
+        // Column 6 of row 0, to column 8 of row 1.
+        state.pointer_event(press(4 + 6 * 8, 4, Some(true)), 1000, None);
+        state.pointer_event(press(4 + 8 * 8, 4 + 10, None), 1010, None);
+        assert!(state.selection.unwrap().dragging);
+        assert!(state.selection.unwrap().contains(0, 7));
+        assert!(!state.selection.unwrap().contains(0, 5));
+        state.pointer_event(press(4 + 8 * 8, 4 + 10, Some(false)), 1020, None);
+        assert!(!state.selection.unwrap().dragging);
+        assert!(state.copy_selection());
+        let mut buffer = [0u8; 64];
+        assert_eq!(session::clipboard_get(&mut buffer), "world\nsecond \u{3b1}\u{3b2}");
+
+        // A double click takes the word, and a plain click clears it again.
+        state.pointer_event(press(4 + 2 * 8, 4, Some(true)), 2000, None);
+        state.pointer_event(press(4 + 2 * 8, 4, Some(false)), 2010, None);
+        assert_eq!(state.selection, None);
+        state.pointer_event(press(4 + 2 * 8, 4, Some(true)), 2100, None);
+        let word = state.selection.unwrap();
+        assert_eq!(state.vt.text_between(word.anchor, word.head), "hello");
+    }
+
+    #[test]
+    fn the_right_half_of_a_wide_character_selects_it() {
+        let mut state = TerminalState::new(None);
+        state.vt.clear_all();
+        state.vt.feed("\u{4e2d}x".as_bytes());
+        assert_eq!(state.cell_at(4 + 8, 4).1, 0);
+        assert_eq!(state.cell_at(4 + 16, 4).1, 2);
     }
 
     #[test]

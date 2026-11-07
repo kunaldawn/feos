@@ -3,6 +3,7 @@
 //! desktop. Sound keeps playing while the window is minimized.
 
 use core::fmt::Write;
+use core::sync::atomic::AtomicU64;
 
 use alloc::vec::Vec;
 
@@ -14,7 +15,9 @@ use feos_gui::{Align, Event, Key, Painter, RectExt, VerticalAlign};
 use feos_sync::SpinLock;
 use feos_text::Text;
 
-use crate::audio_worker::{AudioFailure, AudioTask, Source, TrackInfo, MUSIC_PIPE};
+use crate::audio_worker::{
+    fail_for_test, strip_test_failure, AudioFailure, AudioTask, Source, TrackInfo, MUSIC_PIPE,
+};
 use crate::player::is_audio_file;
 
 const MAX_TRACKS: usize = 256;
@@ -437,6 +440,7 @@ impl Names {
 
 static NAMES: Names = Names(SpinLock::new(None));
 static WINDOW: SpinLock<Option<MusicState>> = SpinLock::new(None);
+static TEST_STARTED: AtomicU64 = AtomicU64::new(0);
 
 /// The Music application.
 pub struct Music;
@@ -480,7 +484,7 @@ impl App for Music {
         };
         *NAMES.0.lock() = Some(fs);
         let mut state = MusicState::new(fs, context.platform.processes);
-        let path = context.args.trim();
+        let (path, _) = strip_test_failure(context.args);
         if !path.is_empty() {
             match fs.resolve(path).filter(|&node| fs.is_file(node)) {
                 Some(node) => {
@@ -502,11 +506,13 @@ impl App for Music {
         let Some(fs) = context.platform.filesystem else {
             return WindowFrame::Close;
         };
-        let mut guard = WINDOW.lock();
-        let Some(state) = guard.as_mut() else {
+        // Out of the lock for the frame: a failure with a lock held stops the machine, and
+        // this way it's only this window's. `close_window` tidies up with or without it.
+        let Some(mut state) = WINDOW.lock().take() else {
             return WindowFrame::Close;
         };
         let now = context.now_ms;
+        fail_for_test(context.args, &TEST_STARTED, now);
         let width = context.canvas.width() as i32;
         let height = context.canvas.height() as i32;
         let visible = list_rows(height);
@@ -532,6 +538,7 @@ impl App for Music {
         state.tick(fs, now);
         let mut painter = Painter::new(context.canvas);
         state.draw(&mut painter, width, height);
+        *WINDOW.lock() = Some(state);
         WindowFrame::Continue
     }
 

@@ -64,6 +64,8 @@ pub enum FsError {
     InvalidPath,
     /// The operation is not supported by this filesystem.
     NotSupported,
+    /// The file's owner and mode say no.
+    PermissionDenied,
     /// The file does not fit the overlay quota or the heap.
     NoSpace,
     /// The path is nested too deeply.
@@ -95,6 +97,7 @@ impl FsError {
             Self::Io => "Input/output error",
             Self::Busy => "Device or resource busy",
             Self::Loop => "Too many levels of symbolic links",
+            Self::PermissionDenied => "Permission denied",
         }
     }
 }
@@ -109,6 +112,31 @@ pub trait Vfs {
 
     /// Returns metadata for `path`.
     fn meta(&self, path: &str) -> Result<Meta, FsError>;
+
+    /// Facts about `path` itself, with its owner and mode: what `ls -l` and `stat` show.
+    fn stat_full(&self, _path: &str) -> Option<feos_fs::Stat> {
+        None
+    }
+
+    /// Sets permission bits.
+    fn chmod(&mut self, _path: &str, _mode: u16) -> Result<(), FsError> {
+        Err(FsError::NotSupported)
+    }
+
+    /// Sets the owner, the group, or both.
+    fn chown(&mut self, _path: &str, _uid: Option<u32>, _gid: Option<u32>) -> Result<(), FsError> {
+        Err(FsError::NotSupported)
+    }
+
+    /// Gives a file another name.
+    fn hard_link(&mut self, _existing: &str, _path: &str) -> Result<(), FsError> {
+        Err(FsError::NotSupported)
+    }
+
+    /// Checks the filesystem holding `path`.
+    fn fsck(&mut self, _path: &str, _repair: bool) -> Result<feos_fs::FsckReport, FsError> {
+        Err(FsError::NotSupported)
+    }
 
     /// Reads a whole file into memory.
     fn read_file(&mut self, path: &str) -> Result<Vec<u8>, FsError>;
@@ -1004,6 +1032,35 @@ impl Vfs for OverlayFs {
         tree.read_link(&path).map_err(shared_error)
     }
 
+    fn stat_full(&self, path: &str) -> Option<feos_fs::Stat> {
+        let path = normalize(&self.cwd, path);
+        self.shared?.lstat(&path).ok()
+    }
+
+    fn chmod(&mut self, path: &str, mode: u16) -> Result<(), FsError> {
+        let path = normalize(&self.cwd, path);
+        let tree = self.shared.ok_or(FsError::NotSupported)?;
+        tree.chmod(&path, mode).map_err(shared_error)
+    }
+
+    fn chown(&mut self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<(), FsError> {
+        let path = normalize(&self.cwd, path);
+        let tree = self.shared.ok_or(FsError::NotSupported)?;
+        tree.chown(&path, uid, gid).map_err(shared_error)
+    }
+
+    fn hard_link(&mut self, existing: &str, path: &str) -> Result<(), FsError> {
+        let (existing, path) = (normalize(&self.cwd, existing), normalize(&self.cwd, path));
+        let tree = self.shared.ok_or(FsError::NotSupported)?;
+        tree.link(&existing, &path).map_err(shared_error)
+    }
+
+    fn fsck(&mut self, path: &str, repair: bool) -> Result<feos_fs::FsckReport, FsError> {
+        let path = normalize(&self.cwd, path);
+        let tree = self.shared.ok_or(FsError::NotSupported)?;
+        tree.fsck(&path, repair).map_err(shared_error)
+    }
+
     fn sync(&mut self) -> Result<(), FsError> {
         match self.shared {
             Some(tree) => tree.sync().map_err(shared_error),
@@ -1032,6 +1089,7 @@ fn shared_error(error: feos_fs::FsError) -> FsError {
         Tree::ReadOnly => FsError::ReadOnly,
         Tree::Busy => FsError::Busy,
         Tree::SymlinkLoop => FsError::Loop,
+        Tree::PermissionDenied => FsError::PermissionDenied,
         _ => FsError::Io,
     }
 }

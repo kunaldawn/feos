@@ -29,6 +29,7 @@ pub(crate) fn try_push<T>(vec: &mut Vec<T>, value: T) -> Result<()> {
 }
 
 /// Reads bits most-significant first.
+#[derive(Clone)]
 pub(crate) struct MsbReader<'a> {
     data: &'a [u8],
     /// Next byte to move into the cache.

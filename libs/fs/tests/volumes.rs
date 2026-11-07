@@ -1170,7 +1170,7 @@ fn fat32_rejects_long_names_with_bad_sequences() {
 }
 
 #[test]
-fn control_characters_in_names_are_neutralised() {
+fn names_are_kept_raw_with_a_path_separator_the_only_exception() {
     let short = short_entry(b"ESCAPE  TXT", 0x20, 0, 0);
     let mut entries = lfn_entries("bad\u{1b}[2Jname\u{7f}\u{9b}.txt", &short);
     entries.push(short);
@@ -1178,14 +1178,24 @@ fn control_characters_in_names_are_neutralised() {
     image.push_entries(FAT_ROOT, &entries);
     let fs = Fat32::mount(&mut image.disk).unwrap();
     let node = fs.child_at(NodeId::ROOT, 0).unwrap();
-    assert_eq!(fs.name(node), Some("bad_[2Jname__.txt"));
+    assert_eq!(fs.name(node), Some("bad\u{1b}[2Jname\u{7f}\u{9b}.txt"));
+    assert_eq!(fs.resolve("/bad\u{1b}[2Jname\u{7f}\u{9b}.txt"), Some(node));
+
+    let short = short_entry(b"SLASH   TXT", 0x20, 0, 0);
+    let mut entries = lfn_entries("a/b\\c.txt", &short);
+    entries.push(short);
+    let mut image = FatImage::new(FAT_512);
+    image.push_entries(FAT_ROOT, &entries);
+    let fs = Fat32::mount(&mut image.disk).unwrap();
+    let node = fs.child_at(NodeId::ROOT, 0).unwrap();
+    assert_eq!(fs.name(node), Some("a_b\\c.txt"));
 
     let mut image = ExfatImage::new(EXFAT_512);
     image.add_file(EXFAT_ROOT, "x\u{1b}y", b"");
     let fs = Exfat::mount(&mut image.disk).unwrap();
     assert!(!fs.is_damaged());
     let node = fs.child_at(NodeId::ROOT, 0).unwrap();
-    assert_eq!(fs.name(node), Some("x_y"));
+    assert_eq!(fs.name(node), Some("x\u{1b}y"));
 }
 
 #[test]

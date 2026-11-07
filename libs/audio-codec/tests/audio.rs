@@ -134,8 +134,10 @@ fn inspects_ogg_opus() {
     let mut out = [0i16; 16];
     assert!(matches!(
         decode(OPUS, &mut out, &mut []),
-        Err(AudioError::UnsupportedFeature(_))
+        Err(AudioError::BufferTooSmall { .. })
     ));
+    let mut out = vec![0i16; props.frames as usize];
+    assert_eq!(decode(OPUS, &mut out, &mut []).unwrap().frames, props.frames as usize);
 
     let packet = opus::parse_packet(&[0x03, 0x03]).unwrap();
     assert_eq!(packet.config, 0);
@@ -574,9 +576,9 @@ fn aac_truncated_and_unsupported_streams() {
     assert_eq!(decoded.frames as u64, props.frames);
     assert_eq!(out[..decoded.frames * 2], whole[..decoded.frames * 2]);
 
-    // ADTS profile 0 is AAC Main, which this decoder refuses honestly.
+    // ADTS profile 2 is SSR, with gain control, which this decoder refuses honestly.
     let mut main = file.to_vec();
-    main[2] &= 0x3f;
+    main[2] = (main[2] & 0x3f) | 0x80;
     assert_eq!(
         info(&main),
         Err(AudioError::UnsupportedFeature("AAC object type"))
@@ -585,4 +587,22 @@ fn aac_truncated_and_unsupported_streams() {
         decode(&main, &mut out, &mut []).map(|d| d.frames),
         Err(AudioError::UnsupportedFeature("AAC object type"))
     );
+}
+
+/// A program config element, from FFmpeg's encoder: 5.1 with channel configuration 0.
+#[test]
+fn aac_program_config_element() {
+    const PCE: &[u8] = include_bytes!("data/lc-pce.aac");
+    const REFERENCE: &[u8] = include_bytes!("data/lc-pce.aac.s16");
+    let props = info(PCE).unwrap();
+    assert_eq!(props.channels, 6);
+    let mut out = vec![0i16; props.frames as usize * 6];
+    let decoded = decode(PCE, &mut out, &mut []).unwrap();
+    let wanted: Vec<i16> = REFERENCE
+        .chunks_exact(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+        .collect();
+    assert_eq!(decoded.frames * 6, wanted.len());
+    let worst = out.iter().zip(&wanted).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
+    assert!(worst <= 2, "differs from FFmpeg by up to {worst}");
 }

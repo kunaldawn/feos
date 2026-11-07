@@ -72,7 +72,7 @@ use notify::Notifications;
 
 pub use config::{
     ConfigError, DesktopConfig, ShortcutConfig, StartMenuConfig, TaskbarConfig, TaskbarPosition,
-    WallpaperConfig, WallpaperStyle, WindowConfig,
+    WallpaperConfig, WallpaperPreset, WallpaperStyle, WindowConfig,
 };
 pub use feos_bundle::{BundleFormat, DirEntry};
 pub use feos_init::{InitError, RestartPolicy, ServiceState, ServiceStatus};
@@ -481,6 +481,9 @@ pub struct Desktop<
     window_menu: ContextMenuState,
     /// The window that menu belongs to.
     window_menu_target: usize,
+    /// Seconds until a new screen size goes back by itself, while it's being asked about.
+    resolution_prompt: Option<u32>,
+    resolution_answer: Option<bool>,
     /// Whether the Display Properties dialog is open.
     settings_open: bool,
     /// The user changed something that should outlive the session.
@@ -554,6 +557,8 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             pointer_window: None,
             window_menu: ContextMenuState::CLOSED,
             window_menu_target: 0,
+            resolution_prompt: None,
+            resolution_answer: None,
             settings_open: false,
             settings_changed: false,
             notifications_open: false,
@@ -603,6 +608,37 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
         self.scratch = scratch;
         self.background_valid = false;
         self.repaint_all = true;
+    }
+
+    /// Takes the caches back, for whoever provided them to free.
+    pub fn take_buffers(&mut self) -> (Option<&'static mut [u32]>, Option<&'static mut [u32]>) {
+        self.background_valid = false;
+        self.repaint_all = true;
+        (self.background.take(), self.scratch.take())
+    }
+
+    /// Fits the session to a screen of a new size: its windows, and everything painted,
+    /// all of which is redone on the next frame. The caches are the caller's to replace.
+    pub fn screen_changed(&mut self, width: usize, height: usize) {
+        let screen = Rect::new(0, 0, width as u32, height as u32);
+        let layout = taskbar::layout(screen, &self.config.taskbar);
+        self.work_area = layout.work_area(screen, self.config.taskbar.position);
+        self.windows.fit_to(self.work_area);
+        self.background_valid = false;
+        self.repaint_all = true;
+    }
+
+    /// Shows the prompt asking whether to keep a new screen size, or takes it down.
+    pub fn set_resolution_prompt(&mut self, seconds_left: Option<u32>) {
+        if self.resolution_prompt != seconds_left {
+            self.repaint_all = true;
+        }
+        self.resolution_prompt = seconds_left;
+    }
+
+    /// What the prompt was answered with: `true` to keep the size, `false` to go back.
+    pub fn take_resolution_answer(&mut self) -> Option<bool> {
+        self.resolution_answer.take()
     }
 
     /// Returns `true` once [`set_buffers`](Self::set_buffers) has provided the
@@ -679,14 +715,24 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
         self.init.set_policy(config.init.policy);
     }
 
+    /// Applies one setting in the form they're saved in, as the Settings app asks.
+    /// One that makes no sense changes nothing.
+    pub fn apply_setting(&mut self, key: &str, value: &str) {
+        let mut line = Text::<64>::new();
+        let _ = write!(line, "{key}: {value}\n");
+        let mut next = self.config;
+        next.apply_settings(line.as_str());
+        if next != self.config {
+            self.set_config(next);
+            self.settings_changed = true;
+        }
+    }
+
     /// Switches to a colour scheme, including its wallpaper.
     pub fn set_theme(&mut self, name: ThemeName) {
         let mut config = self.config;
         config.theme = name;
-        let palette = name.palette();
-        config.wallpaper.top = palette.wallpaper_top;
-        config.wallpaper.bottom = palette.wallpaper_bottom;
-        config.wallpaper.grid = palette.wallpaper_grid;
+        config.wallpaper = config.wallpaper_preset.wallpaper(name);
         self.set_config(config);
     }
 
@@ -797,6 +843,7 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
     /// Whether a dialog or pop-up menu has the keyboard and pointer to itself.
     fn modal_open(&self) -> bool {
         self.run_dialog.open
+            || self.resolution_prompt.is_some()
             || self.shutdown.open
             || self.clock_open
             || self.logoff_open
@@ -1924,6 +1971,21 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             false
         };
 
+        if let Some(seconds) = self.resolution_prompt {
+            let answer = render_resolution_prompt(&mut ui, &theme, self.work_area, seconds);
+            let answer = answer.or_else(|| {
+                if enter_pressed {
+                    Some(true)
+                } else if escape_pressed {
+                    Some(false)
+                } else {
+                    None
+                }
+            });
+            if answer.is_some() {
+                self.resolution_answer = answer;
+            }
+        }
         let logoff_action = if self.logoff_open {
             render_logoff_dialog(&mut ui, &theme, self.work_area)
         } else {
@@ -2918,6 +2980,71 @@ fn render_logoff_dialog<const N: usize>(
         LogoffAction::Cancel
     } else {
         LogoffAction::None
+    }
+}
+
+/// Asks whether a new screen size can be seen, and so should stay.
+fn render_resolution_prompt<const N: usize>(
+    ui: &mut Ui<'_, '_, '_, N>,
+    theme: &DesktopTheme,
+    work_area: Rect,
+    seconds: u32,
+) -> Option<bool> {
+    const WIDTH: u32 = 380;
+    const HEIGHT: u32 = 140;
+    const TITLE: u32 = 28;
+
+    let full = ui.canvas_rect();
+    let _blocker = ui.interact(Id::from_name("desktop.resolution.modal"), full, Sense::click());
+    let x = work_area.x + (work_area.width as i32 - WIDTH as i32) / 2;
+    let y = work_area.y + (work_area.height as i32 - HEIGHT as i32) / 2;
+    let panel = Rect::new(x.max(work_area.x), y.max(work_area.y), WIDTH, HEIGHT);
+    ui.painter.shadow(panel, 8, 10, 120);
+    ui.painter.fill_rounded_rect(panel, 4, theme.menu_bg);
+    ui.painter.stroke_rounded_rect(panel, 4, 1, theme.menu_border);
+    let title = Rect::new(panel.x + 1, panel.y + 1, panel.width - 2, TITLE);
+    ui.painter
+        .fill_vertical_gradient(title, theme.title_active_top, theme.title_active_bottom);
+    ui.painter.draw_text_ellipsis(
+        Rect::new(title.x + 10, title.y, title.width.saturating_sub(20), TITLE),
+        "Screen Resolution",
+        theme.title_text,
+        1,
+        Align::Start,
+        VerticalAlign::Middle,
+    );
+    let mut line = Text::<64>::new();
+    let _ = write!(line, "Keep this size? Going back in {seconds} s.");
+    ui.painter.draw_text_ellipsis(
+        Rect::new(panel.x + 16, panel.y + 48, panel.width.saturating_sub(32), 24),
+        line.as_str(),
+        theme.menu_text,
+        1,
+        Align::Center,
+        VerticalAlign::Middle,
+    );
+    let keep = Rect::new(panel.right_i32() - 166, panel.bottom_i32() - 38, 70, 24);
+    let revert = Rect::new(panel.right_i32() - 88, panel.bottom_i32() - 38, 72, 24);
+    let keep_hit = ui.interact(Id::from_name("desktop.resolution.keep"), keep, Sense::click());
+    let revert_hit = ui.interact(Id::from_name("desktop.resolution.revert"), revert, Sense::click());
+    for (rect, hit, label, color) in [
+        (keep, keep_hit, "Keep", theme.caption_button),
+        (revert, revert_hit, "Revert", theme.task_button),
+    ] {
+        ui.painter.fill_rounded_rect(
+            rect,
+            3,
+            if hit.hovered { color.lerp(Color::WHITE, 40) } else { color },
+        );
+        ui.painter.stroke_rounded_rect(rect, 3, 1, theme.menu_border);
+        ui.painter.draw_text_centered(rect, label, Color::WHITE, 1);
+    }
+    if keep_hit.clicked {
+        Some(true)
+    } else if revert_hit.clicked {
+        Some(false)
+    } else {
+        None
     }
 }
 

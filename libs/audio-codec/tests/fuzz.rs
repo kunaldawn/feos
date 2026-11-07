@@ -278,6 +278,13 @@ fn fixtures() -> Vec<(String, Vec<u8>)> {
         if name.ends_with(".s16") || name.ends_with(".md") {
             continue;
         }
+        if path.is_dir() {
+            // Opus, one of each kind, as these are slow in a debug build.
+            for name in ["silk-nb.opus", "hybrid-swb.opus", "celt-40.opus"] {
+                files.push((name.to_owned(), std::fs::read(path.join(name)).expect("fixture")));
+            }
+            continue;
+        }
         files.push((name, std::fs::read(&path).expect("fixture")));
     }
     // Directory order differs between machines; the test must not.

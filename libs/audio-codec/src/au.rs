@@ -25,6 +25,27 @@ fn be_u32(input: &[u8], offset: usize) -> Result<u32> {
 }
 
 fn parse(input: &[u8]) -> Result<Format> {
+    parse_sized(input, input.len())
+}
+
+/// See [`crate::wav::layout`].
+pub(crate) fn layout(head: &[u8], file_len: usize) -> Result<(AudioInfo, usize, usize, usize)> {
+    let format = parse_sized(head, file_len)?;
+    let align = format.data_len.checked_div(format.frames).unwrap_or(1).max(1);
+    Ok((
+        AudioInfo {
+            sample_rate: format.sample_rate,
+            channels: format.channels,
+            frames: format.frames as u64,
+            format: AudioFormat::Au,
+        },
+        format.data_offset,
+        format.data_len,
+        align,
+    ))
+}
+
+fn parse_sized(input: &[u8], file_len: usize) -> Result<Format> {
     if input.len() < 24 || &input[..4] != b".snd" {
         return Err(AudioError::UnknownFormat);
     }
@@ -39,7 +60,7 @@ fn parse(input: &[u8]) -> Result<Format> {
     if data_offset < 24 || data_offset > input.len() {
         return Err(AudioError::InvalidData("bad AU data offset"));
     }
-    let available = input.len() - data_offset;
+    let available = file_len - data_offset;
     let data_len = if data_size == u32::MAX {
         available
     } else {

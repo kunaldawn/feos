@@ -234,8 +234,11 @@ there's no driver for. PCI devices on such a machine use INTx. INTx for a device
 a bridge is also not handled, because the pin is rotated at each bridge; the machines
 here give such devices MSI-X instead.
 
-`virtio-blk` is interrupt-driven, by the best its function offers: MSI-X, then INTx.
-A task waiting for a request blocks, with a 100 ms timeout in case the interrupt never
+`virtio-blk` is interrupt-driven, by the best its function offers: MSI-X, then INTx. It has one
+request in flight on purpose: every filesystem operation holds the one `Vfs` state mutex across its
+disk I/O, so nothing could submit a second, and the cache already joins contiguous writes into one
+request, with metadata ordered by flushes. An async `BlockDevice` would have no caller until that
+lock is split. A task waiting for a request blocks, with a 100 ms timeout in case the interrupt never
 comes, and polls when interrupts are masked, as they are early in boot. An idle CPU
 reschedules after a device interrupt, so a woken task doesn't wait for its next timer.
 `virtio-net` and xHCI take the same order, with xHCI falling back to plain MSI. Plain MSI
@@ -384,16 +387,16 @@ user frees them.
 
 **The boundary ends** at memory and privilege. It doesn't reach:
 
-- **Kernel-linked apps.** Those aren't behind it at all.
-- **The filesystem.** Programs read and write the whole shared tree: no users, no permissions.
+- **Kernel-linked apps.** Those aren't behind it at all. They run as root, and `id` says so: a shell, its coreutils and every app are uid 0 and nothing checks them. Permissions apply to user programs.
+- **The filesystem, except where it has owners.** A program has a user and group, and on the [native filesystem](#the-native-filesystem) its modes are enforced at the system call boundary. FAT, exFAT and RAM mounts have no owners, so programs read and write all of those whoever they are. An open file is only checked when it's opened.
 - **Resources other than memory.** A program has a 64 MiB limit, but enough programs can fill the frames (they get `ENOMEM`), or the 32 process slots (they get `EBUSY`), and a program can write to the console, to disk or keep spinning. Nothing bills for it.
 - **Bugs in the kernel.** A system call handler is kernel code, and a bug in one is a kernel bug. A panic there ends the process if it held no lock, and otherwise stops the machine.
 - **Side channels.** Nothing here tries, and there's no page table isolation.
 - **The x86_64 NMI window.** An NMI in the few instructions around `swapgs` would run with the wrong GS base. The only NMI is the fatal path's stop.
 
 Other limits: one thread per process, so a futex has nothing to wake but itself; no `fork`,
-`exec`, signals, demand paging, shared memory or `dup`; a program reading a terminal gets end of
-file, because there's no line discipline; `mmap` addresses are only reused from the top; and
+`exec`, signals, demand paging, shared memory or `dup`; a program reading a terminal gets the
+shell's cooked lines, with no way to ask for raw keys; `mmap` addresses are only reused from the top; and
 surfaces are a fixed size, with no way to hear about a resize.
 
 Adding a program is a file in `user/src/bin/` and its name in `USER_BINS` in the `Makefile`. A
@@ -436,6 +439,19 @@ candlestick views. Both layers are inherent methods on `Ui`, so an app can mix
 them with custom widgets. See
 [`libs/gui/src/components/README.md`](../libs/gui/src/components/README.md) for
 the full component reference.
+
+### The font
+
+Everything's drawn with one 8x8 font, `feos_gfx::font`, so `Ui` text is UTF-8 with one advance per
+character. ASCII is `font8x8`. The rest is a generated table, `font_extended.rs` from
+`scripts/gen-font.py`: Latin-1, Latin Extended-A, Cyrillic and some punctuation from the VGA8 console
+fonts, with Greek drawn for this project and box drawing and block elements generated from what each
+one is. About 590 glyphs, 6 KiB. The console fonts' own Unicode tables have most of Greek pointing at
+the wrong bitmaps, which is why having a glyph isn't what the tests check: see `LICENSING.md` for the sources.
+
+What has no glyph is an empty box: CJK, and anything else outside those blocks. Combining marks
+aren't composed, and right-to-left text isn't reordered. The Terminal carries box lines through the
+two pixels between its rows.
 
 Floating surfaces (select popups, menus, popovers, drawers, dialogs and toasts)
 paint immediately rather than registering an overlay. Apps therefore draw them
@@ -539,24 +555,39 @@ there is one. Each block records the task that allocated it, for accounting. Tha
 be used to reclaim a killed task's heap (KRN-7): a block allocated by one task can
 be owned by something shared, such as a file in the VFS or a pipe's reader, and freeing
 it would be a use-after-free. What a killed task leaves behind is reported instead.
-`Allocator` implements `GlobalAlloc`; the player reads a
-media file into a `Vec`, allocates the RGBA frame and decoder scratch, and
-releases them when the clip changes. GIF, MJPEG and raw/RLE decoders do not
-allocate themselves.
+`Allocator` implements `GlobalAlloc`; the player reads a media file of up to 16 MiB into a
+`Vec`, allocates the RGBA frame and decoder scratch, and releases them when the clip changes.
+GIF, MJPEG and raw/RLE decoders do not allocate themselves.
 
 The video path is:
 
-1. The `player` app scans `Platform::filesystem` for video extensions and reads
-   the selected node into a bounded buffer.
+1. The `player` app scans `Platform::filesystem` for video extensions. Its decode task reads
+   the selected node into a bounded buffer, or for a larger file, opens it as a `Source`.
 2. `feos-video` detects the container and reports dimensions, codec, frame
    count and frame rate. `decode_frame` writes one RGBA8888 frame into the
    caller buffer.
-3. H.264 containers call into `feos-h264`; its reference pictures use the
-   kernel heap.
+3. H.264 containers call into `feos-h264`, whose reference pictures use the kernel heap, and
+   VP8 into `feos_video::vp8`, which allocates when a key frame sets the size. What a damaged
+   H.264 stream doesn't deliver is concealed from the latest reference picture. Interlaced,
+   High10 and 4:2:2 streams are refused.
 4. The app scales the RGBA frame with nearest-neighbour sampling into an
    off-screen canvas, letterboxes according to the selected aspect mode, paints
    the VLC-style chrome around it, and copies the completed frame to the ramfb
    scanout in one pass.
+
+### Files too large to read
+
+`feos-source` has one trait, `Source`: bytes at an offset. `apps/commands`' `FileSource` is one
+over the filesystem, read at most 256 KiB at a time so that nothing else on the disk waits
+long. `VideoDecoder::from_source` keeps the container's metadata and sample table, and reads a
+sample as it decodes it, so memory doesn't grow with the file. `SourceStream` does the same for
+sound files, a packet at a time. Each format seeks in its own way: PCM directly, FLAC and Ogg
+by bisection on what their frames and pages say, and MP3 and ADTS by proportion, or an Xing
+table, so they land exactly only at a constant bit rate. All of this runs on the media tasks,
+so the desktop keeps drawing while the disk works: the boot test sees frames of about 300 ms at
+worst, under TCG. H.264's key frames are checked as they're reached rather than when opening,
+as that would read every sample. Formats that have to be searched for their frames aren't
+streamed: MPEG program streams, raw H.264, MJPEG, GIF and fragmented MP4.
 
 ## The audio path
 
@@ -578,11 +609,19 @@ Audio crosses the same layers as graphics:
    that stream's ring. A task, `mixer`, started with the first stream, sums the
    rings into the device about every 5 ms, and keeps its queue near 100 ms. Master
    volume and mute live here; the tray's speaker sets them. A stream whose owner
-   has been killed is closed by the task.
+   has been killed is closed by the task. `Capture` goes the other way: one recorder at a
+   time, in the device's format, from the codec's input widget on the controller's first
+   input stream. `rec` writes what it hears to a WAV. Only `hda-duplex` and `hda-micro` have
+   an input, so QEMU's usual `hda-output` reports there's none.
 6. `tone`, `play`, the Music window, the Media Player and FEOS-DOS all go through
    a `Stream`. `apps/commands/src/audio_worker.rs` decodes files and video tracks
    on a task of its own, and its position, from the frames the mixer reports as
-   played, is the Media Player's clock when there is sound.
+   played, is the Media Player's clock when there is sound. Between half and double speed the
+   sound follows, kept at its pitch by `feos_mixer::wsola`. Outside that, it's silent.
+7. A media window holds no lock across a frame, because a failure with a lock held stops the
+   machine. So when a window's task dies, killed or crashed, the desktop closes the window,
+   which tells its decode and audio tasks to go, and they close their streams. The media boot
+   test listens to the capture to be sure the sound stops.
 
 Every board identity-maps RAM, so DMA addresses are the buffers' virtual addresses.
 `feos_hal::dma::DmaBuf<T>` wraps a value shared with a device and has a `phys()` for the
@@ -618,6 +657,55 @@ Because the image is compiled in, adding a file is a rebuild, not a mount. The
 same structure can later be fed from an archive or a filesystem driver without
 changing the explorer.
 
+Explorer's search walks on a task of its own (`search`, at a low priority), reading files 64 KiB at a
+time when it's looking inside them, and the window takes in what's been found each frame. So the VFS
+lock is only held for a chunk, and the desktop goes on drawing: `FEOS_BOOT_TEST_ONLY=search` reads a
+192 MiB file with a longest frame under 100 ms.
+
+**Crashes.** FAT32 and exFAT mark themselves dirty before changing anything, and `check` runs at mount
+on a dirty volume. A torn exFAT entry set is repaired there. A set is only rewritten when it's created,
+when it holds no data, so one that isn't whole is cleared; and when its stream entry and primary
+change, which leaves its name matching its hash, so it's kept and its checksum put right. On a clean
+volume nothing explains a torn set but damage, and the volume stays read-only rather than guess.
+`libs/fs/tests/crash.rs` cuts at every write, with writes since the last flush also landing at random.
+
+Scanners keep names raw. Only `/` and NUL are replaced, as they'd mean something else in a path.
+
+### The native filesystem
+
+`feos_fs::native` is FEOS's own on-disk format, for what FAT can't do: inodes with mode, owner, group,
+link count and times, hard links, symbolic links, and a journal in place of a check after a crash. The
+format and the commit protocol are at the top of `libs/fs/src/native.rs`. In brief, metadata goes through
+a redo journal as whole blocks and only ever between whole operations, file data is flushed ahead of
+what refers to it, and a block freed in the open transaction isn't reused until that commits. Overwriting
+existing file data isn't journalled, so a crash during one can leave a mix, sector by sector, and what wasn't
+synced can be lost. It's never half an operation.
+
+It's **never the root**. Existing systems boot from FAT or the embedded image, and a disk with the
+signature mounts at `/native<n>`, whichever order the disks come in. A blank disk is still formatted as FAT.
+`feos_fs::native::format` is the formatter, used by host tests. There's no guest command for it, since the VFS
+has no raw devices: a test's disk comes from `scripts/mkfs-feos.py`, which a host test checks writes
+identical bytes. `fsck [-r] PATH` checks the filesystem holding a path, from the guest.
+
+A `NodeId` names a directory entry, not an inode, because a `FileSystem` node has one parent and one name:
+so a hard link is two nodes on one inode. `posix`, `set_mode`, `set_owner`, `hard_link` and `fsck` on
+`WritableFileSystem` default to "this filesystem can't". `Stat` always has a mode and owner, made up for
+FAT, exFAT and RAM mounts from what they do know, with `Stat::posix` false to say so. `chmod`, `chown` and `ln`
+without `-s` fail there, and `stat` says the values are made up.
+
+**Users.** A task has a uid and gid in the scheduler, inherited by what it starts. Everything starts as root, and
+a user program can give that up for good with `setuid`: `/bin/runas UID GID PROGRAM` is how to start one as
+someone else. `VfsTree::check_access` is the check, walking directories one at a time so that a closed
+directory hides what's in it. `kernel/src/user.rs` applies it in `open`, `stat`, `mkdir`, `unlink`, `link`,
+`chmod` and `chown` and when loading a program, and a new file belongs to its creator. Root may do anything
+but run a file nobody has execute permission on. There are no names, groups beyond one per task, setuid
+programs or sticky directories. The bits are kept and not acted on.
+
+`libs/fs/tests/native.rs` crashes at every write that reaches the device, in order and with what's unflushed
+landing at random, and sabotaging the barriers or the free-space rule makes it fail.
+`FEOS_BOOT_TEST_ONLY=native` runs a real virtio disk through kills during writes until one has landed in a commit
+and been replayed, with `fsck` and the data checked after each, and `/bin/permtest` from user mode.
+
 ## Testing strategy
 
 Bare-metal code cannot be tested on the host when it executes privileged
@@ -629,11 +717,13 @@ instructions or touches MMIO. The split makes most logic host-testable:
   QEMU.
 - The kernel is tested by booting. `scripts/boot-test.py` boots a kernel headless and
   drives the serial shell, through phases `FEOS_BOOT_TEST_ONLY` can select: storage,
-  `smp`, `irq`, `ram`, `fault`, `sched`, `gicv3`, `net`, `usb`, `efi`, `el`, `input`, `user`, `hosted`. The `efi`
+  `smp`, `irq`, `ram`, `fault`, `sched`, `gicv3`, `net`, `usb`, `efi`, `el`, `input`, `user`, `hosted`, `jobs`, `names`, `settings`, `terminal`, `search`, `resolution`, `fonts`, `native`. The `efi`
   phase needs the loader built, and everything in it runs on OVMF or AAVMF from the image. What can only be seen from inside the
   kernel, such as which CPU a task ran on or what's in an XMM register across a
   preemption, is in `kernel/src/ktest.rs`, the `ktest` shell command. Some of it stops
-  the machine on purpose. `scripts/media-boot-test.py` measures real audio output.
+  the machine on purpose. `scripts/media-boot-test.py` measures real audio output, and real
+  input, by giving QEMU's ALSA backend ALSA's `file` plugin to read a tone from. With an image
+  from `scripts/make-media-disk.sh`, it plays large files from a virtio disk and seeks.
 - `make run` still gives a scheduler smoke test by hand: `spawn tick 8 200` several
   times, `ps` to see them, `kill <pid>` to remove one.
 
