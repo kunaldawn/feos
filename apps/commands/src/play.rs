@@ -3,7 +3,7 @@
 use feos_app::{App, Context, EXIT_KILLED};
 use feos_console::{eprintln, println};
 
-use crate::audio_worker::{play_media, AudioFailure, AudioPipe, Finished, Source};
+use crate::audio_worker::{measure_decoding, play_media, AudioFailure, AudioPipe, Finished, Source};
 
 /// The `play` command.
 pub struct Play;
@@ -14,7 +14,7 @@ impl App for Play {
     }
 
     fn usage(&self) -> &'static str {
-        "play [--at seconds] <file>"
+        "play [--at seconds | --speed] <file>"
     }
 
     fn description(&self) -> &'static str {
@@ -29,6 +29,11 @@ impl App for Play {
             start_ms = seconds.parse::<u64>().ok().map(|seconds| seconds * 1000);
             path = rest.trim();
         }
+        let mut speed = false;
+        if let Some(rest) = path.strip_prefix("--speed ") {
+            speed = true;
+            path = rest.trim();
+        }
         if path.is_empty() {
             eprintln!("usage: {}", self.usage());
             return 2;
@@ -41,6 +46,20 @@ impl App for Play {
             eprintln!("play: {path}: no such file");
             return 1;
         };
+        if speed {
+            // How fast this machine decodes it, with no sound.
+            return match measure_decoding(context.platform, fs, node) {
+                Ok((sound_ms, took_ms)) => {
+                    let percent = sound_ms * 100 / took_ms.max(1);
+                    println!("decoded {sound_ms} ms of sound in {took_ms} ms: {percent}% of real time");
+                    0
+                }
+                Err(_) => {
+                    eprintln!("play: {path}: cannot decode it");
+                    1
+                }
+            };
+        }
         // This process is the task, so the pipe is only here to hold reports.
         let pipe = AudioPipe::new();
         let identity = pipe.claim();

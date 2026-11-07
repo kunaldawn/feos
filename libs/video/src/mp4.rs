@@ -442,7 +442,7 @@ pub(crate) fn info(input: &[u8]) -> Result<Mp4Info> {
     if track.fragmented && track.frame_count == 0 {
         let mut fragments = FragmentStats::default();
         // Damaged fragments only cut the frame count short.
-        let _ = walk_fragments(input, &track, |_, _, _, _| Ok(()), &mut fragments);
+        let _ = walk_fragments(input, track.id, |_, _, _, _| Ok(()), &mut fragments);
         track.frame_count = fragments.samples;
         if track.frame_rate.is_none() && fragments.samples > 1 && fragments.ticks > 0 {
             let per_kilosecond = (fragments.samples as u128 * track.timescale as u128 * 1000)
@@ -599,13 +599,13 @@ pub(crate) fn build_index_sized(
         // Damaged trailing fragments keep the frames before them.
         let _ = walk_fragments(
             input,
-            &track,
+            track.id,
             |offset, size, timing, flags| {
                 let pts = dts + timing.1 as i64 - edit;
                 dts = dts.saturating_add(timing.0 as i64);
                 index.push(
                     limits,
-                    input.len(),
+                    file_len,
                     offset,
                     size,
                     ticks_to_ms(pts, timescale) + delay,
@@ -824,18 +824,67 @@ const MAX_FRAGMENT_SAMPLES: u32 = 1 << 24;
 /// A `sample_flags` value's sample_is_non_sync_sample bit.
 const NON_SYNC: u32 = 0x0001_0000;
 
+/// The name of the box [`source_head`] adds after the `moof`s it keeps: the file's length,
+/// then for each `moof`, where it is in the head and where it is in the file.
+const MAP_BOX: &[u8; 4] = b"feMp";
+
+struct FragmentMap<'a> {
+    file_len: usize,
+    entries: &'a [u8],
+}
+
+impl FragmentMap<'_> {
+    /// Where a `moof` in the head came from. They're in order, and few are looked up twice.
+    fn file_offset(&self, head_offset: usize) -> Option<usize> {
+        let count = self.entries.len() / 16;
+        let (mut low, mut high) = (0, count);
+        while low < high {
+            let middle = (low + high) / 2;
+            let entry = &self.entries[middle * 16..middle * 16 + 16];
+            let at = u64::from_be_bytes(entry[..8].try_into().ok()?) as usize;
+            match at.cmp(&head_offset) {
+                core::cmp::Ordering::Equal => {
+                    return usize::try_from(u64::from_be_bytes(entry[8..].try_into().ok()?)).ok();
+                }
+                core::cmp::Ordering::Less => low = middle + 1,
+                core::cmp::Ordering::Greater => high = middle,
+            }
+        }
+        None
+    }
+}
+
+fn fragment_map(input: &[u8]) -> Option<FragmentMap<'_>> {
+    let mut pos = 0;
+    while let Some(top) = read_top_box(input, pos) {
+        if pos == top.next {
+            return None;
+        }
+        pos = top.next;
+        if &top.kind == MAP_BOX {
+            let body = input.get(top.payload..top.end)?;
+            let file_len = usize::try_from(u64::from_be_bytes(body.get(..8)?.try_into().ok()?)).ok()?;
+            return Some(FragmentMap { file_len, entries: body.get(8..)? });
+        }
+    }
+    None
+}
+
 /// Walks every `moof`, calling `f(offset, size, (duration, composition), flags)`
 /// for each sample of the track.
 fn walk_fragments<F>(
     input: &[u8],
-    track: &Track<'_>,
+    track_id: u32,
     mut f: F,
     stats: &mut FragmentStats,
 ) -> Result<()>
 where
     F: FnMut(usize, usize, (u32, i32), u8) -> Result<()>,
 {
-    let trex = trex_defaults(input, track.id)?;
+    let trex = trex_defaults(input, track_id)?;
+    // With only the metadata in memory, there's a map of where it all came from.
+    let map = fragment_map(input);
+    let limit = map.as_ref().map_or(input.len(), |map| map.file_len);
     let mut pos = 0;
     while let Some(top) = read_top_box(input, pos) {
         pos = top.next;
@@ -843,6 +892,10 @@ where
             continue;
         }
         let moof_start = top.payload - 8;
+        let moof_in_file = match &map {
+            Some(map) => map.file_offset(moof_start).ok_or(VideoError::InvalidData("MP4 moof map"))?,
+            None => moof_start,
+        };
         let mut at = top.payload;
         while let Some(traf) = read_box(input, at, top.end)? {
             at = traf.next;
@@ -850,12 +903,12 @@ where
                 continue;
             }
             let tfhd = required_box(input, traf.payload, traf.end, b"tfhd")?;
-            if u32_at(input, tfhd.payload + 4)? != track.id && track.id != 0 {
+            if u32_at(input, tfhd.payload + 4)? != track_id && track_id != 0 {
                 continue;
             }
             let tf_flags = u32_at(input, tfhd.payload)? & 0x00ff_ffff;
             let mut field = tfhd.payload + 8;
-            let mut base = moof_start;
+            let mut base = moof_in_file;
             if tf_flags & 0x1 != 0 {
                 base = usize::try_from(u64_at(input, field)?).map_err(|_| VideoError::Overflow)?;
                 field += 8;
@@ -945,7 +998,7 @@ where
                     }
                     let size = size as usize;
                     let end = offset.checked_add(size).ok_or(VideoError::Overflow)?;
-                    if end > input.len() {
+                    if end > limit {
                         return Err(VideoError::UnexpectedEnd);
                     }
                     let key = if sample_flags & NON_SYNC == 0 { FLAG_KEY } else { 0 };
@@ -1200,7 +1253,33 @@ pub(crate) fn audio_track_sized(input: &[u8], file_len: usize) -> Option<AudioTr
             AudioCodec::MuLaw | AudioCodec::ALaw => Some(channels as usize),
             _ => None,
         };
-        let packets = audio_packets(input, file_len, stbl, timescale, start_ticks, frame_bytes)?;
+        let fragmented = children(input, moov, b"mvex").ok().flatten().is_some();
+        let mut packets = match audio_packets(input, file_len, stbl, timescale, start_ticks, frame_bytes) {
+            Some(packets) => packets,
+            None if fragmented => Vec::new(),
+            None => return None,
+        };
+        // Nothing in the sample table, and the movie has fragments: they're in there.
+        if packets.is_empty() && fragmented {
+            let id = children(input, trak, b"tkhd")
+                .ok()
+                .flatten()
+                .and_then(|tkhd| parse_tkhd(input, tkhd).ok())
+                .map(|tkhd| tkhd.id)?;
+            let mut stats = FragmentStats::default();
+            let mut dts = 0i64;
+            let _ = walk_fragments(
+                input,
+                id,
+                |offset, size, timing, _| {
+                    let pts = (dts + timing.1 as i64 - start_ticks).max(0);
+                    dts = dts.saturating_add(timing.0 as i64);
+                    crate::audio::push_packet(&mut packets, file_len, offset, size, ticks_to_ms(pts, timescale).max(0) as u64)
+                        .ok_or(VideoError::LimitExceeded("too many audio packets"))
+                },
+                &mut stats,
+            );
+        }
         return Some(AudioTrack {
             codec,
             sample_rate: rate,
@@ -1217,31 +1296,59 @@ const MAX_HEAD: u64 = 24 * 1024 * 1024;
 
 /// A file's metadata, for one too large to read: its `ftyp` and `moov`, one after the
 /// other. Offsets in the sample tables are the file's, so they don't care where this
-/// `moov` ended up. Fragments keep their tables all over the file, and aren't handled.
+/// `moov` ended up. Fragments keep their tables all over the file, so in a fragmented file every
+/// `moof` comes along too, with a map of where it was, as a run's offsets can be from its `moof`.
 pub(crate) fn source_head(window: &mut feos_source::Window<'_>) -> Result<alloc::vec::Vec<u8>> {
     let file_len = window.file_len();
     let mut head = alloc::vec::Vec::new();
-    let mut pos = 0u64;
-    let mut read_box_into = |window: &mut feos_source::Window<'_>, at: u64, size: u64| -> Result<()> {
-        if (head.len() as u64).saturating_add(size) > MAX_HEAD {
-            return Err(VideoError::LimitExceeded("MP4 metadata is too large"));
-        }
-        let start = head.len();
-        head.try_reserve_exact(size as usize).map_err(|_| VideoError::OutOfMemory)?;
-        head.resize(start + size as usize, 0);
-        let mut done = 0u64;
-        while done < size {
-            let chunk = window.bytes(at + done, (size - done) as usize);
-            if chunk.is_empty() {
-                return Err(VideoError::UnexpectedEnd);
-            }
-            let count = chunk.len();
-            head[start + done as usize..start + done as usize + count].copy_from_slice(chunk);
-            done += count as u64;
-        }
-        Ok(())
-    };
     let mut found = false;
+    walk_top_boxes(window, file_len, |window, kind, at, size| {
+        match kind {
+            b"ftyp" => read_box_into(&mut head, window, at, size)?,
+            b"moov" => {
+                read_box_into(&mut head, window, at, size)?;
+                found = true;
+                return Ok(false);
+            }
+            _ => {}
+        }
+        Ok(true)
+    })?;
+    if !found {
+        return Err(VideoError::InvalidData("MP4 file has no moov"));
+    }
+    if !is_fragmented(&head) {
+        return Ok(head);
+    }
+    let mut map = alloc::vec::Vec::new();
+    walk_top_boxes(window, file_len, |window, kind, at, size| {
+        if kind == b"moof" {
+            map.try_reserve(16).map_err(|_| VideoError::OutOfMemory)?;
+            map.extend_from_slice(&(head.len() as u64).to_be_bytes());
+            map.extend_from_slice(&at.to_be_bytes());
+            read_box_into(&mut head, window, at, size)?;
+        }
+        Ok(true)
+    })?;
+    if (head.len() as u64).saturating_add(16 + map.len() as u64) > MAX_HEAD {
+        return Err(VideoError::LimitExceeded("MP4 metadata is too large"));
+    }
+    let size = 8 + 8 + map.len();
+    head.try_reserve_exact(size).map_err(|_| VideoError::OutOfMemory)?;
+    head.extend_from_slice(&(size as u32).to_be_bytes());
+    head.extend_from_slice(MAP_BOX);
+    head.extend_from_slice(&file_len.to_be_bytes());
+    head.extend_from_slice(&map);
+    Ok(head)
+}
+
+/// Calls `f` with each top-level box's kind, offset and size, until it says to stop.
+fn walk_top_boxes(
+    window: &mut feos_source::Window<'_>,
+    file_len: u64,
+    mut f: impl FnMut(&mut feos_source::Window<'_>, &[u8; 4], u64, u64) -> Result<bool>,
+) -> Result<()> {
+    let mut pos = 0u64;
     while pos + 8 <= file_len {
         let header = window.bytes(pos, 16);
         if header.len() < 8 {
@@ -1262,26 +1369,37 @@ pub(crate) fn source_head(window: &mut feos_source::Window<'_>) -> Result<alloc:
         if size < 8 || pos.saturating_add(size) > file_len && &kind != b"mdat" {
             break;
         }
-        match &kind {
-            b"ftyp" => read_box_into(window, pos, size)?,
-            b"moov" => {
-                read_box_into(window, pos, size)?;
-                found = true;
-            }
-            _ => {}
-        }
-        if found {
+        if !f(window, &kind, pos, size)? {
             break;
         }
         pos = pos.saturating_add(size);
     }
-    if !found {
-        return Err(VideoError::InvalidData("MP4 file has no moov"));
+    Ok(())
+}
+
+fn read_box_into(
+    head: &mut alloc::vec::Vec<u8>,
+    window: &mut feos_source::Window<'_>,
+    at: u64,
+    size: u64,
+) -> Result<()> {
+    if (head.len() as u64).saturating_add(size) > MAX_HEAD {
+        return Err(VideoError::LimitExceeded("MP4 metadata is too large"));
     }
-    if is_fragmented(&head) {
-        return Err(VideoError::UnsupportedCodec("fragmented MP4 this large"));
+    let start = head.len();
+    head.try_reserve_exact(size as usize).map_err(|_| VideoError::OutOfMemory)?;
+    head.resize(start + size as usize, 0);
+    let mut done = 0u64;
+    while done < size {
+        let chunk = window.bytes(at + done, (size - done) as usize);
+        if chunk.is_empty() {
+            return Err(VideoError::UnexpectedEnd);
+        }
+        let count = chunk.len();
+        head[start + done as usize..start + done as usize + count].copy_from_slice(chunk);
+        done += count as u64;
     }
-    Ok(head)
+    Ok(())
 }
 
 /// Whether a head's `moov` says the samples are in fragments.

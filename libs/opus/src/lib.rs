@@ -476,6 +476,26 @@ impl Decoder {
 
     /// Return whether the last decoded packet carried SILK redundancy.
     ///
+    /// What the old mode would have gone on to say, from its concealment, for the new one to
+    /// fade in from: a change of mode with no redundant data has this instead.
+    fn transition_audio(&mut self, frame_samples_48k: usize, most: usize) -> Vec<i16> {
+        let channels = self.channels as usize;
+        let samples = (frame_samples_48k * self.fs_hz as usize / 48_000).min(most);
+        let mut pcm = vec![0i16; samples * channels];
+        match self.prev_mode {
+            Some(OpusMode::CeltOnly) => {
+                let concealed = self.celt.decode_lost(samples, channels);
+                for (dst, src) in pcm.iter_mut().zip(concealed.iter()) {
+                    *dst = src.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                }
+            }
+            _ => {
+                let _ = self.silk.decode_lost(samples, &mut pcm, 0);
+            }
+        }
+        pcm
+    }
+
     /// This follows the top-level transition bookkeeping used by the decoder.
     pub(crate) fn last_had_redundancy(&self) -> bool {
         self.last_had_redundancy
@@ -540,21 +560,23 @@ impl Decoder {
         let transition_samples = (self.fs_hz as usize) / 200;
         let transition_overlap = (self.fs_hz as usize) / 400;
         let channels = self.channels as usize;
-        let celt_transition = if transition && mode == OpusMode::CeltOnly {
-            vec![0i16; transition_samples * channels]
-        } else {
-            Vec::new()
-        };
-        let mut apply_celt_transition = transition && mode == OpusMode::CeltOnly;
+        let mut transition_pcm = Vec::new();
+        // A frame with redundant data has that to fade in from instead.
+        let mut fade_in = transition;
+        let apply_celt_transition = transition && mode == OpusMode::CeltOnly;
         let mut reset_silk = transition && self.prev_mode == Some(OpusMode::CeltOnly);
         let mut had_redundancy = false;
         let mut last_celt_to_silk = false;
         let mut written_per_channel = 0usize;
         for &frame in pp.frames().iter() {
+            let written_before = written_per_channel;
             let frame_samples_48k = pp.samples_per_frame_48k;
             let out_frame = &mut out[written_per_channel * self.channels as usize..];
             match mode {
                 OpusMode::CeltOnly => {
+                    if fade_in {
+                        transition_pcm = self.transition_audio(frame_samples_48k, transition_samples);
+                    }
                     if apply_celt_transition {
                         self.celt.reset();
                     }
@@ -571,17 +593,6 @@ impl Decoder {
                         out_frame,
                         false,
                     )?;
-                    if apply_celt_transition {
-                        apply_transition_fade_i16(
-                            &celt_transition,
-                            &mut out_frame[..celt_frame.samples_per_channel * channels],
-                            transition_overlap.min(celt_frame.samples_per_channel / 2),
-                            channels,
-                            self.celt.window(),
-                            self.fs_hz,
-                        );
-                        apply_celt_transition = false;
-                    }
                     self.last_packet_split_count += self.celt.last_split_count();
                     self.last_final_range = self.celt.final_range();
                     written_per_channel += celt_frame.samples_per_channel;
@@ -601,6 +612,11 @@ impl Decoder {
                         out_frame,
                     )?;
                     last_celt_to_silk = silk_frame.celt_to_silk;
+                    if silk_frame.consumed_redundancy {
+                        fade_in = false;
+                    } else if fade_in {
+                        transition_pcm = self.transition_audio(frame_samples_48k, transition_samples);
+                    }
                     let mut redundancy_rng = 0u32;
                     if silk_frame.consumed_redundancy {
                         let redundancy_data =
@@ -662,6 +678,10 @@ impl Decoder {
                     written_per_channel += silk_frame.samples_per_channel;
                 }
                 OpusMode::Hybrid => {
+                    if reset_silk {
+                        self.silk.reset();
+                        reset_silk = false;
+                    }
                     let mut ec = EcDec::new(frame);
                     let silk_frame = self.silk.decode_frame_with_ec(
                         frame,
@@ -684,6 +704,9 @@ impl Decoder {
                         celt_to_silk = ec.dec_bit_logp(1);
                         redundancy_bytes = ec.dec_uint(256) as usize + 2;
                         ec.shrink_storage(redundancy_bytes);
+                        fade_in = false;
+                    } else if fade_in {
+                        transition_pcm = self.transition_audio(frame_samples_48k, transition_samples);
                     }
                     let mut celt_to_silk_audio = Vec::new();
                     let mut celt_to_silk_samples = 0usize;
@@ -802,6 +825,18 @@ impl Decoder {
                     had_redundancy = redundancy && !celt_to_silk;
                     written_per_channel += silk_frame.samples_per_channel;
                 }
+            }
+            if fade_in {
+                fade_in = false;
+                let samples = written_per_channel - written_before;
+                apply_transition_fade_i16(
+                    &transition_pcm,
+                    &mut out[written_before * channels..written_per_channel * channels],
+                    transition_overlap.min(samples / 2),
+                    channels,
+                    self.celt.window(),
+                    self.fs_hz,
+                );
             }
         }
 

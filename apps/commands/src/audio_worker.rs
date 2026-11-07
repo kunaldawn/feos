@@ -469,6 +469,78 @@ pub enum Finished {
 /// Plays one file until it ends or the pipe wants something else. `identity` and
 /// `media` are what the pipe has to keep saying for this to carry on. With
 /// `wait_at_end`, the end is reported and this waits for the next request.
+/// Decodes all of a file's sound, as fast as it goes, and says how much there was and how long
+/// that took, in milliseconds: how a decoder's speed on this machine is found out.
+pub fn measure_decoding(
+    platform: &Platform,
+    fs: &'static dyn FileSystem,
+    node: NodeId,
+) -> Result<(u64, u64), AudioFailure> {
+    let size = fs.size(node);
+    let file = FileSource::new(fs, node);
+    let whole;
+    let head;
+    let puller = if size > MAX_MEDIA_BYTES {
+        let mut first = [0u8; 4096];
+        let got = fs.read(node, 0, &mut first);
+        if feos_video::detect(&first[..got]).is_none() {
+            SourceStream::open(alloc::boxed::Box::new(FileSource::new(fs, node)))
+                .map(Puller::OnDisk)
+                .map_err(AudioFailure::Codec)
+        } else {
+            match audio_track_from_source(&file) {
+                Some((bytes, track)) => {
+                    head = bytes;
+                    TrackSource::with_track(&head, Some(&file), track).map(Puller::Track)
+                }
+                None => Err(AudioFailure::NoTrack),
+            }
+        }
+    } else {
+        whole = read_file(fs, node, size).ok_or(AudioFailure::Unreadable)?;
+        if feos_video::detect(&whole).is_some() {
+            TrackSource::open(&whole).map(Puller::Track)
+        } else {
+            AudioStream::open(&whole).map(Puller::File).map_err(AudioFailure::Codec)
+        }
+    };
+    let mut puller = puller?;
+    let mut chunk = Vec::new();
+    if !grow_samples(&mut chunk, puller.chunk_samples().clamp(4096, MAX_CHUNK_SAMPLES)) {
+        return Err(AudioFailure::Codec(AudioError::OutOfMemory));
+    }
+    let started = platform.clock.uptime_ms();
+    let mut sound_ms = 0u64;
+    let mut remainder = 0u64;
+    let mut failures = 0u32;
+    loop {
+        match puller.next_chunk(&mut chunk) {
+            Ok(Some(frames)) => {
+                if let Some(format) = puller.format() {
+                    let scaled = frames as u64 * 1000 + remainder;
+                    sound_ms += scaled / format.sample_rate() as u64;
+                    remainder = scaled % format.sample_rate() as u64;
+                }
+            }
+            Ok(None) => break,
+            Err(AudioError::BufferTooSmall { required, .. }) => {
+                if !grow_samples(&mut chunk, required.min(MAX_CHUNK_SAMPLES)) {
+                    return Err(AudioFailure::Codec(AudioError::OutOfMemory));
+                }
+            }
+            // A damaged packet is passed over, as it would be when playing, unless nothing
+            // but damage is left.
+            Err(_) => {
+                failures += 1;
+                if failures > 1000 {
+                    break;
+                }
+            }
+        }
+    }
+    Ok((sound_ms, platform.clock.uptime_ms() - started))
+}
+
 pub fn play_media(
     pipe: &AudioPipe,
     platform: &Platform,

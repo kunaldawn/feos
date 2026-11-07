@@ -75,6 +75,15 @@ fn close_to_libopus(name: &str, mode: &[u8]) {
     assert!(worst <= 2, "{name}: differs from libopus by up to {worst}, SNR {snr:.1} dB");
 }
 
+/// Mapping family 1, with each channel where WAVE order has it.
+#[test]
+fn more_than_two_channels() {
+    for name in ["multi-3", "multi-51"] {
+        let (worst, snr) = compare(name);
+        assert!(worst <= 2, "{name}: differs from libopus by up to {worst}, SNR {snr:.1} dB");
+    }
+}
+
 const SILK: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
 const HYBRID: &[u8] = &[12, 13, 14, 15];
 const CELT: &[u8] = &[16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31];
@@ -241,6 +250,8 @@ fn malformed_packets_never_panic() {
 }
 
 /// The official test vectors of RFC 8251, which are too large to keep here. Point
+/// Each vector within what's been reached, and the three things that were wrong kept fixed:
+/// mono hybrid folding, the SILK reset after CELT and the fade in from concealment.
 /// OPUS_VECTORS at an unpacked `opus_testvectors-rfc8251.tar.gz` to run this. Each packet's
 /// final range says whether the entropy decoding agrees exactly with the encoder's.
 #[test]
@@ -288,5 +299,6 @@ fn rfc_8251_vectors() {
             wanted.len()
         );
         assert_eq!(range_errors, 0, "vector {number}");
+        assert!(worst <= 33, "vector {number}: worst {worst}");
     }
 }

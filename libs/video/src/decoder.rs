@@ -91,15 +91,15 @@ impl VideoDecoder<Vec<u8>> {
     /// Opens a video that stays where it is, with only its metadata and sample table in
     /// memory. A sample is read when it's decoded.
     ///
-    /// This walks the container, so it takes as long as the disk does. MP4 (not
-    /// fragmented), Matroska and WebM, AVI and FLV can do this. Anything that has to be
-    /// searched for its frames can't, and comes back as
-    /// [`VideoError::LimitExceeded`].
+    /// This walks the container, so it takes as long as the disk does. MP4, fragmented or not,
+    /// Matroska and WebM, AVI, FLV and MPEG program streams can do this. Anything else that has
+    /// to be searched for its frames can't, and comes back as [`VideoError::LimitExceeded`].
     pub fn from_source(file: Box<dyn Source>, limits: DecoderLimits) -> Result<Self> {
         let mut compression = Compression::None;
         let mut dib = None;
         let mut palette = 0..0;
         let mut configs = Vec::new();
+        let mut mpeg1_stream = None;
         let len = file.len();
         if len > usize::MAX as u64 {
             return Err(VideoError::Overflow);
@@ -142,6 +142,16 @@ impl VideoDecoder<Vec<u8>> {
                 index.set_uniform_timing(Some(rate.unwrap_or(DEFAULT_FPS)));
                 (head, index)
             }
+            ContainerFormat::Mpeg1 => {
+                if window.bytes(0, 4).get(3) != Some(&mpeg1::PACK) {
+                    return Err(VideoError::LimitExceeded("this kind of file can't be streamed"));
+                }
+                let (stream, head) = mpeg1::Mpeg1Stream::open_source(&*file, &limits)?;
+                let mut index = stream.build_index(len as usize, &limits)?;
+                index.set_uniform_timing(Some(mpeg1::info(&head)?.frame_rate));
+                mpeg1_stream = Some(stream);
+                (head, index)
+            }
             _ => return Err(VideoError::LimitExceeded("this kind of file can't be streamed")),
         };
         drop(window);
@@ -161,7 +171,7 @@ impl VideoDecoder<Vec<u8>> {
             compression,
             dib,
             palette,
-            None,
+            mpeg1_stream,
             &limits,
         )
     }
@@ -496,7 +506,7 @@ impl<S: AsRef<[u8]>> VideoDecoder<S> {
                 }
             }
             State::Mpeg1(stream) => {
-                if !stream.advance(input, index, budget, out)? {
+                if !stream.advance(input, file, index, budget, out)? {
                     return Ok(None);
                 }
             }

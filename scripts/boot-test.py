@@ -145,6 +145,14 @@ class Guest:
         while time.monotonic() < deadline:
             match = compiled.search(self.log, self.mark)
             if match:
+                # A match that reaches the end of the output may be a line still
+                # being printed: a greedy group would return only part of it.
+                while match.end() == len(self.log):
+                    before = len(self.log)
+                    self.pump(0.2)
+                    if len(self.log) == before:
+                        break
+                    match = compiled.search(self.log, self.mark)
                 self.mark = match.end()
                 return match.group(1).decode()
             if b"[panic]" in self.log[self.mark:]:
@@ -1967,7 +1975,7 @@ def fonts_test(arch, kernel):
     guest.send("mkdir /fonts; for n in " + " ".join(names) + "; do echo hi > /fonts/$n; done\r")
     time.sleep(3)
     guest.send("files /fonts\r")
-    listing = guest.capture(r"\[explorer\] /fonts:([^\r\n]*)")
+    listing = guest.capture(r"\[explorer\] /fonts:([^\r\n]*)[\r\n]")
     time.sleep(3)
     explorer = work_path(kernel, "fonts-explorer.ppm")
     guest.monitor(f"screendump {explorer}")

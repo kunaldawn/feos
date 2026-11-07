@@ -71,3 +71,10 @@ formula for the Kaiser-Bessel-derived window (alpha 4 long, alpha 6 short).
 `lc-pce.aac` is 5.1 AAC-LC with a program config element, from FFmpeg's encoder with
 `-aac_pce 1`, and `lc-pce.aac.s16` is FFmpeg's decoding of it. `opus/` is explained by
 `make_opus.sh`, beside this folder.
+
+# HE-AAC with nothing to say so but its first frame, from a fraction of a second of an ISO
+# conformance stream: ../../../video/tests/data/he-sbr.mp4, which is described in
+# ../../../video/tests/data/README.md.
+ffmpeg -v error -y -i he-sbr.mp4 -c copy -f adts he-implicit.aac
+ffmpeg -v error -y -i he-implicit.aac -f s16le -c:a pcm_s16le he-implicit.aac.s16
+```

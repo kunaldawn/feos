@@ -1,6 +1,6 @@
 //! Opus: packet parsing here, and decoding by `feos-opus`.
 
-use feos_opus::{OpusDecoder, OpusError};
+use feos_opus::{OpusDecoder, OpusMultistreamDecoder, OpusError};
 
 use crate::error::{AudioError, Result};
 
@@ -88,13 +88,16 @@ pub(crate) struct OpusConfig {
     pub pre_skip: u16,
     /// A gain to apply, in 256ths of a decibel.
     pub gain: i16,
+    /// With more than two channels: streams, those that are coupled, and which stream's
+    /// channel each output channel is.
+    pub layout: Option<(u8, u8, [u8; MAX_MAPPED])>,
 }
 
 impl OpusConfig {
     /// Reads an `OpusHead` packet, as Ogg and Matroska have it, or the body of an MP4
     /// `dOps` box, which has the same fields big-endian after no magic.
     pub(crate) fn parse(data: &[u8]) -> Result<Self> {
-        let (channels, pre_skip, gain, family) = match data.strip_prefix(b"OpusHead") {
+        let (channels, pre_skip, gain, family, table) = match data.strip_prefix(b"OpusHead") {
             Some(rest) => {
                 let head = rest.get(..11).ok_or(AudioError::UnexpectedEnd)?;
                 (
@@ -102,6 +105,7 @@ impl OpusConfig {
                     u16::from_le_bytes([head[2], head[3]]),
                     i16::from_le_bytes([head[8], head[9]]),
                     head[10],
+                    rest.get(11..).unwrap_or(&[]),
                 )
             }
             None => {
@@ -111,19 +115,32 @@ impl OpusConfig {
                     u16::from_be_bytes([head[2], head[3]]),
                     i16::from_be_bytes([head[8], head[9]]),
                     head[10],
+                    data.get(11..).unwrap_or(&[]),
                 )
             }
         };
         if channels == 0 {
             return Err(AudioError::InvalidData("Opus stream has no channels"));
         }
-        if channels > 2 || family != 0 {
-            return Err(AudioError::UnsupportedFeature("Opus with more than two channels"));
-        }
+        let layout = match family {
+            0 if channels <= 2 => None,
+            1 if channels as usize <= MAX_MAPPED => {
+                let table = table.get(..2 + channels as usize).ok_or(AudioError::UnexpectedEnd)?;
+                let (streams, coupled) = (table[0], table[1]);
+                if streams == 0 || coupled > streams || streams as usize + coupled as usize > channels as usize {
+                    return Err(AudioError::InvalidData("bad Opus channel mapping"));
+                }
+                let mut mapping = [0u8; MAX_MAPPED];
+                mapping[..channels as usize].copy_from_slice(&table[2..]);
+                Some((streams, coupled, mapping))
+            }
+            _ => return Err(AudioError::UnsupportedFeature("Opus channel mapping family")),
+        };
         Ok(Self {
             channels: channels as u16,
             pre_skip,
             gain,
+            layout,
         })
     }
 }
@@ -146,10 +163,31 @@ fn gain_factor(gain: i16) -> f32 {
     value
 }
 
+/// The most channels mapping family 1 has.
+const MAX_MAPPED: usize = 8;
+
+/// For each channel count, which of Vorbis's order is at each place of WAVE's.
+static WAVE_ORDER: [&[u8]; 9] = [
+    &[],
+    &[0],
+    &[0, 1],
+    &[0, 2, 1],
+    &[0, 1, 2, 3],
+    &[0, 2, 1, 3, 4],
+    &[0, 2, 1, 5, 3, 4],
+    &[0, 2, 1, 6, 5, 3, 4],
+    &[0, 2, 1, 7, 5, 6, 3, 4],
+];
+
+enum Decoder {
+    One(OpusDecoder),
+    Many(OpusMultistreamDecoder),
+}
+
 /// Decodes the packets of one Opus stream to 16-bit samples at 48 kHz, the rate Opus
 /// streams come back at here.
 pub struct OpusPacketDecoder {
-    decoder: OpusDecoder,
+    decoder: Decoder,
     channels: u16,
     /// Samples still to be dropped from the start.
     skip: usize,
@@ -161,7 +199,19 @@ impl OpusPacketDecoder {
     pub fn new(head: &[u8]) -> Result<Self> {
         let config = OpusConfig::parse(head)?;
         Ok(Self {
-            decoder: OpusDecoder::new(48_000, config.channels as usize).map_err(map_error)?,
+            decoder: match config.layout {
+                None => Decoder::One(OpusDecoder::new(48_000, config.channels as usize).map_err(map_error)?),
+                Some((streams, coupled, mapping)) => Decoder::Many(
+                    OpusMultistreamDecoder::new(
+                        48_000,
+                        config.channels as usize,
+                        streams as usize,
+                        coupled as usize,
+                        &mapping[..config.channels as usize],
+                    )
+                    .map_err(map_error)?,
+                ),
+            },
             channels: config.channels,
             skip: config.pre_skip as usize,
             factor: (config.gain != 0).then(|| gain_factor(config.gain)),
@@ -175,12 +225,15 @@ impl OpusPacketDecoder {
 
     /// The most interleaved samples one packet can make.
     pub fn max_packet_samples(&self) -> usize {
-        OpusDecoder::MAX_FRAME_SIZE_48K * self.channels as usize
+        5760 * self.channels as usize
     }
 
     /// Forgets what it was decoding, for a seek. Nothing more gets dropped from the start.
     pub fn forget(&mut self) {
-        self.decoder.reset();
+        match &mut self.decoder {
+            Decoder::One(decoder) => decoder.reset(),
+            Decoder::Many(decoder) => decoder.reset(),
+        }
         self.skip = 0;
     }
 
@@ -194,7 +247,23 @@ impl OpusPacketDecoder {
                 available: out.len(),
             });
         }
-        let frames = self.decoder.decode(packet, out, false).map_err(map_error)?;
+        let frames = match &mut self.decoder {
+            Decoder::One(decoder) => decoder.decode(packet, out, false).map_err(map_error)?,
+            Decoder::Many(decoder) => {
+                let frames = decoder.decode(packet, out, false).map_err(map_error)?;
+                // From Vorbis's channel order, which the stream's in, to WAVE's.
+                if let Some(order) = WAVE_ORDER.get(channels) {
+                    let mut frame = [0i16; MAX_MAPPED];
+                    for samples in out[..frames * channels].chunks_exact_mut(channels) {
+                        frame[..channels].copy_from_slice(samples);
+                        for (slot, &from) in samples.iter_mut().zip(*order) {
+                            *slot = frame[from as usize];
+                        }
+                    }
+                }
+                frames
+            }
+        };
         let samples = frames * channels;
         if let Some(factor) = self.factor {
             for sample in &mut out[..samples] {

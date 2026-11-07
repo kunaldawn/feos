@@ -121,11 +121,11 @@ impl OpusMultistreamDecoder {
         fec: bool,
     ) -> Result<usize, OpusError> {
         let sub_packets = if packet.is_empty() || fec {
-            vec![&[][..]; self.nb_streams]
+            vec![Vec::new(); self.nb_streams]
         } else {
             split_multistream_packet(packet, self.nb_streams)?
         };
-        let frame_size = self.expected_frame_size(&sub_packets, fec)?;
+        let frame_size = self.expected_frame_size(&sub_packets.iter().map(Vec::as_slice).collect::<Vec<_>>(), fec)?;
         let needed = frame_size * self.nb_channels;
         if pcm.len() < needed {
             return Err(OpusError::BufferTooSmall);
@@ -193,11 +193,11 @@ impl OpusMultistreamDecoder {
         fec: bool,
     ) -> Result<usize, OpusError> {
         let sub_packets = if packet.is_empty() || fec {
-            vec![&[][..]; self.nb_streams]
+            vec![Vec::new(); self.nb_streams]
         } else {
             split_multistream_packet(packet, self.nb_streams)?
         };
-        let frame_size = self.expected_frame_size(&sub_packets, fec)?;
+        let frame_size = self.expected_frame_size(&sub_packets.iter().map(Vec::as_slice).collect::<Vec<_>>(), fec)?;
         let needed = frame_size * self.nb_channels;
         if pcm.len() < needed {
             return Err(OpusError::BufferTooSmall);
@@ -308,31 +308,87 @@ impl OpusMultistreamDecoder {
 ///
 /// Parameters: full multistream `packet` and total `nb_streams`.
 /// Returns: borrowed sub-packet slices in stream order.
-fn split_multistream_packet(packet: &[u8], nb_streams: usize) -> Result<Vec<&[u8]>, OpusError> {
+fn split_multistream_packet(packet: &[u8], nb_streams: usize) -> Result<Vec<Vec<u8>>, OpusError> {
     if nb_streams == 0 {
         return Err(OpusError::InvalidArgument("nb_streams"));
     }
     if packet.is_empty() {
-        return Ok(vec![packet; nb_streams]);
+        return Ok(vec![Vec::new(); nb_streams]);
     }
 
     let mut out = Vec::with_capacity(nb_streams);
     let mut offset = 0usize;
     for _stream_idx in 0..nb_streams.saturating_sub(1) {
-        let (packet_len, used) = parse_self_delimited_size(&packet[offset..])?;
+        let (inner, used) = undelimit(packet.get(offset..).ok_or(OpusError::InvalidPacket)?)?;
+        out.push(inner);
         offset += used;
-        if offset + packet_len > packet.len() {
-            return Err(OpusError::InvalidPacket);
-        }
-        out.push(&packet[offset..offset + packet_len]);
-        offset += packet_len;
     }
-
-    if offset > packet.len() {
-        return Err(OpusError::InvalidPacket);
-    }
-    out.push(&packet[offset..]);
+    out.push(packet.get(offset..).ok_or(OpusError::InvalidPacket)?.to_vec());
     Ok(out)
+}
+
+/// One self-delimited packet, RFC 6716 appendix B, at the start of `data`: it's an ordinary one
+/// with the size of its last frame written out too. Returns it as an ordinary packet, and the
+/// bytes it took.
+fn undelimit(data: &[u8]) -> Result<(Vec<u8>, usize), OpusError> {
+    let size_at = |at: usize| -> Result<(usize, usize), OpusError> {
+        parse_self_delimited_size(data.get(at..).ok_or(OpusError::InvalidPacket)?)
+    };
+    let toc = *data.first().ok_or(OpusError::InvalidPacket)?;
+    // Where the extra size is, how big it is, and the bytes of frames (and padding) after it.
+    let (extra_at, extra_len, payload) = match toc & 3 {
+        0 => {
+            let (size, used) = size_at(1)?;
+            (1, used, size)
+        }
+        1 => {
+            let (size, used) = size_at(1)?;
+            (1, used, 2 * size)
+        }
+        2 => {
+            let (first, first_used) = size_at(1)?;
+            let (last, used) = size_at(1 + first_used)?;
+            (1 + first_used, used, first + last)
+        }
+        _ => {
+            let count_byte = *data.get(1).ok_or(OpusError::InvalidPacket)?;
+            let count = (count_byte & 63) as usize;
+            let mut at = 2;
+            let mut padding = 0usize;
+            if count_byte & 0x40 != 0 {
+                loop {
+                    let byte = *data.get(at).ok_or(OpusError::InvalidPacket)? as usize;
+                    at += 1;
+                    if byte == 255 {
+                        padding += 254;
+                    } else {
+                        padding += byte;
+                        break;
+                    }
+                }
+            }
+            if count_byte & 0x80 != 0 {
+                let mut total = padding;
+                for _ in 0..count.saturating_sub(1) {
+                    let (size, used) = size_at(at)?;
+                    at += used;
+                    total += size;
+                }
+                let (last, used) = size_at(at)?;
+                (at, used, total + last)
+            } else {
+                let (size, used) = size_at(at)?;
+                (at, used, padding + count * size)
+            }
+        }
+    };
+    let end = extra_at + extra_len;
+    let total = end.checked_add(payload).ok_or(OpusError::InvalidPacket)?;
+    let rest = data.get(end..total).ok_or(OpusError::InvalidPacket)?;
+    let mut inner = Vec::with_capacity(extra_at + payload);
+    inner.extend_from_slice(&data[..extra_at]);
+    inner.extend_from_slice(rest);
+    Ok((inner, total))
 }
 
 /// Parse one self-delimited multistream sub-packet length.
@@ -437,9 +493,12 @@ mod tests {
     /// Returns: nothing; panics on mismatch.
     #[test]
     fn split_two_stream_packet_with_short_prefix() {
-        let packet = [3u8, 10, 11, 12, 20, 21];
-        let sub_packets = split_multistream_packet(&packet, 2).unwrap();
-        assert_eq!(sub_packets, vec![&[10, 11, 12][..], &[20, 21][..]]);
+        // A code 0 packet, TOC 0x10, with a 3-byte frame: self-delimited, its size follows the
+        // TOC. Then the last stream's packet, ordinary.
+        let packet = [0x10, 3, 1, 2, 3, 0x20, 9, 9];
+        let parts = split_multistream_packet(&packet, 2).unwrap();
+        assert_eq!(parts[0], vec![0x10, 1, 2, 3]);
+        assert_eq!(parts[1], vec![0x20, 9, 9]);
     }
 
     /// Split one empty packet into PLC sub-packets for all streams.

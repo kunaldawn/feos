@@ -34,6 +34,21 @@ ffmpeg -nostdin -v error -f lavfi -i "testsrc2=s=160x120:r=5" -f lavfi -i "$TONE
     -c:v libvpx -deadline realtime -cpu-used 8 -b:v 100k -c:a libopus -b:a 256k "$dir/big.webm"
 ffmpeg -nostdin -v error -f lavfi -i "testsrc2=s=64x48:r=25" -f lavfi -i "sine=f=440:r=44100,aformat=channel_layouts=stereo" -t 4 \
     -c:v mpeg1video -b:v 100k -c:a mp2 -b:a 128k -f mpeg "$dir/av.mpg"
+# Files too large for memory in the containers that have to be walked for their frames, and in
+# AVI and FLV. Sound in the program stream and AVI is what has to come from the file, too.
+ffmpeg -nostdin -v error -f lavfi -i "testsrc2=s=160x120:r=5" -f lavfi -i "$TONE" -t 720 \
+    -c:v libx264 -preset ultrafast -g 25 -pix_fmt yuv420p -c:a aac -b:a 256k \
+    -movflags +frag_keyframe+empty_moov+default_base_moof "$dir/big-frag.mp4"
+ffmpeg -nostdin -v error -f lavfi -i "testsrc2=s=160x120:r=25" -f lavfi -i "$TONE" -t 720 \
+    -c:v mpeg1video -b:v 100k -g 25 -c:a mp2 -b:a 320k -f mpeg "$dir/big-ps.mpg"
+ffmpeg -nostdin -v error -f lavfi -i "testsrc2=s=160x120:r=5" -f lavfi -i "$TONE" -t 120 \
+    -c:v mjpeg -q:v 10 -c:a pcm_s16le "$dir/big.avi"
+ffmpeg -nostdin -v error -f lavfi -i "testsrc2=s=160x120:r=5" -f lavfi -i "$TONE" -t 720 \
+    -c:v libx264 -preset ultrafast -g 25 -pix_fmt yuv420p -c:a aac -b:a 256k "$dir/big.flv"
+# How fast 256 kbit/s stereo Opus decodes, in a size that takes a sensible time.
+ffmpeg -nostdin -v error -f lavfi -i "$TONE" -t 30 -c:a libopus -b:a 256k "$dir/o256.opus"
+# Anything else to put in it: real streams, say, which aren't for the repository.
+[ -n "${FEOS_MEDIA_EXTRA:-}" ] && cp "$FEOS_MEDIA_EXTRA"/* "$dir"/
 ls -l "$dir"
 
 size=$(du -sm "$dir" | cut -f1)
@@ -44,5 +59,5 @@ if command -v mcopy >/dev/null; then
     mcopy -i "$img" "$dir"/* ::/
 else
     docker run --rm --network none -v "$out:$out" --entrypoint mcopy localhost/feos \
-        -i "$img" "$dir"/big.flac "$dir"/big.mp3 "$dir"/big.ogg "$dir"/big.aac "$dir"/big.wav "$dir"/big.mov "$dir"/av.mpg "$dir"/big.opus "$dir"/big.webm ::/
+        -i "$img" "$dir"/* ::/
 fi

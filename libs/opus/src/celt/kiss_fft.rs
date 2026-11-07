@@ -110,33 +110,91 @@ impl KissFft {
     }
 }
 
-/// Compute forward DFT on flat interleaved complex buffers.
-///
-/// Params: `input`/`output` are `[re0, im0, re1, im1, ...]` and `n` is the
-/// number of complex samples.
-/// Returns: nothing; writes the forward transform to `output`.
-pub(crate) fn flat_fft_forward(input: &[f32], output: &mut [f32], n: usize) {
-    assert!(input.len() >= 2 * n && output.len() >= 2 * n);
-    for k in 0..n {
-        let mut sum_re = 0.0f64;
-        let mut sum_im = 0.0f64;
-        for j in 0..n {
-            let angle = -2.0 * PI as f64 * (k as f64) * (j as f64) / (n as f64);
+/// A forward DFT of interleaved `[re0, im0, re1, im1, ...]`, by Stockham's FFT, one factor at a
+/// time. It works in double precision, as the direct sum it replaces did: it's that sum's results
+/// the conformance numbers were measured with, and a sum for each of 480 bins, with a sine and a
+/// cosine for every term, took 1.2 times real time at 256 kbit/s on a fast machine.
+#[derive(Debug, Clone)]
+pub(crate) struct FlatFft {
+    n: usize,
+    /// A whole turn, in `n` steps.
+    twiddle: Vec<(f64, f64)>,
+}
+
+impl FlatFft {
+    pub(crate) fn new(n: usize) -> Self {
+        let mut twiddle = Vec::with_capacity(n);
+        for k in 0..n {
+            let angle = -2.0 * PI as f64 * (k as f64) / (n as f64);
             let (sin_a, cos_a) = angle.sin_cos();
-            let re = input[2 * j] as f64;
-            let im = input[2 * j + 1] as f64;
-            sum_re += re * cos_a - im * sin_a;
-            sum_im += re * sin_a + im * cos_a;
+            twiddle.push((cos_a, sin_a));
         }
-        output[2 * k] = sum_re as f32;
-        output[2 * k + 1] = sum_im as f32;
+        Self { n, twiddle }
+    }
+
+    /// `n` complex values from `input` to `output`.
+    pub(crate) fn run(&self, input: &[f32], output: &mut [f32]) {
+        let total = self.n;
+        assert!(input.len() >= 2 * total && output.len() >= 2 * total);
+        let mut from: Vec<(f64, f64)> =
+            input[..2 * total].chunks_exact(2).map(|c| (c[0] as f64, c[1] as f64)).collect();
+        let mut to = vec![(0.0f64, 0.0f64); total];
+        let mut size = total;
+        let mut stride = 1;
+        while size > 1 {
+            let radix = [2usize, 3, 5].into_iter().find(|p| size % p == 0).unwrap_or(size);
+            let m = size / radix;
+            for p in 0..m {
+                for q in 0..stride {
+                    for t in 0..radix {
+                        let (mut sum_re, mut sum_im) = (0.0f64, 0.0f64);
+                        for i in 0..radix {
+                            let (ar, ai) = from[q + stride * (p + i * m)];
+                            let (wr, wi) = self.twiddle[(i * t * total / radix) % total];
+                            sum_re += ar * wr - ai * wi;
+                            sum_im += ar * wi + ai * wr;
+                        }
+                        let (wr, wi) = self.twiddle[(p * t * stride) % total];
+                        to[q + stride * (radix * p + t)] =
+                            (sum_re * wr - sum_im * wi, sum_re * wi + sum_im * wr);
+                    }
+                }
+            }
+            core::mem::swap(&mut from, &mut to);
+            size = m;
+            stride *= radix;
+        }
+        for (slot, value) in output.chunks_exact_mut(2).zip(&from) {
+            slot[0] = value.0 as f32;
+            slot[1] = value.1 as f32;
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Complex32, KissFft};
+    use super::{Complex32, FlatFft, KissFft};
     use core::f32::consts::PI;
+
+    #[test]
+    fn flat_fft_matches_the_sum() {
+        for n in [60usize, 120, 240, 480, 7] {
+            let input: Vec<f32> = (0..2 * n).map(|i| ((i * i * 37 + 11) % 201) as f32 - 100.0).collect();
+            let mut output = vec![0.0f32; 2 * n];
+            FlatFft::new(n).run(&input, &mut output);
+            for k in 0..n {
+                let (mut re, mut im) = (0.0f64, 0.0f64);
+                for j in 0..n {
+                    let angle = -2.0 * core::f64::consts::PI * (k * j) as f64 / n as f64;
+                    let (s, c) = (angle.sin(), angle.cos());
+                    re += input[2 * j] as f64 * c - input[2 * j + 1] as f64 * s;
+                    im += input[2 * j] as f64 * s + input[2 * j + 1] as f64 * c;
+                }
+                assert!((re as f32 - output[2 * k]).abs() < 1e-2, "{n} {k}");
+                assert!((im as f32 - output[2 * k + 1]).abs() < 1e-2, "{n} {k}");
+            }
+        }
+    }
 
     /// Compute libopus-style forward DFT with `1/N` scaling for tests.
     ///

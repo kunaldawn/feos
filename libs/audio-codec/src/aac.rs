@@ -1,4 +1,4 @@
-//! AAC-LC decoding, in fixed-point integer arithmetic.
+//! AAC decoding, in fixed-point integer arithmetic.
 //!
 //! Input is either an ADTS stream ([`info`], [`decode`], [`AdtsDecoder`]) or
 //! raw access units from a container, which go through
@@ -644,6 +644,24 @@ fn round_even(value: f32) -> f32 {
     f32::from_bits(bits.wrapping_add(0x7fff).wrapping_add((bits & 0x1_0000) >> 16) & 0xffff_0000)
 }
 
+/// `q^(4/3)`, as near as a float gets.
+fn float_power43(q: u32) -> f32 {
+    let value = q as f64;
+    // From what's known to about one part in 8192, two steps are plenty.
+    let mut root = (inverse_quant(q) as f64 / 8192.0 / value).max(1.0);
+    for _ in 0..2 {
+        root = (2.0 * root + value / (root * root)) / 3.0;
+    }
+    (root * value) as f32
+}
+
+/// `2^(exponent/4)`, likewise.
+fn float_gain(exponent: i32) -> f32 {
+    const PARTS: [f32; 4] = [1.0, 1.189_207_1, core::f32::consts::SQRT_2, 1.681_792_8];
+    let whole = exponent.div_euclid(4).clamp(-126, 127);
+    PARTS[exponent.rem_euclid(4) as usize] * f32::from_bits(((whole + 127) as u32) << 23)
+}
+
 fn truncate(value: f32) -> f32 {
     f32::from_bits(value.to_bits() & 0xffff_0000)
 }
@@ -1079,7 +1097,7 @@ fn integer_sqrt(value: u64) -> u64 {
     root
 }
 
-/// A decoder for raw AAC-LC access units.
+/// A decoder for raw AAC access units.
 pub struct AacDecoder {
     config: AudioSpecificConfig,
     layout: Layout,
@@ -1110,13 +1128,17 @@ pub struct AacDecoder {
     noise: u32,
     /// Main only: `channels * 1024` of them.
     predictors: Vec<Predictor>,
+    /// Main only: the spectrum in floating point too. The predictors keep 16 bits of float, so
+    /// their results can jump by one of those steps at the slightest difference, and the
+    /// standard's are matched only by coming to the same floats it does.
+    float_spectrum: Vec<f32>,
     /// LTP only: for each channel, the last two frames it output, in the same format as
     /// `overlap`, whose tail is what the prediction looks at after them.
     ltp_history: Vec<i32>,
     /// LTP only: a prediction's spectrum.
     ltp_spectrum: Vec<i32>,
     /// SBR, once a stream is known to have it, and the core's output for it, in Q13.
-    sbr: Option<SbrDecoder>,
+    sbr: Vec<SbrDecoder>,
     core_pcm: Vec<i32>,
     /// Frames decoded, as far as a first one mattering goes.
     decoded_any: bool,
@@ -1181,14 +1203,15 @@ impl AacDecoder {
             let phase = ((index as i128) << 64) / denominator;
             *slot = q62_to_q31(sin_turn(phase as u64));
         }
-        let sbr = if checked.sbr_active() {
-            Some(open_sbr(&checked)?)
-        } else {
-            None
-        };
+        // One, or none: on the heap, so that moving a decoder doesn't take much stack.
+        let mut sbr = Vec::new();
+        if checked.sbr_active() {
+            sbr.try_reserve_exact(1).map_err(|_| AudioError::OutOfMemory)?;
+            sbr.push(open_sbr(&checked)?);
+        }
         Ok(Self {
             config: checked,
-            core_pcm: if sbr.is_some() {
+            core_pcm: if !sbr.is_empty() {
                 try_vec(channels * FRAME_SAMPLES, 0)?
             } else {
                 Vec::new()
@@ -1214,6 +1237,11 @@ impl AacDecoder {
             previous_shape: [false; MAX_CHANNELS + MAX_COUPLINGS],
             noise: 0x1f2e_3d4c,
             predictors,
+            float_spectrum: if checked.object_type == OBJECT_MAIN {
+                try_vec(channels * FRAME_SAMPLES, 0.0)?
+            } else {
+                Vec::new()
+            },
             ltp_history: if checked.object_type == OBJECT_LTP {
                 try_vec(channels * 2 * FRAME_SAMPLES, 0)?
             } else {
@@ -1253,7 +1281,7 @@ impl AacDecoder {
         self.previous_shape = [false; MAX_CHANNELS + MAX_COUPLINGS];
         self.predictors.fill(Predictor::START);
         self.ltp_history.fill(0);
-        if let Some(sbr) = &mut self.sbr {
+        for sbr in &mut self.sbr {
             sbr.reset();
         }
     }
@@ -1279,7 +1307,7 @@ impl AacDecoder {
             let used = info.predictor_present && info.prediction_used & (1 << band) != 0;
             for line in swb[band] as usize..swb[band + 1] as usize {
                 // Coefficients are Q3 here, and the predictor runs on the standard's scale.
-                let value = spectrum[line] as f32 / 8.0;
+                let value = self.float_spectrum[start + line];
                 let e0 = predictors[line].run(value, used);
                 if used {
                     spectrum[line] = (e0 * 8.0) as i32;
@@ -1363,7 +1391,8 @@ impl AacDecoder {
                     .get_mut(position)
                     .ok_or(AudioError::InvalidData("AAC pulse outside the frame"))?;
                 let amplitude = pulses.amplitudes[index] as i32;
-                *slot += if *slot < 0 { -amplitude } else { amplitude };
+                // The standard's rule: a value of zero goes negative.
+                *slot += if *slot > 0 { amplitude } else { -amplitude };
             }
         }
         self.dequantize(channel, ics, swb);
@@ -1378,6 +1407,10 @@ impl AacDecoder {
             return;
         };
         spectrum.fill(0);
+        let want_floats = channel < self.channels && !self.float_spectrum.is_empty();
+        if want_floats {
+            self.float_spectrum[start..start + FRAME_SAMPLES].fill(0.0);
+        }
         let max_sfb = ics.info.max_sfb;
         let mut window_start = 0;
         for group in 0..ics.info.groups {
@@ -1393,15 +1426,32 @@ impl AacDecoder {
                         BAND_ZERO | BAND_INTENSITY_IN | BAND_INTENSITY_OUT => {}
                         BAND_NOISE => {
                             let energy = ics.scalefactors[index] as i32;
-                            fill_noise(&mut spectrum[range], energy, &mut self.noise);
+                            fill_noise(&mut spectrum[range.clone()], energy, &mut self.noise);
+                            if want_floats {
+                                for line in range {
+                                    self.float_spectrum[start + line] = spectrum[line] as f32 / 8.0;
+                                }
+                            }
                         }
                         _ => {
                             let gain = ics.scalefactors[index] as i32 - 100;
                             let input = &self.quantized[range.clone()];
-                            for (slot, &q) in spectrum[range].iter_mut().zip(input) {
+                            for (slot, &q) in spectrum[range.clone()].iter_mut().zip(input) {
                                 if q != 0 {
                                     let value = apply_gain(inverse_quant(q.unsigned_abs()), gain);
                                     *slot = (if q < 0 { -value } else { value }) as i32;
+                                }
+                            }
+                            if want_floats {
+                                let scale = float_gain(gain);
+                                for (slot, &q) in self.float_spectrum[start + range.start..start + range.end]
+                                    .iter_mut()
+                                    .zip(input)
+                                {
+                                    if q != 0 {
+                                        let value = float_power43(q.unsigned_abs()) * scale;
+                                        *slot = if q < 0 { -value } else { value };
+                                    }
                                 }
                             }
                         }
@@ -1471,6 +1521,15 @@ impl AacDecoder {
                             let (m, s) = (*l, *r);
                             *l = m.wrapping_add(s);
                             *r = m.wrapping_sub(s);
+                        }
+                        if !self.float_spectrum.is_empty() {
+                            let a = pair.0 * FRAME_SAMPLES + offset;
+                            let b = pair.1 * FRAME_SAMPLES + offset;
+                            for line in low..high {
+                                let (m, s) = (self.float_spectrum[a + line], self.float_spectrum[b + line]);
+                                self.float_spectrum[a + line] = m + s;
+                                self.float_spectrum[b + line] = m - s;
+                            }
                         }
                     }
                 }
@@ -1975,7 +2034,8 @@ impl AacDecoder {
             // A first frame without it means there isn't any.
             self.config.sbr = Some(false);
         }
-        if let Some(mut sbr) = self.sbr.take() {
+        let mut holder = core::mem::take(&mut self.sbr);
+        if let Some(sbr) = holder.first_mut() {
             let out_channels = self.config.output_channels();
             for channel in 0..channels {
                 let (kind, _, side) = targets[channel];
@@ -1992,8 +2052,8 @@ impl AacDecoder {
                 };
                 sbr.apply(channel, pair, &self.core_pcm, FRAME_SAMPLES, out, out_channels, places);
             }
-            self.sbr = Some(sbr);
         }
+        self.sbr = holder;
         Ok(self.config.output_frame())
     }
 
@@ -2009,12 +2069,13 @@ impl AacDecoder {
         let (13 | 14, Some((first, pair))) = (kind, element) else {
             return Ok(());
         };
-        if self.config.may_be_implicit() && !self.decoded_any && self.sbr.is_none() {
+        if self.config.may_be_implicit() && !self.decoded_any && self.sbr.is_empty() {
             self.config.sbr = Some(true);
-            self.sbr = Some(open_sbr(&self.config)?);
+            self.sbr.try_reserve_exact(1).map_err(|_| AudioError::OutOfMemory)?;
+            self.sbr.push(open_sbr(&self.config)?);
             self.core_pcm = try_vec(self.channels * FRAME_SAMPLES, 0)?;
         }
-        if let Some(sbr) = &mut self.sbr {
+        if let Some(sbr) = self.sbr.first_mut() {
             let _ = sbr.read(&mut reader, count * 8 - 4, kind == 14, first, pair);
         }
         Ok(())

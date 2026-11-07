@@ -6,8 +6,8 @@
 //! signal is made by all-pass filters and delays, and each band of the two is mixed by a matrix
 //! the side data picks, moved smoothly from one to the next.
 //!
-//! The phase parameters (IPD and OPD) in the stream's extension are skipped, as a baseline
-//! decoder does. All of it is integers: subband samples as in `sbr.rs`, matrices in Q28.
+//! All of it is integers but the phase parameters' smoothing: subband samples as in `sbr.rs`,
+//! matrices in Q28.
 
 use alloc::vec::Vec;
 
@@ -16,17 +16,19 @@ use crate::aac_tables::Code;
 use crate::bits::{try_vec, MsbReader};
 use crate::error::{AudioError, Result};
 use crate::mdct::cmul;
-use crate::sbr::{Cx, BANDS, SLOTS};
+use crate::sbr::{sqrt, Cx, BANDS, SLOTS};
 use crate::sbr_tables::{
     BINS_20, BINS_34, BORDERS_20, BORDERS_34, FRAC_QMF_IM, FRAC_QMF_RE, FRAC_SUB_IM_20,
     FRAC_SUB_IM_34, FRAC_SUB_RE_20, FRAC_SUB_RE_34, ICC_DF, ICC_DT, IID_DF, IID_DF_FINE, IID_DT,
-    IID_DT_FINE, LINK_DECAY, MIX_A, MIX_A_FINE, MIX_B, MIX_B_FINE, MOD_12, MOD_2, MOD_4, MOD_8,
+    IID_DT_FINE, IPD_DF, IPD_DT, LINK_DECAY, MIX_A, MIX_A_FINE, MIX_B, MIX_B_FINE, MOD_12, MOD_2, MOD_4, MOD_8, OPD_DF, OPD_DT,
     P12_34, P2_20, P4_34, P8_20, P8_34, SER_QMF_IM, SER_QMF_RE, SER_SUB_IM_20, SER_SUB_IM_34,
     SER_SUB_RE_20, SER_SUB_RE_34,
 };
 
 const MAX_ENV: usize = 5;
 const MAX_BINS: usize = 34;
+/// Bins phases can apply to.
+const PHASE_BINS: usize = 17;
 const FILTER: usize = 13;
 /// Slots of a hybrid band's input: six before the frame, and six past its end.
 const WINDOW: usize = 6 + SLOTS + 6;
@@ -59,7 +61,24 @@ struct Params {
     iid_before: [i8; MAX_BINS],
     icc_before: [i8; MAX_BINS],
     fresh: bool,
+    enable_phase: bool,
+    ipd: [[u8; PHASE_BINS]; MAX_ENV + 1],
+    opd: [[u8; PHASE_BINS]; MAX_ENV + 1],
+    ipd_before: [u8; PHASE_BINS],
+    opd_before: [u8; PHASE_BINS],
 }
+
+/// Phases by index: eighths of a turn.
+const PHASES: [(f32, f32); 8] = [
+    (1.0, 0.0),
+    (core::f32::consts::FRAC_1_SQRT_2, core::f32::consts::FRAC_1_SQRT_2),
+    (0.0, 1.0),
+    (-core::f32::consts::FRAC_1_SQRT_2, core::f32::consts::FRAC_1_SQRT_2),
+    (-1.0, 0.0),
+    (-core::f32::consts::FRAC_1_SQRT_2, -core::f32::consts::FRAC_1_SQRT_2),
+    (0.0, -1.0),
+    (core::f32::consts::FRAC_1_SQRT_2, -core::f32::consts::FRAC_1_SQRT_2),
+];
 
 /// The second half of the mapping from 20 bands to 34, in place.
 fn map_20_to_34(p: &mut [i8; MAX_BINS]) {
@@ -178,6 +197,13 @@ pub(crate) struct Ps {
     energy: [i64; MAX_BINS],
     h: [[i32; 4]; MAX_BINS],
     h_delta: [[i32; 4]; MAX_BINS],
+    /// The matrices' imaginary parts, while phases are in use.
+    h_im: [[i32; 4]; MAX_BINS],
+    h_im_delta: [[i32; 4]; MAX_BINS],
+    complex: bool,
+    /// The last two envelopes' phases, which each one's are smoothed with.
+    ipd_history: [[u8; PHASE_BINS]; 2],
+    opd_history: [[u8; PHASE_BINS]; 2],
     env: usize,
     top: usize,
     /// The second synthesis bank.
@@ -220,6 +246,11 @@ impl Ps {
                 iid_before: [0; MAX_BINS],
                 icc_before: [0; MAX_BINS],
                 fresh: false,
+                enable_phase: false,
+                ipd: [[0; PHASE_BINS]; MAX_ENV + 1],
+                opd: [[0; PHASE_BINS]; MAX_ENV + 1],
+                ipd_before: [0; PHASE_BINS],
+                opd_before: [0; PHASE_BINS],
             },
             started: false,
             use_34: false,
@@ -243,6 +274,11 @@ impl Ps {
             energy: [0; MAX_BINS],
             h: [[0; 4]; MAX_BINS],
             h_delta: [[0; 4]; MAX_BINS],
+            h_im: [[0; 4]; MAX_BINS],
+            h_im_delta: [[0; 4]; MAX_BINS],
+            complex: false,
+            ipd_history: [[0; PHASE_BINS]; 2],
+            opd_history: [[0; PHASE_BINS]; 2],
             env: 0,
             top: BANDS,
             bank: try_vec(bank_len, 0)?,
@@ -262,6 +298,12 @@ impl Ps {
         self.peak_difference = [0; MAX_BINS];
         self.energy = [0; MAX_BINS];
         self.h = [[0; 4]; MAX_BINS];
+        self.h_im = [[0; 4]; MAX_BINS];
+        self.complex = false;
+        self.ipd_history = [[0; PHASE_BINS]; 2];
+        self.opd_history = [[0; PHASE_BINS]; 2];
+        self.params.ipd_before = [0; PHASE_BINS];
+        self.params.opd_before = [0; PHASE_BINS];
         self.bank.fill(0);
     }
 
@@ -333,7 +375,38 @@ impl Ps {
             if count == 15 {
                 count += reader.read(8)? as usize;
             }
-            reader.skip_long(8 * count)?;
+            let mut left = 8 * count;
+            p.enable_phase = false;
+            while left > 7 {
+                let start = reader.bits_left();
+                if reader.read(2)? == 0 {
+                    p.enable_phase = reader.bit()?;
+                    if p.enable_phase {
+                        let (ipd_before, opd_before) = (p.ipd_before, p.opd_before);
+                        for e in 0..coded {
+                            read_phases(reader, &mut p.ipd, &ipd_before, e, p.iid_mode, &IPD_DT, &IPD_DF)?;
+                            read_phases(reader, &mut p.opd, &opd_before, e, p.iid_mode, &OPD_DT, &OPD_DF)?;
+                        }
+                    }
+                    reader.bit()?;
+                    let used = start - reader.bits_left();
+                    if used > left {
+                        return Err(AudioError::InvalidData("parametric stereo extension overruns"));
+                    }
+                    left -= used;
+                } else {
+                    let used = start - reader.bits_left();
+                    reader.skip_long(left - used)?;
+                    left = 0;
+                }
+            }
+            reader.skip_long(left)?;
+        } else {
+            p.enable_phase = false;
+        }
+        if !p.enable_phase {
+            p.ipd = [[0; PHASE_BINS]; MAX_ENV + 1];
+            p.opd = [[0; PHASE_BINS]; MAX_ENV + 1];
         }
 
         let mut envelopes = coded;
@@ -341,9 +414,13 @@ impl Ps {
             envelopes = 1;
             p.iid[0] = if p.enable_iid { p.iid_before } else { [0; MAX_BINS] };
             p.icc[0] = if p.enable_icc { p.icc_before } else { [0; MAX_BINS] };
+            p.ipd[0] = p.ipd_before;
+            p.opd[0] = p.opd_before;
         }
         p.iid_before = p.iid[envelopes - 1];
         p.icc_before = p.icc[envelopes - 1];
+        p.ipd_before = p.ipd[envelopes - 1];
+        p.opd_before = p.opd[envelopes - 1];
 
         let slots = SLOTS as i32;
         if class {
@@ -356,6 +433,8 @@ impl Ps {
                 border[envelopes] = SLOTS as u8;
                 p.iid[envelopes - 1] = p.iid[envelopes - 2];
                 p.icc[envelopes - 1] = p.icc[envelopes - 2];
+                p.ipd[envelopes - 1] = p.ipd[envelopes - 2];
+                p.opd[envelopes - 1] = p.opd[envelopes - 2];
             }
             for e in 1..envelopes {
                 let most = slots - (envelopes - e) as i32;
@@ -384,10 +463,6 @@ impl Ps {
         self.extension = extension;
         self.next_34 = use_34;
         p.fresh = true;
-        extern crate std;
-        {static C: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-        if C.fetch_add(1, core::sync::atomic::Ordering::Relaxed)<12 { std::eprintln!("ps iid {} m{} fine {} icc {} m{} mixb {} ext {} env {} class {} border {:?}",p.enable_iid,p.iid_mode,p.fine,p.enable_icc,p.icc_mode,p.mix_b,extension,envelopes,class,&border[..=envelopes]); }}
-        p.fresh = true;
         self.params = p;
         self.started = true;
         Ok(())
@@ -413,6 +488,8 @@ impl Ps {
             let last = p.num_env.saturating_sub(1);
             p.iid[0] = p.iid[last];
             p.icc[0] = p.icc[last];
+            p.ipd[0] = p.ipd[last];
+            p.opd[0] = p.opd[last];
             p.num_env = 1;
             p.border = [0, SLOTS as u8, 0, 0, 0, 0, 0];
         }
@@ -456,7 +533,7 @@ impl Ps {
 
     /// Picks the matrices the envelope ends on, and how far each moves per slot.
     fn start_envelope(&mut self) {
-        let p = &self.params;
+        let p = self.params;
         let bins = if self.use_34 { 34 } else { 20 };
         let length = (p.border[self.env + 1] as i32 - p.border[self.env] as i32).max(1);
         let (table, steps): (&[i32], usize) = match (p.mix_b, p.fine) {
@@ -465,14 +542,54 @@ impl Ps {
             (true, false) => (&MIX_B, 7),
             (true, true) => (&MIX_B_FINE, 15),
         };
+        let mut complex = false;
         for bin in 0..bins {
             let level = (p.iid[self.env][bin] as i32).clamp(-(steps as i32), steps as i32) + steps as i32;
             let correlation = (p.icc[self.env][bin] as i32).clamp(0, 7);
             let at = (level as usize * 8 + correlation as usize) * 4;
+            let mut target = [table[at], table[at + 1], table[at + 2], table[at + 3]];
+            let mut imaginary = [0i32; 4];
+            if p.enable_phase && bin < PHASE_BINS {
+                // The phases, smoothed with the last two envelopes', as unit vectors.
+                let phase = |now: u8, one: u8, two: u8| {
+                    let (a, b, c) = (PHASES[now as usize & 7], PHASES[one as usize & 7], PHASES[two as usize & 7]);
+                    let re = a.0 + 0.5 * b.0 + 0.25 * c.0;
+                    let im = a.1 + 0.5 * b.1 + 0.25 * c.1;
+                    let size = sqrt(re * re + im * im);
+                    if size > 0.0 { (re / size, im / size) } else { (1.0, 0.0) }
+                };
+                let ipd = phase(p.ipd[self.env][bin], self.ipd_history[0][bin], self.ipd_history[1][bin]);
+                let opd = phase(p.opd[self.env][bin], self.opd_history[0][bin], self.opd_history[1][bin]);
+                // The left channel turns by OPD, and the right by OPD less IPD.
+                let left = opd;
+                let right = (opd.0 * ipd.0 + opd.1 * ipd.1, opd.1 * ipd.0 - opd.0 * ipd.1);
+                let turn = |value: i32, by: f32| (value as f32 * by) as i32;
+                imaginary = [
+                    turn(target[0], left.1),
+                    turn(target[1], right.1),
+                    turn(target[2], left.1),
+                    turn(target[3], right.1),
+                ];
+                target = [
+                    turn(target[0], left.0),
+                    turn(target[1], right.0),
+                    turn(target[2], left.0),
+                    turn(target[3], right.0),
+                ];
+            }
             for m in 0..4 {
-                self.h_delta[bin][m] = (table[at + m] - self.h[bin][m]) / length;
+                self.h_delta[bin][m] = (target[m] - self.h[bin][m]) / length;
+                self.h_im_delta[bin][m] = (imaginary[m] - self.h_im[bin][m]) / length;
+                if imaginary[m] != 0 || self.h_im[bin][m] != 0 {
+                    complex = true;
+                }
             }
         }
+        self.complex = complex;
+        self.ipd_history[1] = self.ipd_history[0];
+        self.opd_history[1] = self.opd_history[0];
+        self.ipd_history[0] = p.ipd[self.env];
+        self.opd_history[0] = p.opd[self.env];
     }
 
     /// The hybrid analysis of one slot, into `out`.
@@ -522,9 +639,10 @@ impl Ps {
         for bin in 0..bins {
             for m in 0..4 {
                 self.h[bin][m] = self.h[bin][m].wrapping_add(self.h_delta[bin][m]);
+                self.h_im[bin][m] = self.h_im[bin][m].wrapping_add(self.h_im_delta[bin][m]);
             }
         }
-        let (borders, map, sub_groups, first_qmf): (&[u8], &[u8], usize, usize) = if self.use_34 {
+        let (borders, map, sub_groups, first_qmf): (&[u8], &[u16], usize, usize) = if self.use_34 {
             (&BORDERS_34, &BINS_34, 32, 5)
         } else {
             (&BORDERS_20, &BINS_20, 10, 3)
@@ -546,7 +664,7 @@ impl Ps {
             re * re + im * im
         };
         for gr in 0..map.len() {
-            let bin = map[gr] as usize;
+            let bin = (map[gr] & 255) as usize;
             if gr < sub_groups {
                 power[bin] += square(hl[borders[gr] as usize]);
             } else {
@@ -578,7 +696,7 @@ impl Ps {
         };
         for gr in 0..sub_groups {
             let sb = borders[gr] as usize;
-            let bin = map[gr] as usize;
+            let bin = (map[gr] & 255) as usize;
             let input = hl[sb];
             let delayed = core::mem::replace(&mut self.sub_delay[self.delay_at * MAX_HYBRID + sb], input);
             let mut value = cmul(delayed.0, delayed.1, frac_re[sb], frac_im[sb]);
@@ -589,7 +707,7 @@ impl Ps {
             hr[sb] = scaled(value, ratio[bin]);
         }
         for gr in sub_groups..map.len() {
-            let bin = map[gr] as usize;
+            let bin = (map[gr] & 255) as usize;
             for sb in borders[gr] as usize..borders[gr + 1] as usize {
                 let input = left[sb];
                 let value = if sb >= ALL_PASS_BANDS {
@@ -625,14 +743,26 @@ impl Ps {
         // Mixing.
         for gr in 0..sub_groups {
             let sb = borders[gr] as usize;
-            let (a, b) = mix(&self.h[map[gr] as usize], hl[sb], hr[sb]);
+            let bin = (map[gr] & 255) as usize;
+            let (a, b) = if self.complex {
+                mix_complex(&self.h[bin], &self.h_im[bin], map[gr] & 256 != 0, hl[sb], hr[sb])
+            } else {
+                mix(&self.h[bin], hl[sb], hr[sb])
+            };
             hl[sb] = a;
             hr[sb] = b;
         }
         for gr in sub_groups..map.len() {
-            let h = self.h[map[gr] as usize];
+            let bin = (map[gr] & 255) as usize;
+            let h = self.h[bin];
+            let h_im = self.h_im[bin];
+            let complex = self.complex;
             for sb in borders[gr] as usize..borders[gr + 1] as usize {
-                let (a, b) = mix(&h, left[sb], right[sb]);
+                let (a, b) = if complex {
+                    mix_complex(&h, &h_im, map[gr] & 256 != 0, left[sb], right[sb])
+                } else {
+                    mix(&h, left[sb], right[sb])
+                };
                 left[sb] = a;
                 right[sb] = b;
             }
@@ -702,6 +832,55 @@ fn mix(h: &[i32; 4], l: Cx, r: Cx) -> (Cx, Cx) {
             ((h12 * l.1 as i64 + h22 * r.1 as i64 + round) >> 28) as i32,
         ),
     )
+}
+
+/// Mixing with matrices that have imaginary parts, which some groups see negated.
+#[inline]
+fn mix_complex(h: &[i32; 4], im: &[i32; 4], negate: bool, l: Cx, r: Cx) -> (Cx, Cx) {
+    let round = 1i64 << 27;
+    let one = |re_a: i32, im_a: i32, re_b: i32, im_b: i32| -> Cx {
+        let (im_a, im_b) = if negate { (-(im_a as i64), -(im_b as i64)) } else { (im_a as i64, im_b as i64) };
+        let (re_a, re_b) = (re_a as i64, re_b as i64);
+        (
+            ((re_a * l.0 as i64 - im_a * l.1 as i64 + re_b * r.0 as i64 - im_b * r.1 as i64 + round) >> 28) as i32,
+            ((im_a * l.0 as i64 + re_a * l.1 as i64 + im_b * r.0 as i64 + re_b * r.1 as i64 + round) >> 28) as i32,
+        )
+    };
+    (one(h[0], im[0], h[2], im[2]), one(h[1], im[1], h[3], im[3]))
+}
+
+/// Reads an envelope's phases, which are modulo 8.
+fn read_phases(
+    reader: &mut MsbReader<'_>,
+    table: &mut [[u8; PHASE_BINS]; MAX_ENV + 1],
+    before: &[u8; PHASE_BINS],
+    e: usize,
+    mode: u8,
+    dt: &[Code],
+    df: &[Code],
+) -> Result<()> {
+    let bins = [5, 11, 17][mode as usize];
+    let stride = if mode == 0 { 2 } else { 1 };
+    let time = reader.bit()?;
+    let previous = if e == 0 { *before } else { table[e - 1] };
+    let mut line = [0u8; PHASE_BINS];
+    let mut running = 0u16;
+    for b in 0..bins {
+        let code = read_code(reader, if time { dt } else { df })?;
+        line[b] = if time {
+            ((previous[b * stride] as u16 + code) & 7) as u8
+        } else {
+            running = (running + code) & 7;
+            running as u8
+        };
+    }
+    if mode == 0 {
+        for b in (0..10).rev() {
+            line[b] = line[b / 2];
+        }
+    }
+    table[e] = line;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

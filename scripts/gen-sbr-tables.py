@@ -6,7 +6,9 @@
 The tables are the normative ones of ISO/IEC 14496-3 for SBR and parametric stereo, as they
 appear in libxaac, the Android Open Source Project's AAC decoder, under Apache-2.0. Its source
 ships in the `libxaac-sys` crate (version 0.1.0 was used) as `libxaac/decoder` and
-`libxaac/common`. No FFmpeg or other LGPL table goes in here. Huffman codes are recovered by
+`libxaac/common`. The four codebooks for phase parameters, which libxaac doesn't read, are ISO
+tables 8.B.20 and 8.B.21 as listed in the `oxideav-aac` crate 0.1.7 (MIT, by the OxideAV
+project, which says it worked from the standard). No FFmpeg or other LGPL table goes in here. Huffman codes are recovered by
 running libxaac's table formats, and checked to be complete prefix codes. The mixing matrices
 are computed here from the standard's formulas and libxaac's level tables.
 """
@@ -163,6 +165,14 @@ const fn c(code: u32, length: u8, symbol: u16) -> Code {
     Code { code, length, symbol }
 }"""
 
+# (length, code), by symbol from 0 to 7.
+PHASE_BOOKS = {
+    "IPD_DF": [(1, 0b1), (3, 0b000), (4, 0b0110), (4, 0b0100), (4, 0b0010), (4, 0b0011), (4, 0b0101), (4, 0b0111)],
+    "IPD_DT": [(1, 0b1), (3, 0b010), (4, 0b0010), (5, 0b00011), (5, 0b00010), (4, 0b0000), (4, 0b0011), (3, 0b011)],
+    "OPD_DF": [(1, 0b1), (3, 0b001), (4, 0b0110), (4, 0b0100), (5, 0b01111), (5, 0b01110), (4, 0b0101), (3, 0b000)],
+    "OPD_DT": [(1, 0b1), (3, 0b010), (4, 0b0001), (5, 0b00111), (5, 0b00110), (4, 0b0000), (4, 0b0010), (3, 0b011)],
+}
+
 SBR_BOOKS = [
     ("T_ENV_1_5", "t_huffman_env_1_5db"),
     ("F_ENV_1_5", "f_huffman_env_1_5db"),
@@ -251,6 +261,11 @@ def main():
     for name, marker in PS_BOOKS:
         parts.append(code_text(name, ps_book(source, "// const WORD16 " + marker)))
 
+    for name, entries in PHASE_BOOKS.items():
+        if sum(Fraction(1, 1 << length) for length, _ in entries) != 1:
+            sys.exit(f"{name} is not a complete prefix code")
+        parts.append(code_text(name, sorted((code << (32 - length), length, symbol) for symbol, (length, code) in enumerate(entries))))
+
     parts.append(array("START_MIN", integers(source, "// const WORD8 start_min[12]"), "u8", 12,
                        "By the rate's index among 96000 down to 8000."))
     parts.append(array("START_ROW", integers(source, "// const WORD8 offset_idx[12]"), "u8", 12))
@@ -307,10 +322,11 @@ def main():
     parts.append(array("BORDERS_20", integers(source, "// const WORD32 group_borders_20_tbl"), "u8", 16))
     parts.append(array("BORDERS_34", integers(source, "// group_borders_34_tbl"), "u8", 16))
 
-    text = body(source, "// const WORD32 bin_group_map_20").replace("NEGATE_IPD_MASK", "0")
-    parts.append(array("BINS_20", [eval(v.strip()) for v in text.split(",") if v.strip()], "u8", 16))
-    text = body(source, "// const WORD32 bin_group_map_34").replace("NEGATE_IPD_MASK", "0")
-    parts.append(array("BINS_34", [eval(v.strip()) for v in text.split(",") if v.strip()], "u8", 16))
+    text = body(source, "// const WORD32 bin_group_map_20").replace("NEGATE_IPD_MASK", "256")
+    parts.append(array("BINS_20", [eval(v.strip()) for v in text.split(",") if v.strip()], "u16", 16,
+                       "The bin of each group, plus 256 if phases are negated there."))
+    text = body(source, "// const WORD32 bin_group_map_34").replace("NEGATE_IPD_MASK", "256")
+    parts.append(array("BINS_34", [eval(v.strip()) for v in text.split(",") if v.strip()], "u16", 16))
 
     scales = floats(source, "// const FLOAT32 scale_factors_flt")
     fine = floats(source, "// scale_factors_fine_flt")

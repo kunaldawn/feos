@@ -10,7 +10,7 @@ measures the capture's frequencies, level and length for every format. It also l
 for sound stopping when a media window dies. With FEOS_MEDIA_DISK naming an image from
 scripts/make-media-disk.sh, it plays files too large for memory from that disk.
 
-FEOS_MEDIA_ONLY picks a phase: disk, window or sound.
+FEOS_MEDIA_ONLY picks a phase: disk, stream, window, sound or record.
 """
 
 import importlib.util
@@ -167,6 +167,8 @@ def window_test(arch, kernel):
 # Goertzel, because a zero crossing count wants a cleaner signal than these files have.
 def tone_at(capture, seconds, candidates):
     """Which of `candidates` is loudest in the last `seconds` of the capture."""
+    if not os.path.exists(capture) or os.path.getsize(capture) < 44:
+        return 0
     with open(capture, "rb") as f:
         rate = struct.unpack("<I", f.read(28)[24:])[0]
         size = os.path.getsize(capture)
@@ -347,6 +349,72 @@ def disk_test(arch, kernel, image):
         sys.exit(f"the desktop stalled for {longest} ms")
 
 
+def speed_test(arch, guest):
+    """How fast this machine decodes, in the guest. Reports what it finds."""
+    for name in ("he-sbr.mp4", "he-51.mp4", "he-ps.mp4", "he-psp.mp4", "a960.mp4", "altp.mp4", "o256.opus", "big.aac"):
+        guest.send(f"play --speed /{name}\r")
+        line = guest.capture(r"(decoded \d+ ms of sound in \d+ ms: \d+% of real time|cannot decode it)", 600)
+        print(f"speed {arch}: {name}: {line}", flush=True)
+        if "cannot" in line:
+            boot.fail(guest, f"{name} wouldn't decode")
+
+
+def stream_test(arch, kernel, image):
+    """Files too large for memory in the containers that used to have to be: a picture and the
+    right sound, and after seeking. The sound is the same minute-by-minute tone as the others'."""
+    capture = boot.work_path(kernel, "capture.wav")
+    args = [
+        word + ",snapshot=on" if word.startswith("if=none") else word
+        for word in boot.disk_device(arch, image)
+    ]
+    command = [
+        f"wav,id=snd0,path={capture}" if word == "none,id=snd0" else word
+        for word in boot.qemu_command(arch, kernel, args)
+    ]
+    guest = boot.Guest(command)
+    guest.expect("[fs] virtio0: mounted at /", boot.BOOT_TIMEOUT)
+    guest.expect("[desktop] session started", boot.BOOT_TIMEOUT)
+    time.sleep(3)
+    boot.open_terminal(guest)
+
+    # Name, the codec the player says it's opened, and how far a press of Page Down takes it.
+    for name, codec, presses in (
+        ("big-frag.mp4", "h264", 4),
+        ("big-ps.mpg", "mpeg1", 4),
+        ("big.avi", "mjpeg", 2),
+        ("big.flv", "h264", 4),
+    ):
+        type_keys(guest, f"player /{name}\n")
+        guest.expect(f"[player] opened {codec} 160x120", 180)
+        guest.expect("[player] first frame", 90)
+        deadline = time.monotonic() + 120
+        while tone_at(capture, 1, TONES) != 300 and time.monotonic() < deadline:
+            guest.pump(2)
+        heard = tone_at(capture, 1, TONES)
+        if heard != 300:
+            boot.fail(guest, f"{name}: heard {heard} Hz, wanted 300 Hz")
+        print(f"stream {arch}: {name}: picture, and {heard} Hz", flush=True)
+        for _ in range(presses):
+            guest.monitor("sendkey pgdn")
+        wanted = big_tone(30 * presses)
+        deadline = time.monotonic() + 120
+        while tone_at(capture, 1, TONES) != wanted and time.monotonic() < deadline:
+            guest.pump(2)
+        heard = tone_at(capture, 1, TONES)
+        if heard != wanted:
+            boot.fail(guest, f"{name} after seeking: heard {heard} Hz, wanted {wanted} Hz")
+        print(f"stream {arch}: {name} after seeking {30 * presses} s: {heard} Hz", flush=True)
+        guest.monitor("sendkey alt-f4")
+        time.sleep(3)
+
+    guest.send("\x1c")
+    guest.expect("entering the serial shell", 60)
+    speed_test(arch, guest)
+    guest.send("poweroff\r")
+    guest.wait_exit()
+    os.remove(capture)
+
+
 def record_test(arch, kernel):
     """Real samples into the guest: QEMU's ALSA backend reads ALSA's `file` plugin, which
     gives it a file of a generated tone as what its input device heard."""
@@ -415,7 +483,11 @@ def main():
     image = os.environ.get("FEOS_MEDIA_DISK")
     if only == "disk" or (only is None and image):
         disk_test(arch, kernel, image)
-    elif only is None:
+    if only == "stream" or (only is None and image):
+        stream_test(arch, kernel, image)
+    if only == "stream":
+        return
+    if only is None and not image:
         print("media boot test: no FEOS_MEDIA_DISK, so large files weren't tried")
     if only == "disk":
         return

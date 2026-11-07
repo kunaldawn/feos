@@ -20,3 +20,10 @@ make silk-stereo -b:a 24k -application voip -ar 16000
 make silk-60 -b:a 12k -ac 1 -application voip -frame_duration 60 -ar 16000
 make hybrid-swb -b:a 24k -ac 1 -application voip -ar 24000
 make hybrid-fb -b:a 32k -application voip
+# Mapping family 1: more than two channels, each tone at its place.
+S6='aevalsrc=0.3*sin(2*PI*220*t)|0.3*sin(2*PI*330*t)|0.3*sin(2*PI*440*t)|0.2*sin(2*PI*60*t)|0.25*sin(2*PI*550*t)|0.25*sin(2*PI*660*t):s=48000:d=0.3:c=5.1'
+S3='aevalsrc=0.3*sin(2*PI*220*t)|0.3*sin(2*PI*330*t)|0.3*sin(2*PI*440*t):s=48000:d=0.3:c=3.0'
+ffmpeg -nostdin -y -v error -f lavfi -i "$S6" -b:a 192k -mapping_family 1 -c:a libopus multi-51.opus
+ffmpeg -nostdin -y -v error -c:a libopus -i multi-51.opus -c:a flac -compression_level 12 multi-51.flac
+ffmpeg -nostdin -y -v error -f lavfi -i "$S3" -b:a 96k -mapping_family 1 -c:a libopus multi-3.opus
+ffmpeg -nostdin -y -v error -c:a libopus -i multi-3.opus -c:a flac -compression_level 12 multi-3.flac

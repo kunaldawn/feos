@@ -495,7 +495,7 @@ Paths in this section are relative to `libs/dosbox/src/` unless given in full.
   - `docs/dosbox.md:159-164` says the crate is original, that rust-dos is GPL-2.0-or-later and "cannot be copied", and that only interface knowledge was borrowed. The crate declares `MIT OR Apache-2.0`.
   - Commit `c605128` says "we have ported dos-box". The only licence files in the repo are under `libs/h264/docs/`.
   - **Impact:** if the rust-dos reading is right, the distributed LTO kernel may be a combined GPL work, and the MIT/Apache claim fails for it. LGPL static linking also has its own obligations.
-  - **Fix:** see [Decisions](#decisions-for-the-project-owner). Check mwemu's licence, and compare `cpu.rs`, `dos.rs` and `vga.rs` against rust-dos, which isn't on this machine.
+  - **Fix:** see [Decisions](#decisions-for-the-project-owner). Check mwemu's licence, and compare `cpu.rs`, `dos.rs` and `vga.rs` against rust-dos. (Correction: this audit said rust-dos wasn't on this machine, but a GPL v2 clone was in `/tmp/rust-dos`. The DOS code has since been relicensed to GPL-2.0-or-later; see `LICENSING.md`.)
 - **DOS-7 · Game redistribution rests on one website's label.** Confirmed by reading `data/games/README.md:8-11`. 13 ZIPs and `dos.img` are tracked in git and can be linked into the kernel, including DOOM, Quake, Duke Nukem 3D and demos of Warcraft II and SimCity 2000. Each title's own licence inside its ZIP hasn't been reviewed. **Fix:** review each licence, or replace them with a download script.
 
 ### High
@@ -918,5 +918,5 @@ These were examined and are fine, so they don't need re-auditing.
 - **Only some bugs were run.** 44 of the 203 numbered findings were reproduced, on real boots or on the host. The rest come from reading the code. KRN-1 is a timing race, and wasn't reproduced.
 - **QEMU only.** Nothing ran on real hardware or KVM, so `[check]` findings about them are unverified. The GUI wasn't driven interactively, so UI findings other than UI-1 and UI-16 weren't observed on screen.
 - **No game was run.** The status of each title in `data/games` is unknown. DOS-1 suggests real programs fail early.
-- **No comparison against rust-dos.** It isn't on this machine, so the extent of any copying beyond the marked files is unknown. Nothing here is legal advice.
+- **No comparison against rust-dos.** This audit didn't compare the code with it, and wrongly said it wasn't on this machine (a GPL v2 clone was in `/tmp/rust-dos`). The extent of any copying beyond the marked files was left unknown; relicensing the DOS code to GPL-2.0-or-later has since made that moot for licensing. Nothing here is legal advice.
 - **Line numbers will drift.** They are accurate at `78cf9c0`.

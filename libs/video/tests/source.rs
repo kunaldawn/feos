@@ -25,7 +25,7 @@ impl Source for Counting {
 }
 
 fn file(name: &str) -> Vec<u8> {
-    std::fs::read(format!("{MEDIA}/{name}")).unwrap()
+    std::fs::read(format!("{MEDIA}/{name}")).unwrap_or_else(|_| data(name))
 }
 
 fn frames_match(name: &str) {
@@ -55,6 +55,46 @@ fn frames_match(name: &str) {
         memory.decode(index, &mut a).unwrap();
         disk.decode(index, &mut b).unwrap();
         assert!(a == b, "{name}: frame {index} differs after a seek");
+    }
+}
+
+#[test]
+fn fragmented_mp4_through_a_source() {
+    frames_match("fragmented.mp4");
+}
+
+#[test]
+fn program_stream_through_a_source() {
+    frames_match("mpeg1.mpg");
+    frames_match("av-mp2.mpg");
+}
+
+/// A fragmented file's sound, from memory and from a file.
+#[test]
+fn fragmented_mp4_audio() {
+    let bytes = file("av-frag.mp4");
+    let whole = audio_track(&bytes).unwrap();
+    assert!(whole.packets.len() > 40, "{}", whole.packets.len());
+    let source = Counting { data: bytes.clone(), read: 0.into() };
+    let (_, disk) = audio_track_from_source(&source).unwrap();
+    assert_eq!(whole.packets.len(), disk.packets.len());
+    for (a, b) in whole.packets.iter().zip(&disk.packets) {
+        assert_eq!((a.offset, a.size, a.pts_ms), (b.offset, b.size, b.pts_ms));
+    }
+    frames_match("av-frag.mp4");
+}
+
+/// Packets as they'd come from the whole file, each read from where the file has it.
+#[test]
+fn program_stream_audio_through_a_source() {
+    let name = "av-mp2.mpg";
+    let bytes = file(name);
+    let whole = audio_track(&bytes).unwrap();
+    let source = Counting { data: bytes.clone(), read: 0.into() };
+    let (_, disk) = audio_track_from_source(&source).unwrap();
+    assert_eq!(whole.packets.len(), disk.packets.len());
+    for (a, b) in whole.packets.iter().zip(&disk.packets) {
+        assert_eq!((a.offset, a.size, a.pts_ms), (b.offset, b.size, b.pts_ms));
     }
 }
 

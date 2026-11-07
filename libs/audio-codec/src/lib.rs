@@ -19,8 +19,8 @@
 //! | MPEG audio: MP3, Layers I and II | yes | no |
 //! | FLAC, native and in Ogg | yes, to 16 bits | no |
 //! | Ogg Vorbis | yes | no |
-//! | AAC-LC, in ADTS or raw frames | yes | no |
-//! | Ogg Opus | SILK, CELT and hybrid, by `feos-opus`, in one or two channels | yes |
+//! | AAC (LC, Main, LTP, HE and HE v2), in ADTS or raw frames | yes | no |
+//! | Ogg Opus | SILK, CELT and hybrid, by `feos-opus`, up to eight channels | yes |
 //!
 //! ```
 //! use feos_audio_codec::{decode, detect, AudioFormat};
@@ -90,7 +90,7 @@ pub enum AudioFormat {
     OggFlac,
     /// Native FLAC.
     Flac,
-    /// AAC-LC in ADTS framing.
+    /// AAC in ADTS framing.
     Aac,
 }
 

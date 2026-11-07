@@ -16,7 +16,7 @@ use crate::pixel::YuvCoefficients;
 const SEQUENCE: u8 = 0xb3;
 const GROUP: u8 = 0xb8;
 const PICTURE: u8 = 0x00;
-const PACK: u8 = 0xba;
+pub(crate) const PACK: u8 = 0xba;
 const SYSTEM_HEADER: u8 = 0xbb;
 const VIDEO_STREAM: u8 = 0xe0;
 
@@ -283,10 +283,268 @@ struct Picture {
     display: u32,
 }
 
+/// A run of an elementary stream that's in a file: where it starts in the stream, where in the
+/// file, and how long it is.
+#[derive(Clone, Copy)]
+struct Extent {
+    stream: u64,
+    file: u64,
+    len: u32,
+}
+
+/// Works out the order pictures show in, as they're found.
+#[derive(Default)]
+struct PictureOrder {
+    pictures: Vec<Picture>,
+    display: u32,
+    /// A reference picture shows when the next one has arrived.
+    waiting: Option<usize>,
+}
+
+impl PictureOrder {
+    /// A picture's start code at `at`: the first byte after the prefix.
+    fn add(&mut self, at: usize, kind: u8, stream_len: usize, limits: &DecoderLimits) -> Result<()> {
+        if self.pictures.len() >= limits.max_frames {
+            return Err(VideoError::LimitExceeded("too many MPEG-1 pictures"));
+        }
+        if let Some(last) = self.pictures.last_mut() {
+            last.end = at - 3;
+        }
+        self.pictures.try_reserve(1).map_err(|_| VideoError::OutOfMemory)?;
+        let index = self.pictures.len();
+        let mut number = u32::MAX;
+        if kind == BIDIRECTIONAL {
+            number = self.display;
+            self.display += 1;
+        } else {
+            if let Some(held) = self.waiting {
+                self.pictures[held].display = self.display;
+                self.display += 1;
+            }
+            self.waiting = Some(index);
+        }
+        self.pictures.push(Picture {
+            start: at + 1,
+            end: stream_len,
+            kind,
+            display: number,
+        });
+        Ok(())
+    }
+
+    fn finish(mut self) -> Vec<Picture> {
+        if let Some(held) = self.waiting {
+            self.pictures[held].display = self.display;
+        }
+        self.pictures
+    }
+}
+
+/// How much of a program stream is looked at in one go. A packet is at most 64 KiB.
+const SCAN_BYTES: usize = 256 * 1024;
+
+/// Reads a program stream's packets from a file, without keeping them. `f` gets each packet's
+/// code, the file offset of what follows its length, and those bytes.
+fn walk_packets(
+    file: &dyn feos_source::Source,
+    mut f: impl FnMut(u8, u64, &[u8]) -> Result<()>,
+) -> Result<()> {
+    let mut chunk = Vec::new();
+    chunk.try_reserve_exact(SCAN_BYTES).map_err(|_| VideoError::OutOfMemory)?;
+    chunk.resize(SCAN_BYTES, 0u8);
+    let file_len = file.len();
+    let mut base = 0u64;
+    let mut have = file.read_full(0, &mut chunk);
+    let mut pos = 0usize;
+    loop {
+        // Enough in hand for the biggest packet, or everything that's left.
+        if have - pos < 70_000 && base + (have as u64) < file_len {
+            chunk.copy_within(pos..have, 0);
+            have -= pos;
+            base += pos as u64;
+            pos = 0;
+            let got = file.read_full(base + have as u64, &mut chunk[have..]);
+            if got == 0 {
+                return Ok(());
+            }
+            have += got;
+        }
+        let Some(at) = next_start_code(&chunk[..have], pos) else {
+            if base + (have as u64) >= file_len {
+                return Ok(());
+            }
+            pos = have.saturating_sub(3);
+            continue;
+        };
+        let code = chunk[at];
+        match code {
+            PACK => pos = at + 9,
+            SYSTEM_HEADER | 0xbc..=0xff => {
+                let Some(length) = chunk[..have].get(at + 1..at + 3) else {
+                    return Ok(());
+                };
+                let length = u16::from_be_bytes([length[0], length[1]]) as usize;
+                let end = (at + 3 + length).min(have);
+                f(code, base + at as u64 + 3, &chunk[at + 3..end])?;
+                pos = end;
+            }
+            _ => pos = at + 1,
+        }
+        pos = pos.min(have);
+    }
+}
+
+/// Where a program stream's pictures are in a file, and the first of its video, which has what
+/// describes it, from its sequence header on.
+struct ProgramScan {
+    extents: Vec<Extent>,
+    pictures: Vec<Picture>,
+    head: Vec<u8>,
+}
+
+/// A start code seen in the elementary stream, at `offset`. A picture's type comes two bytes after
+/// it, which might be in the next packet: `kind` is `None` if so.
+fn note_code(
+    order: &mut PictureOrder,
+    pending: &mut Option<u64>,
+    offset: u64,
+    code: u8,
+    kind: Option<u8>,
+    limits: &DecoderLimits,
+) -> Result<()> {
+    if code != PICTURE {
+        return Ok(());
+    }
+    match kind {
+        Some(kind) => order.add(offset as usize, kind, usize::MAX, limits),
+        None => {
+            *pending = Some(offset);
+            Ok(())
+        }
+    }
+}
+
+fn scan_program(file: &dyn feos_source::Source, limits: &DecoderLimits) -> Result<ProgramScan> {
+    const HEAD_BYTES: usize = 4096;
+    let mut extents: Vec<Extent> = Vec::new();
+    let mut order = PictureOrder::default();
+    let mut head = Vec::new();
+    let mut stream = 0u64;
+    // The end of the last packet, as a start code can be split between two.
+    let mut tail = [0u8; 3];
+    let mut tail_len = 0usize;
+    let mut pending: Option<u64> = None;
+    walk_packets(file, |code, at, packet| {
+        if code != VIDEO_STREAM {
+            return Ok(());
+        }
+        let Some((body, _)) = pes_body(packet, 0, packet.len()) else {
+            return Ok(());
+        };
+        let payload = &packet[body..];
+        if payload.is_empty() {
+            return Ok(());
+        }
+        extents.try_reserve(1).map_err(|_| VideoError::OutOfMemory)?;
+        extents.push(Extent { stream, file: at + body as u64, len: payload.len() as u32 });
+        if head.len() < HEAD_BYTES {
+            head.try_reserve(payload.len()).map_err(|_| VideoError::OutOfMemory)?;
+            head.extend_from_slice(payload);
+        }
+        // A picture whose type wasn't in the last packet.
+        if let Some(offset) = pending.take() {
+            let skip = (offset + 2).saturating_sub(stream) as usize;
+            match payload.get(skip) {
+                Some(&byte) => order.add(offset as usize, (byte >> 3) & 7, usize::MAX, limits)?,
+                None => pending = Some(offset),
+            }
+        }
+        // A prefix that starts in the last packet and ends in this one, or just at its end.
+        let mut joined = [0u8; 6];
+        joined[..tail_len].copy_from_slice(&tail[..tail_len]);
+        let take = payload.len().min(3);
+        joined[tail_len..tail_len + take].copy_from_slice(&payload[..take]);
+        for i in 0..tail_len {
+            if i + 3 <= tail_len + take && joined[i..i + 3] == [0, 0, 1] {
+                let byte_at = i + 3 - tail_len;
+                if let Some(&found) = payload.get(byte_at) {
+                    let kind = payload.get(byte_at + 2).map(|byte| (byte >> 3) & 7);
+                    note_code(&mut order, &mut pending, stream + byte_at as u64, found, kind, limits)?;
+                }
+            }
+        }
+        let mut pos = 0;
+        while let Some(code_at) = next_start_code(payload, pos) {
+            pos = code_at;
+            let kind = payload.get(code_at + 2).map(|byte| (byte >> 3) & 7);
+            note_code(&mut order, &mut pending, stream + code_at as u64, payload[code_at], kind, limits)?;
+        }
+        tail_len = payload.len().min(3);
+        tail[..tail_len].copy_from_slice(&payload[payload.len() - tail_len..]);
+        stream += payload.len() as u64;
+        Ok(())
+    })?;
+    let total = stream as usize;
+    let mut pictures = order.finish();
+    if let Some(last) = pictures.last_mut() {
+        last.end = total;
+    }
+    let at = sequence_header(&head)?;
+    head.drain(..at.saturating_sub(4));
+    Ok(ProgramScan { extents, pictures, head })
+}
+
+/// The first audio stream of a program stream on disk. See [`audio_track`].
+pub(crate) fn audio_track_source(file: &dyn feos_source::Source) -> Option<(Vec<u8>, AudioTrack)> {
+    let mut packets = Vec::new();
+    let mut stream = None;
+    let mut first_video = None;
+    let mut last_pts = None;
+    let mut header = None;
+    let file_len = usize::try_from(file.len()).ok()?;
+    walk_packets(file, |code, at, packet| {
+        if code == VIDEO_STREAM && first_video.is_none() {
+            first_video = pes_body(packet, 0, packet.len()).and_then(|(_, pts)| pts);
+        } else if (0xc0..=0xdf).contains(&code) && *stream.get_or_insert(code) == code {
+            let Some((body, pts)) = pes_body(packet, 0, packet.len()) else {
+                return Ok(());
+            };
+            if body == packet.len() {
+                return Ok(());
+            }
+            let pts = pts.or(last_pts);
+            last_pts = pts;
+            header = header.or_else(|| first_frame_format(&packet[body..]));
+            push_packet(&mut packets, file_len, at as usize + body, packet.len() - body, pts.unwrap_or(0))
+                .ok_or(VideoError::LimitExceeded("too many audio packets"))?;
+        }
+        Ok(())
+    })
+    .ok()?;
+    let (sample_rate, channels) = header?;
+    let base = first_video.or_else(|| packets.first().map(|packet: &AudioPacket| packet.pts_ms))?;
+    for packet in &mut packets {
+        packet.pts_ms = packet.pts_ms.saturating_sub(base) / 90;
+    }
+    Some((
+        Vec::new(),
+        AudioTrack {
+            codec: AudioCodec::MpegSplit,
+            sample_rate,
+            channels,
+            config: 0..0,
+            packets,
+        },
+    ))
+}
+
 /// A decoder.
 pub(crate) struct Mpeg1Stream {
-    /// The elementary stream, when it had to be pulled out of a program stream.
+    /// The elementary stream, when it had to be pulled out of a program stream. For one on disk,
+    /// just the picture in hand.
     owned: Vec<u8>,
+    /// A program stream on disk: where each run of the elementary stream is in the file.
+    extents: Vec<Extent>,
     width: usize,
     height: usize,
     mb_width: usize,
@@ -407,6 +665,40 @@ fn clamp8(value: i32) -> u8 {
 }
 
 impl Mpeg1Stream {
+    /// Opens a program stream that stays on disk. Returns it and what describes it: the start of
+    /// its video. Finding the pictures reads the whole file once.
+    pub(crate) fn open_source(file: &dyn feos_source::Source, limits: &DecoderLimits) -> Result<(Self, Vec<u8>)> {
+        let scan = scan_program(file, limits)?;
+        let mut stream = Self::open(&scan.head, limits)?;
+        stream.pictures = scan.pictures;
+        stream.extents = scan.extents;
+        stream.next = 0;
+        Ok((stream, scan.head))
+    }
+
+    /// Brings a picture of a stream on disk into memory, and says where it is there.
+    fn load_picture(&mut self, file: &dyn feos_source::Source, picture: Picture) -> Option<Picture> {
+        let start = picture.start as u64;
+        let len = picture.end.checked_sub(picture.start)?;
+        self.owned.clear();
+        self.owned.try_reserve(len).ok()?;
+        self.owned.resize(len, 0);
+        let mut first = self.extents.partition_point(|extent| extent.stream + extent.len as u64 <= start);
+        let mut done = 0usize;
+        while done < len {
+            let extent = *self.extents.get(first)?;
+            let inner = (start + done as u64).checked_sub(extent.stream)?;
+            let take = (extent.len as u64 - inner).min((len - done) as u64) as usize;
+            let got = file.read_full(extent.file + inner, &mut self.owned[done..done + take]);
+            if got != take {
+                return None;
+            }
+            done += take;
+            first += 1;
+        }
+        Some(Picture { start: 0, end: len, ..picture })
+    }
+
     /// Opens a stream, working out the order pictures are shown in.
     pub(crate) fn open(input: &[u8], limits: &DecoderLimits) -> Result<Self> {
         let owned = if input.get(3) == Some(&PACK) {
@@ -432,11 +724,8 @@ impl Mpeg1Stream {
             frame.resize(plane, 128u8);
         }
 
-        let mut pictures: Vec<Picture> = Vec::new();
+        let mut order = PictureOrder::default();
         let mut pos = 0;
-        let mut display = 0u32;
-        // A reference picture shows when the next one has arrived.
-        let mut waiting: Option<usize> = None;
         while let Some(at) = next_start_code(stream, pos) {
             pos = at;
             if stream[at] != PICTURE {
@@ -445,40 +734,11 @@ impl Mpeg1Stream {
             let Some(head) = stream.get(at + 1..at + 3) else {
                 break;
             };
-            let kind = (head[1] >> 3) & 7;
-            if pictures.len() >= limits.max_frames {
-                return Err(VideoError::LimitExceeded("too many MPEG-1 pictures"));
-            }
-            if let Some(last) = pictures.last_mut() {
-                last.end = at - 3;
-            }
-            pictures
-                .try_reserve(1)
-                .map_err(|_| VideoError::OutOfMemory)?;
-            let index = pictures.len();
-            let mut number = u32::MAX;
-            if kind == BIDIRECTIONAL {
-                number = display;
-                display += 1;
-            } else {
-                if let Some(held) = waiting {
-                    let picture: &mut Picture = &mut pictures[held];
-                    picture.display = display;
-                    display += 1;
-                }
-                waiting = Some(index);
-            }
-            pictures.push(Picture {
-                start: at + 1,
-                end: stream.len(),
-                kind,
-                display: number,
-            });
+            order.add(at, (head[1] >> 3) & 7, stream.len(), limits)?;
         }
-        if let Some(held) = waiting {
-            pictures[held].display = display;
-        }
+        let pictures = order.finish();
         let mut result = Self {
+            extents: Vec::new(),
             owned: Vec::new(),
             width,
             height,
@@ -547,6 +807,7 @@ impl Mpeg1Stream {
     pub(crate) fn advance(
         &mut self,
         input: &[u8],
+        file: Option<&dyn feos_source::Source>,
         target: u32,
         budget: u32,
         out: &mut [u8],
@@ -591,6 +852,14 @@ impl Mpeg1Stream {
             if picture.kind == BIDIRECTIONAL && picture.display != target {
                 continue;
             }
+            // On disk, it has to come in from there.
+            let picture = match file.filter(|_| !self.extents.is_empty()) {
+                Some(file) => match self.load_picture(file, picture) {
+                    Some(loaded) => loaded,
+                    None => return Err(VideoError::UnexpectedEnd),
+                },
+                None => picture,
+            };
             // Moved out for the call, as decoding needs `self` too.
             let owned = core::mem::take(&mut self.owned);
             let stream: &[u8] = if owned.is_empty() { input } else { &owned };

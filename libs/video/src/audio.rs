@@ -160,6 +160,7 @@ pub fn audio_track_from_source(file: &dyn Source) -> Option<(Vec<u8>, AudioTrack
         ContainerFormat::Matroska => matroska::audio_track_source(&mut window),
         ContainerFormat::Flv => flv::audio_track_source(&mut window),
         ContainerFormat::Avi => avi::audio_track_source(&mut window),
+        ContainerFormat::Mpeg1 => mpeg1::audio_track_source(file),
         _ => None,
     }?;
     (!found.1.packets.is_empty()).then_some(found)

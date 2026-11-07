@@ -586,8 +586,11 @@ by bisection on what their frames and pages say, and MP3 and ADTS by proportion,
 table, so they land exactly only at a constant bit rate. All of this runs on the media tasks,
 so the desktop keeps drawing while the disk works: the boot test sees frames of about 300 ms at
 worst, under TCG. H.264's key frames are checked as they're reached rather than when opening,
-as that would read every sample. Formats that have to be searched for their frames aren't
-streamed: MPEG program streams, raw H.264, MJPEG, GIF and fragmented MP4.
+as that would read every sample. A fragmented MP4 keeps its sample tables all over the file, so
+opening one reads every `moof` into memory, with a map of where each came from. A program stream
+has no table at all, so opening one reads the whole file once, to note where its video's packets
+and pictures are, and a picture comes together from its packets when it's decoded. Sound in both
+is an ordinary list of packets. Raw H.264, MJPEG files and GIF aren't streamed.
 
 ## The audio path
 
@@ -613,12 +616,18 @@ Audio crosses the same layers as graphics:
    time, in the device's format, from the codec's input widget on the controller's first
    input stream. `rec` writes what it hears to a WAV. Only `hda-duplex` and `hda-micro` have
    an input, so QEMU's usual `hda-output` reports there's none.
-6. `tone`, `play`, the Music window, the Media Player and FEOS-DOS all go through
+6. AAC is in `feos-audio-codec`, with HE-AAC on top of its core: `sbr.rs` rebuilds the top of the
+   spectrum and `ps.rs` makes two channels of one. Their filter banks and everything per sample
+   are integers, as a guest under TCG pays heavily for floats, and only what's done once per band
+   of a frame is floating point. A stream's first frame can show SBR its config didn't mention, as
+   ADTS always has to. Then `PacketDecoder`'s rate and channels change, as they do for MP3, and the
+   worker reopens its stream.
+7. `tone`, `play`, the Music window, the Media Player and FEOS-DOS all go through
    a `Stream`. `apps/commands/src/audio_worker.rs` decodes files and video tracks
    on a task of its own, and its position, from the frames the mixer reports as
    played, is the Media Player's clock when there is sound. Between half and double speed the
    sound follows, kept at its pitch by `feos_mixer::wsola`. Outside that, it's silent.
-7. A media window holds no lock across a frame, because a failure with a lock held stops the
+8. A media window holds no lock across a frame, because a failure with a lock held stops the
    machine. So when a window's task dies, killed or crashed, the desktop closes the window,
    which tells its decode and audio tasks to go, and they close their streams. The media boot
    test listens to the capture to be sure the sound stops.

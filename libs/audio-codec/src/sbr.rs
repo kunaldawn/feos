@@ -121,7 +121,7 @@ fn pow2_half(n: i32) -> f32 {
 }
 
 /// A square root, near enough to float precision, for what's done once per band.
-fn sqrt(x: f32) -> f32 {
+pub(crate) fn sqrt(x: f32) -> f32 {
     if !(x > 0.0) {
         return 0.0;
     }
@@ -975,7 +975,7 @@ struct Element {
 /// The decoder for a stream's SBR: a channel's state for each channel of the core.
 pub(crate) struct SbrDecoder {
     channels: Vec<Channel>,
-    elements: [Element; crate::aac::MAX_CHANNELS],
+    elements: Vec<Element>,
     fft: Fft64,
     /// Bands of the synthesis filter bank: 64, or 32 when output is at the core's rate.
     synthesis_bands: usize,
@@ -987,8 +987,9 @@ pub(crate) struct SbrDecoder {
     out_b: Vec<i32>,
     rate: u32,
     rate_row: usize,
-    /// Parametric stereo, on a mono core that might have it.
-    ps: Option<Ps>,
+    /// Parametric stereo, on a mono core that might have it: one, or none. On the heap, so
+    /// that moving this around doesn't take much stack.
+    ps: Vec<Ps>,
 }
 
 /// The rates the tables go by.
@@ -1014,8 +1015,10 @@ impl SbrDecoder {
         }
         Ok(Self {
             channels: list,
-            elements: [Element { header: Header::default(), bands: None, reset: false, coupled: false };
-                crate::aac::MAX_CHANNELS],
+            elements: try_vec(
+                channels.max(1),
+                Element { header: Header::default(), bands: None, reset: false, coupled: false },
+            )?,
             fft: Fft64::new(),
             synthesis_bands,
             transform: Imdct::new(2 * synthesis_bands)?,
@@ -1025,7 +1028,14 @@ impl SbrDecoder {
             out_b: try_vec(2 * BANDS, 0)?,
             rate,
             rate_row,
-            ps: if stereo { Some(Ps::new()?) } else { None },
+            ps: if stereo {
+                let mut one = Vec::new();
+                one.try_reserve_exact(1).map_err(|_| AudioError::OutOfMemory)?;
+                one.push(Ps::new()?);
+                one
+            } else {
+                Vec::new()
+            },
         })
     }
 
@@ -1037,7 +1047,7 @@ impl SbrDecoder {
             element.bands = None;
             element.header = Header::default();
         }
-        if let Some(ps) = &mut self.ps {
+        for ps in &mut self.ps {
             ps.reset();
         }
     }
@@ -1065,8 +1075,6 @@ impl SbrDecoder {
                 let new = BandTables::new(&header, self.rate_row, self.rate);
                 element.reset = true;
                 element.bands = new;
-                extern crate std;
-                if let Some(b)=&new { std::eprintln!("tables rate {} row {} kx {} m {} nhi {} nlo {} nq {} patches {} start {:?} size {:?} lim {:?} hdr start {} stop {} xo {} scale {} alter {}", self.rate,self.rate_row,b.kx,b.m,b.n_high,b.n_low,b.n_noise,b.patches,&b.patch_start[..b.patches],&b.patch_size[..b.patches],&b.limit[..=b.n_limit],header.start_freq,header.stop_freq,header.xover,header.freq_scale,header.alter_scale); } else { std::eprintln!("invalid header {}",header.stop_freq);}
             }
         }
         let Some(bands) = self.elements[first].bands else {
@@ -1130,7 +1138,7 @@ impl SbrDecoder {
             while left > 7 {
                 let id = reader.read(2)?;
                 left -= 2;
-                match (id, &mut self.ps) {
+                match (id, self.ps.first_mut()) {
                     (2, Some(ps)) if !pair => {
                         let start = reader.bits_left();
                         ps.read(reader, left)?;
@@ -1182,9 +1190,9 @@ impl SbrDecoder {
         }
         let bands = self.elements[first].bands;
         let (kx, m) = bands.map_or((LOW_BANDS, 0), |b| (b.kx, b.m));
-        let wanted_ps = !pair && self.ps.is_some();
+        let wanted_ps = !pair && !self.ps.is_empty();
         if wanted_ps {
-            let ps_started = self.ps.as_ref().is_some_and(Ps::started);
+            let ps_started = self.ps.first().is_some_and(Ps::started);
             if ps_started {
                 self.apply_ps(first, kx, m, out, stride, positions);
             } else {
@@ -1216,7 +1224,8 @@ impl SbrDecoder {
     }
 
     fn apply_ps(&mut self, channel_index: usize, kx: usize, m: usize, out: &mut [i16], stride: usize, positions: (usize, usize)) {
-        let Some(mut ps) = self.ps.take() else {
+        let mut holder = core::mem::take(&mut self.ps);
+        let Some(ps) = holder.first_mut() else {
             return;
         };
         let bands = self.synthesis_bands;
@@ -1260,7 +1269,7 @@ impl SbrDecoder {
             });
         }
         ps.end_frame();
-        self.ps = Some(ps);
+        self.ps = holder;
     }
 
     /// From what a frame said, the energies and noise floors it means.
@@ -1542,6 +1551,15 @@ pub(crate) fn synthesize_into(
     // The kernel's cosine part is a DCT-IV of the real parts, and its sine part a DST-IV of
     // the imaginary ones, which is a DCT-IV of them reversed with every other result negated.
     let n = 2 * bands;
+    if bands < BANDS {
+        // At half the rate the kernel's offset isn't a whole number of samples: this is the
+        // quarter sample that would otherwise be left over from the analysis.
+        for k in 0..bands {
+            let (re, im) = cmul(in_re[k], in_im[k], ANALYSIS_ROTATE[k].0, ANALYSIS_ROTATE[k].1);
+            in_re[k] = re;
+            in_im[k] = im;
+        }
+    }
     transform.run(&in_re[..bands], &mut out_a[..n]);
     in_im[..bands].reverse();
     transform.run(&in_im[..bands], &mut out_b[..n]);

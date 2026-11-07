@@ -7,7 +7,7 @@
 
 #[allow(unused_imports)]
 use crate::prelude::*;
-use crate::celt::kiss_fft::{KissFft, flat_fft_forward};
+use crate::celt::kiss_fft::{FlatFft, KissFft};
 
 /// Backward MDCT helper for CELT decode path.
 #[derive(Debug, Clone)]
@@ -15,6 +15,7 @@ pub(crate) struct MdctBackward {
     n: usize,
     overlap: usize,
     fft: KissFft,
+    flat: FlatFft,
     trig: Vec<f32>,
 }
 
@@ -35,6 +36,7 @@ impl MdctBackward {
             n,
             overlap,
             fft: KissFft::new(n / 4),
+            flat: FlatFft::new(n / 4),
             trig,
         }
     }
@@ -181,7 +183,7 @@ impl MdctBackward {
         }
 
         let mut f2_out = vec![0.0f32; n2];
-        flat_fft_forward(&f2, &mut f2_out, n4);
+        self.flat.run(&f2, &mut f2_out);
         if impulse_mode && f2_out.len() >= 8 {
             debug_trace!(
                 "IMPULSE f2_out[0..8]: {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",

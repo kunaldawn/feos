@@ -606,3 +606,22 @@ fn aac_program_config_element() {
     let worst = out.iter().zip(&wanted).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
     assert!(worst <= 2, "differs from FFmpeg by up to {worst}");
 }
+
+/// ADTS has nowhere to mention SBR, so a first frame has to show it.
+#[test]
+fn aac_finds_sbr_nothing_mentioned() {
+    let file = include_bytes!("data/he-implicit.aac");
+    let reference = s16le(include_bytes!("data/he-implicit.aac.s16"));
+    let (samples, decoded) = decode_all(file);
+    assert_eq!((decoded.info.sample_rate, decoded.info.channels), (48_000, 2));
+    assert_eq!(samples.len(), reference.len());
+    let worst = samples
+        .iter()
+        .zip(&reference)
+        .map(|(a, b)| (*a as i32 - *b as i32).abs())
+        .max()
+        .unwrap();
+    assert!(worst <= 2, "worst {worst}");
+    let information = info(file).unwrap();
+    assert_eq!(information.frames as usize * 2, reference.len());
+}

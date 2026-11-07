@@ -30,15 +30,29 @@ No upstream commit is recorded: the crate doesn't carry one.
   re-whitens the history at subframe 2. That was 963 away on a narrow-band SILK fixture. It
   comes from the stream now.
 - Malformed packets: redundancy that claims more than the frame has is `BadPacket`.
+- **Multistream framing.** Published 0.1.1 read a bare length before each stream's packet.
+  RFC 6716 appendix B's self-delimited form is the packet itself with the size of its
+  last frame added, for all four frame count codes.
+- **Mode changes.** SILK was reset coming from CELT only for SILK-only packets, not hybrid,
+  and the fade in from the old mode's concealment wasn't there, or faded in from silence.
+  Both are as in libopus now, and a frame with redundant data has that instead.
+- **Speed.** The inverse MDCT did its FFT as a direct sum, with a sine and cosine for each
+  term. It's a real FFT now, with the same results within rounding: that was the decoder's cost,
+  as it was 1.2 times real time at 256 kbit/s natively.
+- **Hybrid folding in mono.** Only the stereo path did libopus's `special_hybrid_folding`, the
+  fix RFC 8251 made for a hybrid frame's second CELT band, so mono hybrid frames differed in
+  that band (9.6 to 12 kHz), up to 242 away.
 
 ## What's been checked
 
 See `libs/audio-codec/tests/opus.rs`. Against libopus 1.6.1 by way of FFmpeg, on fixtures from
 its encoder: SILK narrow and wide band, mono, are identical; everything else is within 1 of
 16 bits. All 12 RFC 8251 vectors decode with no final range error, which checks the entropy
-decoding exactly. Their PCM is within 1 for vectors 1, 2, 3, 4, 7, 9 and 11 and 4 for 8, but up to
-242 (43 dB SNR) for 5, 6, 10 and 12. Those have SILK and hybrid switching, and that wasn't
-tracked down.
+decoding exactly. Their PCM is within 1 for vectors 1, 2, 3, 4, 7, 9 and 11, 2 for 5, 4 for 8, 10
+for 6 and 12 and 33 for 10 (76.6 dB SNR). What's left in 6, 10 and 12 is a few packets after some
+switches to hybrid, not tracked down.
 
-PLC and FEC exist but weren't compared, nor multistream, and `feos-audio-codec` refuses
-anything but one or two channels with mapping family 0.
+Mapping family 1 is compared with libopus through FFmpeg, and the rest of the families are
+refused. Concealment does not match libopus: 12 vectors with every 23rd packet dropped, against
+a libopus 1.5.2 build doing the same, are -25 to 16 dB. It's only reached when a container has
+an empty packet, as files lose nothing. FEC isn't implemented: asking for it conceals.

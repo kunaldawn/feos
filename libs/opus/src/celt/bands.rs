@@ -1242,6 +1242,11 @@ pub(crate) fn quant_all_bands_mono(
         let tf_change = tf_res[i];
         let mut n_b = n / b_blocks.max(1);
         let n_b_initial = n_b;
+
+        if i == start + 1 {
+            special_hybrid_folding_decode(mode, &mut norm_hist[norm_offset..], &mut [], start, m, false);
+        }
+
         let mut effective_lowband = None::<usize>;
         let mut x_cm = if b_blocks >= 32 {
             u32::MAX
