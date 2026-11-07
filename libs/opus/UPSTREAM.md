@@ -53,6 +53,15 @@ for 6 and 12 and 33 for 10 (76.6 dB SNR). What's left in 6, 10 and 12 is a few p
 switches to hybrid, not tracked down.
 
 Mapping family 1 is compared with libopus through FFmpeg, and the rest of the families are
-refused. Concealment does not match libopus: 12 vectors with every 23rd packet dropped, against
-a libopus 1.5.2 build doing the same, are -25 to 16 dB. It's only reached when a container has
-an empty packet, as files lose nothing. FEC isn't implemented: asking for it conceals.
+refused.
+
+SILK's concealment, comfort noise and redundant frames (FEC) are ports of libopus's `PLC.c` and
+`CNG.c`, and the `FLAG_DECODE_LBRR` path. On streams from libopus's encoder with FEC on (`fec-*.bit`),
+with every 23rd packet lost, mono SILK's output is identical to libopus 1.5.2's, with or without
+FEC. Stereo SILK is 59 dB or better (worst 195 of 16 bits, in a few frames not tracked down), and
+hybrid is within 1 with FEC and 64 dB without. **CELT's
+pitch-based concealment isn't ported**: a CELT stream's losses get the noise that libopus keeps for
+long losses, and 12 RFC 8251 vectors with every 23rd packet lost, in the same comparison, are 9 to
+44 dB, the lowest being those that are mostly CELT. That was -25 to 16 dB before, when SILK's concealment
+was full-scale noise, for tens of frames. It's only reached when a container has an empty packet,
+as files lose nothing.

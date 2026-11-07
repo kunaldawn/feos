@@ -8,12 +8,13 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use crate::error::{require_rgba, Result, VideoError};
-use crate::index::{DecoderLimits, Index, FLAG_KEY, FLAG_PARAMS};
+use crate::index::{DecoderLimits, Index, FLAG_CHECKED, FLAG_KEY, FLAG_PARAMS};
 use crate::pixel::{self, YuvCoefficients};
 
 use feos_h264::{
     annex_b_ranges, annex_b_units, avcc_ranges, avcc_units, parse_avcc_config, parse_nal_bytes,
-    sps_info, DecodeError, Frame, Limits, NalUnit, NalUnitType, OrderedDecoder, SpsInfo,
+    sps_info, DecodeError, Frame, FrameBoundary, Limits, NalUnit, NalUnitType, OrderedDecoder,
+    SpsInfo,
 };
 
 /// Reads the properties of the first SPS of an `avcC` record.
@@ -49,37 +50,31 @@ pub(crate) fn info_from_sample(sample: &[u8], length_size: Option<usize>) -> Opt
     }
 }
 
-/// Whether a NAL starts a new coded picture. `first_mb_in_slice` is the first
-/// RBSP bits, so a set top bit means it is zero. Emulation prevention can't
-/// affect this byte.
-fn starts_picture(nal: &[u8]) -> bool {
-    matches!(nal.first().map(|header| header & 0x1f), Some(1 | 5))
-        && nal.get(1).is_some_and(|byte| byte & 0x80 != 0)
-}
-
-/// Counts coded pictures in an Annex-B stream.
+/// Counts frames in an Annex-B stream, two field pictures making one.
 pub(crate) fn annex_b_frame_count(input: &[u8]) -> u32 {
     let mut count = 0u32;
+    let mut frames = FrameBoundary::new();
     for range in annex_b_ranges(input) {
-        if starts_picture(&input[range]) {
+        if frames.starts_frame(&input[range]) {
             count = count.saturating_add(1);
         }
     }
     count
 }
 
-/// Splits an Annex-B stream into access units, one per coded picture. Parameter
-/// sets and SEI before a picture belong to that picture's sample.
+/// Splits an Annex-B stream into samples, one per frame, whose two fields stay together.
+/// Parameter sets and SEI before a picture belong to that picture's sample.
 pub(crate) fn build_annex_b_index(input: &[u8], limits: &DecoderLimits) -> Result<Index> {
     let mut index = Index::default();
     // Where the current access unit started, and where the next one may start.
     let mut unit_start = None;
     let mut next_start = 0usize;
     let mut has_picture = false;
+    let mut frames = FrameBoundary::new();
     for range in annex_b_ranges(input) {
         let nal = &input[range.clone()];
         let vcl = matches!(nal.first().map(|h| h & 0x1f), Some(1 | 5));
-        if starts_picture(nal) {
+        if frames.starts_frame(nal) {
             if has_picture {
                 if let Some(start) = unit_start {
                     index.push(limits, input.len(), start, next_start - start, 0, FLAG_KEY)?;
@@ -104,6 +99,193 @@ pub(crate) fn build_annex_b_index(input: &[u8], limits: &DecoderLimits) -> Resul
         }
     }
     Ok(index)
+}
+
+/// Bytes of a NAL unit kept while walking a file: more than any parameter set here, and what a
+/// slice has to say about where it belongs comes first.
+const NAL_PREFIX: usize = 4096;
+/// How much of a raw stream is read at a time when walking it.
+const WALK_CHUNK: usize = 1 << 20;
+/// Most parameter sets a raw stream may have, in bytes.
+const MAX_PARAMETER_BYTES: usize = 1 << 20;
+
+/// What walking a raw stream on disk found.
+pub(crate) struct WalkedStream {
+    pub index: Index,
+    /// The first of the file, with every different parameter set after it.
+    pub head: Vec<u8>,
+    pub configs: Vec<(u32, core::ops::Range<usize>)>,
+}
+
+/// The same as [`build_annex_b_index`] for a stream that stays on disk. It reads the whole file
+/// once. Key frames are known exactly, and parameter sets are kept, for seeking past them.
+pub(crate) fn walk_annex_b(
+    file: &dyn feos_source::Source,
+    len: usize,
+    limits: &DecoderLimits,
+    head: Vec<u8>,
+) -> Result<WalkedStream> {
+    let mut walk = Walk {
+        limits,
+        len,
+        index: Index::default(),
+        head,
+        configs: Vec::new(),
+        seen: Vec::new(),
+        frames: FrameBoundary::new(),
+        unit_start: None,
+        next_start: 0,
+        has_picture: false,
+        first_vcl: None,
+        head_base: 0,
+    };
+    walk.head_base = walk.head.len();
+    let mut chunk = feos_source::zeroed(WALK_CHUNK).ok_or(VideoError::OutOfMemory)?;
+    let mut prefix = [0u8; NAL_PREFIX];
+    let mut prefix_len = 0;
+    let mut current: Option<usize> = None;
+    let mut pos = 0usize;
+    while pos < len {
+        let read = file.read_full(pos as u64, &mut chunk);
+        if read == 0 {
+            break;
+        }
+        let bytes = &chunk[..read];
+        let last = pos + read >= len;
+        // A start code can straddle chunks, so the last two bytes are looked at again.
+        let limit = if last { read } else { read.saturating_sub(2) };
+        let mut i = 0;
+        while i + 3 <= read.min(limit + 2) {
+            if bytes[i + 2] > 1 {
+                i += 3;
+                continue;
+            }
+            if bytes[i] != 0 || bytes[i + 1] != 0 || bytes[i + 2] != 1 {
+                i += 1;
+                continue;
+            }
+            let at = pos + i;
+            if let Some(start) = current {
+                // A four-byte start code's extra zero isn't part of this NAL.
+                let end = if at > start && i > 0 && bytes[i - 1] == 0 { at - 1 } else { at };
+                walk.nal(start, end, &prefix[..prefix_len])?;
+            }
+            let start = at + 3;
+            current = Some(start);
+            let from = i + 3;
+            let wanted = NAL_PREFIX.min(len - start);
+            if from + wanted <= read {
+                prefix[..wanted].copy_from_slice(&bytes[from..from + wanted]);
+                prefix_len = wanted;
+            } else {
+                prefix_len = file.read_full(start as u64, &mut prefix[..wanted]);
+            }
+            i += 3;
+        }
+        if read <= 2 {
+            break;
+        }
+        pos += if last { read } else { read - 2 };
+    }
+    if let Some(start) = current {
+        walk.nal(start, len, &prefix[..prefix_len])?;
+    }
+    walk.finish()
+}
+
+/// State of [`walk_annex_b`], which follows [`build_annex_b_index`].
+struct Walk<'a> {
+    limits: &'a DecoderLimits,
+    len: usize,
+    index: Index,
+    head: Vec<u8>,
+    configs: Vec<(u32, core::ops::Range<usize>)>,
+    /// Hashes of the parameter sets kept so far.
+    seen: Vec<u64>,
+    frames: FrameBoundary,
+    unit_start: Option<usize>,
+    next_start: usize,
+    has_picture: bool,
+    first_vcl: Option<u8>,
+    head_base: usize,
+}
+
+impl Walk<'_> {
+    fn nal(&mut self, start: usize, end: usize, prefix: &[u8]) -> Result<()> {
+        let kind = prefix.first().map(|header| header & 0x1f);
+        let vcl = matches!(kind, Some(1 | 5));
+        if self.frames.starts_frame(prefix) {
+            if self.has_picture {
+                if let Some(unit) = self.unit_start {
+                    self.push_unit(unit, self.next_start)?;
+                }
+                self.unit_start = Some(self.next_start);
+            }
+            self.has_picture = true;
+        }
+        if self.unit_start.is_none() {
+            self.unit_start = Some(start.saturating_sub(3));
+        }
+        if vcl || !self.has_picture {
+            self.next_start = end;
+        }
+        if vcl && self.first_vcl.is_none() {
+            self.first_vcl = kind;
+        }
+        if matches!(kind, Some(7 | 8)) {
+            self.keep_parameters(prefix.get(..end - start).unwrap_or(prefix))?;
+        }
+        Ok(())
+    }
+
+    fn push_unit(&mut self, start: usize, end: usize) -> Result<()> {
+        let flags = FLAG_CHECKED | if self.first_vcl == Some(5) { FLAG_KEY } else { 0 };
+        self.index
+            .push(self.limits, self.len, start, end - start, 0, flags)?;
+        self.first_vcl = None;
+        Ok(())
+    }
+
+    fn keep_parameters(&mut self, nal: &[u8]) -> Result<()> {
+        let hash = nal
+            .iter()
+            .fold(0xcbf29ce484222325u64, |value, &byte| (value ^ byte as u64).wrapping_mul(0x100000001b3));
+        if self.seen.contains(&hash) {
+            return Ok(());
+        }
+        if self.head.len() - self.head_base + nal.len() > MAX_PARAMETER_BYTES {
+            return Err(VideoError::LimitExceeded("too many parameter sets"));
+        }
+        self.seen.try_reserve(1).map_err(|_| VideoError::OutOfMemory)?;
+        self.seen.push(hash);
+        self.head
+            .try_reserve(nal.len() + 3)
+            .map_err(|_| VideoError::OutOfMemory)?;
+        let from = self.head.len();
+        self.head.extend_from_slice(&[0, 0, 1]);
+        self.head.extend_from_slice(nal);
+        self.configs
+            .try_reserve(1)
+            .map_err(|_| VideoError::OutOfMemory)?;
+        // In force from the frame being put together.
+        self.configs
+            .push((self.index.samples.len() as u32, from..self.head.len()));
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<WalkedStream> {
+        if self.has_picture {
+            if let Some(unit) = self.unit_start {
+                let end = self.len;
+                self.push_unit(unit, end)?;
+            }
+        }
+        Ok(WalkedStream {
+            index: self.index,
+            head: self.head,
+            configs: self.configs,
+        })
+    }
 }
 
 /// How NAL units are framed inside the samples of a stream.
@@ -267,9 +449,10 @@ impl H264Stream {
                 let mut shown = self.next_output;
                 // An IDR's sample number is its display index: everything
                 // before it is displayed first. This resynchronises the count
-                // after a picture was lost to a damaged sample.
+                // after a picture was lost to a damaged sample. It can't go back: a
+                // stream may display pictures decoded after its IDR before it.
                 if frame.is_idr {
-                    shown = frame.tag.min(u32::MAX as u64) as u32;
+                    shown = shown.max(frame.tag.min(u32::MAX as u64) as u32);
                 }
                 self.next_output = shown.saturating_add(1);
                 if shown >= target {

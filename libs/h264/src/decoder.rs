@@ -61,6 +61,45 @@ pub struct Frame {
     pub tag: u64,
     /// Macroblocks that no slice delivered, filled in from an earlier picture.
     pub concealed_mbs: u32,
+    /// Coded bits per sample. `y`, `u` and `v` are always 8 bits.
+    pub bit_depth: u8,
+    /// `chroma_format_idc` as coded: `y`, `u` and `v` are always 4:2:0.
+    pub chroma_format: u8,
+    /// The samples as coded, when asked for with [`Decoder::set_keep_native`].
+    pub native: Option<NativeFrame>,
+}
+
+/// Samples of a plane as coded.
+#[derive(Debug, Clone)]
+pub enum NativePlane {
+    /// 8 bits per sample.
+    U8(Arc<Vec<u8>>),
+    /// 9 or more bits per sample.
+    U16(Arc<Vec<u16>>),
+}
+
+/// A picture as coded, in its own bit depth and chroma format. Uses the
+/// coded picture's strides; `Frame::width` and `height` give the visible size.
+#[derive(Debug, Clone)]
+pub struct NativeFrame {
+    /// Luma.
+    pub y: NativePlane,
+    /// Cb.
+    pub u: NativePlane,
+    /// Cr.
+    pub v: NativePlane,
+    /// Samples between luma rows.
+    pub stride: usize,
+    /// Samples between chroma rows.
+    pub chroma_stride: usize,
+    /// Chroma rows in the coded picture.
+    pub chroma_rows: usize,
+    /// Offset of the first visible luma sample.
+    pub y_offset: usize,
+    /// Offset of the first visible chroma sample.
+    pub chroma_offset: usize,
+    /// Visible chroma rows.
+    pub chroma_height: usize,
 }
 
 impl Frame {
@@ -80,6 +119,31 @@ impl Frame {
     pub fn v_row(&self, row: usize) -> &[u8] {
         let start = self.uv_offset + row * self.uv_stride;
         &self.v[start..start + self.width as usize / 2]
+    }
+
+    /// Appends the visible picture to `out` as coded: planar, with samples over 8 bits as
+    /// 16-bit little endian. Empty without [`native`](Self::native).
+    pub fn append_native(&self, out: &mut Vec<u8>) {
+        let Some(native) = &self.native else {
+            return;
+        };
+        let mut put = |plane: &NativePlane, offset: usize, stride: usize, width: usize, rows: usize| {
+            for row in 0..rows {
+                let at = offset + row * stride;
+                match plane {
+                    NativePlane::U8(p) => out.extend_from_slice(&p[at..at + width]),
+                    NativePlane::U16(p) => {
+                        for value in &p[at..at + width] {
+                            out.extend_from_slice(&value.to_le_bytes());
+                        }
+                    }
+                }
+            }
+        };
+        let (w, h) = (self.width as usize, self.height as usize);
+        put(&native.y, native.y_offset, native.stride, w, h);
+        put(&native.u, native.chroma_offset, native.chroma_stride, w / 2, native.chroma_height);
+        put(&native.v, native.chroma_offset, native.chroma_stride, w / 2, native.chroma_height);
     }
 
     /// Appends the visible picture to `out` as planar I420.
@@ -313,6 +377,10 @@ pub struct Decoder {
     /// Reorder depth of the active SPS.
     reorder_depth: usize,
     tag: u64,
+    /// The core for field pictures, MBAFF, high bit depths and 4:2:2.
+    ext: crate::ext::ExtDecoder,
+    /// The SPS that core last worked from.
+    ext_sps: Option<u32>,
 }
 
 impl Default for Decoder {
@@ -341,7 +409,17 @@ impl Decoder {
             scratch_pool: None,
             reorder_depth: 0,
             tag: 0,
+            ext: crate::ext::ExtDecoder::new(),
+            ext_sps: None,
         }
+    }
+
+    /// Keeps each frame's samples as coded, in [`Frame::native`], for callers
+    /// that want more than the 8-bit 4:2:0 display planes. It applies to streams
+    /// that aren't 8-bit progressive 4:2:0 and started after this call. It holds
+    /// their memory while the frame lives.
+    pub fn set_keep_native(&mut self, keep: bool) {
+        self.ext.set_keep_native(keep);
     }
 
     /// Sets the tag recorded on pictures started from now on. See
@@ -358,6 +436,7 @@ impl Decoder {
         }
         self.dpb.reset();
         self.deferred_output.clear();
+        self.ext.reset();
     }
 
     /// Feed a single NAL unit to the decoder.
@@ -397,6 +476,12 @@ impl Decoder {
             }
             NalUnitType::Sei => Ok(self.take_deferred_output()),
             NalUnitType::SliceIdr | NalUnitType::Slice => {
+                if let Some(result) = self.decode_ext_slice(nal) {
+                    return result;
+                }
+                if self.ext.is_active() {
+                    self.flush_ext();
+                }
                 // Peek at first_mb_in_slice to detect new vs continuation slice
                 let mut peek = BitstreamReader::new(&nal.rbsp);
                 let first_mb = peek.read_ue().unwrap_or(0);
@@ -445,7 +530,46 @@ impl Decoder {
         if let Some(frame) = self.finalize_pending() {
             self.deferred_output.push_back(frame);
         }
+        self.flush_ext();
         self.take_deferred_output()
+    }
+
+    /// Hands a slice to the other core if its stream belongs there, and gives the
+    /// result. `None` means it belongs here.
+    fn decode_ext_slice(&mut self, nal: &NalUnit) -> Option<Result<Option<Frame>, DecodeError>> {
+        let mut peek = BitstreamReader::new(&nal.rbsp);
+        peek.read_ue().ok()?;
+        peek.read_ue().ok()?;
+        let pps_id = peek.read_ue().ok()?;
+        let sps_id = self.pps_table.get(&pps_id)?.seq_parameter_set_id;
+        if !crate::ext::wanted(self.sps_table.get(&sps_id)?) {
+            return None;
+        }
+        if let Some(frame) = self.finalize_pending() {
+            self.deferred_output.push_back(frame);
+        }
+        let pps = self.pps_table.get(&pps_id)?;
+        let sps = self.sps_table.get(&sps_id)?;
+        self.reorder_depth = sps.reorder_depth();
+        self.ext_sps = Some(sps.seq_parameter_set_id);
+        let result = self.ext.decode_slice(nal, sps, pps, self.tag, &self.limits);
+        while let Some(frame) = self.ext.pop_output() {
+            self.deferred_output.push_back(frame);
+        }
+        Some(match result {
+            // What's decoded stays, and the rest of the picture gets concealed.
+            Err(e @ (DecodeError::OutOfMemory | DecodeError::Unsupported(_))) => Err(e),
+            _ => Ok(self.take_deferred_output()),
+        })
+    }
+
+    /// Finishes whatever the other core has in progress.
+    fn flush_ext(&mut self) {
+        let sps = self.ext_sps.and_then(|id| self.sps_table.get(&id));
+        self.ext.flush(sps);
+        while let Some(frame) = self.ext.pop_output() {
+            self.deferred_output.push_back(frame);
+        }
     }
 
     /// Frames an [`OrderedDecoder`] must hold back for the active SPS.
@@ -647,6 +771,9 @@ impl Decoder {
             is_idr,
             tag: ps.tag,
             concealed_mbs: concealed,
+            bit_depth: 8,
+            chroma_format: 1,
+            native: None,
         };
         let pic = Arc::new(DecodedPicture {
             y: full_y,
@@ -1370,6 +1497,11 @@ impl OrderedDecoder {
             gop_id: 0,
             max_depth: Some(max_depth.max(1)),
         }
+    }
+
+    /// See [`Decoder::set_keep_native`].
+    pub fn set_keep_native(&mut self, keep: bool) {
+        self.inner.set_keep_native(keep);
     }
 
     /// Sets the tag recorded on pictures started from now on. See

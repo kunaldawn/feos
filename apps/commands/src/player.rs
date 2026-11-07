@@ -312,7 +312,7 @@ impl App for Player {
     }
 
     fn usage(&self) -> &'static str {
-        "player [path]"
+        "player [--speed] [path]"
     }
 
     fn description(&self) -> &'static str {
@@ -364,6 +364,21 @@ impl App for Player {
                 println!("player: no filesystem is available on this board");
                 return;
             };
+            if let Some(path) = context.args.trim().strip_prefix("--speed ") {
+                // How fast this machine decodes it, with nothing shown.
+                let measured = fs
+                    .resolve(path.trim())
+                    .filter(|&node| fs.is_file(node))
+                    .and_then(|node| crate::decode_worker::measure_video(context.platform, fs, node));
+                match measured {
+                    Some((done, count, ms)) => println!(
+                        "decoded {done} of {count} frames in {ms} ms: {} frames/s",
+                        done as u64 * 1000 / ms.max(1)
+                    ),
+                    None => println!("player: {path}: cannot decode it"),
+                }
+                return;
+            }
             run(fs, context);
         })();
         0

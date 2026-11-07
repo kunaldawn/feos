@@ -430,7 +430,7 @@ const COEFF_ABS_LEVEL_M1_OFFSET: [usize; 6] = [
 
 /// Per-position context offset for significant_coeff_flag in 8x8 blocks (frame mode).
 #[rustfmt::skip]
-const SIGNIFICANT_COEFF_FLAG_OFFSET_8X8: [u8; 63] = [
+pub(crate) const SIGNIFICANT_COEFF_FLAG_OFFSET_8X8: [u8; 63] = [
     0, 1, 2, 3, 4, 5, 5, 4, 4, 3, 3, 4, 4, 4, 5, 5,
     4, 4, 4, 4, 3, 3, 6, 7, 7, 7, 8, 9,10, 9, 8, 7,
     7, 6,11,12,13,11, 6, 7, 8, 9,14,10, 9, 8, 6,11,
@@ -439,7 +439,7 @@ const SIGNIFICANT_COEFF_FLAG_OFFSET_8X8: [u8; 63] = [
 
 /// Per-position offsets for field-coded 8x8 blocks (spec Table 9-34).
 #[rustfmt::skip]
-const SIGNIFICANT_COEFF_FLAG_FIELD_OFFSET_8X8: [u8; 63] = [
+pub(crate) const SIGNIFICANT_COEFF_FLAG_FIELD_OFFSET_8X8: [u8; 63] = [
     0, 1, 1, 2, 2, 3, 3, 4, 5, 6, 7, 7, 7, 8, 4, 5,
     6, 9,10,10, 8,11,12,11, 9, 9,10,10, 8,11,12,11,
     9, 9,10,10, 8,11,12,11, 9, 9,10,10, 8,13,13, 9,
@@ -448,7 +448,7 @@ const SIGNIFICANT_COEFF_FLAG_FIELD_OFFSET_8X8: [u8; 63] = [
 
 /// Per-position context offset for last_significant_coeff_flag in 8x8 blocks.
 #[rustfmt::skip]
-const LAST_COEFF_FLAG_OFFSET_8X8: [u8; 63] = [
+pub(crate) const LAST_COEFF_FLAG_OFFSET_8X8: [u8; 63] = [
     0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
     2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
     3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4,

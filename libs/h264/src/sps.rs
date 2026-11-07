@@ -276,11 +276,14 @@ impl Sps {
     /// Rejects valid syntax this decoder can't reconstruct, rather than
     /// producing garbage.
     pub fn check_supported(&self) -> Result<(), &'static str> {
-        if self.chroma_format_idc != 1 {
-            return Err("only 4:2:0 chroma is supported");
+        if self.chroma_format_idc > 2 {
+            return Err("4:4:4 chroma is not supported");
         }
-        if self.bit_depth_luma_minus8 != 0 || self.bit_depth_chroma_minus8 != 0 {
-            return Err("only 8-bit samples are supported");
+        if self.bit_depth_luma_minus8 != self.bit_depth_chroma_minus8 {
+            return Err("different luma and chroma bit depths are not supported");
+        }
+        if self.bit_depth_luma_minus8 > 2 {
+            return Err("more than 10 bits per sample is not supported");
         }
         if self.qpprime_y_zero_transform_bypass_flag {
             return Err("lossless transform bypass is not supported");

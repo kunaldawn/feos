@@ -10,7 +10,10 @@ measures the capture's frequencies, level and length for every format. It also l
 for sound stopping when a media window dies. With FEOS_MEDIA_DISK naming an image from
 scripts/make-media-disk.sh, it plays files too large for memory from that disk.
 
-FEOS_MEDIA_ONLY picks a phase: disk, stream, window, sound or record.
+FEOS_MEDIA_ONLY picks a phase: disk, stream, window, sound, record or h264.
+
+FEOS_H264_DISK names an image from scripts/make-h264-disk.sh: every H.264 mode the decoder
+accepts, opened in the Player, and timed. It's a phase of its own, run when the image is given.
 """
 
 import importlib.util
@@ -415,6 +418,46 @@ def stream_test(arch, kernel, image):
     os.remove(capture)
 
 
+def h264_test(arch, kernel, image):
+    """Each file on the disk in the Player, then how fast this machine decodes it."""
+    args = [
+        word + ",snapshot=on" if word.startswith("if=none") else word
+        for word in boot.disk_device(arch, image)
+    ]
+    guest = boot.Guest(boot.qemu_command(arch, kernel, args))
+    guest.expect("[fs] virtio0: mounted at /", boot.BOOT_TIMEOUT)
+    guest.expect("[desktop] session started", boot.BOOT_TIMEOUT)
+    time.sleep(3)
+    boot.open_terminal(guest)
+    names = os.environ.get("FEOS_H264_FILES", "").split()
+    if not names:
+        boot.fail(guest, "FEOS_H264_FILES lists nothing to play")
+    # On a frame or two it's the opening and first picture that count here.
+    for name in names:
+        type_keys(guest, f"player /{name}\n")
+        line = guest.capture(r"\[player\] opened (\w+ \d+x\d+, \d+ frames)", 300)
+        guest.expect("[player] first frame decoded", 600)
+        print(f"h264 {arch}: {name}: {line}, first frame shown", flush=True)
+        time.sleep(1)
+        guest.monitor("sendkey alt-f4")
+        # A short clip's window can have moved on to the next file by now. Nothing it
+        # says counts for the next one.
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            guest.pump(0.5)
+        guest.mark = len(guest.log)
+    guest.send("\x1c")
+    guest.expect("entering the serial shell", 60)
+    for name in names:
+        guest.send(f"player --speed /{name}\r")
+        line = guest.capture(r"(decoded \d+ of \d+ frames in \d+ ms: \d+ frames/s|cannot decode it)", 1800)
+        print(f"h264 {arch}: {name}: {line}", flush=True)
+        if "cannot" in line:
+            boot.fail(guest, f"{name} wouldn't decode")
+    guest.send("poweroff\r")
+    guest.wait_exit()
+
+
 def record_test(arch, kernel):
     """Real samples into the guest: QEMU's ALSA backend reads ALSA's `file` plugin, which
     gives it a file of a generated tone as what its input device heard."""
@@ -475,6 +518,11 @@ def main():
         sys.exit(__doc__)
     arch, kernel = sys.argv[1:]
     only = os.environ.get("FEOS_MEDIA_ONLY")
+    h264_image = os.environ.get("FEOS_H264_DISK")
+    if only == "h264" or (only is None and h264_image):
+        h264_test(arch, kernel, h264_image)
+    if only == "h264":
+        return
     if only in (None, "record"):
         record_test(arch, kernel)
     if only == "record":

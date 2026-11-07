@@ -302,3 +302,152 @@ fn rfc_8251_vectors() {
         assert!(worst <= 33, "vector {number}: worst {worst}");
     }
 }
+
+fn fnv64(pcm: &[i16]) -> u64 {
+    pcm.iter().flat_map(|v| v.to_le_bytes()).fold(0xcbf29ce484222325, |value, byte| {
+        (value ^ byte as u64).wrapping_mul(0x100000001b3)
+    })
+}
+
+/// Decodes a stream, in opus_demo's framing, with every 23rd packet lost: concealed, or
+/// recovered from the next packet's in-band copy.
+fn with_losses(stream: &[u8], fec: bool) -> Vec<i16> {
+    let mut decoder = feos_opus::OpusDecoder::new(48_000, 2).unwrap();
+    let mut out = vec![0i16; 5760 * 2];
+    let mut pcm = Vec::new();
+    let (mut pos, mut n, mut lost, mut last) = (0, 0, false, 960usize);
+    while pos + 8 <= stream.len() {
+        let len = u32::from_be_bytes(stream[pos..pos + 4].try_into().unwrap()) as usize;
+        let packet = &stream[pos + 8..pos + 8 + len];
+        pos += 8 + len;
+        n += 1;
+        if n % 23 == 0 {
+            if fec {
+                lost = true;
+            } else if let Ok(frames) = decoder.decode(&[], &mut out[..last * 2], false) {
+                pcm.extend_from_slice(&out[..frames * 2]);
+            }
+            continue;
+        }
+        if lost {
+            lost = false;
+            if let Ok(frames) = decoder.decode(packet, &mut out[..last * 2], true) {
+                pcm.extend_from_slice(&out[..frames * 2]);
+            }
+        }
+        if let Ok(frames) = decoder.decode(packet, &mut out, false) {
+            last = frames;
+            pcm.extend_from_slice(&out[..frames * 2]);
+        }
+    }
+    pcm
+}
+
+/// Hashes of what libopus 1.5.2 makes of `fec-mono.bit`, which its encoder made with in-band FEC
+/// on, with the same packets lost. Mono SILK's concealment and redundant frames are the same as
+/// its, to the sample. Stereo and hybrid come to 59 dB or better, which a hash can't say, and
+/// `packet_loss_against_libopus`'s kind of comparison says: here it's that they keep time.
+#[test]
+fn silk_loss_and_fec_identical_to_libopus() {
+    let mono = file("fec-mono.bit");
+    assert_eq!(fnv64(&with_losses(&mono, false)), 0xb68fc67e338f3865);
+    assert_eq!(fnv64(&with_losses(&mono, true)), 0xfbd0bfeca32a00dd);
+    for name in ["fec-wb.bit", "fec-hy.bit"] {
+        let stream = file(name);
+        assert_eq!(with_losses(&stream, false).len(), 144_000);
+        assert_eq!(with_losses(&stream, true).len(), 144_000);
+    }
+}
+
+/// Losses must never panic, whatever comes around them.
+#[test]
+fn losses_in_damaged_streams_never_panic() {
+    for name in ["fec-mono.bit", "fec-wb.bit", "fec-hy.bit"] {
+        let clean = file(name);
+        for seed in 0..200u64 {
+            let mut stream = clean.clone();
+            let mut rng = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+            let mut pos = 0;
+            while pos + 8 <= stream.len() {
+                let len = u32::from_be_bytes(stream[pos..pos + 4].try_into().unwrap()) as usize;
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                if rng % 3 == 0 && len > 0 {
+                    let at = pos + 8 + rng as usize % len;
+                    stream[at] ^= (rng >> 32) as u8;
+                }
+                pos += 8 + len;
+            }
+            let _ = with_losses(&stream, false);
+            let _ = with_losses(&stream, true);
+        }
+    }
+}
+
+/// Against libopus on RFC 8251's vectors with every 23rd packet lost, concealed or recovered from
+/// the next packet's in-band copy. `OPUS_LOSS_REFS` names a directory of what libopus made of
+/// them: `plcNN.raw` and `fecNN.raw`, as 16-bit stereo. It reports, as nothing in
+/// this repository can say what's close enough for a guess at what's missing.
+#[test]
+fn packet_loss_against_libopus() {
+    use feos_opus::OpusDecoder;
+    let (Ok(dir), Ok(refs)) = (std::env::var("OPUS_VECTORS"), std::env::var("OPUS_LOSS_REFS")) else {
+        println!("skipped: OPUS_VECTORS and OPUS_LOSS_REFS not set");
+        return;
+    };
+    for fec in [false, true] {
+        for number in 1..=12 {
+            let stream = std::fs::read(format!("{dir}/testvector{number:02}.bit")).unwrap();
+            let kind = if fec { "fec" } else { "plc" };
+            let wanted = std::fs::read(format!("{refs}/{kind}{number:02}.raw")).unwrap();
+            let wanted: Vec<i16> = wanted
+                .chunks_exact(2)
+                .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]))
+                .collect();
+            let mut decoder = OpusDecoder::new(48_000, 2).unwrap();
+            let mut out = vec![0i16; 5760 * 2];
+            let mut pcm = Vec::new();
+            let (mut pos, mut n, mut lost, mut last) = (0, 0, false, 960usize);
+            while pos + 8 <= stream.len() {
+                let len = u32::from_be_bytes(stream[pos..pos + 4].try_into().unwrap()) as usize;
+                let packet = &stream[pos + 8..pos + 8 + len];
+                pos += 8 + len;
+                n += 1;
+                if n % 23 == 0 {
+                    if !fec {
+                        if let Ok(frames) = decoder.decode(&[], &mut out[..last * 2], false) {
+                            pcm.extend_from_slice(&out[..frames * 2]);
+                        }
+                    } else {
+                        lost = true;
+                    }
+                    continue;
+                }
+                if lost {
+                    lost = false;
+                    if let Ok(frames) = decoder.decode(packet, &mut out[..last * 2], true) {
+                        pcm.extend_from_slice(&out[..frames * 2]);
+                    }
+                }
+                if let Ok(frames) = decoder.decode(packet, &mut out, false) {
+                    last = frames;
+                    pcm.extend_from_slice(&out[..frames * 2]);
+                }
+            }
+            let (mut noise, mut signal, mut worst) = (0f64, 0f64, 0i32);
+            for (ours, theirs) in pcm.iter().zip(&wanted) {
+                let difference = *ours as i32 - *theirs as i32;
+                worst = worst.max(difference.abs());
+                noise += (difference * difference) as f64;
+                signal += (*theirs as i32 * *theirs as i32) as f64;
+            }
+            println!(
+                "{kind} {number:02}: {} samples against {}, worst {worst}, SNR {:.1} dB",
+                pcm.len(),
+                wanted.len(),
+                10.0 * (signal / noise.max(1.0)).log10()
+            );
+        }
+    }
+}

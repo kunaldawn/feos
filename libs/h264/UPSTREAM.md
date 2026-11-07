@@ -1,6 +1,29 @@
 # Provenance of feos-h264
 
-## Origin
+## Two cores
+
+Since the interlace and High 10 work, slices are decoded by `src/ext/`, which is **our own code**,
+written from the H.264 specification. FFmpeg was used only as a black-box reference decoder, as
+a test oracle: none of its source, nor JM's, was read for this, and neither was recalled. The
+ITU-T specification wasn't downloadable here, so Table 6-4's corner for a lower frame macroblock
+beside a field pair, the macroblock chosen for direct prediction from a field pair in an MBAFF
+frame and similar corners were settled by trying the readings against the FFmpeg oracle on real
+streams. `src/ext/` shares parameter set and slice header parsing, CAVLC tables and the spec's
+tables (CABAC initialisation, deblocking thresholds) with the vendored decoder.
+
+It does frames, field pictures and MBAFF, 8 to 10 bits, monochrome, 4:2:0 and 4:2:2, CAVLC and
+CABAC. Still refused: 4:4:4, lossless transform bypass, unequal luma and chroma depths, more than
+10 bits, FMO, ASO and SP and SI slices.
+
+The vendored macroblock paths described below are still in the tree, but `VENDORED_FOR_PROGRESSIVE`
+in `src/ext/mod.rs` is off, so nothing reaches them. On FATE's `h264-conformance`, they differ from
+FFmpeg on 20 progressive streams that `src/ext/` matches (CABA3_Sony_C, CAPCM1_Sand_E, MR4_TANDBERG_C,
+SL1_SVA_B and so on), and `src/ext/` was faster on the clips measured. Removing them is a
+separate decision; turning that constant on brings them back for 8-bit progressive 4:2:0.
+
+`tests/fate.rs` compares every frame with FFmpeg's on those streams, when pointed at them.
+
+## Origin of the vendored decoder
 
 This decoder is a vendored port of [`z264`](https://github.com/p14c31355/z264)
 by p14c31355, which adapts the pure-Rust `rust_h264` 0.4.x implementation. Both
@@ -33,8 +56,8 @@ decoding behaviour are these:
 - **Input validation.** Range checks on SPS, PPS and slice headers: parameter set
   ids, POC cycle length, reference counts, crop, QP, weights, deblock offsets,
   and the lengths of the list modification and MMCO loops.
-- **Refused rather than decoded wrongly.** Anything but 8-bit 4:2:0, transform
-  bypass, and MBAFF, whose field macroblock paths don't match a reference decoder.
+- **Refused rather than decoded wrongly.** Transform bypass, and FMO. On the vendored paths,
+  also anything but 8-bit progressive 4:2:0.
 - **Geometry.** Coded size comes from the SPS's macroblock counts instead of the
   cropped size; left and top crops are honoured. `Frame` shares the coded planes
   and describes the crop with offsets and strides.

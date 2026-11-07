@@ -104,8 +104,9 @@ impl OpusDecoder {
     ///
     /// Empty `packet` input triggers packet loss concealment using the previous
     /// decoder state. Returns the number of decoded samples per channel.
-    /// - `fec`: reserved for future in-band FEC support. Currently treated as
-    ///   packet loss concealment (PLC) when `true`. Pass `false` for normal decode.
+    /// - `fec`: true when the packet before this one was lost, for what this one holds of it.
+    ///   `pcm` is then exactly the size of what was lost, as much as can be from the packet's
+    ///   in-band copy, and concealment for what can't. Pass `false` for normal decode.
     ///
     /// # Examples
     ///
@@ -125,8 +126,13 @@ impl OpusDecoder {
         pcm: &mut [i16],
         fec: bool,
     ) -> Result<usize, OpusError> {
-        let samples_per_channel = if packet.is_empty() || fec {
+        let samples_per_channel = if packet.is_empty() {
             self.decoder.decode(None, pcm).map_err(OpusError::from)?
+        } else if fec {
+            let frame_size = pcm.len() / self.decoder.channels() as usize;
+            self.decoder
+                .decode_fec(packet, pcm, frame_size)
+                .map_err(OpusError::from)?
         } else {
             self.decoder
                 .decode(Some(packet), pcm)
@@ -414,9 +420,23 @@ impl Decoder {
                     *dst = src.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
                 }
             }
-            Some(OpusMode::SilkOnly | OpusMode::Hybrid) => {
+            Some(OpusMode::SilkOnly) => {
                 self.silk
                     .decode_lost(samples_per_channel, out, self.loss_count)?;
+            }
+            Some(OpusMode::Hybrid) => {
+                self.silk
+                    .decode_lost(samples_per_channel, out, self.loss_count)?;
+                // The upper bands are CELT's, as noise.
+                self.celt.set_start_band(17);
+                let upper = self
+                    .celt
+                    .decode_lost(samples_per_channel, self.channels as usize);
+                self.celt.set_start_band(0);
+                for (dst, src) in out[..needed].iter_mut().zip(upper.iter()) {
+                    let sum = *dst as f32 + *src;
+                    *dst = sum.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                }
             }
             _ => {
                 self.conceal_with_fade(samples_per_channel, self.loss_count, out);
@@ -506,6 +526,74 @@ impl Decoder {
     /// This is a debug helper for transition tracing in the conformance harness.
     pub(crate) fn last_celt_to_silk(&self) -> bool {
         self.last_celt_to_silk
+    }
+
+    /// Recovers `frame_size` samples per channel lost before `packet`, from the copy of its
+    /// last frame's worth a SILK or hybrid packet can carry (`opus_decode` with `decode_fec`).
+    pub(crate) fn decode_fec(
+        &mut self,
+        packet: &[u8],
+        out: &mut [i16],
+        frame_size: usize,
+    ) -> Result<usize, Error> {
+        let channels = self.channels as usize;
+        let needed = frame_size * channels;
+        if out.len() < needed {
+            return Err(Error::OutputTooSmall {
+                needed,
+                got: out.len(),
+            });
+        }
+        let pp = packet::parse_packet(packet)?;
+        let packet_frame = pp.samples_per_frame_48k * self.fs_hz as usize / 48_000;
+        let config = (pp.toc >> 3) & 0x1f;
+        let mode = match config {
+            0..=11 => OpusMode::SilkOnly,
+            12..=15 => OpusMode::Hybrid,
+            _ => OpusMode::CeltOnly,
+        };
+        let frame = pp.frames().first().copied();
+        let conceal = |this: &mut Self, samples: usize, out: &mut [i16]| {
+            this.last_packet_duration = samples;
+            this.decode_lost_packet(out)
+        };
+        let Some(frame) = frame.filter(|_| {
+            frame_size >= packet_frame
+                && mode != OpusMode::CeltOnly
+                && self.prev_mode != Some(OpusMode::CeltOnly)
+        }) else {
+            return conceal(self, frame_size, out);
+        };
+        let lead = frame_size - packet_frame;
+        if lead > 0 {
+            conceal(self, lead, out)?;
+        }
+        let packet_idx = TRACE_DECODE_PACKET_IDX.fetch_add(1, Ordering::SeqCst);
+        let tail = &mut out[lead * channels..needed];
+        self.silk.decode_fec_frame(
+            frame,
+            pp.samples_per_frame_48k,
+            config,
+            pp.packet_channels,
+            packet_idx,
+            tail,
+        )?;
+        if mode == OpusMode::Hybrid {
+            self.celt.set_start_band(17);
+            let upper = self.celt.decode_lost(packet_frame, channels);
+            self.celt.set_start_band(0);
+            for (dst, src) in tail.iter_mut().zip(upper.iter()) {
+                let sum = *dst as f32 + *src;
+                *dst = sum.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+            }
+        }
+        self.prev_mode = Some(mode);
+        self.prev_redundancy = false;
+        self.last_packet_duration = frame_size;
+        self.last_final_range = 0;
+        self.loss_count = 0;
+        self.store_last_output(out, frame_size);
+        Ok(frame_size)
     }
 
     /// Decode one Opus packet to interleaved i16 PCM.

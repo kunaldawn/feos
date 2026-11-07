@@ -182,6 +182,16 @@ fn mutated_streams_decode_without_panicking_or_exhausting_the_heap() {
         include_bytes!("../testdata/high_cavlc_8x8dct.h264"),
         include_bytes!("../testdata/crop_rect_left_top.h264"),
         include_bytes!("../testdata/sliced_deblock_idc2.h264"),
+        include_bytes!("../testdata/hi10_cabac.h264"),
+        include_bytes!("../testdata/hi10_cavlc.h264"),
+        include_bytes!("../testdata/hi422_cabac.h264"),
+        include_bytes!("../testdata/hi422_cavlc.h264"),
+        include_bytes!("../testdata/hi42210_cabac.h264"),
+        include_bytes!("../testdata/mbaff_cabac.h264"),
+        include_bytes!("../testdata/mbaff_temporal.h264"),
+        include_bytes!("../testdata/mbaff_cavlc.h264"),
+        include_bytes!("../testdata/mbaff_hi422.h264"),
+        include_bytes!("../testdata/paff_pcm.h264"),
     ];
     // FEOS_FUZZ_ROUNDS and FEOS_FUZZ_SEED widen the search for one-off runs.
     let rounds: u64 = option_env!("FEOS_FUZZ_ROUNDS")
@@ -211,6 +221,54 @@ fn mutated_streams_decode_without_panicking_or_exhausting_the_heap() {
         frames as u64 > rounds * SEEDS.len() as u64,
         "only {frames} frames survived mutation"
     );
+}
+
+/// The same with field-coded and other streams that aren't in the repository, if
+/// `FEOS_H264_CONF` names a directory holding them. See `fate.rs`.
+#[test]
+fn mutated_conformance_streams_decode_without_panicking() {
+    let Ok(dir) = std::env::var("FEOS_H264_CONF") else {
+        println!("skipped: FEOS_H264_CONF not set");
+        return;
+    };
+    const NAMES: &[&str] = &[
+        "CVSE3_Sony_H.jsv",
+        "CVSEFDFT3_Sony_E.jsv",
+        "Sharp_MP_Field_1_B.jvt",
+        "Sharp_MP_PAFF_1r2.jvt",
+        "CAPAMA3_Sand_F.264",
+        "CAFI1_SVA_C.264",
+        "CVMA1_TOSHIBA_B.264",
+        "CAMA3_Sand_E.264",
+        "camp_mot_picaff0_full.26l",
+        "cvmp_mot_fld0_full_B.26l",
+        "MR9_BT_B.h264",
+        "CAPCM1_Sand_E.264",
+        "FRext/HPCAMAPALQ_BRCM_B.264",
+        "FRext/Hi422FR1_SONY_A.jsv",
+        "FRext/PPH422I1_Panasonic_A.264",
+        "FRext/HPCVMOLQ_BRCM_B.264",
+    ];
+    // Enough for parameter sets and several frames: the sizes keep this to minutes.
+    const LENGTH: usize = 192 * 1024;
+    let rounds: u64 = std::env::var("FEOS_FUZZ_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(12);
+    on_small_stack(move || {
+        for (index, name) in NAMES.iter().enumerate() {
+            let Ok(mut seed) = std::fs::read(std::path::Path::new(&dir).join(name)) else {
+                println!("{name}: not found");
+                continue;
+            };
+            seed.truncate(LENGTH);
+            for round in 0..rounds {
+                let mut rng = Rng(0x5eed_0000_0000_0002 ^ ((index as u64) << 32) ^ (round << 8));
+                let input = mutate(&seed, &mut rng);
+                decode(&input);
+            }
+        }
+    });
 }
 
 #[test]

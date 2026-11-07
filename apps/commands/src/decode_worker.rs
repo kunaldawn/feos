@@ -538,6 +538,31 @@ impl Worker {
     }
 }
 
+/// How fast this machine decodes a file's pictures, as a player would, to RGBA. Gives the
+/// frames decoded, the frames in the file and the time taken in milliseconds.
+pub fn measure_video(
+    platform: &feos_app::Platform,
+    fs: &'static dyn FileSystem,
+    node: NodeId,
+) -> Option<(u32, u32, u64)> {
+    let (mut decoder, opened) = open_file(fs, node).ok()?;
+    let mut buffer = zeroed(opened.rgba_len)?;
+    let count = decoder.frame_count();
+    let started = platform.clock.uptime_ms();
+    let (mut next, mut done) = (0u32, 0u32);
+    while next < count {
+        match decoder.advance(next, &mut buffer, 16) {
+            Ok(Some(frame)) => {
+                done += 1;
+                next = frame.index.saturating_add(1);
+            }
+            Ok(None) => {}
+            Err(_) => break,
+        }
+    }
+    Some((done, count, platform.clock.uptime_ms() - started))
+}
+
 fn open_file(
     fs: &'static dyn FileSystem,
     node: NodeId,

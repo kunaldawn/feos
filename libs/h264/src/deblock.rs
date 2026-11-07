@@ -63,7 +63,7 @@ pub struct MbInfo {
 
 // H.264 Table 8-16a: alpha threshold indexed by indexA = clamp(0..51, QPavg + offset_a)
 #[rustfmt::skip]
-const ALPHA_TABLE: [i32; 52] = [
+pub(crate) const ALPHA_TABLE: [i32; 52] = [
      0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
      4,  4,  5,  6,  7,  8,  9, 10, 12, 13, 15, 17, 20, 22, 25, 28,
     32, 36, 40, 45, 50, 56, 63, 71, 80, 90,101,113,127,144,162,182,
@@ -72,7 +72,7 @@ const ALPHA_TABLE: [i32; 52] = [
 
 // H.264 Table 8-16b: beta threshold
 #[rustfmt::skip]
-const BETA_TABLE: [i32; 52] = [
+pub(crate) const BETA_TABLE: [i32; 52] = [
      0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
      2,  2,  2,  3,  3,  3,  3,  4,  4,  4,  6,  6,  7,  7,  8,  8,
      9,  9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15, 16, 16,
@@ -81,7 +81,7 @@ const BETA_TABLE: [i32; 52] = [
 
 // H.264 Table 8-16c: tc0 indexed by [indexA][bS-1] for bS=1..3
 #[rustfmt::skip]
-const TC0_TABLE: [[i32; 3]; 52] = [
+pub(crate) const TC0_TABLE: [[i32; 3]; 52] = [
     [ 0, 0, 0], [ 0, 0, 0], [ 0, 0, 0], [ 0, 0, 0], [ 0, 0, 0], [ 0, 0, 0],
     [ 0, 0, 0], [ 0, 0, 0], [ 0, 0, 0], [ 0, 0, 0], [ 0, 0, 0], [ 0, 0, 0],
     [ 0, 0, 0], [ 0, 0, 0], [ 0, 0, 0], [ 0, 0, 0], [ 0, 0, 0], [ 0, 0, 1],

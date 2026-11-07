@@ -191,3 +191,52 @@ fn b_frames_through_a_source() {
         }
     }
 }
+
+/// The raw formats have no table of where frames are: walking the file finds them, without
+/// holding it, and a seek still finds its parameter sets.
+#[test]
+fn raw_h264_and_mjpeg_stream_like_the_rest() {
+    let raw = file("h264-stream.h264");
+    let mut jpegs = Vec::new();
+    {
+        // Three images of a motion JPEG file, concatenated, make a raw one.
+        let avi = file("motion-jpeg.avi");
+        let mut at = 0;
+        let mut count = 0;
+        while count < 3 {
+            let Some(start) = avi[at..].windows(3).position(|w| w == [0xff, 0xd8, 0xff]) else {
+                break;
+            };
+            let start = at + start;
+            let end = avi[start..].windows(2).position(|w| w == [0xff, 0xd9]).unwrap() + start + 2;
+            jpegs.extend_from_slice(&avi[start..end]);
+            at = end;
+            count += 1;
+        }
+    }
+    for data in [raw, jpegs] {
+        let mut memory = VideoDecoder::open(data.clone()).unwrap();
+        let source = Box::new(Counting {
+            data,
+            read: std::cell::Cell::new(0),
+        });
+        let mut disk = VideoDecoder::from_source(source, DecoderLimits::default()).unwrap();
+        assert_eq!(memory.frame_count(), disk.frame_count());
+        assert!(memory.frame_count() > 1);
+        let info = *memory.info();
+        let mut a = vec![0u8; info.rgba_len().unwrap()];
+        let mut b = a.clone();
+        let count = memory.frame_count();
+        for index in 0..count {
+            memory.decode(index, &mut a).unwrap();
+            disk.decode(index, &mut b).unwrap();
+            assert_eq!(a, b, "frame {index}");
+        }
+        // Back to the start, and to the end, past any parameter sets.
+        for index in [0, count - 1, 0] {
+            memory.decode(index, &mut a).unwrap();
+            disk.decode(index, &mut b).unwrap();
+            assert_eq!(a, b, "after seeking, frame {index}");
+        }
+    }
+}

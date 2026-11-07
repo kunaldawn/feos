@@ -70,7 +70,9 @@ formula for the Kaiser-Bessel-derived window (alpha 4 long, alpha 6 short).
 
 `lc-pce.aac` is 5.1 AAC-LC with a program config element, from FFmpeg's encoder with
 `-aac_pce 1`, and `lc-pce.aac.s16` is FFmpeg's decoding of it. `opus/` is explained by
-`make_opus.sh`, beside this folder.
+`make_opus.sh`, beside this folder, but for `opus/fec-*.bit`: 1.5 s from `silk-wb.s16`, encoded
+by a small program over libopus 1.5.2 with in-band FEC on and 30% loss expected, in `opus_demo`'s
+framing, at 16 kbit/s mono and 24 kbit/s stereo forced to SILK, and 40 kbit/s stereo forced to hybrid.
 
 # HE-AAC with nothing to say so but its first frame, from a fraction of a second of an ISO
 # conformance stream: ../../../video/tests/data/he-sbr.mp4, which is described in

@@ -1,5 +1,7 @@
 //! Motion JPEG: one JPEG image per video sample.
 
+use alloc::vec::Vec;
+
 use crate::error::{require_rgba, Result, VideoError};
 use crate::index::{DecoderLimits, Index, FLAG_KEY};
 
@@ -63,6 +65,57 @@ pub(crate) fn build_index(input: &[u8], limits: &DecoderLimits) -> Result<Index>
         Ok(true)
     })?;
     Ok(index)
+}
+
+/// Largest single image in a file on disk.
+const MAX_STREAM_IMAGE: usize = 16 << 20;
+
+/// The same as [`build_index`] for a file that stays on disk. It reads the whole file once. Gives
+/// the index, and the first image, which is all [`info`] needs to see.
+pub(crate) fn walk(file: &dyn feos_source::Source, len: usize, limits: &DecoderLimits) -> Result<(Index, Vec<u8>)> {
+    let mut index = Index::default();
+    let mut first = Vec::new();
+    let mut size = 2usize << 20;
+    let mut chunk = feos_source::zeroed(size).ok_or(VideoError::OutOfMemory)?;
+    let mut pos = 0usize;
+    while pos < len {
+        let read = file.read_full(pos as u64, &mut chunk);
+        if read == 0 {
+            break;
+        }
+        let bytes = &chunk[..read];
+        let mut at = 0usize;
+        while let Some(start) = find_soi(bytes, at) {
+            let Some(image_len) = feos_image::jpeg::image_end(&bytes[start..]) else {
+                at = start;
+                break;
+            };
+            index.push(limits, len, pos + start, image_len, 0, FLAG_KEY)?;
+            if first.is_empty() {
+                first
+                    .try_reserve_exact(image_len)
+                    .map_err(|_| VideoError::OutOfMemory)?;
+                first.extend_from_slice(&bytes[start..start + image_len]);
+            }
+            at = start + image_len.max(2);
+        }
+        if pos + read >= len {
+            // What's left is a trailing partial image, which doesn't count.
+            break;
+        }
+        if at == 0 {
+            // The image doesn't fit here: look again with more room.
+            if size >= MAX_STREAM_IMAGE {
+                return Err(VideoError::LimitExceeded("an image is too large"));
+            }
+            size *= 2;
+            drop(core::mem::take(&mut chunk));
+            chunk = feos_source::zeroed(size).ok_or(VideoError::OutOfMemory)?;
+            continue;
+        }
+        pos += at;
+    }
+    Ok((index, first))
 }
 
 /// Decodes one JPEG, returning its dimensions.

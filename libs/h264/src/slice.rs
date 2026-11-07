@@ -216,8 +216,9 @@ pub fn parse_slice_header<'a>(
     let needs_weight_table = (slice_type == SliceType::P && pps.weighted_pred_flag)
         || (slice_type == SliceType::B && pps.weighted_bipred_idc == 1);
     let weight_table = if needs_weight_table {
+        let has_chroma = sps.chroma_format_idc != 0;
         let luma_log2_weight_denom = r.read_ue()?;
-        let chroma_log2_weight_denom = r.read_ue()?;
+        let chroma_log2_weight_denom = if has_chroma { r.read_ue()? } else { 0 };
         // Spec constrains these to [0, 7]. Clamp to prevent shift overflow.
         if luma_log2_weight_denom > 7 || chroma_log2_weight_denom > 7 {
             return Err(DecodeError::InvalidSyntax("log2_weight_denom out of range"));
@@ -225,9 +226,9 @@ pub fn parse_slice_header<'a>(
         let luma_def = 1i32 << luma_log2_weight_denom;
         let chroma_def = 1i32 << chroma_log2_weight_denom;
 
-        let l0 = read_weight_list(&mut r, num_ref_idx_l0_active, luma_def, chroma_def)?;
+        let l0 = read_weight_list(&mut r, num_ref_idx_l0_active, luma_def, chroma_def, has_chroma)?;
         let l1 = if slice_type == SliceType::B {
-            read_weight_list(&mut r, num_ref_idx_l1_active, luma_def, chroma_def)?
+            read_weight_list(&mut r, num_ref_idx_l1_active, luma_def, chroma_def, has_chroma)?
         } else {
             Vec::new()
         };
@@ -321,7 +322,7 @@ pub fn parse_slice_header<'a>(
 
     let slice_qp_delta = r.read_se()?;
     let slice_qp = (pps.pic_init_qp_minus26 + 26).saturating_add(slice_qp_delta);
-    if !(0..=51).contains(&slice_qp) {
+    if !(-6 * sps.bit_depth_luma_minus8 as i32..=51).contains(&slice_qp) {
         return Err(DecodeError::InvalidSyntax("slice QP out of range"));
     }
     if slice_type == SliceType::Sp || slice_type == SliceType::Si {
@@ -425,6 +426,7 @@ fn read_weight_list(
     count: u32,
     luma_default: i32,
     chroma_default: i32,
+    has_chroma: bool,
 ) -> Result<Vec<RefWeight>, &'static str> {
     let mut weights = Vec::with_capacity(count as usize);
     for _ in 0..count {
@@ -439,7 +441,7 @@ fn read_weight_list(
             weight.luma_offset = r.read_se()?;
             check_weight(weight.luma_weight, weight.luma_offset)?;
         }
-        if r.read_bit()? != 0 {
+        if has_chroma && r.read_bit()? != 0 {
             for component in 0..2 {
                 weight.chroma_weight[component] = r.read_se()?;
                 weight.chroma_offset[component] = r.read_se()?;

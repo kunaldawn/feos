@@ -1,12 +1,13 @@
 //! SILK excitation reconstruction and LPC synthesis.
 #![allow(clippy::needless_range_loop)]
 
+use alloc::boxed::Box;
 #[allow(unused_imports)]
 use crate::prelude::*;
 use super::gain;
 use super::ltp;
 use super::pitch;
-use super::plc::SilkPlcState;
+use super::plc::{LastFrame, SilkPlcState};
 use super::tables::{
     LTP_MEM_LENGTH_MS, LTP_ORDER, MAX_FRAME_LENGTH, MAX_LPC_ORDER, MAX_NB_SUBFR,
     MAX_SUB_FRAME_LENGTH, QUANT_LEVEL_ADJUST_Q10, QUANTIZATION_OFFSETS_Q10,
@@ -70,7 +71,11 @@ pub(super) struct SilkChannelState {
     /// Output buffer kept for future voiced re-whitening.
     pub out_buf: [i16; MAX_FRAME_LENGTH + 2 * MAX_SUB_FRAME_LENGTH],
     /// PLC state refreshed after every successful decode.
-    pub plc: SilkPlcState,
+    pub plc: Box<SilkPlcState>,
+    /// The last frame's excitation, which concealment takes its noise from.
+    pub exc_q14: Vec<i32>,
+    /// The last frame's parameters.
+    pub last_frame: Box<LastFrame>,
 }
 
 impl Default for SilkChannelState {
@@ -86,7 +91,9 @@ impl Default for SilkChannelState {
             lag_prev: 100,
             s_lpc_q14_buf: [0; MAX_LPC_ORDER],
             out_buf: [0; MAX_FRAME_LENGTH + 2 * MAX_SUB_FRAME_LENGTH],
-            plc: SilkPlcState::default(),
+            plc: Box::default(),
+            exc_q14: vec![0; MAX_FRAME_LENGTH],
+            last_frame: Box::default(),
         }
     }
 }
@@ -270,6 +277,13 @@ pub(super) fn decode_core(
     state
         .s_lpc_q14_buf
         .copy_from_slice(&s_lpc_q14[..MAX_LPC_ORDER]);
+    state.exc_q14.copy_from_slice(&exc_q14);
+    *state.last_frame = LastFrame {
+        gains_q16,
+        ltp_coeffs_q14,
+        ltp_scale_q14,
+        pitch_lags,
+    };
     state.prev_signal_type = params.signal_type;
     if params.signal_type == TYPE_VOICED && pitch_lags[params.nb_subfr - 1] > 0 {
         state.lag_prev = pitch_lags[params.nb_subfr - 1];
@@ -436,7 +450,7 @@ fn smlaww(a32: i32, b32: i32, c32: i32) -> i32 {
 ///
 /// Params: signed non-zero `value` and target result Q-domain `q_res`.
 /// Returns: reciprocal approximation in fixed-point.
-fn inverse32_var_q(value: i32, q_res: usize) -> i32 {
+pub(super) fn inverse32_var_q(value: i32, q_res: usize) -> i32 {
     debug_assert!(value != 0);
     debug_assert!(q_res > 0);
 
@@ -461,7 +475,7 @@ fn inverse32_var_q(value: i32, q_res: usize) -> i32 {
 ///
 /// Params: mutable `output`, past decoded `input`, LPC `a_q12`, signal `len`, and LPC `order`.
 /// Returns: nothing; `output[..len]` receives Q0 re-whitened samples.
-fn lpc_analysis_filter(output: &mut [i16], input: &[i16], a_q12: &[i16], len: usize, order: usize) {
+pub(super) fn lpc_analysis_filter(output: &mut [i16], input: &[i16], a_q12: &[i16], len: usize, order: usize) {
     debug_assert!(order <= len);
     output[..order].fill(0);
     for ix in order..len {

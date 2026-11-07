@@ -262,36 +262,33 @@ impl CeltDecoder {
             return pcm;
         }
 
+        let start = self.start_band.min(end);
         let mut left_energy = self.prev_energy[..nb_ebands].to_vec();
         let mut right_energy = if active_channels == 2 {
             self.prev_energy[nb_ebands..2 * nb_ebands].to_vec()
         } else {
             left_energy.clone()
         };
-        if self.loss_count > 0 {
-            for band in 0..end {
-                left_energy[band] = (left_energy[band] - 6.0).max(self.background_log_energy[band]);
-                if active_channels == 2 {
-                    right_energy[band] = (right_energy[band] - 6.0)
-                        .max(self.background_log_energy[nb_ebands + band]);
-                }
+        // Energy decays quicker on the first loss, down to the background's.
+        let decay = if self.loss_count == 0 { 1.5 } else { 0.5 };
+        for band in start..end {
+            left_energy[band] = (left_energy[band] - decay).max(self.background_log_energy[band]);
+            if active_channels == 2 {
+                right_energy[band] = (right_energy[band] - decay)
+                    .max(self.background_log_energy[nb_ebands + band]);
             }
-        }
-        for band in end..nb_ebands {
-            left_energy[band] = LOG_ENERGY_FLOOR_DB;
-            right_energy[band] = LOG_ENERGY_FLOOR_DB;
         }
 
         let mut mdct_left = vec![0.0f32; frame_size_48k];
-        for band in 0..end {
-            let start = (self.mode.e_bands[band] as usize) << lm;
+        for band in start..end.min(21) {
+            let at = (self.mode.e_bands[band] as usize) << lm;
             let band_len =
                 (self.mode.e_bands[band + 1] as usize - self.mode.e_bands[band] as usize) << lm;
-            for value in &mut mdct_left[start..start + band_len] {
+            for value in &mut mdct_left[at..at + band_len] {
                 self.rng_seed = bands::celt_lcg_rand(self.rng_seed);
-                *value = ((self.rng_seed >> 16) as i16) as f32;
+                *value = ((self.rng_seed as i32) >> 20) as f32;
             }
-            vq::renormalise_vector(&mut mdct_left[start..start + band_len], 1.0);
+            vq::renormalise_vector(&mut mdct_left[at..at + band_len], 1.0);
         }
         let mut denorm_left = vec![0.0f32; frame_size_48k];
         bands::denormalise_bands(
@@ -299,8 +296,8 @@ impl CeltDecoder {
             &mdct_left,
             &mut denorm_left,
             &left_energy,
-            0,
-            end,
+            start,
+            end.min(21),
             lm,
             false,
         );
@@ -324,15 +321,15 @@ impl CeltDecoder {
 
         if active_channels == 2 {
             let mut mdct_right = vec![0.0f32; frame_size_48k];
-            for band in 0..end {
-                let start = (self.mode.e_bands[band] as usize) << lm;
+            for band in start..end.min(21) {
+                let at = (self.mode.e_bands[band] as usize) << lm;
                 let band_len =
                     (self.mode.e_bands[band + 1] as usize - self.mode.e_bands[band] as usize) << lm;
-                for value in &mut mdct_right[start..start + band_len] {
+                for value in &mut mdct_right[at..at + band_len] {
                     self.rng_seed = bands::celt_lcg_rand(self.rng_seed);
-                    *value = ((self.rng_seed >> 16) as i16) as f32;
+                    *value = ((self.rng_seed as i32) >> 20) as f32;
                 }
-                vq::renormalise_vector(&mut mdct_right[start..start + band_len], 1.0);
+                vq::renormalise_vector(&mut mdct_right[at..at + band_len], 1.0);
             }
             let mut denorm_right = vec![0.0f32; frame_size_48k];
             bands::denormalise_bands(
@@ -340,8 +337,8 @@ impl CeltDecoder {
                 &mdct_right,
                 &mut denorm_right,
                 &right_energy,
-                0,
-                end,
+                start,
+                end.min(21),
                 lm,
                 false,
             );
@@ -364,22 +361,10 @@ impl CeltDecoder {
             }
         }
 
-        self.postfilter_period = 0;
-        self.postfilter_period_old = 0;
-        self.postfilter_gain = 0.0;
-        self.postfilter_gain_old = 0.0;
-        self.postfilter_tapset = 0;
-        self.postfilter_tapset_old = 0;
-        self.old_log_energy2[..nb_ebands].copy_from_slice(&self.old_log_energy[..nb_ebands]);
-        self.old_log_energy[..nb_ebands].copy_from_slice(&left_energy);
         self.prev_energy[..nb_ebands].copy_from_slice(&left_energy);
-        self.old_log_energy2[nb_ebands..2 * nb_ebands]
-            .copy_from_slice(&self.old_log_energy[nb_ebands..2 * nb_ebands]);
         if active_channels == 2 {
-            self.old_log_energy[nb_ebands..2 * nb_ebands].copy_from_slice(&right_energy);
             self.prev_energy[nb_ebands..2 * nb_ebands].copy_from_slice(&right_energy);
         } else {
-            self.old_log_energy[nb_ebands..2 * nb_ebands].copy_from_slice(&left_energy);
             self.prev_energy[nb_ebands..2 * nb_ebands].copy_from_slice(&left_energy);
         }
 

@@ -14,6 +14,7 @@ extern crate alloc;
 extern crate std;
 
 mod bitstream;
+mod boundary;
 mod cabac;
 mod cabac_tables;
 mod cavlc;
@@ -23,6 +24,7 @@ mod decode_cavlc;
 pub mod decoder;
 mod dpb;
 mod error;
+mod ext;
 mod inter_pred;
 mod intra_pred;
 mod mv_pred;
@@ -36,7 +38,8 @@ mod slice;
 mod slice_context;
 mod sps;
 
-pub use decoder::{Decoder, Frame, Limits, OrderedDecoder};
+pub use boundary::FrameBoundary;
+pub use decoder::{Decoder, Frame, Limits, NativeFrame, NativePlane, OrderedDecoder};
 pub use error::DecodeError;
 pub use nal::{
     AvccConfig, NalUnit, NalUnitType, annex_b_ranges, annex_b_units, avcc_ranges, avcc_units,

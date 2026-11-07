@@ -65,7 +65,9 @@ pub fn parse_residual_block_cavlc(
 
     // Total zeros
     let total_zeros = if total_coeff < max_num_coeff as u8 {
-        if max_num_coeff > 4 {
+        if max_num_coeff == 8 {
+            parse_total_zeros_chroma_dc_422(reader, total_coeff)?
+        } else if max_num_coeff > 4 {
             parse_total_zeros(reader, total_coeff)?
         } else {
             parse_total_zeros_chroma_dc(reader, total_coeff)?
@@ -108,7 +110,11 @@ pub fn parse_residual_block_cavlc(
 }
 
 fn parse_coeff_token(reader: &mut BitstreamReader, nc: i32) -> Result<(u8, u8), &'static str> {
-    if nc < 0 {
+    if nc == -2 {
+        let lut = LUT_COEFF_CHROMA_DC_422
+            .get_or_init(|| build_coeff_lut(&COEFF_TOKEN_CHROMA_DC_422, 13));
+        coeff_lut_lookup(reader, lut, 13)
+    } else if nc < 0 {
         let lut = LUT_COEFF_CHROMA_DC.get_or_init(|| build_coeff_lut(&COEFF_TOKEN_CHROMA_DC, 8));
         coeff_lut_lookup(reader, lut, 8)
     } else if nc < 2 {
@@ -294,6 +300,7 @@ static LUT_COEFF_NC0: OnceCell<Vec<CoeffEntry>> = OnceCell::new(); // 16 bits ×
 static LUT_COEFF_NC2: OnceCell<Vec<CoeffEntry>> = OnceCell::new(); // 14 bits × 3 B = 48 KiB
 static LUT_COEFF_NC4: OnceCell<Vec<CoeffEntry>> = OnceCell::new(); // 10 bits × 3 B = 3 KiB
 static LUT_COEFF_CHROMA_DC: OnceCell<Vec<CoeffEntry>> = OnceCell::new(); // 8 bits × 3 B = 768 B
+static LUT_COEFF_CHROMA_DC_422: OnceCell<Vec<CoeffEntry>> = OnceCell::new(); // 13 bits × 3 B = 24 KiB
 
 #[allow(clippy::declare_interior_mutable_const)]
 #[allow(clippy::borrow_interior_mutable_const)]
@@ -825,3 +832,66 @@ static RUN_BEFORE_7PLUS: [(u32, u8, u8); 15] = [
     (0b0000001, 7, 10), (0b00000001, 8, 11), (0b000000001, 9, 12),
     (0b0000000001, 10, 13), (0b00000000001, 11, 14),
 ];
+
+/// Table 9-5, the nC == -2 column: chroma DC of 4:2:2, as (code, length, total, trailing ones).
+#[rustfmt::skip]
+static COEFF_TOKEN_CHROMA_DC_422: [(u32, u8, u8, u8); 30] = [
+    (0b1, 1, 0, 0),
+    (0b0001111, 7, 1, 0),
+    (0b01, 2, 1, 1),
+    (0b0001110, 7, 2, 0),
+    (0b0001101, 7, 2, 1),
+    (0b001, 3, 2, 2),
+    (0b000000111, 9, 3, 0),
+    (0b0001100, 7, 3, 1),
+    (0b0001011, 7, 3, 2),
+    (0b00001, 5, 3, 3),
+    (0b000000110, 9, 4, 0),
+    (0b000000101, 9, 4, 1),
+    (0b0001010, 7, 4, 2),
+    (0b000001, 6, 4, 3),
+    (0b0000000111, 10, 5, 0),
+    (0b0000000110, 10, 5, 1),
+    (0b000000100, 9, 5, 2),
+    (0b0001001, 7, 5, 3),
+    (0b00000000111, 11, 6, 0),
+    (0b00000000110, 11, 6, 1),
+    (0b0000000101, 10, 6, 2),
+    (0b0001000, 7, 6, 3),
+    (0b000000000111, 12, 7, 0),
+    (0b000000000110, 12, 7, 1),
+    (0b00000000101, 11, 7, 2),
+    (0b0000000100, 10, 7, 3),
+    (0b0000000000111, 13, 8, 0),
+    (0b000000000101, 12, 8, 1),
+    (0b000000000100, 12, 8, 2),
+    (0b00000000100, 11, 8, 3),
+];
+
+/// Table 9-9(b): total_zeros of 4:2:2 chroma DC, by total_coeff, as (code, length, value).
+const TOTAL_ZEROS_422: [&[(u32, u8, u8)]; 7] = [
+    &[(0b1, 1, 0), (0b010, 3, 1), (0b011, 3, 2), (0b0010, 4, 3), (0b0011, 4, 4), (0b0001, 4, 5), (0b00001, 5, 6), (0b00000, 5, 7)],
+    &[(0b000, 3, 0), (0b01, 2, 1), (0b001, 3, 2), (0b100, 3, 3), (0b101, 3, 4), (0b110, 3, 5), (0b111, 3, 6)],
+    &[(0b000, 3, 0), (0b001, 3, 1), (0b01, 2, 2), (0b10, 2, 3), (0b110, 3, 4), (0b111, 3, 5)],
+    &[(0b110, 3, 0), (0b00, 2, 1), (0b01, 2, 2), (0b10, 2, 3), (0b111, 3, 4)],
+    &[(0b00, 2, 0), (0b01, 2, 1), (0b10, 2, 2), (0b11, 2, 3)],
+    &[(0b00, 2, 0), (0b01, 2, 1), (0b1, 1, 2)],
+    &[(0b0, 1, 0), (0b1, 1, 1)],
+];
+
+fn parse_total_zeros_chroma_dc_422(
+    r: &mut BitstreamReader,
+    total_coeff: u8,
+) -> Result<u8, &'static str> {
+    let table = TOTAL_ZEROS_422
+        .get(total_coeff as usize - 1)
+        .ok_or("total_coeff out of range for 4:2:2 chroma DC")?;
+    let peek = r.peek_bits(5);
+    for &(code, len, value) in table.iter() {
+        if peek >> (5 - len) == code {
+            r.skip_bits(len);
+            return Ok(value);
+        }
+    }
+    Err("invalid total_zeros for 4:2:2 chroma DC")
+}

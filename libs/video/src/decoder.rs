@@ -92,8 +92,9 @@ impl VideoDecoder<Vec<u8>> {
     /// memory. A sample is read when it's decoded.
     ///
     /// This walks the container, so it takes as long as the disk does. MP4, fragmented or not,
-    /// Matroska and WebM, AVI, FLV and MPEG program streams can do this. Anything else that has
-    /// to be searched for its frames can't, and comes back as [`VideoError::LimitExceeded`].
+    /// Matroska and WebM, AVI, FLV, MPEG program streams, raw H.264 and MJPEG can do this.
+    /// Anything else that has to be searched for its frames can't, and comes back as
+    /// [`VideoError::LimitExceeded`].
     pub fn from_source(file: Box<dyn Source>, limits: DecoderLimits) -> Result<Self> {
         let mut compression = Compression::None;
         let mut dib = None;
@@ -151,6 +152,22 @@ impl VideoDecoder<Vec<u8>> {
                 index.set_uniform_timing(Some(mpeg1::info(&head)?.frame_rate));
                 mpeg1_stream = Some(stream);
                 (head, index)
+            }
+            ContainerFormat::H264 => {
+                let mut start = Vec::new();
+                start.extend_from_slice(window.bytes(0, 64 * 1024));
+                let walked = h264::walk_annex_b(&*file, len as usize, &limits, start)?;
+                let rate = info(&walked.head)?.frame_rate;
+                configs = walked.configs;
+                let mut index = walked.index;
+                index.set_uniform_timing(Some(rate.unwrap_or(DEFAULT_FPS)));
+                (walked.head, index)
+            }
+            ContainerFormat::MotionJpeg => {
+                let (mut index, first) = mjpeg::walk(&*file, len as usize, &limits)?;
+                let rate = info(&first)?.frame_rate;
+                index.set_uniform_timing(Some(rate.unwrap_or(DEFAULT_FPS)));
+                (first, index)
             }
             _ => return Err(VideoError::LimitExceeded("this kind of file can't be streamed")),
         };

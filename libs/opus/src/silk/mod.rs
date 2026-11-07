@@ -18,6 +18,9 @@ mod ltp;
 mod nlsf;
 mod pitch;
 mod plc;
+
+/// Bandwidth expansion of the LPC filter on the first frame after a loss.
+const BWE_AFTER_LOSS_Q16: i32 = 63570;
 mod resampler;
 mod resampler_private;
 mod resampler_rom;
@@ -66,6 +69,8 @@ pub(crate) struct SilkDecoder {
     prev_nlsf_q15: [[i16; tables::MAX_LPC_ORDER]; 2],
     pred_coef_q12: [[[[i16; tables::MAX_LPC_ORDER]; MAX_LPC_HALVES]; MAX_INTERNAL_FRAMES]; 2],
     first_frame_after_reset: [bool; 2],
+    /// The frame being decoded is to be read from its in-band redundant copy.
+    fec: bool,
     prev_decode_only_middle: bool,
     prev_packet_channels: u8,
 }
@@ -90,6 +95,7 @@ impl SilkDecoder {
             prev_nlsf_q15: [[0; tables::MAX_LPC_ORDER]; 2],
             pred_coef_q12: [[[[0; tables::MAX_LPC_ORDER]; MAX_LPC_HALVES]; MAX_INTERNAL_FRAMES]; 2],
             first_frame_after_reset: [true; 2],
+            fec: false,
             prev_decode_only_middle: false,
             prev_packet_channels: 1,
         }
@@ -173,6 +179,7 @@ impl SilkDecoder {
             out[..needed].fill(0);
             return Ok(samples_per_channel);
         }
+        let fs_khz = plc0.fs_khz;
 
         let frame_output_samples = if self.fs_hz == 48_000 {
             self.resampler_state[0]
@@ -194,19 +201,35 @@ impl SilkDecoder {
 
         for _ in 0..conceal_frames {
             let mut internal_pcm = [[0i16; tables::MAX_FRAME_LENGTH]; 2];
+            if packet_channels == 2 && self.prev_decode_only_middle {
+                // The side channel comes back, as it does for a frame with side coding.
+                let side = &mut self.core_state[1];
+                side.out_buf.fill(0);
+                side.s_lpc_q14_buf.fill(0);
+                side.lag_prev = 100;
+                side.last_gain_index = 10;
+                side.prev_signal_type = 0;
+                side.plc.first_frame_after_reset = true;
+                self.first_frame_after_reset[1] = true;
+                self.prev_decode_only_middle = false;
+            }
             for (ch, frame_pcm) in internal_pcm.iter_mut().enumerate().take(packet_channels) {
-                let ch_state = &mut self.core_state[ch];
-                let frame_pcm = &mut frame_pcm[..internal_frame_samples];
-                let (plc_state, lpc_state) = (&mut ch_state.plc, &mut ch_state.s_lpc_q14_buf[..]);
-                plc::plc_conceal(plc_state, lpc_state, frame_pcm, loss_count);
-                let fs_khz = plc_state.fs_khz as u32;
-                let pitch_lag = plc_state.pitch_lag;
-                Self::refresh_conceal_history(
-                    &mut ch_state.out_buf,
-                    &mut ch_state.lag_prev,
-                    pitch_lag,
-                    frame_pcm,
+                plc::conceal(
+                    &mut self.core_state[ch],
+                    &mut frame_pcm[..internal_frame_samples],
                     fs_khz,
+                );
+            }
+            if packet_channels == 2 {
+                let pred = self.stereo_state.pred_prev_q13.map(i32::from);
+                let (left, right) = internal_pcm.split_at_mut(1);
+                stereo::ms_to_lr(
+                    &mut self.stereo_state,
+                    &mut left[0][..internal_frame_samples],
+                    &mut right[0][..internal_frame_samples],
+                    pred,
+                    fs_khz as u32,
+                    0,
                 );
             }
 
@@ -219,11 +242,12 @@ impl SilkDecoder {
             let frame_write =
                 frame_output_samples.min(samples_per_channel.saturating_sub(written_total));
             if self.fs_hz == 48_000 {
-                let mut resampled_pcm = [[0i16; MAX_API_FRAME_SAMPLES_48K]; 2];
+                // One internal frame's worth, of 20 ms at most: this is a deep call, on a small stack.
+                let mut resampled_pcm = [[0i16; 960]; 2];
                 for ch in 0..packet_channels {
                     if let Some(resampler) = self.resampler_state[ch].as_mut() {
                         let frame_pcm = &internal_pcm[ch][..internal_frame_samples];
-                        let expected = resampler.output_len(internal_frame_samples);
+                        let expected = resampler.output_len(internal_frame_samples).min(960);
                         let written = if packet_channels == 2 {
                             resampler.process(frame_pcm, &mut resampled_pcm[ch][..expected])
                         } else {
@@ -314,6 +338,25 @@ impl SilkDecoder {
             packet_idx,
             out,
         )
+    }
+
+    /// Decodes the redundant copy a SILK frame payload carries of what came before it, where
+    /// it has one, and conceals where it hasn't (`FLAG_DECODE_LBRR`).
+    ///
+    /// Params and result as for [`decode_frame`](Self::decode_frame).
+    pub fn decode_fec_frame(
+        &mut self,
+        frame: &[u8],
+        frame_samples_48k: usize,
+        config: u8,
+        packet_channels: u8,
+        packet_idx: usize,
+        out: &mut [i16],
+    ) -> Result<SilkFrameDecode, Error> {
+        self.fec = true;
+        let result = self.decode_frame(frame, frame_samples_48k, config, packet_channels, packet_idx, out);
+        self.fec = false;
+        result
     }
 
     /// Decode one SILK Opus frame payload using a shared entropy decoder.
@@ -439,7 +482,10 @@ impl SilkDecoder {
             );
             // #endregion
         }
-        if let Err(err) = consume_lbrr_payload(
+        let fec = self.fec;
+        if fec {
+            // The redundant data is read in place of the frames themselves.
+        } else if let Err(err) = consume_lbrr_payload(
             &mut dec,
             &parsed,
             packet_channels as usize,
@@ -468,6 +514,7 @@ impl SilkDecoder {
             &mut internal_pcm,
             &mut self.stereo_state,
             &mut self.prev_decode_only_middle,
+            fec,
             packet_idx,
             trace_pkt0,
         ) {
@@ -476,7 +523,7 @@ impl SilkDecoder {
         let mut consumed_redundancy = false;
         let mut redundancy_bytes = 0usize;
         let mut celt_to_silk = false;
-        if !is_hybrid && dec.tell() + 17 <= (8 * frame.len() as i32) {
+        if !fec && !is_hybrid && dec.tell() + 17 <= (8 * frame.len() as i32) {
             celt_to_silk = dec.dec_bit_logp(1);
             redundancy_bytes = frame
                 .len()
@@ -736,6 +783,7 @@ fn consume_main_payload(
     internal_pcm: &mut [[i16; MAX_INTERNAL_FRAMES * tables::MAX_FRAME_LENGTH]; 2],
     stereo_state: &mut stereo::StereoState,
     prev_decode_only_middle: &mut bool,
+    fec: bool,
     packet_idx: usize,
     trace_pkt0: bool,
 ) -> Result<(), Error> {
@@ -744,12 +792,18 @@ fn consume_main_payload(
     for i in 0..internal_frames {
         let mut decode_only_middle = false;
         let mut pred_q13 = [0i32; 2];
-        let mut decoded_frames: [Option<plc::SilkDecodedFrame>; 2] = [None, None];
-        let mut plc_lpc_q12 = [[0i32; tables::MAX_LPC_ORDER]; 2];
-        let mut plc_nb_coefs = [0usize; 2];
         if packet_channels == 2 {
-            pred_q13 = stereo::decode_stereo_pred(dec);
-            decode_only_middle = !header.channels[1].vad_flags[i] && stereo::decode_mid_only(dec);
+            if !fec || header.channels[0].lbrr_flags[i] {
+                pred_q13 = stereo::decode_stereo_pred(dec);
+                let side_coded = if fec {
+                    header.channels[1].lbrr_flags[i]
+                } else {
+                    header.channels[1].vad_flags[i]
+                };
+                decode_only_middle = !side_coded && stereo::decode_mid_only(dec);
+            } else {
+                pred_q13 = stereo_state.pred_prev_q13.map(i32::from);
+            }
             mid_only_flags[i] = decode_only_middle;
             if trace_pkt0 {
                 trace_checkpoint(dec, packet_idx, &format!("after_stereo_i{}", i));
@@ -783,7 +837,22 @@ fn consume_main_payload(
             if ch == 1 && decode_only_middle {
                 continue;
             }
-            let cond = if i == 0 {
+            if fec && !header.channels[ch].lbrr_flags[i] {
+                let pcm_range = i * frame_length..(i + 1) * frame_length;
+                plc::conceal(
+                    &mut core_state[ch],
+                    &mut internal_pcm[ch][pcm_range],
+                    states[ch].fs_khz as i32,
+                );
+                continue;
+            }
+            let cond = if fec {
+                if i > 0 && header.channels[ch].lbrr_flags[i - 1] {
+                    lbrr::CondCoding::Conditionally
+                } else {
+                    lbrr::CondCoding::Independently
+                }
+            } else if i == 0 {
                 if ch > 0 && *prev_decode_only_middle {
                     lbrr::CondCoding::IndependentlyNoLtpScaling
                 } else {
@@ -798,7 +867,7 @@ fn consume_main_payload(
                 &mut states[ch],
                 dec,
                 header.channels[ch].vad_flags[i],
-                false,
+                fec,
                 cond,
             )?;
             if packet_idx == 0 && i == 0 && ch == 0 {
@@ -829,6 +898,11 @@ fn consume_main_payload(
                 i,
                 ch,
             );
+            if core_state[ch].plc.loss_cnt != 0 {
+                let order = tables::nlsf_codebook(states[ch].fs_khz).order;
+                lpc::bw_expand(&mut pred_coef_q12[ch][i][0], order, BWE_AFTER_LOSS_Q16);
+                lpc::bw_expand(&mut pred_coef_q12[ch][i][1], order, BWE_AFTER_LOSS_Q16);
+            }
             if trace_pkt0 && packet_idx == 0 && i == 0 && ch == 0 {
                 trace_lpc(
                     packet_idx,
@@ -893,47 +967,18 @@ fn consume_main_payload(
                 packet_idx,
                 i,
             );
-            let mut ltp_gains = [0i32; tables::MAX_NB_SUBFR];
-            let lag = if frame_params.signal_type == TYPE_VOICED {
-                let pitch_lags = pitch::decode_pitch_lags(
-                    frame_params.lag_index as i32,
-                    frame_params.contour_index as i32,
-                    frame_params.fs_khz as i32,
-                    frame_params.nb_subfr,
-                );
-                let (ltp_coeffs_q14, _) = ltp::decode_ltp_coeffs(
-                    frame_params.per_index,
-                    &frame_params.ltp_indices,
-                    frame_params.nb_subfr,
-                    frame_params.ltp_scale_index,
-                );
-                for (subframe_idx, gain) in
-                    ltp_gains.iter_mut().enumerate().take(frame_params.nb_subfr)
-                {
-                    let summed_q14 = ltp_coeffs_q14[subframe_idx]
-                        .iter()
-                        .map(|coef| i32::from(*coef))
-                        .sum::<i32>()
-                        .max(0);
-                    *gain = summed_q14.clamp(0, 1 << 16);
-                }
-                pitch_lags[frame_params.nb_subfr - 1]
-            } else {
-                0
-            };
-            for (dst, src) in plc_lpc_q12[ch]
-                .iter_mut()
-                .zip(pred_coef_q12[ch][i][1].iter())
-                .take(frame_params.lpc_order)
-            {
-                *dst = i32::from(*src);
-            }
-            plc_nb_coefs[ch] = frame_params.lpc_order;
-            decoded_frames[ch] = Some(plc::SilkDecodedFrame {
-                lag,
-                ltp_gains,
-                output: Vec::new(),
-            });
+            let pcm_range = i * frame_length..(i + 1) * frame_length;
+            plc::after_good_frame(
+                &mut core_state[ch],
+                frame_params.signal_type,
+                &pred_coef_q12[ch][i][1],
+                &prev_nlsf_q15[ch],
+                &mut internal_pcm[ch][pcm_range],
+                frame_params.fs_khz as i32,
+                frame_params.nb_subfr,
+                frame_length / frame_params.nb_subfr,
+                frame_params.lpc_order,
+            );
             if trace_pkt0 && packet_idx == 0 && i == 0 && ch == 0 {
                 trace_core(packet_idx, "exc_Q14", &trace.exc_q14_head);
                 trace_core(packet_idx, "sLPC_Q14", &trace.s_lpc_q14_head);
@@ -960,25 +1005,6 @@ fn consume_main_payload(
             stereo_state
                 .s_mid
                 .copy_from_slice(&frame[frame_length - 2..frame_length]);
-        }
-
-        let pcm_range = i * frame_length..(i + 1) * frame_length;
-        for ch in 0..packet_channels {
-            let Some(mut decoded_frame) = decoded_frames[ch].take() else {
-                continue;
-            };
-            decoded_frame
-                .output
-                .extend_from_slice(&internal_pcm[ch][pcm_range.clone()]);
-            plc::plc_update(
-                &mut core_state[ch].plc,
-                &decoded_frame,
-                &plc_lpc_q12[ch][..plc_nb_coefs[ch]],
-                states[ch].nb_subfr,
-                frame_length / states[ch].nb_subfr,
-                states[ch].fs_khz as i32,
-                plc_nb_coefs[ch],
-            );
         }
 
         *prev_decode_only_middle = decode_only_middle;

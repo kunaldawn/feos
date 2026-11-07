@@ -547,7 +547,7 @@ See [`networking.md`](networking.md).
 
 ## The kernel heap and video path
 
-Most of feos is allocation-free, but the vendored H.264 decoder keeps reference
+Most of feos is allocation-free, but the H.264 decoder keeps reference
 pictures in `alloc` collections. `kernel/src/allocator.rs` provides one arena with a
 sorted free list, a header on each block and a lock that masks interrupts. Usage is
 counters, so asking for it costs nothing, and `realloc` grows into a free neighbour when
@@ -568,8 +568,14 @@ The video path is:
    caller buffer.
 3. H.264 containers call into `feos-h264`, whose reference pictures use the kernel heap, and
    VP8 into `feos_video::vp8`, which allocates when a key frame sets the size. What a damaged
-   H.264 stream doesn't deliver is concealed from the latest reference picture. Interlaced,
-   High10 and 4:2:2 streams are refused.
+   H.264 stream doesn't deliver is concealed from the latest reference picture. The decoding is
+   `libs/h264/src/ext/`, generic over the sample type, `u8` or `u16`, so that a
+   progressive 8-bit stream pays nothing for the rest. A frame store holds a frame's samples
+   whichever way it was coded, and a field is that with a doubled stride. Macroblock state is
+   kept by position in the frame, so that rows alternate between fields, or between the two
+   macroblocks of an MBAFF pair. Reference marking is per field. High 10 and 4:2:2 become 8-bit
+   4:2:0 on output, and fields are woven: nothing deinterlaces them. 4:4:4, FMO and SP slices
+   are refused.
 4. The app scales the RGBA frame with nearest-neighbour sampling into an
    off-screen canvas, letterboxes according to the selected aspect mode, paints
    the VLC-style chrome around it, and copies the completed frame to the ramfb
@@ -590,7 +596,9 @@ as that would read every sample. A fragmented MP4 keeps its sample tables all ov
 opening one reads every `moof` into memory, with a map of where each came from. A program stream
 has no table at all, so opening one reads the whole file once, to note where its video's packets
 and pictures are, and a picture comes together from its packets when it's decoded. Sound in both
-is an ordinary list of packets. Raw H.264, MJPEG files and GIF aren't streamed.
+is an ordinary list of packets. Raw H.264 and MJPEG files are read once on opening to find their
+frames, and H.264's parameter sets are kept in memory, as a seek has to go through them. GIF
+isn't streamed.
 
 ## The audio path
 
