@@ -20,7 +20,7 @@
 //! | FLAC, native and in Ogg | yes, to 16 bits | no |
 //! | Ogg Vorbis | yes | no |
 //! | AAC (LC, Main, LTP, HE and HE v2), in ADTS or raw frames | yes | no |
-//! | Ogg Opus | SILK, CELT and hybrid, by `feos-opus`, up to eight channels | yes |
+//! | Opus, in Ogg (and in Matroska or MP4 through `feos-video`) | SILK, CELT and hybrid, by `feos-opus`, up to eight channels | no |
 //!
 //! ```
 //! use feos_audio_codec::{decode, detect, AudioFormat};

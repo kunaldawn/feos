@@ -1,7 +1,7 @@
 # FEOS-DOS vs rust-dos: feature gap
 
 `rust-dos` is the reference for what a complete DOS box can do. FEOS-DOS is
-built for a `no_std` AArch64 kernel, so some features cannot be copied
+built for a `no_std` kernel on AArch64 and x86_64, so some features cannot be copied
 directly; this table records what exists, what is partial, and what is still a
 project of its own.
 
@@ -17,7 +17,7 @@ implemented.
 | 286 protected mode | yes | 16-bit segments, gates and TSSs |
 | 386/486/Pentium protected mode, paging, v86 | partial | 386 protected mode, rings, paging, task switches and v86, some 486 instructions. No Pentium |
 | DOS/4GW, DOS/4G, DPMI host | yes | DOS/4GW, DOS/4G and `DPMI32VM` on the hardware emulation, and a built-in DPMI 0.9 host for the rest. See the game table in `dosbox.md` |
-| MMX, SSE, 3DNow!, dynamic recompiler | no | beyond the real-mode DOS target |
+| MMX, SSE, 3DNow!, dynamic recompiler | no | beyond the 386/486 target; it's an interpreter |
 | CPU speed control, deterministic mode | yes | `CYCLES n`; guest time follows retired instruction units |
 
 ## DOS and BIOS
@@ -92,8 +92,8 @@ implemented.
 
 | rust-dos feature | FEOS-DOS | Notes |
 |---|---|---|
-| IPX LAN, relay, room browser | no | no network stack |
-| NE2000 behind a router | no | no NIC |
+| IPX LAN, relay, room browser | no | the guest has no network, though FEOS has one |
+| NE2000 behind a router | no | no NIC emulation |
 | Serial mouse / null modem / modem | no | no UART emulation |
 | Joysticks | partial | game port emulated, with no host joystick to feed it |
 | Printer to PDF/PNG | no | no printer |
@@ -106,8 +106,9 @@ first:
 
 1. **Run a real `EMM386.EXE`** or similar on the CPU's virtual-8086 mode, which only has CPU
    tests so far, and find why `DPMI ON` differs for Warcraft II and `32RTM`.
-2. **Key-up events** are in; what's left is real input from a game port.
+2. **A joystick for the game port**: the port is emulated, but the front end has nothing to
+   feed it.
 3. **Paging under the DPMI host**, for clients that want `AX=0507h` and page protection.
-5. **VESA linear frame buffers and more modes.**
-6. **CD-ROM/ISO**, then **NE2000/IPX and serial**.
-7. **Settings window, profiles, recording and cheats.**
+4. **VESA linear frame buffers and more modes.**
+5. **CD-ROM/ISO**, then **NE2000/IPX and serial**.
+6. **Settings window, profiles, recording and cheats.**

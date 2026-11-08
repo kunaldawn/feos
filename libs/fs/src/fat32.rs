@@ -1,10 +1,9 @@
 //! FAT32, read and write.
 //!
 //! The driver understands the FAT32 BPB, long file names (LFN), the FAT
-//! cluster chain, and arbitrary directory trees. It intentionally rejects
-//! FAT12/FAT16 volumes: those use a fixed root-directory area and a different
-//! cluster-count threshold, and this crate targets the format that removable
-//! media uses today.
+//! cluster chain, and arbitrary directory trees. It rejects FAT12/FAT16
+//! volumes, which use a fixed root-directory area and a different
+//! cluster-count threshold: those are [`crate::Fat16`]'s, read-only.
 //!
 //! Metadata is untrusted. A directory that loops, is cross-linked, runs past the
 //! specification's size limit or nests too deeply is skipped, and the volume is

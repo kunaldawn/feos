@@ -38,7 +38,7 @@ and `[net] lease ...` in the log says when it's done.
 | `ping [-c n] [-s size] host` | ICMP echo. The result of a failed `ping` is status 1. |
 | `nslookup name` | Through the name server DHCP gave. |
 | `wget [-O file] http://host[:port]/path` | HTTP/1.0 GET, saved to the VFS, checked against `Content-Length`. |
-| `nc [-s text] [-f file] [-o file] host port` | Sends what it's given, closes its side and takes everything back: to a file with `-o`, or stdout. |
+| `nc [-s text] [-f file] [-o file] host port` | Sends what it's given (`-s`, `-f`, or else standard input), closes its side and takes everything back: to a file with `-o`, or stdout. |
 | `nc -l [-k] [-s text] [-f file] [-o file] port` | The same, for one connection, or for each with `-k`. |
 
 Relative paths are from `/`: external commands have no current directory.
@@ -87,7 +87,5 @@ it reports. Loss and reordering are only tested on the host.
   real randomness in the kernel. Don't rely on this stack against an attacker on the path.
 - A DNS answer's address isn't checked for being one that makes sense. ARP believes what
   it's told, in answer or not.
-- `nc` doesn't read standard input, because external commands don't get it: see
-  `ProcessHost::run_external`. It sends what `-s` or `-f` gives it.
 - `wget` has no HTTPS, redirects or chunked encoding, none of which HTTP/1.0 asks for.
 - Nothing shows the network on the desktop.

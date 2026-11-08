@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-`.cargo/config.toml` defaults the build target to `aarch64-unknown-none`, so host tests **must** pass `--target x86_64-unknown-linux-gnu`. The x86_64 kernel target is the custom hard-float `arch/x86_64/x86_64-feos.json`, built through `scripts/cargo-x64.sh` (`core` from rust-src, unstable flags under `RUSTC_BOOTSTRAP=1`), which every x86_64 build must go through. See the script for why.
+`.cargo/config.toml` defaults the build target to `aarch64-unknown-none`, so host tests **must** pass the host triple, e.g. `--target x86_64-unknown-linux-gnu` (the Makefile uses `HOST_TARGET`). The x86_64 kernel target is the custom hard-float `arch/x86_64/x86_64-feos.json`, built through `scripts/cargo-x64.sh` (`core` from rust-src, unstable flags under `RUSTC_BOOTSTRAP=1`), which every x86_64 build must go through. See the script for why.
 
 ```sh
 make build-arm            # also `make build`; release kernel at target/aarch64-unknown-none/release/feos
@@ -17,6 +17,9 @@ make check-arm            # also `make check`; type-check the workspace for AArc
 make check-x64            # type-check the workspace for x86_64
 make test                 # every host test crate in the Makefile
 make test-gui             # one crate; targets are named test-<lib>
+make clippy               # clippy on both ports and user/, -D warnings (CLIPPY_FLAGS lists allowed lints)
+make fuzz                 # the fuzz-style tests under the optimised `fuzz` profile with overflow checks
+make build-efi            # the UEFI loaders (boot/efi), via scripts/cargo-efi.sh
 
 # One crate, or one test in it
 cargo test -p feos-gui --target x86_64-unknown-linux-gnu
@@ -30,10 +33,10 @@ make bundles              # repack apps/desktop/bundle-src/* into apps/desktop/a
 ```
 
 - `cargo check --workspace` fails without the Makefile's `--exclude` lists, because each arch-specific crate contains target-specific assembly. Use the `check-*` targets, and add any new arch-specific crate to the other target's exclude list.
-- `make test` lists its crates explicitly. A new test crate needs a `test-<name>` target, added to the `test` prerequisites too. `feos-apps` has tests that `make test` does not run: use `cargo test -p feos-apps --target x86_64-unknown-linux-gnu`.
-- Kernel code (`kernel/`, `arch/`, `boards/`, most drivers) has no host tests; verify it by booting. `scripts/boot-test.py arm|x64 <kernel>` boots headless and drives the shell, with `FEOS_BOOT_TEST_ONLY` selecting a phase (`smp`, `irq`, `ram`, `fault`, `sched`, `gicv3` and the storage ones). The `ktest` command (`kernel/src/ktest.rs`) is what those phases run in the guest. By hand: `spawn tick 8 200` a few times in the shell, then `ps` and `kill <pid>`.
-- Display and resource variables differ by entry point. `make run-arm` reads `QEMU_DISPLAY`, `QEMU_SMP` and `QEMU_MEM`. `make run-x64` and `cargo run` go through `scripts/qemu-x64.sh` / `scripts/qemu.sh`, which read `FEOS_DISPLAY`, `FEOS_SMP` and `FEOS_MEM`.
-- No rustfmt or clippy config exists, and there is no CI.
+- `make test` lists its crates explicitly. A new test crate needs a `test-<name>` target, added to the `test` prerequisites (and `.PHONY`) too.
+- Kernel code (`kernel/`, `arch/`, `boards/`, most drivers) has no host tests; verify it by booting. `scripts/boot-test.py arm|x64 <kernel>` (`make boot-test-arm`/`-x64`) boots headless and drives the shell, with `FEOS_BOOT_TEST_ONLY` selecting a phase (`smp`, `irq`, `ram`, `fault`, `sched`, `gicv3`, `net`, `usb`, `efi`, `user`, `hosted`, `native` and more: see the list near the end of the script). The `ktest` command (`kernel/src/ktest.rs`) is what those phases run in the guest. By hand: `spawn tick 8 200` a few times in the shell, then `ps` and `kill <pid>`.
+- Display and resource variables differ by entry point. `make run-arm` and `make run-x64` read `QEMU_DISPLAY`, `QEMU_MEM` and `QEMU_SMP` (`QEMU_SMP_X64` for x86_64) and pass them on, overriding the environment. `cargo run` calls `scripts/qemu.sh` / `scripts/qemu-x64.sh` directly, which read `FEOS_DISPLAY`, `FEOS_SMP` and `FEOS_MEM`.
+- No rustfmt config exists. Clippy is configured by the Makefile's `CLIPPY_FLAGS` and, in the crates that parse untrusted input, a `[lints.clippy]` table of panic lints. `.github/workflows/ci.yml` runs check, test, clippy, fuzz and boot tests, but isn't enabled anywhere yet.
 
 ## Architecture
 
@@ -49,7 +52,7 @@ Rules that keep the layers separate (details in `docs/architecture.md`):
 
 - **Drivers** never print and never hard-code addresses; the board passes the base address to the constructor.
 - **Libs** never depend on a board, driver or the kernel. They use `#![cfg_attr(not(test), no_std)]` so tests run on the host.
-- **Apps** never touch MMIO or arch registers. They get services through `Context::platform` (`feos_app::Platform`: clock, power, cpu, audio, pointer, keyboard, processes, memory, apps, filesystem).
+- **Apps** never touch MMIO or arch registers. They get services through `Context::platform` (`feos_app::Platform`: clock, power, cpu, audio, pointer, keyboard, processes, memory, apps, filesystem, net, display).
 - **The kernel** holds no device logic: boot wiring in `main.rs`, the scheduler's mechanism in `sched.rs`, secondary CPU startup in `smp.rs`, RAM in `memory.rs`, heap in `allocator.rs`, the failure policy in `fatal.rs`, self-tests in `ktest.rs`.
 - Inversions avoid upward dependencies: arch crates call handlers the kernel registers (IRQ, exceptions), and libs resolve apps by name through the `AppRegistry` trait in `Platform::apps`.
 
@@ -61,22 +64,23 @@ Rules that keep the layers separate (details in `docs/architecture.md`):
 
 **Failure.** A fault or panic in a spawned task holding no lock ends just that task (status 139). Anything else stops the machine. Task stacks have guard pages. See `docs/architecture.md`.
 
-**Device interrupts.** `feos_irq` is the handler table. Boards route lines and message-signalled interrupts through `boards/common`'s `IrqRouter`. virtio-blk is the interrupt-driven driver; input and audio playback are polled.
+**Device interrupts.** `feos_irq` is the handler table. Boards route lines and message-signalled interrupts (MSI-X, MSI, then INTx; GICv2m on AArch64, none on GICv3) through `boards/common`'s `IrqRouter`. virtio-blk, virtio-net and xHCI are interrupt-driven, as are HDA codec responses; input (virtio, PS/2, USB) and audio playback are polled.
 
-**Boot flow.** `kmain` initialises the console and vectors, reads firmware's tables (`libs/firmware`: DTB, multiboot, ACPI), sets up RAM (`kernel/src/memory.rs`), the interrupt controller, display, audio and input, builds `Platform`, starts the scheduler and secondaries, then runs the desktop session (`feos_desktop_app::run_session`). When that ends, it drops into the serial shell (`feos_shell::run`).
+**Boot flow.** The kernel is entered by QEMU `-kernel` (multiboot on x86_64, bare ELF with a DTB on AArch64) or by the UEFI loader in `boot/efi`, which passes a `feos_bootinfo::Handoff`. `kmain` initialises the console and vectors, reads firmware's tables (`libs/firmware`: DTB, multiboot, ACPI), sets up RAM (`kernel/src/memory.rs`), the interrupt controller, display, audio, input, USB and the network (`libs/net`, see `docs/networking.md`), builds `Platform`, starts the scheduler and secondaries, then runs the desktop session (`feos_desktop_app::run_session`). When that ends, it drops into the serial shell (`feos_shell::run`).
 
-**Apps and the desktop.** A shell command is a unit struct implementing `feos_app::App`, listed in `REGISTRY` in `apps/commands/src/lib.rs`. Desktop Start-menu entries are separate: `.fapp` bundles (ZIP/TAR with `manifest.yaml` and an icon) in `apps/desktop/apps/`, embedded by `apps/desktop/build.rs`. A manifest's `entry` names a `REGISTRY` command, so a new GUI app usually needs both. Windowed apps implement `App::windowed`, `open_window` and `frame_window`, and draw into a content-sized `Canvas` the desktop provides. Session config is `apps/desktop/desktop.yaml`, embedded at build time.
+**Apps and the desktop.** A shell command is a unit struct implementing `feos_app::App`, listed in `REGISTRY` in `apps/commands/src/lib.rs`. Desktop Start-menu entries are separate: `.fapp` bundles (ZIP/TAR with `manifest.yaml` and an icon) in `apps/desktop/apps/`, embedded by `apps/desktop/build.rs`. A manifest's `entry` names a `REGISTRY` command, so a new GUI app usually needs both. Windowed apps implement `App::windowed`, `open_window` and `frame_window`, and draw into a content-sized `Canvas` the desktop provides. Session config is `apps/desktop/desktop.yaml`, embedded at build time. Pictures come from `assets/icons` through `feos-iconset` (bundles carry `.ico` copies), and the pointer from `assets/cursors` (`.cur`/`.ani`, decoded by `feos-image`).
 
 **GUI.** `feos-gui` is immediate-mode and caller-owned: apps hold all state, `Ui` allocates nothing and keeps no widget tree or z-order, so floating surfaces must be drawn late in the frame. Component reference: `libs/gui/src/components/README.md`.
 
-**Shell.** `apps/shell` (console and registry adapter) -> `feos-sh` (parser, expansion, builtins, line editor) -> `feos-coreutils` (commands, writable overlay VFS) -> `feos-fs`.
+**Shell.** `apps/shell` (console and registry adapter) -> `feos-sh` (parser, expansion, builtins, line editor) -> `feos-coreutils` (commands; `OverlayFs`, a per-shell working directory over the shared VFS) -> `feos-fs`.
 
-**Filesystem image.** Both boards' `build.rs` compile `boards/qemu-virt/fs/` into a `StaticNode` table, so adding a file means rebuilding. Optional `boards/qemu-virt/disk*.img` files (gitignored) are also linked into the kernel. `make games-image` links `data/games/dos.img` this way, which needs more guest RAM than the image size.
+**Filesystem.** Both boards' `build.rs` (via `boards/common/fs_image_build.rs`) compile `boards/qemu-virt/fs/` plus `user/out/<arch>` into a `StaticNode` table, so adding a file to the image means rebuilding. Optional `boards/qemu-virt/disk*.img` files (gitignored) are also linked into the kernel. `make games-image` links `data/games/dos.img` this way, which needs more guest RAM than the image size. At boot `feos_fs::vfs::assemble` builds one shared tree (`feos_fs::Vfs`): the first disk with a filesystem is the root (a blank one is formatted and seeded from the image), otherwise a RAM copy of the image; FAT32, exFAT, read-only FAT12/16 and the journalled native format (`libs/fs/src/native.rs`, never the root) mount alongside. `make run-*` give QEMU a persistent disk under `target/` (`FEOS_DISK=none` for none).
 
-**Heap.** Most code is allocation-free, using fixed-capacity, caller-owned buffers. `kernel/src/allocator.rs` is a heap over frames from `libs/frames`, sized from discovered RAM (at least 64 MiB when it fits), for the few `alloc` users, such as the H.264 decoder. Keep new libs allocation-free where practical.
+**Heap.** Much code is allocation-free, using fixed-capacity, caller-owned buffers. `kernel/src/allocator.rs` (algorithm in `libs/heap`) is a heap over frames from `libs/frames`, half of free RAM with at least 64 MiB when it fits and at most 1 GiB, for the `alloc` users: media decoders, writable filesystems and the VFS, the network stack, xHCI, the mixer. Keep new libs allocation-free where practical, and use `try_reserve` on sizes that come from input.
 
 ## Documentation
 
 - `docs/architecture.md`: layers, interrupt path, audio, video and filesystem paths.
-- `docs/desktop.md`, `docs/terminal.md`, `docs/dosbox.md`, `docs/dosbox-gap.md`: subsystem references.
-- `README.md`: feature and command reference. Its "Notes and limitations" section is stale (it says single core, eight process slots, no heap), so trust `docs/architecture.md` and the code over it.
+- `docs/desktop.md`, `docs/terminal.md`, `docs/networking.md`, `docs/dosbox.md`, `docs/dosbox-gap.md`: subsystem references.
+- `README.md`: feature and command reference. Parts are stale (pending a rewrite), so trust `docs/architecture.md` and the code over it.
+- `vnext.md` is an audit; `vnext-todo.md` tracks what's been done about it.

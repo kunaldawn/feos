@@ -11,8 +11,14 @@ ENV DEBIAN_FRONTEND=noninteractive
 # qemu-system-arm ships qemu-system-aarch64 (used for the `virt` machine);
 # qemu-system-x86 ships qemu-system-x86_64 (used for q35). binutils provides
 # objcopy for the x86_64 flat multiboot image.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+#
+# The downloaded packages stay in a BuildKit cache between builds, outside the
+# image. They go to a directory of their own, because the base image's
+# docker-clean hook deletes them from apt's usual one.
+RUN --mount=type=cache,id=feos-apt-archives,target=/var/cache/feos-apt,sharing=locked \
+    mkdir -p /var/cache/feos-apt/partial \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends -o Dir::Cache::Archives=/var/cache/feos-apt \
         binutils \
         ca-certificates \
         dosfstools \
@@ -42,12 +48,23 @@ ARG CARGO_BUILD_JOBS
 ARG CARGO_PROFILE_RELEASE_LTO
 
 # The test disks are made here so that `make docker-run` starts from a cached
-# build instead of relinking both kernels on every start.
-RUN chmod +x scripts/*.sh scripts/*.py \
+# build instead of relinking both kernels on every start. The UEFI loaders are
+# built too: `make docker-boot-test` runs with no network, so their crates must
+# already be in the image.
+#
+# `COPY . .` above means any change to the tree reruns this step, so cargo builds
+# in a BuildKit cache that outlives the layer, and only what changed is rebuilt.
+# The result is copied to target/, where the image has always had it.
+RUN --mount=type=cache,id=feos-target,target=/var/cache/feos-target \
+    export CARGO_TARGET_DIR=/var/cache/feos-target \
+    && chmod +x scripts/*.sh scripts/*.py \
     && ./scripts/make-test-disks.sh \
     && make user-arm user-x64 \
     && cargo build --release --target aarch64-unknown-none \
-    && ./scripts/cargo-x64.sh build --release
+    && ./scripts/cargo-x64.sh build --release \
+    && make build-efi \
+    && mkdir -p target \
+    && cp -a "$CARGO_TARGET_DIR"/. target/
 
 # `docker run --rm -it feos` builds (cached) and boots the kernel.
 # FEOS_ARCH selects arm (default) or x64. FEOS_DISPLAY picks the QEMU backend:

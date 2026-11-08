@@ -136,9 +136,7 @@ pub fn run_session(
         if keys.poll(now, &mut input) {
             println!();
             println!("[desktop] longest frame {longest_frame_ms} ms");
-            println!("[desktop] log off - returning to the serial shell");
-            shell::set_session_active(false);
-            return SessionExit::LogOff;
+            return log_off(&mut session, platform);
         }
 
         // A virtio keyboard (when QEMU exposes one) feeds the same GUI event
@@ -170,9 +168,7 @@ pub fn run_session(
             .is_some_and(|window| window.runtime.is_some());
         if wants_exit(&input, app_has_keyboard) {
             println!();
-            println!("[desktop] log off - returning to the serial shell");
-            shell::set_session_active(false);
-            return SessionExit::LogOff;
+            return log_off(&mut session, platform);
         }
 
         // Drain the pointer device into this frame's GUI event queue. A
@@ -369,9 +365,7 @@ pub fn run_session(
             animation_period = response.animation_period_ms;
 
             if response.command == StartMenuCommand::LogOff {
-                println!("[desktop] log off - returning to the serial shell");
-                shell::set_session_active(false);
-                return SessionExit::LogOff;
+                return log_off(&mut session, platform);
             }
         }
 
@@ -401,6 +395,20 @@ pub fn run_session(
         input.clear_events();
         platform.clock.idle_ms(FRAME_MS);
     }
+}
+
+/// Ends the session: every open window closes, as on Windows, so the apps
+/// behind them stop with it instead of running on with nothing to show them.
+/// Session services keep running; they belong to the machine, not the
+/// windows.
+fn log_off(session: &mut super::Session, platform: &Platform) -> SessionExit {
+    println!("[desktop] log off - returning to the serial shell");
+    let closed = session.close_all_windows(platform.processes);
+    if closed > 0 {
+        println!("[desktop] closed {closed} window(s)");
+    }
+    shell::set_session_active(false);
+    SessionExit::LogOff
 }
 
 /// Whether this frame's keys ask to leave the desktop.

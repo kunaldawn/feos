@@ -10,34 +10,34 @@ apps/shell        console + app-registry adapter
       |
      feos-sh      lexer, parser, expansion, builtins, line editor
       |
-feos-coreutils    commands, writable overlay VFS, text/system services
+feos-coreutils    commands, OverlayFs (a working directory over the VFS), text/system services
       |
-   feos-fs        the board's compiled-in read-only image
+   feos-fs        the shared VFS: disks, RAM and the compiled-in image
 ```
 
 Nothing in the shell knows about QEMU, the PL011 or a particular board. The
 adapter supplies console streams, platform facts (`uname`, `uptime`, `free`)
-and an external-command host that resolves names through the normal app
-registry. Keyboard input reaches the desktop from the serial console and, when
-QEMU is started with `-device virtio-keyboard-device`, from the graphical
-window as well.
+and an external-command host (`apps/commands/src/host.rs`) that runs app-registry
+commands and `/bin` programs as processes. Keyboard input reaches the desktop from the
+serial console and from the machine's keyboard: virtio, PS/2 or USB.
 
 ## Supported language
 
 | Feature | Notes |
 |---|---|
-| Quoting | `'single'`, `"double"`, backslash escapes, line continuations |
-| Variables | `NAME=value`, `$NAME`, `${NAME}`, `${#NAME}`, `${NAME:-x}`, `${NAME:=x}`, `${NAME:+x}` |
-| Special parameters | `$?`, `$$`, `$#`, `$0`–`$9` |
-| Command substitution | `$(command)` |
-| Arithmetic | `$((expression))` with `+ - * / %`, parentheses and variables; integer only |
-| Globbing | `*`, `?`, `[abc]`, `[a-z]`, `[!abc]` |
-| Word splitting | Unquoted expansions split on whitespace; quoted expansions do not |
+| Quoting | `'single'`, `"double"`, `$'ansi-c'`, backslash escapes, line continuations |
+| Variables | `NAME=value`, `$NAME`, `${NAME}` and the `${}` operators (`:-`, `:=`, `:+`, `:?`, `#`, `%`, `/`, `:offset:length`, `^`, `,`, `${#NAME}`, `${!NAME}`), `readonly`, `declare`/`typeset`; no arrays |
+| Special parameters | `$?`, `$$`, `$!`, `$#`, `$@`, `$*`, `$0`, `$1`… with `shift` and `set --` |
+| Command substitution | `$(command)` and backquotes |
+| Arithmetic | `$((expression))`, `(( ))` and `let`, with C's operators and assignments, on 64-bit integers |
+| Globbing | `*`, `?`, `[abc]`, `[a-z]`, `[!abc]`, `[[:class:]]` |
+| Word splitting | Unquoted expansions split on `IFS`; quoted expansions do not |
 | Lists | `;`, newline, `&&`, `\|\|`, `&` |
-| Pipelines | `cmd1 \| cmd2 \| cmd3` |
-| Redirection | `<`, `>`, `>>`, `2>`, `2>>`, `2>&1`, `&>`, `&>>` |
-| Compound commands | `if`/`elif`/`else`/`fi`, `for`/`in`/`do`/`done`, `while`, `until`, `{ ...; }`, `( ... )` |
-| Builtins | `cd`, `pwd`, `export`, `unset`, `set`, `exit`, `return`, `source`/`.`, `eval`, `alias`, `unalias`, `history`, `help`, `type`, `command`, `read`, `break`, `continue`, `clear`, `sh`/`bash` |
+| Pipelines | `cmd1 \| cmd2 \| cmd3`, `!`, `set -o pipefail` |
+| Redirection | `<`, `>`, `>>`, `>\|`, `<>`, `n>&m`, `n<&-`, `&>`, `&>>` on any descriptor, here-docs (`<<`, `<<-`) and here-strings (`<<<`), on simple and compound commands |
+| Compound commands | `if`/`elif`/`else`/`fi`, `for`/`in`/`do`/`done`, `while`, `until`, `case`/`esac`, `{ ...; }`, `( ... )`, `[[ ... ]]`, functions with `local` |
+| Builtins | `.`, `:`, `alias`, `bash`, `bg`, `break`, `builtin`, `cd`, `clear`, `command`, `continue`, `declare`, `eval`, `exec`, `exit`, `export`, `false`, `fg`, `getopts`, `help`, `history`, `jobs`, `kill`, `let`, `local`, `pwd`, `read`, `readonly`, `return`, `set`, `sh`, `shift`, `source`, `timeout`, `trap`, `true`, `type`, `typeset`, `unalias`, `unset`, `wait`, `which` |
+| Options | `set -e`, `-u`, `-x`, `-f`, `-C`, `-o pipefail` |
 | Interactive editing | Arrows, Home/End, Delete, history, Ctrl-A/E/U/K/W, Ctrl-L, Ctrl-C, Ctrl-D, Ctrl-R, Tab |
 | Zoom (desktop window) | Ctrl-`=`/Ctrl-`+` zooms in, Ctrl-`-` zooms out, Ctrl-`0` resets (1x–4x) |
 | Scripts | `sh script`, `source script`, `bash -c '...'` |
@@ -45,16 +45,16 @@ window as well.
 | Traps | `trap` fires EXIT, ERR, INT, HUP, TERM and QUIT |
 | Job control | `&`, `jobs`, `fg`, `bg`, `wait`, `kill %n`, Ctrl-Z |
 
-Pipelines are executed by running each stage, buffering its output and feeding
-it to the next. This is not a streaming pipe, but it is deterministic and works
-with every finite coreutil. Commands from the app registry (`ps`, `tone`,
-`files`, `player`, …) are intentionally blocked inside pipelines and file
-redirections: they print through the global console and cannot be captured.
+A pipeline's stages run at once, each on a task of its own with bounded pipes between
+them, so `yes | head -1` ends; the last stage stays on the shell's task. Each stage is a
+fork of the shell: a copy of its variables, functions and working directory that writes
+to the same files. App-registry commands run as processes whose console is a pair of
+pipes, so `ps | grep shell`, `$(ps)` and `ps > /tmp/out` work. Apps that draw on the
+framebuffer can't be captured: the serial shell runs one on its own thread, and a
+Terminal asks the desktop to open it in a window. A host without tasks, as in host tests,
+gets buffered pipelines and runs `&` in the foreground.
 
-`&` launches a registered app through the kernel process scheduler when the
-command is external. Builtins and coreutils run in the foreground because they
-share the shell's overlay filesystem and variables; a future job-control layer
-would need a per-process VFS handle to change that.
+The history keeps 200 lines, and `seq` stops at 1,000,000 values.
 
 ## Signals and traps
 
@@ -115,50 +115,47 @@ exFAT and RAM mounts, which have no such thing. `ls -l` and `stat` show real own
 any, and say when they're made up. `fsck [-r] PATH` checks a native filesystem. To run a user program as somebody
 else: `/bin/runas UID GID PROGRAM [ARGS]`. Permissions apply to it.
 
-## Writable filesystem
+## Files
 
-The board compiles a read-only image into the kernel. The terminal wraps it in
-`feos-coreutils::OverlayFs`:
-
-- reads fall through to the base image;
-- writes are stored in an in-RAM `BTreeMap` keyed by absolute path;
-- deleting a base file or directory leaves a tombstone so the base stays
-  untouched;
-- copying or renaming a base subtree materialises it in RAM;
-- the overlay is reset on reboot.
-
-There are no symlinks, hard links, permissions, timestamps or user quotas yet.
-`ls -l`, `stat` and `df` print sensible fixed values.
-
-Each shell instance owns its overlay. The serial terminal and the desktop
-window therefore start from the same read-only image but do not currently see
-each other's writes; that would need a shared VFS handle in `Platform`.
+Every shell, every Terminal and Explorer work on the one shared tree
+(`feos_fs::Vfs`; see [the filesystem path](architecture.md#the-filesystem-path)), so a
+file written in one is there in the others at once. A shell's `OverlayFs` holds only
+its working directory. What's on a disk survives a reboot, being synced about once a
+second. With no disk the root is a RAM copy of the image, and `/tmp` is always in RAM:
+those are gone at power-off. `df` and `mount` show what's where.
 
 ## Coreutils coverage
 
 ```
-basename  cat      cmp      cp       cut      dirname  df       du
-echo      env      expr     false    find     free     grep     head
-hexdump   hostname id       ls       mkdir    mv       nl       nproc
-paste     printenv printf   pwd      rev      rm       rmdir    seq
-sha256sum sort     stat     tac      tail     tee      test     touch
-tr        tree     true     uname    uniq     uptime   wc       whoami
-yes
+[         appinstall arch     awk      base64   basename cat      chmod
+chown     cmp      comm     cp       cut      date     dd       df
+diff      dirname  du       echo     edit     env      expr     false
+file      find     fold     free     fsck     grep     gunzip   gzip
+head      hexdump  hostname id       less     ln       ls       mkdir
+mktemp    mount    mv       nl       nproc    od       paste    printenv
+printf    pwd      readlink realpath rev      rm       rmdir    sed
+seq       sha256sum sort    split    stat     strings  sync     tac
+tail      tar      tee      test     touch    tr       tree     true
+uname     uniq     uptime   wc       whoami   xargs    yes      zcat
 ```
 
-Use `help <command>` or `coreutils <command>` for usage. The implementations
-are intentionally practical rather than byte-for-byte GNU clones; for example
-`grep` uses a small backtracking regex engine with literals, `.`, `*`, `+`,
-`?`, classes and anchors, but no groups or alternation.
+Aliases: `dir` (`ls`), `xxd` (`hexdump`), `nano` (`edit`), `more` (`less`).
 
-`yes` is capped at 10,000 lines because FEOS has no signal delivery yet; a
-truly unbounded `yes` would make the serial console unrecoverable.
+Use `help <command>` or `coreutils <command>` for usage, and `help` alone for the
+builtins, utilities and applications. The implementations are intentionally practical
+rather than byte-for-byte GNU clones. `grep` and `sed` share a backtracking POSIX
+regex engine, basic and extended, with groups, alternation, intervals and
+back-references.
+
+`yes` is capped at 10,000 lines.
 
 ## Examples
 
 ```bash
-# A script stored in the read-only image can be sourced
-source /examples/notes.txt
+# A script can be written and sourced
+printf 'greet() { echo "hello, $1"; }\n' > /tmp/lib.sh
+source /tmp/lib.sh
+greet world
 
 # Count files and show the largest names
 ls /docs | wc -l

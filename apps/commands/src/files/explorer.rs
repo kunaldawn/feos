@@ -8463,6 +8463,7 @@ mod tests {
             platform,
             now_ms: 1000,
             origin: Point::new(0, 0),
+            theme: &feos_gui::Theme::dark(),
             pointer_active: true,
             keyboard_active: true,
             cursor: feos_gui::CursorShape::Arrow,

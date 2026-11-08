@@ -8,20 +8,22 @@
 //! anything. [`VideoDecoder`] keeps a sample table and codec state, so decoding
 //! the next frame costs one frame; all its allocation is fallible and limited
 //! by [`DecoderLimits`]. [`decode_frame`] is a stateless wrapper around it.
+//! A decoder can also read a file through a [`Source`] as it goes, rather than
+//! from memory, and [`audio`] finds a file's sound track for the audio codecs.
 //!
 //! | Container | Demux | Decode |
 //! |-----------|-------|--------|
 //! | GIF (animated) | yes | yes |
-//! | AVI (RIFF) | yes | MJPEG, uncompressed RGB/YUV, RLE8/RLE4, H.264 |
-//! | MP4 / MOV (ISO BMFF) | yes | MJPEG, uncompressed, H.264 |
-//! | Matroska / WebM | yes | MJPEG, uncompressed, H.264 |
+//! | AVI (RIFF) | yes | MJPEG, uncompressed RGB/YUV, RLE8/RLE4, H.264, VP8 |
+//! | MP4 / MOV (ISO BMFF) | yes | MJPEG, uncompressed, H.264, VP8 |
+//! | Matroska / WebM | yes | MJPEG, uncompressed, H.264, VP8 |
 //! | FLV | yes | H.264 |
-//! | IVF | yes | metadata (VP8/VP9/AV1 payload) |
+//! | IVF | yes | VP8 (VP9 and AV1: metadata only) |
 //! | Annex-B H.264 | yes | yes |
 //! | Motion JPEG | yes | yes |
 //! | MPEG-1 elementary and program streams | yes (video only) | yes |
 //!
-//! Other codecs (HEVC, VP8, VP9, AV1, MPEG-2/4, MPEG-1 inside other containers, Theora, ProRes, VC-1, VP6,
+//! Other codecs (HEVC, VP9, AV1, MPEG-2/4, MPEG-1 inside other containers, Theora, ProRes, VC-1, VP6,
 //! H.263, Cinepak) are recognised and described by [`info`]. Their samples are
 //! located by the demuxers, but pixel reconstruction is not implemented yet
 //! and [`decode_frame`] returns [`VideoError::UnsupportedCodec`].

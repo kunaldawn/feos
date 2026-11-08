@@ -1,34 +1,27 @@
 # How the filesystem is put together
 
 `libs/fs` defines the read-only `FileSystem` trait, the writable
-`WritableFileSystem` trait, and three backends:
+`WritableFileSystem` trait, and these backends:
 
-* `StaticFs` — the compiled-in tree used by this image.
-* `Fat32` — FAT32 with long file names, cluster chains and read/write support.
-* `Exfat` — exFAT with UTF-16 names, allocation bitmaps and read/write support.
+* `StaticFs` — the compiled-in tree this file comes from.
+* `Fat32` and `Exfat` — read and write, with long or UTF-16 names.
+* `Fat16` — FAT12 and FAT16, read-only.
+* `Native` — FEOS's own journalled format, with owners, modes and links.
+* `RamFs` — a writable tree in RAM.
 
-`boards/qemu-virt/build.rs` walks `boards/qemu-virt/fs/` at build time and
-generates a flat `StaticNode` table. Each node stores its name, kind, parent
-index, child indices and (for a file) a borrowed byte slice.
+`boards/common/fs_image_build.rs`, run by each board's `build.rs`, walks
+`boards/qemu-virt/fs/` at build time and generates a flat `StaticNode` table,
+adding the user programs as `/bin`. To add a file to the image, drop it into
+`boards/qemu-virt/fs/` and rebuild the kernel.
 
-Adding content:
-
-1. Drop a file into `boards/qemu-virt/fs/`.
-2. Rebuild the kernel.
-
-The file appears in the explorer and in `files ls` automatically.
-
-A FAT32 or exFAT image placed at `boards/qemu-virt/disk.img` is probed at boot
-and mounted instead of the compiled-in tree. The board has no block-device
-driver yet, so that optional mount is read-only; the `feos-fs` read/write
-backends are available to any board that supplies a `WritableBlockDevice`.
-
-`make docker-run` creates `disk-fat32.img` and `disk-exfat.img` inside the
-container, seeds them with the `feos-fs` write API, and mounts both together.
-They appear as `/fat32` and `/exfat`:
+At boot, the first disk with a filesystem becomes the root and later ones appear
+as `/disk1` and so on (`/native<n>` for native disks, `/usb<n>` for USB sticks).
+A blank disk is formatted and seeded from this image. With no disk, the root is a
+RAM copy of the image: you can write to it, and the changes last until power-off.
+`/tmp` and `/dev` are always in RAM.
 
 ```text
-files tree /
-files cat /fat32/hello.txt
-files cat /exfat/café.txt
+df
+ls -l /
+mount
 ```

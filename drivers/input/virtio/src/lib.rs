@@ -336,6 +336,8 @@ impl VirtioInput {
         transport.queue_activate(0, QUEUE_SIZE as u16, desc, avail, used)
     }
 
+    /// Tells the device about every buffer offered since the last call, with one
+    /// notification, or none when there's nothing new.
     fn publish(&mut self) {
         if self.queue.publish() {
             if let Some(transport) = self.transport.as_ref() {
@@ -525,7 +527,9 @@ impl VirtioInput {
         event
     }
 
-    /// Processes one descriptor from the used ring.
+    /// Processes one descriptor from the used ring, and offers its buffer again
+    /// without telling the device: [`poll`](Self::poll) and
+    /// [`poll_key`](Self::poll_key) publish the whole batch with one notification.
     ///
     /// `Some(report)` means a descriptor was consumed, with an optional pointer
     /// report; `None` means the queue is empty.
@@ -554,7 +558,6 @@ impl VirtioInput {
             None
         };
         self.release_descriptor(id);
-        self.publish();
         Some(report)
     }
 
@@ -571,21 +574,32 @@ impl VirtioInput {
 
     /// Returns the next pointer report, if any.
     pub fn poll(&mut self) -> Option<PointerEvent> {
-        loop {
-            if let Some(report) = self.process_next()? { return Some(report) }
-        }
+        // A report is several events, each in its own buffer: X, Y, buttons, SYN.
+        let report = loop {
+            match self.process_next() {
+                Some(Some(report)) => break Some(report),
+                Some(None) => {}
+                None => break None,
+            }
+        };
+        self.publish();
+        report
     }
 
     /// Returns the next key transition from a keyboard device.
     ///
     /// Call this repeatedly until it returns `None`.
     pub fn poll_key(&mut self) -> Option<KeyboardEvent> {
-        loop {
+        let event = loop {
             if let Some(event) = self.take_key() {
-                return Some(event);
+                break Some(event);
             }
-            self.process_next()?;
-        }
+            if self.process_next().is_none() {
+                break None;
+            }
+        };
+        self.publish();
+        event
     }
 }
 

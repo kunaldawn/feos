@@ -2056,3 +2056,27 @@ fn a_file_read_into_the_ems_frame_reaches_the_mapped_page() {
     }
     assert_eq!(dos.bus.dos.last_return & 0xFF, 0x5A);
 }
+
+#[test]
+fn demo_box_has_straight_sides() {
+    let mut dos = DosBox::new(None);
+    drain_batch(&mut dos);
+    type_line(&mut dos, "DEMO");
+    assert!(!dos.is_running());
+    let text = dos.text();
+    let lines: Vec<Vec<char>> = text.lines().map(|line| line.chars().collect()).collect();
+    let top = lines
+        .iter()
+        .position(|line| line.contains(&'\u{c9}'))
+        .expect("no top-left corner");
+    let column = |row: usize, ch: char| lines[row].iter().rposition(|&c| c == ch);
+    let left = lines[top].iter().position(|&c| c == '\u{c9}');
+    let right = column(top, '\u{bb}');
+    assert!(right.is_some(), "no top-right corner");
+    // The middle row's last side and the bottom corners line up with the top.
+    assert_eq!(lines[top + 1].iter().position(|&c| c == '\u{ba}'), left);
+    assert_eq!(column(top + 1, '\u{ba}'), right);
+    assert_eq!(lines[top + 2].iter().position(|&c| c == '\u{c8}'), left);
+    assert_eq!(column(top + 2, '\u{bc}'), right);
+    assert!(lines[top + 1].iter().collect::<String>().contains("FEOS-DOS"));
+}

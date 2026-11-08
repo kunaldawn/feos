@@ -36,6 +36,13 @@ else
 AUDIODEV ?= alsa,id=snd0
 endif
 
+# The docker-run targets use the host's PulseAudio/PipeWire socket when there is
+# one, unless AUDIODEV was given: ALSA's hardware device is exclusive, so on a
+# desktop it's either busy ("Device or resource busy") or takes the sound card
+# away from everything else for as long as QEMU runs.
+PULSE_AUDIODEV := pa,id=snd0
+DOCKER_AUDIODEV ?= $(if $(and $(wildcard $(PULSE_SOCKET)),$(filter file,$(origin AUDIODEV))),$(PULSE_AUDIODEV),$(AUDIODEV))
+
 # Passed through to QEMU by the run scripts on both architectures.
 POINTER_FLAGS ?= -device virtio-tablet-device
 KEYBOARD_FLAGS ?= -device virtio-keyboard-device
@@ -68,8 +75,8 @@ USER_FLAGS      := -C linker=rust-lld -C link-arg=-T$(CURDIR)/user/link.ld -C li
         test-heap test-sched test-hal test-console test-app test-pci test-i8042 test-apic test-gicv2 test-gicv3 test-uart16550 test-intel-hda \
         test-json test-yaml test-image test-audio-codec test-compress test-archive \
         test-h264 test-source test-opus test-video test-text test-bundle test-init test-fs test-keys \
-        test-coreutils test-sh test-abi test-elf test-vm user user-arm user-x64 \
-        test-desktop test-desktop-app test-virtio-input test-virtio-core test-virtio-blk test-virtio-net test-virtio-gpu test-rtc test-net test-xhci test-bootinfo test-dosbox test-dosbox-app test-apps \
+        test-coreutils test-sh test-abi test-elf test-vm user user-arm user-x64 fuzz \
+        test-desktop test-desktop-app test-virtio-input test-virtio-core test-virtio-blk test-virtio-net test-virtio-gpu test-ramfb test-rtc test-net test-xhci test-bootinfo test-dosbox test-dosbox-app test-apps \
         boot-test boot-test-arm boot-test-x64 docker-boot-test \
         bundles games-image games-unlink games-check run-games run-games-x64 audio-demo \
         docker-build docker-run docker-run-arm docker-run-x64 \
@@ -90,11 +97,14 @@ build-x64: user-x64
 
 user: user-arm user-x64
 
+# `cp -p` keeps each program's link time. The boards' build scripts watch
+# user/out, so a fresh mtime on an unchanged copy would rebuild and relink the
+# kernel on every `make build-*` (and every `make docker-run`).
 user-arm:
 	cd user && RUSTFLAGS="$(USER_FLAGS) -C relocation-model=static" \
 		cargo build --release --target $(TARGET_ARM) --target-dir $(USER_TARGET_DIR)
 	mkdir -p user/out/aarch64
-	cd $(USER_TARGET_DIR)/$(TARGET_ARM)/release && cp -f $(USER_BINS) $(CURDIR)/user/out/aarch64/
+	cd $(USER_TARGET_DIR)/$(TARGET_ARM)/release && cp -fp $(USER_BINS) $(CURDIR)/user/out/aarch64/
 
 # A program lives far above 2 GiB, so its code is position-independent, as the x86_64
 # small code model would otherwise want it low, and it's linked at a fixed address.
@@ -102,7 +112,7 @@ user-x64:
 	RUSTFLAGS="$(USER_FLAGS) -C relocation-model=pic -C code-model=small -C link-arg=--no-pie" \
 		$(CARGO_X64) build --release --manifest-path user/Cargo.toml --target-dir $(USER_TARGET_DIR)
 	mkdir -p user/out/x86_64
-	cd $(USER_TARGET_DIR)/$(TARGET_X64)/release && cp -f $(USER_BINS) $(CURDIR)/user/out/x86_64/
+	cd $(USER_TARGET_DIR)/$(TARGET_X64)/release && cp -fp $(USER_BINS) $(CURDIR)/user/out/x86_64/
 
 # The UEFI loaders. Each reads \\feos.elf, a kernel as built above, from its own volume.
 build-efi:
@@ -175,7 +185,18 @@ docker-boot-test: docker-build
 	docker run --rm --network none --entrypoint sh $(IMAGE) \
 		-c 'echo nameserver 127.0.0.1 > /etc/resolv.conf; make boot-test'
 
-test: test-firmware test-frames test-irq test-gfx test-gui test-audio test-mixer test-iconset test-sync test-heap test-sched test-hal test-console test-app test-pci test-i8042 test-apic test-gicv2 test-gicv3 test-uart16550 test-intel-hda test-json test-yaml test-image test-audio-codec test-compress test-archive test-h264 test-source test-opus test-video test-text test-bundle test-init test-fs test-keys test-coreutils test-sh test-abi test-elf test-vm test-desktop test-desktop-app test-virtio-input test-dosbox test-dosbox-app test-apps test-virtio-core test-virtio-blk test-virtio-net test-virtio-gpu test-rtc test-net test-xhci test-bootinfo
+test: test-firmware test-frames test-irq test-gfx test-gui test-audio test-mixer test-iconset test-sync test-heap test-sched test-hal test-console test-app test-pci test-i8042 test-apic test-gicv2 test-gicv3 test-uart16550 test-intel-hda test-json test-yaml test-image test-audio-codec test-compress test-archive test-h264 test-source test-opus test-video test-text test-bundle test-init test-fs test-keys test-coreutils test-sh test-abi test-elf test-vm test-desktop test-desktop-app test-virtio-input test-dosbox test-dosbox-app test-apps test-virtio-core test-virtio-blk test-virtio-net test-virtio-gpu test-ramfb test-rtc test-net test-xhci test-bootinfo
+
+# The fuzz-style tests again, under the `fuzz` profile: optimised, with overflow
+# checks and debug assertions, on a kernel-sized stack. `make test` runs the same
+# tests under the dev profile. FEOS_FUZZ_SCALE=<n> runs n times the inputs.
+FUZZ_CRATES := feos-archive feos-audio-codec feos-bundle feos-compress feos-fs feos-image \
+	feos-init feos-json feos-sh feos-video feos-yaml
+
+fuzz:
+	FEOS_FUZZ_STACK=131072 cargo test --profile fuzz --target $(HOST_TARGET) \
+		$(addprefix -p ,$(FUZZ_CRATES)) --test fuzz
+	cargo test --profile fuzz --target $(HOST_TARGET) -p feos-h264 --test malformed
 
 # Host-side tests. Architecture and board crates contain AArch64 assembly or
 # MMIO, so the test set is explicit rather than `--workspace`.
@@ -314,6 +335,9 @@ test-bootinfo:
 test-virtio-gpu:
 	cargo test -p feos-driver-virtio-gpu --target $(HOST_TARGET)
 
+test-ramfb:
+	cargo test -p feos-driver-ramfb --target $(HOST_TARGET)
+
 test-rtc:
 	cargo test -p feos-driver-pl031 -p feos-driver-cmos-rtc --target $(HOST_TARGET)
 
@@ -427,12 +451,13 @@ define DOCKER_RUN_BODY
 		xhost +si:localuser:$$user +si:localuser:root >/dev/null 2>&1 || true; \
 		trap 'xhost -si:localuser:$$user -si:localuser:root >/dev/null 2>&1 || true' EXIT INT TERM; \
 	fi; \
-	audiod="$(AUDIODEV)"; \
+	audiod="$(DOCKER_AUDIODEV)"; \
 	audiod="$$(printf '%s' "$$audiod" | sed 's#target/audio#/out#')"; \
 	audio_args=""; \
 	case "$$audiod" in \
 		alsa*) audio_args="--device /dev/snd";; \
-		pa*) audio_args="-v $(PULSE_SOCKET):$(PULSE_SOCKET) -e PULSE_SERVER=unix:$(PULSE_SOCKET)";; \
+		pa*) audio_args="-v $(PULSE_SOCKET):$(PULSE_SOCKET) -e PULSE_SERVER=unix:$(PULSE_SOCKET)"; \
+			case "$$audiod" in *server=*) ;; *) audiod="$$audiod,server=unix:$(PULSE_SOCKET)";; esac;; \
 		wav*) mkdir -p target/audio; audio_args="-v $(CURDIR)/target/audio:/out";; \
 	esac; \
 	docker run --rm -it \
@@ -459,16 +484,18 @@ docker-run-x64: docker-build
 	$(call DOCKER_RUN_BODY,x64)
 
 # Headless / remote: serve the display over VNC on localhost:5900. Audio follows
-# the same AUDIODEV rules as `make docker-run`, so WAV output lands in
-# target/audio and ALSA/PulseAudio play live.
+# the same DOCKER_AUDIODEV rules as `make docker-run`, so WAV output lands in
+# target/audio and ALSA/PulseAudio play live. QEMU in the image ignores
+# PULSE_SERVER, so a `pa` backend is given the socket as `server=`.
 define DOCKER_RUN_VNC_BODY
 	@set -e; \
-	audiod="$(AUDIODEV)"; \
+	audiod="$(DOCKER_AUDIODEV)"; \
 	audiod="$$(printf '%s' "$$audiod" | sed 's#target/audio#/out#')"; \
 	audio_args=""; \
 	case "$$audiod" in \
 		alsa*) audio_args="--device /dev/snd";; \
-		pa*) audio_args="-v $(PULSE_SOCKET):$(PULSE_SOCKET) -e PULSE_SERVER=unix:$(PULSE_SOCKET)";; \
+		pa*) audio_args="-v $(PULSE_SOCKET):$(PULSE_SOCKET) -e PULSE_SERVER=unix:$(PULSE_SOCKET)"; \
+			case "$$audiod" in *server=*) ;; *) audiod="$$audiod,server=unix:$(PULSE_SOCKET)";; esac;; \
 		wav*) mkdir -p target/audio; audio_args="-v $(CURDIR)/target/audio:/out";; \
 	esac; \
 	docker run --rm -it -p 127.0.0.1:5900:5900 \

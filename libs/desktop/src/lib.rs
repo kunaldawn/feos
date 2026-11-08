@@ -896,6 +896,45 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
         self.windows.close(index)
     }
 
+    /// Closes every open window, for log off, and stops the processes behind
+    /// them. Returns how many windows were open.
+    ///
+    /// A kill can fail while its target is running on another CPU, so each
+    /// one is retried for a short while; whatever is still left is picked up
+    /// by the next [`tick_session`](Self::tick_session).
+    pub fn close_all_windows(&mut self, processes: &dyn Processes) -> usize {
+        let mut closed = 0;
+        for index in 0..N {
+            if self.close_window(index) {
+                closed += 1;
+            }
+        }
+        for _ in 0..LOG_OFF_KILL_TRIES {
+            let mut live = [ProcessInfo::EMPTY; MAX_PROCESSES];
+            let count = processes.snapshot(&mut live);
+            let mut waiting = false;
+            for slot in &mut self.pending_kill {
+                let Some(pid) = *slot else {
+                    continue;
+                };
+                let alive = live[..count]
+                    .iter()
+                    .any(|process| process.pid == pid && process.state != ProcessState::Exited);
+                if !alive || processes.kill(pid) {
+                    *slot = None;
+                } else {
+                    waiting = true;
+                }
+            }
+            if !waiting {
+                break;
+            }
+            processes.sleep_ms(10);
+        }
+        self.publish_windows();
+        closed
+    }
+
     /// Handles the shortcuts that work no matter what has the keyboard.
     fn handle_shortcuts(&mut self, input: &Input) {
         for (key, modifiers) in input.keys() {
@@ -3905,6 +3944,7 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
                             platform,
                             now_ms,
                             Point::new(content.x, content.y),
+                            &theme.ui,
                             pointer_active,
                             keyboard_active,
                         );
@@ -3929,6 +3969,7 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
                             platform,
                             now_ms,
                             Point::new(visible.x, visible.y),
+                            &theme.ui,
                             pointer_active,
                             keyboard_active,
                         );
@@ -4140,6 +4181,9 @@ fn hosted_failed<const N: usize>(
     true
 }
 
+/// How many times log off asks for a closed window's process to stop.
+const LOG_OFF_KILL_TRIES: usize = 50;
+
 /// Starts a hosted app if needed and runs one frame of it. Returns `true` when
 /// the app asked to close.
 #[allow(clippy::too_many_arguments)]
@@ -4153,6 +4197,7 @@ fn run_hosted_app<const N: usize>(
     platform: &Platform,
     now_ms: u64,
     origin: Point,
+    theme: &feos_gui::Theme,
     pointer_active: bool,
     keyboard_active: bool,
 ) -> bool {
@@ -4164,6 +4209,7 @@ fn run_hosted_app<const N: usize>(
         platform,
         now_ms,
         origin,
+        theme,
         pointer_active,
         keyboard_active,
         cursor: feos_gui::CursorShape::Arrow,

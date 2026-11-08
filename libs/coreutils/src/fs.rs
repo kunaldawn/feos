@@ -1,14 +1,18 @@
-//! A writable in-memory overlay on top of the board's read-only filesystem.
+//! The filesystem view the core utilities work through: the [`Vfs`] trait and
+//! [`OverlayFs`], its one implementation.
 //!
-//! The board compiles a small read-only image into the kernel (`feos-fs`).
-//! A real terminal needs `mkdir`, `cp`, `mv`, `rm`, output redirection and
-//! friends, so this module keeps every mutation in a `BTreeMap` overlay and
-//! leaves the immutable base image untouched. Reads fall through to the base,
-//! writes are captured in RAM, and deletes are recorded as tombstones.
+//! In the kernel the base is the system's shared tree (`feos_fs::Vfs`, reached
+//! through [`FileSystem::tree`]), and [`OverlayFs`] passes every operation
+//! straight to it: every shell, Terminal and Explorer sees the same files, and
+//! symbolic links, hard links, owners, modes and times are whatever the mounted
+//! filesystem keeps. Only the working directory is per-shell.
 //!
-//! The implementation is deliberately lexical: there are no symlinks, hard
-//! links, permissions or timestamps yet. Paths are normalised relative to a
-//! current working directory and never escape the root.
+//! Over a base that is only a read-only [`FileSystem`], as in host tests, it
+//! keeps every change in a `BTreeMap` overlay in RAM instead, under a quota:
+//! reads fall through to the base, writes are captured, and deletes are
+//! recorded as tombstones. That overlay is lexical, with no links, permissions
+//! or times. Either way, paths are normalised relative to the working
+//! directory and never escape the root.
 
 use alloc::collections::BTreeMap;
 use alloc::format;

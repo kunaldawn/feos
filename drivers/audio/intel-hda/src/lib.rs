@@ -1,17 +1,20 @@
 //! Intel High Definition Audio (HDA) driver.
 //!
 //! QEMU exposes an ICH6-compatible HDA controller as `-device intel-hda` with
-//! an `hda-output` codec (playback only). The controller is a PCI device with a
-//! memory BAR; this driver programs the controller's corb/rirb command rings,
-//! discovers the codec's DAC and output pin, and streams interleaved 16-bit PCM
-//! through one output stream descriptor.
+//! an `hda-output` codec (playback only), or `hda-duplex`/`hda-micro`, which add
+//! an input. The controller is a PCI device with a memory BAR; this driver
+//! programs the controller's corb/rirb command rings, discovers the codec's DAC
+//! and output pin, and streams interleaved 16-bit PCM through one output stream
+//! descriptor, and records through the first input stream when the codec has an
+//! input widget.
 //!
 //! # Streaming
 //!
 //! DMA runs cyclically over a ring described by a multi-entry buffer descriptor
 //! list. [`Audio::write`] copies samples in behind what is queued and never
-//! blocks; [`Audio::play`] is built on it. The driver is polled and
-//! interrupt-free, so the ring has to look after itself between calls:
+//! blocks; [`Audio::play`] is built on it. Streaming is polled: only codec
+//! responses can raise an interrupt, when the board wires one. So the ring has
+//! to look after itself between calls:
 //!
 //! - Every poll reads the link position and zeroes what the hardware has just
 //!   played. If the writer falls behind or stops, DMA runs on into silence

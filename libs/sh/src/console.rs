@@ -12,7 +12,7 @@ use feos_coreutils::{Available, Input, Output};
 use feos_sync::SpinLock;
 
 const LINE_BYTES: usize = 1024;
-const TYPE_AHEAD_BYTES: usize = 256;
+const TYPE_AHEAD_BYTES: usize = 1024;
 
 /// How many timer ticks an escape sequence's next byte may take to arrive.
 const PENDING_WAITS: usize = 3;
@@ -60,9 +60,18 @@ fn next_raw() -> Option<u8> {
 
 /// Looks for Ctrl-C without losing what else was typed. A host calls this from
 /// [`crate::Host::poll_cancel`] while a command runs on the serial console.
+///
+/// It stops reading once the type-ahead buffer is full and leaves the rest in
+/// the UART. Reading on and throwing bytes away lost everything typed or pasted
+/// past the first few hundred bytes while a command ran; left where they are,
+/// they hold the sender back (QEMU stops feeding a full FIFO) until the shell
+/// reads them. A Ctrl-C behind a full buffer waits for its turn.
 pub fn poll_interrupt() -> bool {
     let mut tty = TTY.lock();
-    while let Some(byte) = read_byte() {
+    while tty.count < TYPE_AHEAD_BYTES {
+        let Some(byte) = read_byte() else {
+            break;
+        };
         if byte == 0x03 {
             INTERRUPTED.store(true, Ordering::Relaxed);
             tty.count = 0;
@@ -79,11 +88,9 @@ pub fn poll_interrupt() -> bool {
             QUIT.store(true, Ordering::Relaxed);
             continue;
         }
-        if tty.count < TYPE_AHEAD_BYTES {
-            let tail = (tty.head + tty.count) % TYPE_AHEAD_BYTES;
-            tty.type_ahead[tail] = byte;
-            tty.count += 1;
-        }
+        let tail = (tty.head + tty.count) % TYPE_AHEAD_BYTES;
+        tty.type_ahead[tail] = byte;
+        tty.count += 1;
     }
     drop(tty);
     INTERRUPTED.swap(false, Ordering::Relaxed)
@@ -445,6 +452,27 @@ mod tests {
         assert_eq!(input.read_pending(&mut byte), 1);
         assert_eq!(&byte, b"y");
         assert_eq!(input.read_pending(&mut byte), 0);
+    }
+
+    #[test]
+    fn polling_never_drops_what_was_typed_while_a_command_ran() {
+        let _guard = CONSOLE_LOCK.lock().unwrap();
+        INTERRUPTED.store(false, Ordering::Relaxed);
+        // Far more than the type-ahead buffer holds, as a paste would be.
+        let typed: alloc::vec::Vec<u8> = (0..TYPE_AHEAD_BYTES * 4)
+            .map(|index| b'a' + (index % 26) as u8)
+            .collect();
+        feed(&typed);
+        for _ in 0..8 {
+            assert!(!poll_interrupt());
+        }
+        let mut input = ConsoleInput;
+        let mut byte = [0u8; 1];
+        for (index, &wanted) in typed.iter().enumerate() {
+            assert_eq!(input.read_raw(&mut byte), 1);
+            assert_eq!(byte[0], wanted, "byte {index}");
+        }
+        feed(b"");
     }
 
     #[test]

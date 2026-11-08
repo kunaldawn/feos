@@ -5,7 +5,10 @@
 //!
 //! ```text
 //! manifest.yaml   id, name, version, entry point, category, description
-//! icon.bmp        application icon (BMP, PNG, JPEG, PPM or QOI)
+//! icon.ico        application icon (ICO, BMP, PNG, JPEG, PPM or QOI), at most
+//!                 48x48; `icon.bmp` when the manifest names none
+//! icon-32.ico     optional exact 32 and 16 pixel versions, named by
+//! icon-16.ico     `icon_medium` and `icon_small`
 //! ...             any additional resources
 //! ```
 //!
@@ -28,14 +31,16 @@
 //! id: terminal
 //! name: Terminal
 //! version: 1.0.0
-//! entry: gui
+//! entry: terminal
 //! category: System
-//! description: Run the feos control center
-//! icon: icon.bmp
+//! description: Bash-compatible shell with POSIX core utilities
+//! icon: icon.ico
+//! icon_medium: icon-32.ico
+//! icon_small: icon-16.ico
 //! args: ""
 //! window:
-//!   width: 640
-//!   height: 420
+//!   width: 760
+//!   height: 520
 //! ```
 //!
 //! `entry` names an `App` in the shell registry. The desktop uses it when

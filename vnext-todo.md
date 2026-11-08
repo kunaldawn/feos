@@ -30,9 +30,9 @@ Generated from `vnext.md`. `[x]` means fixed and verified, `[~]` means partly do
 - [x] YAML and filesystem: FS-1, FS-2, FS-3, FS-6.
 - [x] Media: MED-1, MED-2, MED-3, MED-4 to MED-8, MED-14.
 - [x] FEOS-DOS: DOS-2, DOS-3, DOS-4, DOS-5, DOS-9, DOS-10.
-- [ ] Add panic-focused clippy lints to parser crates (`string_slice`, `indexing_slicing`, `arithmetic_side_effects`).
-- [~] Add host fuzz targets with a 64 MiB failing allocator and a small-stack thread. See [Testability](#testability). (partial: shell fuzzing runs on a small stack but not under the failing allocator)
-- [ ] Add `overflow-checks = true` to a fuzzing profile, so wraps that release builds hide become failures.
+- [~] Add panic-focused clippy lints to parser crates (`string_slice`, `indexing_slicing`, `arithmetic_side_effects`). (partial: the 16 crates that read untrusted input (image, h264, video, source, audio-codec, opus, elf, fs, archive, compress, yaml, json, firmware, bundle, net, bootinfo) have `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, `unreachable` and `string_slice` in their `[lints.clippy]`, and `make clippy` passes with them as errors. What they flagged was fixed or allowed on the one item with a comment saying why it can't happen. `indexing_slicing` and `arithmetic_side_effects` are on `feos-elf` and `feos-firmware` only, which are clean of both. Not done: those two on the other crates, which have about 20,000 sites between them (5,000 in h264, 7,500 in video); `make fuzz` runs their fuzz tests under overflow checks instead)
+- [x] Add host fuzz targets with a 64 MiB failing allocator and a small-stack thread. See [Testability](#testability). (notes: `libs/sh/tests/fuzz.rs` runs syntax and per-command fuzzing under the parsers' `LimitAllocator` on `run_constrained`'s thread. The allocator can also refuse every request above a size on one thread, `with_request_limit`, so the shell's `try_reserve` budgets take their failure paths without aborting the test: at 256 KiB, `cat`, `sort`, `tr`, `grep`, `$(...)` and `seq` over 2 MiB fail the command, and the shell carries on)
+- [x] Add `overflow-checks = true` to a fuzzing profile, so wraps that release builds hide become failures. (notes: `[profile.fuzz]` inherits release, with overflow checks and debug assertions on and no LTO. `make fuzz` runs every crate's `fuzz` test and h264's `malformed` under it, on a 128 KiB kernel-sized stack (`FEOS_FUZZ_STACK`), and CI runs it. It passes, at 20 times the inputs too)
 
 ### M2: Kernel foundations
 
@@ -463,7 +463,7 @@ Generated from `vnext.md`. `[x]` means fixed and verified, `[~]` means partly do
 
 ### Testability
 
-- [~] **Fuzz everything that parses.** Host targets for inflate, gzip, zlib, ZIP, TAR, `Bundle::manifest`, YAML, JSON, FAT32 and exFAT mount-walk-read, `feos_video::{info, decode_frame}`, `feos_image::decode`, `feos_audio_codec::decode`, and the shell's `lex`, `parse` and each command. Run them under a 64 MiB failing allocator on a small-stack thread, so out-of-memory and recursion count as failures. (partial: parsers run under the failing allocator on a small stack; shell fuzzing has no failing allocator)
+- [x] **Fuzz everything that parses.** Host targets for inflate, gzip, zlib, ZIP, TAR, `Bundle::manifest`, YAML, JSON, FAT32 and exFAT mount-walk-read, `feos_video::{info, decode_frame}`, `feos_image::decode`, `feos_audio_codec::decode`, and the shell's `lex`, `parse` and each command. Run them under a 64 MiB failing allocator on a small-stack thread, so out-of-memory and recursion count as failures. (notes: the shell's `lex`, `parse` and each command now run under the failing allocator on a small stack too, in `libs/sh/tests/fuzz.rs`)
 - [x] **Fix the vacuous H.264 fuzz test.** `libs/h264/tests/malformed.rs:49-67` has no SPS or PPS, so every input stops early. Seed it with `mini.h264` and mutate.
 - [x] **Add a differential shell suite.** Run about 200 lines of scripts on host `dash` or `bash` and on `feos-sh`, comparing stdout and status. Also run the examples in `docs/terminal.md` as tests. `exec.rs` and `editor.rs` have no direct tests.
 - [x] **Add a CPU conformance suite for DOS.** Per-instruction JSON test vectors for the 8086. `Cpu` is already generic over `Bus`, and `cpu.rs:1677-1696` has a flat memory bus. Today there are 3 CPU tests and none cover flags. Add table-driven FPU tests. (done with a substitute: JSON vectors recorded from the host's own CPU by `scripts/gen-dos-cpu-vectors.py`, as no published 8086 set was available offline. They found a DAS borrow bug. They run in 32-bit mode and don't cover 8086-specific behaviour)
@@ -471,7 +471,7 @@ Generated from `vnext.md`. `[x]` means fixed and verified, `[~]` means partly do
 - [x] **Add scripted input tests for `Desktop::render_with_platform`.** Enter and Ctrl+Esc with an app focused, Start-menu click-through, Tab onto a minimized window.
 - [x] **Add golden-image tests.** `taskmgr.rs` and `explorer.rs` already render to a host canvas, and `preview_tests` writes PPMs without comparing them. Include minimum and tiny canvases.
 - [x] **Add property tests for `TextBuffer`.** Cursor and anchor always in bounds and on char boundaries.
-- [~] **Add mock driver tests.** `ConfigSpace` is already mockable; cover the PCI scan, `push_mouse`, `decode_keyboard`, BDL and verb encoding, the ramfb block, and virtqueue handling. (partial: PCI, i8042, HDA and virtqueue covered; the ramfb block has no test)
+- [x] **Add mock driver tests.** `ConfigSpace` is already mockable; cover the PCI scan, `push_mouse`, `decode_keyboard`, BDL and verb encoding, the ramfb block, and virtqueue handling. (notes: ramfb reaches fw_cfg through a `ConfigFiles` trait now, so `make test-ramfb` checks the 28-byte block byte for byte against a fake, and that a missing item, a wrong size or a refused write configures nothing)
 - [x] **Move kernel logic to testable crates.** A `libs/heap` crate so the allocator's tests finally run, and the same for `next_runnable` and the state machine.
 - [x] **Add fixtures that today's tests can't see.** CABAC, B-frames, High profile, rotated video, widths not divisible by 4, multi-sector clusters, 4 KiB sectors, cycles, truncated chains and bad BPBs.
 - [x] **Assert struct layouts.** `offset_of!` for the AArch64 `TrapFrame` (`arch/aarch64/src/irq.rs:40-41` checks only size and alignment) and for x86 `xmm` and `r15`.
@@ -523,7 +523,7 @@ Generated from `vnext.md`. `[x]` means fixed and verified, `[~]` means partly do
 - [x] Keep allocator counters instead of an O(n) scan under the lock (`kernel/src/allocator.rs:347-357`), and add in-place `realloc`, because the default doubles peak use when a `Vec` grows.
 - [x] Use the vector already in the x86 `TrapFrame` instead of up to 8 MMIO reads per tick (`drivers/interrupt/apic/src/lib.rs:100`).
 - [x] Use a ticket lock, and `wfe`/`sev` on AArch64 (`libs/sync/src/lib.rs:50-60`). (`IrqSpinLock` is the ticket lock; `SpinLock` can't be one, because a preempted or killed waiter would hold up the queue)
-- [~] Batch virtio `publish` per poll, and set `VIRTQ_AVAIL_F_NO_INTERRUPT` while polled (`drivers/input/virtio/src/lib.rs:526,768-769`). (partial: `VIRTQ_AVAIL_F_NO_INTERRUPT` is set; publish still runs per event)
+- [x] Batch virtio `publish` per poll, and set `VIRTQ_AVAIL_F_NO_INTERRUPT` while polled (`drivers/input/virtio/src/lib.rs:526,768-769`). (notes: `VIRTQ_AVAIL_F_NO_INTERRUPT` is set, and the buffers a `poll` or `poll_key` call recycles are published with one notification when it returns, where each event took one: a pointer report is several. Event-index and `VIRTQ_USED_F_NO_NOTIFY` aren't negotiated or read, as before. Boot-tested on both ports, including x64's virtio-pci-only input phase and arm's Settings clicks through the virtio tablet)
 - [x] Read seeks restart from the first cluster on every call, making `coreutils` 4 KiB chunking O(n²) (`libs/fs/src/fat32.rs:368-374`, `libs/fs/src/exfat.rs:370-376`). Add a per-file cursor or extent map.
 - [x] Each sub-block read clears an 8 KiB scratch (`libs/fs/src/volume.rs:68,113`). Add a sector cache.
 - [x] `visited.contains` is O(n²) at mount (`fat32.rs:325`, `exfat.rs:325`). Use a bitset.
@@ -546,24 +546,34 @@ Generated from `vnext.md`. `[x]` means fixed and verified, `[~]` means partly do
 
 - [x] Keep one source of truth for QEMU flags. `Makefile:37` and the two scripts can drift.
 - [x] Add `-accel` passthrough to the scripts.
-- [~] `FEOS_TEST_DISKS=1` forces a full LTO rebuild on every container start, and `COPY . .` invalidates the build layer on any change. Generate disks at image build, and use BuildKit cache mounts. (partial: disks are made at image build; no BuildKit cache mounts, and `COPY . .` still invalidates the build layer)
+- [x] `FEOS_TEST_DISKS=1` forces a full LTO rebuild on every container start, and `COPY . .` invalidates the build layer on any change. Generate disks at image build, and use BuildKit cache mounts. (notes: disks are made at image build. The apt step keeps downloaded packages in a BuildKit cache, and the build step builds in one and copies the result to `target/`, where the image has always had it, so the image's contents are as before. `COPY . .` still reruns the build step on any change, but it's incremental now: with a warm cache, a one-file change rebuilt the image in 80 s, relinking the kernels only. The cargo registry isn't cached, as `build-std`'s crates have to be in the image for offline runs)
 - [x] Exclude `data/` from the Docker context when it isn't needed.
 - [x] Add `debug = "line-tables-only"`, which doesn't affect the loaded image.
-- [ ] Make clippy warnings fail CI once the 227 current warning lines are cleared.
+- [x] Make clippy warnings fail CI once the 227 current warning lines are cleared. (notes: `make clippy` runs clippy over both ports and the user programs with `-D warnings`, and `.github/workflows/ci.yml` has a job for it. The warnings were fixed, by hand or `clippy --fix`, except for eight style lints the Makefile's `CLIPPY_FLAGS` allows with the reason: index loops in DSP code, argument counts, large enum variants (boxing would allocate), complex types, `!(x > 0.0)` for NaN, `next`/`from_str` names, `Result<_, ()>` and `chunks_exact` with a constant. The workflow file isn't enabled anywhere yet)
 
 ## Documentation
 
-- [ ] CLAUDE.md: correct everything listed in `vnext.md`
-- [ ] README.md: correct everything listed in `vnext.md`
-- [ ] docs/architecture.md: correct everything listed in `vnext.md`
-- [ ] docs/terminal.md: correct everything listed in `vnext.md`
-- [ ] docs/desktop.md: correct everything listed in `vnext.md`
-- [~] docs/dosbox.md and docs/dosbox-gap.md: correct everything listed in `vnext.md` (partial: both rewritten for the DOS work here; not checked line by line against `vnext.md`)
-- [ ] Filesystem and media doc comments: correct everything listed in `vnext.md`
+- [x] CLAUDE.md: correct everything listed in `vnext.md` (notes: run variables, `disk*.img` ignore, the kill smoke test, plus what changed since: clippy, fuzz and CI, interrupt-driven drivers, boot paths, the shared VFS, heap sizing, `feos-apps` now in `make test`)
+- [x] README.md: correct everything listed in `vnext.md` (done by the README rewrite below)
+- [x] docs/architecture.md: correct everything listed in `vnext.md` (notes: the listed items were already right, or fixed in code comments, by the time this was checked; also corrected the display, HDA and PCI paths, the heap's users, the filesystem path (rewritten for the shared VFS and disks), the boot-test phases, and added clippy, fuzz and CI)
+- [x] docs/terminal.md: correct everything listed in `vnext.md` (notes: language table, pipelines and the files section rewritten from the code; the coreutils list is generated from `COMMANDS`; the `source` example now sources a script)
+- [x] docs/desktop.md: correct everything listed in `vnext.md` (notes: sample manifest, app count, Ctrl-D, input devices, Alt shortcuts, layout tree, run-time `appinstall`; UI-17's autostart sample works now, so it stays)
+- [x] docs/dosbox.md and docs/dosbox-gap.md: correct everything listed in `vnext.md` (notes: the listed claims are gone or true after the rewrite; fixed the RAM note, the gap table's real-mode and network wording and its numbering, and the guest's stale `ABOUT` text. `data/games/README.md` and `GAMES.TXT` checked)
+- [x] Filesystem and media doc comments: correct everything listed in `vnext.md` (notes: `feos-fs`, FAT32, exFAT and YAML headers, `feos-coreutils::fs`, `feos-bundle`'s icon names, `feos-video`'s table and README (VP8, MPEG-1, streaming, audio), `feos-audio-codec`'s Opus row, the HDA driver header, the player header, and the text files in the embedded image, `media/README.txt` included)
 
 ## Added requests
 
-- [ ] Rewrite `README.md` with more screenshots and full capabilities (do last, from the final kernel)
+- [x] Bugs seen while taking README screenshots:
+  - [x] Stale boot log: `[sched] preemptive round-robin at 100 Hz, 32 process slots` and the AArch64 banner "a tiny aarch64 kernel" (now `[sched] preemptive, priorities 0-15, 10 ms slices on a one-shot timer per CPU, 32 process slots` and `feos 0.1.0 - aarch64 kernel`; no test matched the old text)
+  - [x] Component Gallery doesn't fit its window (labels cut off: "Notification", "Compact dens", "New w..."), Compact density has no visible effect, and chart y-axis labels run upside down (0 at the top) (notes: short sidebar labels, buttons sized to their text, subtitles and hints ellipsized to the room left, the page scrolls when a tab is taller than the window; Compact switches to `Theme::compact()`; `feos-gui` charts label the top grid line with the maximum; README screenshot retaken)
+  - [x] Task Manager Processes tab: Image Name runs into the PID column ("File Explorer1000000"); list header and selection stay blue under the xp-olive theme (notes: the overflow was the seven-digit hosted-window PID; every cell is clipped to its column and the PID column fits seven digits; `WindowContext::theme` carries the desktop's widget theme, and title, header and selection colours follow its accent, classic XP colours for xp-blue)
+  - [x] FEOS-DOS `DEMO`: BOX.COM's box draws misaligned (right border detached) (notes: two causes: BOX.COM's middle row was five cells wider than its top and bottom, and the double-line corner and tee glyphs in `libs/dosbox/src/font.rs` ended their lines in the wrong column)
+  - [x] x86_64 serial shell drops characters when typed at ~100 chars/s (notes: the shell's Ctrl-C poll while a command runs drained the UART into a 256-byte type-ahead buffer and threw the rest away; it now stops at a full buffer (now 1 KiB), so QEMU holds the rest back. Same code on arm. The 16550 driver also no longer drops a good byte on an overrun flag. A 4.3 KB burst arrives whole on both ports)
+  - [x] Logging off leaves open windows' apps running (`dosbox`, `dos-vm`, `mixer` in `ps`); decide and fix if unintended (notes: unintended; log off now closes every window and stops their processes. `mixer` is the audio service: it starts with the first stream and exits 3 s after the last closes, so it goes once `dos-vm` does. Session services keep running)
+  - [x] `play` usage text omits Opus (now "play a WAV, AIFF, AU, MP3, FLAC, Vorbis, Opus or AAC file, or the sound of a video")
+  - [x] Explorer view-mode count: source header says five, `docs/architecture.md` says four (five is right: Details, Icons, List, Tiles, Thumbnails; the doc is fixed)
+- [x] Fix `make docker-run-x64`: reported not working (owner request; check `make docker-run-arm` and the `docker-run-vnc-*` targets too)
+- [x] Rewrite `README.md` with more screenshots and full capabilities (do last, from the final kernel) (notes: rewritten from the code and docs; 10 new screenshots in `docs/screenshots/` from release kernels of both ports, `docs/desktop.png` and `docs/dosbox.png` refreshed, six stale README-only images removed)
 - [x] Build an organised iconset in `assets/icons/` from the supplied icons
 - [x] Use the new icons in the desktop bundles, with an ICO decoder
 - [~] Use the `assets/icons` iconset for every icon in FEOS, replacing all icons drawn in code (owner request) (partial: every picture is from the iconset, through `feos-iconset`, including `feos_gui::Icon` where a picture matches; small UI marks and symbols the iconset has no picture for stay drawn: caption buttons, chevrons, arrows, check, plus/minus, close, scroll and combo arrows, checkboxes and radio buttons, warning triangle, success, play/pause, rating stars, the Start flag, Show Desktop, the Turn Off dialog's buttons, and Explorer's Back/Forward/Up)

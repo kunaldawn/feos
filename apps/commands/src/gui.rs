@@ -232,7 +232,13 @@ fn localise_input(context: &WindowContext<'_, '_>, input: &mut Input) {
 
 /// Draws the gallery and returns the pointer its widgets asked for.
 fn render(canvas: &mut Canvas, state: &mut DemoState, arch: &str) -> feos_gui::CursorShape {
-    let theme = Theme::dark();
+    // Compact density swaps in the smaller metrics: text, controls and gaps
+    // all shrink, and the fixed regions below leave more room around them.
+    let theme = if state.compact {
+        Theme::compact()
+    } else {
+        Theme::dark()
+    };
     let DemoState {
         input,
         interaction,
@@ -303,8 +309,15 @@ fn render(canvas: &mut Canvas, state: &mut DemoState, arch: &str) -> feos_gui::C
     ui.row(Rect::new(20, 9, (width - 40).max(0) as u32, 36), 12, |ui| {
         ui.badge("FEOS", palette.accent);
         ui.heading("Control Center");
-        ui.label_muted(&alloc::format!("QEMU {arch} / ramfb / XRGB8888"));
-        ui.avatar("KD", palette.accent, 28);
+        let avatar = 28;
+        fit_text(
+            ui,
+            &alloc::format!("QEMU {arch} / ramfb / XRGB8888"),
+            avatar + 12,
+            metrics.font_scale,
+            palette.text_muted,
+        );
+        ui.avatar("KD", palette.accent, avatar);
     });
 
     // Sidebar -------------------------------------------------------------
@@ -337,8 +350,9 @@ fn render(canvas: &mut Canvas, state: &mut DemoState, arch: &str) -> feos_gui::C
 
         ui.separator();
         ui.label_muted("SYSTEM");
-        ui.checkbox(notifications, "Notifications");
-        ui.checkbox(compact, "Compact density");
+        // Short labels: the sidebar is 210 pixels wide at the desktop text size.
+        ui.checkbox(notifications, "Alerts");
+        ui.checkbox(compact, "Compact");
         if ui.button("About").clicked {
             *dialog_open = true;
         }
@@ -347,7 +361,7 @@ fn render(canvas: &mut Canvas, state: &mut DemoState, arch: &str) -> feos_gui::C
         }
         ui.space(metrics.section_gap);
         ui.badge("GUI v0.1", palette.success);
-        ui.label_muted("widgets / layout / charts");
+        wrapped_note(ui, "widgets / charts");
     });
 
     // Main content --------------------------------------------------------
@@ -357,7 +371,10 @@ fn render(canvas: &mut Canvas, state: &mut DemoState, arch: &str) -> feos_gui::C
         (width - 270).max(0) as u32,
         (height - 100).max(0) as u32,
     );
-    ui.column(main, 14, |ui| {
+    // The denser tabs are taller than a 1024x768 screen at the desktop text
+    // size, so the page scrolls; each tab keeps its own offset.
+    let page_id = Id::from_name("gallery-page").child(*tab as u64);
+    ui.scroll_area_with_id(page_id, main, |ui| {
         let title = match *tab {
             0 => "Overview",
             1 => "Charts",
@@ -370,14 +387,23 @@ fn render(canvas: &mut Canvas, state: &mut DemoState, arch: &str) -> feos_gui::C
         ui.row(header, 12, |ui| {
             ui.heading(title);
             let (tag, subtitle) = match *tab {
-                2 => ("KIT", "reusable pieces"),
-                3 => ("DESKTOP", "Window-style controls"),
-                4 => ("PATTERNS", "advanced composition"),
-                _ => ("LIVE", "all systems nominal"),
+                2 => ("KIT", "reusable"),
+                3 => ("DESKTOP", "window controls"),
+                4 => ("PATTERNS", "composition"),
+                _ => ("LIVE", "systems nominal"),
             };
             ui.badge(tag, palette.success);
-            ui.label_muted(subtitle);
-            if ui.button_sized(130, "New window").clicked {
+            // The button keeps its full label; the subtitle gets what's left.
+            let button = "New window";
+            let button_width = ui.painter.text_width(button, metrics.font_scale) + metrics.padding_x * 2;
+            fit_text(
+                ui,
+                subtitle,
+                button_width + 12,
+                metrics.font_scale,
+                palette.text_muted,
+            );
+            if ui.button(button).clicked {
                 window.open = true;
             }
         });
@@ -464,10 +490,10 @@ fn render(canvas: &mut Canvas, state: &mut DemoState, arch: &str) -> feos_gui::C
                 ui.settings_card(
                     card,
                     Icon::Sun,
-                    "Appearance",
-                    "Use the dark palette",
+                    "Density",
+                    "Smaller text and controls",
                     |ui| {
-                        ui.toggle_button(compact, "Dark");
+                        ui.toggle_button(compact, "Compact");
                     },
                 );
                 let line = ui.allocate(0, 40);
@@ -865,10 +891,16 @@ fn render(canvas: &mut Canvas, state: &mut DemoState, arch: &str) -> feos_gui::C
                     if ui.button_sized(120, "Apply").clicked {
                         *clicks = clicks.saturating_add(1);
                     }
-                    if ui.button_sized(120, "Open panel").clicked {
+                    if ui.button("Open panel").clicked {
                         window.open = true;
                     }
-                    ui.label_muted("fixed-capacity text, no allocator");
+                    fit_text(
+                        ui,
+                        "fixed-capacity text, no allocator",
+                        0,
+                        metrics.small_scale,
+                        palette.text_muted,
+                    );
                 });
             });
         }
@@ -932,7 +964,7 @@ fn render(canvas: &mut Canvas, state: &mut DemoState, arch: &str) -> feos_gui::C
             ui.checkbox(notifications, "Notifications enabled");
             ui.slider(volume, 0.0, 1.0);
             ui.text_input(name);
-            ui.label_muted("Changes are local to this demo frame.");
+            wrapped_note(ui, "Changes are local to this demo frame.");
         });
         let _ = response;
     }
@@ -967,8 +999,44 @@ fn render(canvas: &mut Canvas, state: &mut DemoState, arch: &str) -> feos_gui::C
         }
     }
 
-    let _ = (compact, notes);
+    let _ = notes;
     ui.cursor()
+}
+
+/// Draws one line of `text` in the space left in the current row, less
+/// `reserve` pixels for what follows it, ending in `...` when it doesn't fit.
+fn fit_text<const N: usize>(
+    ui: &mut Ui<'_, '_, '_, N>,
+    text: &str,
+    reserve: i32,
+    scale: u32,
+    color: Color,
+) {
+    let (available, _) = ui.remaining();
+    let gap = ui.theme.metrics.gap;
+    let room = (available - reserve - gap).max(0);
+    let width = ui.painter.text_width(text, scale).min(room);
+    let height = ui.painter.text_height(text, scale);
+    let rect = ui.allocate_sized(width, height);
+    ui.painter.draw_text_ellipsis(
+        rect,
+        text,
+        color,
+        scale,
+        Align::Start,
+        VerticalAlign::Middle,
+    );
+}
+
+/// Draws small muted text wrapped to the width of the current column.
+fn wrapped_note<const N: usize>(ui: &mut Ui<'_, '_, '_, N>, text: &str) {
+    let scale = ui.theme.metrics.small_scale;
+    let color = ui.theme.palette.text_muted;
+    let (width, _) = ui.remaining();
+    let width = width.max(1);
+    let height = ui.painter.wrapped_text_height(width, text, scale);
+    let rect = ui.allocate(width, height);
+    ui.painter.draw_text_wrapped(rect, text, color, scale);
 }
 
 #[cfg(test)]

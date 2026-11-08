@@ -10,10 +10,8 @@ from an *application folder* of single-file bundles.
 ## Booting into the desktop
 
 On a graphical boot the kernel draws the splash, waits 1.5 seconds, and then
-starts the desktop automatically. QEMU supplies a virtio tablet and (with the
-default run flags) a virtio keyboard, so the desktop is driven with a real
-pointer and the graphical window accepts typing. The serial console remains a
-keyboard and works alongside it:
+starts the desktop automatically. The machine's pointer and keyboard (virtio,
+PS/2 or USB) drive it, and the serial console remains a keyboard alongside them:
 
 | Input | Action |
 |-------|--------|
@@ -27,9 +25,12 @@ keyboard and works alongside it:
 | `Enter` | Launch the highlighted application |
 | `Space` | Open the Start menu from the desktop; toggle All Programs while it is open |
 | `Ctrl+Esc` | Open the Start menu even while an application has focus |
+| `Alt+Tab`, `Alt+Shift+Tab` | Focus the next or previous window |
+| `Alt+F4` | Close the focused window, or open Turn Off Computer with none |
+| `Alt+Space` | Open the focused window's menu |
 | `Tab` | Toggle All Programs, or focus the next window when the menu is closed |
 | `Esc` | Close the Start menu |
-| `Ctrl-\` | Leave the desktop and return to the serial shell (`Ctrl-D` also works) |
+| `Ctrl-\` | Leave the desktop and return to the serial shell (in the session, `Ctrl-D` goes to the focused app) |
 
 The Start menu starts closed, like XP: click **start** (or press `Space`) to
 open it. Hovering an item moves the highlight, a single click launches it, and
@@ -41,12 +42,12 @@ opens Date and Time Properties, and the taskbar's Show Desktop button
 minimises every window and restores them on a second click. The Start menu's
 "Log Off" button asks for confirmation and then behaves like `Ctrl-\`.
 
-The pointer is a `virtio-tablet-device` (absolute coordinates) or
-`virtio-mouse-device` (relative coordinates) on QEMU's virtio MMIO bus. The
-keyboard is a `virtio-keyboard-device`; its Linux-evdev transitions are decoded
-by `feos-keys::EvdevKeys`. Both devices are auto-detected by
-`feos-driver-virtio-input`. When neither is present the desktop still works
-from the serial keyboard.
+The pointer is a virtio tablet (absolute coordinates) or mouse (relative
+coordinates), on the virtio MMIO bus on AArch64 and on PCI on q35, a PS/2 mouse
+on q35, or a USB mouse or tablet. The keyboard is likewise virtio, PS/2 or USB;
+virtio's Linux-evdev transitions are decoded by `feos-keys::EvdevKeys`. The
+virtio devices are auto-detected by `feos-driver-virtio-input`. With none
+present the desktop still works from the serial keyboard.
 
 Run the same session from the shell:
 
@@ -54,7 +55,7 @@ Run the same session from the shell:
 feos> desktop
 [desktop] session started
 [desktop] click Start, double-click desktop icons, drag windows; Ctrl-\ returns to the shell
-[desktop] 7 application(s) discovered in the application folder (0 skipped)
+[desktop] 13 application(s) discovered in the application folder (0 skipped)
 ```
 
 Other forms are useful on a serial-only boot:
@@ -79,13 +80,17 @@ libs/desktop/src/
 ├── paint.rs        # wallpaper, icon scaling, clock, Start flag, pointer
 ├── taskbar.rs      # Start button, quick launch, task buttons, tray
 ├── start_menu.rs   # pinned apps, All Programs, commands, Run dialog, power footer
-└── window.rs       # z-order, focus, move/resize, minimize/maximize
+├── window.rs       # z-order, focus, move/resize, minimize/maximize
+├── keyboard.rs     # keyboard layouts
+├── notify.rs       # tray notifications
+├── volume.rs       # the tray's volume control
+└── scripted.rs     # host tests that drive whole sessions
 
-libs/hal/           # Pointer trait shared by drivers and the desktop app
+libs/hal/           # Pointer and Keyboard traits shared by drivers and the desktop app
 libs/init/          # restart policies and service supervision
-libs/bundle/        # .fapp reader: manifest, icon, catalog scan
-drivers/input/virtio/  # virtio MMIO tablet/mouse driver
-apps/desktop/       # the `desktop` app, YAML file and embedded app folder
+libs/bundle/        # .fapp reader: manifest, icon, catalog scan, install checks
+drivers/input/      # virtio and i8042 (PS/2) input; USB is drivers/usb/xhci
+apps/desktop/       # the `desktop` app, session loop, YAML file and embedded app folder
 ```
 
 The desktop library is allocation-free, `no_std`, and has no dependency on the
@@ -176,9 +181,9 @@ my-app.fapp
 id: terminal
 name: Terminal
 version: 1.0.0
-entry: gui            # command in the shell registry
+entry: terminal       # command in the shell registry
 category: System
-description: GUI dashboard and component gallery
+description: Bash-compatible shell with POSIX core utilities
 icon: icon.ico
 icon_medium: icon-32.ico
 icon_small: icon-16.ico
@@ -207,15 +212,18 @@ make bundles
 
 ### The application folder
 
-On the QEMU port there is no block device yet, so the application folder is
-embedded in the kernel image. `apps/desktop/build.rs` turns every file in
-`apps/desktop/apps/` into a `DirEntry` with `include_bytes!`. Adding a bundle
-there and rebuilding is enough for it to appear in the Start menu — no code,
-registry entry or configuration change.
+The bundles shipped with the system are embedded in the kernel image:
+`apps/desktop/build.rs` turns every file in `apps/desktop/apps/` into a
+`DirEntry` with `include_bytes!`. Adding a bundle there and rebuilding is enough
+for it to appear in the Start menu — no code, registry entry or configuration
+change.
 
-A board with a filesystem passes the same `&[DirEntry]` list to
-`Desktop::scan`, and can call it again whenever the folder changes. Detection
-is dynamic in both cases; only the source of the bytes differs.
+Bundles can also be installed at run time: `appinstall FILE [SHA256]` copies a
+package to `/apps` with its digest beside it, once the whole file matches. The
+session scans `/apps` along with the embedded folder, loading only packages that
+still match their digest, and scans again when it changes. A package carries
+only a manifest and icons: its `entry` still names a command already in the
+registry, so no code is loaded.
 
 ## Window manager and taskbar
 
@@ -235,7 +243,9 @@ the manifest entry point through `AppRegistry`, and either hosts it in the
 window or spawns it through `Processes`. An unknown entry leaves the window open
 with an explanation instead of failing silently.
 
-File Explorer, Task Manager and Media Player implement `App::windowed`, so the
+Most GUI apps implement `App::windowed` (File Explorer, Task Manager, Media
+Player, Music, Image Viewer, Terminal, Settings, the gallery, FEOS-DOS and the
+host for a user program's window), so the
 desktop drives them one frame at a time through `App::open_window` and
 `App::frame_window`. Their state persists in each app across frames, which
 means the desktop keeps running normally while they are open: wallpaper icons
@@ -254,12 +264,13 @@ while the pointer is over that window's content and not on a resize edge.
 
 Apps that return `true` from `App::foreground` but not `App::windowed` still use
 the older synchronous path with `Context::viewport` and `Context::suspend_area`
-for compatibility. The desktop app's session loop polls the virtio pointer
-through `feos_hal::Pointer` and feeds `feos_gui::Input` events; the same path
-forwards `DesktopResponse::launch`.
+for compatibility; a windowed app is still run that way from the serial shell.
+The desktop app's session loop polls the pointer and keyboard through
+`feos_hal::Pointer` and `feos_hal::Keyboard` and feeds `feos_gui::Input` events;
+the same path forwards `DesktopResponse::launch`.
 
 The boot session composes frames into the board's off-screen back buffer and
-copies the finished frame to the ramfb scanout in one pass. It also redraws
+copies the finished frame to the display's scanout in one pass. It also redraws
 only when input arrives, the clock minute changes, a service or window state
 changes, a launch needs a new frame, or an animating windowed app (media
 playback, live task-manager graphs) asks for another frame. An idle desktop

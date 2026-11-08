@@ -1,4 +1,4 @@
 Hello from a regular file on the embedded filesystem.
 
-You can read this from the explorer preview pane, with `files cat
-/examples/hello.txt`, or from the shell's file explorer app.
+You can read this in the explorer's preview pane, with `cat /examples/hello.txt`,
+or with `files cat /examples/hello.txt`.

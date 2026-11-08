@@ -1,1448 +1,499 @@
 # feos
 
-A tiny bare-metal **Rust** operating-system skeleton for the **aarch64** QEMU
-`virt` machine and the **x86_64** QEMU `q35` machine, organised as a multi-crate
-workspace. On AArch64 it boots at EL1 with PL011 serial; on x86_64 it boots
-through a multiboot long-mode entry with COM1, the LAPIC/IOAPIC and PS/2 input.
-Both ports install exception vectors, bring up a **ramfb** framebuffer, draw a
-splash screen, start a preemptive round-robin scheduler, and open an
-interactive **desktop session** where applications can be launched with the
-keyboard. Logging off (or `Ctrl-\` on the serial console)
-drops into a **Bash-compatible terminal** with a writable overlay filesystem,
-pipelines, redirection, job-style background launches and a built-in POSIX
-coreutils library.
+`feos` is a bare-metal, `no_std` operating system written in Rust for two QEMU machines:
+**AArch64 `virt`** and **x86_64 `q35`**. It's a monolithic, preemptive, multi-core kernel
+with an XP-style desktop, a Bash-compatible shell with POSIX core utilities, a TCP/IP
+stack, writable FAT32, exFAT and native filesystems, a media player with its own audio and
+video decoders, isolated user programs in ring 3 / EL0, and FEOS-DOS, an x86 virtual machine
+and DOS that runs real protected-mode DOS games.
 
-Everything can be built and run inside Docker, so the only host requirement is
-Docker.
+Everything from the boot code to the codecs is in this repository; the only host requirement
+for building and running it is Docker (or Rust and QEMU).
 
-![feos boot splash](docs/splash.png)
+![The feos desktop on AArch64: File Explorer and a Terminal session](docs/screenshots/hero.png)
 
-![feos graphics test card](docs/demo.png)
+<p align="center">
+  <img src="docs/screenshots/splash.png" width="32%" alt="The boot splash on x86_64">
+  <img src="docs/desktop.png" width="32%" alt="The Start menu">
+  <img src="docs/screenshots/task-manager.png" width="32%" alt="Task Manager with four CPUs under load">
+</p>
 
-## Why the workspace is split up
+## Contents
 
-The project is designed to grow along four independent axes:
+- [Highlights](#highlights)
+- [Quick start](#quick-start)
+- [Screenshots](#screenshots)
+- [Features](#features)
+- [Command reference](#command-reference)
+- [Media formats](#media-formats)
+- [FEOS-DOS](#feos-dos)
+- [Developing](#developing)
+- [Repository layout](#repository-layout)
+- [Known limitations](#known-limitations)
+- [Licensing](#licensing)
 
-- **architectures** — every CPU port gets a crate in `arch/<arch>` (`aarch64`, `x86_64`)
-- **boards** — every machine gets a board support package in `boards/<name>`
-- **drivers** — every device gets its own crate in `drivers/<class>/<name>`
-- **libraries** — reusable, hardware-independent code lives in `libs/<name>`
-- **apps** — every shell command is an app in `apps/`
+## Highlights
 
-Dependencies point in one direction only:
+| Area | What's there |
+|------|--------------|
+| Kernel | SMP up to 8 CPUs on both ports, 32 process slots, priorities 0-15, CPU affinity, one-shot timers, guard pages, fault containment per task |
+| Isolation | Separate ELF programs in `/bin` at EL0 / ring 3, each with its own page tables, a checked system call ABI and uid/gid permissions |
+| Hardware | virtio blk, net, gpu and input; ramfb; UEFI GOP framebuffer; xHCI USB (keyboard, mouse, tablet, mass storage); Intel HDA playback and capture; PS/2; PL031 and CMOS RTCs; GICv2, GICv3 and LAPIC/IOAPIC with MSI/MSI-X |
+| Boot | QEMU `-kernel` (ELF on AArch64, multiboot on x86_64), or UEFI through its own loader (OVMF, AAVMF); device tree, ACPI and multiboot parsing |
+| Storage | FAT32, exFAT and a journalled native filesystem read-write, FAT12/16 read-only, MBR and GPT, a RAM root when there's no disk, changes synced about once a second |
+| Network | Ethernet, ARP, IPv4, ICMP, UDP, TCP, DHCP and DNS; `ifconfig`, `ping`, `nslookup`, `wget`, `nc` |
+| Desktop | Windows XP-style session: taskbar, Start menu, window manager, six colour schemes, an iconset and the XP cursor set, live resolution changes, settings that persist |
+| Apps | File Explorer with content search, Terminal, Task Manager, Settings, Media Player, Music, Image Viewer, Component Gallery, System Information, FEOS-DOS |
+| Shell | Bash-compatible language (functions, pipelines, redirection, here-docs, arithmetic, `[[ ]]`, traps, job control) and about 80 utilities |
+| Media | H.264 (incl. High 10, 4:2:2, interlaced), VP8, MPEG-1, MJPEG, GIF; AAC/HE-AAC, Opus, MP3, FLAC, Vorbis, WAV, AIFF, AU; PNG, JPEG, BMP, ICO, QOI |
+| FEOS-DOS | 386 interpreter with protected and virtual-8086 mode, x87, DPMI 0.9 host, VCPI, XMS/EMS, VGA/VESA, OPL3 and Sound Blaster 16 |
 
-```
-kernel  ->  boards  ->  drivers  ->  libs/hal
-   |           |           |
-   |           +---------> libs (gfx, console, ...)
-   |
-   +------>  arch (aarch64)  ->  libs/hal
-   +------>  apps  ->  libs/app  ->  libs/hal
-   |                    apps  ->  libs/gfx, libs/gui, libs/console
-   +------>  libs/hal
-```
+## Quick start
 
-Nothing points back up the stack: an architecture crate never knows about a
-board, a driver never knows about the kernel, and an app never owns hardware.
-That is what makes it possible to add a second board, a second display driver,
-or a second shell app without touching unrelated code. The kernel's scheduler
-is the one piece of policy that lives above the layers: it consumes the
-architecture IRQ entry and the `Processes` service defined in `libs/app`.
-
-Apps also never mention a real architecture or board. The kernel hands them a
-`feos_app::Platform` containing the board facts and the `Clock`, `Power`, `Cpu`
-and `Audio` implementations from the HAL, so the same app set runs on every
-port.
-
-`members` in the root `Cargo.toml` uses globs, so a new crate directory is
-picked up by Cargo automatically. The only edits needed to wire it in are the
-dependency edges (usually one line in a `Cargo.toml` and one line in a board or
-app registry).
-
-## Repository layout
-
-```
-.
-├── Cargo.toml                  # virtual workspace manifest (no kernel code)
-├── rust-toolchain.toml         # stable + aarch64/x86_64 bare-metal targets
-├── .cargo/config.toml          # default target, rust-lld flags, cargo runner
-├── Dockerfile                  # rust:1-slim-bookworm + QEMU arm/x86
-├── Makefile                    # build, run, test, Docker targets
-├── scripts/
-│   ├── qemu.sh                 # AArch64 QEMU launch (ramfb + HDA + display)
-│   ├── qemu-x64.sh             # x86_64 QEMU launch (flat image + q35 + ramfb)
-│   ├── pack-app.py             # pack a directory into a single-file .fapp bundle
-│   └── docker-run.sh           # container entry point: build, then boot
-├── docs/                       # screenshots and architecture notes
-│
-├── kernel/                     # feos-kernel: the bootable binary (bin: feos)
-│   └── src/
-│       ├── main.rs             # kmain, IRQ handler, panic handler, wiring
-│       ├── smp.rs              # secondary-CPU startup
-│       ├── memory.rs           # discovered RAM and the frame allocator
-│       ├── allocator.rs        # first-fit heap over frames, sized from RAM
-│       ├── fatal.rs            # what happens when something fails
-│       ├── ktest.rs            # self-tests behind the boot tests
-│       └── sched.rs            # process table, per-CPU queues and priorities
-│
-├── arch/
-│   ├── aarch64/                # feos-arch-aarch64
-│   │   └── src/
-│   │       ├── boot.S          # _start: CPU setup, BSS, jump to kmain
-│   │       ├── vectors.S       # exception table + recoverable IRQ entry
-│   │       ├── exceptions.rs   # vector install, FaultInfo, handler hook
-│   │       ├── irq.rs          # TrapFrame, IRQ dispatch, mask helpers
-│   │       ├── cpu.rs          # halt, current EL, MIDR, per-CPU index
-│   │       ├── psci.rs         # CPU_ON, poweroff / reboot
-│   │       ├── smp.rs          # secondary entry + handler hook
-│   │       └── timer.rs        # generic timer helpers, per-CPU idle hints
-│   └── x86_64/                 # feos-arch-x86_64
-│       └── src/
-│           ├── boot.S          # multiboot entry, page tables, long mode
-│           ├── interrupts.S    # 64-bit IDT stubs + recoverable IRQ frame
-│           ├── exceptions.rs   # IDT install, FaultInfo, handler hook
-│           ├── irq.rs          # TrapFrame, IRQ dispatch, mask helpers
-│           ├── cpu.rs          # halt, CPUID, per-CPU index
-│           ├── power.rs        # ACPI poweroff / PCI reset
-│           ├── smp.rs          # AP trampoline and INIT/SIPI startup
-│           ├── mmu.rs          # guard pages in the identity map
-│           └── timer.rs        # TSC clock + per-CPU one-shot APIC timer
-│
-├── boards/
-│   ├── qemu-virt/              # feos-board-qemu-virt (aarch64)
-│   │   ├── build.rs            # generates the embedded filesystem image
-│   │   ├── fs/                 # files and directories compiled into the kernel
-│   │   │   └── media/          # sample GIF, MJPEG, AVI, MP4, MKV, FLV clips
-│   │   ├── linker.ld           # 0x40080000 load address, BSS, 256 KiB stack
-│   │   └── src/lib.rs          # MMIO map, UART/framebuffer/audio/pointer wiring
-│   └── qemu-x86_64/            # feos-board-qemu-x86_64 (x86_64 q35)
-│       ├── build.rs            # shares the virt board's fs tree and disk images
-│       ├── linker.ld           # 0x100000 load address, multiboot header
-│       └── src/lib.rs          # COM1, APIC/IOAPIC, PCI ports, ramfb, HDA, PS/2
-│
-├── drivers/
-│   ├── serial/pl011/           # feos-driver-pl011
-│   ├── serial/uart16550/       # feos-driver-uart16550 (x86 COM1)
-│   ├── firmware/fw-cfg/        # feos-driver-fw-cfg (MMIO and I/O port)
-│   ├── display/ramfb/          # feos-driver-ramfb
-│   ├── bus/pci/                # feos-driver-pci: ECAM or legacy port config
-│   ├── audio/intel-hda/        # feos-driver-intel-hda: Intel HDA playback
-│   ├── input/virtio/           # feos-driver-virtio-input: tablet/mouse/keyboard
-│   ├── input/i8042/            # feos-driver-i8042: PS/2 keyboard + mouse
-│   ├── interrupt/gicv2/        # feos-driver-gicv2
-│   └── interrupt/apic/         # feos-driver-apic: LAPIC + IOAPIC
-│
-├── libs/
-│   ├── hal/                    # feos-hal: device + system-service traits
-│   ├── sync/                   # feos-sync: SpinLock and friends
-│   ├── console/                # feos-console: registered console + macros
-│   ├── coreutils/              # feos-coreutils: POSIX utilities + overlay VFS
-│   ├── sh/                     # feos-sh: Bash-compatible shell engine
-│   ├── gfx/                    # feos-gfx: dependency-free 2D graphics
-│   ├── gui/                    # feos-gui: immediate-mode widgets, layout, charts
-│   ├── desktop/                # feos-desktop: YAML desktop, XP taskbar, WM
-│   ├── init/                   # feos-init: service supervisor and restart policy
-│   ├── bundle/                 # feos-bundle: single-file .fapp applications
-│   ├── fs/                     # feos-fs: StaticFs + read/write FAT32/exFAT
-│   ├── keys/                   # feos-keys: serial + evdev keyboard decoding
-│   ├── text/                   # feos-text: fixed-capacity UTF-8 strings
-│   ├── audio/                  # feos-audio: PCM buffers, mixing, synthesis
-│   ├── json/                   # feos-json: allocation-free JSON parser/writer
-│   ├── yaml/                   # feos-yaml: practical-subset YAML parser/emitter
-│   ├── image/                  # feos-image: PNG, JPEG, BMP, PPM and QOI codecs
-│   ├── audio-codec/            # feos-audio-codec: WAVE, AIFF, AU, MP3, Ogg
-│   ├── h264/                   # feos-h264: vendored H.264/AVC decoder
-│   ├── video/                  # feos-video: containers, GIF, MJPEG, raw video
-│   ├── compress/               # feos-compress: DEFLATE, zlib and gzip
-│   ├── archive/                # feos-archive: ZIP, TAR and gzip archives
-│   └── app/                    # feos-app: App trait, Context, Platform
-│
-└── apps/
-    ├── desktop/                # feos-desktop-app: `desktop` session + app folder
-    │   ├── desktop.yaml        # embedded desktop configuration
-    │   ├── apps/               # .fapp bundles scanned by build.rs
-    │   └── bundle-src/         # unpacked sources for `make bundles`
-    ├── commands/               # feos-apps: built-in apps + registry
-    │   └── src/
-    │       ├── help.rs  echo.rs  info.rs  uptime.rs  sleep.rs
-    │       ├── coreutils.rs    # `coreutils` command/help for the terminal
-    │       ├── clear.rs  gfx.rs  splash.rs  tone.rs  power.rs
-    │       ├── gui.rs          # feos-gui dashboard demo
-    │       ├── files.rs        # file explorer app + ls/cat/tree/stat
-    │       ├── files/
-    │       │   └── explorer.rs # XP-style explorer UI, input and rendering
-    │       ├── player.rs       # VLC-style video player, playlist and dialogs
-    │       ├── taskmgr.rs      # XP-style task manager, graphs and process control
-    │       ├── spawn.rs  ps.rs  kill.rs  tick.rs
-    │       ├── ui.rs           # splash screen and test card renderer
-    │       └── lib.rs          # REGISTRY and find()
-    └── shell/                  # feos-shell: terminal adapter + app host
-        └── src/lib.rs
-```
-
-## Adding things
-
-**A driver.** Create `drivers/<class>/<name>/` with a `Cargo.toml`, implement
-the relevant trait from `feos-hal` (or add a new trait there), and let the board
-instantiate it. Drivers take their MMIO base address as a constructor
-argument; they never hard-code board addresses.
-
-**A library.** Create `libs/<name>/`, keep it `no_std` and dependency-light,
-and add it to `[workspace.dependencies]` if several crates need it.
-
-**An app.** Add a module under `apps/commands/src/` whose unit struct
-implements `feos_app::App`, then add it to `REGISTRY` in
-`apps/commands/src/lib.rs`. Apps get `args`, the optional `Canvas`, and the
-`Platform` services through `Context`; they do not depend on a board or
-architecture crate. To put an app in the desktop Start menu instead, drop a
-single-file `.fapp` bundle into `apps/desktop/apps/` (or a source folder in
-`apps/desktop/bundle-src/` plus `make bundles`); the desktop discovers it
-automatically.
-
-**A board.** Copy `boards/qemu-virt/`, adjust the constants and devices, point
-the kernel at it in `kernel/Cargo.toml`, and select the linker script from
-`.cargo/config.toml` (or a per-board build flag). The kernel source does not
-change.
-
-**A new architecture.** Add `arch/<name>/` with the same public surface as
-`arch/aarch64`, plus a board that uses it.
-
-## Features
-
-- `#![no_std]`, `#![no_main]` kernel with zero external dependencies
-- Layered Cargo workspace: kernel, arch, board, drivers, libraries, apps
-- Boot assembly: stack setup, BSS zeroing, FP/SIMD enable, and PSCI secondary
-  CPU entry with a private stack and shared exception vectors
-- PL011 UART driver behind a `Serial` HAL trait
-- PCIe ECAM enumeration and BAR assignment, enough to bring up firmware-less
-  PCI devices
-- Intel HDA audio driver: CORB/RIRB command rings, codec discovery, and polled
-  DMA playback through one output stream
-- `feos-hal` device traits (`Serial`, `Audio`) and system-service traits
-  (`Clock`, `Power`, `Cpu`) that keep apps board- and architecture-independent
-- Registered console with `print!` / `println!` and panic-safe output
-- AArch64 exception vector table with an ESR/ELR/FAR diagnostic dump, plus a
-  recoverable IRQ entry that saves and restores a full 800-byte `TrapFrame`
-- GICv2 driver behind an `InterruptController` HAL trait, with Group 0 and a
-  per-CPU timer PPI initialized by each core
-- **Multi-core** preemptive round-robin scheduler: up to eight CPUs share one
-  process table, each CPU has its own current-task slot and idle stack, and a
-  spin-locked scheduler prevents a process running on two cores at once
-- Sixteen process slots, 128 KiB stacks, and a 100 Hz generic-timer tick on
-  every CPU; the shell is PID 1
-- `spawn`, `ps`, `kill`, and `tick` commands for running and inspecting
-  background processes
-- **Bash-compatible terminal** (`feos-sh`): quoting and escapes, parameter and
-  command substitution, integer arithmetic, globbing, `&&`/`||`/`;`/`&`
-  lists, multi-stage pipelines, `<`/`>`/`>>`/`2>`/`2>&1` redirection, variables,
-  aliases, `if`/`elif`/`else`, `for`, `while`, `until`, `break`, `continue`,
-  `source`, `eval`, `read`, `history`, and tab completion
-- Interactive line editor: cursor movement, Home/End, history, Ctrl-A/E/U/K/W,
-  Ctrl-L, Ctrl-C, Ctrl-D, reverse history search (Ctrl-R), multi-line
-  continuation for open quotes and substitutions
-- Terminal zoom: Ctrl-`=`/Ctrl-`+` and Ctrl-`-` scale the desktop Terminal
-  window from 1x to 4x, with Ctrl-`0` resetting it
-- **POSIX coreutils** (`feos-coreutils`): `ls`, `cat`, `echo`, `printf`, `pwd`,
-  `mkdir`, `rmdir`, `rm`, `cp`, `mv`, `touch`, `head`, `tail`, `wc`, `grep`,
-  `sort`, `uniq`, `cut`, `tr`, `seq`, `basename`, `dirname`, `nl`, `rev`,
-  `tac`, `paste`, `tee`, `cmp`, `find`, `stat`, `tree`, `du`, `df`, `env`,
-  `printenv`, `uname`, `whoami`, `id`, `hostname`, `nproc`, `arch`, `uptime`,
-  `free`, `hexdump`/`xxd`, `base64`, `sha256sum`, `test`, `expr`, `true`,
-  `false`, `yes`
-- **Writable overlay VFS**: the compiled-in read-only image is extended with
-  an in-RAM copy-on-write layer, so `mkdir`, `cp`, `mv`, `rm`, `touch` and
-  shell redirection work without a block device; writes never touch the base
-  image
-- `feos-console::write_bytes` for raw binary terminal output (`cat` of a
-  binary file, `hexdump`, and friends)
-- **FEOS-DOS** (`feos-dosbox`): an original 8086/80186 virtual machine with
-  1 MiB of memory, VGA 80x25 text mode, the CP437 character set, BIOS
-  `INT 10h`/`16h`/`1Ah` services, a DOS `INT 21h` kernel, a writable RAM drive
-  and a `COMMAND.COM`-style prompt that runs real `.COM` and `.EXE` programs
-  from the desktop or the serial shell
-- QEMU `ramfb` framebuffer: 1024x768 linear **XRGB8888** in guest RAM
-- `feos-gfx`: a `no_std` 2D library with pixels, rectangles, Bresenham lines,
-  circles, gradients, blitting, and an 8x8 bitmap font
-- `feos-gui`: a `no_std`, allocation-free immediate-mode GUI toolkit with
-  widgets, a Windows/Fluent-inspired component library, linear layout,
-  scrolling, text input, charts, windows and dialogs
-- `feos-desktop`: a YAML-configured desktop session with XP-style taskbar and
-  Start menu, wallpaper shortcuts, a window manager and theme support
-- `feos-driver-virtio-input`: a virtio MMIO tablet/mouse/keyboard driver, wired
-  through the `Pointer` and `Keyboard` HAL traits so the desktop tracks a real
-  pointer and accepts typing from the QEMU display as well as the serial port
-- `feos-fs`: a FAT32 and exFAT driver with read/write support (long names,
-  UTF-16 names, allocation bitmaps, cluster chains, create/write/rename/remove)
-  plus a compiled-in, allocation-free `StaticFs` image
-- `feos-keys`: serial-console and Linux-evdev keyboard decoding shared by the
-  desktop and full-screen apps
-- A **File Explorer** app with XP Luna window chrome, a menu bar, standard
-  buttons, an editable address bar with history, a folder tree, recursive
-  search, Details/Icons/List/Tiles views, sortable columns, multi-selection,
-  a preview pane, text/binary viewer, properties, context menus, mouse and
-  wheel input, and keyboard shortcuts, plus `files ls`, `files cat`,
-  `files tree` and `files stat` shell forms
-- A VLC-style **Media Player** with menus, transport controls, seek bar,
-  playlist, fullscreen mode, aspect modes, speed/frame controls, media
-  information, mouse context menus and a static kernel heap for H.264
-  playback
-- A Windows XP-style **Task Manager** (`taskmgr`) with Applications,
-  Processes, Performance, Networking and Users tabs; live CPU/memory history
-  graphs with a combined or per-core CPU view; sortable process columns;
-  per-process CPU time, memory, threads and priority; Run, Select Columns,
-  Properties, About, Help and confirmation dialogs; context menus; configurable
-  update speed; and mouse/keyboard control
-- Real multi-core scheduler and memory accounting: per-process CPU ticks summed
-  across cores, per-CPU idle-tick detection through `WFI`, online-CPU counts,
-  and a HAL `Memory` service backed by the kernel heap for commit charge,
-  physical memory and kernel-memory panels
-- Foreground app launching: an app can request the full framebuffer from the
-  desktop and return to it with Esc
-- `feos-bundle`: single-file `.fapp` applications (ZIP/TAR with manifest and
-  icon), detected by content and scanned from an application folder
-- `feos-init`: a fixed-capacity service supervisor with `never`/`on-failure`/
-  `always` restart policies and `ps`-style status snapshots
-- `feos-audio`: a `no_std` 16-bit PCM library with sample buffers, saturating
-  mixing, fades, and sine/square/triangle/sawtooth/noise synthesis
-- `feos-json`: a `no_std`, allocation-free RFC 8259 parser/writer with a
-  caller-provided node arena
-- `feos-yaml`: a practical-subset YAML parser/emitter (block and flow
-  collections, quoted and block scalars, comments, document markers)
-- `feos-image`: PNG, baseline JPEG, BMP, PPM and QOI decoders plus PNG/BMP/
-  PPM/QOI encoders, all writing into caller-provided RGBA buffers
-- `feos-audio-codec`: WAVE/AIFF/AU and MP3 decoding, PCM16 WAVE/AIFF
-  encoding, and Ogg Opus header/page/TOC inspection
-- `feos-h264`: a vendored, `no_std` H.264/AVC decoder (CAVLC/CABAC, P/B
-  pictures, reference frames) with `alloc`-backed picture storage
-- `feos-video`: GIF, AVI, MP4/MOV, Matroska/WebM, FLV, IVF, Annex-B H.264 and
-  Motion JPEG demuxing, with RGBA decoding for GIF, MJPEG, raw/RLE video and
-  H.264; other codecs are recognised and reported as unsupported
-- `feos-compress`: allocation-free raw DEFLATE, zlib and multi-member gzip
-  compression/decompression with CRC-32 and Adler-32
-- `feos-archive`: ZIP, TAR (ustar/GNU/PAX) and gzip readers, extraction into
-  caller buffers, and ZIP/TAR writers
-- `tone` shell command: synthesizes a chord with `feos-audio` and plays it
-  through the HDA codec
-- Boot splash followed by the interactive desktop session, with an interactive
-  graphics test card available from the shell
-- Generic timer (`CNTPCT_EL0`) for uptime, busy-wait sleeps, and the scheduler
-  tick (`CNTP_TVAL_EL0`)
-- PSCI over `HVC` for clean `poweroff` / `reboot`
-- Interactive serial shell with line editing (backspace, Ctrl-C)
-- App registry with per-command crates/modules and aliases
-- Host unit tests for the graphics, GUI, audio, synchronization, JSON, YAML,
-  image, audio-codec, video, H.264, compression, and archive libraries
-- Docker image containing Rust, QEMU with GTK (window) and VNC display support
-
-## Quick start (Docker)
+### With Docker
 
 ```sh
 make docker-build
-make docker-run-arm     # or: make docker-run
-make docker-run-x64
+make docker-run-arm        # AArch64 virt (`make docker-run` is the same)
+make docker-run-x64        # x86_64 q35
 ```
 
-`make docker-run-arm` (aliased as `make docker-run`) boots the AArch64 `virt`
-machine; `make docker-run-x64` boots the x86_64 `q35` machine from the same
-image. Both open a **real QEMU window** on your desktop while the serial
-shell stays in your terminal. It grants QEMU temporary access to your X11 /
-XWayland display (`xhost +si:localuser:<you>`), binds it in with
-`-v /tmp/.X11-unix`, and revokes the access again when QEMU exits.
-
-Requirements for the window: an X11 or Wayland (XWayland) session and a
-`qemu-system-gui` build inside the image (already installed by the
-`Dockerfile`). On Wayland the window appears through XWayland.
-
-Then use the `gfx` command in the serial shell to redraw the test card,
-`gui` to render the widget and chart dashboard, and `tone` to play an A-major
-chord through the emulated Intel HDA codec. Use the `poweroff` command (or
-`Ctrl-A` then `X`) to leave QEMU.
-
-`make docker-run` wires the guest's HDA codec to a host backend. On Linux with
-`/dev/snd`, the Makefile passes `--device /dev/snd` and QEMU uses ALSA, so
-`tone` is audible on the default output. If there is no `/dev/snd`, QEMU
-writes `target/audio/qemu.wav` at 48 kHz stereo instead; play that file on the
-host to hear the same samples. See
-[Hearing it](#hearing-it) for backend overrides.
-
-### VNC instead of a window
-
-For headless machines, SSH sessions, or a remote desktop, use:
+Both open a QEMU window on your X11 or Wayland (XWayland) desktop, with the serial shell in
+the terminal. The window needs `DISPLAY` set; the Makefile grants QEMU access to it with
+`xhost` for as long as QEMU runs. Without a desktop, serve the display over VNC on
+`127.0.0.1:5900`:
 
 ```sh
-make docker-run-vnc          # AArch64
-make docker-run-vnc-x64      # x86_64
-```
-
-This publishes QEMU's display over **VNC on port 5900**, using the same audio
-backend rules as `make docker-run`. Connect from another terminal:
-
-```sh
+make docker-run-vnc        # AArch64 (`docker-run-vnc-arm` is the same)
+make docker-run-vnc-x64
 vncviewer localhost:5900
-# or GNOME Connections / Remmina / TigerVNC: vnc://localhost:5900
 ```
 
-Or run the image directly with an explicit backend:
-
-```sh
-docker build -t feos .
-docker run --rm -it -p 5900:5900 -e FEOS_ARCH=arm -e FEOS_DISPLAY=vnc=0.0.0.0:0 feos
-docker run --rm -it -p 5900:5900 -e FEOS_ARCH=x64 -e FEOS_DISPLAY=vnc=0.0.0.0:0 feos
-```
-
-`FEOS_ARCH` selects the architecture (`arm`, the default, or `x64`).
-`FEOS_DISPLAY` selects the QEMU backend: `gtk` (window through the host X
-server), `vnc=...` (VNC server), or `none` (serial only). The GTK backend needs
-the X socket mount and `DISPLAY`; the Makefile handles both for you.
-
-`make docker-shell` opens a shell with the source mounted and a named volume
-for `target/`, so build artifacts are not written as root on the host:
-
-```sh
-make docker-shell
-# inside:
-cargo build --release --target aarch64-unknown-none
-./scripts/qemu.sh
-# or:
-./scripts/cargo-x64.sh build --release
-./scripts/qemu-x64.sh
-```
-
-## Native build and run
-
-Requirements: Rust (rustup), `qemu-system-aarch64`, `qemu-system-x86_64` and
-`objcopy` (GNU binutils; only needed for the x86_64 flat image).
-
-```sh
-rustup show    # installs what rust-toolchain.toml declares
-
-make build-arm                           # or: cargo build --release
-make run                                 # AArch64, VNC on localhost:5900
-
-make build-x64
-make run-x64                             # x86_64 q35, VNC on localhost:5900
-```
-
-`make build` is an alias for `make build-arm`; `make run` is an alias for
-`make run-arm`. The workspace sets `default-members = ["kernel"]`, so a plain
-`cargo build` builds whichever kernel target `.cargo/config.toml` selects
-(AArch64 by default). The x86_64 kernel has a custom hard-float target, so it builds
-through `scripts/cargo-x64.sh`, which `make build-x64` calls; that script says why. The
-run targets boot with four CPUs and 512 MiB of RAM by default; override them with
-`QEMU_SMP` and `QEMU_MEM` (up to eight CPUs are supported on both ports, and the kernel
-uses whatever RAM firmware reports). On AArch64, `FEOS_MACHINE=virt,gic-version=3
-./scripts/qemu.sh <kernel>` boots with a GICv3.
-
-`make check-arm` and `make check-x64` check the workspace for each port. A
-single `cargo check --workspace` cannot compile both architecture crates in
-one pass because each contains target-specific assembly.
-
-On Debian/Ubuntu, QEMU comes from `qemu-system-arm` and `qemu-system-x86`:
-
-```sh
-sudo apt install qemu-system-arm qemu-system-x86 binutils
-```
-
-Useful overrides:
-
-| Command                              | Result                                    |
-|--------------------------------------|-------------------------------------------|
-| `make run`                           | AArch64 VNC display on `127.0.0.1:5900`   |
-| `make run-x64`                       | x86_64 VNC display on `127.0.0.1:5900`    |
-| `make run QEMU_DISPLAY=gtk`           | Native GTK window (if QEMU has GTK)       |
-| `make run QEMU_DISPLAY=none`          | Headless: serial console only             |
-| `make run QEMU_DISPLAY=vnc=0.0.0.0:0`| VNC reachable from other machines         |
-| `make run AUDIODEV=alsa,id=snd0`      | Live ALSA output (needs `/dev/snd`)       |
-| `make run AUDIODEV=pa,id=snd0`        | Live PulseAudio/PipeWire output           |
-| `make run AUDIODEV=wav,id=snd0,path=/tmp/qemu.wav` | Capture playback to WAV     |
-| `make run QEMU_SMP=8 QEMU_MEM=1G`    | Boot eight CPUs with 1 GiB of RAM          |
-| `make audio-demo`                    | Render the audio example WAV natively      |
-| `make docker-audio`                  | Render the audio example WAV in Docker     |
-
-The run targets add `-device virtio-tablet-device` for the pointer and
-`-device virtio-keyboard-device` for typing in the QEMU window. Override
-`POINTER_FLAGS` (for example with `-device virtio-mouse-device`) to use a
-relative mouse, or set it to an empty value for a serial-only boot. Set
-`KEYBOARD_FLAGS=` to disable the virtio keyboard and use only the serial
-console.
-
-The scripts pass `-net none` because the kernel does not use networking and
-some distributions' QEMU packages omit the `efi-virtio.rom` file that the
-default NIC would load.
-
-## Shell commands
-
-The serial console is a Bash-compatible terminal, not just a line dispatcher.
-It understands quoting, variables, globs, pipelines, redirection, `&&`/`||`,
-`if`/`for`/`while`, aliases and command substitution. The complete reference is
-in [`docs/terminal.md`](docs/terminal.md).
-
-```text
-feos:/$ ls -l /docs
--rw-r--r-- 1 feos feos      569 Jan  1 00:00 getting-started.md
--rw-r--r-- 1 feos feos      546 Jan  1 00:00 filesystem.md
-
-feos:/$ cat /docs/getting-started.md | grep -i build
-feos:/$ mkdir -p /tmp/demo && cp /README.txt /tmp/demo/
-feos:/$ for f in /tmp/demo/*; do echo "$f"; done
-feos:/$ echo "the answer is $((6 * 7))" > /tmp/answer
-feos:/$ cat /tmp/answer
-the answer is 42
-feos:/$ ps | grep shell
-feos:/$ help grep
-```
-
-The utilities live in `feos-coreutils`; the language engine lives in
-`feos-sh`. `apps/shell` only adapts them to the console and the kernel's app
-registry.
-
-| Command       | Description                                          |
-|---------------|------------------------------------------------------|
-| `help`        | List apps, shell builtins and coreutils               |
-| `help <cmd>`  | Usage and description for one command                 |
-| `echo <text>` | Print text back                                      |
-| `printf FORMAT [args]` | Formatted output (`%s`, `%d`, `%x`, `%b`, width) |
-| `ls [-la1hRFr] [path]` | List directory contents                    |
-| `cat [-nbsA] [file]` | Concatenate files                            |
-| `pwd`, `cd [dir]` | Print or change the working directory            |
-| `mkdir`, `rmdir`, `rm`, `cp`, `mv`, `touch` | File management   |
-| `head`, `tail`, `wc`, `nl`, `rev`, `tac`, `paste` | Text slicing   |
-| `grep`, `sort`, `uniq`, `cut`, `tr`, `seq` | Text filtering          |
-| `find`, `stat`, `tree`, `du`, `df` | Filesystem inspection            |
-| `tee`, `cmp`, `sha256sum`, `base64`, `hexdump` | Data utilities     |
-| `test`, `expr`, `true`, `false` | Conditionals and arithmetic      |
-| `env`, `printenv`, `uname`, `whoami`, `id`, `hostname`, `nproc`, `arch`, `uptime`, `free` | System facts |
-| `coreutils [cmd]` | List or describe the POSIX utilities             |
-| `terminal`    | Open the Bash-compatible terminal window (`term`, `xterm`) |
-| `sh [script]`, `bash` | Start a nested shell or run a script        |
-| `info`        | Board, exception level, MIDR, timer, memory, display, audio |
-| `gfx`         | Draw the graphics test card (`demo` is an alias)     |
-| `gui`         | Draw the feos-gui dashboard and component gallery (`dashboard`) |
-| `desktop`     | Run the YAML-configured desktop session (`wm`; `list`, `status`, `run <id>`, `service <action> <id>`) |
-| `files`       | Open the file explorer, or use `ls`, `cat`, `tree` and `stat` (`explorer` alias) |
-| `player`      | Open the VLC-style video player (`vlc`, `video`, `media`, `media-player` aliases) |
-| `taskmgr`     | Open the XP-style Task Manager (`task-manager`, `taskmanager`, `tm` aliases) |
-| `splash`      | Redraw the boot splash                               |
-| `tone [ms]`   | Play an A-major chord for `ms` (default 1500, max 3000; `play` alias) |
-| `uptime`      | Milliseconds since the counter started               |
-| `sleep <ms>`  | Busy-wait for the given number of milliseconds       |
-| `spawn <cmd> [args]` | Run a registered command as a background process |
-| `ps`          | List processes and their state (`procs`, `processes`) |
-| `kill <pid>`  | Stop a background process (the shell cannot be killed) |
-| `tick [count] [ms]` | Print periodic ticks; useful with `spawn`       |
-| `clear`       | Clear the terminal (ANSI escape)                     |
-| `poweroff`    | PSCI SYSTEM_OFF; QEMU exits (`shutdown` alias)       |
-| `reboot`      | PSCI SYSTEM_RESET (`reset` alias)                    |
-
-## Processes and scheduling
-
-Processes in feos are **kernel threads**, not isolated user processes: they
-share the kernel address space, all run at EL1, and each has its own 128 KiB
-stack and saved register frame. The process table has sixteen slots in `.bss`;
-slot 0 is the shell, which is always PID 1 and is never reused.
-
-The board initializes a GICv2 and enables the EL1 physical timer PPI (IRQ 30).
-The timer fires at 100 Hz, the architecture's IRQ stub saves a full `TrapFrame`
-on the interrupted stack, and `kernel/src/sched.rs` swaps that frame for the
-next runnable process's frame. Returning from the exception therefore resumes a
-different process. Scheduling is a plain round-robin; there are no priorities
-and no blocking wait queues.
-
-Try it from the shell:
-
-```text
-feos> spawn tick 8 200
-started pid 2: tick
-feos> spawn tick 8 200
-started pid 3: tick
-feos> ps
-  PID  STATE    NAME
-*   1  running  shell
-    2  ready    tick
-    3  ready    tick
-feos> kill 2
-killed pid 2
-```
-
-The ticks from PIDs 2 and 3 interleave with the prompt because both apps are
-busy-waiting and the timer preempts them. `spawn` looks the command up in the
-normal app registry, so any command can run in the background. Background apps
-receive their own argument string and the `Platform` services (clock, power,
-CPU, audio, processes), but no framebuffer: graphics apps such as `gfx` and
-`splash` should stay in the foreground. A process exits when its `App::run`
-returns; the scheduler frees the slot on the next timer tick so it can be
-reused by a later `spawn`.
-
-## The graphics library
-
-`feos-gfx` (in `libs/gfx/`) is a standalone `no_std` crate with no
-dependencies. It draws into any `&mut [u32]` pixel buffer in XRGB8888 format:
-
-```rust
-use feos_gfx::{Canvas, Color, Rect};
-
-let mut pixels = [0u32; 64 * 32];
-let mut canvas = Canvas::new(&mut pixels, 64, 32, 64).unwrap();
-
-canvas.clear(Color::rgb(8, 11, 24));
-canvas.fill_rect(Rect::new(4, 4, 20, 10), Color::RED);
-canvas.fill_circle(48, 16, 10, Color::YELLOW);
-canvas.line(0, 31, 63, 0, Color::CYAN);
-canvas.fill_vertical_gradient(
-    Rect::new(30, 18, 30, 12),
-    Color::NAVY,
-    Color::PURPLE,
-);
-canvas.draw_text(4, 22, "hi feos", Color::WHITE, 1);
-```
-
-API summary:
-
-- `Canvas::new(pixels, width, height, stride)` with clipping on every draw
-- `clear`, `put_pixel`, `pixel`
-- `fill_rect`, `stroke_rect`, `hline`, `vline`, `line`
-- `circle`, `fill_circle`
-- `fill_vertical_gradient`
-- `draw_char`, `draw_text`, `text_width`, `text_height` (8x8 bitmap font)
-- `blit` for packed XRGB8888 images
-- `Color` with `rgb`, `from_u32`, channel accessors, constants, and `lerp`
-- `Point`, `Size`, `Rect` geometry helpers
-
-The library is host-testable:
-
-```sh
-make test
-# equivalent to:
-cargo test -p feos-gfx -p feos-gui -p feos-audio -p feos-sync \
-    -p feos-json -p feos-yaml -p feos-image -p feos-audio-codec \
-    -p feos-h264 -p feos-video -p feos-compress -p feos-archive \
-    --target x86_64-unknown-linux-gnu
-```
-
-## The GUI library
-
-`feos-gui` (in `libs/gui/`) builds a small desktop toolkit on top of
-`feos-gfx`. It is `no_std`, has no allocator, no `unsafe`, and no dependencies
-beyond `feos-gfx`. The model is **immediate mode**: an app rebuilds its
-interface every frame, widgets return a `Response`, and state that must survive
-between frames lives in caller-owned structs.
-
-```rust
-use feos_gfx::{Canvas, Rect};
-use feos_gui::InteractionState;
-use feos_gui::prelude::*;
-
-let mut pixels = [0u32; 480 * 320];
-let mut canvas = Canvas::new(&mut pixels, 480, 320, 480).unwrap();
-let theme = Theme::dark();
-let input = Input::new();
-let mut state = InteractionState::<8>::new();
-let mut volume = 0.6f32;
-let mut enabled = true;
-
-let mut ui = Ui::new(&mut canvas, &theme, &input, &mut state);
-ui.desktop_background(ui.canvas_rect());
-let panel = Rect::new(24, 24, 280, 180);
-ui.card(panel, "Settings", |ui| {
-    ui.label_muted("APPEARANCE");
-    ui.checkbox(&mut enabled, "Enable notifications");
-    ui.slider(&mut volume, 0.0, 1.0);
-    if ui.primary_button("Apply").clicked {
-        // handle the click
-    }
-});
-```
-
-Key pieces:
-
-- `Ui` — the frame handle. It owns a clipped `Painter`, the active theme,
-  input, and interaction state. Widgets are inherent methods, so custom
-  widgets can mix freely with the built-in ones.
-- `InteractionState<N>` — fixed-capacity hover/active/focus/tab-order table
-  and scroll offsets. It never grows; extra regions degrade gracefully.
-- `LayoutStack` / `ui.column`, `ui.row`, `ui.grid` — deterministic linear
-  layout. No constraint solver and no allocations.
-- `Painter` — clipping, rounded rectangles, alpha blending, shadows, and
-  text drawing/wrapping/ellipsis over `feos_gfx::Canvas`.
-- `Input` / `Event` — pointer, wheel and keyboard events. The QEMU board feeds
-  them from virtio tablet/keyboard devices and the serial console decoder.
-- Widgets — labels, headings, paragraphs, buttons, checkboxes, radios, toggles,
-  sliders, progress bars, badges, separators, text fields with selection and
-  UTF-8 editing, panels, cards, scroll areas, tabs, windows, dialogs, lists,
-  tooltips, and a desktop background.
-- Components — search fields, selects, menus, segmented controls, numeric
-  steppers, ratings, colour pickers, form fields, alerts, toasts, spinners,
-  skeletons, empty states, loading overlays, progress rings, confirmation
-  dialogs, toolbars, status bars, breadcrumbs, pagination, step indicators,
-  tables, key/value lists, timelines, trees, stat cards, avatars, chips,
-  accordions, split panes, drawers, popovers and a built-in icon set.
-- Windows/Fluent-inspired components — `NavigationView`, `TabView`,
-  `MenuBar`, `CommandBar`, `ListView`, `GridView`, `FlipView`, `PipsPager`,
-  `InfoBar`, `InfoBadge`, `Persona`, `SettingsCard`, `HeroBanner`,
-  `TeachingTip`, `Flyout`, context menus, `Calendar`/`DatePicker`/
-  `TimePicker`, `AutoSuggestBox`, `ToggleButton`, `SplitButton`,
-  `DropDownButton`, `HyperlinkButton` and radio groups. They follow WinUI
-  behaviour and naming where practical while keeping the same caller-owned,
-  allocation-free state model.
-- Advanced inputs — password boxes, multiline text areas, two-thumb range
-  sliders, rotary knobs, tag editors, hotkey recorders, cascaders, transfer
-  lists, file drop zones and `@mention` fields.
-- Patterns — avatar groups, presence badges, group boxes, property grids, log,
-  code and diff viewers, comment/chat threads, result pages, selector bars,
-  pivots, title bars, floating action buttons, back-to-top controls, bottom
-  sheets, popconfirms, command palettes, swipe actions, pull-to-refresh,
-  annotated scrollbars and zoom controls.
-- Charts — line, area, bar and sparkline series over caller-provided slices,
-  plus pie, donut, scatter, radar, heatmap, funnel, bullet, treemap and
-  candlestick charts. All chart data is caller-owned and allocation-free.
-
-The library now exposes well over 100 reusable components and widgets, and the
-same list keeps growing without changing the layering rules: `Ui` methods,
-caller-owned state and a clipped painter. The full component inventory lives in
-[`libs/gui/src/components/README.md`](libs/gui/src/components/README.md).
-- `WindowState` — draggable and resizable window geometry, also caller-owned.
-
-Components are still inherent methods on `Ui`, and their state is caller-owned
-the same way widget state is. There is no hidden widget tree or z-order stack:
-popups, menus, drawers, popovers and toasts paint inline, so draw them late in
-the frame when they need to float over other content.
-
-```rust
-let mut select = SelectState::new();
-let mut theme_choice = 0;
-let mut page = 0;
-let mut tabs = TabViewState::from_titles(["Overview", "Details", "Activity"]);
-let mut menu = MenuBarState::new();
-let mut list = ListState::<8>::new();
-
-ui.menu_bar(&mut menu, &[MenuBarMenu::new("File", &file_entries)]);
-ui.list_view(list_rect, &items, &mut list);
-ui.tab_view(&mut tabs, panel, |ui, _content| {
-    ui.label("Content for the active tab");
-});
-ui.select(&mut select, &mut theme_choice, &["Dark", "Light"], "Theme");
-ui.pagination(&mut page, 8);
-```
-
-Everything is fallible only at the edges: `Canvas::new` validates the buffer,
-while widgets simply clip or skip work when there is no room.
-
-```sh
-make test-gui
-# equivalent to:
-cargo test -p feos-gui --target x86_64-unknown-linux-gnu
-```
-
-## The desktop environment
-
-![The feos desktop with the XP-style Start menu](docs/desktop.png)
-
-`feos-desktop` (in `libs/desktop/`) is the session layer above `feos-gui`:
-wallpaper and shortcuts, an XP-style taskbar and Start menu, a fixed-capacity
-window manager, and an init/service supervisor. It is `no_std`, allocation-free
-and independent of the board. Full reference:
-[`docs/desktop.md`](docs/desktop.md).
-
-On boot the kernel draws the splash, waits briefly, and then starts the desktop
-automatically. QEMU supplies a virtio tablet and, with the default run flags, a
-virtio keyboard, so windows, the Start menu and terminal work with the pointer
-and keyboard in the QEMU window. The serial console is still a keyboard and can
-be used alongside it:
-
-| Input | Action |
-|-------|--------|
-| Mouse | Move the pointer; click Start, menus, taskbar buttons and window controls |
-| Keyboard | Type in the focused window (terminal, dialogs) or use arrows/Enter on the desktop |
-| Double-click | Open a desktop shortcut, or maximise/restore a window from its title bar |
-| Drag | Move a window by its title bar, or resize it from any edge or corner |
-| Cursor | Arrow on the desktop, horizontal/vertical arrows on window edges, diagonal arrows on corners |
-| Right-click | Open the desktop menu |
-| Arrow keys | Move the Start-menu highlight, or the wallpaper selection when the menu is closed |
-| `Enter` | Launch the highlighted application |
-| `Space` | Open the Start menu from the desktop (or toggle All Programs while it is open) |
-| `Ctrl+Esc` | Open the Start menu while an application has focus |
-| `Tab` | Toggle All Programs, or focus the next window when the menu is closed |
-| `Esc` | Close the Start menu |
-| `Ctrl-\` | Leave the desktop and return to the serial shell (`Ctrl-D` also works) |
-
-The Start menu starts closed; click **start** to open it. **Run...** accepts a
-bundle id (`system-info`) or a shell command (`ps`), **Turn Off Computer**
-shows the XP shutdown confirmation, and the tray clock opens Date and Time
-Properties.
-
-The same controls work in the shell with the `desktop` command:
-
-```text
-feos> desktop
-[desktop] session started
-[desktop] click Start, double-click desktop icons, drag windows; Ctrl-\ returns to the shell
-[desktop] 7 application(s) discovered in the application folder (0 skipped)
-feos> desktop list
-  files                System         entry=files  Browse, search and preview files with an XP-style explorer
-  terminal             System         entry=gui    GUI dashboard and component gallery
-  system-info          System         entry=info   Board, CPU, memory and kernel details
-  process-monitor      System         entry=taskmgr Applications, processes, graphs and process control
-feos> desktop run files
-[desktop] launching 'files' in the foreground
-[files] explorer closed
-[desktop] returned from 'files'
-```
-
-The session is configured entirely in YAML
-([`apps/desktop/desktop.yaml`](apps/desktop/desktop.yaml)): theme, wallpaper
-style and colours, taskbar edge/height/clock/quick-launch count, Start-menu
-size and layout, desktop icons, default window sizes, application folders and
-autostart services. Unknown keys and invalid values keep their defaults.
-
-Applications are **single-file bundles** (`.fapp`): one ZIP or TAR archive with
-`manifest.yaml`, an icon and any resources. The scanner detects them by archive
-magic, not by suffix, so renaming a bundle does not hide it. On QEMU the
-application folder is embedded at build time: `apps/desktop/build.rs` turns
-every file in `apps/desktop/apps/` into an embedded `DirEntry`, so dropping a
-bundle in that folder and rebuilding adds it to the Start menu. A
-filesystem-backed board passes the same `&[DirEntry]` list to `Desktop::scan`
-at run time.
-
-```yaml
-# manifest.yaml inside a .fapp
-id: terminal
-name: Terminal
-entry: gui
-category: System
-description: GUI dashboard and component gallery
-icon: icon.bmp
-window:
-  width: 760
-  height: 520
-```
-
-`Desktop::launch` opens the window, resolves the manifest entry through the
-`AppRegistry` published in `Platform::apps`, and spawns it through
-`Processes`. `libs/init` supervises services with `never`, `on-failure` or
-`always` restart policies and a bounded retry budget; the YAML `init.autostart`
-list is registered when the session starts and ticked once per frame.
-
-```sh
-make test-desktop test-desktop-app
-make bundles      # repack apps/desktop/bundle-src/* into apps/desktop/apps/*.fapp
-```
-
-## FEOS-DOS
-
-![FEOS-DOS in the desktop](docs/dosbox-window.png)
-
-`feos-dosbox` (in `libs/dosbox/`) is FEOS's own DOS box: an original,
-dependency-free `no_std` implementation of the PC that a DOS program expects.
-Open **FEOS-DOS** from the Start menu, or run `dosbox` from the serial shell.
-
-It provides:
-
-- an 8086/80186 CPU interpreter with the full integer instruction set,
-  segmentation, flags, interrupts and `REP` string operations, plus an x87
-  FPU with the common arithmetic, load/store, comparison, BCD and control
-  instructions;
-- 1 MiB of conventional memory, the interrupt vector table and the BIOS data
-  area;
-- an 80x25 VGA text adapter with the CP437 box-drawing and block characters,
-  plus VGA mode 13h (320x200, 256 colours), CGA modes 4/5/6 and EGA/VGA planar
-  modes with the graphics-controller registers and DAC palette;
-- BIOS `INT 10h` video, `INT 16h` keyboard, `INT 1Ah` clock, `INT 33h` mouse,
-  equipment/memory calls and honest "not present" answers for disks, serial
-  and printer;
-- a DOS kernel with a writable `C:` RAM drive, handles, a DTA, file search,
-  memory allocation and the `INT 21h` calls a text-mode program needs;
-- OPL2/OPL3 FM synthesis on the AdLib/Sound Blaster ports, a PC speaker BEL
-  beep, and stereo mixing through `feos_hal::Audio`;
-- `MOUNT` of per-game ZIPs, `SCREEN` BMP screenshots, and `SAVESTATE` /
-  `LOADSTATE` machine snapshots;
-- a `COMMAND.COM`-style prompt with `DIR`, `CD`, `TYPE`, `COPY`, `DEL`, `REN`,
-  `MD`, `RD`, `CLS`, `ECHO`, `PROMPT`, `VER`, `MEM`, `VOL`, `DATE`, `TIME`,
-  `MOUNT`, `GAMES`, `SCREEN`, `HELP`, `ABOUT`, `DEMO`, `RUN` and `EXIT`, plus
-  batch files;
-- real `.COM` and `.EXE` loading: `HELLO.COM` and `BOX.COM` are assembled by
-  hand and exercise the CPU, DOS and VGA paths end to end.
-
-`C:` is a RAM drive, so DOS programs can create and change files without
-touching the read-only host image. `MOUNT WOLF3D` imports a directory from the
-board's filesystem on demand; `GAMES` lists the shipped game image and `SCREEN`
-writes a BMP screenshot to `C:\SCREEN.BMP`. Full reference:
-[`docs/dosbox.md`](docs/dosbox.md), with the full rust-dos comparison in
-[`docs/dosbox-gap.md`](docs/dosbox-gap.md).
-
-The repository includes a 64 MiB exFAT image at `data/games/dos.img` with 13
-shareware, demo and freeware DOS games from DOSGames.com, one ZIP per title.
-`make games-image` links it as the QEMU board's optional disk, and `MOUNT`
-extracts one ZIP at a time so it fits the kernel heap.
-
-Graphics hardware and the CPU paths are in place, but **none of the 13 titles
-has been validated as playable end to end yet**. The image mounts, `GAMES`
-lists it, `MOUNT` imports a title and `DIR` shows its files; Wolfenstein 3D
-decompresses and reaches its self-relocation stub, which still needs loader
-work. The DOS/4GW, DOS/4G, DJGPP and CWSDPMI games additionally need 386
-protected mode and DOS extenders. Transcendental x87 instructions, Sound
-Blaster DSP/DMA, GUS/MT-32/MIDI, networking and video/GIF recording are not
-implemented; OPL2/OPL3 FM, the PC speaker BEL beep, mouse, screenshots and save
-states are. `ABOUT` in the guest says the same thing.
-
-## The Task Manager
-
-![The feos Task Manager showing the Processes tab](docs/taskmgr.png)
-
-`taskmgr` is a Windows XP-style task manager with five tabs and live data from
-the kernel scheduler and heap:
-
-- **Applications** lists running tasks with End Task, Switch To and New Task.
-- **Processes** shows PID, CPU percentage, CPU time, memory, threads, start
-  time, status and priority. Click a heading to sort; double-click for
-  properties; right-click for the context menu; End Process or Delete ends the
-  selected task.
-- **Performance** draws CPU and memory history graphs on the classic black
-  grid, alongside Totals, Commit Charge, Physical Memory and Kernel Memory
-  panels. View > CPU Graph switches between one combined CPU line and a
-  separate graph for every online core.
-- **Networking** presents the adapter view; on a board without a network driver
-  it reports a disconnected adapter and a flat graph rather than pretending.
-- **Users** shows the console session.
-
-The File, Options, View and Help menus expose Run, Select Columns, update
-speed (High/Normal/Low/Paused), status-bar and graph toggles, the combined or
-per-core CPU graph mode, Help and About.
-Dialogs use the Luna title bar and include Run, Select Columns, Process
-Properties, About, Help, End Process and Log Off. The window can be dragged,
-resized, maximised or closed with the mouse.
-
-```text
-feos> taskmgr
-feos> spawn tick 100 200
-feos> taskmgr
-```
-
-The `ps` command remains the serial-console view. The task manager is a
-windowed app, so the desktop opens it from the Start menu or the desktop
-context menu's **Task Manager** item; it can be moved, resized, minimized and
-restored while the taskbar and other windows stay live.
-
-CPU accounting is real: the scheduler records one tick per process and marks
-ticks spent in the architecture's `WFI` idle wait separately, so an idle
-desktop is quiet while a busy app actually raises the graph. Memory figures
-come from a HAL `Memory` service backed by the kernel's static heap and the
-loaded image ranges.
-
-## The filesystem and File Explorer
-
-![The feos file explorer showing the docs directory](docs/files.png)
-
-`feos-fs` (in `libs/fs/`) provides three backends. The QEMU board has no block
-device driver yet, so its default image is compiled into the kernel:
-`boards/qemu-virt/build.rs` walks `boards/qemu-virt/fs/` and generates a flat
-`StaticNode` table. Each node knows its name, kind, parent and children; file
-data is borrowed from the image, so lookup and reads never allocate.
-
-The same crate now provides real FAT32 and exFAT readers/writers over the
-`BlockDevice`/`WritableBlockDevice` traits. The drivers understand long FAT
-file names, exFAT UTF-16 names and up-case tables, allocation bitmaps, FAT and
-contiguous cluster streams, and support creating, writing, extending,
-truncating, renaming and deleting files and directories. On-disk structures were
-validated with `fsck.fat` and `fsck.exfat`. Mutations use the
-`WritableFileSystem` trait; the read-only `FileSystem` view remains available
-through a shared borrow.
-
-To boot QEMU with a real filesystem image, drop a FAT32 or exFAT image at
-`boards/qemu-virt/disk.img` and rebuild. The board probes it at boot and prefers
-it over the compiled-in tree (the optional mount is read-only until a block
-device driver is wired up). A board with a virtio-blk, SD or USB driver can use
-`MemoryBlockDeviceMut` or `RamDisk` today:
-
-```rust
-use feos_fs::{Fat32, MemoryBlockDeviceMut, NodeId, WritableFileSystem};
-
-let mut fs = Fat32::mount(MemoryBlockDeviceMut::new(&mut image))?;
-let file = fs.create_file(NodeId::ROOT, "hello.txt")?;
-fs.write(file, 0, b"hello\n")?;
-fs.flush()?;
-```
-
-`make docker-run` goes one step further: the container creates a 36 MiB FAT32
-image and a 16 MiB exFAT image, seeds both with sample files, embeds them in the
-kernel and mounts them as `/fat32` and `/exfat`:
-
-```text
-feos> files tree /
-/
-  fat32
-    hello.txt
-    docs
-      notes.md
-    big.bin
-    Long File Name.txt
-  exfat
-    hello.txt
-    docs
-      notes.md
-    big.bin
-    café.txt
-feos> files cat /fat32/hello.txt
-feos> files cat /exfat/café.txt
-```
-
-That path exercises the read/write drivers twice: the `seed` example writes the
-files, the kernel mounts both volumes, and the explorer/shell read them back.
-Use `make docker-run-vnc` when there is no X11 display. The test images are
-created inside the container, not in your working tree; set
-`FEOS_TEST_DISKS=0` when running `docker run` directly to skip them.
-
-Drop a file into `boards/qemu-virt/fs/` and rebuild to add it to the explorer
-and the shell. The initial image contains `README.txt`, `docs/`, `etc/`,
-`examples/` and an empty directory.
-
-Apps reach the filesystem through `Platform::filesystem`, so the same API works
-for a future disk or RAM backend. The `files` app has a graphical mode and
-text-mode forms:
-
-```text
-feos> files              # full-screen explorer (Esc returns)
-feos> files ls /
-feos> files cat /README.txt
-feos> files tree /docs
-feos> files stat /etc/motd
-```
-
-The explorer is a complete Windows XP-style browser rather than a directory
-dump. It has the Luna title bar, File/Edit/View/Favorites/Tools/Help menus,
-Back/Forward/Up/Search/Folders/Views standard buttons, an editable Address bar
-with a history drop-down, a synchronised folder tree, File and Folder Tasks,
-and a Details pane. The main view supports Details, Icons, List and Tiles
-layouts, sortable columns, multi-selection and right-click context menus.
-Folders can be searched recursively (with an optional subfolder toggle), and
-text or binary files open in a scrollable viewer with a hex dump for binary
-data. Properties, Folder Options and About are modal XP-style dialogs.
-
-The filesystem is read-only, so file-changing commands are deliberately
-disabled and explain that the image is compiled into the kernel. Everything
-else works with the mouse, the virtio keyboard or the serial keyboard:
-
-| Input | Action |
-|-------|--------|
-| Click / double-click | Select, open folders, or open a file viewer |
-| Right-click | Context menu for an item or the current folder |
-| Mouse wheel | Scroll the list, tree, preview or viewer |
-| Title bar | Drag a restored window; the square button maximises/restores |
-| Window edges | Drag any edge or corner to resize; the cursor changes to the matching XP resize arrow |
-| Arrow keys | Move the list or tree selection |
-| `Shift` + arrows | Extend the selection |
-| `Ctrl` + arrow keys | Move the focus without changing the selection |
-| `Enter` / `Right` | Open a folder or file |
-| `Backspace` / `Left` | Go to the parent folder |
-| `Alt+Left` / `Alt+Right` | Back / Forward |
-| `F3` / `Ctrl+F` | Open the Search pane |
-| `F5` / `Ctrl+R` | Refresh |
-| `F10` | Open the File menu |
-| `F1` | About File Explorer |
-| `Ctrl+L` | Focus and edit the Address bar |
-| `Ctrl+A` | Select all (Edit menu can invert the selection) |
-| `Tab` / `Shift+Tab` | Move focus between list, tree and address bar |
-| `Esc` | Close a menu/dialog, or return to the desktop |
-
-Interactive apps implement `App::windowed`. The desktop opens a managed
-window, then calls `App::frame_window` once per frame with a content canvas and
-the desktop's input. The app keeps its state while the desktop stays in its
-normal loop, so wallpaper icons remain visible beside the window and the
-taskbar, Start menu and other windows keep working. Minimizing a window
-preserves the app; restoring it from the taskbar resumes the same session.
-File Explorer, Task Manager and Media Player all run this way.
-
-## The video player
-
-![The feos video player showing an H.264 MP4](docs/player.png)
-
-`player` is a VLC-inspired windowed application built on `feos-video`,
-`feos-fs` and the GUI toolkit. It scans `/media` recursively, opens the first
-movie automatically, and keeps a session playlist with the other supported
-files. The initial filesystem ships with tiny GIF, MJPEG, raw AVI, H.264 MP4,
-MKV, FLV and Annex-B samples; VP9 files are listed as recognised but not
-decodable so the media-information path can be inspected too.
-
-The interface has VLC-style Media/Playback/Audio/Video/Subtitle/Tools/View/Help
-menus, standard transport buttons, a seek bar with elapsed/duration labels,
-playback speed, loop and shuffle modes, a playlist strip, fullscreen mode with
-auto-hiding controls, and Fit/Fill/Stretch/Original aspect modes. Media
-Information reports the container, codec, dimensions, frame count/rate,
-duration, file size and decode support. A modal Open Media dialog lists every
-video on the filesystem. Right-clicking the video or playlist opens a context
-menu.
-
-```text
-feos> player                    # scan /media and start playing
-feos> player /media/h264-sample.mp4
-feos> player /media/animation.gif
-```
-
-| Input | Action |
-|-------|--------|
-| `Space` | Play or pause |
-| `S` / `B` / `N` | Stop / previous / next |
-| `Left`, `Right` | Seek 5 seconds (`Shift` seeks 1 second) |
-| `Page Up`, `Page Down` | Seek 30 seconds |
-| `Home`, `End` | Start / end |
-| `,`, `.` | Previous / next frame while paused |
-| `+`, `-`, `0` | Faster, slower, normal speed |
-| `F` / `F11` | Toggle fullscreen |
-| `P` | Toggle the playlist |
-| `O` | Open the media browser |
-| `I` | Media information |
-| `L` / `R` | Cycle repeat mode / toggle shuffle |
-| `A` | Cycle aspect mode |
-| `Tab` | Switch between video and playlist focus |
-| Mouse | Click video to play/pause, double-click for fullscreen |
-| Wheel | Seek, or scroll the playlist |
-| `Esc` | Close a dialog, leave fullscreen, or quit |
-
-`feos-video` demuxes the container and decodes GIF, MJPEG, uncompressed/RLE AVI
-and H.264 into caller-provided RGBA buffers. H.264 needs `alloc` for reference
-pictures, so the kernel now has a small static first-fit heap
-(`kernel/src/allocator.rs`). Everything else remains allocation-free outside
-the player's file and frame buffers. The player has no audio track support yet
-because the current video demuxers expose the video track only; the Audio menu
-is present but explains that limitation.
-
-## The audio library
-
-`feos-audio` (in `libs/audio/`) is the audio counterpart of `feos-gfx`: a
-standalone `no_std` crate with no dependencies. It works on caller-provided
-interleaved 16-bit PCM buffers, never allocates, and uses only integer math.
-
-```rust
-use feos_audio::{AudioBuffer, AudioFormat, Oscillator, Sample, Waveform};
-
-let format = AudioFormat::mono(48_000).unwrap();
-let mut samples = [0i16; 48_000];
-let mut buffer = AudioBuffer::new(&mut samples, format).unwrap();
-
-// Render a one-second 440 Hz sine wave at half volume.
-let mut tone = Oscillator::new(Waveform::Sine, 440, Sample::from_i16(16_000));
-buffer.render_oscillator(&mut tone, Sample::MAX);
-
-// Layer a quieter square wave on top.
-let mut second = Oscillator::new(Waveform::Square, 660, Sample::from_i16(6_000));
-buffer.mix_oscillator(&mut second, Sample::MAX);
-
-// Add short fades and mutate the whole buffer.
-buffer.fade_in(480);
-buffer.fade_out(480);
-buffer.apply_gain(Sample::from_i16(24_000));
-```
-
-API summary:
-
-- `AudioBuffer::new(samples, format)` over `&mut [i16]`, validating whole frames
-- `frames`, `channels`, `sample_rate`, `duration_ms`
-- `clear`, `sample`, `set_sample`, `frame`, `frame_mut`
-- `write_frame`, `mix_frame` with saturating addition
-- `mix` another buffer of the same format
-- `apply_gain`, `fade_in`, `fade_out`, `peak`, `is_silent`
-- `render_oscillator`, `mix_oscillator`
-- `Sample`: signed 16-bit PCM with `from_i16` / `from_i8` / `from_u8` /
-  `from_f32`, `raw`, `to_f32`, `magnitude`, `gain`, and saturating `mix`
-- `AudioFormat`: sample rate plus mono/stereo constructors
-- `Oscillator` + `Waveform`: sine, square, triangle, sawtooth, and noise with
-  changeable frequency, amplitude, and phase reset
-
-## Data and media libraries
-
-These libraries follow the same rules as `feos-gfx` where practical: `no_std`,
-dependency-light, and caller-provided buffers. `feos-video` builds on
-`feos-image` and `feos-h264`; `feos-h264` is the one media crate that uses
-`alloc` and contains the vendored unsafe NEON kernels. The kernel's 64 MiB
-static heap exists to serve it.
-
-| Crate | Formats | Notes |
-|-------|---------|-------|
-| `feos-json` | JSON | RFC 8259 parse into a node arena, compact/pretty emit |
-| `feos-yaml` | YAML subset | block/flow mappings and sequences, quoted and block scalars |
-| `feos-image` | PNG, JPEG, BMP, PPM, QOI | decodes to RGBA8888; PNG/BMP/PPM/QOI encoders |
-| `feos-audio-codec` | WAVE, AIFF, AU, MP3, Ogg | decodes to interleaved `i16`; WAVE/AIFF encoders |
-| `feos-h264` | H.264/AVC | Baseline/Main/High 4:2:0 decode; uses `alloc` |
-| `feos-video` | GIF, AVI, MP4/MOV, Matroska/WebM, FLV, IVF, Annex-B, MJPEG | decodes GIF, MJPEG, raw/RLE and H.264 to RGBA8888 |
-| `feos-compress` | DEFLATE, zlib, gzip | inflate plus a small fixed-Huffman deflater; CRC-32/Adler-32 |
-| `feos-archive` | ZIP, TAR, gzip | stored/deflate ZIP, ustar/GNU/PAX TAR, ZIP/TAR writers |
-
-JSON and YAML borrow both the source text and a caller-owned node arena:
-
-```rust
-use feos_json::{JsonDocument, JsonNode};
-
-let mut arena = [JsonNode::EMPTY; 64];
-let doc = JsonDocument::parse(r#"{"name":"feos","cores":4}"#, &mut arena).unwrap();
-let root = doc.root();
-assert_eq!(doc.as_i64(doc.get(root, "cores").unwrap()), Some(4));
-```
-
-Images decode into an RGBA buffer, with optional scratch space for PNG's
-inflated scanlines:
-
-```rust
-use feos_image::{decode, info, scratch_len};
-
-let info = info(png_bytes)?;
-let mut rgba = vec![0u8; info.rgba_len()?];
-let mut scratch = vec![0u8; scratch_len(png_bytes)?];
-decode(png_bytes, &mut rgba, &mut scratch)?;
-```
-
-Audio follows the same pattern with `i16` samples:
-
-```rust
-use feos_audio_codec::{decode, info};
-
-let props = info(wav_bytes)?;
-let mut pcm = vec![0i16; props.sample_count()?];
-let decoded = decode(wav_bytes, &mut pcm, &mut [])?;
-assert_eq!(decoded.info.sample_rate, 44_100);
-```
-
-Video decodes into the same RGBA canvas, with scratch space only for animated
-GIF:
-
-```rust
-use feos_video::{decode_frame, info, scratch_len};
-
-let props = info(video_bytes)?;
-let mut rgba = vec![0u8; props.rgba_len()?];
-let mut scratch = vec![0u8; scratch_len(video_bytes)?];
-let frame = decode_frame(video_bytes, 0, &mut rgba, &mut scratch)?;
-assert_eq!((frame.width, frame.height), (props.width, props.height));
-```
-
-Compression and archives use the same caller-buffer model:
-
-```rust
-use feos_archive::zip::ZipReader;
-
-let mut gz = vec![0u8; feos_compress::deflate::bound(data.len()) + 64];
-let len = feos_compress::gzip::compress(data, &mut gz)?;
-let mut plain = vec![0u8; data.len()];
-let written = feos_compress::gzip::decompress(&gz[..len], &mut plain)?;
-assert_eq!(&plain[..written], data);
-
-let mut zip = ZipReader::open(zip_bytes)?;
-let mut out = vec![0u8; 4096];
-while let Some(entry) = zip.next()? {
-    let written = entry.extract(&mut out)?;
-    let _ = (entry.name()?, &out[..written]);
-}
-```
-
-Current scope limits:
-
-- JPEG supports baseline and extended-sequential 8-bit files. Progressive
-  JPEG, arithmetic coding and CMYK are rejected with `UnsupportedFeature`.
-- The PNG encoder uses uncompressed zlib "stored" blocks, which keeps the
-  encoder tiny but does not reduce file size.
-- Ogg Opus container headers, pages and packet TOC bytes can be inspected, but
-  Opus packet decoding to PCM is **not implemented yet** and returns
-  `AudioError::UnsupportedFeature`.
-- MP3 is decoded by a vendored, safe-Rust port of minimp3
-  (`libs/audio-codec/src/mp3/`, MIT OR Apache-2.0).
-- `feos-video` reconstructs pixels for GIF, MJPEG, uncompressed/RLE AVI and
-  H.264. HEVC, VP8, VP9, AV1, MPEG-1/2/4, Theora, ProRes, VC-1, VP6, H.263 and
-  Cinepak are recognised and their samples are locatable, but `decode_frame`
-  returns `UnsupportedCodec` for them. Fragmented MP4 is not supported.
-- H.264 limits follow `feos-h264`: 8-bit progressive 4:2:0 Baseline, Main and
-  High profiles, with unsupported features reported as errors.
-- `feos-archive` reads ZIP64, multi-disk and encrypted archives only far enough
-  to reject them; extraction supports stored (`0`) and deflate (`8`) members.
-  The TAR writer emits ustar headers, while the reader also handles GNU long
-  names and PAX `path`/`linkpath`/`size` records.
-- `feos-compress` writes one fixed-Huffman DEFLATE block with greedy LZ77
-  matching. The output is standards-compliant but larger than zlib's optimal
-  encoder. Decompression handles all legal dynamic-Huffman DEFLATE streams.
-- The PNG decoder uses `feos-compress` for zlib, so compressed image support is
-  shared with archives rather than duplicated.
-
-Host tests:
-
-```sh
-make test-json test-yaml test-image test-audio-codec test-h264 test-video test-compress test-archive
-```
-
-## The audio driver
-
-The kernel boots with no PCI firmware, so `feos-driver-pci` enumerates QEMU's
-PCIe ECAM window, sizes BAR0 of the Intel HDA controller (`8086:2668`), assigns
-it `0x1000_0000`, and enables memory decoding plus bus mastering. The board
-does this in `init_audio()` and hands the resulting `&dyn Audio` to apps
-through `Platform`.
-
-`feos-driver-intel-hda` then:
-
-- resets the controller and points CORB/RIRB at static command rings
-- discovers the audio function group, output DAC and output pin at runtime
-  (QEMU's `hda-output` reports DAC 2, pin 3)
-- programs 48 kHz/16-bit stereo, unmutes the DAC and enables the output pin
-- plays one block at a time through output stream descriptor 4, polling the
-  buffer-completion bit instead of using interrupts
-
-The rings, buffer descriptor list and PCM buffer are owned by the board's
-static `AUDIO` object, so playback needs no allocator. The MMU is off, so DMA
-addresses are the buffers' identity-mapped virtual addresses. A block may hold
-up to 288,000 interleaved samples (three seconds); longer blocks are rejected
-with `AudioError::TooLong`.
-
-`tone` fills a static 48 kHz stereo buffer with a 440 + 554 + 659 Hz chord,
-applies fades, and calls `Audio::play`. `info` prints whether the device is
-ready.
-
-> QEMU's `hda-duplex` codec also exposes a capture path and fails to create its
-> ADC voice on some hosts. The launcher therefore uses `hda-output`, which is
-> playback-only and matches the driver.
-
-### Hearing it
-
-`make docker-run` and `make docker-run-vnc` start QEMU with an Intel HDA codec
-and a host audio backend. At the prompt:
-
-```sh
-make docker-build
-make docker-run
-# feos> tone 1500
-```
-
-The backend is chosen by `AUDIODEV`:
+**Sound.** The Docker targets pick the QEMU audio backend from `DOCKER_AUDIODEV`. Unless
+`AUDIODEV` is given on the command line, that's `pa,id=snd0` (PulseAudio or PipeWire) when
+the socket `PULSE_SOCKET` (default `/run/user/<uid>/pulse/native`) exists, and otherwise the
+same default as `make run`: ALSA when there's a `/dev/snd`, or a WAV file in `target/audio`.
 
 | `AUDIODEV` | Effect |
 |------------|--------|
-| `alsa,id=snd0` (default when `/dev/snd` exists) | `--device /dev/snd`; QEMU opens the default ALSA output |
-| `pa,id=snd0` | mounts `PULSE_SOCKET` and sets `PULSE_SERVER` |
-| `wav,id=snd0,path=target/audio/qemu.wav,...` (default otherwise) | writes a WAV under `target/audio` |
-
-The WAV backend is pinned to `out.frequency=48000,out.channels=2,out.format=s16`
-so the capture matches the codec and is not resampled. Listen to or inspect it
-with:
-
-```sh
-file target/audio/qemu.wav
-aplay target/audio/qemu.wav
-```
-
-If ALSA reports a busy device, stop the program holding the output or select a
-different backend:
+| `pa,id=snd0` | Mounts `PULSE_SOCKET` into the container and passes it to QEMU as `server=` |
+| `alsa,id=snd0` | Passes `--device /dev/snd`; QEMU opens the default ALSA output, which a desktop may hold busy |
+| `wav,id=snd0,path=target/audio/qemu.wav,...` | Writes a 48 kHz stereo WAV under `target/audio`, bind-mounted from `/out` |
 
 ```sh
 make docker-run AUDIODEV=pa,id=snd0
 make docker-run AUDIODEV=wav,id=snd0,path=target/audio/qemu.wav,out.frequency=48000,out.channels=2,out.format=s16
 ```
 
-The WAV path is rewritten to `/out/...` inside the container and bind-mounted
-back to `target/audio`.
-
-The library alone can also be rendered without QEMU:
+The image can also be run directly. `FEOS_ARCH` is `arm` (the default) or `x64`, and
+`FEOS_DISPLAY` is `gtk`, `vnc=...` or `none`:
 
 ```sh
-make docker-audio             # render inside the container
-aplay target/audio/feos-tone.wav
+docker run --rm -it -p 127.0.0.1:5900:5900 -e FEOS_ARCH=x64 -e FEOS_DISPLAY=vnc=0.0.0.0:0 feos
 ```
 
-`make docker-audio` uses the same Docker image as `make docker-run`, runs the
-`tone` example with `cargo run`, and streams the WAV back to
-`target/audio/feos-tone.wav` without booting QEMU. It works with rootless
-Podman as well, and the file is owned by your host user. Use `paplay`,
-`ffplay -autoexit`, or `afplay` instead of `aplay` if that is what your host
-provides.
+`make docker-shell` opens a shell in the image with the tree mounted at `/src`, and
+`make docker-boot-test` runs the boot test there with no network.
 
-The same demo works without Docker:
+### On the host
+
+You need the toolchain in `rust-toolchain.toml` (`rustup show` installs it), QEMU
+(`qemu-system-aarch64`, `qemu-system-x86_64`) and `objcopy` for the x86_64 image. On
+Debian or Ubuntu: `sudo apt install qemu-system-arm qemu-system-x86 binutils`.
 
 ```sh
-make audio-demo               # native render to target/audio/feos-tone.wav
-aplay target/audio/feos-tone.wav
-
-# or directly, choosing your own path:
-cargo run -p feos-audio --example tone --target x86_64-unknown-linux-gnu -- /tmp/tone.wav
+make run-arm               # build and boot AArch64 (`make run`); VNC on 127.0.0.1:5900
+make run-x64               # build and boot x86_64; VNC on 127.0.0.1:5900
 ```
 
-Change the output path with `make audio-demo AUDIO_OUT=/tmp/tone.wav`. The
-example renders a three-second 48 kHz/16-bit stereo A-major chord and prints
-its peak level, so a non-zero peak confirms the DSP path ran.
+Both build the user programs first, then a release kernel with LTO. They boot 4 CPUs and
+512 MiB by default, with an Intel HDA codec and a virtio disk image,
+`target/feos-disk-<arch>.img`, created sparse at 512 MiB and formatted by the kernel on first
+boot, so files survive reboots (`FEOS_DISK=none` boots with a RAM root instead).
 
-## How the boot works
+| Override | Result |
+|----------|--------|
+| `make run QEMU_DISPLAY=gtk` | A native QEMU window, if QEMU has GTK |
+| `make run QEMU_DISPLAY=none` | Serial console only |
+| `make run QEMU_SMP=8 QEMU_MEM=1G` | Eight CPUs and 1 GiB (`QEMU_SMP_X64` for `run-x64`) |
+| `make run AUDIODEV=pa,id=snd0` | Live PulseAudio/PipeWire output |
+| `make run QEMU_EXTRA="-netdev user,id=n0 -device virtio-net-pci,netdev=n0"` | A network card: the run scripts otherwise boot with `-net none` |
+| `make run QEMU_EXTRA="-device virtio-gpu-pci"` | A virtio-gpu, used instead of ramfb |
+| `FEOS_MACHINE=virt,gic-version=3 ./scripts/qemu.sh <kernel>` | AArch64 with a GICv3 |
 
-1. QEMU loads the ELF at `0x4020_0000` (from
-   `boards/qemu-virt/linker.ld`) and starts at `_start` in EL1 with the MMU,
-   caches, and interrupts off. `x0` is 0 from the ELF loader, and the device tree
-   is at the start of RAM, below the kernel.
-2. `arch/aarch64/src/boot.S` keeps only the boot CPU running, sets `sp` to
-   `__stack_top`, enables FP/SIMD via `CPACR_EL1.FPEN`, zeroes `.bss`, and
-   calls `kmain(dtb)`.
-3. `kmain` asks the board to initialize the console (PL011 plus the console
-   writer/reader registration), installs `VBAR_EL1`, and prints the banner.
-4. The board looks up the writable fw_cfg item `etc/ramfb`, fills in a 28-byte
-   big-endian `RAMFBCfg` (address, `XR24` fourcc, width, height, stride), and
-   submits it through fw_cfg's DMA interface. The 3 MiB scanout buffer is a
-   page-aligned `static` in the board crate's `.bss`.
-5. `ramfb` scans out of guest RAM directly, so drawing is simply writing
-   pixels; there is no flush or virtqueue. `feos-gfx` renders the splash into
-   the canvas. After a short pause the kernel starts the desktop session, which
-   redraws the same canvas; logging off returns to the shell, where `gfx` can
-   redraw the test card.
-6. The board finds the Intel HDA controller through the PCIe ECAM window,
-   assigns BAR0, enables bus mastering, and initialises the driver: reset,
-   CORB/RIRB setup, codec discovery, 48 kHz stereo format. The desktop and
-   shell receive the resulting `&dyn Audio` in `Platform`.
-7. `kmain` installs the IRQ handler, asks the board to initialize the GICv2 and
-   enable timer PPI 30, creates the shell as PID 1, and starts the 100 Hz tick.
-   Unmasking IRQs is the point where the desktop and shell become preemptible.
-8. Faults land in the vector table, which forwards a `FaultInfo` to the kernel's
-   reporter: `ESR_EL1`, `ELR_EL1`, `FAR_EL1`, `SPSR_EL1`, and the stack
-   pointer, then halts. IRQs take the separate recoverable path described above.
-9. `poweroff` issues PSCI `SYSTEM_OFF` over `HVC`; QEMU exits.
+On AArch64 the run target adds a virtio tablet and keyboard (`POINTER_FLAGS`,
+`KEYBOARD_FLAGS`); x86_64 has PS/2. `cargo run` goes through the same scripts, which read
+`FEOS_DISPLAY`, `FEOS_SMP` and `FEOS_MEM` instead.
 
-## Notes and limitations
+### Booting from UEFI
 
-- The MMU and caches are still off; the framebuffer is accessed through the
-  identity mapping.
-- Resolution is fixed at 1024x768 and the buffer lives in the board's `.bss`
-  (3 MiB).
-- The desktop composes each frame in an off-screen `BACK` buffer and copies it
-  to the scanout in one pass. Foreground apps use their own off-screen canvas,
-  sized to the desktop work area so the taskbar stays visible, and present it
-  with one copy as well, so pointer movement does not expose a half-drawn
-  frame. There is no hardware acceleration, and the font is ASCII-only
-  (non-ASCII falls back to `?`).
-- Single core. All processes share one address space and run at EL1, so there
-  is no memory protection or privilege boundary between them; a fault in any
-  process halts the machine.
-- Eight process slots including the shell, 128 KiB per spawned stack, and no
-  heap. `spawn` copies at most 96 bytes of arguments into the process table.
-- Round-robin has no priorities, blocking sleep, or wait/join. `sleep` and
-  `tick` busy-wait and rely on preemption, and a process cannot wait for
-  another to exit.
-- Background processes get no framebuffer, and apps share crate-level statics:
-  avoid running the same stateful app (for example `tone`, which owns a static
-  PCM buffer) in two processes at once.
-- Audio is playback-only and interrupt-free: one HDA output stream, fixed
-  48 kHz/16-bit stereo, no hardware volume or jack detection, and a three-second
-  maximum block while the driver waits for completion. The scheduler can
-  preempt the polling loop, but the HDA stream keeps running and playback
-  resumes when the `tone` process is next scheduled. QEMU's `hda-output`
-  codec is required (`hda-duplex` has a capture path that can fail to start).
-- Debian's `qemu-system-arm` prints
-  `Could not open option rom 'vgabios-ramfb.bin'` when `ramfb` starts. That ROM
-  is x86 firmware and is unused on aarch64; the warning is harmless.
+`make build-efi` builds the loader for both architectures (`boot/efi`). Put it on a FAT
+ESP as `\EFI\BOOT\BOOTAA64.EFI` or `\EFI\BOOT\BOOTX64.EFI`, with a kernel ELF beside it as
+`\feos.elf`, and boot OVMF or AAVMF from it. The loader asks GOP for a 1024x768
+framebuffer, passes the memory map, ACPI RSDP and device tree to the kernel, and jumps to it.
+The `efi` phase of `scripts/boot-test.py` (`make_esp` and `efi_command`) does exactly this.
 
-Natural extensions: identity-map the kernel with caches enabled, add an EL0
-user mode with per-process page tables and a syscall boundary, add blocking
-sleep/wait queues and priorities to the scheduler, support GICv3/ITS, add
-a `virtio-gpu` driver for larger modes, add
-interrupt-driven HDA playback with a mixer and hardware volume control, or
-parse the device tree. Each of these fits into an existing layer: `libs/` for
-media and scheduler policy, `kernel/` for the heap, `drivers/` for GICv3,
-virtio-gpu and audio, and `apps/` for an animation or audio app.
+### First steps
 
-## License
+The kernel shows a splash, then the desktop. Click **start**, or double-click an icon.
+`Ctrl-\` on the serial console (or **Log Off**) leaves the desktop for the serial shell, and
+`desktop` goes back. Some things to try in a Terminal or the serial shell:
 
-Most crates are `MIT OR Apache-2.0`. `feos-dosbox`, `feos-dosbox-app`, the kernel
-crate and the linked `feos` binary are `GPL-2.0-or-later`. See
-[`LICENSING.md`](LICENSING.md).
+```sh
+ps; nproc; free; df
+spawn tick 8 200          # a background task; `kill <pid>` ends it
+player /media/av-sample.mp4
+play /media/sound/tone.flac
+ifconfig; ping -c 3 10.0.2.2
+/bin/hello from ring 3
+dosbox                    # FEOS-DOS
+poweroff
+```
 
-The 8x8 bitmap font data in `libs/gfx/src/font.rs` is the public-domain
-`font8x8_basic` table by Daniel Hepper, based on Marcel Sondaar's public-domain
-IBM VGA font.
+## Screenshots
+
+All taken from the current kernels under QEMU at 1024x768.
+
+| | |
+|---|---|
+| ![File Explorer](docs/screenshots/file-explorer.png) **File Explorer** browsing the sample media, with the folder tree and details pane | ![Task Manager](docs/screenshots/task-manager.png) **Task Manager** while three busy tasks share four CPUs |
+| ![Media Player](docs/screenshots/media-player.png) **Media Player** paused on an H.264 MP4 with AAC sound and SRT subtitles | ![Settings](docs/screenshots/settings.png) **Settings** switching the whole desktop to the olive scheme |
+| ![FEOS-DOS](docs/screenshots/feos-dos.png) **FEOS-DOS** on the x86_64 port | ![User program](docs/screenshots/x64-user-program.png) A **ring-3 user program** (`/bin/wdemo`) drawing its own window, and System Information, on x86_64 |
+| ![Component Gallery](docs/screenshots/component-gallery.png) The **Component Gallery**, `feos-gui`'s widgets and charts with demo data | ![Image Viewer](docs/screenshots/image-viewer.png) **Image Viewer** showing a JPEG |
+
+## Features
+
+### Kernel
+
+- **Two ports behind one interface.** The kernel calls the CPU and machine only through the
+  `feos_hal::Arch` and `feos_hal::Board` traits, so both ports build from the same source.
+  AArch64 boots at EL1 (dropping from EL2 or EL3 when started there) with the MMU and caches
+  on; x86_64 enters long mode from multiboot with SSE/x87 state saved per task.
+- **SMP.** Up to 8 CPUs: PSCI `CPU_ON` (HVC or SMC, from the device tree) with GICv2 or
+  GICv3 on AArch64, ACPI MADT and INIT/SIPI with the LAPIC and IOAPIC on x86_64. Each CPU
+  has its own interrupt stack and a one-shot timer.
+- **Scheduler.** 32 slots, priorities 0-15 (default 8), round-robin among equals with aging
+  so nothing starves, affinity masks (`taskset`), a home CPU per task with work stealing,
+  and blocking sleeps and futex-style waits. A trap saves straight into the task's frame,
+  so a switch is a pointer change. See [the scheduler](docs/architecture.md#the-scheduler).
+- **Memory.** RAM from the device tree, multiboot map or UEFI memory map into a frame
+  allocator; a heap sized from what's found (at least 64 MiB when it fits). Task stacks
+  are 256 KiB with unmapped guard pages below them.
+- **Failure.** A fault or panic in a task holding no lock ends only that task (status 139);
+  a hung or crashed desktop app closes its window and the desktop carries on. Anything else
+  stops every CPU with a report. See [When something fails](docs/architecture.md#when-something-fails).
+- **User programs.** Static ELF binaries in `/bin` run at EL0 / ring 3 in their own address
+  space (ASIDs, PAN/UXN/PXN on AArch64; NX, SMEP, SMAP on x86_64). The kernel never
+  dereferences a user pointer: `feos-vm` walks the tables and copies. Programs get files,
+  pipes, `mmap`, a futex, a window surface, and a uid/gid enforced on the native filesystem.
+  See [User programs](docs/architecture.md#user-programs).
+- **Interrupts.** One handler table for both ports, wired lines and message-signalled
+  interrupts (MSI-X, MSI, GICv2m). virtio-blk, virtio-net and xHCI are interrupt-driven.
+
+### Drivers
+
+| Class | Drivers |
+|-------|---------|
+| Interrupts | `gicv2`, `gicv3` (AArch64), `apic` (x86_64) |
+| Serial | `pl011` (AArch64), `uart16550` (x86_64) |
+| Display | `ramfb` (via `fw-cfg`), `virtio-gpu` (live mode changes), the UEFI GOP framebuffer |
+| Storage | `virtio-blk` (MMIO or PCI), USB mass storage through `xhci` |
+| Network | `virtio-net` (MMIO or PCI) |
+| Input | `virtio-input` tablet, mouse and keyboard; `i8042` PS/2 (x86_64); USB HID through `xhci` |
+| Sound | `intel-hda`: streaming playback and capture |
+| Clock | `pl031` (AArch64), `cmos` (x86_64) |
+| Bus | `pci` (ECAM and legacy ports, BAR assignment), `virtio-core` (MMIO and PCI transports) |
+
+### Filesystems and storage
+
+All shells, Terminals and File Explorer share one tree. The first disk with a filesystem is
+the root, later ones `/disk<n>`, native filesystems `/native<n>` and USB sticks `/usb<n>`; a
+blank disk is formatted as FAT32 (or exFAT if too small) and seeded from the embedded image.
+With no disk the root is a RAM copy of that image. `/tmp` and `/dev` are always in RAM.
+
+- **FAT32 and exFAT**, read-write, with a dirty flag and a check at mount after a crash;
+  **FAT12/16** read-only.
+- **The native filesystem**: inodes with owners, modes and times, hard and symbolic links,
+  and a redo journal. `fsck` checks it from the guest. See
+  [the native filesystem](docs/architecture.md#the-native-filesystem).
+- **Permissions** apply to user programs on native filesystems (`/bin/runas`, `permtest`);
+  kernel-linked apps run as root.
+- MBR and GPT partitions, a buffer cache, and `fsflush` syncing about once a second.
+
+### Networking
+
+`feos-net` is a TCP/IP stack written for feos: Ethernet, ARP, IPv4, ICMP echo, UDP, DHCP, DNS
+and TCP with RFC 6298 retransmission, congestion control, out-of-order reassembly and
+zero-window probes. The `netd` task drives it, and the boot test pushes 8 MiB each way over
+every interrupt transport. See [`docs/networking.md`](docs/networking.md).
+
+### Desktop
+
+A Windows XP-style session configured by `apps/desktop/desktop.yaml`: wallpaper and desktop
+icons, a taskbar with quick launch, task buttons, a volume control and clock, a two-column
+Start menu with All Programs, Run and Turn Off, and a window manager with focus, drag, resize
+from any edge, minimise, maximise and `Alt+Tab`. Applications are single-file `.fapp`
+bundles (ZIP or TAR, a YAML manifest and icons), discovered at boot or installed at run time
+with `appinstall`.
+
+- **Settings**: colour scheme (`xp-blue`, `xp-olive`, `xp-silver`, `dark`, `light`,
+  `high-contrast`), keyboard layout, wallpaper, clock and screen resolution, from 640x480 to
+  1920x1080, applied live with a 15-second revert prompt. Saved to `/etc/desktop.conf`.
+- **Icons and cursors**: every picture comes from the iconset in `assets/icons`; the pointer
+  is the Windows XP cursor set, with resize, text, link and animated busy cursors.
+- **Font**: one 8x8 font with about 590 glyphs: ASCII, Latin-1, Latin Extended-A, Greek,
+  Cyrillic, box drawing and block elements, and wide-character cell widths in the Terminal.
+- **File Explorer**: menus, toolbar, address bar with history, folder tree, view modes,
+  preview pane, new folder, cut, copy, paste, rename and delete, and search by name or
+content on a background task.
+- **Input**: virtio, PS/2 or USB keyboard and pointer, with the wheel, plus the serial
+  console as a keyboard.
+
+See [`docs/desktop.md`](docs/desktop.md) for configuration, bundles and keyboard shortcuts.
+
+### Shell
+
+The serial console and every Terminal window run the same Bash-compatible shell: quoting,
+parameter expansion with the `${}` operators, command substitution, arithmetic, globbing,
+pipelines whose stages run concurrently, every redirection form including here-docs and
+here-strings, `if`/`for`/`while`/`until`/`case`, functions with `local`, `[[ ]]`, `set -euxo
+pipefail`, `trap`, `time`, `&`, `jobs`/`fg`/`bg`/`wait` and Ctrl-Z, with a line editor,
+history, Ctrl-R search and Tab completion. The Terminal adds zoom, selection and a clipboard.
+See [`docs/terminal.md`](docs/terminal.md).
+
+## Command reference
+
+`help` lists everything, and `help <command>` shows usage.
+
+**Shell builtins:** `.` `:` `alias` `bash` `bg` `break` `builtin` `cd` `clear` `command`
+`continue` `declare` `eval` `exec` `exit` `export` `false` `fg` `getopts` `help` `history`
+`jobs` `kill` `let` `local` `pwd` `read` `readonly` `return` `set` `sh` `shift` `source`
+`timeout` `trap` `true` `type` `typeset` `unalias` `unset` `wait` `which`
+
+**Core utilities** (`feos-coreutils`; aliases `dir`, `xxd`, `nano`, `more`):
+
+```
+[         appinstall arch     awk      base64   basename cat      chmod
+chown     cmp      comm     cp       cut      date     dd       df
+diff      dirname  du       echo     edit     env      expr     false
+file      find     fold     free     fsck     grep     gunzip   gzip
+head      hexdump  hostname id       less     ln       ls       mkdir
+mktemp    mount    mv       nl       nproc    od       paste    printenv
+printf    pwd      readlink realpath rev      rm       rmdir    sed
+seq       sha256sum sort    split    stat     strings  sync     tac
+tail      tar      tee      test     touch    tr       tree     true
+uname     uniq     uptime   wc       whoami   xargs    yes      zcat
+```
+
+**Applications and system commands** (`apps/commands`, the desktop and FEOS-DOS):
+
+| Area | Commands |
+|------|----------|
+| Desktop | `desktop` (`wm`): the session, or `list`, `status`, `run <id>`, `menu`, `service ...`; `settings` |
+| Windows | `terminal` (`term`), `files` (`explorer`), `taskmgr` (`task-manager`, `tm`), `player` (`media-player`, `video`) `[--speed] [path]`, `music [file]`, `viewer <file>` (`image-viewer`), `gui` (Component Gallery), `dosbox` (`dos`, `feos-dos`) |
+| Processes | `ps`, `spawn <command> [args]`, `kill [-SIGNAL] <pid>`, `renice <priority> <pid>`, `taskset <mask> <pid>`, `tick [count] [ms] [busy]`, `sleep <ms>` |
+| Sound | `play [--at seconds \| --speed] <file>`, `rec <seconds> <file.wav>`, `tone [ms]` |
+| Network | `ifconfig` (`ip`) `[-s]`, `ping [-c n] [-s size] <host>`, `nslookup <name>`, `wget [-O file] <url>`, `nc [...] <host> <port>`, `nc -l [-k] [...] <port>` |
+| System | `info`, `coreutils [command]`, `gfx` (test card), `splash`, `poweroff`, `reboot` |
+| Kernel tests | `ktest <uspawn \| user-memory \| cpus \| fp \| irqs \| mem \| priority \| affinity \| timer \| panic \| overflow \| overflow-locked \| null \| task-panic>` (some stop the machine on purpose) |
+
+**User programs** in `/bin`, run by path: `hello`, `cat`, `wdemo` (a windowed program),
+`runas <uid> <gid> <program>`, and the test programs `utest`, `vmcheck`, `spin`,
+`permtest` and `malicious`.
+
+## Media formats
+
+The Media Player plays video and sound files from any mounted filesystem, streaming large
+files from disk rather than loading them, with a playlist (M3U save and load), seeking,
+aspect modes, fullscreen, SRT subtitles picked up by name, and speeds where sound between
+half and double speed keeps its pitch. Music plays sound files; Image Viewer shows pictures.
+All decoders are in-tree, `no_std`, bounded in memory and fuzzed on the host.
+
+| Kind | Format | Notes |
+|------|--------|-------|
+| Video | **H.264** | Baseline (no FMO), Main, High, High 10 and High 4:2:2; progressive, field-coded and MBAFF; CAVLC and CABAC. Output is 8-bit 4:2:0, fields are woven, not deinterlaced. 4:4:4, lossless, FMO and SP/SI are refused |
+| | **VP8** | Written from RFC 6386 |
+| | **MPEG-1** video | Elementary and program streams, with Layer II sound in a program stream |
+| | **Motion JPEG**, uncompressed RGB/YUV, RLE4/RLE8 | |
+| | **GIF** (animated) | Read whole, up to 16 MiB |
+| Containers | MP4/MOV (incl. fragmented), Matroska/WebM, AVI (incl. OpenDML), FLV, IVF, Annex-B H.264, MPEG program streams | HEVC, VP9, AV1, MPEG-2/4 Part 2, Theora and others are recognised and described, but not decoded |
+| Sound | **AAC** | LC, Main, LTP, HE-AAC (SBR) and HE-AAC v2 (parametric stereo), in ADTS, MP4 or Matroska |
+| | **Opus** | SILK, CELT and hybrid, up to 8 channels, in Ogg, Matroska or MP4 |
+| | **MP3**, MPEG Layers I and II | Seeks (and ADTS AAC's) land exactly only at a constant bit rate; otherwise they're estimated, from a Xing table when there is one |
+| | **FLAC** (native and Ogg), **Ogg Vorbis** | FLAC is output at 16 bits |
+| | **WAV** (PCM, float, A-law, µ-law), **AIFF/AIFF-C**, **AU** | WAV is also written by `rec` |
+| Pictures | PNG (incl. Adam7), JPEG (baseline and progressive, CMYK), BMP, ICO, CUR, ANI, PNM, QOI | |
+
+Sound goes through `feos-mixer`, which mixes up to 8 streams at 48 kHz, converting each from
+its own format, with master volume and mute. `rec` records from the HDA codec's input, which QEMU's `hda-duplex` or
+`hda-micro` provides (the run scripts use `hda-output`, which has none). Archives and
+compression (ZIP, TAR, gzip, DEFLATE), JSON and YAML have their own crates too. See
+[the video path](docs/architecture.md#the-kernel-heap-and-video-path) and
+[the audio path](docs/architecture.md#the-audio-path).
+
+## FEOS-DOS
+
+![FEOS-DOS prompt](docs/dosbox.png)
+
+FEOS-DOS (`libs/dosbox`) is an x86 PC and DOS written for the kernel. Open it from the Start
+menu or run `dosbox`.
+
+- **CPU**: an 80386 interpreter with some 486 instructions; real, protected and
+  virtual-8086 mode, paging, rings, gates and task switches; a 387-class x87 with 80-bit
+  arithmetic.
+- **Machine**: 640 KiB plus 15 MiB extended, A20, XMS 3.0, EMS 4.0, a DPMI 0.9 host,
+  VCPI under `EMM386 ON`; PICs, PIT, 8042, DMA; CGA/EGA/VGA with a register-level core
+  and VESA banked modes `100h`/`101h`; PC speaker, OPL2/OPL3 and a Sound Blaster 16, Pro
+  or 2.0; mouse.
+- **DOS**: a DOS 5-compatible `INT 21h` with a real process model, and a `COMMAND.COM`-style
+  prompt with batch files. `C:` is a 40 MiB RAM drive; `MOUNT` extracts a game ZIP onto it.
+- **Games**: all 13 titles in the shareware/demo library (`data/games`, linked in with
+  `make run-games`) start and reach play or their menus, including DOOM, Duke Nukem 3D,
+  Quake, Warcraft II and Super Street Fighter II Turbo. The per-title table is in
+  [`docs/dosbox.md`](docs/dosbox.md#game-status).
+- **Gaps**: no pipes at the prompt, CD-ROM, GUS, MIDI or VESA linear frame buffers; `DPMI ON`
+  fails Warcraft II's sound and `32RTM`; a guest's own `EMM386.EXE` hasn't been run. See
+  [`docs/dosbox-gap.md`](docs/dosbox-gap.md).
+
+## Developing
+
+### Build and check
+
+```sh
+make build-arm             # target/aarch64-unknown-none/release/feos (`make build`)
+make build-x64             # target/x86_64-feos/release/feos
+make build-efi             # the UEFI loaders
+make check-arm             # type-check every crate for one port (`make check`)
+make check-x64
+make clippy                # both ports and the user programs, warnings as errors
+```
+
+The default cargo target is `aarch64-unknown-none`. The x86_64 kernel uses the custom
+hard-float target `arch/x86_64/x86_64-feos.json`, which builds `core` from source, so every
+x86_64 build goes through `scripts/cargo-x64.sh` (see the script for why). A plain
+`cargo check --workspace` fails, because each port's crates contain that port's assembly:
+use the `check-*` targets. `make user-arm` and `make user-x64` build the user programs into
+`user/out/<arch>`, which the kernel embeds as `/bin`; `make build-*` does this first.
+
+### Test
+
+```sh
+make test                                                      # every host test crate
+make test-gui                                                  # one crate: test-<name>
+cargo test -p feos-gui --target x86_64-unknown-linux-gnu      # the same by hand
+make fuzz                                                      # fuzz tests, optimised with overflow checks
+make boot-test                                                 # boot both kernels headless and drive them
+FEOS_BOOT_TEST_ONLY=smp ./scripts/boot-test.py arm target/aarch64-unknown-none/release/feos
+```
+
+Host tests need `--target`, as the default target is bare metal. Libraries are
+`#![cfg_attr(not(test), no_std)]` and tested on the host; parsers of untrusted input are
+fuzzed with a failing allocator and a small stack. Kernel code is tested by booting:
+`scripts/boot-test.py` has phases for storage, SMP, IRQs, RAM sizes, faults, the scheduler,
+GICv3, networking, USB, UEFI, exception levels, user programs, settings, resolution changes
+and more, and `scripts/media-boot-test.py` checks real audio output and input.
+`.github/workflows/ci.yml` runs the checks, tests, clippy, fuzz and the boot tests.
+
+### Architecture
+
+```
+kernel ──> boards/<board> ──> drivers/<class>/<name> ──> libs/hal
+   │             └──> boards/common
+   ├────> arch/<arch> ──> libs/hal
+   └────> apps/* ──> libs/* (through feos_app::Platform; never hardware)
+```
+
+Dependencies point one way. Drivers never print or hard-code addresses, libraries never
+depend on a board, driver or the kernel, and apps reach the machine only through
+`feos_app::Platform`: clock, power, CPU, audio, pointer, keyboard, processes, memory, the
+app registry, the filesystem and the network. Inversions keep it that way: architecture
+crates call handlers the kernel registers, and libraries find apps by name through the
+`AppRegistry` trait. A new driver, library, app or board is one crate plus one dependency
+edge. [`docs/architecture.md`](docs/architecture.md) covers the layers, interrupt and
+scheduling paths, user programs, the GUI, memory, booting, USB and the media, audio and
+filesystem paths.
+
+**Adding an app**: a unit struct implementing `feos_app::App` in `apps/commands/src/`,
+listed in `REGISTRY`. For a Start-menu entry, add a bundle source in
+`apps/desktop/bundle-src/<id>/` whose manifest `entry` names the command, then
+`make bundles`. **Adding a user program**: a file in `user/src/bin/` and its name in
+`USER_BINS` in the `Makefile`.
+
+## Repository layout
+
+```
+arch/aarch64/       EL1 entry and EL2/EL3 drop, vectors, MMU, PSCI, generic timer
+arch/x86_64/        multiboot and EFI entry, long mode, IDT/GDT/TSS, SIPI trampoline,
+                    and the x86_64-feos.json target
+boards/qemu-virt/   AArch64 virt: memory map, devices, linker script (image at 0x4020_0000),
+                    and fs/, the embedded filesystem image
+boards/qemu-x86_64/ x86_64 q35: devices, linker script (image at 0x200_0000, 32 MiB)
+boards/common/      what both boards share: display, disks, USB, IRQ routing, image build
+boot/efi/           the UEFI loader (feos-efi)
+drivers/            audio/intel-hda  block/virtio  bus/pci  display/{ramfb,virtio-gpu}
+                    firmware/fw-cfg  input/{i8042,virtio}  interrupt/{apic,gicv2,gicv3}
+                    net/virtio  rtc/{cmos,pl031}  serial/{pl011,uart16550}  usb/xhci
+                    virtio/core
+kernel/             boot wiring, scheduler, SMP, memory, heap, user programs, fatal
+                    policy, ktest
+libs/               hal app console sync irq sched heap frames firmware bootinfo
+                    abi elf vm                      kernel support and user programs
+                    fs archive compress source      storage and archives
+                    net                             TCP/IP
+                    gfx gui desktop iconset init bundle keys text json yaml
+                    image video h264 audio audio-codec opus mixer
+                    sh coreutils                    shell
+                    dosbox                          FEOS-DOS
+                    port-io
+apps/commands/      the app registry: Terminal, Explorer, Task Manager, Media Player, ...
+apps/shell/         the shell's console and registry adapter
+apps/desktop/       the desktop session, desktop.yaml, bundle-src/ and apps/*.fapp
+apps/dosbox/        the FEOS-DOS window and serial front end
+user/               the user-program workspace: runtime, link.ld, src/bin/
+assets/             icons/ (the iconset) and cursors/ (the XP cursor set)
+data/games/         the DOS game library and its exFAT image
+scripts/            run, build, boot-test, disk and table-generation scripts
+docs/               architecture, desktop, terminal, networking and FEOS-DOS references
+```
+
+## Known limitations
+
+- **QEMU only.** Real hardware has never been booted. The EL2/EL3 entry, PSCI conduit and
+  UEFI paths are implemented and tested under QEMU only, and on AArch64 the kernel needs a
+  device tree, not ACPI alone.
+- **Kernel-linked apps aren't isolated.** The shell, desktop and apps share the kernel's
+  address space and privilege; only `/bin` programs are behind the user/kernel boundary.
+  Those have one thread each and no `fork`, `exec`, signals or shared memory.
+- **A killed task's heap isn't reclaimed** (KRN-7): it's tracked and reported, as freeing it
+  by owner could free memory something shared still uses.
+- **One scheduler lock, one disk request.** Per-CPU queues are policy under one lock, and
+  virtio-blk keeps one request in flight because the VFS has a single lock.
+- **Devices.** No USB hubs or hot plug; no MSI on GICv3 (it would need an ITS driver);
+  HDA capture needs a codec with an input.
+- **Networking** is IPv4 with one interface, no IP fragments, no window scaling and no
+  HTTPS, and its sequence numbers aren't cryptographically random.
+- **Text** is one 8x8 font: CJK shows as boxes, and combining marks and right-to-left text
+  aren't handled.
+- **Media**: VP9, AV1, HEVC and MPEG-2/4 aren't decoded; GIF isn't streamed; CELT-only Opus
+  conceals lost packets with noise.
+- **FEOS-DOS** gaps are listed [above](#feos-dos), and whether the bundled game data may be
+  redistributed is still the owner's review (DOS-7).
+
+## Licensing
+
+Most crates are `MIT OR Apache-2.0` (`LICENSE-MIT`, `LICENSE-APACHE`). `feos-dosbox`,
+`feos-dosbox-app` and the kernel crate are `GPL-2.0-or-later` (`COPYING`), because FEOS-DOS
+contains code derived from rust-dos and an LGPL Nuked-OPL3 port, and the kernel links it
+statically: **the `feos` binary is GPL-2.0-or-later as a whole.** Third-party code (the
+H.264, MP3 and Opus decoder ports, MPEG-1 from PL_MPEG, codec tables, font data) is listed
+with its licence in [`LICENSING.md`](LICENSING.md).
+
+Not covered by those licences:
+
+- **Cursors** (`assets/cursors`): the "Windows XP" set from rw-designer.com, whose readme says
+  "License: Demo" and requires a purchased licence for anything but evaluation. They were
+  included by the project owner's decision; settle those terms or replace them before
+  distributing the repository or a kernel built from it.
+- **Icons** (`assets/icons`): supplied by the owner as open for inclusion, unconfirmed.
+- **Games** (`data/games`): third-party shareware, demos and freeware under each title's own
+  terms; see [`data/games/README.md`](data/games/README.md).

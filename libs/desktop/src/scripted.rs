@@ -879,6 +879,28 @@ fn closing_a_window_ends_its_process_even_if_the_first_kills_fail() {
 }
 
 #[test]
+fn log_off_closes_every_window_and_ends_their_processes() {
+    let processes = FakeProcesses::leaked(2);
+    let mut rig = Rig::with_processes(
+        1024,
+        768,
+        &[("background", "background"), ("probe", "probe")],
+        processes,
+    );
+    let first = rig.launch(0);
+    let second = rig.launch(1);
+    rig.frame();
+    assert!(rig.window(first).open && rig.window(second).open);
+    assert_eq!(processes.with(|log| log.live.len()), 1);
+
+    // The first two kills are refused; log off keeps asking.
+    assert_eq!(rig.desktop.close_all_windows(processes), 2);
+    assert!(!rig.window(first).open && !rig.window(second).open);
+    assert_eq!(processes.with(|log| log.live.len()), 0);
+    assert_eq!(rig.desktop.close_all_windows(processes), 0);
+}
+
+#[test]
 fn minimized_windows_get_background_ticks_and_visible_ones_do_not() {
     let mut rig = Rig::new(1024, 768, &APP);
     let window = rig.launch(0);

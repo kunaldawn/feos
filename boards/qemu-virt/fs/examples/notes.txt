@@ -1,7 +1,6 @@
 Scratch notes
 =============
 
-- The filesystem is read-only for now.
-- The explorer highlights the current entry and previews text files.
-- Directories show how many direct children they contain.
+- The root filesystem is writable: on a disk, changes survive a reboot.
+- The explorer previews text files and pictures.
 - Binary files are reported by size instead of being printed.

@@ -104,9 +104,10 @@ rebuild:
 make run-games       # links the image, builds, and boots QEMU with 512 MiB
 ```
 
-The board mounts it at `/exfat`, where `MOUNT` and `GAMES` look. The image is linked into the kernel, so
-`run-games` raises QEMU's RAM to 512 MiB; a plain `make run` keeps the default
-128 MiB and is only for builds without the game image. In FEOS-DOS:
+The board mounts it at `/exfat`, where `MOUNT` and `GAMES` look. The image is linked into the
+kernel, so the guest needs RAM for it on top of the kernel's own: `run-games` (and
+`run-games-x64`) boot with 512 MiB, which is also `make run`'s default. `make games-unlink`
+removes the link again. In FEOS-DOS:
 
 ```text
 GAMES                list the image's GAMES.TXT (or its top-level entries)

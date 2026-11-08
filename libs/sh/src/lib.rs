@@ -12,7 +12,7 @@
 //! `if`/`for`/`while`/`until`/`case`, `(( ))`, `[[ ]]`, subshells, aliases,
 //! `set -e -u -x -o pipefail`, `getopts`, script execution by path, and, with a
 //! [`TaskHost`], streaming pipelines, `&`, `jobs`, `fg`, `bg`, `wait` and `$!`.
-//! `trap` handles EXIT, INT and ERR. Arrays are not implemented.
+//! `trap` handles EXIT, ERR, INT, HUP, TERM and QUIT. Arrays are not implemented.
 //!
 //! Commands share one address space and one kernel stack, so every recursive
 //! path is bounded and every buffer has a budget: a hostile script gets an error

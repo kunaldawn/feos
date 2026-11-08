@@ -1,4 +1,4 @@
-//! feos - a tiny bare-metal multi-architecture kernel skeleton.
+//! feos - a bare-metal multi-architecture kernel.
 //!
 //! This binary contains only the boot sequence and the wiring between the
 //! board, the architecture crate, shared libraries and the shell. Hardware
@@ -101,7 +101,7 @@ pub extern "C" fn kmain(boot_info: usize) -> ! {
     feos_console::set_waiter(wait_for_console);
 
     println!();
-    println!("feos {} - a tiny {} kernel", env!("CARGO_PKG_VERSION"), Machine::ARCH);
+    println!("feos {} - {} kernel", env!("CARGO_PKG_VERSION"), Machine::ARCH);
     println!("----------------------------------------");
 
     // Install IDT/vectors and calibrate the architecture clock before any
@@ -221,8 +221,9 @@ pub extern "C" fn kmain(boot_info: usize) -> ! {
         Machine::TIMER_IRQ
     );
     println!(
-        "[sched] preemptive round-robin at {} Hz, {} process slots",
-        smp::TICK_HZ,
+        "[sched] preemptive, priorities 0-{}, {} ms slices on a one-shot timer per CPU, {} process slots",
+        feos_app::PRIORITY_MAX,
+        1000 / smp::TICK_HZ,
         feos_app::MAX_PROCESSES
     );
 

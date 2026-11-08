@@ -251,10 +251,10 @@ impl<'a, 'b, 's, const N: usize> Ui<'a, 'b, 's, N> {
         if chart.show_labels {
             let scale = metrics.small_scale;
             for index in 0..=grid {
-                let value = y_min + (y_max - y_min) * index as f32 / grid as f32;
+                let (value, line) = y_tick(y_min, y_max, plot, index, grid);
                 let mut buffer = [0u8; 24];
                 let label = format_f32(value, 1, &mut buffer);
-                let y = plot.y + plot.height as i32 * index / grid - 4;
+                let y = line - 4;
                 self.painter.draw_text_aligned(
                     Rect::new(rect.x + 4, y, 36, 8),
                     label,
@@ -373,6 +373,15 @@ fn value_range(values: &[f32]) -> (f32, f32) {
     (min, max)
 }
 
+/// The value and pixel row of the y-axis grid line `index` of `grid`, counted
+/// from the top of `plot`. The top line is `max` and the bottom one `min`, the
+/// same way round as [`map_y`] plots values.
+fn y_tick(min: f32, max: f32, plot: Rect, index: i32, grid: i32) -> (f32, i32) {
+    let grid = grid.max(1);
+    let value = max - (max - min) * index as f32 / grid as f32;
+    (value, plot.y + plot.height as i32 * index / grid)
+}
+
 fn map_x(value: f32, min: f32, max: f32, rect: Rect) -> i32 {
     if !value.is_finite() {
         return rect.x;
@@ -399,4 +408,23 @@ fn map_y(value: f32, min: f32, max: f32, rect: Rect) -> i32 {
     }
     .clamp(0.0, 1.0);
     rect.bottom_i32() - (fraction * rect.height as f32) as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn y_axis_labels_increase_upward_like_the_plotted_values() {
+        let plot = Rect::new(10, 20, 200, 160);
+        let (top, top_y) = y_tick(0.0, 100.0, plot, 0, 4);
+        let (bottom, bottom_y) = y_tick(0.0, 100.0, plot, 4, 4);
+        assert_eq!(top, 100.0);
+        assert_eq!(bottom, 0.0);
+        assert!(top_y < bottom_y);
+        for index in 0..=4 {
+            let (value, y) = y_tick(0.0, 70.0, plot, index, 4);
+            assert!((map_y(value, 0.0, 70.0, plot) - y).abs() <= 1, "tick {index}");
+        }
+    }
 }

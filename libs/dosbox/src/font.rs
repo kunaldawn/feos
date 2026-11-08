@@ -63,18 +63,20 @@ pub fn glyph(code: u8) -> [u8; 8] {
         0xC1 => [0x18, 0x18, 0x18, 0xFF, 0xFF, 0x00, 0x00, 0x00],
         0xC5 => [0x18, 0x18, 0x18, 0xFF, 0xFF, 0x18, 0x18, 0x18],
 
-        // Box drawing, double line.
+        // Box drawing, double line: rows 2 and 5 and columns 2 and 5. Where two
+        // double lines meet, the outer lines join and the inner ones turn, so
+        // the inner line stops at the corner instead of running through it.
         0xBA => [0x24; 8],
         0xCD => [0x00, 0x00, 0xFF, 0x00, 0x00, 0xFF, 0x00, 0x00],
-        0xC9 => [0x00, 0x00, 0xFC, 0x24, 0x24, 0xFC, 0x24, 0x24],
-        0xBB => [0x00, 0x00, 0x27, 0x24, 0x24, 0x27, 0x24, 0x24],
-        0xC8 => [0x24, 0x24, 0xFC, 0x24, 0x24, 0xFC, 0x00, 0x00],
-        0xBC => [0x24, 0x24, 0x27, 0x24, 0x24, 0x27, 0x00, 0x00],
-        0xCC => [0x24, 0x24, 0xFC, 0x24, 0x24, 0xFC, 0x24, 0x24],
-        0xB9 => [0x24, 0x24, 0x27, 0x24, 0x24, 0x27, 0x24, 0x24],
-        0xCB => [0x00, 0x00, 0xFF, 0x24, 0x24, 0xFF, 0x24, 0x24],
-        0xCA => [0x24, 0x24, 0xFF, 0x24, 0x24, 0xFF, 0x00, 0x00],
-        0xCE => [0x24, 0x24, 0xFF, 0x24, 0x24, 0xFF, 0x24, 0x24],
+        0xC9 => [0x00, 0x00, 0xFC, 0x04, 0x04, 0xE4, 0x24, 0x24],
+        0xBB => [0x00, 0x00, 0x3F, 0x20, 0x20, 0x27, 0x24, 0x24],
+        0xC8 => [0x24, 0x24, 0xE4, 0x04, 0x04, 0xFC, 0x00, 0x00],
+        0xBC => [0x24, 0x24, 0x27, 0x20, 0x20, 0x3F, 0x00, 0x00],
+        0xCC => [0x24, 0x24, 0xE4, 0x04, 0x04, 0xE4, 0x24, 0x24],
+        0xB9 => [0x24, 0x24, 0x27, 0x20, 0x20, 0x27, 0x24, 0x24],
+        0xCB => [0x00, 0x00, 0xFF, 0x00, 0x00, 0xE7, 0x24, 0x24],
+        0xCA => [0x24, 0x24, 0xE7, 0x00, 0x00, 0xFF, 0x00, 0x00],
+        0xCE => [0x24, 0x24, 0xE7, 0x00, 0x00, 0xE7, 0x24, 0x24],
 
         // Box drawing, mixed single and double lines.
         0xB5 => [0x18, 0x18, 0x1F, 0x18, 0x18, 0x1F, 0x18, 0x18],
@@ -225,4 +227,92 @@ pub fn rom16(code: u8) -> [u8; 16] {
         out[index * 2 + 1] = *line;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Draws CP437 text, one row of codes per line, as a bitmap of 8x8 cells.
+    fn draw(rows: &[&[u8]]) -> Vec<Vec<bool>> {
+        let width = rows[0].len() * 8;
+        let mut bitmap = vec![vec![false; width]; rows.len() * 8];
+        for (row, codes) in rows.iter().enumerate() {
+            for (column, &code) in codes.iter().enumerate() {
+                for (line, bits) in glyph(code).iter().enumerate() {
+                    for bit in 0..8 {
+                        bitmap[row * 8 + line][column * 8 + bit] = bits & (1 << bit) != 0;
+                    }
+                }
+            }
+        }
+        bitmap
+    }
+
+    /// The pixels on a rectangle's outline, from corner to corner inclusive.
+    fn outline(left: usize, top: usize, right: usize, bottom: usize) -> Vec<(usize, usize)> {
+        let mut points = Vec::new();
+        for x in left..=right {
+            points.push((x, top));
+            points.push((x, bottom));
+        }
+        for y in top..=bottom {
+            points.push((left, y));
+            points.push((right, y));
+        }
+        points
+    }
+
+    #[test]
+    fn a_double_line_box_is_two_closed_outlines_and_nothing_else() {
+        // ╔═╗ / ║ ║ / ╚═╝, as BOX.COM and most DOS programs draw them.
+        let bitmap = draw(&[
+            &[0xC9, 0xCD, 0xBB],
+            &[0xBA, b' ', 0xBA],
+            &[0xC8, 0xCD, 0xBC],
+        ]);
+        let outer = outline(2, 2, 21, 21);
+        let inner = outline(5, 5, 18, 18);
+        for &(x, y) in outer.iter().chain(&inner) {
+            assert!(bitmap[y][x], "gap in the box at ({x}, {y})");
+        }
+        for (y, line) in bitmap.iter().enumerate() {
+            for (x, &lit) in line.iter().enumerate() {
+                if lit {
+                    assert!(
+                        outer.contains(&(x, y)) || inner.contains(&(x, y)),
+                        "stray pixel at ({x}, {y})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn double_line_tees_and_crosses_meet_their_neighbours() {
+        // ╔╦╗ / ╠╬╣ / ╚╩╝: each piece's lines reach the cell edges its
+        // neighbours' lines do, so the grid joins up.
+        let bitmap = draw(&[
+            &[0xC9, 0xCB, 0xBB],
+            &[0xCC, 0xCE, 0xB9],
+            &[0xC8, 0xCA, 0xBC],
+        ]);
+        for cell in 0..3 {
+            for line in [2, 5] {
+                let y = cell * 8 + line;
+                // Across each cell boundary, a horizontal line continues.
+                for edge in [8, 16] {
+                    assert_eq!(bitmap[y][edge - 1], bitmap[y][edge], "row {y} breaks at x {edge}");
+                }
+                let x = cell * 8 + line;
+                for edge in [8, 16] {
+                    assert_eq!(bitmap[edge - 1][x], bitmap[edge][x], "column {x} breaks at y {edge}");
+                }
+            }
+        }
+        // The outer frame is closed.
+        for (x, y) in outline(2, 2, 21, 21) {
+            assert!(bitmap[y][x], "gap in the frame at ({x}, {y})");
+        }
+    }
 }

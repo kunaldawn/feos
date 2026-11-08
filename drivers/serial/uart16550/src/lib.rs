@@ -24,8 +24,10 @@ const MCR: u16 = 4;
 const LSR: u16 = 5;
 
 const LSR_DATA_READY: u8 = 1 << 0;
-/// Overrun, parity, framing and break.
-const LSR_ERRORS: u8 = 0x1e;
+/// Parity, framing and break: the byte at the head of the FIFO is bad. Overrun
+/// (bit 1) is left out on purpose. It says a byte that arrived later was lost,
+/// not that this one is wrong, so dropping this one too would lose two.
+const LSR_ERRORS: u8 = 0x1c;
 const LSR_THR_EMPTY: u8 = 1 << 5;
 /// What an I/O port with no device behind it reads as.
 const LSR_ABSENT: u8 = 0xff;
@@ -152,7 +154,10 @@ mod tests {
     fn line_status_decodes_data_and_errors() {
         assert_eq!(receive_action(0x60), ReceiveAction::Nothing);
         assert_eq!(receive_action(0x61), ReceiveAction::Deliver);
-        assert_eq!(receive_action(0x61 | 0x02), ReceiveAction::Discard);
+        // An overrun lost a later byte; this one is still good.
+        assert_eq!(receive_action(0x61 | 0x02), ReceiveAction::Deliver);
+        assert_eq!(receive_action(0x61 | 0x04), ReceiveAction::Discard);
+        assert_eq!(receive_action(0x61 | 0x10), ReceiveAction::Discard);
         assert_eq!(receive_action(0x61 | 0x08), ReceiveAction::Discard);
         // Errors with no byte waiting have nothing to discard.
         assert_eq!(receive_action(0x60 | 0x02), ReceiveAction::Nothing);

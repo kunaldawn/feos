@@ -1,6 +1,6 @@
 //! FEOS Media Player.
 //!
-//! The player scans the read-only filesystem for supported media, decodes
+//! The player scans the filesystem for supported video and sound files, decodes
 //! frames with `feos-video`, and provides menus, transport controls, a seek
 //! bar, playlist, fullscreen mode, aspect modes, media information and
 //! keyboard/mouse control.

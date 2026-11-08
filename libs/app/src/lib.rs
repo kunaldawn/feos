@@ -609,6 +609,10 @@ pub struct WindowContext<'a, 'b> {
     pub now_ms: u64,
     /// Content origin in framebuffer coordinates.
     pub origin: Point,
+    /// The desktop's current widget theme. An app that draws its own controls
+    /// takes its accent and selection colours from here, so they follow the
+    /// colour scheme the user picked.
+    pub theme: &'a feos_gui::Theme,
     /// Whether pointer events belong to this window this frame.
     pub pointer_active: bool,
     /// Whether keyboard events belong to this window this frame.

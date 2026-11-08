@@ -35,17 +35,20 @@ fi
 # some installations; GNU binutils is the usual host fallback.
 if [ -z "${OBJCOPY:-}" ]; then
     # Prefer the multi-target tools: GNU objcopy on a non-x86 host rejects this
-    # ELF.
+    # ELF. Each candidate is run, not just found: rustc ships `rust-objcopy`
+    # without the libLLVM it links against unless the llvm-tools component is
+    # installed, so on a minimal toolchain (the pinned one, and the Docker image)
+    # it exists but can't start.
     SYSROOT="$(rustc --print sysroot 2>/dev/null || true)"
     HOST="$(rustc -vV 2>/dev/null | sed -n 's/^host: //p')"
     RUST_OBJCOPY="$SYSROOT/lib/rustlib/$HOST/bin/rust-objcopy"
-    if command -v llvm-objcopy >/dev/null 2>&1; then
-        OBJCOPY=llvm-objcopy
-    elif [ -x "$RUST_OBJCOPY" ]; then
-        OBJCOPY="$RUST_OBJCOPY"
-    else
-        OBJCOPY=objcopy
-    fi
+    OBJCOPY=objcopy
+    for candidate in llvm-objcopy "$RUST_OBJCOPY"; do
+        if "$candidate" --version >/dev/null 2>&1; then
+            OBJCOPY="$candidate"
+            break
+        fi
+    done
 fi
 
 if [ ! -x "$OBJCOPY" ] && ! command -v "$OBJCOPY" >/dev/null 2>&1; then

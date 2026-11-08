@@ -1,7 +1,4 @@
-feos 0.1.0 - a tiny aarch64 kernel
-Serial console: PL011 at 0x0900_0000
-Framebuffer: ramfb, 1024x768 XRGB8888
-Filesystem: read-only, embedded in the kernel image
-
-The desktop is a session layer above the GUI toolkit. The file explorer is a
-foreground app: launch it from the Start menu and press Esc to return.
+feos 0.1.0 - a small kernel for QEMU's AArch64 virt and x86_64 q35 machines
+Serial console: PL011 on AArch64, COM1 on x86_64
+Framebuffer: virtio-gpu, ramfb or the firmware's, 1024x768 by default
+Filesystem: the first disk, or a RAM copy of the embedded image

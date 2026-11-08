@@ -65,17 +65,55 @@ const FACE_LIGHT: Color = Color::rgb(244, 241, 232);
 const FACE_DARK: Color = Color::rgb(214, 208, 190);
 const BORDER: Color = Color::rgb(172, 168, 153);
 const BORDER_DARK: Color = Color::rgb(128, 124, 111);
-const TITLE_TOP: Color = Color::rgb(0, 88, 238);
-const TITLE_BOTTOM: Color = Color::rgb(58, 145, 255);
-const SELECT: Color = Color::rgb(49, 106, 197);
-const SELECT_SOFT: Color = Color::rgb(214, 228, 250);
 const FIELD: Color = Color::WHITE;
 const FIELD_BORDER: Color = Color::rgb(127, 157, 185);
-const HEADER_TOP: Color = Color::rgb(123, 162, 231);
-const HEADER_BOTTOM: Color = Color::rgb(99, 117, 214);
 const TEXT: Color = Color::rgb(24, 24, 24);
 const MUTED: Color = Color::rgb(92, 92, 92);
 const DISABLED: Color = Color::rgb(160, 160, 160);
+/// The colours that follow the desktop's colour scheme: title bar, list
+/// headers and selection. The rest of the window is the XP face colours above,
+/// which every XP scheme shares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Scheme {
+    title_top: Color,
+    title_bottom: Color,
+    header_top: Color,
+    header_bottom: Color,
+    select: Color,
+    select_soft: Color,
+}
+
+impl Scheme {
+    /// Windows XP's own blue, used for the blue scheme and outside the desktop.
+    const CLASSIC: Self = Self {
+        title_top: Color::rgb(0, 88, 238),
+        title_bottom: Color::rgb(58, 145, 255),
+        header_top: Color::rgb(123, 162, 231),
+        header_bottom: Color::rgb(99, 117, 214),
+        select: Color::rgb(49, 106, 197),
+        select_soft: Color::rgb(214, 228, 250),
+    };
+
+    /// The accent of the XP blue desktop theme, which `CLASSIC` belongs to.
+    const CLASSIC_ACCENT: Color = Color::rgb(0, 84, 227);
+
+    /// Derives the scheme from the desktop theme's accent colour.
+    fn from_theme(theme: &feos_gui::Theme) -> Self {
+        let accent = theme.palette.accent;
+        if accent == Self::CLASSIC_ACCENT {
+            return Self::CLASSIC;
+        }
+        Self {
+            title_top: accent,
+            title_bottom: accent.lerp(Color::WHITE, 72),
+            header_top: accent.lerp(Color::WHITE, 120),
+            header_bottom: accent.lerp(Color::WHITE, 64),
+            select: accent.lerp(Color::WHITE, 24),
+            select_soft: accent.lerp(Color::WHITE, 200),
+        }
+    }
+}
+
 const GRAPH_BG: Color = Color::rgb(0, 0, 0);
 const GRAPH_GRID: Color = Color::rgb(0, 110, 0);
 const GRAPH_CPU: Color = Color::rgb(0, 255, 0);
@@ -301,13 +339,15 @@ impl Column {
 
     const fn width(self) -> i32 {
         match self {
-            Self::ImageName => 142,
-            Self::Pid => 44,
+            Self::ImageName => 132,
+            // Hosted windows are listed from 1000000, so seven digits; the
+            // columns either side gave up the room for them.
+            Self::Pid => 64,
             Self::Cpu => 40,
-            Self::CpuTime => 78,
+            Self::CpuTime => 72,
             Self::MemUsage => 82,
             Self::Threads => 64,
-            Self::StartTime => 90,
+            Self::StartTime => 88,
             Self::Status => 68,
             Self::Priority => 72,
             Self::UserName => 78,
@@ -629,6 +669,9 @@ struct State {
 
     exit: bool,
     exit_message: &'static str,
+
+    /// Title, header and selection colours from the desktop theme.
+    scheme: Scheme,
 }
 
 impl State {
@@ -701,6 +744,7 @@ impl State {
             notice_until: 0,
             exit: false,
             exit_message: "",
+            scheme: Scheme::CLASSIC,
         };
         // The last two columns are optional; enable them from View > Select
         // Columns on a wide display.
@@ -1730,6 +1774,7 @@ pub(super) fn open_task_manager(context: &WindowContext<'_, '_>) -> bool {
     state.pointer = context.pointer();
     state.embedded = true;
     state.maximized = true;
+    state.scheme = Scheme::from_theme(context.theme);
     state.sample(context.platform, context.now_ms);
     publish_animation(&state, context.now_ms);
     *WINDOW.lock() = Some(state);
@@ -1756,6 +1801,8 @@ pub(super) fn frame_task_manager(context: &mut WindowContext<'_, '_>) -> WindowF
     }
 
     state.sample_if_due(platform, now, true);
+    // The user can switch schemes while the window is open.
+    state.scheme = Scheme::from_theme(context.theme);
     if state.notice_until != 0 && now >= state.notice_until {
         state.notice.clear();
         state.notice_until = 0;
@@ -3099,7 +3146,7 @@ fn draw_window(painter: &mut Painter<'_, '_>, state: &State, layout: Layout, now
     if !state.embedded {
         painter
             .canvas_mut()
-            .fill_vertical_gradient(layout.title, TITLE_TOP, TITLE_BOTTOM);
+            .fill_vertical_gradient(layout.title, state.scheme.title_top, state.scheme.title_bottom);
 
         draw_taskmgr_icon(
             painter,
@@ -3211,7 +3258,7 @@ fn draw_menu_bar(painter: &mut Painter<'_, '_>, state: &State, layout: Layout) {
         let rect = menu_title_rect(layout, index);
         let open = state.menu == Some(*menu);
         if open || rect.contains(state.pointer) {
-            painter.fill_rect(rect, if open { SELECT } else { SELECT_SOFT });
+            painter.fill_rect(rect, if open { state.scheme.select } else { state.scheme.select_soft });
         }
         let color = if open { Color::WHITE } else { TEXT };
         painter.draw_text_aligned(
@@ -3287,7 +3334,7 @@ fn draw_content(
         Tab::Processes => draw_processes(painter, state, layout),
         Tab::Performance => draw_performance(painter, state, layout),
         Tab::Networking => draw_networking(painter, state, layout),
-        Tab::Users => draw_users(painter, layout),
+        Tab::Users => draw_users(painter, layout, state.scheme),
     }
     let _ = (platform, now);
 }
@@ -3307,7 +3354,7 @@ fn draw_applications(painter: &mut Painter<'_, '_>, state: &State, layout: Layou
         .app_scroll
         .min(state.row_count.saturating_sub(visible));
 
-    draw_applications_header(painter, list.header);
+    draw_applications_header(painter, list.header, state.scheme);
 
     draw_sunken(painter, list.list);
     if state.row_count == 0 {
@@ -3326,7 +3373,7 @@ fn draw_applications(painter: &mut Painter<'_, '_>, state: &State, layout: Layou
             ROW_HEIGHT as u32,
         );
         let selected = state.selected_pid == Some(row.pid);
-        draw_row_background(painter, rect, selected, rect.contains(state.pointer));
+        draw_row_background(painter, rect, selected, rect.contains(state.pointer), state.scheme);
         let name = application_name(&row);
         if selected {
             let icon_rect = Rect::new(rect.x + 4, rect.y + 2, 16, 16);
@@ -3433,7 +3480,7 @@ fn draw_processes(painter: &mut Painter<'_, '_>, state: &State, layout: Layout) 
             ROW_HEIGHT as u32,
         );
         let selected = state.selected_pid == Some(row.pid);
-        draw_row_background(painter, rect, selected, rect.contains(state.pointer));
+        draw_row_background(painter, rect, selected, rect.contains(state.pointer), state.scheme);
         let color = if selected { Color::WHITE } else { TEXT };
         let muted = if selected { Color::WHITE } else { MUTED };
         let mut x = rect.x;
@@ -3448,7 +3495,8 @@ fn draw_processes(painter: &mut Painter<'_, '_>, state: &State, layout: Layout) 
                 Column::ImageName => {
                     let icon_rect = Rect::new(x + 2, rect.y + 2, 16, 16);
                     draw_app_icon(painter, icon_rect, row.name.as_str());
-                    painter.draw_text_ellipsis(
+                    draw_cell(
+                        painter,
                         Rect::new(x + 20, rect.y, (width - 24).max(8) as u32, rect.height),
                         row.name.as_str(),
                         color,
@@ -3460,7 +3508,7 @@ fn draw_processes(painter: &mut Painter<'_, '_>, state: &State, layout: Layout) 
                 Column::Pid => {
                     let mut value = Text::<12>::new();
                     let _ = write!(value, "{}", row.pid);
-                    painter.draw_text_aligned(
+                    draw_cell(painter,
                         cell,
                         value.as_str(),
                         color,
@@ -3472,7 +3520,7 @@ fn draw_processes(painter: &mut Painter<'_, '_>, state: &State, layout: Layout) 
                 Column::Cpu => {
                     let mut value = Text::<12>::new();
                     let _ = write!(value, "{}%", row.cpu_percent);
-                    painter.draw_text_aligned(
+                    draw_cell(painter,
                         cell,
                         value.as_str(),
                         color,
@@ -3483,7 +3531,7 @@ fn draw_processes(painter: &mut Painter<'_, '_>, state: &State, layout: Layout) 
                 }
                 Column::CpuTime => {
                     let value = format_duration(row.cpu_time_ms);
-                    painter.draw_text_aligned(
+                    draw_cell(painter,
                         cell,
                         value.as_str(),
                         color,
@@ -3494,7 +3542,7 @@ fn draw_processes(painter: &mut Painter<'_, '_>, state: &State, layout: Layout) 
                 }
                 Column::MemUsage => {
                     let value = format_memory(row.memory_bytes);
-                    painter.draw_text_aligned(
+                    draw_cell(painter,
                         cell,
                         value.as_str(),
                         color,
@@ -3505,7 +3553,7 @@ fn draw_processes(painter: &mut Painter<'_, '_>, state: &State, layout: Layout) 
                 }
                 Column::Threads => {
                     let value = format_count(row.threads as usize);
-                    painter.draw_text_aligned(
+                    draw_cell(painter,
                         cell,
                         value.as_str(),
                         color,
@@ -3516,7 +3564,7 @@ fn draw_processes(painter: &mut Painter<'_, '_>, state: &State, layout: Layout) 
                 }
                 Column::StartTime => {
                     let value = format_duration(row.started_ms);
-                    painter.draw_text_aligned(
+                    draw_cell(painter,
                         cell,
                         value.as_str(),
                         color,
@@ -3526,7 +3574,7 @@ fn draw_processes(painter: &mut Painter<'_, '_>, state: &State, layout: Layout) 
                     );
                 }
                 Column::Status => {
-                    painter.draw_text_aligned(
+                    draw_cell(painter,
                         cell,
                         row.status_name(),
                         muted,
@@ -3536,7 +3584,7 @@ fn draw_processes(painter: &mut Painter<'_, '_>, state: &State, layout: Layout) 
                     );
                 }
                 Column::Priority => {
-                    painter.draw_text_aligned(
+                    draw_cell(painter,
                         cell,
                         row.priority_name(),
                         muted,
@@ -3546,10 +3594,10 @@ fn draw_processes(painter: &mut Painter<'_, '_>, state: &State, layout: Layout) 
                     );
                 }
                 Column::UserName => {
-                    painter.draw_text_aligned(cell, "feos", muted, 1, align, VerticalAlign::Middle);
+                    draw_cell(painter, cell, "feos", muted, 1, align, VerticalAlign::Middle);
                 }
                 Column::SessionId => {
-                    painter.draw_text_aligned(cell, "0", muted, 1, align, VerticalAlign::Middle);
+                    draw_cell(painter, cell, "0", muted, 1, align, VerticalAlign::Middle);
                 }
             }
             x += width;
@@ -3576,10 +3624,26 @@ fn draw_processes(painter: &mut Painter<'_, '_>, state: &State, layout: Layout) 
     );
 }
 
-fn draw_applications_header(painter: &mut Painter<'_, '_>, rect: Rect) {
+/// Draws one list cell's text, ending in `...` when it is wider than the cell
+/// and clipped to it, so a long value never runs into the next column.
+fn draw_cell(
+    painter: &mut Painter<'_, '_>,
+    cell: Rect,
+    text: &str,
+    color: Color,
+    scale: u32,
+    align: Align,
+    vertical: VerticalAlign,
+) {
+    let clip = painter.push_clip(cell);
+    painter.draw_text_ellipsis(cell, text, color, scale, align, vertical);
+    painter.restore_clip(clip);
+}
+
+fn draw_applications_header(painter: &mut Painter<'_, '_>, rect: Rect, scheme: Scheme) {
     painter
         .canvas_mut()
-        .fill_vertical_gradient(rect, HEADER_TOP, HEADER_BOTTOM);
+        .fill_vertical_gradient(rect, scheme.header_top, scheme.header_bottom);
     painter.fill_rect(
         Rect::new(rect.x, rect.bottom_i32() - 1, rect.width, 1),
         BORDER_DARK,
@@ -3610,7 +3674,7 @@ fn draw_applications_header(painter: &mut Painter<'_, '_>, rect: Rect) {
 fn draw_column_header(painter: &mut Painter<'_, '_>, rect: Rect, state: &State) {
     painter
         .canvas_mut()
-        .fill_vertical_gradient(rect, HEADER_TOP, HEADER_BOTTOM);
+        .fill_vertical_gradient(rect, state.scheme.header_top, state.scheme.header_bottom);
     painter.fill_rect(
         Rect::new(rect.x, rect.bottom_i32() - 1, rect.width, 1),
         BORDER_DARK,
@@ -3651,11 +3715,17 @@ fn draw_column_header(painter: &mut Painter<'_, '_>, rect: Rect, state: &State) 
     }
 }
 
-fn draw_row_background(painter: &mut Painter<'_, '_>, rect: Rect, selected: bool, hovered: bool) {
+fn draw_row_background(
+    painter: &mut Painter<'_, '_>,
+    rect: Rect,
+    selected: bool,
+    hovered: bool,
+    scheme: Scheme,
+) {
     if selected {
-        painter.fill_rect(rect, SELECT);
+        painter.fill_rect(rect, scheme.select);
     } else if hovered {
-        painter.fill_rect(rect, SELECT_SOFT);
+        painter.fill_rect(rect, scheme.select_soft);
     }
     painter.fill_rect(
         Rect::new(rect.x, rect.bottom_i32() - 1, rect.width, 1),
@@ -4144,7 +4214,7 @@ fn draw_networking(painter: &mut Painter<'_, '_>, state: &State, layout: Layout)
         adapter_area.width.saturating_sub(8),
         22,
     );
-    painter.fill_rect(row, SELECT);
+    painter.fill_rect(row, state.scheme.select);
     painter.draw_text(
         row.x + 6,
         row.y + 7,
@@ -4198,11 +4268,11 @@ fn draw_networking(painter: &mut Painter<'_, '_>, state: &State, layout: Layout)
     let _ = state;
 }
 
-fn draw_users(painter: &mut Painter<'_, '_>, layout: Layout) {
+fn draw_users(painter: &mut Painter<'_, '_>, layout: Layout, scheme: Scheme) {
     let list = list_layout(layout);
     painter
         .canvas_mut()
-        .fill_vertical_gradient(list.header, HEADER_TOP, HEADER_BOTTOM);
+        .fill_vertical_gradient(list.header, scheme.header_top, scheme.header_bottom);
     painter.fill_rect(
         Rect::new(
             list.header.x,
@@ -4234,7 +4304,7 @@ fn draw_users(painter: &mut Painter<'_, '_>, layout: Layout) {
 
     draw_sunken(painter, list.list);
     let row = Rect::new(list.rows.x, list.rows.y, list.rows.width, ROW_HEIGHT as u32);
-    painter.fill_rect(row, SELECT);
+    painter.fill_rect(row, scheme.select);
     let values = ["feos", "1", "Active", "Console", "0"];
     let mut x = row.x;
     for (index, value) in values.iter().enumerate() {
@@ -4371,7 +4441,7 @@ fn draw_menu(painter: &mut Painter<'_, '_>, state: &State, layout: Layout, menu:
         }
         let hovered = rect.contains(state.pointer) || index == state.menu_hover;
         if hovered && item.enabled {
-            painter.fill_rect(rect, SELECT);
+            painter.fill_rect(rect, state.scheme.select);
         }
         let color = if !item.enabled {
             DISABLED
@@ -4422,7 +4492,7 @@ fn draw_context(
         let enabled = *action != Action::None;
         let hovered = rect.contains(state.pointer) || index == context.hover;
         if hovered && enabled {
-            painter.fill_rect(rect, SELECT);
+            painter.fill_rect(rect, state.scheme.select);
         }
         let color = if !enabled {
             DISABLED
@@ -4509,7 +4579,7 @@ fn draw_dialog(
     let title = Rect::new(panel.x + 1, panel.y + 1, panel.width.saturating_sub(2), 25);
     painter
         .canvas_mut()
-        .fill_vertical_gradient(title, TITLE_TOP, TITLE_BOTTOM);
+        .fill_vertical_gradient(title, state.scheme.title_top, state.scheme.title_bottom);
     painter.draw_text_ellipsis(
         Rect::new(
             title.x + 9,
@@ -4611,6 +4681,7 @@ fn draw_about_dialog(
     let _ = write!(line, "Board: {}", platform.board.name);
     painter.draw_text(body.x, y, line.as_str(), TEXT, 1);
     y += 16;
+    line.clear();
     let _ = write!(
         line,
         "CPU: EL{}  MIDR {:#018x}",
@@ -4619,6 +4690,7 @@ fn draw_about_dialog(
     );
     painter.draw_text(body.x, y, line.as_str(), TEXT, 1);
     y += 16;
+    line.clear();
     let _ = write!(
         line,
         "Uptime: {}",
@@ -4626,6 +4698,7 @@ fn draw_about_dialog(
     );
     painter.draw_text(body.x, y, line.as_str(), TEXT, 1);
     y += 16;
+    line.clear();
     let _ = write!(
         line,
         "Processes: {}   Threads: {}",
@@ -4633,6 +4706,7 @@ fn draw_about_dialog(
     );
     painter.draw_text(body.x, y, line.as_str(), TEXT, 1);
     y += 16;
+    line.clear();
     let _ = write!(
         line,
         "Memory: {} total, {} free",
@@ -4651,7 +4725,7 @@ fn draw_columns_dialog(painter: &mut Painter<'_, '_>, state: &State, body: Rect)
     for (index, column) in Column::ALL.iter().enumerate() {
         let row = Rect::new(body.x, y, body.width, DIALOG_ROW as u32);
         if row.contains(state.pointer) {
-            painter.fill_rect(row, SELECT_SOFT);
+            painter.fill_rect(row, state.scheme.select_soft);
         }
         draw_checkbox(
             painter,
@@ -5874,6 +5948,7 @@ mod behavior_tests {
             platform: &platform,
             now_ms: 1_000,
             origin: Point::new(0, 0),
+            theme: &feos_desktop::DesktopTheme::xp_blue().ui,
             pointer_active: false,
             keyboard_active: false,
             cursor: feos_gui::CursorShape::Arrow,
@@ -6041,6 +6116,16 @@ mod golden_tests {
                 frame(&mut results, &name, state, width, height);
             }
         }
+
+        // The olive scheme, with a hosted window's row: its long name and
+        // seven-digit PID each stay in their own column.
+        let mut state = stable(898, 590, Tab::Processes);
+        state.scheme = Scheme::from_theme(&feos_desktop::DesktopTheme::xp_olive().ui);
+        let mut row = state.rows[3];
+        row.pid = shell::HOSTED_PID_BASE;
+        row.name = Text::from_str("File Explorer");
+        state.rows[3] = row;
+        frame(&mut results, "taskmgr_olive_processes", state, 898, 590);
 
         let mut state = stable(898, 590, Tab::Performance);
         state.cpu_view = CpuView::PerCore;
@@ -6257,6 +6342,7 @@ mod fuzz_tests {
                     platform: &platform,
                     now_ms: now,
                     origin: Point::new(0, 0),
+                    theme: &feos_desktop::DesktopTheme::xp_blue().ui,
                     pointer_active: true,
                     keyboard_active: true,
                     cursor: feos_gui::CursorShape::Arrow,
@@ -6331,5 +6417,64 @@ mod fuzz_tests {
                 render(&mut canvas, &platform, &mut state, now);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod scheme_tests {
+    use super::*;
+    use feos_desktop::DesktopTheme;
+
+    #[test]
+    fn a_cell_never_draws_outside_its_column() {
+        const WIDTH: usize = 120;
+        const HEIGHT: usize = 20;
+        let mut pixels = [0u32; WIDTH * HEIGHT];
+        let mut canvas = Canvas::new(&mut pixels, WIDTH, HEIGHT, WIDTH).unwrap();
+        let mut painter = Painter::new(&mut canvas);
+        // A PID column too narrow for a hosted window's seven digits.
+        let cell = Rect::new(40, 0, 36, HEIGHT as u32);
+        for align in [Align::Start, Align::Center, Align::End] {
+            draw_cell(
+                &mut painter,
+                cell,
+                "1000000",
+                Color::WHITE,
+                1,
+                align,
+                VerticalAlign::Middle,
+            );
+        }
+        let canvas = painter.canvas_mut();
+        let mut inside = 0;
+        for y in 0..HEIGHT as i32 {
+            for x in 0..WIDTH as i32 {
+                let lit = canvas.pixel(x, y).map(|color| color != Color::rgb(0, 0, 0)).unwrap_or(false);
+                if lit {
+                    assert!(cell.contains(Point::new(x, y)), "pixel at ({x}, {y}) is outside the cell");
+                    inside += 1;
+                }
+            }
+        }
+        assert!(inside > 0, "the cell drew nothing");
+    }
+
+    #[test]
+    fn hosted_window_pids_fit_the_pid_column() {
+        let digits = shell::HOSTED_PID_BASE.to_string().len() as i32;
+        assert!(digits * 8 <= Column::Pid.width() - 8);
+    }
+
+    #[test]
+    fn list_colours_follow_the_desktop_scheme() {
+        assert_eq!(Scheme::from_theme(&DesktopTheme::xp_blue().ui), Scheme::CLASSIC);
+        let olive = Scheme::from_theme(&DesktopTheme::xp_olive().ui);
+        assert_ne!(olive, Scheme::CLASSIC);
+        // Olive is green-led, not blue-led.
+        for color in [olive.select, olive.header_top, olive.header_bottom, olive.title_top] {
+            assert!(color.g() > color.b(), "{color:?} is not olive");
+        }
+        let silver = Scheme::from_theme(&DesktopTheme::xp_silver().ui);
+        assert_ne!(silver.select, olive.select);
     }
 }

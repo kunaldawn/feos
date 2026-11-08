@@ -18,7 +18,7 @@ impl App for Play {
     }
 
     fn description(&self) -> &'static str {
-        "play a WAV, AIFF, AU, MP3, FLAC, Vorbis or AAC file"
+        "play a WAV, AIFF, AU, MP3, FLAC, Vorbis, Opus or AAC file, or the sound of a video"
     }
 
     fn run(&self, context: &mut Context<'_>) -> i32 {

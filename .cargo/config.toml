@@ -22,6 +22,11 @@ rustflags = [
     "-C", "linker=rust-lld",
     "-C", "link-arg=-Tboards/qemu-x86_64/linker.ld",
     "-C", "relocation-model=static",
+    # No red zone, as for any x86_64 kernel: code must not keep data below its
+    # stack pointer where a trap could land. Every IDT gate switches to an IST
+    # stack today, but nothing should depend on that. The target JSON already
+    # sets `disable-redzone`; this repeats it. `aarch64-unknown-none` has no red
+    # zone either, so the AArch64 flags don't need it.
     "-C", "no-redzone=yes",
     "-C", "link-arg=-z", "-C", "link-arg=max-page-size=4096",
 ]

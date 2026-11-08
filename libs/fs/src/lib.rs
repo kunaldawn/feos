@@ -1,19 +1,30 @@
-//! Read-only and writable filesystems for feos.
+//! Filesystems for feos, and the tree that joins them.
 //!
 //! The abstraction is deliberately storage-agnostic: an app walks nodes
 //! through [`FileSystem`] and never sees whether the bytes came from an
-//! embedded image, a disk, or RAM. Three backends are provided:
+//! embedded image, a disk, or RAM. The backends are:
 //!
-//! * [`StaticFs`] — a compiled-in `StaticNode` table. It is allocation-free
-//!   and is what the QEMU board uses by default.
+//! * [`StaticFs`] — a compiled-in `StaticNode` table, allocation-free. It's
+//!   the boards' embedded image, which seeds the root.
 //! * [`Fat32`] — FAT32 long-file-name volumes on any [`BlockDevice`].
+//! * [`Fat16`] — FAT12 and FAT16, read-only, for DOS-era images.
 //! * [`Exfat`] — exFAT volumes, including UTF-16 names, contiguous streams,
 //!   allocation bitmaps and both main and backup boot regions.
+//! * [`Native`] — FEOS's own format, with owners, modes, links and a journal
+//!   (see [`native`]).
+//! * [`vfs::RamFs`] — a writable tree in RAM, optionally seeded from another
+//!   filesystem: the root when there's no disk, and `/tmp` and `/dev`.
 //!
-//! [`WritableFileSystem`] adds `create_file`, `create_dir`, `write`, `set_len`,
-//! `rename`, `remove` and `flush` for devices implementing
-//! [`WritableBlockDevice`]. The read-only [`FileSystem`] view stays available
-//! through a shared borrow.
+//! [`WritableFileSystem`] adds creating, writing, renaming, removing, attributes,
+//! times, `flush` and `check`, and the POSIX metadata only [`Native`] keeps, for
+//! devices implementing [`WritableBlockDevice`]. The read-only [`FileSystem`]
+//! view stays available through a shared borrow. [`BufferCache`] sits between a
+//! filesystem and its disk, and [`read_partitions`] reads MBR and GPT tables.
+//!
+//! [`Vfs`] is the one tree the system shares: a mount table of writable
+//! filesystems behind one lock, which [`vfs::assemble`] builds at boot from the
+//! disks a board found. [`MountTable`] is a read-only view of several volumes
+//! under one root, which the boot path doesn't use.
 //!
 //! Disk backends walk the directory tree once at mount time into a small
 //! in-memory index (one allocation per entry) and read file data on demand

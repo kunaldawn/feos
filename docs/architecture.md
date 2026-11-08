@@ -38,17 +38,12 @@ Every workspace crate uses the `feos-` prefix. Crates that fill a role use
 
 - `feos-arch-aarch64`, `feos-arch-x86_64`
 - `feos-board-qemu-virt`, `feos-board-qemu-x86_64`
-- `feos-driver-pl011`, `feos-driver-uart16550`, `feos-driver-fw-cfg`,
-  `feos-driver-ramfb`
-- `feos-driver-pci`, `feos-driver-intel-hda`, `feos-driver-gicv2`,
-  `feos-driver-gicv3`, `feos-driver-apic`, `feos-driver-i8042`,
-  `feos-driver-virtio-net`, `feos-driver-xhci`
+- `feos-driver-<name>` for each driver: `feos-driver-pl011`, `feos-driver-gicv3`,
+  `feos-driver-virtio-net`, `feos-driver-xhci` and so on (the shared virtio transport is
+  `feos-virtio-core`)
 - `feos-efi`, the UEFI loader, in `boot/efi`
-- `feos-abi`, `feos-elf`, `feos-vm`, `feos-hal`, `feos-firmware`, `feos-frames`, `feos-irq`, `feos-sync`, `feos-console`, `feos-gfx`, `feos-gui`,
-  `feos-net`, `feos-bootinfo`,
-  `feos-audio`, `feos-image`, `feos-audio-codec`, `feos-video`, `feos-h264`,
-  `feos-compress`, `feos-archive`, `feos-fs`, `feos-keys`, `feos-app`
-- `feos-apps`, `feos-shell`
+- libraries by what they are: `feos-hal`, `feos-fs`, `feos-net`, `feos-h264`, ...
+- apps: `feos-apps` (`apps/commands`), `feos-shell`, `feos-desktop-app`, `feos-dosbox-app`
 - `feos-kernel` (binary name: `feos`)
 
 Crate directories mirror the package name, except that trailing role words are
@@ -407,7 +402,9 @@ windowed one also needs a kernel-linked host app, which `user_window.rs` is, and
 `feos-gui` is a pure library above `feos-gfx`; it never talks to a device:
 
 1. A board driver supplies a `feos_gfx::Canvas` over the framebuffer. On the
-   QEMU board this is the ramfb XRGB8888 buffer.
+   QEMU boards that's a virtio-gpu when the machine has one, and otherwise the
+   ramfb XRGB8888 buffer, or the framebuffer the EFI loader passed
+   (`boards/common/src/display.rs`).
 2. An app owns its persistent state — `InteractionState`, `TextBuffer`,
    `WindowState`, component state such as `SelectState` or `TableResponse`
    inputs, booleans, sliders — and passes it to widgets each frame.
@@ -462,12 +459,9 @@ that need more room than their container simply clip.
 The QEMU boards expose a virtio tablet and keyboard (on PCI on q35 if they're there, and
 otherwise PS/2) and any USB ones, and the desktop session also translates serial-console keys into `feos_gui::Input` events:
 arrows navigate the Start menu and wallpaper, `Enter` launches, `Space` opens
-the menu and `Ctrl-\` returns to the shell. The `gui` app still renders a static dashboard
-frame with an overview, charts, a classic component gallery and a Fluent gallery
-showing the newer collection, navigation and overlay controls, and a Patterns
-gallery for advanced composition and chart types. Adding a pointer driver only
-requires feeding `Event`s into `Input` and clearing them per frame; the widget
-layer is already complete.
+the menu and `Ctrl-\` returns to the shell. The `gui` app is the dashboard and
+component gallery: a window driven by real input on the desktop, and one static frame
+when run from the shell.
 
 ## Memory
 
@@ -547,8 +541,10 @@ See [`networking.md`](networking.md).
 
 ## The kernel heap and video path
 
-Most of feos is allocation-free, but the H.264 decoder keeps reference
-pictures in `alloc` collections. `kernel/src/allocator.rs` provides one arena with a
+Most of feos is allocation-free, but some of it uses `alloc` collections: the media decoders
+(H.264 reference pictures, VP8, GIF's canvas, the audio codecs), the writable FAT32, exFAT and
+native mounts, the network stack, xHCI, the mixer's rings and the display's later modes.
+`kernel/src/allocator.rs` provides one arena with a
 sorted free list, a header on each block and a lock that masks interrupts. Usage is
 counters, so asking for it costs nothing, and `realloc` grows into a free neighbour when
 there is one. Each block records the task that allocated it, for accounting. That can't
@@ -556,12 +552,12 @@ be used to reclaim a killed task's heap (KRN-7): a block allocated by one task c
 be owned by something shared, such as a file in the VFS or a pipe's reader, and freeing
 it would be a use-after-free. What a killed task leaves behind is reported instead.
 `Allocator` implements `GlobalAlloc`; the player reads a media file of up to 16 MiB into a
-`Vec`, allocates the RGBA frame and decoder scratch, and releases them when the clip changes.
-GIF, MJPEG and raw/RLE decoders do not allocate themselves.
+`Vec` (a larger one is streamed: see below), allocates the RGBA frame and decoder scratch, and
+releases them when the clip changes.
 
 The video path is:
 
-1. The `player` app scans `Platform::filesystem` for video extensions. Its decode task reads
+1. The `player` app scans `Platform::filesystem` for video and sound extensions. Its decode task reads
    the selected node into a bounded buffer, or for a larger file, opens it as a `Source`.
 2. `feos-video` detects the container and reports dimensions, codec, frame
    count and frame rate. `decode_frame` writes one RGBA8888 frame into the
@@ -576,10 +572,11 @@ The video path is:
    macroblocks of an MBAFF pair. Reference marking is per field. High 10 and 4:2:2 become 8-bit
    4:2:0 on output, and fields are woven: nothing deinterlaces them. 4:4:4, FMO and SP slices
    are refused.
-4. The app scales the RGBA frame with nearest-neighbour sampling into an
-   off-screen canvas, letterboxes according to the selected aspect mode, paints
-   the VLC-style chrome around it, and copies the completed frame to the ramfb
-   scanout in one pass.
+4. The app scales the RGBA frame with nearest-neighbour sampling into its
+   canvas, letterboxes according to the selected aspect mode and paints the
+   VLC-style chrome around it. On the desktop that canvas is the window's
+   content; run from the shell, it's an off-screen canvas copied to the
+   framebuffer in one pass.
 
 ### Files too large to read
 
@@ -606,13 +603,14 @@ Audio crosses the same layers as graphics:
 
 1. `feos-audio` renders and mixes 16-bit PCM in a caller-owned buffer. It is
    hardware-independent and host-testable.
-2. `feos-driver-pci` reads PCIe ECAM configuration space. Because the kernel
-   boots without firmware, it also sizes and assigns the HDA controller's BAR
-   and enables memory decoding plus bus mastering.
+2. `feos-driver-pci` reads configuration space, by ECAM on AArch64 and the legacy
+   ports on x86_64. The AArch64 kernel boots without firmware, so it also sizes and
+   assigns BARs; on x86_64 it keeps what SeaBIOS assigned, and assigns one only
+   where nothing did. It enables memory decoding plus bus mastering.
 3. `feos-driver-intel-hda` resets the controller, sets up the CORB/RIRB command
-   rings, discovers the codec's DAC and output pin, and plays one block through
-   an output stream descriptor. Its rings, BDL and PCM buffer are static, so no
-   allocator is involved.
+   rings, discovers the codec's DAC and output pin, and streams through a cyclic
+   ring on an output stream descriptor. Its rings, BDL and PCM buffers are static,
+   so no allocator is involved.
 4. The board owns the controller instance and assigns the BAR address; the
    kernel exposes the initialised `&dyn Audio` in `Platform`.
 5. `feos-mixer` owns the device for everything else. A client opens a `Stream`
@@ -649,30 +647,34 @@ still use their statics' addresses directly.
 
 The filesystem is a library service, not a device driver:
 
-1. `feos-fs` defines the read-only `FileSystem` trait and `StaticFs`, a backend
-   over a flat `StaticNode` table. Path resolution, parent links, directory
-   iteration and chunked reads are all allocation-free and host-tested.
-2. `boards/qemu-virt/build.rs` walks `boards/qemu-virt/fs/` at build time and
-   emits a `StaticNode` table with `include_bytes!` for file contents. The
-   board exposes it as `&dyn FileSystem`.
-3. The kernel stores that reference in `Platform::filesystem`, so apps never
-   learn how the image is stored. A future virtio-blk or RAM backend implements
-   the same trait.
-4. The `files` app renders an XP-style explorer inside a desktop window.
+1. `feos-fs` defines the read-only `FileSystem` trait and `WritableFileSystem` on top
+   of it, with backends: `StaticFs` over a compiled-in `StaticNode` table, FAT32,
+   exFAT and the [native filesystem](#the-native-filesystem) read and write, FAT12/16
+   read-only, and `RamFs` in memory. A `BufferCache` sits between each disk and its
+   filesystem, and MBR and GPT partitions are read. All of it is host-tested.
+2. `boards/common/fs_image_build.rs`, run by both boards' `build.rs`, walks
+   `boards/qemu-virt/fs/` at build time and emits a `StaticNode` table with
+   `include_bytes!` for file contents, adding `user/out/<arch>` as `/bin`. Optional
+   `boards/qemu-virt/disk*.img` files are embedded too.
+3. At boot, `feos_fs::vfs::assemble` (through `boards/common`'s `mount_filesystem`)
+   builds the one shared tree, `feos_fs::Vfs`, from what the board found. The first
+   disk with a filesystem is the root, later ones are `/disk<n>`, native ones
+   `/native<n>` and USB sticks `/usb<n>`. A blank disk is formatted (FAT32, or exFAT when too small for FAT32) and seeded
+   from the embedded image. With no usable disk, the root is a `RamFs` seeded from
+   the image, so changes last until power-off. `/tmp` and `/dev` are always in RAM.
+   A background task, `fsflush`, syncs about once a second.
+4. The kernel stores the tree in `Platform::filesystem`, a `&dyn FileSystem`, so apps
+   never learn how it's stored; `FileSystem::tree` reaches the writable interface.
+   The shell, every Terminal and Explorer see the same files.
+5. The `files` app renders an XP-style explorer inside a desktop window.
    `apps/commands/src/files/explorer.rs` owns the menu bar, toolbar, address
-   history, folder tree, search, four view modes, preview pane, dialogs and
-   pointer/keyboard input. `App::windowed` lets the desktop drive it through
+   history, folder tree, search, five view modes (Details, Icons, List, Tiles,
+   Thumbnails), preview pane, dialogs and pointer/keyboard input. `App::windowed` lets the desktop drive it through
    `App::open_window`/`App::frame_window` with a `WindowContext`: the desktop
    supplies a content-sized `Canvas` sub-view, frame input and its platform
-   services. Because the app no longer owns the screen, wallpaper icons, the
-   taskbar, the Start menu and other windows stay interactive. The desktop's
-   serial-key loop is in `feos-keys`; routed `Event`s give the explorer and
-   the desktop identical arrow, modified-arrow, function-key, Page Up/Down and
-   Escape decoding.
-
-Because the image is compiled in, adding a file is a rebuild, not a mount. The
-same structure can later be fed from an archive or a filesystem driver without
-changing the explorer.
+   services. The desktop's serial-key loop is in `feos-keys`; routed `Event`s give
+   the explorer and the desktop identical arrow, modified-arrow, function-key,
+   Page Up/Down and Escape decoding.
 
 Explorer's search walks on a task of its own (`search`, at a low priority), reading files 64 KiB at a
 time when it's looking inside them, and the window takes in what's been found each frame. So the VFS
@@ -733,8 +735,8 @@ instructions or touches MMIO. The split makes most logic host-testable:
 - Drivers are intentionally thin register accessors; they can be exercised in
   QEMU.
 - The kernel is tested by booting. `scripts/boot-test.py` boots a kernel headless and
-  drives the serial shell, through phases `FEOS_BOOT_TEST_ONLY` can select: storage,
-  `smp`, `irq`, `ram`, `fault`, `sched`, `gicv3`, `net`, `usb`, `efi`, `el`, `input`, `user`, `hosted`, `jobs`, `names`, `settings`, `terminal`, `search`, `resolution`, `fonts`, `native`. The `efi`
+  drives the serial shell, through phases `FEOS_BOOT_TEST_ONLY` can select: `storage`,
+  `milestone`, `partition`, `format`, `install`, `persistence`, `gpu`, `transport`, `smp`, `irq`, `ram`, `fault`, `sched`, `gicv3`, `net`, `usb`, `efi`, `el`, `input`, `user`, `hosted`, `jobs`, `names`, `settings`, `terminal`, `search`, `resolution`, `fonts`, `native`. The `efi`
   phase needs the loader built, and everything in it runs on OVMF or AAVMF from the image. What can only be seen from inside the
   kernel, such as which CPU a task ran on or what's in an XMM register across a
   preemption, is in `kernel/src/ktest.rs`, the `ktest` shell command. Some of it stops
@@ -744,4 +746,7 @@ instructions or touches MMIO. The split makes most logic host-testable:
 - `make run` still gives a scheduler smoke test by hand: `spawn tick 8 200` several
   times, `ps` to see them, `kill <pid>` to remove one.
 
-`make check-arm` and `make check-x64` type-check every crate for each port.
+`make check-arm` and `make check-x64` type-check every crate for each port, and `make clippy`
+runs clippy over both with warnings as errors; the crates that parse untrusted input add panic
+lints in their own `[lints.clippy]`. `make fuzz` runs the fuzz-style tests again, optimised with
+overflow checks. `.github/workflows/ci.yml` runs the checks, tests, clippy, fuzz and boot tests.

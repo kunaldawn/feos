@@ -15,15 +15,16 @@ vendored [`feos-h264`](../h264/) crate. `feos-video` is `no_std`.
 | Container | Demux | Pixel decode |
 |-----------|-------|--------------|
 | GIF (animated) | yes | yes (LZW, transparency, disposal) |
-| AVI (RIFF), OpenDML, `rec ` lists | yes | MJPEG, uncompressed RGB/YUV/palette, RLE8/RLE4, H.264 |
-| MP4 / MOV (ISO BMFF), fragmented | yes | MJPEG, uncompressed, H.264 |
-| Matroska / WebM, unknown-size clusters, header-strip and zlib tracks | yes | MJPEG, uncompressed, H.264 |
+| AVI (RIFF), OpenDML, `rec ` lists | yes | MJPEG, uncompressed RGB/YUV/palette, RLE8/RLE4, H.264, VP8 |
+| MP4 / MOV (ISO BMFF), fragmented | yes | MJPEG, uncompressed, H.264, VP8 |
+| Matroska / WebM, unknown-size clusters, header-strip and zlib tracks | yes | MJPEG, uncompressed, H.264, VP8 |
 | FLV | yes | H.264 |
-| IVF | yes | metadata only (VP8/VP9/AV1 payload) |
+| IVF | yes | VP8 (VP9/AV1: metadata only) |
 | Annex-B H.264 | yes | yes |
 | Motion JPEG | yes | yes |
+| MPEG-1 elementary and program streams | yes | MPEG-1 video |
 
-The demuxers recognise HEVC, VP8, VP9, AV1, MPEG-1/2/4, Theora, ProRes, VC-1,
+The demuxers recognise HEVC, VP9, AV1, MPEG-2/4 (and MPEG-1 in other containers), Theora, ProRes, VC-1,
 VP6, H.263 and Cinepak as well. Their dimensions and frame counts are reported
 by `info`, but pixel reconstruction is not implemented for them yet;
 `decode_frame` returns `VideoError::UnsupportedCodec`.
@@ -78,23 +79,28 @@ IDR, by scanning its NAL headers: other "key frames" aren't self-contained.
 
 ## Scope limits
 
-- H.264 support tracks `feos-h264`: 8-bit progressive 4:2:0 Baseline, Main and
-  High profiles. Anything else returns an error, and a damaged sample loses only
-  its picture.
-- VP8, VP9, AV1, HEVC, MPEG-1/2/4, Theora, ProRes, VC-1, VP6, H.263 and
-  Cinepak samples are locatable but not decoded to pixels.
-- Only the first video track of a file is decoded, and audio isn't demuxed.
+- H.264 support tracks `feos-h264`: Baseline, Main, High, High 10 and High 4:2:2,
+  progressive, field-coded or MBAFF (see its README). Anything else returns an
+  error, and a damaged stream is concealed from the latest reference picture.
+- VP8 is decoded by `feos_video::vp8`, written for feos.
+- VP9, AV1, HEVC, MPEG-2/4, Theora, ProRes, VC-1, VP6, H.263 and Cinepak samples
+  are locatable but not decoded to pixels.
+- Only the first video track of a file is decoded. `audio` finds the sound track
+  (`audio_track`, `audio_track_from_source`) and hands its packets to the audio codecs.
 - An edit list is honoured for its start offset and leading delay, not its later
   segments.
-- The whole file must be in memory.
+- A file can be in memory or read through a `feos_source::Source` as it decodes
+  (`VideoDecoder::from_source`). A fragmented MP4, a program stream, raw H.264 and
+  MJPEG are read once on opening to index them. GIF must be in memory.
 
 ## Attribution
 
 The H.264 decoder is vendored from `z264` (MIT OR Apache-2.0), which adapts
 `rust_h264` 0.4.x. See [`libs/h264/README.md`](../h264/README.md) and
 [`libs/h264/UPSTREAM.md`](../h264/UPSTREAM.md) for provenance and
-licensing. Containers, GIF, raw/RLE conversion and the H.264 glue in this
-crate were written for feos.
+licensing. MPEG-1 video is ported from PL_MPEG by Dominic Szablewski (MIT).
+Containers, GIF, raw/RLE conversion, VP8 and the H.264 glue in this crate were
+written for feos.
 
 ## Tests
 

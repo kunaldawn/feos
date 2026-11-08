@@ -99,6 +99,18 @@ codegen-units = 1
 # Line tables make panics and faults easier to trace, and aren't loaded.
 debug = "line-tables-only"
 
+# The fuzz-style host tests (`make fuzz`): optimised like the kernel, so they run
+# as many inputs and have its stack depth, but with overflow checks and debug
+# assertions on, so wraps that a release build hides become failures. No LTO, as
+# it buys nothing here and takes memory.
+[profile.fuzz]
+inherits = "release"
+overflow-checks = true
+debug-assertions = true
+lto = false
+codegen-units = 16
+debug = false
+
 # The image is dominated by data, so speed matters more than size in hot code.
 [profile.release.package.feos-gfx]
 opt-level = 3

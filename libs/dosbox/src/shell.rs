@@ -1508,18 +1508,19 @@ fn about(out: &mut Out<'_>) {
     out.line("An x86 virtual machine and DOS written in Rust for feos.");
     out.line("");
     for line in [
-        "  * 80386 interpreter with protected mode and paging, and an x87",
+        "  * 80386 interpreter: protected, virtual-8086 mode, paging, an x87",
         "  * 16 MiB RAM, XMS and EMS, 8259 PIC, 8254 PIT, 8042 and 8237 DMA",
         "  * VGA register core with text, CGA, EGA, VGA and tweaked modes",
         "  * BIOS and DOS services reached through the guest's own vectors",
-        "  * OPL2/OPL3 FM, PC speaker and a Sound Blaster 2.0",
+        "  * OPL2/OPL3 FM, PC speaker and a Sound Blaster 2.0, Pro or 16",
+        "  * a DPMI 0.9 host, and VCPI under EMM386 ON",
         "  * writable C: RAM drive with MOUNT, GAMES, SCREEN and SAVESTATE",
     ] {
         out.line(line);
     }
     out.line("");
-    out.line("Virtual-8086 mode, a DPMI host, CD-ROM, networking and recording");
-    out.line("are not implemented. See docs/dosbox.md for game status.");
+    out.line("CD-ROM, networking, MIDI and recording are not implemented.");
+    out.line("See docs/dosbox.md for game status.");
     out.line("");
 }
 

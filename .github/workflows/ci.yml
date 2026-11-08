@@ -16,6 +16,29 @@ jobs:
       - name: Host tests
         run: make test
 
+  # Clippy over both ports and the user programs, with warnings as errors: a new
+  # warning fails the build. The parser crates add their own panic lints in their
+  # Cargo.toml, and the Makefile's CLIPPY_FLAGS lists what's allowed and why.
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup show && rustup component add clippy
+      - name: Clippy
+        run: make clippy
+
+  # The fuzz-style tests, optimised but with overflow checks and debug
+  # assertions, on a kernel-sized stack.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup show
+      - name: Fuzz tests
+        run: make fuzz
+
   boot:
     runs-on: ubuntu-latest
     strategy:
