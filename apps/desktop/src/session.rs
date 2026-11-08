@@ -16,7 +16,7 @@ use feos_app::shell::Request;
 use feos_app::{shell, Platform};
 use feos_text::Text;
 use feos_console::println;
-use feos_desktop::{paint, CursorShape, DesktopResponse, StartMenuCommand};
+use feos_desktop::{paint, CursorShape, StartMenuCommand};
 use feos_gfx::{Canvas, Point, Rect};
 use feos_gui::{Event, Input, Key, Modifiers, MouseButton, Painter};
 use feos_hal::PointerEvent;
@@ -111,6 +111,10 @@ pub fn run_session(
         input.set_pointer(Point::new(x as i32, y as i32));
     }
     let mut cursor = SoftCursor::new();
+    // The pointer the last frame asked for, and until when a launch shows the
+    // working pointer instead of the arrow.
+    let mut desktop_cursor = CursorShape::Arrow;
+    let mut working_until = 0u64;
     let mut scratch = Input::new();
     // A new screen size waiting to be kept: the size to go back to, and when.
     let mut pending_mode: Option<PendingMode> = None;
@@ -324,8 +328,14 @@ pub fn run_session(
             let may_run_foreground = response.launch.is_some()
                 || response.run.is_some()
                 || response.command != StartMenuCommand::None;
+            let shown_at = platform.clock.uptime_ms();
+            if response.launch.is_some() || response.run.is_some() {
+                working_until = shown_at + LAUNCH_FEEDBACK_MS;
+            }
+            desktop_cursor = response.cursor;
+            let shape = pointer_shape(desktop_cursor, shown_at, working_until);
             if may_run_foreground {
-                present(display, back, &response, input.pointer(), &mut cursor);
+                present(display, back, response.damage, input.pointer(), shape, shown_at, &mut cursor);
             }
 
             let ran_foreground = super::apply_response(&mut session, &response, platform, display);
@@ -346,7 +356,7 @@ pub fn run_session(
             // A foreground app drew directly to the scanout buffer. Leave it
             // alone and compose a fresh desktop frame on the next pass.
             if !ran_foreground {
-                present(display, back, &response, input.pointer(), &mut cursor);
+                present(display, back, response.damage, input.pointer(), shape, shown_at, &mut cursor);
             }
             // Some interactions change state after the frame was painted
             // (closing a window, say), and a launch opens one. Only those need
@@ -378,6 +388,14 @@ pub fn run_session(
         // just printed something, say. No frame has reported that yet.
         if animation_period == 0 {
             animation_period = session.animation_period();
+        }
+
+        // An animated pointer moves on by itself, and the launch feedback ends
+        // by itself; neither needs the desktop composed again.
+        let now = platform.clock.uptime_ms();
+        let shape = pointer_shape(desktop_cursor, now, working_until);
+        if cursor.due(now) || (cursor.drawn.is_some() && shape != cursor.shape) {
+            present(display, back, None, input.pointer(), shape, now, &mut cursor);
         }
 
         input.clear_events();
@@ -429,7 +447,7 @@ fn publish_settings(session: &super::Session, display: &Option<Canvas<'static>>,
     if let Some(front) = display.as_ref() {
         config.resolution = Some((front.width() as u16, front.height() as u16));
     }
-    let _ = write!(text, "{}revision: {revision}\n", config.settings_text().as_str());
+    let _ = writeln!(text, "{}revision: {revision}", config.settings_text().as_str());
     shell::publish_settings(text.as_str());
 }
 
@@ -466,11 +484,25 @@ fn change_mode(
 ///
 /// The composed frame stays free of cursor pixels, so moving the pointer only
 /// has to restore the old cursor's rectangle from it and draw the new one. The
-/// back buffer is the save-under.
+/// back buffer is the save-under. The rectangle is the cursor's whole image
+/// placed by its hot spot, which for the XP cursors starts up to 16 pixels
+/// above and left of the pointer, so what's restored is always all that was
+/// drawn.
 struct SoftCursor {
     drawn: Option<Rect>,
     position: Point,
     shape: CursorShape,
+    /// When the shape appeared, which is when an animation starts.
+    since: u64,
+    /// When an animated shape next shows another image.
+    next_frame_at: Option<u64>,
+}
+
+/// What a cursor update drew over: where the old cursor was and the new one is.
+#[derive(Clone, Copy, Default)]
+struct CursorDamage {
+    old: Option<Rect>,
+    new: Option<Rect>,
 }
 
 impl SoftCursor {
@@ -479,6 +511,8 @@ impl SoftCursor {
             drawn: None,
             position: Point::new(0, 0),
             shape: CursorShape::Arrow,
+            since: 0,
+            next_frame_at: None,
         }
     }
 
@@ -487,8 +521,13 @@ impl SoftCursor {
         self.drawn = None;
     }
 
-    /// Restores what the cursor covered, if it needs to move or was erased, and
-    /// draws it.
+    /// Whether an animated cursor is due to show its next image.
+    fn due(&self, now: u64) -> bool {
+        self.drawn.is_some() && self.next_frame_at.is_some_and(|at| now >= at)
+    }
+
+    /// Restores what the cursor covered, if it needs to move, change or was
+    /// erased, and draws it.
     fn update(
         &mut self,
         front: &mut Canvas<'static>,
@@ -496,22 +535,49 @@ impl SoftCursor {
         position: Point,
         shape: CursorShape,
         damage: Option<Rect>,
-    ) {
+        now: u64,
+    ) -> CursorDamage {
         let overwritten = match (self.drawn, damage) {
             (Some(drawn), Some(damage)) => drawn.intersect(damage).is_some(),
             (None, _) => true,
             _ => false,
         };
-        if !overwritten && position == self.position && shape == self.shape {
-            return;
+        if shape != self.shape {
+            self.since = now;
         }
-        if let Some(drawn) = self.drawn {
+        if !overwritten && position == self.position && shape == self.shape && !self.due(now) {
+            return CursorDamage::default();
+        }
+        let old = self.drawn;
+        if let Some(drawn) = old {
             front.copy_rect_from(back, drawn);
         }
-        paint::draw_cursor_shape(&mut Painter::new(front), position.x, position.y, shape);
-        self.drawn = Some(paint::cursor_bounds(position.x, position.y, shape));
+        let elapsed = now.saturating_sub(self.since);
+        paint::draw_cursor_shape_at(&mut Painter::new(front), position.x, position.y, shape, elapsed);
+        let new = paint::cursor_bounds(position.x, position.y, shape);
+        self.drawn = Some(new);
+        self.next_frame_at = paint::cursor_frame_left(shape, elapsed).map(|left| now + left);
         self.position = position;
         self.shape = shape;
+        CursorDamage {
+            old,
+            new: Some(new),
+        }
+    }
+}
+
+/// How long the working-in-background pointer shows after a launch, as XP's
+/// launch feedback does. Opening a window happens inside one frame here, so
+/// there's nothing finer to wait on.
+const LAUNCH_FEEDBACK_MS: u64 = 1_500;
+
+/// The pointer to show: the desktop's, unless a launch has just happened and
+/// the desktop wants the plain arrow.
+fn pointer_shape(desktop: CursorShape, now: u64, working_until: u64) -> CursorShape {
+    if desktop == CursorShape::Arrow && now < working_until {
+        CursorShape::Working
+    } else {
+        desktop
     }
 }
 
@@ -565,47 +631,39 @@ fn push_pointer(input: &mut Input, report: PointerEvent, last: &mut (u16, u16)) 
 fn present(
     display: &mut Option<Canvas<'static>>,
     back: &Option<Canvas<'static>>,
-    response: &DesktopResponse,
+    damage: Option<Rect>,
     pointer: Point,
+    shape: CursorShape,
+    now: u64,
     cursor: &mut SoftCursor,
 ) {
     let (Some(front), Some(back)) = (display.as_mut(), back.as_ref()) else {
         return;
     };
 
-    if let Some(damage) = response.damage {
+    if let Some(damage) = damage {
         front.copy_rect_from(back, damage);
     }
-    cursor.update(front, back, pointer, response.cursor, response.damage);
-    report_damage(response.damage, pointer);
+    let drawn = cursor.update(front, back, pointer, shape, damage, now);
+    report_damage(damage, drawn);
 }
 
-/// Tells a display that needs telling what changed: the frame's damage, and where
-/// the pointer is and was, which the soft cursor drew over outside the damage.
-fn report_damage(damage: Option<Rect>, pointer: Point) {
-    use core::sync::atomic::{AtomicU64, Ordering};
-    static LAST_POINTER: AtomicU64 = AtomicU64::new(0);
+/// Tells a display that needs telling what changed: the frame's damage, and
+/// where the cursor was and is, which it drew over outside the damage.
+fn report_damage(damage: Option<Rect>, cursor: CursorDamage) {
     if !feos_hal::display::needs_refresh() {
         return;
     }
-    if let Some(damage) = damage {
-        feos_hal::display::flush(
-            damage.x.max(0) as u32,
-            damage.y.max(0) as u32,
-            damage.width,
-            damage.height,
-        );
-    }
-    let packed = (pointer.x.max(0) as u64) << 32 | pointer.y.max(0) as u64;
-    let last = LAST_POINTER.swap(packed, Ordering::AcqRel);
-    for spot in [last, packed] {
-        let (x, y) = ((spot >> 32) as u32, spot as u32);
-        feos_hal::display::flush(x, y, CURSOR_REACH, CURSOR_REACH);
+    for rect in [damage, cursor.old, cursor.new].into_iter().flatten() {
+        // A cursor at the top or left edge starts off the screen.
+        let (x, y) = (rect.x.max(0), rect.y.max(0));
+        let width = (rect.x + rect.width as i32 - x).max(0) as u32;
+        let height = (rect.y + rect.height as i32 - y).max(0) as u32;
+        if width > 0 && height > 0 {
+            feos_hal::display::flush(x as u32, y as u32, width, height);
+        }
     }
 }
-
-/// A square that holds the soft cursor, from its hot spot.
-const CURSOR_REACH: u32 = 32;
 
 #[cfg(test)]
 mod tests {
@@ -650,17 +708,17 @@ mod tests {
         let mut front = solid(leaked(64, 64), 64, 64, 0x0011_2233);
         let back = solid(leaked(64, 64), 64, 64, 0x0011_2233);
         let mut cursor = SoftCursor::new();
-        cursor.update(&mut front, &back, Point::new(4, 4), CursorShape::Arrow, None);
+        cursor.update(&mut front, &back, Point::new(20, 20), CursorShape::Arrow, None, 0);
         assert_ne!(front.pixels(), back.pixels());
 
-        cursor.update(&mut front, &back, Point::new(40, 40), CursorShape::Arrow, None);
+        cursor.update(&mut front, &back, Point::new(52, 52), CursorShape::Arrow, None, 0);
         // Nothing is left of the old cursor.
-        for y in 0..30usize {
-            for x in 0..30usize {
+        for y in 0..40usize {
+            for x in 0..40usize {
                 assert_eq!(front.pixels()[y * 64 + x], 0x0011_2233, "{x},{y}");
             }
         }
-        assert_ne!(front.pixels()[42 * 64 + 41], 0x0011_2233);
+        assert_ne!(front.pixels()[54 * 64 + 53], 0x0011_2233);
     }
 
     #[test]
@@ -668,17 +726,59 @@ mod tests {
         let mut front = solid(leaked(64, 64), 64, 64, 1);
         let back = solid(leaked(64, 64), 64, 64, 1);
         let mut cursor = SoftCursor::new();
-        cursor.update(&mut front, &back, Point::new(4, 4), CursorShape::Arrow, None);
+        cursor.update(&mut front, &back, Point::new(4, 4), CursorShape::Arrow, None, 0);
         // A marker where the cursor is not; a redraw would not touch it either,
         // so check the cursor survives damage that erases its pixels.
         let far = Some(Rect::new(40, 40, 8, 8));
         let tip = front.pixels()[4 * 64 + 4];
-        cursor.update(&mut front, &back, Point::new(4, 4), CursorShape::Arrow, far);
+        cursor.update(&mut front, &back, Point::new(4, 4), CursorShape::Arrow, far, 0);
         assert_eq!(front.pixels()[4 * 64 + 4], tip);
 
         front.copy_rect_from(&back, Rect::new(0, 0, 32, 32));
         let near = Some(Rect::new(0, 0, 32, 32));
-        cursor.update(&mut front, &back, Point::new(4, 4), CursorShape::Arrow, near);
+        cursor.update(&mut front, &back, Point::new(4, 4), CursorShape::Arrow, near, 0);
         assert_eq!(front.pixels()[4 * 64 + 4], tip);
+    }
+
+    #[test]
+    fn every_shape_moves_without_leaving_a_trail() {
+        for shape in CursorShape::ALL {
+            let mut front = solid(leaked(96, 96), 96, 96, 0x0011_2233);
+            let back = solid(leaked(96, 96), 96, 96, 0x0011_2233);
+            let mut cursor = SoftCursor::new();
+            for (step, point) in [(2, 2), (40, 40), (90, 5), (5, 90), (60, 60)].into_iter().enumerate() {
+                let drawn = cursor.update(&mut front, &back, Point::new(point.0, point.1), shape, None, step as u64 * 250);
+                let new = drawn.new.unwrap();
+                for (index, &pixel) in front.pixels().iter().enumerate() {
+                    let at = Point::new((index % 96) as i32, (index / 96) as i32);
+                    if pixel != 0x0011_2233 {
+                        assert!(new.contains(at), "{shape:?} left {at:?} outside {new:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_animated_cursor_is_due_again_and_a_still_one_is_not() {
+        let mut front = solid(leaked(64, 64), 64, 64, 1);
+        let back = solid(leaked(64, 64), 64, 64, 1);
+        let mut cursor = SoftCursor::new();
+        cursor.update(&mut front, &back, Point::new(30, 30), CursorShape::Arrow, None, 0);
+        assert!(!cursor.due(10_000));
+        cursor.update(&mut front, &back, Point::new(30, 30), CursorShape::Busy, None, 100);
+        assert!(!cursor.due(100));
+        assert!(cursor.due(100 + 2_000));
+        let first = front.pixels().to_vec();
+        let drawn = cursor.update(&mut front, &back, Point::new(30, 30), CursorShape::Busy, None, 100 + 2_000);
+        assert!(drawn.new.is_some());
+        assert_ne!(front.pixels(), &first[..]);
+    }
+
+    #[test]
+    fn a_launch_shows_the_working_pointer_for_a_while() {
+        assert_eq!(pointer_shape(CursorShape::Arrow, 10, 500), CursorShape::Working);
+        assert_eq!(pointer_shape(CursorShape::SizeVertical, 10, 500), CursorShape::SizeVertical);
+        assert_eq!(pointer_shape(CursorShape::Arrow, 500, 500), CursorShape::Arrow);
     }
 }

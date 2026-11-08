@@ -96,6 +96,8 @@ pub trait FaultDetails {
     /// that ending the task could be an answer to it.
     fn is_task_fault(&self) -> bool;
     /// Whether a user program caused this, as opposed to kernel code.
+    // "From" as in where the fault came from, not a conversion.
+    #[allow(clippy::wrong_self_convention)]
     fn from_user(&self) -> bool;
     /// The address a memory fault was on, if this is one.
     fn fault_address(&self) -> Option<u64>;

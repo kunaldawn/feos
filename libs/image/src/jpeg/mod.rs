@@ -725,7 +725,7 @@ impl Geometry {
             for (i, base) in rows.iter_mut().enumerate().take(frame.count) {
                 *base = self.plane_base[i] + self.y_map[i][py] as usize;
             }
-            for (px, pixel) in row.chunks_exact_mut(4).enumerate() {
+            for (px, pixel) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let sample = |i: usize| planes[rows[i] + self.x_map[i][px] as usize];
                 let (r, g, b) = match color {
                     Color::Gray => {

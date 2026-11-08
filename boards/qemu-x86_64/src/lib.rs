@@ -313,6 +313,8 @@ fn init_virtio_input() {
             return;
         };
         let any = AnyTransport::Pci(transport);
+        // The transport moves into whichever device takes it, which a match guard can't do.
+        #[allow(clippy::collapsible_match)]
         match feos_driver_virtio_input::probe_transport(&any) {
             Some(DeviceKind::Pointer(kind)) => {
                 if VIRTIO_POINTER.lock().init_transport(any, width as u16, height as u16) {

@@ -63,7 +63,7 @@ pub fn init() {
         // past the end of RAM reads as nothing and the report says why.
         panic!("the kernel image ends at {kernel_end:#x}, past the RAM firmware reports");
     }
-    frames.reserve(0, Machine::LOW_RESERVED.min(kernel_start));
+    frames.reserve(0, kernel_start);
     frames.reserve(kernel_start, kernel_end - kernel_start);
 
     let total = frames.total_bytes();

@@ -613,6 +613,11 @@ pub struct WindowContext<'a, 'b> {
     pub pointer_active: bool,
     /// Whether keyboard events belong to this window this frame.
     pub keyboard_active: bool,
+    /// The pointer the app wants over its content, set during the frame. It
+    /// starts as the arrow each frame; a text field sets
+    /// [`CursorShape::Text`](feos_gui::CursorShape::Text), say. The desktop
+    /// shows it while the pointer is over the content and not on an edge.
+    pub cursor: feos_gui::CursorShape,
 }
 
 impl WindowContext<'_, '_> {

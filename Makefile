@@ -63,7 +63,7 @@ USER_TARGET_DIR ?= $(or $(CARGO_TARGET_DIR),$(CURDIR)/target)/user
 USER_BINS       := hello cat vmcheck spin utest wdemo malicious permtest runas
 USER_FLAGS      := -C linker=rust-lld -C link-arg=-T$(CURDIR)/user/link.ld -C link-arg=-z -C link-arg=max-page-size=4096
 
-.PHONY: all build build-arm build-x64 build-efi check check-arm check-x64 run run-arm run-x64 clean \
+.PHONY: all build build-arm build-x64 build-efi check check-arm check-x64 clippy clippy-arm clippy-x64 run run-arm run-x64 clean \
         test test-firmware test-frames test-irq test-gfx test-gui test-audio test-mixer test-iconset test-sync \
         test-heap test-sched test-hal test-console test-app test-pci test-i8042 test-apic test-gicv2 test-gicv3 test-uart16550 test-intel-hda \
         test-json test-yaml test-image test-audio-codec test-compress test-archive \
@@ -111,26 +111,46 @@ build-efi:
 
 # `--workspace` cannot build both architecture crates in one pass: each
 # contains target-specific assembly. Check the port that matches the target.
+EXCLUDE_ARM := --exclude feos-efi --exclude feos-arch-x86_64 --exclude feos-board-qemu-x86_64 \
+	--exclude feos-driver-apic --exclude feos-driver-i8042 --exclude feos-driver-uart16550
+EXCLUDE_X64 := --exclude feos-efi --exclude feos-arch-aarch64 --exclude feos-board-qemu-virt \
+	--exclude feos-driver-gicv2 --exclude feos-driver-gicv3
+
 check: check-arm
 
 check-arm:
-	cargo check --workspace --target $(TARGET_ARM) \
-		--exclude feos-efi \
-		--exclude feos-arch-x86_64 \
-		--exclude feos-board-qemu-x86_64 \
-		--exclude feos-driver-apic \
-		--exclude feos-driver-i8042 \
-		--exclude feos-driver-uart16550
+	cargo check --workspace --target $(TARGET_ARM) $(EXCLUDE_ARM)
 	cd user && cargo check --target $(TARGET_ARM) --target-dir $(USER_TARGET_DIR)
 
 check-x64:
-	$(CARGO_X64) check --workspace \
-		--exclude feos-efi \
-		--exclude feos-arch-aarch64 \
-		--exclude feos-board-qemu-virt \
-		--exclude feos-driver-gicv2 \
-		--exclude feos-driver-gicv3
+	$(CARGO_X64) check --workspace $(EXCLUDE_X64)
 	$(CARGO_X64) check --manifest-path user/Cargo.toml --target-dir $(USER_TARGET_DIR)
+
+# Clippy over both ports, with every warning an error: CI runs these. The parser
+# crates that read untrusted input add panic lints of their own in their
+# Cargo.toml `[lints.clippy]`. The lints allowed here are style ones whose fixes
+# would cost more than they'd buy: index loops in DSP code read like the
+# specifications they follow, boxing a large enum variant would allocate, and
+# `!(x > 0.0)` is meant to catch NaN.
+CLIPPY_FLAGS := -D warnings \
+	-A clippy::needless_range_loop \
+	-A clippy::too_many_arguments \
+	-A clippy::large_enum_variant \
+	-A clippy::type_complexity \
+	-A clippy::neg_cmp_op_on_partial_ord \
+	-A clippy::should_implement_trait \
+	-A clippy::result_unit_err \
+	-A clippy::chunks_exact_to_as_chunks
+
+clippy: clippy-arm clippy-x64
+
+clippy-arm:
+	cargo clippy --workspace --target $(TARGET_ARM) $(EXCLUDE_ARM) -- $(CLIPPY_FLAGS)
+	cd user && cargo clippy --target $(TARGET_ARM) --target-dir $(USER_TARGET_DIR) -- $(CLIPPY_FLAGS)
+
+clippy-x64:
+	$(CARGO_X64) clippy --workspace $(EXCLUDE_X64) -- $(CLIPPY_FLAGS)
+	$(CARGO_X64) clippy --manifest-path user/Cargo.toml --target-dir $(USER_TARGET_DIR) -- $(CLIPPY_FLAGS)
 
 run: run-arm
 
@@ -350,7 +370,8 @@ run-games-x64: games-image
 
 # Repacks every bundle source directory into apps/desktop/apps. The desktop's
 # build script picks up whatever is in that folder, so adding an app is:
-#   1. create apps/desktop/bundle-src/<id>/{manifest.yaml,icon.bmp}
+#   1. create apps/desktop/bundle-src/<id>/{manifest.yaml,icon.ico,icon-32.ico,icon-16.ico},
+#      copying the icons from assets/icons
 #   2. make bundles
 #   3. rebuild the kernel
 bundles:

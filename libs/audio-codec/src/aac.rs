@@ -2115,7 +2115,7 @@ impl AacDecoder {
         let sign = reader.bit()?;
         let scale_shift = reader.read(2)?;
         // A step of the gain is 2^(1 / 8), 2^(1 / 4), 2^(1 / 2) or 2.
-        let per_octave = (8 >> scale_shift) as i32;
+        let per_octave = 8 >> scale_shift;
 
         let channel = self.channels + index;
         let mut ics = Ics::new();
@@ -2296,7 +2296,7 @@ fn power_of_two(numerator: i32, denominator: i32) -> f32 {
         1.090_507_7,
         1.189_207_1,
         1.296_839_6,
-        1.414_213_5,
+        core::f32::consts::SQRT_2,
         1.542_210_2,
         1.681_792_8,
         1.834_008_1,
@@ -2500,10 +2500,7 @@ pub fn info(input: &[u8]) -> Result<AudioInfo> {
     let config = first.config.with_program_from(input.get(pos + first.header_len..).unwrap_or(&[]))?;
     let config = resolve_implicit(config, input.get(pos + first.header_len..pos + first.frame_len))?;
     let mut frames = 0u64;
-    loop {
-        let Some((at, header)) = next_adts(input, pos)? else {
-            break;
-        };
+    while let Some((at, header)) = next_adts(input, pos)? {
         // A cut-off last frame does not count: it will not decode.
         if at + header.frame_len > input.len() {
             break;

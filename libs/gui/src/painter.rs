@@ -63,6 +63,8 @@ impl<'a, 'buf> Painter<'a, 'buf> {
     }
 
     /// The current clip rectangle.
+    // The logical clip is the one callers see: `clip` is it with the mask applied.
+    #[allow(clippy::misnamed_getters)]
     pub const fn clip(&self) -> Rect {
         self.logical
     }

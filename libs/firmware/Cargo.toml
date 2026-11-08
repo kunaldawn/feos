@@ -5,3 +5,18 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+
+# This crate reads untrusted input: a malformed file must be an error, not a panic.
+# CI's clippy denies these (see `CLIPPY_FLAGS` in the Makefile).
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+string_slice = "warn"
+# Boot reads firmware's tables before anything can recover from a panic, so the
+# arithmetic and indexing are checked too, beyond the other parsers' panic lints.
+indexing_slicing = "warn"
+arithmetic_side_effects = "warn"

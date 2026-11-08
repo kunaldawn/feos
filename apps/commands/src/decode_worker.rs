@@ -170,6 +170,12 @@ pub struct Pipe {
     inner: Mutex<Inner>,
 }
 
+impl Default for Pipe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Pipe {
     /// Creates an unowned pipe.
     pub const fn new() -> Self {

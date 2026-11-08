@@ -63,9 +63,9 @@ fn read_map<M: PhysMem + ?Sized>(mem: &M, info: u64) -> Option<RegionList> {
         if size < MIN_ENTRY {
             break;
         }
-        let base = read_u64(mem, entry + 4)?;
-        let bytes = read_u64(mem, entry + 12)?;
-        let kind = read_u32(mem, entry + 20)?;
+        let base = read_u64(mem, entry.checked_add(4)?)?;
+        let bytes = read_u64(mem, entry.checked_add(12)?)?;
+        let kind = read_u32(mem, entry.checked_add(20)?)?;
         if kind == TYPE_RAM && base.checked_add(bytes).is_some() {
             list.push(Region { base, size: bytes });
         }

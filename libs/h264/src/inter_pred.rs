@@ -626,6 +626,8 @@ fn luma_mc_inner(
                     }
                 }
                 (1, 2) => {
+                    // `rows_v` is made above for (1, 2) and (3, 2).
+                    #[allow(clippy::expect_used)]
                     let rows = rows_v.as_ref().expect("vertical rows cached for (1, 2)");
                     for i in 0..w {
                         let val = rows[0][i] as i32 - 5 * rows[1][i] as i32
@@ -637,6 +639,8 @@ fn luma_mc_inner(
                     }
                 }
                 (3, 2) => {
+                    // `rows_v` is made above for (1, 2) and (3, 2).
+                    #[allow(clippy::expect_used)]
                     let rows = rows_v.as_ref().expect("vertical rows cached for (3, 2)");
                     for i in 0..w {
                         let val = rows[0][i] as i32 - 5 * rows[1][i] as i32
@@ -647,6 +651,8 @@ fn luma_mc_inner(
                         output[r * w + i] = avg(hv_at(i), clip_u8((val + 16) >> 5));
                     }
                 }
+                // The `matches!` above lets only these five cases in.
+                #[allow(clippy::unreachable)]
                 _ => unreachable!(),
             }
         }
@@ -946,6 +952,8 @@ fn luma_mc_inner(
                 }
             }
         }
+        // Both fractions are `rem_euclid(4)`, and every pair is matched.
+        #[allow(clippy::unreachable)]
         _ => unreachable!(),
     }
 }

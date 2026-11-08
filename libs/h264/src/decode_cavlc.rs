@@ -545,6 +545,8 @@ impl SliceContext<'_> {
                             (8, 4) => vec![(0, 0), (0, 4)],
                             (4, 8) => vec![(0, 0), (4, 0)],
                             (4, 4) => vec![(0, 0), (4, 0), (0, 4), (4, 4)],
+                            // `B_SUB_TABLE` holds only these four shapes.
+                            #[allow(clippy::unreachable)]
                             _ => unreachable!(),
                         };
                         layouts.push(SubLayout {
@@ -1380,6 +1382,8 @@ impl SliceContext<'_> {
                     0 => (16usize, 16usize, 1usize),
                     1 => (16, 8, 2),
                     2 => (8, 16, 2),
+                    // Inter P types are 0 to 4, and 3 and 4 are P_8x8, handled above.
+                    #[allow(clippy::unreachable)]
                     _ => unreachable!(),
                 };
 
@@ -1810,7 +1814,7 @@ impl SliceContext<'_> {
                 && (mb_idx % self.mb_width as usize) + 1 < self.mb_width as usize
                 && self.mb_slice_id[mb_idx - self.mb_width as usize + 1] == self.this_slice_id
                 && self.is_intra_neighbor_avail(mb_idx - self.mb_width as usize + 1, sp)
-        } else if mb_idx % 2 != 0 {
+        } else if !mb_idx.is_multiple_of(2) {
             // MBAFF bottom MBs: above-right is in the next pair (not yet decoded)
             false
         } else {
@@ -2081,7 +2085,8 @@ impl SliceContext<'_> {
             for blk in 0..16 {
                 let (blk_row, blk_col) = BLOCK_INDEX_TO_OFFSET[blk];
                 let mut block_raster = [0i32; 16];
-                let dc_idx = DC_RASTER_TO_BLOCK.iter().position(|&b| b == blk).unwrap();
+                // The order is its own inverse, so this is where `blk` is in it.
+                let dc_idx = DC_RASTER_TO_BLOCK[blk];
                 block_raster[0] = luma_dc_raster[dc_idx];
 
                 if cbp_luma != 0 {

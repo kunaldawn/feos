@@ -909,20 +909,16 @@ impl Parser {
                 self.expect(")")?;
                 let body = self.body_statement()?;
                 // `else` may follow on a later line or after a `;`.
-                loop {
-                    if self.token == Token::Newline || self.is_op(";") {
-                        let saved_position = self.lexer.position;
-                        let saved_previous = self.lexer.previous.clone();
-                        let saved_token = self.token.clone();
-                        self.skip_terminators()?;
-                        if self.is_keyword("else") {
-                            break;
-                        }
+                if self.token == Token::Newline || self.is_op(";") {
+                    let saved_position = self.lexer.position;
+                    let saved_previous = self.lexer.previous.clone();
+                    let saved_token = self.token.clone();
+                    self.skip_terminators()?;
+                    if !self.is_keyword("else") {
                         self.lexer.position = saved_position;
                         self.lexer.previous = saved_previous;
                         self.token = saved_token;
                     }
-                    break;
                 }
                 let otherwise = if self.is_keyword("else") {
                     self.advance()?;
@@ -1903,7 +1899,7 @@ impl Interp<'_, '_, '_> {
 
     fn poll(&mut self) -> Eval<()> {
         self.ticks = self.ticks.wrapping_add(1);
-        if self.ticks % 1024 == 0 && self.ctx.stdout.is_broken() {
+        if self.ticks.is_multiple_of(1024) && self.ctx.stdout.is_broken() {
             self.exit_code = 130;
             return Err(Stop::Exit);
         }

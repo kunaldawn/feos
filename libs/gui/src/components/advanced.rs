@@ -47,6 +47,9 @@ pub fn text_area<'a, 'b, 's, const N: usize, const M: usize>(
     );
     let id = ui.next_id();
     let mut response = ui.interact(id, rect, Sense::focus());
+    if response.hovered {
+        ui.set_cursor(crate::cursor::CursorShape::Text);
+    }
     if response.focused {
         let mut changed = false;
         for event in ui.input.events() {

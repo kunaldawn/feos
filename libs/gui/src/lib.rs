@@ -77,7 +77,11 @@ mod math;
 
 pub use chart::{Chart, ChartPoint, Series, SeriesKind};
 pub use components::*;
-pub use cursor::{cursor_bounds, draw_cursor, draw_cursor_shape, CursorShape};
+pub use feos_iconset::Stock;
+pub use cursor::{
+    cursor_bounds, cursor_frame_left, draw_cursor, draw_cursor_shape, draw_cursor_shape_at, CursorShape,
+    CURSOR_MAX,
+};
 pub use geometry::{Align, Padding, RectExt, VerticalAlign};
 pub use id::Id;
 pub use input::{Event, Input, Key, Modifiers, MouseButton, MAX_EVENTS, POINTER_RESERVE};

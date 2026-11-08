@@ -441,11 +441,10 @@ impl<P: Pixel> Sd<'_, P> {
 
     /// Error out on data the slice can't have.
     pub fn check_overrun(&self) -> Result<(), DecodeError> {
-        if let Some(cab) = &self.cab {
-            if cab.overrun() {
+        if let Some(cab) = &self.cab
+            && cab.overrun() {
                 return Err(DecodeError::InvalidSyntax("CABAC data ran out"));
             }
-        }
         Ok(())
     }
 }

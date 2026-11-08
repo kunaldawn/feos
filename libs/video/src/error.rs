@@ -125,7 +125,7 @@ impl From<feos_h264::DecodeError> for VideoError {
 
 /// Helper for checking that a slice has at least `n` remaining bytes.
 pub(crate) fn need(len: usize, index: usize, n: usize) -> Result<()> {
-    if index.checked_add(n).map_or(true, |end| end > len) {
+    if index.checked_add(n).is_none_or(|end| end > len) {
         Err(VideoError::UnexpectedEnd)
     } else {
         Ok(())

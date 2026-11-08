@@ -119,7 +119,7 @@ fn parse(input: &[u8]) -> Result<Header> {
     };
     let palette_stride = if dib_size == 12 { 3 } else { 4 };
     let palette_offset = dib_size.checked_add(14).ok_or(ImageError::Overflow)?;
-    let stride = ((width * bpp as usize + 31) / 32) * 4;
+    let stride = (width * bpp as usize).div_ceil(32) * 4;
 
     Ok(Header {
         width,
@@ -399,7 +399,7 @@ pub fn encode_rgba(width: u32, height: u32, pixels: &[u8], out: &mut [u8]) -> Re
             available: pixels.len(),
         });
     }
-    let stride = ((width as usize * 3 + 3) / 4) * 4;
+    let stride = (width as usize * 3).div_ceil(4) * 4;
     let data_size = stride
         .checked_mul(height as usize)
         .ok_or(ImageError::Overflow)?;

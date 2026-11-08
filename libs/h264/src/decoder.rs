@@ -510,11 +510,10 @@ impl Decoder {
                 if let Some(frame) = prev_frame {
                     self.deferred_output.push_back(frame);
                 }
-                if let Err(e) = result {
-                    if self.pending.is_none() || matches!(e, DecodeError::OutOfMemory) {
+                if let Err(e) = result
+                    && (self.pending.is_none() || matches!(e, DecodeError::OutOfMemory)) {
                         return Err(e);
                     }
-                }
                 Ok(self.take_deferred_output())
             }
             _ => Ok(self.take_deferred_output()),
@@ -863,9 +862,9 @@ impl Decoder {
             let mut refs = self.dpb.short_term_ref_list(header.frame_num, max_pic_num);
             // Pad ref list if shorter than num_ref_idx_l0_active (spec 8.2.4.2.1:
             // if the list is shorter, duplicate the last entry to fill)
-            if !refs.is_empty() {
+            if let Some(last) = refs.last().cloned() {
                 while refs.len() < header.num_ref_idx_l0_active as usize {
-                    refs.push(refs.last().unwrap().clone());
+                    refs.push(last.clone());
                 }
             }
             refs
@@ -874,9 +873,9 @@ impl Decoder {
         };
         let mut _ref_pic_list_l0 = if is_b_slice {
             let mut refs = self.dpb.ref_list_l0_b(current_poc);
-            if !refs.is_empty() {
+            if let Some(last) = refs.last().cloned() {
                 while refs.len() < header.num_ref_idx_l0_active as usize {
-                    refs.push(refs.last().unwrap().clone());
+                    refs.push(last.clone());
                 }
             }
             refs
@@ -885,9 +884,9 @@ impl Decoder {
         };
         let mut _ref_pic_list_l1 = if is_b_slice {
             let mut refs = self.dpb.ref_list_l1_b(current_poc);
-            if !refs.is_empty() {
+            if let Some(last) = refs.last().cloned() {
                 while refs.len() < header.num_ref_idx_l1_active as usize {
-                    refs.push(refs.last().unwrap().clone());
+                    refs.push(last.clone());
                 }
             }
             refs
@@ -1262,6 +1261,8 @@ impl Decoder {
 
             // CABAC decode path
             if use_cabac {
+                // `cabac_reader` is made whenever `use_cabac` is set.
+                #[allow(clippy::unwrap_used)]
                 let cr = cabac_reader.as_mut().unwrap();
                 let st = &mut cabac_state;
 
@@ -1601,6 +1602,8 @@ impl OrderedDecoder {
 
     /// Remove and return the buffered frame with the lowest `(gop, poc)`.
     fn pop_lowest(&mut self) -> Frame {
+        // Only called while the buffer holds more than `depth` frames.
+        #[allow(clippy::unwrap_used)]
         let idx = self
             .buffer
             .iter()

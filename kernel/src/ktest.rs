@@ -258,7 +258,7 @@ fn test_panic() -> i32 {
     static HELD: SpinLock<()> = SpinLock::new(());
 
     fn worker(index: usize) {
-        if index % 2 == 0 {
+        if index.is_multiple_of(2) {
             Port::irq_disable();
         }
         loop {

@@ -28,11 +28,12 @@ const PNG_SIGNATURE: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 
 /// One entry of the directory, with its payload.
 #[derive(Clone, Copy)]
-struct Entry<'a> {
-    width: u32,
-    height: u32,
-    bits: u16,
-    data: &'a [u8],
+pub(crate) struct Entry<'a> {
+    /// The depth for an icon. A cursor keeps its hot spot's y here.
+    pub(crate) bits: u16,
+    /// The planes for an icon. A cursor keeps its hot spot's x here.
+    pub(crate) planes: u16,
+    pub(crate) data: &'a [u8],
 }
 
 fn read_u16(input: &[u8], at: usize) -> Result<u16> {
@@ -45,43 +46,51 @@ fn read_u32(input: &[u8], at: usize) -> Result<u32> {
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
+/// The directory type of an icon file.
+pub(crate) const TYPE_ICON: u8 = 1;
+/// The directory type of a cursor file, whose entries hold a hot spot where an
+/// icon's hold planes and depth.
+pub(crate) const TYPE_CURSOR: u8 = 2;
+
 /// Whether `input` looks like an icon. The signature is short, so this checks
 /// what the directory says too.
 pub fn is_magic(input: &[u8]) -> bool {
-    if input.len() < HEADER + ENTRY || input[..4] != [0, 0, 1, 0] {
+    if !has_directory(input, TYPE_ICON) {
+        return false;
+    }
+    let planes = u16::from_le_bytes([input[HEADER + 4], input[HEADER + 5]]);
+    planes <= 1
+}
+
+/// Whether `input` starts with a directory of `kind` holding at least one entry.
+pub(crate) fn has_directory(input: &[u8], kind: u8) -> bool {
+    if input.len() < HEADER + ENTRY || input[..4] != [0, 0, kind, 0] {
         return false;
     }
     let count = u16::from_le_bytes([input[4], input[5]]) as usize;
-    if count == 0 {
-        return false;
-    }
-    let reserved = input[HEADER + 3];
-    let planes = u16::from_le_bytes([input[HEADER + 4], input[HEADER + 5]]);
-    reserved == 0 && planes <= 1
+    count != 0 && input[HEADER + 3] == 0
 }
 
-fn entry(input: &[u8], index: usize) -> Result<Entry<'_>> {
+pub(crate) fn entry(input: &[u8], index: usize) -> Result<Entry<'_>> {
     let at = HEADER + index * ENTRY;
-    let head = input.get(at..at + ENTRY).ok_or(ImageError::UnexpectedEnd)?;
-    let side = |byte: u8| if byte == 0 { 256 } else { byte as u32 };
+    input.get(at..at + ENTRY).ok_or(ImageError::UnexpectedEnd)?;
     let size = read_u32(input, at + 8)? as usize;
     let offset = read_u32(input, at + 12)? as usize;
     let end = offset.checked_add(size).ok_or(ImageError::Overflow)?;
     let data = input.get(offset..end).ok_or(ImageError::UnexpectedEnd)?;
     Ok(Entry {
-        width: side(head[0]),
-        height: side(head[1]),
         bits: read_u16(input, at + 6)?,
+        planes: read_u16(input, at + 4)?,
         data,
     })
 }
 
 /// The dimensions and depth of an entry, from its payload rather than the
 /// directory, which writers often get wrong.
-fn measure(entry: &Entry<'_>) -> Result<(u32, u32, u16)> {
+pub(crate) fn measure(entry: &Entry<'_>) -> Result<(u32, u32, u16)> {
     if entry.data.starts_with(PNG_SIGNATURE) {
         let info = png::info(entry.data)?;
-        return Ok((info.width, info.height, entry.bits.max(32)));
+        return Ok((info.width, info.height, 32));
     }
     let header = read_u32(entry.data, 0)? as usize;
     if header < INFO_HEADER {
@@ -101,6 +110,11 @@ fn best(input: &[u8]) -> Result<Entry<'_>> {
     if !is_magic(input) {
         return Err(ImageError::UnknownFormat);
     }
+    best_entry(input)
+}
+
+/// The best entry of a directory already known to be one.
+pub(crate) fn best_entry(input: &[u8]) -> Result<Entry<'_>> {
     let count = read_u16(input, 4)? as usize;
     let mut chosen: Option<(u64, u16, Entry<'_>)> = None;
     for index in 0..count {
@@ -148,8 +162,13 @@ pub fn decode(input: &[u8], out: &mut [u8], scratch: &mut [u8]) -> Result<ImageI
         png::decode(chosen.data, out, scratch)?;
         return Ok(info);
     }
-    decode_dib(chosen.data, info.width as usize, info.height as usize, out)?;
+    decode_dib(chosen.data, info.width as usize, info.height as usize, out, &mut [])?;
     Ok(info)
+}
+
+/// Whether a payload is a PNG rather than a DIB.
+pub(crate) fn is_png(data: &[u8]) -> bool {
+    data.starts_with(PNG_SIGNATURE)
 }
 
 fn stride(width: usize, bits: usize) -> Result<usize> {
@@ -157,7 +176,19 @@ fn stride(width: usize, bits: usize) -> Result<usize> {
     Ok(row_bits.div_ceil(32) * 4)
 }
 
-fn decode_dib(data: &[u8], width: usize, height: usize, out: &mut [u8]) -> Result<()> {
+/// Decodes a DIB payload into straight RGBA.
+///
+/// Where the AND mask is set over a colour other than black, the image asks for
+/// the screen under it to be inverted, which RGBA can't say. Those pixels come
+/// out transparent (their colour is left in place), and their bits are set in `invert` (row by row, one bit a
+/// pixel, the first pixel in the low bit) when it's not empty.
+pub(crate) fn decode_dib(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    out: &mut [u8],
+    invert: &mut [u8],
+) -> Result<()> {
     let required = width
         .checked_mul(height)
         .and_then(|pixels| pixels.checked_mul(4))
@@ -167,6 +198,16 @@ fn decode_dib(data: &[u8], width: usize, height: usize, out: &mut [u8]) -> Resul
             required,
             available: out.len(),
         });
+    }
+    let invert_len = (width * height).div_ceil(8);
+    if !invert.is_empty() {
+        if invert.len() < invert_len {
+            return Err(ImageError::BufferTooSmall {
+                required: invert_len,
+                available: invert.len(),
+            });
+        }
+        invert[..invert_len].fill(0);
     }
     let header = read_u32(data, 0)? as usize;
     let bits = read_u16(data, 14)? as usize;
@@ -215,7 +256,7 @@ fn decode_dib(data: &[u8], width: usize, height: usize, out: &mut [u8]) -> Resul
     for y in 0..height {
         let row = &pixels[(height - 1 - y) * colour_stride..][..colour_stride];
         let target = &mut out[y * width * 4..(y + 1) * width * 4];
-        for (x, pixel) in target.chunks_exact_mut(4).enumerate() {
+        for (x, pixel) in target.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let (b, g, r, a) = match bits {
                 32 => {
                     let at = x * 4;
@@ -248,14 +289,19 @@ fn decode_dib(data: &[u8], width: usize, height: usize, out: &mut [u8]) -> Resul
         for y in 0..height {
             let row = &mask[(height - 1 - y) * mask_stride..][..mask_stride];
             let target = &mut out[y * width * 4..(y + 1) * width * 4];
-            for (x, pixel) in target.chunks_exact_mut(4).enumerate() {
+            for (x, pixel) in target.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let transparent = row[x / 8] >> (7 - x % 8) & 1 != 0;
+                if transparent && pixel[..3] != [0, 0, 0]
+                    && !invert.is_empty() {
+                        let at = y * width + x;
+                        invert[at / 8] |= 1 << (at % 8);
+                    }
                 pixel[3] = if transparent { 0 } else { 255 };
             }
         }
     } else {
         // Nothing says what's transparent, so nothing is.
-        for pixel in out[..required].chunks_exact_mut(4) {
+        for pixel in out[..required].as_chunks_mut::<4>().0 {
             pixel[3] = 255;
         }
     }

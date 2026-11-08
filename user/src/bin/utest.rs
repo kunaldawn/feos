@@ -206,7 +206,7 @@ fn test_time_and_futex(report: &mut Report) {
     let before = uptime_ms();
     sleep_ms(30);
     let slept = uptime_ms() - before;
-    report.check("sleep", slept >= 29 && slept < 2000);
+    report.check("sleep", (29..2000).contains(&slept));
     report.check("getpid", getpid() > 1);
 
     let word = AtomicU32::new(5);

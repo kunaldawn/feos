@@ -14,7 +14,7 @@ fn main(args: Args) -> i32 {
         eprintln!("usage: runas UID GID PROGRAM [ARGS...]");
         return 2;
     };
-    let result = setuid(uid as usize, gid as usize);
+    let result = setuid(uid, gid);
     if result < 0 {
         eprintln!("runas: {}", error_name(result));
         return 1;

@@ -52,3 +52,12 @@ path  width  height  bits  source_ids  description
 `path` is relative to this directory. `bits` is the colour depth. `source_ids` is
 a comma-separated list of the original file numbers; byte-identical duplicates are
 stored once and share a row.
+
+## Use in feos
+
+`libs/iconset/src/lib.rs` embeds the pictures feos draws, each only at the sizes
+something draws it at: folders, drives and file types for File Explorer and the
+Start menu; status, user, power and app pictures for the desktop, the tray,
+notifications, Task Manager and Media Player; and the pictures behind
+`feos_gui::Icon` (see `Icon::picture` in `libs/gui/src/components/icons.rs`).
+The desktop bundles in `apps/desktop/bundle-src` hold copies of iconset files.

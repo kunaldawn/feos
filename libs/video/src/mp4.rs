@@ -53,7 +53,7 @@ struct BoxHeader {
 }
 
 fn read_box(data: &[u8], pos: usize, end: usize) -> Result<Option<BoxHeader>> {
-    if pos.checked_add(8).map_or(true, |header_end| header_end > end) {
+    if pos.checked_add(8).is_none_or(|header_end| header_end > end) {
         return Ok(None);
     }
     let size32 = u32_at(data, pos)? as u64;
@@ -212,10 +212,10 @@ fn parse_stbl<'a>(data: &'a [u8], stbl: BoxHeader) -> Result<Track<'a>> {
                     u32_at(data, child.payload + 4)?,
                 );
             }
-            b"colr" if child.payload + 10 <= child.end => {
-                if &data[child.payload..child.payload + 4] == b"nclx"
-                    || &data[child.payload..child.payload + 4] == b"nclc"
-                {
+            b"colr" if child.payload + 10 <= child.end
+                && (&data[child.payload..child.payload + 4] == b"nclx"
+                    || &data[child.payload..child.payload + 4] == b"nclc")
+                => {
                     colour.primaries = data[child.payload + 5];
                     colour.transfer = data[child.payload + 7];
                     colour.matrix = data[child.payload + 9];
@@ -225,7 +225,6 @@ fn parse_stbl<'a>(data: &'a [u8], stbl: BoxHeader) -> Result<Track<'a>> {
                         colour.full_range = data[child.payload + 10] & 0x80 != 0;
                     }
                 }
-            }
             _ => {}
         }
     }
@@ -237,10 +236,9 @@ fn parse_stbl<'a>(data: &'a [u8], stbl: BoxHeader) -> Result<Track<'a>> {
         // A count is only as good as what could hold it, as it goes straight into the
         // duration: the table's entries, or for a fixed size, what the file has room for.
         let fixed = u32_at(data, stsz.payload + 4)? as usize;
-        let room = if fixed != 0 {
-            (data.len() / fixed).max(1)
-        } else {
-            (stsz.end - stsz.payload - 12) / 4
+        let room = match data.len().checked_div(fixed) {
+            Some(room) => room.max(1),
+            None => (stsz.end - stsz.payload - 12) / 4,
         };
         u32_at(data, stsz.payload + 8)?.min(room.min(u32::MAX as usize) as u32)
     } else if let Some(stz2) = find_box(data, stbl.payload, stbl.end, b"stz2")? {
@@ -632,7 +630,7 @@ impl Track<'_> {
             .ok()
             .flatten()
             .and_then(|stsz| u32_at(input, stsz.payload + 8).ok())
-            .map_or(true, |count| count == 0)
+            .is_none_or(|count| count == 0)
     }
 }
 
@@ -703,7 +701,7 @@ fn index_stbl(
                 let byte = *input
                     .get(size_table + at / 2)
                     .ok_or(VideoError::UnexpectedEnd)?;
-                (if at % 2 == 0 { byte >> 4 } else { byte & 15 }) as usize
+                (if at.is_multiple_of(2) { byte >> 4 } else { byte & 15 }) as usize
             }
         })
     };
@@ -739,7 +737,7 @@ fn index_stbl(
             }
             let size = sample_size(sample)?;
             // Tolerate a file cut off inside its media data.
-            if offset.checked_add(size).map_or(true, |e| e > file_len) {
+            if offset.checked_add(size).is_none_or(|e| e > file_len) {
                 break 'chunks;
             }
             let delta = stts.next(input);

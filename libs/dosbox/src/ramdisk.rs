@@ -636,11 +636,7 @@ pub fn fcb_pattern(pattern: &str) -> [u8; 11] {
         None => (pattern, ""),
     };
     let fill = |field: &mut [u8], text: &str| {
-        let mut at = 0;
-        for byte in text.bytes() {
-            if at >= field.len() {
-                break;
-            }
+        for (at, byte) in text.bytes().enumerate().take(field.len()) {
             if byte == b'*' {
                 for slot in field[at..].iter_mut() {
                     *slot = b'?';
@@ -648,7 +644,6 @@ pub fn fcb_pattern(pattern: &str) -> [u8; 11] {
                 return;
             }
             field[at] = byte.to_ascii_uppercase();
-            at += 1;
         }
     };
     let (name, ext) = out.split_at_mut(8);

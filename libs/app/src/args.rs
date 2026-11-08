@@ -111,6 +111,8 @@ impl ArgBlock {
     }
 
     /// Number of arguments.
+    // `len` is the bytes the arguments take; this is how many there are.
+    #[allow(clippy::misnamed_getters)]
     pub const fn len(&self) -> usize {
         self.count
     }
@@ -122,7 +124,7 @@ impl ArgBlock {
 
     /// The arguments, in order.
     pub fn iter(&self) -> impl Iterator<Item = &str> {
-        self.bytes[..self.len.saturating_sub(1).max(0)]
+        self.bytes[..self.len.saturating_sub(1)]
             .split(|byte| *byte == 0)
             .take(self.count)
             .map(|word| core::str::from_utf8(word).unwrap_or(""))

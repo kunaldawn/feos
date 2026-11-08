@@ -298,7 +298,7 @@ fn read_residual(
     };
     let partition_order = reader.read(4)?;
     let partitions = 1usize << partition_order;
-    if block % partitions != 0 {
+    if !block.is_multiple_of(partitions) {
         return Err(AudioError::InvalidData("bad FLAC partition order"));
     }
     let partition_len = block >> partition_order;

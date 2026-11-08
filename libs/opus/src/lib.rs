@@ -623,7 +623,7 @@ impl Decoder {
             });
         }
 
-        let Some(toc) = toc else {
+        let (Some(toc), Some(packet)) = (toc, packet) else {
             return self.decode_lost_packet(out);
         };
 
@@ -632,11 +632,11 @@ impl Decoder {
         let mode = match config {
             0..=11 => OpusMode::SilkOnly,
             12..=15 => OpusMode::Hybrid,
-            16..=31 => OpusMode::CeltOnly,
-            _ => unreachable!(),
+            // 16 to 31: the configuration is five bits.
+            _ => OpusMode::CeltOnly,
         };
         // Parse again to get per-frame slices.
-        let pp = packet::parse_packet(packet.unwrap())?;
+        let pp = packet::parse_packet(packet)?;
         self.last_packet_split_count = 0;
         self.last_final_range = 0;
 

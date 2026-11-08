@@ -135,6 +135,12 @@ pub struct AudioPipe {
     position_ms: AtomicU64,
 }
 
+impl Default for AudioPipe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AudioPipe {
     /// Creates an unowned pipe.
     pub const fn new() -> Self {

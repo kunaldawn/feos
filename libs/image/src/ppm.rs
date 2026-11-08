@@ -165,7 +165,7 @@ fn decode_raw_samples(input: &[u8], header: &Header, pixels: &mut [u8]) -> Resul
     need(input.len(), header.data_start, raster)?;
     let data = &input[header.data_start..header.data_start + raster];
     let stride = header.channels * bytes_per_sample;
-    for (pixel, encoded) in pixels.chunks_exact_mut(4).zip(data.chunks_exact(stride)) {
+    for (pixel, encoded) in pixels.as_chunks_mut::<4>().0.iter_mut().zip(data.chunks_exact(stride)) {
         let mut samples = [0u8; 3];
         for (sample, bytes) in samples
             .iter_mut()
@@ -185,7 +185,7 @@ fn decode_raw_samples(input: &[u8], header: &Header, pixels: &mut [u8]) -> Resul
 
 fn decode_ascii_samples(input: &[u8], header: &Header, pixels: &mut [u8]) -> Result<()> {
     let mut pos = header.data_start;
-    for pixel in pixels.chunks_exact_mut(4) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
         let mut samples = [0u8; 3];
         for sample in samples.iter_mut().take(header.channels) {
             *sample = scale(token(input, &mut pos)?, header.maxval);
@@ -198,7 +198,7 @@ fn decode_ascii_samples(input: &[u8], header: &Header, pixels: &mut [u8]) -> Res
 /// In a PBM, 1 is black. P1 digits need no whitespace between them.
 fn decode_ascii_bits(input: &[u8], header: &Header, pixels: &mut [u8]) -> Result<()> {
     let mut pos = header.data_start;
-    for pixel in pixels.chunks_exact_mut(4) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
         pos = skip_space(input, pos);
         let value = match input.get(pos) {
             Some(b'0') => 255,
@@ -224,7 +224,7 @@ fn decode_raw_bits(input: &[u8], header: &Header, pixels: &mut [u8]) -> Result<(
         .chunks_exact_mut(header.width * 4)
         .zip(data.chunks_exact(stride))
     {
-        for (x, pixel) in row.chunks_exact_mut(4).enumerate() {
+        for (x, pixel) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let value = if bytes[x / 8] & (0x80 >> (x % 8)) != 0 {
                 0
             } else {
@@ -301,7 +301,7 @@ pub fn encode_rgba(width: u32, height: u32, pixels: &[u8], out: &mut [u8]) -> Re
 
     let mut pos = len;
     for pixel in pixels
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .take(width as usize * height as usize)
     {
         out[pos] = pixel[0];

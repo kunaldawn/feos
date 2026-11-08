@@ -444,6 +444,13 @@ impl ConfigSpace for PciEcam {
 pub struct PciPort;
 
 #[cfg(target_arch = "x86_64")]
+impl Default for PciPort {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 impl PciPort {
     /// Creates a legacy-port accessor.
     pub const fn new() -> Self {

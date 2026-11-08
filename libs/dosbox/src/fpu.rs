@@ -730,11 +730,10 @@ impl Fpu {
                     self.unary(f80::sin);
                 }
             }
-            0xFF => {
-                if !self.trig_refused() {
+            0xFF
+                if !self.trig_refused() => {
                     self.unary(f80::cos);
                 }
-            }
             // The remaining encodings do nothing.
             _ => {}
         }

@@ -114,7 +114,7 @@ impl Handoff {
     /// The eight bytes at `address` must be readable, and so must the whole structure
     /// if they hold the mark.
     pub unsafe fn at(address: usize) -> Option<&'static Self> {
-        if address == 0 || address % 8 != 0 {
+        if address == 0 || !address.is_multiple_of(8) {
             return None;
         }
         // SAFETY: as promised by the caller.
@@ -258,8 +258,10 @@ impl<'a> Elf<'a> {
         let first = self.segment(0).ok()??;
         let window = first.data.get(..first.data.len().min(8192))?;
         window
-            .chunks_exact(8)
-            .position(|chunk| chunk == mark.to_le_bytes())
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .position(|chunk| *chunk == mark.to_le_bytes())
             .and_then(|index| u64_at(window, (index + 1) * 8))
     }
 }

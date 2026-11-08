@@ -40,6 +40,8 @@ fn contour_value(fs_khz: i32, nb_subfr: usize, subframe: usize, contour_index: u
         (8, 2) => CB_LAGS_STAGE2_10MS_NB[subframe][contour_index],
         (_, 4) => CB_LAGS_STAGE3_WB[subframe][contour_index],
         (_, 2) => CB_LAGS_STAGE3_10MS_WB[subframe][contour_index],
+        // SILK frames have two or four subframes.
+        #[allow(clippy::panic)]
         _ => panic!("unsupported pitch shape fs_khz={fs_khz} nb_subfr={nb_subfr}"),
     }
 }

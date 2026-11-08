@@ -133,8 +133,7 @@ impl Resampler {
         }
         let denominator = input_rate.max(output_rate);
         let wing = ((ZERO_CROSSINGS as u64 * input_rate).div_ceil(output_rate) as usize)
-            .max(ZERO_CROSSINGS)
-            .min(MAX_WING);
+            .clamp(ZERO_CROSSINGS, MAX_WING);
         let mut resampler = Self {
             input_channels: input_channels as usize,
             output_channels: output_channels as usize,

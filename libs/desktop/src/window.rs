@@ -156,6 +156,8 @@ pub struct DesktopWindow {
     pub pid: Option<u32>,
     /// Whether the app has been launched in the background.
     pub launched: bool,
+    /// The pointer the hosted app asked for over its content in its last frame.
+    pub cursor: feos_gui::CursorShape,
 }
 
 impl DesktopWindow {
@@ -182,6 +184,7 @@ impl DesktopWindow {
         z: 0,
         pid: None,
         launched: false,
+        cursor: feos_gui::CursorShape::Arrow,
     };
 }
 
@@ -587,7 +590,7 @@ impl<const N: usize> WindowManager<N> {
         // Hosted apps lay themselves out against a minimum content size, so
         // keep their desktop frames large enough to avoid clipping their UI.
         let (min_width, min_height) = if window.runtime.is_some() {
-            ((720 + 2) as i32, (480 + TITLE_HEIGHT as i32 + 2) as i32)
+            ((720 + 2), (480 + TITLE_HEIGHT as i32 + 2))
         } else {
             (MIN_WINDOW_WIDTH as i32, MIN_WINDOW_HEIGHT as i32)
         };

@@ -389,7 +389,7 @@ pub fn format<D: WritableBlockDevice>(device: &mut D, created: u64) -> Result<()
 /// Device blocks per filesystem block.
 fn device_ratio<D: crate::block::BlockDevice>(device: &D) -> Result<u64, FsError> {
     let size = device.block_size();
-    if size == 0 || size > BLOCK || BLOCK % size != 0 {
+    if size == 0 || size > BLOCK || !BLOCK.is_multiple_of(size) {
         return Err(FsError::UnsupportedBlockSize);
     }
     Ok((BLOCK / size) as u64)
@@ -571,7 +571,7 @@ impl<D: WritableBlockDevice> Native<D> {
         let mut block = new_block()?;
         for index in 0..self.layout.bitmap_blocks {
             self.read_meta(self.layout.bitmap_start + index, &mut block[..])?;
-            for (word_index, chunk) in block.chunks_exact(8).enumerate() {
+            for (word_index, chunk) in block.as_chunks::<8>().0.iter().enumerate() {
                 let at = index as usize * (BLOCK / 8) + word_index;
                 if let Some(word) = self.allocated.get_mut(at) {
                     *word = get_u64(chunk, 0);

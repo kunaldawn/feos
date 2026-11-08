@@ -294,12 +294,12 @@ impl Memory {
         match width {
             1 => slice.fill(pattern as u8),
             2 => {
-                for cell in slice.chunks_exact_mut(2) {
+                for cell in slice.as_chunks_mut::<2>().0 {
                     cell.copy_from_slice(&(pattern as u16).to_le_bytes());
                 }
             }
             _ => {
-                for cell in slice.chunks_exact_mut(4) {
+                for cell in slice.as_chunks_mut::<4>().0 {
                     cell.copy_from_slice(&pattern.to_le_bytes());
                 }
             }

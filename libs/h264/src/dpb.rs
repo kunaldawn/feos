@@ -596,11 +596,10 @@ impl Dpb {
         } else {
             let max_idx = max_long_term_frame_idx_plus1 - 1;
             for entry in &mut self.entries {
-                if let ReferenceStatus::LongTerm(idx) = entry.reference {
-                    if idx > max_idx {
+                if let ReferenceStatus::LongTerm(idx) = entry.reference
+                    && idx > max_idx {
                         entry.reference = ReferenceStatus::Unused;
                     }
-                }
             }
         }
         self.remove_unused();
@@ -668,6 +667,8 @@ fn reorder_ref_list(
     keep: impl Fn(&Arc<DecodedPicture>, &Arc<DecodedPicture>) -> bool,
 ) {
     let pic = ref_list[found_pos].clone();
+    // `ref_list[found_pos]` above means the list is not empty.
+    #[allow(clippy::unwrap_used)]
     ref_list.push(ref_list.last().unwrap().clone());
     let end = ref_list.len() - 1;
     for c in (insert_at + 1..=end).rev() {

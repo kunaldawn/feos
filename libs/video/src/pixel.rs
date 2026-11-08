@@ -75,8 +75,8 @@ pub fn rgba_len(width: u32, height: u32) -> Result<usize> {
 pub fn frame_len(format: PixelFormat, width: u32, height: u32) -> Result<usize> {
     let w = width as usize;
     let h = height as usize;
-    let cw = (w + 1) / 2;
-    let ch = (h + 1) / 2;
+    let cw = w.div_ceil(2);
+    let ch = h.div_ceil(2);
     let bytes = match format {
         PixelFormat::Rgba8888 | PixelFormat::Bgra8888 => {
             w.checked_mul(h).and_then(|n| n.checked_mul(4))
@@ -259,7 +259,7 @@ pub fn dib_to_rgba(
         palette,
     )?;
     if matches!(format, PixelFormat::Bgra8888 | PixelFormat::Rgba8888) {
-        for pixel in out[..rgba_len(width, height)?].chunks_exact_mut(4) {
+        for pixel in out[..rgba_len(width, height)?].as_chunks_mut::<4>().0 {
             pixel[3] = 255;
         }
     }
@@ -292,8 +292,8 @@ fn convert(
     }
     let w = width as usize;
     let h = height as usize;
-    let cw = (w + 1) / 2;
-    let ch = (h + 1) / 2;
+    let cw = w.div_ceil(2);
+    let ch = h.div_ceil(2);
 
     match format {
         PixelFormat::Rgba8888
@@ -328,22 +328,22 @@ fn convert(
                 let orow = &mut out[y * w * 4..(y + 1) * w * 4];
                 match format {
                     PixelFormat::Rgba8888 => {
-                        for (i, px) in srow.chunks_exact(4).enumerate() {
+                        for (i, px) in srow.as_chunks::<4>().0.iter().enumerate() {
                             put(orow, i * 4, px[0], px[1], px[2], px[3]);
                         }
                     }
                     PixelFormat::Bgra8888 => {
-                        for (i, px) in srow.chunks_exact(4).enumerate() {
+                        for (i, px) in srow.as_chunks::<4>().0.iter().enumerate() {
                             put(orow, i * 4, px[2], px[1], px[0], px[3]);
                         }
                     }
                     PixelFormat::Rgb888 => {
-                        for (i, px) in srow.chunks_exact(3).enumerate() {
+                        for (i, px) in srow.as_chunks::<3>().0.iter().enumerate() {
                             put(orow, i * 4, px[0], px[1], px[2], 255);
                         }
                     }
                     PixelFormat::Bgr888 => {
-                        for (i, px) in srow.chunks_exact(3).enumerate() {
+                        for (i, px) in srow.as_chunks::<3>().0.iter().enumerate() {
                             put(orow, i * 4, px[2], px[1], px[0], 255);
                         }
                     }
@@ -361,7 +361,7 @@ fn convert(
                         }
                     }
                     PixelFormat::Bgr555 => {
-                        for (i, px) in srow.chunks_exact(2).enumerate() {
+                        for (i, px) in srow.as_chunks::<2>().0.iter().enumerate() {
                             let v = u16::from_le_bytes([px[0], px[1]]);
                             let (r, g, b) = ((v >> 10) & 31, (v >> 5) & 31, v & 31);
                             put(
@@ -375,7 +375,7 @@ fn convert(
                         }
                     }
                     PixelFormat::Bgr565 => {
-                        for (i, px) in srow.chunks_exact(2).enumerate() {
+                        for (i, px) in srow.as_chunks::<2>().0.iter().enumerate() {
                             let v = u16::from_le_bytes([px[0], px[1]]);
                             let (r, g, b) = ((v >> 11) & 31, (v >> 5) & 63, v & 31);
                             put(
@@ -418,6 +418,8 @@ fn convert(
                             }
                         }
                     }
+                    // The outer arm lets only the formats matched here in.
+                    #[allow(clippy::unreachable)]
                     _ => unreachable!(),
                 }
             }
@@ -479,8 +481,8 @@ pub fn yuv420_to_rgba(
 ) -> Result<()> {
     let w = width as usize;
     let h = height as usize;
-    let cw = (w + 1) / 2;
-    let ch = (h + 1) / 2;
+    let cw = w.div_ceil(2);
+    let ch = h.div_ceil(2);
     if y.len() < w * h || u.len() < cw * ch || v.len() < cw * ch {
         return Err(VideoError::InvalidData("short YUV plane"));
     }
@@ -513,7 +515,7 @@ pub(crate) fn yuv420_row(
     v: &[u8],
     out: &mut [u8],
 ) {
-    for (x, (pixel, &luma)) in out.chunks_exact_mut(4).zip(y).enumerate() {
+    for (x, (pixel, &luma)) in out.as_chunks_mut::<4>().0.iter_mut().zip(y).enumerate() {
         let chroma = x / 2;
         let cb = u.get(chroma).copied().unwrap_or(128);
         let cr = v.get(chroma).copied().unwrap_or(128);

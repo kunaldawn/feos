@@ -688,7 +688,7 @@ pub(super) fn dd(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
 
     if !quiet {
         let whole = data.len() / block;
-        let partial = usize::from(data.len() % block != 0);
+        let partial = usize::from(!data.len().is_multiple_of(block));
         let message = format!(
             "{whole}+{partial} records in\n{whole}+{partial} records out\n{} bytes copied\n",
             data.len()

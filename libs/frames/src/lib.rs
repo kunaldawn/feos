@@ -124,7 +124,7 @@ impl<const WORDS: usize> Frames<WORDS> {
         let mut first_free = None;
         while frame < frames {
             // A word with nothing free can be stepped over whole.
-            if frame % WORD_BITS == 0 && self.free[frame / WORD_BITS] == 0 {
+            if frame.is_multiple_of(WORD_BITS) && self.free[frame / WORD_BITS] == 0 {
                 frame += WORD_BITS;
                 continue;
             }
@@ -135,7 +135,7 @@ impl<const WORDS: usize> Frames<WORDS> {
             first_free.get_or_insert(frame);
             // Alignment is of the address, as a device or a page table needs it.
             let address_frame = (self.base / FRAME_SIZE) as usize + frame;
-            if address_frame % align != 0 {
+            if !address_frame.is_multiple_of(align) {
                 frame += align - address_frame % align;
                 continue;
             }
@@ -165,7 +165,7 @@ impl<const WORDS: usize> Frames<WORDS> {
     /// Returns a run of frames from [`alloc`](Self::alloc). All of it is checked
     /// before any of it changes.
     pub fn free(&mut self, address: u64, count: usize) -> Result<(), FreeError> {
-        if address % FRAME_SIZE != 0 || address < self.base {
+        if !address.is_multiple_of(FRAME_SIZE) || address < self.base {
             return Err(FreeError::NotOurs);
         }
         let start = ((address - self.base) / FRAME_SIZE) as usize;

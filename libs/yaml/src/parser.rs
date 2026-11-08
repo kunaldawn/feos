@@ -84,6 +84,8 @@ impl<'a> Parser<'a> {
         }
     }
 
+    // Offsets here come from byte scans that stop only at ASCII bytes or the end, so they fall on character boundaries.
+    #[allow(clippy::string_slice)]
     fn peek_line(&mut self) -> Result<Option<Line<'a>>> {
         let bytes = self.input.as_bytes();
         loop {
@@ -186,6 +188,8 @@ impl<'a> Parser<'a> {
     ///
     /// `first_item` is an item that already started on the current line, as in
     /// the inner sequence of `- - a`.
+    // Offsets here come from byte scans that stop only at ASCII bytes or the end, so they fall on character boundaries.
+    #[allow(clippy::string_slice)]
     fn parse_sequence(
         &mut self,
         nodes: &mut [YamlNode<'a>],
@@ -270,10 +274,7 @@ impl<'a> Parser<'a> {
             self.add_mapping_entry(nodes, entry, indent, depth, &mut first, &mut last)?;
         }
 
-        loop {
-            let Some(line) = self.peek_line()? else {
-                break;
-            };
+        while let Some(line) = self.peek_line()? {
             if line.indent < indent {
                 break;
             }
@@ -304,6 +305,8 @@ impl<'a> Parser<'a> {
         Ok(mapping)
     }
 
+    // Offsets here come from byte scans that stop only at ASCII bytes or the end, so they fall on character boundaries.
+    #[allow(clippy::string_slice)]
     fn add_mapping_entry(
         &mut self,
         nodes: &mut [YamlNode<'a>],
@@ -416,6 +419,8 @@ impl<'a> Parser<'a> {
 
     /// A quoted scalar that starts `text`, which may go on over the following lines. Those
     /// have to be indented further than the collection it's in.
+    // Offsets here come from byte scans that stop only at ASCII bytes or the end, so they fall on character boundaries.
+    #[allow(clippy::string_slice)]
     fn scan_quoted(&mut self, text: &'a str, parent: Option<usize>) -> Result<YamlScalar<'a>> {
         let base = self.base_of(text);
         let double = text.as_bytes()[0] == b'"';
@@ -466,6 +471,8 @@ impl<'a> Parser<'a> {
     /// A plain scalar that starts with `text`, taking in the more indented lines that
     /// follow it, unless a comment has ended it. One that looks like a mapping entry
     /// isn't taken, and whatever's reading the block rejects it: it's not valid here.
+    // Offsets here come from byte scans that stop only at ASCII bytes or the end, so they fall on character boundaries.
+    #[allow(clippy::string_slice)]
     fn scan_plain(&mut self, text: &'a str, parent: Option<usize>) -> Result<YamlScalar<'a>> {
         let base = self.base_of(text);
         let first_line_end = self.input[base..].find('\n').map_or(self.input.len(), |at| base + at);
@@ -480,7 +487,7 @@ impl<'a> Parser<'a> {
             let Some(line) = self.peek_line()? else {
                 break;
             };
-            let deep_enough = parent.map_or(true, |parent| line.indent > parent);
+            let deep_enough = parent.is_none_or(|parent| line.indent > parent);
             let content = strip_comment(line.content);
             if !deep_enough
                 || find_mapping_colon(content).is_some()
@@ -499,6 +506,8 @@ impl<'a> Parser<'a> {
         Ok(YamlScalar::plain(&self.input[base..end]))
     }
 
+    // Offsets here come from byte scans that stop only at ASCII bytes or the end, so they fall on character boundaries.
+    #[allow(clippy::string_slice)]
     fn expect_end(&self, text: &str, used: usize) -> Result<()> {
         if text[used..].trim().is_empty() {
             Ok(())
@@ -551,6 +560,8 @@ impl<'a> Parser<'a> {
     /// `parent` is the indentation of the enclosing collection. The scalar ends
     /// at the first non-blank line indented less than its content; whatever
     /// that line is, it belongs to the enclosing block.
+    // Offsets here come from byte scans that stop only at ASCII bytes or the end, so they fall on character boundaries.
+    #[allow(clippy::string_slice)]
     fn parse_block_scalar(
         &mut self,
         nodes: &mut [YamlNode<'a>],
@@ -640,6 +651,8 @@ impl<'a> Parser<'a> {
         Ok((id, flow.pos))
     }
 
+    // Offsets here come from byte scans that stop only at ASCII bytes or the end, so they fall on character boundaries.
+    #[allow(clippy::string_slice)]
     fn flow_value(
         &mut self,
         nodes: &mut [YamlNode<'a>],
@@ -815,6 +828,8 @@ impl<'a> Parser<'a> {
         Ok(mapping)
     }
 
+    // Offsets here come from byte scans that stop only at ASCII bytes or the end, so they fall on character boundaries.
+    #[allow(clippy::string_slice)]
     fn flow_key(&mut self, flow: &mut Flow<'a>, text: &'a str) -> Result<YamlScalar<'a>> {
         flow.skip_space();
         match flow.bytes.get(flow.pos).copied() {
@@ -984,6 +999,8 @@ fn closing_double(bytes: &[u8], mut i: usize) -> Option<usize> {
     None
 }
 
+// Offsets here come from byte scans that stop only at ASCII bytes or the end, so they fall on character boundaries.
+#[allow(clippy::string_slice)]
 fn strip_comment(content: &str) -> &str {
     match scan_line(content).comment {
         Some(comment) => content[..comment].trim_end(),
@@ -995,6 +1012,8 @@ fn find_mapping_colon(content: &str) -> Option<usize> {
     scan_line(content).colon
 }
 
+// Offsets here come from byte scans that stop only at ASCII bytes or the end, so they fall on character boundaries.
+#[allow(clippy::string_slice)]
 fn scan_single<'a>(text: &'a str, start: usize, base: usize) -> Result<(YamlScalar<'a>, usize)> {
     let bytes = text.as_bytes();
     let mut i = start + 1;
@@ -1017,6 +1036,8 @@ fn scan_single<'a>(text: &'a str, start: usize, base: usize) -> Result<(YamlScal
     })
 }
 
+// Offsets here come from byte scans that stop only at ASCII bytes or the end, so they fall on character boundaries.
+#[allow(clippy::string_slice)]
 fn scan_double<'a>(text: &'a str, start: usize, base: usize) -> Result<(YamlScalar<'a>, usize)> {
     let bytes = text.as_bytes();
     let mut i = start + 1;

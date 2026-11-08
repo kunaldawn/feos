@@ -807,8 +807,8 @@ impl Shell<'_> {
         while index < args.len() {
             let arg = args[index].as_str();
             if names.is_empty() && arg.len() > 1 && arg.starts_with('-') {
-                let mut flags = arg[1..].char_indices();
-                while let Some((at, flag)) = flags.next() {
+                let flags = arg[1..].char_indices();
+                for (at, flag) in flags {
                     match flag {
                         'r' | 's' => raw = raw || flag == 'r',
                         'p' | 'n' | 'N' | 'd' | 't' => {

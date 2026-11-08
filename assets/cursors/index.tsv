@@ -1,0 +1,285 @@
+path	original	role	size	hotspot	frames	steps	bits	description
+3d-blue/alternate-animated.ani	3dsup_ani.ani	alternate	32x32	5,10	3	4	4	Alternate select
+3d-blue/alternate.ani	3dsup.ani	alternate	32x32	5,1	1	1	4	Alternate select
+3d-blue/arrow-twist.ani	3dstwist.ani	arrow-twist	32x32	0,0	8	14	4	Arrow that twists
+3d-blue/arrow-wagtail.ani	3dswagtail.ani	arrow-wagtail	32x32	0,0	7	11	4	Arrow that wags its tail
+3d-blue/arrow.cur	3dsarro.cur	arrow	32x32	0,0	1	1	4	Normal select
+3d-blue/handwriting.cur	3dspen.cur	handwriting	32x32	0,0	1	1	8	Handwriting
+3d-blue/help.cur	3dshelpsel.cur	help	32x32	0,0	1	1	8	Help select
+3d-blue/link-pixel.ani	3dslin1.ani	link-pixel	32x32	5,0	1	1	32	Link select, pixellated
+3d-blue/link.ani	3dslink.ani	link	32x32	5,0	1	1	32	Link select
+3d-blue/move-animated.ani	3dsmove_ani.ani	move	32x32	11,11	3	4	4	Move
+3d-blue/move.cur	3dsmove.cur	move	32x32	10,10	1	1	4	Move
+3d-blue/no-drop.cur	3dsnodrop.cur	no-drop	32x32	15,15	1	1	32	No-drop circle
+3d-blue/precision.cur	3dscross.cur	precision	32x32	8,8	1	1	8	Precision select
+3d-blue/size-nesw-animated.ani	3dsnesw_ani.ani	size-nesw	32x32	8,8	3	4	4	Diagonal resize 2 (NE-SW)
+3d-blue/size-nesw.cur	3dsnesw.cur	size-nesw	32x32	15,13	1	1	4	Diagonal resize 2 (NE-SW)
+3d-blue/size-ns-animated.ani	3dsns_ani.ani	size-ns	32x32	5,10	3	4	4	Vertical resize
+3d-blue/size-ns.cur	3dsns.cur	size-ns	32x32	4,9	1	1	4	Vertical resize
+3d-blue/size-nwse-animated.ani	3dsnwse_ani.ani	size-nwse	32x32	8,8	3	4	4	Diagonal resize 1 (NW-SE)
+3d-blue/size-nwse.cur	3dsnwse.cur	size-nwse	32x32	7,7	1	1	4	Diagonal resize 1 (NW-SE)
+3d-blue/size-we-animated.ani	3dswe_ani.ani	size-we	32x32	10,4	3	4	4	Horizontal resize
+3d-blue/size-we.cur	3dswe.cur	size-we	32x32	15,15	1	1	4	Horizontal resize
+3d-blue/text.cur	3dsbeam.cur	text	32x32	4,8	1	1	8	Text select
+3d-blue/unavailable.cur	3dsno.cur	unavailable	32x32	0,0	1	1	4	Unavailable
+3d-gold/alternate-animated.ani	3dgup_ani.ani	alternate	32x32	5,10	3	4	4	Alternate select
+3d-gold/alternate.ani	3dgup.ani	alternate	32x32	5,1	1	1	4	Alternate select
+3d-gold/arrow-twist.ani	3dgtwist.ani	arrow-twist	32x32	0,0	8	14	4	Arrow that twists
+3d-gold/arrow-wagtail.ani	3dgwagtail.ani	arrow-wagtail	32x32	0,0	7	11	4	Arrow that wags its tail
+3d-gold/arrow.cur	3dgarro.cur	arrow	32x32	0,0	1	1	4	Normal select
+3d-gold/handwriting.cur	3dgpen.cur	handwriting	32x32	0,0	1	1	8	Handwriting
+3d-gold/help.cur	3dghelpsel.cur	help	32x32	0,0	1	1	8	Help select
+3d-gold/link-pixel.ani	3dglin1.ani	link-pixel	32x32	5,0	1	1	32	Link select, pixellated
+3d-gold/link.ani	3dglink.ani	link	32x32	5,0	1	1	32	Link select
+3d-gold/move-animated.ani	3dgmove_ani.ani	move	32x32	11,11	3	4	4	Move
+3d-gold/move.cur	3dgmove.cur	move	32x32	10,10	1	1	4	Move
+3d-gold/no-drop.cur	3dgnodrop.cur	no-drop	32x32	15,15	1	1	32	No-drop circle
+3d-gold/precision.cur	3dgcross.cur	precision	32x32	8,8	1	1	8	Precision select
+3d-gold/size-nesw-animated.ani	3dgnesw_ani.ani	size-nesw	32x32	8,8	3	4	4	Diagonal resize 2 (NE-SW)
+3d-gold/size-nesw.cur	3dgnesw.cur	size-nesw	32x32	7,7	1	1	4	Diagonal resize 2 (NE-SW)
+3d-gold/size-ns-animated.ani	3dgns_ani.ani	size-ns	32x32	5,10	3	4	4	Vertical resize
+3d-gold/size-ns.cur	3dgns.cur	size-ns	32x32	4,9	1	1	4	Vertical resize
+3d-gold/size-nwse-animated.ani	3dgnwse_ani.ani	size-nwse	32x32	8,8	3	4	4	Diagonal resize 1 (NW-SE)
+3d-gold/size-nwse.cur	3dgnwse.cur	size-nwse	32x32	7,7	1	1	4	Diagonal resize 1 (NW-SE)
+3d-gold/size-we-animated.ani	3dgwe_ani.ani	size-we	32x32	10,4	3	4	4	Horizontal resize
+3d-gold/size-we.cur	3dgwe.cur	size-we	32x32	9,4	1	1	4	Horizontal resize
+3d-gold/text.cur	3dgbeam.cur	text	32x32	4,8	1	1	8	Text select
+3d-gold/unavailable.cur	3dgno.cur	unavailable	32x32	0,0	1	1	4	Unavailable
+3d-silver/alternate-animated.ani	3dwup_ani.ani	alternate	32x32	5,10	3	4	4	Alternate select
+3d-silver/alternate.ani	3dwup.ani	alternate	32x32	5,1	1	1	4	Alternate select
+3d-silver/arrow-twist.ani	3dwtwist.ani	arrow-twist	32x32	0,0	8	14	4	Arrow that twists
+3d-silver/arrow-wagtail.ani	3dwwagtail.ani	arrow-wagtail	32x32	0,0	7	11	4	Arrow that wags its tail
+3d-silver/arrow.cur	3dwarro.cur	arrow	32x32	0,0	1	1	4	Normal select
+3d-silver/handwriting.cur	3dwpen.cur	handwriting	32x32	0,0	1	1	8	Handwriting
+3d-silver/help.cur	3dwhelpsel.cur	help	32x32	0,0	1	1	8	Help select
+3d-silver/link-pixel.ani	3dwlin1.ani	link-pixel	32x32	5,0	1	1	32	Link select, pixellated
+3d-silver/link.ani	3dwlink.ani	link	32x32	5,0	1	1	32	Link select
+3d-silver/move-animated.ani	3dwmove_ani.ani	move	32x32	11,11	3	4	4	Move
+3d-silver/move.cur	3dwmove.cur	move	32x32	10,10	1	1	4	Move
+3d-silver/no-drop.cur	3dwnodrop.cur	no-drop	32x32	15,15	1	1	32	No-drop circle
+3d-silver/precision.cur	3dwcross.cur	precision	32x32	8,8	1	1	8	Precision select
+3d-silver/size-nesw-animated.ani	3dwnesw_ani.ani	size-nesw	32x32	8,8	3	4	4	Diagonal resize 2 (NE-SW)
+3d-silver/size-nesw.cur	3dwnesw.cur	size-nesw	32x32	7,7	1	1	4	Diagonal resize 2 (NE-SW)
+3d-silver/size-ns-animated.ani	3dwns_ani.ani	size-ns	32x32	5,10	3	4	4	Vertical resize
+3d-silver/size-ns.cur	3dwns.cur	size-ns	32x32	4,9	1	1	4	Vertical resize
+3d-silver/size-nwse-animated.ani	3dwnwse_ani.ani	size-nwse	32x32	8,8	3	4	4	Diagonal resize 1 (NW-SE)
+3d-silver/size-nwse.cur	3dwnwse.cur	size-nwse	32x32	7,7	1	1	4	Diagonal resize 1 (NW-SE)
+3d-silver/size-we-animated.ani	3dwwe_ani.ani	size-we	32x32	10,4	3	4	4	Horizontal resize
+3d-silver/size-we.cur	3dwwe.cur	size-we	32x32	9,4	1	1	4	Horizontal resize
+3d-silver/text.cur	3dwbeam.cur	text	32x32	4,8	1	1	8	Text select
+3d-silver/unavailable.cur	3dwno.cur	unavailable	32x32	0,0	1	1	4	Unavailable
+animated/busy-gold-static.cur	hourgla2_st.cur	busy	32x32	16,15	1	1	4	Busy
+animated/busy-gold.ani	hourgla2.ani	busy	32x32	16,15	15	15	4	Busy
+animated/busy-silver-static.cur	hourgla3_st.cur	busy	32x32	16,15	1	1	4	Busy
+animated/busy-silver.ani	hourgla3.ani	busy	32x32	16,15	15	15	4	Busy
+animated/busy-static.cur	hourglas_st.cur	busy	32x32	16,15	1	1	4	Busy
+animated/busy.ani	hourglas.ani	busy	32x32	16,15	15	15	4	Busy
+animated/size-nesw.ani	sizenesw.ani	size-nesw	32x32	24,6	2	2	1	Diagonal resize 2 (NE-SW)
+animated/size-ns.ani	sizens.ani	size-ns	32x32	14,10	2	2	1	Vertical resize
+animated/size-nwse.ani	sizenwse.ani	size-nwse	32x32	7,6	2	2	1	Diagonal resize 1 (NW-SE)
+animated/size-we.ani	sizewe.ani	size-we	32x32	17,8	2	2	1	Horizontal resize
+animated/working-cyan-static.cur	appstar1_st.cur	working	32x32	0,0	1	1	4	Working in background
+animated/working-cyan.ani	appstar1.ani	working	32x32	0,0	10	10	4	Working in background
+animated/working-gold-static.cur	appstar2_st.cur	working	32x32	0,0	1	1	4	Working in background
+animated/working-gold.ani	appstar2.ani	working	32x32	0,0	10	10	4	Working in background
+animated/working-silver-static.cur	appstar3_st.cur	working	32x32	0,0	1	1	4	Working in background
+animated/working-silver.ani	appstar3.ani	working	32x32	0,0	10	10	4	Working in background
+animated/working.ani	appstart.ani	working	32x32	0,0	10	10	4	Working in background
+black/alternate-extra-large.cur	up_rl.cur	alternate	32x32	15,6	1	1	1	Alternate select
+black/alternate-large.cur	up_rm.cur	alternate	32x32	15,6	1	1	1	Alternate select
+black/alternate.cur	up_r.cur	alternate	32x32	15,6	1	1	1	Alternate select
+black/arrow-extra-large.cur	arrow_rl.cur	arrow	32x32	0,1	1	1	4	Normal select
+black/arrow-large.cur	arrow_rm.cur	arrow	32x32	0,4	1	1	4	Normal select
+black/arrow.cur	arrow_r.cur	arrow	32x32	0,0	1	1	1	Normal select
+black/busy-extra-large.cur	busy_rl.cur	busy	32x32	16,16	1	1	4	Busy
+black/busy-large.cur	busy_rm.cur	busy	32x32	16,15	1	1	4	Busy
+black/busy.cur	busy_r.cur	busy	32x32	16,16	1	1	1	Busy
+black/handwriting-extra-large.cur	pen_rl.cur	handwriting	32x32	2,3	1	1	4	Handwriting
+black/handwriting-large.cur	pen_rm.cur	handwriting	32x32	4,5	1	1	4	Handwriting
+black/handwriting.cur	pen_r.cur	handwriting	32x32	4,5	1	1	1	Handwriting
+black/help-extra-large.cur	help_rl.cur	help	32x32	0,1	1	1	4	Help select
+black/help-large.cur	help_rm.cur	help	32x32	2,4	1	1	4	Help select
+black/help.cur	help_r.cur	help	32x32	5,7	1	1	1	Help select
+black/link-extra-large.cur	link_rl.cur	link	32x32	8,0	1	1	1	Link select
+black/link-large.cur	link_rm.cur	link	32x32	8,0	1	1	1	Link select
+black/link.cur	link_r.cur	link	32x32	5,1	1	1	1	Link select
+black/move-extra-large.cur	move_rl.cur	move	32x32	16,16	1	1	4	Move
+black/move-large.cur	move_rm.cur	move	32x32	16,16	1	1	4	Move
+black/move.cur	move_r.cur	move	32x32	15,16	1	1	1	Move
+black/precision-extra-large.cur	cross_rl.cur	precision	32x32	16,16	1	1	4	Precision select
+black/precision-large.cur	cross_rm.cur	precision	32x32	15,16	1	1	4	Precision select
+black/precision.cur	cross_r.cur	precision	32x32	15,16	1	1	1	Precision select
+black/size-nesw-extra-large.cur	size1_rl.cur	size-nesw	32x32	16,16	1	1	4	Diagonal resize 2 (NE-SW)
+black/size-nesw-large.cur	size1_rm.cur	size-nesw	32x32	15,16	1	1	4	Diagonal resize 2 (NE-SW)
+black/size-nesw.cur	size1_r.cur	size-nesw	32x32	16,16	1	1	1	Diagonal resize 2 (NE-SW)
+black/size-ns-extra-large.cur	size4_rl.cur	size-ns	32x32	15,15	1	1	4	Vertical resize
+black/size-ns-large.cur	size4_rm.cur	size-ns	32x32	16,16	1	1	4	Vertical resize
+black/size-ns.cur	size4_r.cur	size-ns	32x32	15,16	1	1	1	Vertical resize
+black/size-nwse-extra-large.cur	size2_rl.cur	size-nwse	32x32	16,16	1	1	4	Diagonal resize 1 (NW-SE)
+black/size-nwse-large.cur	size2_rm.cur	size-nwse	32x32	15,16	1	1	4	Diagonal resize 1 (NW-SE)
+black/size-nwse.cur	size2_r.cur	size-nwse	32x32	16,16	1	1	1	Diagonal resize 1 (NW-SE)
+black/size-we-extra-large.cur	size3_rl.cur	size-we	32x32	16,16	1	1	4	Horizontal resize
+black/size-we-large.cur	size3_rm.cur	size-we	32x32	15,16	1	1	4	Horizontal resize
+black/size-we.cur	size3_r.cur	size-we	32x32	16,16	1	1	1	Horizontal resize
+black/text-extra-large.cur	beam_rl.cur	text	32x32	15,15	1	1	4	Text select
+black/text-large.cur	beam_rm.cur	text	32x32	15,15	1	1	4	Text select
+black/text.cur	beam_r.cur	text	32x32	15,16	1	1	1	Text select
+black/unavailable-extra-large.cur	no_rl.cur	unavailable	32x32	15,16	1	1	4	Unavailable
+black/unavailable-large.cur	no_rm.cur	unavailable	32x32	16,15	1	1	4	Unavailable
+black/unavailable.cur	no_r.cur	unavailable	32x32	15,15	1	1	1	Unavailable
+black/working-extra-large.cur	wait_rl.cur	working	32x32	0,1	1	1	4	Working in background
+black/working-large.cur	wait_rm.cur	working	32x32	2,4	1	1	4	Working in background
+black/working.cur	wait_r.cur	working	32x32	0,0	1	1	1	Working in background
+hands-animated/busy.ani	handwait.ani	busy	32x32	16,13	9	50	4	Busy
+hands-animated/pinch.ani	hand.ani	pinch	32x32	16,16	4	5	4	Hand pinching, moving sideways
+hands-animated/size-nesw.ani	handnesw.ani	size-nesw	32x32	22,8	2	2	4	Diagonal resize 2 (NE-SW)
+hands-animated/size-ns.ani	handns.ani	size-ns	32x32	15,6	2	2	4	Vertical resize
+hands-animated/size-nwse.ani	handnwse.ani	size-nwse	32x32	9,8	2	2	4	Diagonal resize 1 (NW-SE)
+hands-animated/size-we.ani	handwe.ani	size-we	32x32	6,16	2	2	4	Horizontal resize
+hands-animated/unavailable.ani	handno.ani	unavailable	32x32	16,29	5	8	4	Unavailable
+hands-animated/working.ani	handapst.ani	working	32x32	12,1	8	8	4	Working in background
+hands/arrow.cur	harrow.cur	arrow	32x32	12,1	1	1	4	Normal select
+hands/move.cur	hmove.cur	move	32x32	16,14	1	1	4	Move
+hands/precision.cur	hcross.cur	precision	32x32	5,13	1	1	4	Precision select
+hands/size-nesw.cur	hnesw.cur	size-nesw	32x32	24,7	1	1	4	Diagonal resize 2 (NE-SW)
+hands/size-ns.cur	hns.cur	size-ns	32x32	15,4	1	1	4	Vertical resize
+hands/size-nwse.cur	hnwse.cur	size-nwse	32x32	7,7	1	1	4	Diagonal resize 1 (NW-SE)
+hands/size-we.cur	hwe.cur	size-we	32x32	4,16	1	1	4	Horizontal resize
+hands/text.cur	hibeam.cur	text	32x32	5,9	1	1	4	Text select
+hands/unavailable.cur	hnodrop.cur	unavailable	32x32	12,1	1	1	4	Unavailable
+inverted/alternate-extra-large.cur	up_il.cur	alternate	32x32	15,6	1	1	1	Alternate select
+inverted/alternate-large.cur	up_im.cur	alternate	32x32	15,6	1	1	1	Alternate select
+inverted/alternate.cur	up_i.cur	alternate	32x32	15,6	1	1	1	Alternate select
+inverted/arrow-extra-large.cur	arrow_il.cur	arrow	32x32	0,1	1	1	4	Normal select
+inverted/arrow-large.cur	arrow_im.cur	arrow	32x32	0,4	1	1	4	Normal select
+inverted/arrow.cur	arrow_i.cur	arrow	32x32	0,0	1	1	1	Normal select
+inverted/busy-extra-large.cur	busy_il.cur	busy	32x32	16,16	1	1	4	Busy
+inverted/busy-large.cur	busy_im.cur	busy	32x32	16,15	1	1	4	Busy
+inverted/busy.cur	busy_i.cur	busy	32x32	16,16	1	1	1	Busy
+inverted/handwriting-extra-large.cur	pen_il.cur	handwriting	32x32	2,3	1	1	4	Handwriting
+inverted/handwriting-large.cur	pen_im.cur	handwriting	32x32	4,5	1	1	4	Handwriting
+inverted/handwriting.cur	pen_i.cur	handwriting	32x32	4,5	1	1	1	Handwriting
+inverted/help-extra-large.cur	help_il.cur	help	32x32	0,1	1	1	4	Help select
+inverted/help-large.cur	help_im.cur	help	32x32	2,4	1	1	4	Help select
+inverted/help.cur	help_i.cur	help	32x32	5,7	1	1	1	Help select
+inverted/link-extra-large.cur	link_il.cur	link	32x32	8,0	1	1	1	Link select
+inverted/link-large.cur	link_im.cur	link	32x32	8,0	1	1	1	Link select
+inverted/link.cur	link_i.cur	link	32x32	5,1	1	1	1	Link select
+inverted/move-extra-large.cur	move_il.cur	move	32x32	16,16	1	1	4	Move
+inverted/move-large.cur	move_im.cur	move	32x32	16,16	1	1	4	Move
+inverted/move.cur	move_i.cur	move	32x32	15,16	1	1	1	Move
+inverted/precision-extra-large.cur	cross_il.cur	precision	32x32	16,16	1	1	4	Precision select
+inverted/precision-large.cur	cross_im.cur	precision	32x32	15,16	1	1	4	Precision select
+inverted/precision.cur	cross_i.cur	precision	32x32	15,16	1	1	1	Precision select
+inverted/size-nesw-extra-large.cur	size1_il.cur	size-nesw	32x32	16,16	1	1	4	Diagonal resize 2 (NE-SW)
+inverted/size-nesw-large.cur	size1_im.cur	size-nesw	32x32	15,16	1	1	4	Diagonal resize 2 (NE-SW)
+inverted/size-nesw.cur	size1_i.cur	size-nesw	32x32	16,16	1	1	1	Diagonal resize 2 (NE-SW)
+inverted/size-ns-extra-large.cur	size4_il.cur	size-ns	32x32	15,15	1	1	4	Vertical resize
+inverted/size-ns-large.cur	size4_im.cur	size-ns	32x32	16,16	1	1	4	Vertical resize
+inverted/size-ns.cur	size4_i.cur	size-ns	32x32	15,16	1	1	1	Vertical resize
+inverted/size-nwse-extra-large.cur	size2_il.cur	size-nwse	32x32	16,16	1	1	4	Diagonal resize 1 (NW-SE)
+inverted/size-nwse-large.cur	size2_im.cur	size-nwse	32x32	15,16	1	1	4	Diagonal resize 1 (NW-SE)
+inverted/size-nwse.cur	size2_i.cur	size-nwse	32x32	16,16	1	1	1	Diagonal resize 1 (NW-SE)
+inverted/size-we-extra-large.cur	size3_il.cur	size-we	32x32	16,16	1	1	4	Horizontal resize
+inverted/size-we-large.cur	size3_im.cur	size-we	32x32	15,16	1	1	4	Horizontal resize
+inverted/size-we.cur	size3_i.cur	size-we	32x32	16,16	1	1	1	Horizontal resize
+inverted/text-extra-large.cur	beam_il.cur	text	32x32	15,15	1	1	4	Text select
+inverted/text-large.cur	beam_im.cur	text	32x32	15,15	1	1	4	Text select
+inverted/text.cur	beam_i.cur	text	32x32	15,16	1	1	1	Text select
+inverted/unavailable-extra-large.cur	no_il.cur	unavailable	32x32	15,16	1	1	4	Unavailable
+inverted/unavailable-large.cur	no_im.cur	unavailable	32x32	16,15	1	1	4	Unavailable
+inverted/unavailable.cur	no_i.cur	unavailable	32x32	15,15	1	1	1	Unavailable
+inverted/working-extra-large.cur	wait_il.cur	working	32x32	0,1	1	1	4	Working in background
+inverted/working-large.cur	wait_im.cur	working	32x32	2,4	1	1	4	Working in background
+inverted/working.cur	wait_i.cur	working	32x32	0,0	1	1	1	Working in background
+magnified/alternate.cur	lup.cur	alternate	32x32	9,0	1	1	4	Alternate select
+magnified/arrow.cur	larrow.cur	arrow	32x32	1,1	1	1	4	Normal select
+magnified/busy.cur	lwait.cur	busy	32x32	11,15	1	1	4	Busy
+magnified/handwriting.cur	lpen.cur	handwriting	32x32	2,3	1	1	4	Handwriting
+magnified/help.cur	lhelpsel.cur	help	32x32	1,1	1	1	4	Help select
+magnified/link.cur	llink.cur	link	32x32	12,3	1	1	4	Link select
+magnified/move.cur	lmove.cur	move	32x32	15,15	1	1	4	Move
+magnified/precision.cur	lcross.cur	precision	32x32	15,14	1	1	4	Precision select
+magnified/size-nesw.cur	lnesw.cur	size-nesw	32x32	12,12	1	1	4	Diagonal resize 2 (NE-SW)
+magnified/size-ns.cur	lns.cur	size-ns	32x32	8,15	1	1	4	Vertical resize
+magnified/size-nwse.cur	lnwse.cur	size-nwse	32x32	12,12	1	1	4	Diagonal resize 1 (NW-SE)
+magnified/size-we.cur	lwe.cur	size-we	32x32	16,9	1	1	4	Horizontal resize
+magnified/text.cur	libeam.cur	text	32x32	6,15	1	1	4	Text select
+magnified/unavailable.cur	lnodrop.cur	unavailable	32x32	16,15	1	1	4	Unavailable
+magnified/working.cur	lappstrt.cur	working	32x32	1,1	1	1	4	Working in background
+novelty/banana.ani	banana.ani	banana	32x32	16,16	15	16	4	banana
+novelty/barber-pole.ani	barber.ani	barber-pole	32x32	16,16	11	11	4	barber-pole
+novelty/coin.ani	coin.ani	coin	32x32	16,16	8	9	4	coin
+novelty/counter.ani	counter.ani	counter	32x32	0,0	20	20	1	counter
+novelty/dinosaur-2.ani	dinosau2.ani	dinosaur-2	32x32	16,19	6	6	4	dinosaur-2
+novelty/dinosaur.ani	dinosaur.ani	dinosaur	32x32	16,20	6	6	4	dinosaur
+novelty/drum.ani	drum.ani	drum	32x32	16,16	4	4	4	drum
+novelty/fill-it-up.ani	fillitup.ani	fill-it-up	32x32	0,0	19	19	4	fill-it-up
+novelty/horse.ani	horse.ani	horse	32x32	16,16	24	24	4	horse
+novelty/metronome.ani	metronom.ani	metronome	32x32	17,17	7	12	4	metronome
+novelty/piano.ani	piano.ani	piano	32x32	13,9	5	8	4	piano
+novelty/rainbow.ani	rainbow.ani	rainbow	32x32	0,0	13	13	1,4	rainbow
+novelty/raindrop.ani	raindrop.ani	raindrop	32x32	15,12	6	6	4	raindrop
+novelty/stopwatch.ani	stopwtch.ani	stopwatch	32x32	16,19	8	45	4	stopwatch
+novelty/vanisher.ani	vanisher.ani	vanisher	32x32	0,0	5	8	1	vanisher
+novelty/wagtail.ani	wagtail.ani	wagtail	32x32	9,6	7	12	1	wagtail
+standard/alternate-extra-large.cur	up_l.cur	alternate	32x32	15,5	1	1	4	Alternate select
+standard/alternate-large.cur	up_m.cur	alternate	32x32	14,6	1	1	4	Alternate select
+standard/arrow-extra-large.cur	arrow_l.cur	arrow	32x32	0,1	1	1	4	Normal select
+standard/arrow-large.cur	arrow_m.cur	arrow	32x32	2,4	1	1	4	Normal select
+standard/busy-extra-large.cur	busy_l.cur	busy	32x32	16,16	1	1	4	Busy
+standard/busy-large.cur	busy_m.cur	busy	32x32	16,16	1	1	4	Busy
+standard/handwriting-extra-large.cur	pen_l.cur	handwriting	32x32	2,3	1	1	4	Handwriting
+standard/handwriting-large.cur	pen_m.cur	handwriting	32x32	4,5	1	1	4	Handwriting
+standard/help-extra-large.cur	help_l.cur	help	32x32	0,1	1	1	4	Help select
+standard/help-large.cur	help_m.cur	help	32x32	2,4	1	1	4	Help select
+standard/link-extra-large.cur	link_l.cur	link	32x32	8,0	1	1	1	Link select
+standard/link-large.cur	link_m.cur	link	32x32	8,0	1	1	1	Link select
+standard/move-extra-large.cur	move_l.cur	move	32x32	16,16	1	1	4	Move
+standard/move-large.cur	move_m.cur	move	32x32	16,16	1	1	4	Move
+standard/precision-extra-large.cur	cross_l.cur	precision	32x32	16,16	1	1	4	Precision select
+standard/precision-large.cur	cross_m.cur	precision	32x32	15,16	1	1	4	Precision select
+standard/size-nesw-extra-large.cur	size1_l.cur	size-nesw	32x32	16,16	1	1	4	Diagonal resize 2 (NE-SW)
+standard/size-nesw-large.cur	size1_m.cur	size-nesw	32x32	16,16	1	1	4	Diagonal resize 2 (NE-SW)
+standard/size-ns-extra-large.cur	size4_l.cur	size-ns	32x32	15,15	1	1	4	Vertical resize
+standard/size-ns-large.cur	size4_m.cur	size-ns	32x32	16,16	1	1	4	Vertical resize
+standard/size-nwse-extra-large.cur	size2_l.cur	size-nwse	32x32	16,16	1	1	4	Diagonal resize 1 (NW-SE)
+standard/size-nwse-large.cur	size2_m.cur	size-nwse	32x32	15,16	1	1	4	Diagonal resize 1 (NW-SE)
+standard/size-we-extra-large.cur	size3_l.cur	size-we	32x32	16,16	1	1	4	Horizontal resize
+standard/size-we-large.cur	size3_m.cur	size-we	32x32	15,16	1	1	4	Horizontal resize
+standard/text-extra-large.cur	beam_l.cur	text	32x32	15,15	1	1	4	Text select
+standard/text-large.cur	beam_m.cur	text	32x32	15,15	1	1	4	Text select
+standard/unavailable-extra-large.cur	no_l.cur	unavailable	32x32	15,16	1	1	4	Unavailable
+standard/unavailable-large.cur	no_m.cur	unavailable	32x32	16,15	1	1	4	Unavailable
+standard/working-extra-large.cur	wait_l.cur	working	32x32	0,1	1	1	4	Working in background
+standard/working-large.cur	wait_m.cur	working	32x32	2,4	1	1	4	Working in background
+xp-default/alternate.cur	default_up.cur	alternate	32x32	10,10	1	1	1	Alternate select
+xp-default/arrow.cur	default_arrow.cur	arrow	32x32	10,10	1	1	1	Normal select
+xp-default/box.cur	default_box.cur	box	32x32	10,10	1	1	1	Box with a dot
+xp-default/busy.cur	default_busy.cur	busy	32x32	10,10	1	1	1	Busy
+xp-default/dvd.cur	default_dvd.cur	dvd	32x32	10,10	1	1	4	Arrow with a disc
+xp-default/handwriting.cur	default_pen.cur	handwriting	32x32	4,4	1	1	1	Handwriting
+xp-default/help.cur	default_helpsel.cur	help	32x32	10,10	1	1	1	Help select
+xp-default/link.cur	default_link.cur	link	32x32	10,10	1	1	1	Link select
+xp-default/location.cur	pin.cur	location	32x32	5,1	1	1	1	Location select
+xp-default/move.cur	default_move.cur	move	32x32	10,10	1	1	1	Move
+xp-default/pan-all.cur	default_scroll_move.cur	pan-all	32x32	15,15	1	1	1	Wheel pan in any direction
+xp-default/pan-e.cur	default_scroll_e.cur	pan-e	32x32	15,15	1	1	1	Wheel pan towards E
+xp-default/pan-ew.cur	default_scroll_ew.cur	pan-ew	32x32	15,15	1	1	1	Wheel pan towards EW
+xp-default/pan-n.cur	default_scroll_n.cur	pan-n	32x32	15,15	1	1	1	Wheel pan towards N
+xp-default/pan-ne.cur	default_scroll_ne.cur	pan-ne	32x32	15,15	1	1	1	Wheel pan towards NE
+xp-default/pan-ns.cur	default_scroll_ns.cur	pan-ns	32x32	15,15	1	1	1	Wheel pan towards NS
+xp-default/pan-nw.cur	default_scroll_nw.cur	pan-nw	32x32	15,15	1	1	1	Wheel pan towards NW
+xp-default/pan-s.cur	default_scroll_s.cur	pan-s	32x32	15,15	1	1	1	Wheel pan towards S
+xp-default/pan-se.cur	default_scroll_se.cur	pan-se	32x32	15,15	1	1	1	Wheel pan towards SE
+xp-default/pan-sw.cur	default_scroll_sw.cur	pan-sw	32x32	15,15	1	1	1	Wheel pan towards SW
+xp-default/pan-w.cur	default_scroll_w.cur	pan-w	32x32	15,15	1	1	1	Wheel pan towards W
+xp-default/person.cur	person.cur	person	32x32	5,1	1	1	1	Person select
+xp-default/precision.cur	cross.cur	precision	32x32	15,15	1	1	4	Precision select
+xp-default/size-nesw.cur	default_size1.cur	size-nesw	32x32	10,10	1	1	1	Diagonal resize 2 (NE-SW)
+xp-default/size-ns.cur	default_size4.cur	size-ns	32x32	10,10	1	1	1	Vertical resize
+xp-default/size-nwse.cur	default_size2.cur	size-nwse	32x32	10,10	1	1	1	Diagonal resize 1 (NW-SE)
+xp-default/size-we.cur	default_size3.cur	size-we	32x32	10,10	1	1	1	Horizontal resize
+xp-default/text.cur	default_ibeam.cur	text	32x32	6,10	1	1	1	Text select
+xp-default/unavailable.cur	default_no.cur	unavailable	32x32	10,10	1	1	1	Unavailable
+xp-default/working.cur	default_wait.cur	working	32x32	10,10	1	1	1	Working in background

@@ -100,8 +100,7 @@ fn read_gpt<D: BlockDevice>(
     let entry_size = le32(sector, 84) as usize;
     if count == 0
         || count > MAX_GPT_ENTRIES
-        || entry_size < 128
-        || entry_size > 4096
+        || !(128..=4096).contains(&entry_size)
         || !entry_size.is_power_of_two()
     {
         return Ok(false);

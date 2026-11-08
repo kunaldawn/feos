@@ -341,15 +341,14 @@ pub(super) fn conceal(state: &mut SilkChannelState, frame: &mut [i16], fs_khz: i
 
     let rand_buf = &state.exc_q14;
     for _ in 0..nb_subfr {
-        let mut lag_at = buf_idx as i32 - lag + LTP_ORDER as i32 / 2;
-        for _ in 0..plc_subfr {
+        let first_lag = buf_idx as i32 - lag + LTP_ORDER as i32 / 2;
+        for lag_at in (first_lag..).take(plc_subfr) {
             let mut pred_q12 = 2;
             for (j, &b) in b_q14.iter().enumerate() {
                 let at = lag_at - j as i32;
                 let value = if at >= 0 { s_ltp_q14[at as usize] } else { 0 };
                 pred_q12 = smlawb(pred_q12, value, b as i32);
             }
-            lag_at += 1;
             rand_seed = silk_rand(rand_seed);
             let at = ((rand_seed >> 25) & RAND_BUF_MASK) as usize;
             let noise = rand_buf[(rand_from + at).min(MAX_FRAME_LENGTH - 1)];

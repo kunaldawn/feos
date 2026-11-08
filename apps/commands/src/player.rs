@@ -2421,11 +2421,10 @@ impl PlayerState {
             return false;
         }
 
-        if self.focus == Focus::Playlist {
-            if self.playlist_key(fs, key, modifiers, now) {
+        if self.focus == Focus::Playlist
+            && self.playlist_key(fs, key, modifiers, now) {
                 return false;
             }
-        }
 
         match key {
             Key::Space => {
@@ -2933,12 +2932,7 @@ fn title_button_rect(layout: Layout, index: usize) -> Rect {
 }
 
 fn title_button_at(layout: Layout, point: Point) -> Option<usize> {
-    for index in 0..3 {
-        if title_button_rect(layout, index).contains(point) {
-            return Some(index);
-        }
-    }
-    None
+    (0..3).find(|&index| title_button_rect(layout, index).contains(point))
 }
 
 fn toolbar_button_rect(layout: Layout, index: usize) -> Rect {
@@ -2958,12 +2952,7 @@ fn toolbar_button_at(layout: Layout, point: Point) -> Option<usize> {
     if layout.toolbar.is_empty() || !layout.toolbar.contains(point) {
         return None;
     }
-    for index in 0..TOOLBAR_WIDTHS.len() {
-        if toolbar_button_rect(layout, index).contains(point) {
-            return Some(index);
-        }
-    }
-    None
+    (0..TOOLBAR_WIDTHS.len()).find(|&index| toolbar_button_rect(layout, index).contains(point))
 }
 
 fn fullscreen_play_rect(layout: Layout) -> Rect {
@@ -3467,13 +3456,7 @@ fn draw_toolbar(painter: &mut Painter<'_, '_>, state: &PlayerState, layout: Layo
             painter.fill_rounded_rect(
                 rect,
                 4,
-                if pressed {
-                    ORANGE_DARK
-                } else if hovered {
-                    ORANGE
-                } else {
-                    ORANGE
-                },
+                if pressed { ORANGE_DARK } else { ORANGE },
             );
             painter.stroke_rounded_rect(rect, 4, 1, ORANGE_LIGHT);
         } else if pressed {
@@ -3656,7 +3639,7 @@ fn draw_sound_only(painter: &mut Painter<'_, '_>, rect: Rect, name: &str) {
         96,
         96,
     );
-    draw_logo(painter, cone);
+    feos_gui::paint_stock(painter, feos_gui::Stock::Sounds, cone);
     painter.draw_text_centered(
         Rect::new(rect.x, cone.bottom_i32() + 20, rect.width, 24),
         name,
@@ -4805,54 +4788,14 @@ fn blit_rgba<'a>(
     }
 }
 
-/// The player's logo: a screen with a play triangle.
+/// The player's logo: the iconset's video camera, which its Start menu bundle
+/// uses too.
 fn draw_logo(painter: &mut Painter<'_, '_>, rect: Rect) {
-    if rect.width < 6 || rect.height < 6 {
-        return;
-    }
-    let w = rect.width as i32;
-    let h = rect.height as i32;
-    painter.fill_rounded_rect(rect, 3, ORANGE);
-    let triangle = [
-        Point::new(rect.x + w * 3 / 8, rect.y + h / 4),
-        Point::new(rect.x + w * 3 / 4, rect.y + h / 2),
-        Point::new(rect.x + w * 3 / 8, rect.y + h * 3 / 4),
-    ];
-    painter.fill_polygon(&triangle, Color::rgb(255, 244, 220));
+    feos_gui::paint_stock(painter, feos_gui::Stock::Camcorder, rect);
 }
 
 fn draw_cursor(painter: &mut Painter<'_, '_>, x: i32, y: i32) {
-    const CURSOR: [&str; 19] = [
-        "X           ",
-        "XX          ",
-        "X.X         ",
-        "X..X        ",
-        "X...X       ",
-        "X....X      ",
-        "X.....X     ",
-        "X......X    ",
-        "X.......X   ",
-        "X........X  ",
-        "X.....XXXXX ",
-        "X..X..X     ",
-        "X.X X..X    ",
-        "XX  X..X    ",
-        "X    X..X   ",
-        "     X..X   ",
-        "      X..X  ",
-        "      X..X  ",
-        "       XX   ",
-    ];
-    for (row, line) in CURSOR.iter().enumerate() {
-        for (column, pixel) in line.bytes().enumerate() {
-            let color = match pixel {
-                b'X' => Color::BLACK,
-                b'.' => Color::WHITE,
-                _ => continue,
-            };
-            painter.put_pixel(x + column as i32, y + row as i32, color);
-        }
-    }
+    feos_gui::draw_cursor(painter, x, y);
 }
 
 #[cfg(test)]

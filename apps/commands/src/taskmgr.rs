@@ -633,8 +633,8 @@ struct State {
 
 impl State {
     fn new(screen: Rect) -> Self {
-        let width = (screen.width as i32).min(980).max(720);
-        let height = (screen.height as i32).min(660).max(520);
+        let width = (screen.width as i32).clamp(720, 980);
+        let height = (screen.height as i32).clamp(520, 660);
         let mut state = Self {
             screen,
             maximized: false,
@@ -1612,10 +1612,9 @@ fn dialog_button_rect(panel: Rect, index: usize, total: usize) -> Rect {
 // Run loop
 // ---------------------------------------------------------------------------
 
-/// Pixels saved around the pointer so the cursor can be restored. The box is
-/// large enough for both the arrow and the wider resize cursors.
-const CURSOR_BOX: i32 = 21;
-const CURSOR_PIXELS: usize = 24 * 24;
+/// Pixels saved around the pointer so the cursor can be restored: as many as
+/// the largest cursor covers.
+const CURSOR_PIXELS: usize = (feos_gui::CURSOR_MAX * feos_gui::CURSOR_MAX) as usize;
 
 /// A hardware cursor composited directly onto the front buffer.
 ///
@@ -1662,14 +1661,10 @@ impl Cursor {
     fn move_to(&mut self, canvas: &mut Canvas<'_>, pointer: Point, shape: feos_gui::CursorShape) {
         self.restore(canvas);
         let bounds = Rect::new(0, 0, canvas.width() as u32, canvas.height() as u32);
-        // The arrow grows right/down from its tip; resize cursors are centred.
-        let origin = match shape {
-            feos_gui::CursorShape::Arrow => pointer,
-            _ => Point::new(pointer.x - 10, pointer.y - 10),
-        };
-        let rect =
-            Rect::new(origin.x, origin.y, CURSOR_BOX as u32, CURSOR_BOX as u32).clipped_to(bounds);
-        if rect.is_empty() {
+        // The cursor's image is placed by its hot spot, so it can start above
+        // and left of the pointer.
+        let rect = feos_gui::cursor_bounds(pointer.x, pointer.y, shape).clipped_to(bounds);
+        if rect.is_empty() || (rect.width * rect.height) as usize > CURSOR_PIXELS {
             return;
         }
 
@@ -3108,7 +3103,7 @@ fn draw_window(painter: &mut Painter<'_, '_>, state: &State, layout: Layout, now
 
         draw_taskmgr_icon(
             painter,
-            Rect::new(layout.title.x + 7, layout.title.y + 5, 18, 18),
+            Rect::new(layout.title.x + 7, layout.title.y + 6, 16, 16),
         );
 
         let buttons_left = title_button_rect(layout, 0).x - 6;
@@ -3141,38 +3136,10 @@ fn draw_window(painter: &mut Painter<'_, '_>, state: &State, layout: Layout, now
     let _ = now;
 }
 
+/// The task manager's own picture: the iconset's performance pie chart, which
+/// its Start menu bundle uses too.
 fn draw_taskmgr_icon(painter: &mut Painter<'_, '_>, rect: Rect) {
-    let w = rect.width as i32;
-    let h = rect.height as i32;
-    painter.fill_rounded_rect(rect, 2, Color::rgb(238, 238, 238));
-    painter.stroke_rounded_rect(rect, 2, 1, Color::rgb(70, 70, 70));
-    let graph = Rect::new(
-        rect.x + 3,
-        rect.y + 4,
-        (w - 6).max(4) as u32,
-        (h - 7).max(4) as u32,
-    );
-    painter.fill_rect(graph, GRAPH_BG);
-    painter.fill_rect(
-        Rect::new(graph.x + 1, graph.y + 1, graph.width.saturating_sub(2), 1),
-        GRAPH_GRID,
-    );
-    let mid = graph.bottom_i32() - graph.height as i32 / 2;
-    painter.fill_rect(
-        Rect::new(graph.x + 1, mid, graph.width.saturating_sub(2), 1),
-        GRAPH_GRID,
-    );
-    let points = [
-        Point::new(graph.x + 1, graph.bottom_i32() - 2),
-        Point::new(graph.x + 4, graph.bottom_i32() - 5),
-        Point::new(graph.x + 7, graph.bottom_i32() - 3),
-        Point::new(graph.x + 10, graph.bottom_i32() - 8),
-        Point::new(graph.x + 13, graph.bottom_i32() - 6),
-        Point::new(graph.x + 15, graph.bottom_i32() - 9),
-    ];
-    for pair in points.windows(2) {
-        painter.line(pair[0].x, pair[0].y, pair[1].x, pair[1].y, GRAPH_CPU);
-    }
+    feos_gui::paint_stock(painter, feos_gui::Stock::Performance, rect);
 }
 
 fn draw_title_button(
@@ -3362,7 +3329,7 @@ fn draw_applications(painter: &mut Painter<'_, '_>, state: &State, layout: Layou
         draw_row_background(painter, rect, selected, rect.contains(state.pointer));
         let name = application_name(&row);
         if selected {
-            let icon_rect = Rect::new(rect.x + 4, rect.y + 3, 14, 14);
+            let icon_rect = Rect::new(rect.x + 4, rect.y + 2, 16, 16);
             draw_app_icon(painter, icon_rect, name);
             painter.draw_text_ellipsis(
                 Rect::new(
@@ -3386,7 +3353,7 @@ fn draw_applications(painter: &mut Painter<'_, '_>, state: &State, layout: Layou
                 VerticalAlign::Middle,
             );
         } else {
-            let icon_rect = Rect::new(rect.x + 4, rect.y + 3, 14, 14);
+            let icon_rect = Rect::new(rect.x + 4, rect.y + 2, 16, 16);
             draw_app_icon(painter, icon_rect, name);
             painter.draw_text_ellipsis(
                 Rect::new(
@@ -3479,7 +3446,7 @@ fn draw_processes(painter: &mut Painter<'_, '_>, state: &State, layout: Layout) 
             let align = column.alignment();
             match column {
                 Column::ImageName => {
-                    let icon_rect = Rect::new(x + 2, rect.y + 3, 14, 14);
+                    let icon_rect = Rect::new(x + 2, rect.y + 2, 16, 16);
                     draw_app_icon(painter, icon_rect, row.name.as_str());
                     painter.draw_text_ellipsis(
                         Rect::new(x + 20, rect.y, (width - 24).max(8) as u32, rect.height),
@@ -3778,52 +3745,33 @@ fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
         .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
-fn draw_app_icon(painter: &mut Painter<'_, '_>, rect: Rect, name: &str) {
-    let accent = if contains_ignore_ascii_case(name, "media")
-        || contains_ignore_ascii_case(name, "player")
-    {
-        Color::rgb(230, 120, 30)
-    } else if contains_ignore_ascii_case(name, "task") {
-        Color::rgb(0, 140, 60)
-    } else if contains_ignore_ascii_case(name, "file")
-        || contains_ignore_ascii_case(name, "explorer")
-    {
-        Color::rgb(220, 170, 40)
-    } else if contains_ignore_ascii_case(name, "terminal")
-        || contains_ignore_ascii_case(name, "shell")
-    {
-        Color::rgb(30, 30, 30)
-    } else if contains_ignore_ascii_case(name, "tick") {
-        Color::rgb(40, 90, 210)
+/// The picture for a process, picked from its name: the same pictures as the
+/// Start menu's bundles where the name says which app it is, and a plain
+/// program window otherwise.
+fn app_stock(name: &str) -> feos_gui::Stock {
+    use feos_gui::Stock;
+    let has = |needle| contains_ignore_ascii_case(name, needle);
+    if has("media") || has("player") {
+        Stock::Camcorder
+    } else if has("music") {
+        Stock::Sounds
+    } else if has("task") || has("monitor") {
+        Stock::Performance
+    } else if has("file") || has("explorer") {
+        Stock::FolderOpen
+    } else if has("terminal") || has("shell") || has("console") {
+        Stock::Terminal
+    } else if has("setting") {
+        Stock::ControlPanel
+    } else if has("dos") {
+        Stock::Computer
     } else {
-        Color::rgb(70, 110, 180)
-    };
-    if rect.width < 4 || rect.height < 4 {
-        return;
+        Stock::Application
     }
-    let w = rect.width as i32;
-    let h = rect.height as i32;
-    let page = Rect::new(
-        rect.x + w / 6,
-        rect.y + 1,
-        (w * 2 / 3).max(5) as u32,
-        (h - 2).max(5) as u32,
-    );
-    painter.fill_rect(page, Color::WHITE);
-    painter.stroke_rect(page, 1, Color::rgb(110, 110, 110));
-    painter.fill_rect(
-        Rect::new(page.x + 2, page.y + 2, page.width.saturating_sub(4), 3),
-        accent,
-    );
-    painter.fill_rect(
-        Rect::new(
-            page.x + 2,
-            page.bottom_i32() - 4,
-            page.width.saturating_sub(5),
-            1,
-        ),
-        Color::rgb(170, 170, 170),
-    );
+}
+
+fn draw_app_icon(painter: &mut Painter<'_, '_>, rect: Rect, name: &str) {
+    feos_gui::paint_stock(painter, app_stock(name), rect);
 }
 
 fn draw_resize_grip(painter: &mut Painter<'_, '_>, window: Rect) {
@@ -4653,7 +4601,7 @@ fn draw_about_dialog(
     state: &State,
     body: Rect,
 ) {
-    draw_taskmgr_icon(painter, Rect::new(body.x, body.y, 40, 40));
+    draw_taskmgr_icon(painter, Rect::new(body.x + 4, body.y + 4, 32, 32));
     painter.draw_text(body.x + 52, body.y + 2, "Task Manager", TEXT, 2);
     painter.draw_text(body.x + 52, body.y + 24, "feos task manager", MUTED, 1);
     painter.draw_text(body.x + 52, body.y + 38, "Version 1.0 (feos)", MUTED, 1);
@@ -5928,6 +5876,7 @@ mod behavior_tests {
             origin: Point::new(0, 0),
             pointer_active: false,
             keyboard_active: false,
+            cursor: feos_gui::CursorShape::Arrow,
         };
         assert!(app.open_window(&context));
         assert!(app.animates());
@@ -6310,6 +6259,7 @@ mod fuzz_tests {
                     origin: Point::new(0, 0),
                     pointer_active: true,
                     keyboard_active: true,
+                    cursor: feos_gui::CursorShape::Arrow,
                 };
                 if !open {
                     assert!(app.open_window(&context));

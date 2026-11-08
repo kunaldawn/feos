@@ -184,70 +184,45 @@ pub fn speaker_rect(layout: &TaskbarLayout) -> Rect {
     Rect::new(bell.right_i32() + 2, bell.y, bell.width, bell.height)
 }
 
+/// The 16-pixel square at the middle of a tray button.
+fn tray_icon_rect(rect: Rect) -> Rect {
+    Rect::new(
+        rect.x + (rect.width as i32 - 16) / 2,
+        rect.y + (rect.height as i32 - 16) / 2,
+        16,
+        16,
+    )
+}
+
+/// The volume button: the iconset's speaker, with a no-entry sign over it
+/// when muted, as XP's tray shows.
 fn draw_speaker<const N: usize>(
     ui: &mut Ui<'_, '_, '_, N>,
     rect: Rect,
-    theme: &DesktopTheme,
-    level: u8,
+    _theme: &DesktopTheme,
+    _level: u8,
     muted: bool,
 ) {
-    let cx = rect.x + rect.width as i32 / 2 - 3;
-    let cy = rect.y + rect.height as i32 / 2;
-    let body = [
-        feos_gfx::Point::new(cx - 4, cy - 2),
-        feos_gfx::Point::new(cx - 1, cy - 2),
-        feos_gfx::Point::new(cx + 3, cy - 6),
-        feos_gfx::Point::new(cx + 3, cy + 6),
-        feos_gfx::Point::new(cx - 1, cy + 2),
-        feos_gfx::Point::new(cx - 4, cy + 2),
-    ];
-    ui.painter.fill_polygon(&body, theme.tray_text);
+    let icon = tray_icon_rect(rect);
+    feos_iconset::draw(&mut ui.painter, feos_iconset::Stock::Sounds, icon);
     if muted {
-        for step in 0..7 {
-            ui.painter.fill_rect(
-                Rect::new(cx + 5 + step, cy - 3 + step, 1, 1),
-                theme.close_button,
-            );
-            ui.painter.fill_rect(
-                Rect::new(cx + 11 - step, cy - 3 + step, 1, 1),
-                theme.close_button,
-            );
-        }
-        return;
-    }
-    // A bar per third of the volume, each taller than the last.
-    for bar in 0..3 {
-        if level as i32 > bar * 33 {
-            let half = 1 + bar * 2;
-            ui.painter.fill_rect(
-                Rect::new(cx + 5 + bar * 2, cy - half, 1, 2 * half as u32 + 1 - 1),
-                theme.tray_text,
-            );
-        }
+        let badge = Rect::new(icon.x + 7, icon.y + 7, 10, 10);
+        feos_iconset::draw(&mut ui.painter, feos_iconset::Stock::Error, badge);
     }
 }
 
+/// The notifications button: the iconset's message bubble, with a red dot
+/// while some are unread.
 fn draw_bell<const N: usize>(
     ui: &mut Ui<'_, '_, '_, N>,
     rect: Rect,
     theme: &DesktopTheme,
     unread: usize,
 ) {
-    let cx = rect.x + rect.width as i32 / 2;
-    let top = rect.y + 4;
-    let body = [
-        feos_gfx::Point::new(cx - 3, top + 2),
-        feos_gfx::Point::new(cx + 3, top + 2),
-        feos_gfx::Point::new(cx + 6, top + 11),
-        feos_gfx::Point::new(cx - 6, top + 11),
-    ];
-    ui.painter.fill_polygon(&body, theme.tray_text);
-    ui.painter
-        .fill_rect(Rect::new(cx - 1, top, 2, 2), theme.tray_text);
-    ui.painter
-        .fill_rect(Rect::new(cx - 2, top + 13, 4, 2), theme.tray_text);
+    let icon = tray_icon_rect(rect);
+    feos_iconset::draw(&mut ui.painter, feos_iconset::Stock::Info, icon);
     if unread > 0 {
-        ui.painter.fill_circle(cx + 6, top + 2, 4, theme.close_button);
+        ui.painter.fill_circle(icon.right_i32() - 2, icon.y + 2, 3, theme.close_button);
     }
 }
 

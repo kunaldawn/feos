@@ -776,8 +776,8 @@ impl Cpu {
         // Load the incoming task.
         let mut new_flags;
         let mut new_sregs = [0u16; 6];
-        let new_ldt;
-        if new32 {
+        
+        let new_ldt = if new32 {
             let cr3 = self.sys_rd32(bus, new_base.wrapping_add(0x1C))?;
             if self.paging && cr3 != self.cr3 {
                 self.cr3 = cr3;
@@ -793,7 +793,7 @@ impl Cpu {
                 new_sregs[index as usize] =
                     self.sys_rd16(bus, new_base.wrapping_add(0x48 + index * 4))?;
             }
-            new_ldt = self.sys_rd16(bus, new_base.wrapping_add(0x60))?;
+            self.sys_rd16(bus, new_base.wrapping_add(0x60))?
         } else {
             self.ip = self.sys_rd16(bus, new_base.wrapping_add(0x0E))? as u32;
             new_flags = self.sys_rd16(bus, new_base.wrapping_add(0x10))? as u32;
@@ -805,8 +805,8 @@ impl Cpu {
                 new_sregs[index as usize] =
                     self.sys_rd16(bus, new_base.wrapping_add(0x22 + index * 2))?;
             }
-            new_ldt = self.sys_rd16(bus, new_base.wrapping_add(0x2A))?;
-        }
+            self.sys_rd16(bus, new_base.wrapping_add(0x2A))?
+        };
         if kind == Switch::Call {
             new_flags |= FLAG_NT;
         }

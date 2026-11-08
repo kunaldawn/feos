@@ -1955,7 +1955,7 @@ pub(super) fn seq(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
             error(ctx.stderr, "seq", "too many values (limit 1000000)");
             return 1;
         }
-        if printed % 256 == 0 && ctx.cancelled() {
+        if printed.is_multiple_of(256) && ctx.cancelled() {
             return 130;
         }
         if !first_item {

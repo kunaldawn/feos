@@ -229,7 +229,7 @@ const FDT_FALLBACK: usize = RAM_BASE;
 /// be. This runs before the kernel knows where RAM ends, so the address must be
 /// somewhere known to be RAM.
 fn device_tree_within(address: usize, limit: usize) -> Option<Fdt<'static>> {
-    if !(RAM_BASE..limit).contains(&address) || address % 8 != 0 {
+    if !(RAM_BASE..limit).contains(&address) || !address.is_multiple_of(8) {
         return None;
     }
     // SAFETY: the address is in RAM, by the limit, and these eight bytes are inside it.

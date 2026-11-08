@@ -880,7 +880,7 @@ impl Mpeg1Stream {
             let luma = y * self.luma_width;
             let chroma = (y / 2) * self.chroma_width;
             let row = &mut out[y * self.width * 4..(y + 1) * self.width * 4];
-            for (x, pixel) in row.chunks_exact_mut(4).enumerate() {
+            for (x, pixel) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let (r, g, b) = self.coefficients.rgb(
                     plane[luma + x],
                     plane[cb + chroma + x / 2],
@@ -1110,7 +1110,7 @@ impl Mpeg1Stream {
         let mut n = 0usize;
         let quant: &[u8; 64];
         if work.intra {
-            let plane = if block > 3 { block - 3 } else { 0 };
+            let plane = block.saturating_sub(3);
             let size = bits.vlc(if plane == 0 {
                 &DCT_SIZE_LUMINANCE
             } else {
@@ -1336,7 +1336,7 @@ fn idct(block: &mut [i32; 64]) {
         block[6 * 8 + i] = y3.wrapping_sub(x4);
         block[7 * 8 + i] = y4.wrapping_sub(b7);
     }
-    for row in block.chunks_exact_mut(8) {
+    for row in block.as_chunks_mut::<8>().0 {
         let b1 = row[4];
         let b3 = row[2].wrapping_add(row[6]);
         let b4 = row[5].wrapping_sub(row[3]);

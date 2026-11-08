@@ -1000,7 +1000,7 @@ impl Vfs for OverlayFs {
             }
         }
 
-        Ok(entries.into_iter().map(|(_, entry)| entry).collect())
+        Ok(entries.into_values().collect())
     }
 
     fn times(&self, path: &str) -> Option<feos_fs::NodeTimes> {

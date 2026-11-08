@@ -177,10 +177,8 @@ fn predict_subblock(work: &mut [u8; WORK * 17], x: usize, y: usize, mode: u8) {
                 avg3(a5, a6, a7),
                 avg3(a6, a7, a7),
             ];
-            for r in 0..4 {
-                for c in 0..4 {
-                    out[r][c] = d[r + c];
-                }
+            for (r, row) in out.iter_mut().enumerate() {
+                row.copy_from_slice(&d[r..r + 4]);
             }
         }
         B_RD_PRED => {

@@ -152,7 +152,7 @@ fn parse_sized(input: &[u8], file_len: usize) -> Result<Format> {
     if channels == 0 || sample_rate == 0 || !matches!(bits, 8 | 16 | 24 | 32) {
         return Err(AudioError::UnsupportedFeature("AIFF sample format"));
     }
-    let bytes = ((bits as usize) + 7) / 8;
+    let bytes = (bits as usize).div_ceil(8);
     let align = bytes * channels as usize;
     let available = data_len / align;
     let frames = (declared_frames as usize).min(available);
@@ -216,7 +216,7 @@ pub(crate) fn read_frames(input: &[u8], start: usize, out: &mut [i16]) -> Result
     let format = parse(input)?;
     let channels = format.channels as usize;
     let frame_count = format.frames.saturating_sub(start).min(out.len() / channels);
-    let bytes = ((format.bits as usize) + 7) / 8;
+    let bytes = (format.bits as usize).div_ceil(8);
     let align = bytes * channels;
     let data = &input[format.data_offset..format.data_offset + format.data_len];
 
@@ -268,7 +268,7 @@ pub fn encode_i16(
         return Err(AudioError::InvalidData("bad AIFF parameters"));
     }
     let channels = channels as usize;
-    if samples.len() % channels != 0 {
+    if !samples.len().is_multiple_of(channels) {
         return Err(AudioError::InvalidData("sample count is not frame aligned"));
     }
     let data_len = samples.len().checked_mul(2).ok_or(AudioError::Overflow)?;
@@ -297,7 +297,7 @@ pub fn encode_i16(
     out[42..46].copy_from_slice(&((data_len + 8) as u32).to_be_bytes());
     out[46..50].copy_from_slice(&0u32.to_be_bytes());
     out[50..54].copy_from_slice(&0u32.to_be_bytes());
-    for (chunk, sample) in out[54..54 + data_len].chunks_exact_mut(2).zip(samples) {
+    for (chunk, sample) in out[54..54 + data_len].as_chunks_mut::<2>().0.iter_mut().zip(samples) {
         chunk.copy_from_slice(&sample.to_be_bytes());
     }
     if data_len & 1 != 0 {

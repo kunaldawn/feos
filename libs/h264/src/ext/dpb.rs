@@ -193,14 +193,14 @@ impl<P: Pixel> Dpb<P> {
     ) -> PocResult {
         let idr = nal_type == NalUnitType::SliceIdr;
         let max_frame_num = 1i32 << (sps.log2_max_frame_num_minus4 + 4).min(30);
-        let mut out = PocResult::default();
-        out.offset = if idr {
+        let offset = if idr {
             0
         } else if self.prev_frame_num > h.frame_num {
             self.prev_frame_num_offset.wrapping_add(max_frame_num)
         } else {
             self.prev_frame_num_offset
         };
+        let mut out = PocResult { offset, ..PocResult::default() };
         match sps.pic_order_cnt_type {
             0 => {
                 let (prev_msb, prev_lsb) = if idr {
@@ -870,11 +870,10 @@ impl<P: Pixel> Dpb<P> {
                 continue;
             }
             let store = self.stores.remove(at);
-            if spare.len() < 2 {
-                if let Some(data) = store.data.and_then(|data| Arc::try_unwrap(data).ok()) {
+            if spare.len() < 2
+                && let Some(data) = store.data.and_then(|data| Arc::try_unwrap(data).ok()) {
                     spare.push(data.motion);
                 }
-            }
         }
     }
 }

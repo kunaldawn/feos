@@ -13,3 +13,14 @@ feos-image = { workspace = true }
 feos-sync = { workspace = true }
 feos-text = { workspace = true }
 feos-yaml = { workspace = true }
+
+# This crate reads untrusted input: a malformed file must be an error, not a panic.
+# CI's clippy denies these (see `CLIPPY_FLAGS` in the Makefile).
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+string_slice = "warn"

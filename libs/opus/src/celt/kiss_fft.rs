@@ -137,12 +137,12 @@ impl FlatFft {
         let total = self.n;
         assert!(input.len() >= 2 * total && output.len() >= 2 * total);
         let mut from: Vec<(f64, f64)> =
-            input[..2 * total].chunks_exact(2).map(|c| (c[0] as f64, c[1] as f64)).collect();
+            input[..2 * total].as_chunks::<2>().0.iter().map(|c| (c[0] as f64, c[1] as f64)).collect();
         let mut to = vec![(0.0f64, 0.0f64); total];
         let mut size = total;
         let mut stride = 1;
         while size > 1 {
-            let radix = [2usize, 3, 5].into_iter().find(|p| size % p == 0).unwrap_or(size);
+            let radix = [2usize, 3, 5].into_iter().find(|p| size.is_multiple_of(*p)).unwrap_or(size);
             let m = size / radix;
             for p in 0..m {
                 for q in 0..stride {
@@ -164,7 +164,7 @@ impl FlatFft {
             size = m;
             stride *= radix;
         }
-        for (slot, value) in output.chunks_exact_mut(2).zip(&from) {
+        for (slot, value) in output.as_chunks_mut::<2>().0.iter_mut().zip(&from) {
             slot[0] = value.0 as f32;
             slot[1] = value.1 as f32;
         }

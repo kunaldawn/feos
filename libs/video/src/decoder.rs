@@ -490,6 +490,8 @@ impl<S: AsRef<[u8]>> VideoDecoder<S> {
         let compression = self.compression.clone();
         let table = &self.index;
         match &mut self.state {
+            // `State::None` returned an error above.
+            #[allow(clippy::unreachable)]
             State::None => unreachable!(),
             State::Intra => {
                 // A zero-length sample means "repeat the previous frame".
@@ -545,7 +547,7 @@ impl<S: AsRef<[u8]>> VideoDecoder<S> {
                 // Frame `next - 1` is on the canvas.
                 if index + 1 < stream.next || key >= stream.next {
                     stream.next = key;
-                    for pixel in stream.canvas.chunks_exact_mut(4) {
+                    for pixel in stream.canvas.as_chunks_mut::<4>().0 {
                         pixel.copy_from_slice(&[0, 0, 0, 255]);
                     }
                 }

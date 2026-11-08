@@ -123,8 +123,8 @@ impl AddressSpace {
 
     fn range_is_pages(&self, address: usize, length: usize) -> bool {
         length != 0
-            && address % PAGE_SIZE == 0
-            && length % PAGE_SIZE == 0
+            && address.is_multiple_of(PAGE_SIZE)
+            && length.is_multiple_of(PAGE_SIZE)
             && self.in_window(address, length)
     }
 
@@ -216,7 +216,7 @@ impl AddressSpace {
         access: PageAccess,
         frames: &mut dyn FrameSource,
     ) -> Result<(), MapError> {
-        if !self.range_is_pages(address, length) || first_frame % PAGE_SIZE != 0 {
+        if !self.range_is_pages(address, length) || !first_frame.is_multiple_of(PAGE_SIZE) {
             return Err(MapError::BadRange);
         }
         let mut done = 0;
@@ -305,7 +305,7 @@ impl AddressSpace {
 
     /// The kernel's address of the word at `address`, for a futex: aligned and mapped.
     pub fn translate_word(&self, address: usize) -> Result<usize, BadAddress> {
-        if address % 4 != 0 {
+        if !address.is_multiple_of(4) {
             return Err(BadAddress);
         }
         self.translate(address, false)

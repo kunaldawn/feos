@@ -101,7 +101,8 @@ impl<'a> Fdt<'a> {
             let Some(token) = be32(self.structure, offset) else {
                 return false;
             };
-            offset += 4;
+            // `be32` read four bytes there, so none of these steps can wrap.
+            offset = offset.saturating_add(4);
             match token {
                 TOKEN_BEGIN => {
                     let Some(rest) = self.structure.get(offset..) else {
@@ -117,8 +118,8 @@ impl<'a> Fdt<'a> {
                         return false;
                     }
                     visit(Event::Begin { name, depth });
-                    depth += 1;
-                    offset = (offset + length + 4) & !3;
+                    depth = depth.saturating_add(1);
+                    offset = offset.saturating_add(length).saturating_add(4) & !3;
                 }
                 TOKEN_END => {
                     let Some(next) = depth.checked_sub(1) else {
@@ -133,7 +134,7 @@ impl<'a> Fdt<'a> {
                     else {
                         return false;
                     };
-                    offset += 8;
+                    offset = offset.saturating_add(8);
                     let size = size as usize;
                     let Some(end) = offset.checked_add(size) else {
                         return false;
@@ -147,7 +148,7 @@ impl<'a> Fdt<'a> {
                     if depth == 0 {
                         return false;
                     }
-                    visit(Event::Property { name, value, depth: depth - 1 });
+                    visit(Event::Property { name, value, depth: depth.saturating_sub(1) });
                     let Some(next) = end.checked_add(3) else {
                         return false;
                     };
@@ -206,11 +207,11 @@ impl<'a> Fdt<'a> {
     /// CPUs: the children of `/cpus` whose names start with `cpu@`.
     pub fn cpu_count(&self) -> usize {
         let mut in_cpus = false;
-        let mut count = 0;
+        let mut count = 0usize;
         self.walk(|event| match event {
             Event::Begin { name, depth: 1 } => in_cpus = name == b"cpus",
             Event::End { depth: 1 } => in_cpus = false,
-            Event::Begin { name, depth: 2 } if in_cpus && name.starts_with(b"cpu@") => count += 1,
+            Event::Begin { name, depth: 2 } if in_cpus && name.starts_with(b"cpu@") => count = count.saturating_add(1),
             _ => {}
         });
         count

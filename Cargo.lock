@@ -420,6 +420,8 @@ name = "feos-gui"
 version = "0.1.0"
 dependencies = [
  "feos-gfx",
+ "feos-iconset",
+ "feos-image",
 ]
 
 [[package]]
@@ -439,7 +441,6 @@ name = "feos-iconset"
 version = "0.1.0"
 dependencies = [
  "feos-gfx",
- "feos-gui",
  "feos-image",
 ]
 

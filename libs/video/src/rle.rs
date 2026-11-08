@@ -120,7 +120,7 @@ pub(crate) fn decode_rle4(
                 }
                 n => {
                     let n = n as usize;
-                    let bytes = (n + 1) / 2;
+                    let bytes = n.div_ceil(2);
                     if pos + bytes > data.len() {
                         return Err(VideoError::UnexpectedEnd);
                     }

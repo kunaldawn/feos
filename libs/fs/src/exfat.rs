@@ -305,7 +305,7 @@ impl<D: BlockDevice> Exfat<D> {
             self.read_cluster(cluster, buffer)?;
             let cluster_start = self.cluster_offset(cluster)?;
 
-            for (entry_index, entry) in buffer.chunks_exact(32).enumerate() {
+            for (entry_index, entry) in buffer.as_chunks::<32>().0.iter().enumerate() {
                 let offset = cluster_start + entry_index as u64 * 32;
                 let entry_type = entry[0];
                 if entry_type == ENTRY_END {
@@ -660,7 +660,7 @@ impl<D: BlockDevice> Exfat<D> {
         loop {
             self.read_cluster(cluster, buffer)?;
             let mut end = false;
-            for entry in buffer.chunks_exact(32) {
+            for entry in buffer.as_chunks::<32>().0 {
                 if entry[0] == ENTRY_END {
                     end = true;
                     break;
@@ -764,7 +764,7 @@ impl<D: BlockDevice> Exfat<D> {
         table.extend((0..=0xffffu32).map(|value| value as u16));
         let mut index = 0usize;
         let mut skip = false;
-        for chunk in bytes.chunks_exact(2) {
+        for chunk in bytes.as_chunks::<2>().0 {
             let unit = u16::from_le_bytes([chunk[0], chunk[1]]);
             if skip {
                 index = index.saturating_add(unit as usize);
@@ -1498,7 +1498,7 @@ impl<D: WritableBlockDevice> Exfat<D> {
         loop {
             self.read_cluster(cluster, &mut buffer)?;
             let base = self.cluster_offset(cluster)?;
-            for (entry_index, entry) in buffer.chunks_exact(32).enumerate() {
+            for (entry_index, entry) in buffer.as_chunks::<32>().0.iter().enumerate() {
                 if entry[0] < 0x80 {
                     offsets.push(base + entry_index as u64 * 32);
                     if offsets.len() == needed {

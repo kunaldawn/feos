@@ -56,7 +56,7 @@ impl fmt::Display for AudioError {
 pub type Result<T> = core::result::Result<T, AudioError>;
 
 pub(crate) fn need(len: usize, index: usize, n: usize) -> Result<()> {
-    if index.checked_add(n).map_or(true, |end| end > len) {
+    if index.checked_add(n).is_none_or(|end| end > len) {
         Err(AudioError::UnexpectedEnd)
     } else {
         Ok(())

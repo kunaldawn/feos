@@ -399,7 +399,7 @@ impl DesktopConfig {
             if self.taskbar.clock_24h { 24 } else { 12 },
         );
         if let Some((width, height)) = self.resolution {
-            let _ = write!(text, "resolution: {width}x{height}\n");
+            let _ = writeln!(text, "resolution: {width}x{height}");
         }
         text
     }

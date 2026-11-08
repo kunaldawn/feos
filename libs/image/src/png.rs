@@ -38,7 +38,7 @@ impl Header {
     }
 
     fn bytes_per_pixel(self) -> usize {
-        (self.bits_per_pixel() + 7) / 8
+        self.bits_per_pixel().div_ceil(8)
     }
 
     fn filter_bpp(self) -> usize {
@@ -46,7 +46,7 @@ impl Header {
     }
 
     fn row_bytes(self, width: usize) -> usize {
-        (width * self.bits_per_pixel() + 7) / 8
+        (width * self.bits_per_pixel()).div_ceil(8)
     }
 }
 
@@ -106,7 +106,7 @@ fn parse_header(input: &[u8]) -> Result<(Header, usize)> {
     Ok((header, data_offset + 13 + 4))
 }
 
-fn next_chunk<'a>(input: &'a [u8], pos: usize) -> Result<([u8; 4], &'a [u8], usize)> {
+fn next_chunk(input: &[u8], pos: usize) -> Result<([u8; 4], &[u8], usize)> {
     need(input.len(), pos, 8)?;
     let length = be_u32(input, pos)? as usize;
     let kind = [
@@ -141,12 +141,12 @@ fn pass_size(header: Header, pass: usize) -> (usize, usize) {
     let width = header.width as usize;
     let height = header.height as usize;
     let pw = if width > ADAM7_X_START[pass] {
-        (width - ADAM7_X_START[pass] + ADAM7_X_STEP[pass] - 1) / ADAM7_X_STEP[pass]
+        (width - ADAM7_X_START[pass]).div_ceil(ADAM7_X_STEP[pass])
     } else {
         0
     };
     let ph = if height > ADAM7_Y_START[pass] {
-        (height - ADAM7_Y_START[pass] + ADAM7_Y_STEP[pass] - 1) / ADAM7_Y_STEP[pass]
+        (height - ADAM7_Y_START[pass]).div_ceil(ADAM7_Y_STEP[pass])
     } else {
         0
     };
@@ -701,7 +701,7 @@ pub fn encode_rgba(width: u32, height: u32, pixels: &[u8], out: &mut [u8]) -> Re
     let raw_len = row_len
         .checked_mul(height as usize)
         .ok_or(ImageError::Overflow)?;
-    let blocks = (raw_len + 65534) / 65535;
+    let blocks = raw_len.div_ceil(65535);
     let idat_len = 2 + blocks * 5 + raw_len + 4;
 
     let start = writer.chunk_begin(b"IDAT", idat_len)?;

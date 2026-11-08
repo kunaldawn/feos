@@ -86,6 +86,8 @@ fn write_value<W: Write>(
 }
 
 /// Writes `text` as a JSON string, with what JSON needs escaped.
+// Only ASCII bytes are escaped, so the offsets fall on character boundaries.
+#[allow(clippy::string_slice)]
 pub(crate) fn write_string<W: Write>(out: &mut W, text: &str) -> fmt::Result {
     out.write_char('"')?;
     let mut clean = 0;

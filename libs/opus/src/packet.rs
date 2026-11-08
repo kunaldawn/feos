@@ -63,7 +63,7 @@ pub(crate) fn parse_packet(packet: &[u8]) -> Result<ParsedPacket<'_>, Error> {
             if payload.len() < 2 {
                 return Err(Error::BadPacket);
             }
-            if payload.len() % 2 != 0 {
+            if !payload.len().is_multiple_of(2) {
                 return Err(Error::BadPacket);
             }
             let sz0 = payload.len() / 2;
@@ -130,7 +130,7 @@ pub(crate) fn parse_packet(packet: &[u8]) -> Result<ParsedPacket<'_>, Error> {
                 sizes[frame_count - 1] = remaining - sum;
             } else {
                 let remaining = data_end.saturating_sub(idx);
-                if remaining % frame_count != 0 {
+                if !remaining.is_multiple_of(frame_count) {
                     return Err(Error::BadPacket);
                 }
                 let sz = remaining / frame_count;

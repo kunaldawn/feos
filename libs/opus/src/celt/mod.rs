@@ -183,7 +183,7 @@ impl CeltDecoder {
     /// Returns: per-channel sample count at the configured public output rate.
     fn output_frame_size(&self, frame_size_48k: usize) -> Result<usize, Error> {
         let downsample = self.downsample_factor()?;
-        if frame_size_48k % downsample != 0 {
+        if !frame_size_48k.is_multiple_of(downsample) {
             return Err(Error::NotImplemented);
         }
         Ok(frame_size_48k / downsample)
@@ -878,8 +878,7 @@ impl CeltDecoder {
                 postfilter_tapset
             );
         }
-        if postfilter_pitch > 0 {
-        }
+        
         tell = ec.tell();
         if trace_this_packet {
             debug_trace!(
@@ -894,6 +893,8 @@ impl CeltDecoder {
             240 => 1,
             480 => 2,
             960 => 3,
+            // Checked against these four sizes at the top of this function.
+            #[allow(clippy::unreachable)]
             _ => unreachable!(),
         };
         let is_transient = if lm > 0 && tell + 3 <= total_bits {

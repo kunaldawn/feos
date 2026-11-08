@@ -654,29 +654,25 @@ pub(crate) fn predict_mv(
     // Special cases for 16x8 and 8x16 (spec 8.4.1.3.1)
     if part_w == 16 && part_h == 8 {
         if part_idx == 0 {
-            if let Some((mv, ri)) = b {
-                if ri == ref_idx {
+            if let Some((mv, ri)) = b
+                && ri == ref_idx {
                     return (mv[0], mv[1]);
                 }
-            }
-        } else if let Some((mv, ri)) = a {
-            if ri == ref_idx {
+        } else if let Some((mv, ri)) = a
+            && ri == ref_idx {
                 return (mv[0], mv[1]);
             }
-        }
     }
     if part_w == 8 && part_h == 16 {
         if part_idx == 0 {
-            if let Some((mv, ri)) = a {
-                if ri == ref_idx {
+            if let Some((mv, ri)) = a
+                && ri == ref_idx {
                     return (mv[0], mv[1]);
                 }
-            }
-        } else if let Some((mv, ri)) = c {
-            if ri == ref_idx {
+        } else if let Some((mv, ri)) = c
+            && ri == ref_idx {
                 return (mv[0], mv[1]);
             }
-        }
     }
 
     let mv = predict_mv_from_neighbors(a, b, c, ref_idx);
@@ -710,7 +706,7 @@ fn mbaff_left_neighbor(
         return None;
     }
     let left_pair = pair_addr - 1;
-    let is_top = mb_idx % 2 == 0;
+    let is_top = mb_idx.is_multiple_of(2);
     let cur_is_field = mb_field_decoding[pair_addr];
     let left_is_field = mb_field_decoding[left_pair];
 
@@ -759,7 +755,7 @@ fn mbaff_above_neighbor(
     mb_field_decoding: &[bool],
 ) -> Option<(usize, usize)> {
     let pair_addr = mb_idx / 2;
-    let is_top = mb_idx % 2 == 0;
+    let is_top = mb_idx.is_multiple_of(2);
 
     if !is_top {
         // Bottom MB: above is top MB of same pair
@@ -1029,7 +1025,7 @@ pub(crate) fn get_mv_neighbor_above_right_mbaff(
             // For bottom MBs, the "above" is the top of the same pair.
             // The pair to the right of the above is in the same pair row,
             // which hasn't been decoded yet → unavailable.
-            if mb_idx % 2 != 0 {
+            if !mb_idx.is_multiple_of(2) {
                 return None;
             }
             let pair_addr = mb_idx / 2;

@@ -226,7 +226,7 @@ pub(crate) struct StreamView<'x, 'y> {
 impl StreamView<'_, '_> {
     fn poll(&mut self) -> bool {
         self.calls = self.calls.wrapping_add(1);
-        if self.calls % POLL_INTERVAL == 0 {
+        if self.calls.is_multiple_of(POLL_INTERVAL) {
             if let Some(host) = self.host.as_deref_mut() {
                 if host.poll_cancel() {
                     self.cancel.cancel();

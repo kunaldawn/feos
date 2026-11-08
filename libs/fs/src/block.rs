@@ -33,7 +33,7 @@ pub trait BlockDevice: Sync {
     /// them. A real disk does this in one request.
     fn read_blocks(&self, start: u64, out: &mut [u8]) -> Result<(), FsError> {
         let size = self.block_size();
-        if size == 0 || out.len() % size != 0 {
+        if size == 0 || !out.len().is_multiple_of(size) {
             return Err(FsError::InvalidBuffer);
         }
         for (index, chunk) in out.chunks_exact_mut(size).enumerate() {
@@ -129,7 +129,7 @@ pub trait WritableBlockDevice: BlockDevice + Send {
     /// Writes consecutive blocks. `data` is a whole number of blocks.
     fn write_blocks(&mut self, start: u64, data: &[u8]) -> Result<(), FsError> {
         let size = self.block_size();
-        if size == 0 || data.len() % size != 0 {
+        if size == 0 || !data.len().is_multiple_of(size) {
             return Err(FsError::InvalidBuffer);
         }
         for (index, chunk) in data.chunks_exact(size).enumerate() {
@@ -297,11 +297,7 @@ impl BlockDevice for MemoryBlockDevice<'_> {
     }
 
     fn block_count(&self) -> u64 {
-        if self.block_size == 0 {
-            0
-        } else {
-            (self.data.len() / self.block_size) as u64
-        }
+        self.data.len().checked_div(self.block_size).unwrap_or(0) as u64
     }
 
     fn read_block(&self, block: u64, out: &mut [u8]) -> Result<(), FsError> {
@@ -369,11 +365,7 @@ impl BlockDevice for MemoryBlockDeviceMut<'_> {
     }
 
     fn block_count(&self) -> u64 {
-        if self.block_size == 0 {
-            0
-        } else {
-            (self.data.len() / self.block_size) as u64
-        }
+        self.data.len().checked_div(self.block_size).unwrap_or(0) as u64
     }
 
     fn read_block(&self, block: u64, out: &mut [u8]) -> Result<(), FsError> {
@@ -427,7 +419,7 @@ impl RamDisk {
         if block_size == 0
             || block_size > MAX_BLOCK_SIZE
             || !block_size.is_power_of_two()
-            || size % block_size != 0
+            || !size.is_multiple_of(block_size)
         {
             return Err(FsError::UnsupportedBlockSize);
         }

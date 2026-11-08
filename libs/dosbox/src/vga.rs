@@ -2278,7 +2278,7 @@ impl Vga {
 
     fn render_vesa(&self, screen: &mut [u32]) {
         for (y, row) in screen
-            .chunks_exact_mut(SCREEN_WIDTH)
+            .as_chunks_mut::<SCREEN_WIDTH>().0.iter_mut()
             .take(self.display_height)
             .enumerate()
         {
@@ -2367,7 +2367,7 @@ impl Vga {
         line: &mut [u8],
     ) {
         let clocks = needed / 4 + 1;
-        for (clock, slot) in line.chunks_exact_mut(4).take(clocks).enumerate() {
+        for (clock, slot) in line.as_chunks_mut::<4>().0.iter_mut().take(clocks).enumerate() {
             let at = addressing.address(counter.wrapping_add(clock as u32), scan) as usize;
             slot.copy_from_slice(&self.planes[at & (PLANE_SIZE - 1)].to_le_bytes());
         }
@@ -2382,7 +2382,7 @@ impl Vga {
         line: &mut [u8],
     ) {
         let clocks = needed / 8 + 1;
-        for (clock, slot) in line.chunks_exact_mut(8).take(clocks).enumerate() {
+        for (clock, slot) in line.as_chunks_mut::<8>().0.iter_mut().take(clocks).enumerate() {
             let at = addressing.address(counter.wrapping_add(clock as u32), scan) as usize;
             let word = self.planes[at & (PLANE_SIZE - 1)];
             let pixels = PIXEL_BITS[(word & 0xFF) as usize]

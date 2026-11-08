@@ -30,7 +30,7 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     tail[remainder.len()] = 0x80;
     let tail_len = if remainder.len() < 56 { 64 } else { 128 };
     tail[tail_len - 8..tail_len].copy_from_slice(&bit_len.to_be_bytes());
-    for chunk in tail[..tail_len].chunks_exact(64) {
+    for chunk in tail[..tail_len].as_chunks::<64>().0 {
         compress(&mut state, chunk);
     }
 
@@ -43,7 +43,7 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 
 fn compress(state: &mut [u32; 8], chunk: &[u8]) {
     let mut schedule = [0u32; 64];
-    for (index, word) in chunk.chunks_exact(4).enumerate() {
+    for (index, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
         schedule[index] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
     }
     for index in 16..64 {

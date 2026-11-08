@@ -48,27 +48,28 @@ static STATE: SpinLock<Option<State>> = SpinLock::new(None);
 
 /// Everything the session accepts, in a fixed order.
 fn build_rows(modes: &str) -> Vec<Row> {
-    let mut rows = Vec::new();
-    rows.push(Row {
-        label: "Colour scheme",
-        key: "theme",
-        values: ThemeName::ALL.iter().map(|theme| String::from(theme.name())).collect(),
-    });
-    rows.push(Row {
-        label: "Keyboard layout",
-        key: "keyboard",
-        values: KeyboardLayout::ALL.iter().map(|layout| String::from(layout.name())).collect(),
-    });
-    rows.push(Row {
-        label: "Wallpaper",
-        key: "wallpaper",
-        values: WallpaperPreset::ALL.iter().map(|preset| String::from(preset.name())).collect(),
-    });
-    rows.push(Row {
-        label: "Clock",
-        key: "clock",
-        values: alloc::vec![String::from("24"), String::from("12")],
-    });
+    let mut rows = alloc::vec![
+        Row {
+            label: "Colour scheme",
+            key: "theme",
+            values: ThemeName::ALL.iter().map(|theme| String::from(theme.name())).collect(),
+        },
+        Row {
+            label: "Keyboard layout",
+            key: "keyboard",
+            values: KeyboardLayout::ALL.iter().map(|layout| String::from(layout.name())).collect(),
+        },
+        Row {
+            label: "Wallpaper",
+            key: "wallpaper",
+            values: WallpaperPreset::ALL.iter().map(|preset| String::from(preset.name())).collect(),
+        },
+        Row {
+            label: "Clock",
+            key: "clock",
+            values: alloc::vec![String::from("24"), String::from("12")],
+        },
+    ];
     // Only what this machine's display can do, once the session has said.
     let values: Vec<String> = modes.split_whitespace().map(String::from).collect();
     if !values.is_empty() {

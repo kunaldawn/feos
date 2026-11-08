@@ -78,12 +78,11 @@ impl Pager {
                     text.pop();
                     self.searching = Some(text);
                 }
-                Key::Enter => {
-                    if !text.is_empty() {
+                Key::Enter
+                    if !text.is_empty() => {
                         self.search(&text, self.top);
                         self.last_search = text;
                     }
-                }
                 _ => {}
             }
             return false;

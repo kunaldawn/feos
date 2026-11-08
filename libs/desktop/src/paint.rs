@@ -11,24 +11,13 @@ use crate::config::{TaskbarConfig, WallpaperConfig, WallpaperStyle};
 use crate::theme::DesktopTheme;
 
 /// Draws a decoded bundle icon, scaling it to `rect` with nearest-neighbour
-/// sampling. An empty icon becomes a small coloured placeholder.
-pub fn draw_icon(painter: &mut Painter<'_, '_>, icon: &Icon, rect: Rect, fallback: Color) {
+/// sampling. An app without an icon gets the iconset's plain program window.
+pub fn draw_icon(painter: &mut Painter<'_, '_>, icon: &Icon, rect: Rect, _fallback: Color) {
     if rect.is_empty() || !painter.visible(rect) {
         return;
     }
     if icon.is_empty() {
-        painter.fill_rounded_rect(rect, 4, fallback);
-        let inset = (rect.width.min(rect.height) / 4) as i32;
-        painter.fill_rounded_rect(
-            Rect::new(
-                rect.x + inset,
-                rect.y + inset,
-                rect.width.saturating_sub((inset * 2) as u32),
-                rect.height.saturating_sub((inset * 2) as u32),
-            ),
-            3,
-            Color::WHITE,
-        );
+        feos_gui::paint_stock(painter, feos_gui::Stock::Application, rect);
         return;
     }
 
@@ -169,7 +158,9 @@ pub fn draw_start_flag(painter: &mut Painter<'_, '_>, rect: Rect) {
     }
 }
 
-pub use feos_gui::{cursor_bounds, draw_cursor, draw_cursor_shape, CursorShape};
+pub use feos_gui::{
+    cursor_bounds, cursor_frame_left, draw_cursor, draw_cursor_shape, draw_cursor_shape_at, CursorShape,
+};
 
 #[cfg(test)]
 mod tests {
@@ -215,16 +206,16 @@ mod tests {
         let mut canvas = Canvas::new(&mut pixels, 64, 64, 64).unwrap();
         canvas.fill_rect(Rect::new(0, 0, 64, 64), background);
         let mut painter = Painter::new(&mut canvas);
-        draw_cursor(&mut painter, 8, 8);
+        draw_cursor(&mut painter, 16, 16);
 
         // The tip and the white interior are painted.
-        assert_eq!(painter.pixel(8, 8), Some(Color::BLACK));
-        assert_eq!(painter.pixel(9, 10), Some(Color::WHITE));
+        assert_eq!(painter.pixel(16, 16), Some(Color::BLACK));
+        assert_eq!(painter.pixel(17, 19), Some(Color::WHITE));
 
         // The area to the right of the arrow stays transparent, so the cursor
         // never appears as a white rectangle on the wallpaper.
-        assert_eq!(painter.pixel(9, 8), Some(background));
-        assert_eq!(painter.pixel(18, 16), Some(background));
+        assert_eq!(painter.pixel(17, 16), Some(background));
+        assert_eq!(painter.pixel(26, 24), Some(background));
     }
 
     #[test]

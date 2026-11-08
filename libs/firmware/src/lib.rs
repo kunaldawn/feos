@@ -54,7 +54,7 @@ impl RegionList {
         }
         if let Some(entry) = self.regions.get_mut(self.count) {
             *entry = region;
-            self.count += 1;
+            self.count = self.count.saturating_add(1);
         }
     }
 

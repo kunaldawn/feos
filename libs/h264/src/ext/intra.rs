@@ -95,7 +95,7 @@ pub(crate) fn pred4x4<P: Pixel>(
                 }
             }
         }
-        4 | 5 | 6 => {
+        4..=6 => {
             // A line through the corner: e[0..=8] runs from the bottom of the left
             // column, through the corner, along the top row.
             let e = [l[3], l[2], l[1], l[0], tl, t[0], t[1], t[2], t[3]];
@@ -285,7 +285,7 @@ pub(crate) fn pred8x8l<P: Pixel>(
                 }
             }
         }
-        4 | 5 | 6 => {
+        4..=6 => {
             // e[8] is the corner, e[9..] the top row, e[7] downwards the left column.
             let mut e = [0i32; 17];
             for i in 0..8 {

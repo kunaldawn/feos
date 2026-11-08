@@ -122,7 +122,7 @@ impl<D: BlockDevice> Fat16<D> {
         self.volume.read_bytes(self.root_start, &mut root)?;
         let root_start = self.root_start;
         let mut lfn = LfnState::new();
-        for (index, entry) in root.chunks_exact(32).enumerate() {
+        for (index, entry) in root.as_chunks::<32>().0.iter().enumerate() {
             let offset = root_start + index as u64 * 32;
             if !self.scan_entry(entry, offset, 0, 0, &mut lfn, &mut queue, &visited)? {
                 break;
@@ -157,7 +157,7 @@ impl<D: BlockDevice> Fat16<D> {
             }
             let base = self.cluster_offset(cluster)?;
             self.volume.read_bytes(base, buffer)?;
-            for (index, entry) in buffer.chunks_exact(32).enumerate() {
+            for (index, entry) in buffer.as_chunks::<32>().0.iter().enumerate() {
                 entries += 1;
                 if entries > MAX_DIRECTORY_ENTRIES {
                     self.damaged = true;

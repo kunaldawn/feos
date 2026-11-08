@@ -445,10 +445,8 @@ fn tar_read(
         let result = if entry.is_dir() {
             make_parents(ctx, &target)
         } else if entry.is_file() {
-            match crate::fs::parent(&ctx.fs.resolve(&target)).to_string() {
-                parent => make_parents(ctx, &parent)
-                    .and_then(|()| ctx.fs.write_file(&target, entry.data, false)),
-            }
+            let parent = crate::fs::parent(&ctx.fs.resolve(&target)).to_string();
+            make_parents(ctx, &parent).and_then(|()| ctx.fs.write_file(&target, entry.data, false))
         } else if entry.is_symlink() {
             // Its target isn't checked: a link can point anywhere, and only what's
             // written through it is confined, by the path checks on later members.

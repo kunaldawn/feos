@@ -187,7 +187,7 @@ impl<T: ?Sized> SpinLock<T> {
             while self.locked.load(Ordering::Relaxed) {
                 irq::wait_event();
                 spins = spins.wrapping_add(1);
-                if spins % RELAX_SPINS == 0 {
+                if spins.is_multiple_of(RELAX_SPINS) {
                     yield_now();
                 }
             }

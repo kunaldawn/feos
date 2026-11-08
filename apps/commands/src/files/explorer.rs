@@ -1490,11 +1490,9 @@ impl ExplorerState {
     }
 
     fn set_message(&mut self, text: &str, now: u64) {
-        if self.message.set(text) {
-            self.message_until = now.saturating_add(3500);
-        } else {
-            self.message_until = now.saturating_add(3500);
-        }
+        // A message too long to keep whole is still shown, cut short.
+        let _ = self.message.set(text);
+        self.message_until = now.saturating_add(3500);
     }
 
     fn read_only(&mut self, now: u64) {
@@ -2822,12 +2820,11 @@ impl ExplorerState {
             }
             return false;
         }
-        if self.address_dropdown {
-            if key == Key::Escape {
+        if self.address_dropdown
+            && key == Key::Escape {
                 self.address_dropdown = false;
                 return false;
             }
-        }
 
         if key == Key::F1 {
             self.dialog = Dialog::About;
@@ -3126,11 +3123,10 @@ impl ExplorerState {
         }
         if self.focus == Focus::Address {
             self.address.insert(ch);
-        } else if self.focus == Focus::Search {
-            if self.search.insert(ch) {
+        } else if self.focus == Focus::Search
+            && self.search.insert(ch) {
                 self.search_dirty = true;
             }
-        }
     }
 
     fn menu_key(&mut self, fs: &dyn FileSystem, key: Key, now: u64) {
@@ -3932,12 +3928,7 @@ fn title_button_rect(layout: Layout, index: usize) -> Rect {
 }
 
 fn title_button_at(layout: Layout, point: Point) -> Option<usize> {
-    for index in 0..3 {
-        if title_button_rect(layout, index).contains(point) {
-            return Some(index);
-        }
-    }
-    None
+    (0..3).find(|&index| title_button_rect(layout, index).contains(point))
 }
 
 /// Thickness of the invisible resize border around the explorer window.
@@ -4008,12 +3999,7 @@ fn toolbar_button_at(layout: Layout, point: Point) -> Option<usize> {
     if !layout.toolbar.contains(point) {
         return None;
     }
-    for index in 0..6 {
-        if toolbar_button_rect(layout, index).contains(point) {
-            return Some(index);
-        }
-    }
-    None
+    (0..6).find(|&index| toolbar_button_rect(layout, index).contains(point))
 }
 
 fn address_field_rect(layout: Layout) -> Rect {
@@ -4126,7 +4112,7 @@ fn grid_metrics(state: &ExplorerState, list: Rect, main_width: u32) -> GridMetri
     let rows = if state.entry_count == 0 {
         0
     } else {
-        (state.entry_count + columns - 1) / columns
+        state.entry_count.div_ceil(columns)
     };
     GridMetrics {
         columns,
@@ -4242,7 +4228,41 @@ pub(super) fn frame_window(
     }
 
     render(context.canvas, fs, state, now);
+    context.cursor = content_cursor(state);
     WindowFrame::Continue
+}
+
+/// The pointer for where it is in the window: the text beam over the address
+/// and search fields, the hand over the task links.
+fn content_cursor(state: &ExplorerState) -> feos_gui::CursorShape {
+    use feos_gui::CursorShape;
+    if !state.has_pointer
+        || state.menu_open.is_some()
+        || state.context.is_some()
+        || state.dialog != Dialog::None
+    {
+        return CursorShape::Arrow;
+    }
+    let layout = Layout::compute(state.screen, state);
+    let point = state.pointer;
+    if address_field_rect(layout).contains(point) {
+        return CursorShape::Text;
+    }
+    if let Some(sidebar) = layout.sidebar {
+        match state.bar {
+            ExplorerBar::Search if search_field_rect(sidebar).contains(point) => {
+                return CursorShape::Text;
+            }
+            // The task links sit under the folder tree.
+            ExplorerBar::Folders
+                if (0..4).any(|index| task_link_rect(layout, index).contains(point)) =>
+            {
+                return CursorShape::Link;
+            }
+            _ => {}
+        }
+    }
+    CursorShape::Arrow
 }
 
 pub(super) fn close_window() {
@@ -4696,7 +4716,7 @@ fn render(canvas: &mut Canvas<'_>, fs: &dyn FileSystem, state: &mut ExplorerStat
         {
             resize_edge_at(layout.window, state.pointer)
                 .map(resize_cursor)
-                .unwrap_or(feos_gui::CursorShape::Arrow)
+                .unwrap_or_else(|| content_cursor(state))
         } else {
             feos_gui::CursorShape::Arrow
         };
@@ -4763,7 +4783,7 @@ fn draw_window(
             let _ = write!(
                 title,
                 "{} - File Explorer",
-                &shown_name(fs, state.current, "/")
+                shown_name(fs, state.current, "/")
             );
         }
         let buttons_left = title_button_rect(layout, 0).x - 6;
@@ -8445,6 +8465,7 @@ mod tests {
             origin: Point::new(0, 0),
             pointer_active: true,
             keyboard_active: true,
+            cursor: feos_gui::CursorShape::Arrow,
         };
         if open {
             assert!(open_window(fs, &context));

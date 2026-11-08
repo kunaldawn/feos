@@ -1972,7 +1972,7 @@ impl Dos {
                 self.write_stdout(mem, vga, &[ch]);
                 regs.set_al(ch);
             }
-            0x03 | 0x04 | 0x05 => regs.set_al(0),
+            0x03..=0x05 => regs.set_al(0),
             0x06 => {
                 if regs.dl() == 0xFF {
                     if let Some(ch) = self.console_char(mem) {

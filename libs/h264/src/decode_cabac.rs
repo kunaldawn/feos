@@ -93,7 +93,7 @@ impl SliceContext<'_> {
         // This matches FFmpeg/x264's CABAC encoding order.
         if self.mbaff && !(sp.is_p_slice || sp.is_b_slice) {
             // I-slice: field_flag for all top MBs (no skip flags exist)
-            if mb_idx % 2 == 0 {
+            if mb_idx.is_multiple_of(2) {
                 self.decode_mbaff_field_flag(cr, st, mb_idx);
             }
         }
@@ -121,7 +121,7 @@ impl SliceContext<'_> {
 
             // MBAFF: after skip flag, handle field_flag based on skip result
             if self.mbaff {
-                let is_top = mb_idx % 2 == 0;
+                let is_top = mb_idx.is_multiple_of(2);
                 if is_top && is_skip {
                     // Top MB is skipped. Check bottom skip immediately (FFmpeg pattern).
                     // The bottom's skip_flag is decoded WITHOUT field_flag first.
@@ -212,7 +212,7 @@ impl SliceContext<'_> {
                         && self.mb_slice_id[mb_idx - self.mb_width as usize + 1]
                             == self.this_slice_id
                         && self.is_intra_neighbor_avail(mb_idx - self.mb_width as usize + 1, sp)
-                } else if mb_idx % 2 != 0 {
+                } else if !mb_idx.is_multiple_of(2) {
                     // MBAFF bottom MBs: above-right is in the next pair (not yet decoded)
                     false
                 } else {
@@ -708,7 +708,8 @@ impl SliceContext<'_> {
                     for blk in 0..16 {
                         let (blk_row, blk_col) = BLOCK_INDEX_TO_OFFSET[blk];
                         let mut block_raster = [0i32; 16];
-                        let dc_idx = DC_RASTER_TO_BLOCK_P.iter().position(|&b| b == blk).unwrap();
+                        // The order is its own inverse, so this is where `blk` is in it.
+                        let dc_idx = DC_RASTER_TO_BLOCK_P[blk];
                         block_raster[0] = luma_dc_raster[dc_idx];
 
                         if cbp_luma != 0 {
@@ -928,6 +929,8 @@ impl SliceContext<'_> {
                     1 => (16, 8, 2),                 // P_L0_L0_16x8
                     2 => (8, 16, 2),                 // P_L0_L0_8x16
                     3 | 4 => (8, 8, 4),              // P_8x8 / P_8x8ref0
+                    // P types are 0 to 4: from 5 up they are intra, and took the branch above.
+                    #[allow(clippy::unreachable)]
                     _ => unreachable!(),
                 };
 
@@ -2396,6 +2399,8 @@ impl SliceContext<'_> {
                             (8, 4) => ([(0, 0), (0, 4), (0, 0), (0, 0)], 2),
                             (4, 8) => ([(0, 0), (4, 0), (0, 0), (0, 0)], 2),
                             (4, 4) => ([(0, 0), (4, 0), (0, 4), (4, 4)], 4),
+                            // `B_SUB_TABLE` holds only these four shapes.
+                            #[allow(clippy::unreachable)]
                             _ => unreachable!(),
                         };
                         layouts[layout_count] = BSubLayout {
@@ -3401,7 +3406,7 @@ impl SliceContext<'_> {
             } else {
                 // For MBAFF bottom MBs, the above-right is in the next pair which
                 // hasn't been decoded yet — so it's unavailable.
-                if mb_idx % 2 != 0 {
+                if !mb_idx.is_multiple_of(2) {
                     false
                 } else {
                     self.above_mb(mb_idx)
@@ -3797,7 +3802,8 @@ impl SliceContext<'_> {
             for blk in 0..16 {
                 let (blk_row, blk_col) = BLOCK_INDEX_TO_OFFSET[blk];
                 let mut block_raster = [0i32; 16];
-                let dc_idx = DC_RASTER_TO_BLOCK.iter().position(|&b| b == blk).unwrap();
+                // The order is its own inverse, so this is where `blk` is in it.
+                let dc_idx = DC_RASTER_TO_BLOCK[blk];
                 block_raster[0] = luma_dc_raster[dc_idx];
 
                 if cbp_luma != 0 {

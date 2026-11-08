@@ -588,7 +588,7 @@ impl Runner<'_> {
                 if *step == 0 {
                     self.line_number == *first
                 } else {
-                    self.line_number >= *first && (self.line_number - first) % step == 0
+                    self.line_number >= *first && (self.line_number - first).is_multiple_of(*step)
                 }
             }
             Address::Regex(regex) => regex.is_match(space),

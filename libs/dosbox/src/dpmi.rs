@@ -813,7 +813,7 @@ impl SystemBus {
     /// A software interrupt's handler: an `IRET` frame on the client's own stack.
     fn call_on_client_stack(&mut self, cpu: &mut Cpu, mut context: Context, handler: (u16, u32)) {
         let frame = [
-            context.flags & 0xFFFF_FFFF,
+            context.flags,
             context.sregs[CS] as u32,
             context.ip,
         ];
@@ -2096,7 +2096,7 @@ impl SystemBus {
             }
             0x0205 => self.set_pm_vector(bx as u8, cx, offset32(context, DX)),
             // Calling real-mode code.
-            0x0300 | 0x0301 | 0x0302 => return self.real_call(cpu, ax, context),
+            0x0300..=0x0302 => return self.real_call(cpu, ax, context),
             0x0303 => {
                 let client = self.dpmi.clients.last_mut().ok_or(error::BAD_STATE)?;
                 let slot = client

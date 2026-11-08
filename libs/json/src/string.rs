@@ -47,7 +47,7 @@ impl<'a> JsonString<'a> {
     /// Returns `None` when `out` is too small or the source contains an
     /// invalid escape. The parser validates escapes before a document can be
     /// built, so the latter only happens for hand-built strings.
-    pub fn decode_into<'b>(self, out: &'b mut [u8]) -> Option<&'b str> {
+    pub fn decode_into(self, out: &mut [u8]) -> Option<&str> {
         let mut written = 0usize;
         let bytes = self.raw.as_bytes();
         let mut i = 0usize;

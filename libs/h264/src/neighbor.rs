@@ -22,14 +22,14 @@ pub(crate) fn cabac_amvd(
 ) -> u32 {
     // Compute left and above neighbor MB indices (MBAFF-aware)
     let (has_left, left_mb_idx, has_above, above_mb_idx) = if !mbaff {
-        let has_left = mb_idx % mb_width != 0;
+        let has_left = !mb_idx.is_multiple_of(mb_width);
         let left = if has_left { mb_idx - 1 } else { 0 };
         let has_above = mb_idx >= mb_width;
         let above = if has_above { mb_idx - mb_width } else { 0 };
         (has_left, left, has_above, above)
     } else {
         let pair_addr = mb_idx / 2;
-        let has_left = pair_addr % mb_width != 0;
+        let has_left = !pair_addr.is_multiple_of(mb_width);
         let left = if has_left {
             (pair_addr - 1) * 2 + (mb_idx % 2)
         } else {
@@ -41,11 +41,11 @@ pub(crate) fn cabac_amvd(
             pair_addr >= mb_width
         } else {
             // Frame-coded: above is top of same pair (always available for bottom)
-            mb_idx % 2 != 0 || pair_addr >= mb_width
+            !mb_idx.is_multiple_of(2) || pair_addr >= mb_width
         };
         let above = if !has_above {
             0
-        } else if mb_idx % 2 != 0 && !is_field {
+        } else if !mb_idx.is_multiple_of(2) && !is_field {
             mb_idx - 1 // Frame-coded: top of same pair
         } else {
             (pair_addr - mb_width) * 2 + 1
@@ -109,14 +109,14 @@ pub(crate) fn cabac_neighbor_ref(
 ) -> (i8, i8) {
     // Compute left and above neighbor MB indices (MBAFF-aware)
     let (has_left, left_mb_idx, has_above, above_mb_idx) = if !mbaff {
-        let has_left = mb_idx % mb_width != 0;
+        let has_left = !mb_idx.is_multiple_of(mb_width);
         let left = if has_left { mb_idx - 1 } else { 0 };
         let has_above = mb_idx >= mb_width;
         let above = if has_above { mb_idx - mb_width } else { 0 };
         (has_left, left, has_above, above)
     } else {
         let pair_addr = mb_idx / 2;
-        let has_left = pair_addr % mb_width != 0;
+        let has_left = !pair_addr.is_multiple_of(mb_width);
         let left = if has_left {
             (pair_addr - 1) * 2 + (mb_idx % 2)
         } else {
@@ -128,11 +128,11 @@ pub(crate) fn cabac_neighbor_ref(
             pair_addr >= mb_width
         } else {
             // Frame-coded: above is top of same pair (always available for bottom)
-            mb_idx % 2 != 0 || pair_addr >= mb_width
+            !mb_idx.is_multiple_of(2) || pair_addr >= mb_width
         };
         let above = if !has_above {
             0
-        } else if mb_idx % 2 != 0 && !is_field {
+        } else if !mb_idx.is_multiple_of(2) && !is_field {
             mb_idx - 1 // Frame-coded: top of same pair
         } else {
             (pair_addr - mb_width) * 2 + 1
@@ -218,7 +218,7 @@ pub(crate) fn cabac_neighbor_nz_luma(
             let has_left = if !mbaff {
                 mb_idx.checked_rem(mb_width) != Some(0)
             } else {
-                (mb_idx / 2) % mb_width != 0
+                !(mb_idx / 2).is_multiple_of(mb_width)
             };
             if !has_left {
                 return is_intra;
@@ -234,14 +234,14 @@ pub(crate) fn cabac_neighbor_nz_luma(
             } else if mb_field_decoding[mb_idx / 2] {
                 (mb_idx / 2) >= mb_width
             } else {
-                mb_idx % 2 != 0 || (mb_idx / 2) >= mb_width
+                !mb_idx.is_multiple_of(2) || (mb_idx / 2) >= mb_width
             };
             if !has_above {
                 return is_intra;
             }
             if !mbaff {
                 mb_idx - mb_width
-            } else if mb_idx % 2 != 0 && !mb_field_decoding[mb_idx / 2] {
+            } else if !mb_idx.is_multiple_of(2) && !mb_field_decoding[mb_idx / 2] {
                 mb_idx - 1 // Frame-coded: top of same pair
             } else {
                 ((mb_idx / 2) - mb_width) * 2 + 1
@@ -296,7 +296,7 @@ pub(crate) fn cabac_neighbor_nz_chroma(
             let has_left = if !mbaff {
                 mb_idx.checked_rem(mb_width) != Some(0)
             } else {
-                (mb_idx / 2) % mb_width != 0
+                !(mb_idx / 2).is_multiple_of(mb_width)
             };
             if !has_left {
                 return is_intra;
@@ -312,14 +312,14 @@ pub(crate) fn cabac_neighbor_nz_chroma(
             } else if mb_field_decoding[mb_idx / 2] {
                 (mb_idx / 2) >= mb_width
             } else {
-                mb_idx % 2 != 0 || (mb_idx / 2) >= mb_width
+                !mb_idx.is_multiple_of(2) || (mb_idx / 2) >= mb_width
             };
             if !has_above {
                 return is_intra;
             }
             if !mbaff {
                 mb_idx - mb_width
-            } else if mb_idx % 2 != 0 && !mb_field_decoding[mb_idx / 2] {
+            } else if !mb_idx.is_multiple_of(2) && !mb_field_decoding[mb_idx / 2] {
                 mb_idx - 1 // Frame-coded: top of same pair
             } else {
                 ((mb_idx / 2) - mb_width) * 2 + 1
@@ -415,9 +415,9 @@ pub(crate) fn get_neighbor_i4x4_mode(
             0 | 2 | 8 | 10 => {
                 // Left edge of MB
                 let has_left = if !mbaff {
-                    mb_idx % mb_width != 0
+                    !mb_idx.is_multiple_of(mb_width)
                 } else {
-                    (mb_idx / 2) % mb_width != 0
+                    !(mb_idx / 2).is_multiple_of(mb_width)
                 };
                 let left_mb = if !has_left {
                     0 // dummy, not used
@@ -435,6 +435,8 @@ pub(crate) fn get_neighbor_i4x4_mode(
                         2 => 7,
                         8 => 13,
                         10 => 15,
+                        // Only blocks 0, 2, 8 and 10 take this arm.
+                        #[allow(clippy::unreachable)]
                         _ => unreachable!(),
                     };
                     Some(modes[left_mb * 16 + left_blk])
@@ -459,13 +461,13 @@ pub(crate) fn get_neighbor_i4x4_mode(
                 } else if mb_field_decoding[mb_idx / 2] {
                     (mb_idx / 2) >= mb_width
                 } else {
-                    mb_idx % 2 != 0 || (mb_idx / 2) >= mb_width
+                    !mb_idx.is_multiple_of(2) || (mb_idx / 2) >= mb_width
                 };
                 let above_mb = if !has_above {
                     0 // dummy, not used
                 } else if !mbaff {
                     mb_idx - mb_width
-                } else if mb_idx % 2 != 0 && !mb_field_decoding[mb_idx / 2] {
+                } else if !mb_idx.is_multiple_of(2) && !mb_field_decoding[mb_idx / 2] {
                     mb_idx - 1 // Frame-coded: top of same pair
                 } else {
                     ((mb_idx / 2) - mb_width) * 2 + 1
@@ -479,6 +481,8 @@ pub(crate) fn get_neighbor_i4x4_mode(
                         1 => 11,
                         4 => 14,
                         5 => 15,
+                        // Only blocks 0, 1, 4 and 5 take this arm.
+                        #[allow(clippy::unreachable)]
                         _ => unreachable!(),
                     };
                     Some(modes[above_mb * 16 + above_blk])
@@ -523,6 +527,8 @@ pub(crate) fn compute_nc(
             11 => (10, true),
             13 => (12, true),
             15 => (14, true),
+            // Luma has 16 blocks a macroblock, and each is matched.
+            #[allow(clippy::unreachable)]
             _ => unreachable!(),
         }
     } else {
@@ -531,6 +537,8 @@ pub(crate) fn compute_nc(
             2 => (3, false),
             1 => (0, true),
             3 => (2, true),
+            // Callers pass 4 blocks a macroblock for chroma.
+            #[allow(clippy::unreachable)]
             _ => unreachable!(),
         }
     };
@@ -539,9 +547,9 @@ pub(crate) fn compute_nc(
         Some(nc_array[mb_idx * blks_per_mb + left_blk])
     } else {
         let has_left = if !mbaff {
-            mb_idx % mb_width != 0
+            !mb_idx.is_multiple_of(mb_width)
         } else {
-            (mb_idx / 2) % mb_width != 0
+            !(mb_idx / 2).is_multiple_of(mb_width)
         };
         if has_left {
             let left_nb = if !mbaff {
@@ -577,6 +585,8 @@ pub(crate) fn compute_nc(
             13 => (7, true),
             14 => (12, true),
             15 => (13, true),
+            // Luma has 16 blocks a macroblock, and each is matched.
+            #[allow(clippy::unreachable)]
             _ => unreachable!(),
         }
     } else {
@@ -585,6 +595,8 @@ pub(crate) fn compute_nc(
             1 => (3, false),
             2 => (0, true),
             3 => (1, true),
+            // Callers pass 4 blocks a macroblock for chroma.
+            #[allow(clippy::unreachable)]
             _ => unreachable!(),
         }
     };
@@ -597,12 +609,12 @@ pub(crate) fn compute_nc(
         } else if mb_field_decoding[mb_idx / 2] {
             (mb_idx / 2) >= mb_width
         } else {
-            mb_idx % 2 != 0 || (mb_idx / 2) >= mb_width
+            !mb_idx.is_multiple_of(2) || (mb_idx / 2) >= mb_width
         };
         if has_above {
             let above_nb = if !mbaff {
                 mb_idx - mb_width
-            } else if mb_idx % 2 != 0 && !mb_field_decoding[mb_idx / 2] {
+            } else if !mb_idx.is_multiple_of(2) && !mb_field_decoding[mb_idx / 2] {
                 mb_idx - 1 // Frame-coded: top of same pair
             } else {
                 ((mb_idx / 2) - mb_width) * 2 + 1
@@ -648,6 +660,8 @@ pub(crate) fn dequant_4x4_ac_raster(block: &mut [i32; 16], qp: i32, scale: &[u8;
             let idx = r * 4 + c;
             if block[idx] != 0 {
                 let pc = (r & 1) + (c & 1);
+                // The zigzag scan holds every position of a 4x4 block.
+                #[allow(clippy::unwrap_used)]
                 let scan_idx = ZIGZAG_4X4
                     .iter()
                     .position(|&(zr, zc)| zr == r && zc == c)

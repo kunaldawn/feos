@@ -39,7 +39,7 @@ fn checksum_ok<M: PhysMem + ?Sized>(mem: &M, address: u64, length: u32) -> bool 
     let mut chunk = [0u8; 64];
     let mut done = 0u32;
     while done < length {
-        let take = (length - done).min(chunk.len() as u32) as usize;
+        let take = length.saturating_sub(done).min(chunk.len() as u32) as usize;
         let Some(bytes) = chunk.get_mut(..take) else {
             return false;
         };
@@ -50,7 +50,8 @@ fn checksum_ok<M: PhysMem + ?Sized>(mem: &M, address: u64, length: u32) -> bool 
             return false;
         }
         sum = bytes.iter().fold(sum, |sum, byte| sum.wrapping_add(*byte));
-        done += take as u32;
+        // At least one byte, as `done < length`.
+        done = done.saturating_add(take as u32);
     }
     sum == 0
 }
@@ -85,7 +86,7 @@ pub fn find_rsdp<M: PhysMem + ?Sized>(mem: &M) -> Option<Rsdp> {
         let ebda = u64::from(u16::from_le_bytes(segment)) << 4;
         if ebda != 0 {
             for offset in (0..1024).step_by(16) {
-                if let Some(rsdp) = rsdp_at(mem, ebda + offset) {
+                if let Some(rsdp) = ebda.checked_add(offset).and_then(|at| rsdp_at(mem, at)) {
                     return Some(rsdp);
                 }
             }
@@ -103,11 +104,12 @@ pub fn find_table<M: PhysMem + ?Sized>(mem: &M, rsdp: &Rsdp, signature: &[u8; 4]
         None => (u64::from(rsdp.rsdt), 4),
     };
     let length = table_length(mem, root)?;
-    let count = ((length - HEADER_SIZE) / entry_size).min(MAX_ROOT_ENTRIES);
+    // `table_length` checked `length` is at least a header.
+    let count = length.saturating_sub(HEADER_SIZE).checked_div(entry_size).unwrap_or(0).min(MAX_ROOT_ENTRIES);
     for index in 0..count {
         let at = root
             .checked_add(u64::from(HEADER_SIZE))?
-            .checked_add(u64::from(index * entry_size))?;
+            .checked_add(u64::from(index.checked_mul(entry_size)?))?;
         let table = if entry_size == 8 {
             read_u64(mem, at)?
         } else {
@@ -216,7 +218,7 @@ fn parse_madt_bytes(bytes: &[u8]) -> Option<Madt> {
         let size = usize::from(size);
         let entry = match size {
             0..=1 => break,
-            _ => match bytes.get(offset..offset + size) {
+            _ => match bytes.get(offset..offset.saturating_add(size)) {
                 Some(entry) => entry,
                 None => break,
             },
@@ -236,7 +238,7 @@ fn parse_madt_bytes(bytes: &[u8]) -> Option<Madt> {
                             address: u32::from_le_bytes(address),
                             gsi_base: u32::from_le_bytes(gsi_base),
                         };
-                        madt.ioapic_count += 1;
+                        madt.ioapic_count = madt.ioapic_count.saturating_add(1);
                     }
                 }
             }
@@ -251,7 +253,7 @@ fn parse_madt_bytes(bytes: &[u8]) -> Option<Madt> {
                             gsi: u32::from_le_bytes(gsi),
                             flags: u16::from_le_bytes(flags),
                         };
-                        madt.override_count += 1;
+                        madt.override_count = madt.override_count.saturating_add(1);
                     }
                 }
             }
@@ -269,7 +271,7 @@ fn parse_madt_bytes(bytes: &[u8]) -> Option<Madt> {
             }
             _ => {}
         }
-        offset += size;
+        offset = offset.saturating_add(size);
     }
     Some(madt)
 }
@@ -282,7 +284,7 @@ fn add_cpu(madt: &mut Madt, id: u32, flags: u32) {
     }
     if let Some(slot) = madt.apic_ids.get_mut(madt.cpu_count) {
         *slot = id;
-        madt.cpu_count += 1;
+        madt.cpu_count = madt.cpu_count.saturating_add(1);
     }
 }
 

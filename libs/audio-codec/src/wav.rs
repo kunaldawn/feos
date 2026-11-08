@@ -94,7 +94,7 @@ fn parse_sized(input: &[u8], file_len: usize) -> Result<Format> {
     if !matches!(tag, 1 | 3 | 6 | 7) {
         return Err(AudioError::UnsupportedFeature("WAVE audio format"));
     }
-    let bytes = ((bits as usize) + 7) / 8;
+    let bytes = (bits as usize).div_ceil(8);
     if bytes == 0 || bytes * channels as usize != block_align {
         return Err(AudioError::InvalidData("bad WAVE block alignment"));
     }
@@ -212,7 +212,7 @@ pub fn encode_i16(
         return Err(AudioError::InvalidData("bad WAVE parameters"));
     }
     let channels = channels as usize;
-    if samples.len() % channels != 0 {
+    if !samples.len().is_multiple_of(channels) {
         return Err(AudioError::InvalidData("sample count is not frame aligned"));
     }
     let data_len = samples.len().checked_mul(2).ok_or(AudioError::Overflow)?;
@@ -241,7 +241,7 @@ pub fn encode_i16(
     out[34..36].copy_from_slice(&16u16.to_le_bytes());
     out[36..40].copy_from_slice(b"data");
     out[40..44].copy_from_slice(&(data_len as u32).to_le_bytes());
-    for (chunk, sample) in out[44..44 + data_len].chunks_exact_mut(2).zip(samples) {
+    for (chunk, sample) in out[44..44 + data_len].as_chunks_mut::<2>().0.iter_mut().zip(samples) {
         chunk.copy_from_slice(&sample.to_le_bytes());
     }
     if data_len & 1 != 0 {

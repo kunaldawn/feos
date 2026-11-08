@@ -67,6 +67,9 @@ impl<'a, 'b, 's, const N: usize> Ui<'a, 'b, 's, N> {
         let id = self.next_id();
         let mut response = self.interact(id, rect, Sense::focus());
         response.changed = false;
+        if response.hovered {
+            self.set_cursor(crate::cursor::CursorShape::Text);
+        }
 
         if response.focused {
             let ctrl = self.ctrl();

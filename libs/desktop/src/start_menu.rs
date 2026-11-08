@@ -213,18 +213,11 @@ pub fn render<const N: usize, const A: usize>(
         theme.menu_header_top,
         theme.menu_header_bottom,
     );
-    ui.painter.fill_circle(
-        header.x + 28,
-        header.y + 28,
-        17,
-        theme.start_bottom.lerp(Color::WHITE, 40),
-    );
-    ui.painter.draw_text_centered(
-        Rect::new(header.x + 11, header.y + 11, 34, 34),
-        "FE",
-        theme.start_text,
-        2,
-    );
+    // The user's picture, in a white frame as XP draws it.
+    let frame = Rect::new(header.x + 8, header.y + 8, 42, 42);
+    ui.painter.fill_rounded_rect(frame, 4, Color::WHITE.lerp(theme.menu_header_top, 40));
+    ui.painter.stroke_rounded_rect(frame, 4, 1, Color::WHITE);
+    feos_iconset::draw(&mut ui.painter, Stock::Users, frame.inset(5));
     ui.painter.draw_text(
         header.x + 54,
         header.y + 14,
@@ -563,18 +556,7 @@ pub fn render<const N: usize, const A: usize>(
         );
         y += 12;
         let user = Rect::new(right.x + 6, y, right.width.saturating_sub(12), 32);
-        ui.painter.fill_circle(
-            user.x + 12,
-            user.y + 16,
-            10,
-            theme.menu_header_bottom.lerp(Color::WHITE, 40),
-        );
-        ui.painter.draw_text_centered(
-            Rect::new(user.x + 4, user.y + 8, 16, 16),
-            "U",
-            theme.menu_header_text,
-            1,
-        );
+        feos_iconset::draw(&mut ui.painter, Stock::Users, Rect::new(user.x + 4, user.y + 4, 24, 24));
         ui.painter.draw_text_ellipsis(
             Rect::new(
                 user.x + 28,
@@ -607,35 +589,41 @@ pub fn render<const N: usize, const A: usize>(
     let shutdown_id = Id::from_name("desktop.start.shutdown");
     let logoff_hit = ui.interact(logoff_id, logoff, Sense::click());
     let shutdown_hit = ui.interact(shutdown_id, shutdown, Sense::click());
-    for (rect, hit, label, color, command) in [
+    // XP's footer: each command is its picture with the name beside it, and a
+    // light frame while the pointer is over it.
+    for (rect, hit, label, picture, command) in [
         (
             logoff,
             logoff_hit,
             "Log Off",
-            theme.caption_button,
+            Stock::LogOff,
             StartMenuCommand::LogOff,
         ),
         (
             shutdown,
             shutdown_hit,
             "Turn Off",
-            theme.close_button,
+            Stock::ShutDown,
             StartMenuCommand::ShutDown,
         ),
     ] {
-        ui.painter.fill_rounded_rect(
-            rect,
-            4,
-            if hit.hovered {
-                color.lerp(Color::WHITE, 40)
-            } else {
-                color
-            },
+        if hit.hovered {
+            ui.painter
+                .fill_rounded_rect(rect, 4, theme.menu_header_top.lerp(Color::WHITE, 50));
+            ui.painter
+                .stroke_rounded_rect(rect, 4, 1, theme.menu_header_top.lerp(Color::WHITE, 120));
+        }
+        let side = rect.height.min(24);
+        let icon = Rect::new(rect.x + 3, rect.y + (rect.height - side) as i32 / 2, side, side);
+        feos_iconset::draw(&mut ui.painter, picture, icon);
+        ui.painter.draw_text_ellipsis(
+            Rect::new(icon.right_i32() + 5, rect.y, rect.width.saturating_sub(side + 9), rect.height),
+            label,
+            theme.menu_header_text,
+            1,
+            Align::Start,
+            VerticalAlign::Middle,
         );
-        ui.painter
-            .stroke_rounded_rect(rect, 4, 1, theme.menu_border);
-        ui.painter
-            .draw_text_centered(rect, label, theme.menu_header_text, 1);
         if hit.clicked {
             response.command = command;
         }

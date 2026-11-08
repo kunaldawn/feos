@@ -533,7 +533,7 @@ impl SoundBlaster {
         if gains == [256, 256] {
             return;
         }
-        for pair in samples.chunks_exact_mut(2) {
+        for pair in samples.as_chunks_mut::<2>().0 {
             pair[0] = ((pair[0] as i32 * gains[0]) >> 8) as i16;
             pair[1] = ((pair[1] as i32 * gains[1]) >> 8) as i16;
         }
@@ -693,7 +693,8 @@ impl SoundBlaster {
                 }
             } else {
                 let byte = mem.read8(address);
-                let low = if transfer.bits16 {
+                
+                if transfer.bits16 {
                     // 16-bit data over the 8-bit channel: the high byte follows.
                     let (high, _) = dma.step(channel);
                     let value = byte as u16 | ((mem.read8(high) as u16) << 8);
@@ -706,8 +707,7 @@ impl SoundBlaster {
                     byte as i8 as i32 * 256
                 } else {
                     (byte as i32 - 128) * 256
-                };
-                low
+                }
             };
             if transfer.stereo {
                 match self.pending_left.take() {

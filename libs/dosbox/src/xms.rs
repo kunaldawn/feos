@@ -120,7 +120,7 @@ impl Xms {
 
     /// Takes a block at a given address, if that's free.
     pub fn alloc_block_at(&mut self, address: u32, size_kb: u32) -> Option<(u16, u32)> {
-        if address % 1024 != 0 {
+        if !address.is_multiple_of(1024) {
             return None;
         }
         let start_kb = address / 1024;

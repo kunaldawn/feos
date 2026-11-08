@@ -98,7 +98,7 @@ pub(crate) fn fat_timestamp(seconds: u64) -> Option<(u16, u16)> {
     let day = ((date.year - FAT_EPOCH_YEAR) as u16) << 9
         | (date.month as u16) << 5
         | date.day as u16;
-    let time = (date.hour as u16) << 11 | (date.minute as u16) << 5 | (date.second as u16) / 2;
+    let time = (date.hour as u16) << 11 | (date.minute as u16) << 5 | ((date.second as u16) / 2);
     Some((day, time))
 }
 
@@ -422,7 +422,7 @@ impl<D: BlockDevice> Fat32<D> {
             self.read_cluster(cluster, buffer)?;
             let cluster_start = self.cluster_offset(cluster)?;
 
-            for (index, entry) in buffer.chunks_exact(32).enumerate() {
+            for (index, entry) in buffer.as_chunks::<32>().0.iter().enumerate() {
                 let offset = cluster_start + index as u64 * 32;
                 if entry[0] == 0x00 {
                     return Ok(());
@@ -596,7 +596,7 @@ impl<D: BlockDevice> Fat32<D> {
         while done < total {
             let entries = (total - done).min((CHECK_CHUNK / 4) as u64) as usize;
             self.volume.read_bytes(start + done * 4, &mut chunk[..entries * 4])?;
-            for (index, entry) in chunk[..entries * 4].chunks_exact(4).enumerate() {
+            for (index, entry) in chunk[..entries * 4].as_chunks::<4>().0.iter().enumerate() {
                 let value = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
                 if done + index as u64 >= 2 && value & FAT_MASK == 0 {
                     free += 1;
@@ -1002,7 +1002,7 @@ impl<D: WritableBlockDevice> Fat32<D> {
         if end > MAX_FILE_SIZE {
             return Err(FsError::NoSpace);
         }
-        let needed = ((end + self.cluster_size as u64 - 1) / self.cluster_size as u64) as usize;
+        let needed = end.div_ceil(self.cluster_size as u64) as usize;
         let start = self.ensure_chain(node, start_cluster, needed)?;
         // A gap reads as zeros. What the new data covers needs no clearing.
         if offset as u64 > old_size {
@@ -1031,7 +1031,7 @@ impl<D: WritableBlockDevice> Fat32<D> {
             return Ok(());
         }
         let needed =
-            ((new_size + self.cluster_size as u64 - 1) / self.cluster_size as u64) as usize;
+            new_size.div_ceil(self.cluster_size as u64) as usize;
         if new_size < old_size {
             // The entry first and durably, so that it never promises clusters
             // that have been freed.
@@ -1149,7 +1149,7 @@ impl<D: WritableBlockDevice> Fat32<D> {
         let mut walked = 0usize;
         loop {
             self.read_cluster(cluster, &mut buffer)?;
-            for entry in buffer.chunks_exact(32) {
+            for entry in buffer.as_chunks::<32>().0 {
                 if entry[0] == 0x00 {
                     return Ok(false);
                 }
@@ -1189,7 +1189,7 @@ impl<D: WritableBlockDevice> Fat32<D> {
         loop {
             self.read_cluster(cluster, &mut buffer)?;
             let base = self.cluster_offset(cluster)?;
-            for (index, entry) in buffer.chunks_exact(32).enumerate() {
+            for (index, entry) in buffer.as_chunks::<32>().0.iter().enumerate() {
                 if entry[0] == 0x00 || entry[0] == 0xe5 {
                     offsets.push(base + index as u64 * 32);
                     if offsets.len() == needed {
@@ -1233,7 +1233,7 @@ impl<D: WritableBlockDevice> Fat32<D> {
         if units.is_empty() || units.len() > 255 {
             return Err(FsError::InvalidName);
         }
-        let lfn_count = (units.len() + 1 + 12) / 13;
+        let lfn_count = (units.len() + 1).div_ceil(13);
         if lfn_count > 20 {
             return Err(FsError::InvalidName);
         }
@@ -1412,7 +1412,7 @@ impl<D: WritableBlockDevice> Fat32<D> {
         let mut buffer = try_zeroed(self.cluster_size)?;
         self.read_cluster(start, &mut buffer)?;
         self.volume.class = WriteClass::Dir;
-        for (index, entry) in buffer.chunks_exact(32).enumerate() {
+        for (index, entry) in buffer.as_chunks::<32>().0.iter().enumerate() {
             if entry[0] == b'.' && entry[1] == b'.' {
                 let offset = base + index as u64 * 32;
                 self.volume
@@ -1767,7 +1767,7 @@ impl<D: WritableBlockDevice> Fat32<D> {
         'walk: loop {
             self.read_cluster(cluster, &mut buffer)?;
             let base = self.cluster_offset(cluster)?;
-            for (index, slot) in buffer.chunks_exact(32).enumerate() {
+            for (index, slot) in buffer.as_chunks::<32>().0.iter().enumerate() {
                 let offset = base + index as u64 * 32;
                 if slot[0] == 0x00 {
                     self.clear_past_end(cluster, offset)?;
@@ -2331,11 +2331,10 @@ fn build_lfn_entry(
 }
 
 fn split_short_name(name: &str) -> (String, String) {
-    match name.rfind('.') {
-        Some(position) if position > 0 && position + 1 < name.len() => (
-            String::from(&name[..position]),
-            String::from(&name[position + 1..]),
-        ),
+    match name.rsplit_once('.') {
+        Some((base, extension)) if !base.is_empty() && !extension.is_empty() => {
+            (String::from(base), String::from(extension))
+        }
         _ => (String::from(name), String::new()),
     }
 }

@@ -159,6 +159,8 @@ fn delta_min_for_order(order: usize) -> &'static [i16] {
     match order {
         10 => tables::NLSF_CB_NB_MB.delta_min_q15,
         16 => tables::NLSF_CB_WB.delta_min_q15,
+        // The two SILK codebooks have orders 10 and 16.
+        #[allow(clippy::panic)]
         _ => panic!("unsupported LPC order {order}"),
     }
 }

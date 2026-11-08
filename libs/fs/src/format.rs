@@ -211,7 +211,7 @@ pub fn format_exfat<D: WritableBlockDevice>(device: &mut D, label: &str) -> Resu
     let heap_start = (EXFAT_FAT_OFFSET + fat_sectors).next_multiple_of(spc);
     let clusters = (total - heap_start) / spc;
     fat_sectors = ((clusters + 2) * 4).div_ceil(SECTOR);
-    if clusters < 8 || clusters > 0xffff_fff5 {
+    if !(8..=0xffff_fff5).contains(&clusters) {
         return Err(FsError::NoSpace);
     }
 
@@ -220,7 +220,7 @@ pub fn format_exfat<D: WritableBlockDevice>(device: &mut D, label: &str) -> Resu
     let bitmap_clusters = bitmap_bytes.div_ceil(cluster_bytes) as u32;
     let upcase = exfat_upcase();
     let mut upcase_bytes = [0u8; 60];
-    for (slot, unit) in upcase_bytes.chunks_exact_mut(2).zip(upcase.iter()) {
+    for (slot, unit) in upcase_bytes.as_chunks_mut::<2>().0.iter_mut().zip(upcase.iter()) {
         slot.copy_from_slice(&unit.to_le_bytes());
     }
     let upcase_cluster = 2 + bitmap_clusters;
@@ -267,7 +267,7 @@ pub fn format_exfat<D: WritableBlockDevice>(device: &mut D, label: &str) -> Resu
     root[0] = 0x83;
     let units: alloc::vec::Vec<u16> = label.encode_utf16().take(11).collect();
     root[1] = units.len() as u8;
-    for (slot, unit) in root[2..24].chunks_exact_mut(2).zip(units.iter()) {
+    for (slot, unit) in root[2..24].as_chunks_mut::<2>().0.iter_mut().zip(units.iter()) {
         slot.copy_from_slice(&unit.to_le_bytes());
     }
     let bitmap = &mut root[32..64];
@@ -317,7 +317,7 @@ pub fn format_exfat<D: WritableBlockDevice>(device: &mut D, label: &str) -> Resu
         }
         sum = sum.rotate_right(1).wrapping_add(byte as u32);
     }
-    for word in region[11 * 512..].chunks_exact_mut(4) {
+    for word in region[11 * 512..].as_chunks_mut::<4>().0 {
         word.copy_from_slice(&sum.to_le_bytes());
     }
     device.write_classified(12, &region, WriteClass::Dir)?;

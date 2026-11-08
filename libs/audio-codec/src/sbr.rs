@@ -410,7 +410,7 @@ impl BandTables {
         for k in 0..=n_high {
             high[k] = master[xover + k] as u8;
         }
-        let n_low = (n_high + 1) / 2;
+        let n_low = n_high.div_ceil(2);
         let mut low = [0u8; MAX_HIGH + 1];
         let odd = n_high & 1;
         for k in 0..=n_low {
@@ -518,9 +518,7 @@ impl BandTables {
             }
             limit_table[..=n_low].copy_from_slice(&low[..=n_low]);
             n_limit = n_low + patches - 1;
-            for i in 1..patches {
-                limit_table[n_low + i] = borders[i];
-            }
+            limit_table[n_low + 1..n_low + patches].copy_from_slice(&borders[1..patches]);
             limit_table[..=n_limit].sort_unstable();
             let is_border = |value: u8| borders[..=patches].contains(&value);
             let mut k = 1;

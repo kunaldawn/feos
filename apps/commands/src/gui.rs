@@ -160,7 +160,7 @@ impl App for Gui {
         // SAFETY: as in `open_window`.
         let state = unsafe { &mut *core::ptr::addr_of_mut!(DEMO) };
         localise_input(context, &mut state.input);
-        render(context.canvas, state, context.platform.board.arch);
+        context.cursor = render(context.canvas, state, context.platform.board.arch);
         WindowFrame::Continue
     }
 
@@ -230,7 +230,8 @@ fn localise_input(context: &WindowContext<'_, '_>, input: &mut Input) {
     }
 }
 
-fn render(canvas: &mut Canvas, state: &mut DemoState, arch: &str) {
+/// Draws the gallery and returns the pointer its widgets asked for.
+fn render(canvas: &mut Canvas, state: &mut DemoState, arch: &str) -> feos_gui::CursorShape {
     let theme = Theme::dark();
     let DemoState {
         input,
@@ -285,7 +286,7 @@ fn render(canvas: &mut Canvas, state: &mut DemoState, arch: &str) {
         pivot_tab,
     } = state;
 
-    let mut ui = Ui::new(canvas, &theme, &input, interaction);
+    let mut ui = Ui::new(canvas, &theme, input, interaction);
     let full = ui.canvas_rect();
     ui.desktop_background(full);
 
@@ -967,6 +968,7 @@ fn render(canvas: &mut Canvas, state: &mut DemoState, arch: &str) {
     }
 
     let _ = (compact, notes);
+    ui.cursor()
 }
 
 #[cfg(test)]

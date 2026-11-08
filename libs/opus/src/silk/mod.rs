@@ -30,7 +30,6 @@ mod tables;
 const MAX_INTERNAL_FRAMES: usize = 3;
 const MAX_LPC_HALVES: usize = 2;
 const MAX_API_FRAME_SAMPLES_48K: usize = 960 * MAX_INTERNAL_FRAMES;
-const TYPE_VOICED: i32 = 2;
 
 /// Result of decoding one SILK Opus frame.
 #[derive(Debug, Clone, Copy)]
@@ -130,29 +129,6 @@ impl SilkDecoder {
         self.final_range
     }
 
-    /// Update the per-channel rewhitening history after PLC synthesis.
-    ///
-    /// Params: mutable channel `state`, concealed internal `frame`, and internal `fs_khz`.
-    /// Returns: nothing; the history buffers are refreshed in place.
-    fn refresh_conceal_history(
-        out_buf: &mut [i16],
-        lag_prev: &mut i32,
-        pitch_lag: i32,
-        frame: &[i16],
-        fs_khz: u32,
-    ) {
-        let ltp_mem_length = fs_khz as usize * tables::LTP_MEM_LENGTH_MS;
-        let frame_len = frame.len();
-        let mv_len = ltp_mem_length.saturating_sub(frame_len);
-        if mv_len > 0 {
-            out_buf.copy_within(frame_len..frame_len + mv_len, 0);
-        }
-        out_buf[mv_len..mv_len + frame_len].copy_from_slice(frame);
-        if pitch_lag > 0 {
-            *lag_prev = pitch_lag;
-        }
-    }
-
     /// Conceal one lost SILK or Hybrid packet using the stored PLC state.
     ///
     /// Params: target `samples_per_channel`, mutable interleaved `out`, and packet `loss_count`.
@@ -161,7 +137,7 @@ impl SilkDecoder {
         &mut self,
         samples_per_channel: usize,
         out: &mut [i16],
-        loss_count: u32,
+        _loss_count: u32,
     ) -> Result<usize, Error> {
         let packet_channels = self.prev_packet_channels.clamp(1, 2) as usize;
         let channels = self.channels as usize;
@@ -280,6 +256,8 @@ impl SilkDecoder {
                                 left
                             };
                         }
+                        // The decoder is made with one or two channels only.
+                        #[allow(clippy::unreachable)]
                         _ => unreachable!(),
                     }
                 }
@@ -298,6 +276,8 @@ impl SilkDecoder {
                                 left
                             };
                         }
+                        // The decoder is made with one or two channels only.
+                        #[allow(clippy::unreachable)]
                         _ => unreachable!(),
                     }
                 }
@@ -485,7 +465,7 @@ impl SilkDecoder {
         let fec = self.fec;
         if fec {
             // The redundant data is read in place of the frames themselves.
-        } else if let Err(err) = consume_lbrr_payload(
+        } else { consume_lbrr_payload(
             &mut dec,
             &parsed,
             packet_channels as usize,
@@ -494,13 +474,11 @@ impl SilkDecoder {
             frame_length,
             packet_idx,
             trace_pkt0,
-        ) {
-            return Err(err);
-        }
+        )?; }
         if trace_pkt0 {
             trace_checkpoint(&dec, packet_idx, "after_lbrr_consume");
         }
-        if let Err(err) = consume_main_payload(
+        consume_main_payload(
             &mut dec,
             &parsed,
             packet_channels as usize,
@@ -517,9 +495,7 @@ impl SilkDecoder {
             fec,
             packet_idx,
             trace_pkt0,
-        ) {
-            return Err(err);
-        }
+        )?;
         let mut consumed_redundancy = false;
         let mut redundancy_bytes = 0usize;
         let mut celt_to_silk = false;
@@ -596,6 +572,8 @@ impl SilkDecoder {
                             left
                         };
                     }
+                    // The decoder is made with one or two channels only.
+                    #[allow(clippy::unreachable)]
                     _ => unreachable!(),
                 }
             }
@@ -612,6 +590,8 @@ impl SilkDecoder {
                             left
                         };
                     }
+                    // The decoder is made with one or two channels only.
+                    #[allow(clippy::unreachable)]
                     _ => unreachable!(),
                 }
             }
@@ -957,7 +937,7 @@ fn consume_main_payload(
                 fs_khz: states[ch].fs_khz,
                 lpc_order: tables::nlsf_codebook(states[ch].fs_khz).order,
             };
-            signal_types[ch][i] = frame_params.signal_type as i32;
+            signal_types[ch][i] = frame_params.signal_type;
             let pcm_range = i * frame_length..(i + 1) * frame_length;
             let trace = decode_core::decode_core(
                 &frame_params,

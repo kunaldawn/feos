@@ -222,7 +222,7 @@ pub(crate) fn chroma<P: Pixel>(
     h: usize,
     out: &mut [P; 256],
 ) {
-    let inside = x >= 0 && y >= 0 && x + w as i32 + 1 <= v.width && y + h as i32 + 1 <= v.height;
+    let inside = x >= 0 && y >= 0 && x + (w as i32) < v.width && y + (h as i32) < v.height;
     let (wa, wb, wc, wd) = ((8 - fx) * (8 - fy), fx * (8 - fy), (8 - fx) * fy, fx * fy);
     if inside {
         let org = v.base + y as usize * v.stride + x as usize;

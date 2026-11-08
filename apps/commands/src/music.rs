@@ -325,8 +325,8 @@ impl MusicState {
         painter.draw_text(width - 8 - time_width + 8, 52, time.as_str(), PANEL_TEXT, 1);
         self.seek = Rect::new(12, 54, (width - 32 - time_width).max(0) as u32, 8);
         painter.fill_rect(self.seek, Color::rgb(70, 94, 144));
-        if duration > 0 {
-            let fill = (self.seek.width as u64 * self.position_ms.min(duration) / duration) as u32;
+        if let Some(fill) = (self.seek.width as u64 * self.position_ms.min(duration)).checked_div(duration) {
+            let fill = fill as u32;
             painter.fill_rect(Rect::new(self.seek.x, self.seek.y, fill, 8), ACCENT);
         }
 

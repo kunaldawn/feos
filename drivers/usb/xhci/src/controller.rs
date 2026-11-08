@@ -1378,7 +1378,7 @@ impl UsbDisk {
     }
 
     fn check_range(&self, start: u64, len: usize) -> Result<(), BlockIoError> {
-        if len % self.block_size != 0 {
+        if !len.is_multiple_of(self.block_size) {
             return Err(BlockIoError::OutOfRange);
         }
         match start.checked_add((len / self.block_size) as u64) {

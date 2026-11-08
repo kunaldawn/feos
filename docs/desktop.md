@@ -21,7 +21,7 @@ keyboard and works alongside it:
 | Keyboard | Type into the focused window, terminal or dialog |
 | Double-click | Open a desktop shortcut, or maximise/restore a window from its title bar |
 | Drag | Move a window by its title bar, or resize it from any edge or corner |
-| Cursor | Follows XP: arrow over the desktop, horizontal/vertical arrows on edges, diagonal arrows on corners |
+| Cursor | The XP cursor set: arrow over the desktop, horizontal/vertical arrows on edges, diagonal arrows on corners, a text beam over text fields and a hand over links in apps that ask for them, and the animated working pointer for a second after a launch |
 | Right-click | Open the desktop menu (Refresh, Show Desktop, Task Manager, Properties) |
 | Arrow keys | Move the Start-menu highlight, or the wallpaper selection when the menu is closed |
 | `Enter` | Launch the highlighted application |
@@ -164,7 +164,9 @@ it needs inside:
 ```text
 my-app.fapp
 ├── manifest.yaml
-├── icon.bmp           # BMP, PNG, JPEG, PPM or QOI, up to 48x48
+├── icon.ico           # ICO, BMP, PNG, JPEG, PPM or QOI, up to 48x48
+├── icon-32.ico        # optional: icon_medium, the 32-pixel picture
+├── icon-16.ico        # optional: icon_small, the 16-pixel picture
 └── ...                # additional resources
 ```
 
@@ -177,7 +179,9 @@ version: 1.0.0
 entry: gui            # command in the shell registry
 category: System
 description: GUI dashboard and component gallery
-icon: icon.bmp
+icon: icon.ico
+icon_medium: icon-32.ico
+icon_small: icon-16.ico
 args: ""
 window:
   width: 760
@@ -242,6 +246,12 @@ are routed only to the topmost content area, and keyboard events go to the
 focused hosted app. Minimizing preserves the app state, so restoring from the
 taskbar resumes the same window instead of restarting the application.
 
+An app picks the pointer over its content by setting `WindowContext::cursor`
+during the frame. Apps built on `feos_gui::Ui` pass on `Ui::cursor()`, which
+text fields set to the text beam and links to the hand; File Explorer sets it
+for its address and search fields and its task links. The desktop shows it
+while the pointer is over that window's content and not on a resize edge.
+
 Apps that return `true` from `App::foreground` but not `App::windowed` still use
 the older synchronous path with `Context::viewport` and `Context::suspend_area`
 for compatibility. The desktop app's session loop polls the virtio pointer
@@ -254,6 +264,25 @@ only when input arrives, the clock minute changes, a service or window state
 changes, a launch needs a new frame, or an animating windowed app (media
 playback, live task-manager graphs) asks for another frame. An idle desktop
 leaves the scanout buffer alone.
+
+## Icons and cursors
+
+Every picture the desktop and its apps draw comes from `assets/icons`, through
+`feos-iconset` (`libs/iconset`), which embeds only the pictures and sizes in use
+and decodes them when drawn. `feos_gui::Icon` draws an iconset picture where one
+shows the same thing (`Icon::picture`), and a glyph otherwise: chevrons, arrows,
+check marks, plus and minus, close, and symbols the iconset lacks such as the
+warning triangle. Bundle icons are copies of iconset files.
+
+The pointer is the Windows XP cursor set in `assets/cursors` (see its README, and
+`LICENSING.md`, as it isn't open-licensed). `libs/gui/src/cursor.rs` embeds the
+`xp-default` arrow, text beam, link hand, help, precision cross, move,
+unavailable and four resize cursors, and the animated busy and working
+hourglasses from `animated`; `feos_image::cur` and `feos_image::ani` decode
+them. Cursors are 32x32 and placed by their hot spot, so the area the session
+restores before drawing the pointer elsewhere is `cursor_bounds`, which starts
+above and left of the pointer. An animated pointer is redrawn by the session
+loop when its next frame is due, without composing the desktop again.
 
 ## Settings
 

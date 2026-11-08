@@ -486,7 +486,7 @@ impl Vga {
                     mem.write16(BDA_BASE + 0x85, height as u16);
                 }
             }
-            sub @ (0x22 | 0x23 | 0x24) => {
+            sub @ (0x22..=0x24) => {
                 let (address, height) = match sub {
                     0x22 => (ROM_FONT14, 14),
                     0x23 => (ROM_FONT8, 8),
@@ -549,14 +549,13 @@ impl Vga {
                 }
             }
             0x32 | 0x33 | 0x35 | 0x36 => regs.set_al(0x12),
-            0x34 => {
-                if regs.al() <= 1 {
+            0x34
+                if regs.al() <= 1 => {
                     self.cursor_emulation = regs.al() == 0;
                     self.program_cursor_shape();
                     self.sync_bios(mem);
                     regs.set_al(0x12);
                 }
-            }
             _ => {}
         }
     }

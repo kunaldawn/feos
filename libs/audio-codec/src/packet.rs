@@ -153,7 +153,7 @@ fn open_kind<'a>(format: PacketFormat<'a>) -> Result<Kind<'a>> {
         } => {
             if !matches!(
                 (bytes, float),
-                (1 | 2 | 3 | 4, false) | (4 | 8, true)
+                (1..=4, false) | (4 | 8, true)
             ) {
                 return Err(AudioError::UnsupportedFeature("PCM sample format"));
             }

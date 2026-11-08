@@ -44,27 +44,24 @@ impl FrameBoundary {
     pub fn starts_frame(&mut self, nal: &[u8]) -> bool {
         match nal.first().map(|header| header & 0x1f) {
             Some(7) => {
-                if let Some(unit) = parse_nal_bytes(nal) {
-                    if let Ok(sps) = parse_sps(&unit.rbsp) {
-                        if let Some(slot) = self.sps.get_mut(sps.seq_parameter_set_id as usize) {
+                if let Some(unit) = parse_nal_bytes(nal)
+                    && let Ok(sps) = parse_sps(&unit.rbsp)
+                        && let Some(slot) = self.sps.get_mut(sps.seq_parameter_set_id as usize) {
                             *slot = Some(SpsFacts {
                                 frame_mbs_only: sps.frame_mbs_only_flag,
                                 frame_num_bits: sps.log2_max_frame_num_minus4 as u8 + 4,
                                 separate_plane: sps.separate_colour_plane_flag,
                             });
                         }
-                    }
-                }
                 false
             }
             Some(8) => {
                 if let Some(unit) = parse_nal_bytes(nal) {
                     let mut r = BitstreamReader::new(&unit.rbsp);
-                    if let (Ok(pps_id), Ok(sps_id)) = (r.read_ue(), r.read_ue()) {
-                        if pps_id < 256 && sps_id < 32 {
+                    if let (Ok(pps_id), Ok(sps_id)) = (r.read_ue(), r.read_ue())
+                        && pps_id < 256 && sps_id < 32 {
                             self.pps_sps[pps_id as usize] = sps_id as u8;
                         }
-                    }
                 }
                 false
             }

@@ -521,7 +521,7 @@ pub fn div(env: &mut Env, a: F80, b: F80) -> F80 {
     let high = (first << 64) / divisor;
     let middle = (first << 64) % divisor;
     let low = (middle << 64) / divisor;
-    let sticky = (middle << 64) % divisor != 0;
+    let sticky = !(middle << 64).is_multiple_of(divisor);
     let quotient = (high << 64) | low;
     let (significand, exponent) = if whole {
         (

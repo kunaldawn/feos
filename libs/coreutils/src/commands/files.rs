@@ -104,7 +104,7 @@ fn ls_directory(
         entries.retain(|entry| !entry.name.starts_with('.'));
     }
     if options.by_size {
-        entries.sort_by(|left, right| right.size.cmp(&left.size));
+        entries.sort_by_key(|entry| core::cmp::Reverse(entry.size));
     }
     if options.all {
         for name in [".", ".."] {
@@ -821,10 +821,7 @@ pub(super) fn stat(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
             );
         }
         if meta.kind == Kind::Dir {
-            match ctx.fs.read_dir(&absolute) {
-                Ok(entries) => write_line(ctx.stdout, format_args!("  Entries: {}", entries.len())),
-                Err(_) => {}
-            }
+            if let Ok(entries) = ctx.fs.read_dir(&absolute) { write_line(ctx.stdout, format_args!("  Entries: {}", entries.len())) }
         }
 
     }
@@ -1216,7 +1213,7 @@ pub(super) fn df(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
             let total = mount.stats.total_blocks as usize * unit;
             let free = mount.stats.free_blocks as usize * unit;
             let used = total.saturating_sub(free);
-            let percent = if total == 0 { 0 } else { used.saturating_mul(100) / total };
+            let percent = used.saturating_mul(100).checked_div(total).unwrap_or(0);
             let show = |bytes: usize| {
                 if human {
                     format_size(bytes)
@@ -1255,11 +1252,7 @@ pub(super) fn df(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
             format!("{}", memory.free),
         )
     };
-    let percent = if memory.total == 0 {
-        0
-    } else {
-        memory.used.saturating_mul(100) / memory.total
-    };
+    let percent = memory.used.saturating_mul(100).checked_div(memory.total).unwrap_or(0);
     write_line(
         ctx.stdout,
         format_args!("Filesystem      Size      Used     Avail Use% Mounted on"),

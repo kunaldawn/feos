@@ -83,7 +83,7 @@ pub unsafe fn unmap_range(
     let Some(end) = base.checked_add(size) else {
         return false;
     };
-    if base % PAGE_SIZE != 0 || size % PAGE_SIZE != 0 || end > MAPPED {
+    if !base.is_multiple_of(PAGE_SIZE) || !size.is_multiple_of(PAGE_SIZE) || end > MAPPED {
         return false;
     }
 

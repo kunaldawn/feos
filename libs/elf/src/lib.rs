@@ -100,9 +100,10 @@ impl Segment {
         self.address & !(PAGE - 1)
     }
 
-    /// One past the last page. Checked not to overflow by [`parse`].
+    /// One past the last page. Checked not to overflow by [`parse`], and saturating
+    /// for a segment that didn't come from it.
     pub const fn page_end(&self) -> u64 {
-        (self.address + self.memory_size + PAGE - 1) & !(PAGE - 1)
+        self.address.saturating_add(self.memory_size).saturating_add(PAGE - 1) & !(PAGE - 1)
     }
 }
 
@@ -117,7 +118,7 @@ pub struct Program {
 impl Program {
     /// The segments to load, in address order.
     pub fn segments(&self) -> &[Segment] {
-        &self.segments[..self.count]
+        self.segments.get(..self.count).unwrap_or(&self.segments)
     }
 }
 
@@ -134,24 +135,21 @@ pub struct Limits {
     pub max_memory: u64,
 }
 
+fn read<const N: usize>(bytes: &[u8], at: usize) -> Result<[u8; N], Error> {
+    let end = at.checked_add(N).ok_or(Error::Truncated)?;
+    bytes.get(at..end).and_then(|part| part.try_into().ok()).ok_or(Error::Truncated)
+}
+
 fn read_u16(bytes: &[u8], at: usize) -> Result<u16, Error> {
-    let end = at.checked_add(2).ok_or(Error::Truncated)?;
-    let part = bytes.get(at..end).ok_or(Error::Truncated)?;
-    Ok(u16::from_le_bytes([part[0], part[1]]))
+    read(bytes, at).map(u16::from_le_bytes)
 }
 
 fn read_u32(bytes: &[u8], at: usize) -> Result<u32, Error> {
-    let end = at.checked_add(4).ok_or(Error::Truncated)?;
-    let part = bytes.get(at..end).ok_or(Error::Truncated)?;
-    Ok(u32::from_le_bytes([part[0], part[1], part[2], part[3]]))
+    read(bytes, at).map(u32::from_le_bytes)
 }
 
 fn read_u64(bytes: &[u8], at: usize) -> Result<u64, Error> {
-    let end = at.checked_add(8).ok_or(Error::Truncated)?;
-    let part = bytes.get(at..end).ok_or(Error::Truncated)?;
-    let mut word = [0u8; 8];
-    word.copy_from_slice(part);
-    Ok(u64::from_le_bytes(word))
+    read(bytes, at).map(u64::from_le_bytes)
 }
 
 /// Bytes of the file's start a caller must supply to [`parse`] for any file it would
@@ -163,17 +161,14 @@ pub const HEADER_BYTES: usize = HEADER_SIZE + MAX_HEADERS * PROGRAM_HEADER_SIZE;
 /// `head` is the file's start, as much of [`HEADER_BYTES`] as it has, and `file_size`
 /// its whole length. Program headers have to be in `head`, which any linker puts them.
 pub fn parse(head: &[u8], file_size: u64, limits: &Limits) -> Result<Program, Error> {
-    if head.len() < 4 {
-        return Err(Error::Truncated);
-    }
-    if head[..4] != [0x7f, b'E', b'L', b'F'] {
+    if read::<4>(head, 0)? != [0x7f, b'E', b'L', b'F'] {
         return Err(Error::BadMagic);
     }
     if head.len() < HEADER_SIZE {
         return Err(Error::Truncated);
     }
     // ELFCLASS64, little-endian, version 1.
-    if head[4] != 2 || head[5] != 1 || head[6] != 1 {
+    if read::<3>(head, 4)? != [2, 1, 1] {
         return Err(Error::BadClass);
     }
     if read_u32(head, 20)? != 1 {
@@ -194,31 +189,29 @@ pub fn parse(head: &[u8], file_size: u64, limits: &Limits) -> Result<Program, Er
         return Err(Error::BadHeaders);
     }
     let table = usize::try_from(table).map_err(|_| Error::BadHeaders)?;
-    let table_end = table
-        .checked_add(entries * PROGRAM_HEADER_SIZE)
+    let table_end = entries
+        .checked_mul(PROGRAM_HEADER_SIZE)
+        .and_then(|size| table.checked_add(size))
         .ok_or(Error::BadHeaders)?;
-    if table_end > head.len() {
-        return Err(Error::Truncated);
-    }
+    let headers = head.get(table..table_end).ok_or(Error::Truncated)?;
 
     let mut segments = [Segment::default(); MAX_SEGMENTS];
     let mut count = 0;
     let mut total = 0u64;
-    for index in 0..entries {
-        let at = table + index * PROGRAM_HEADER_SIZE;
-        let kind = read_u32(head, at)?;
+    for header in headers.as_chunks::<PROGRAM_HEADER_SIZE>().0 {
+        let kind = read_u32(header, 0)?;
         if kind == PT_DYNAMIC || kind == PT_INTERP {
             return Err(Error::NotStatic);
         }
         if kind != PT_LOAD {
             continue;
         }
-        let flags = read_u32(head, at + 4)?;
-        let offset = read_u64(head, at + 8)?;
-        let address = read_u64(head, at + 16)?;
-        let file_size_here = read_u64(head, at + 32)?;
-        let memory_size = read_u64(head, at + 40)?;
-        let align = read_u64(head, at + 48)?;
+        let flags = read_u32(header, 4)?;
+        let offset = read_u64(header, 8)?;
+        let address = read_u64(header, 16)?;
+        let file_size_here = read_u64(header, 32)?;
+        let memory_size = read_u64(header, 40)?;
+        let align = read_u64(header, 48)?;
 
         if memory_size == 0 {
             continue;
@@ -249,12 +242,17 @@ pub fn parse(head: &[u8], file_size: u64, limits: &Limits) -> Result<Program, Er
         if flags & PF_W != 0 && flags & PF_X != 0 {
             return Err(Error::WriteAndExecute);
         }
-        total = total.checked_add(rounded_end - (address & !(PAGE - 1))).ok_or(Error::BadSegment)?;
+        // `rounded_end` is past `address`, as `end` didn't wrap.
+        total = rounded_end
+            .checked_sub(address & !(PAGE - 1))
+            .and_then(|size| total.checked_add(size))
+            .ok_or(Error::BadSegment)?;
         if total > limits.max_memory {
             return Err(Error::BadSegment);
         }
 
-        segments[count] = Segment {
+        let slot = segments.get_mut(count).ok_or(Error::BadSegmentCount)?;
+        *slot = Segment {
             address,
             memory_size,
             file_size: file_size_here,
@@ -263,23 +261,28 @@ pub fn parse(head: &[u8], file_size: u64, limits: &Limits) -> Result<Program, Er
             writable: flags & PF_W != 0,
             executable: flags & PF_X != 0,
         };
-        count += 1;
+        // Below `MAX_SEGMENTS`, as `segments.get_mut(count)` found a slot.
+        count = count.saturating_add(1);
     }
     if count == 0 {
         return Err(Error::BadSegmentCount);
     }
 
-    segments[..count].sort_unstable_by_key(|segment| segment.address);
-    for pair in segments[..count].windows(2) {
-        if pair[0].page_end() > pair[1].page_start() {
-            return Err(Error::Overlap);
+    let loaded = segments.get_mut(..count).ok_or(Error::BadSegmentCount)?;
+    loaded.sort_unstable_by_key(|segment| segment.address);
+    for pair in loaded.windows(2) {
+        if let [first, second] = pair {
+            if first.page_end() > second.page_start() {
+                return Err(Error::Overlap);
+            }
         }
     }
 
-    let runnable = segments[..count].iter().any(|segment| {
+    let runnable = loaded.iter().any(|segment| {
         segment.executable
-            && entry >= segment.address
-            && entry < segment.address + segment.memory_size
+            && entry
+                .checked_sub(segment.address)
+                .is_some_and(|into| into < segment.memory_size)
     });
     if !runnable {
         return Err(Error::BadEntry);

@@ -270,12 +270,12 @@ impl Mixer {
                 if slot.paused {
                     continue;
                 }
-                let gain = curve(slot.gain) as i64 * master as i64 >> 15;
+                let gain = (curve(slot.gain) as i64 * master as i64) >> 15;
                 let count = chunk.min(slot.len);
                 let capacity = slot.ring.len();
                 for (index, total) in sum[..count].iter_mut().enumerate() {
                     let sample = slot.ring[(slot.head + index) % capacity] as i64;
-                    *total = total.saturating_add((sample * gain >> 15) as i32);
+                    *total = total.saturating_add(((sample * gain) >> 15) as i32);
                 }
                 slot.head = (slot.head + count) % capacity;
                 slot.len -= count;

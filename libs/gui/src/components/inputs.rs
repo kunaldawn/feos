@@ -1399,6 +1399,9 @@ impl<'a, 'b, 's, const N: usize> Ui<'a, 'b, 's, N> {
         let rect = self.allocate(width, metrics.control_height);
         let id = self.next_id();
         let mut response = self.interact(id, rect, Sense::click());
+        if response.hovered {
+            self.set_cursor(crate::cursor::CursorShape::Link);
+        }
         let color = if response.hovered || response.active {
             palette.accent_hover
         } else {

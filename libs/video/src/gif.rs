@@ -387,7 +387,7 @@ fn interlaced_row(index: usize, height: usize) -> usize {
     let mut remaining = index;
     for (start, step) in [(0usize, 8usize), (4, 8), (2, 4), (1, 2)] {
         let count = if height > start {
-            (height - start + step - 1) / step
+            (height - start).div_ceil(step)
         } else {
             0
         };

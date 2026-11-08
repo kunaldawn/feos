@@ -456,9 +456,9 @@ pub fn normalize_path(path: &str) -> Result<String, FsError> {
 }
 
 fn parent_of(path: &str) -> &str {
-    match path.rfind('/') {
-        Some(0) | None => "/",
-        Some(index) => &path[..index],
+    match path.rsplit_once('/') {
+        Some(("", _)) | None => "/",
+        Some((parent, _)) => parent,
     }
 }
 
@@ -690,7 +690,8 @@ impl State {
             return Err(FsError::InvalidName);
         }
         let trimmed = path.trim_end_matches('/');
-        let parent = &trimmed[..trimmed.len() - name.len()];
+        // `name` is the last part of `path`, so `trimmed` always ends with it.
+        let parent = trimmed.strip_suffix(name).ok_or(FsError::InvalidName)?;
         let (location, canonical) = self.walk(parent, true)?;
         if self.mounts[location.mount].fs.kind(location.node) != Some(EntryKind::Directory) {
             return Err(FsError::NotDirectory);

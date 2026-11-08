@@ -1467,10 +1467,9 @@ fn system_info() -> SystemInfo {
     }
     let mut cpu_ticks = [0u64; feos_app::MAX_CPUS];
     let mut cpu_idle_ticks = [0u64; feos_app::MAX_CPUS];
-    for cpu in 0..MAX_CPUS.min(feos_app::MAX_CPUS) {
-        cpu_ticks[cpu] = table.cpu_total_ticks[cpu];
-        cpu_idle_ticks[cpu] = table.cpu_idle_ticks[cpu];
-    }
+    let cpus = MAX_CPUS.min(feos_app::MAX_CPUS);
+    cpu_ticks[..cpus].copy_from_slice(&table.cpu_total_ticks[..cpus]);
+    cpu_idle_ticks[..cpus].copy_from_slice(&table.cpu_idle_ticks[..cpus]);
 
     SystemInfo {
         uptime_ms: CLOCK.uptime_ms(),

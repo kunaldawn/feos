@@ -689,7 +689,7 @@ fn l3_stereo_process(
                 G_PAN[ipos]
             } else {
                 let k = l3_ldexp_q2(1.0, ((ipos + 1) >> 1 << mpeg2_sh) as i32);
-                if ipos % 2 == 0 {
+                if ipos.is_multiple_of(2) {
                     (1.0, k)
                 } else {
                     (k, 1.0)
@@ -1863,7 +1863,7 @@ fn l12_apply_scf_384(sci: &L12ScaleInfo, igr: usize, grbuf: &mut [[f32; 576]; 2]
 
 fn mp3d_synth_pair(pcm: &mut [Sample], nch: usize, z: &[f32]) {
     let mut a = (z[14 * 64] - z[0]) * 29.;
-    a += (z[1 * 64] + z[13 * 64]) * 213.;
+    a += (z[64] + z[13 * 64]) * 213.;
     a += (z[12 * 64] - z[2 * 64]) * 459.;
     a += (z[3 * 64] + z[11 * 64]) * 2037.;
     a += (z[10 * 64] - z[4 * 64]) * 5153.;
@@ -1879,7 +1879,7 @@ fn mp3d_synth_pair(pcm: &mut [Sample], nch: usize, z: &[f32]) {
     a += z[6 * 64 + 2] * -9975.;
     a += z[4 * 64 + 2] * -45.;
     a += z[2 * 64 + 2] * 146.;
-    a += z[0 * 64 + 2] * -5.;
+    a += z[2] * -5.;
     pcm[16 * nch] = mp3d_scale_pcm(a);
 }
 

@@ -95,7 +95,7 @@ impl Imdct {
     /// `n` is from 16 to 8192, a multiple of 8 with no factor but 2, 3 and 5; the callers
     /// guarantee it.
     pub(crate) fn new(n: usize) -> Result<Self> {
-        debug_assert!((16..=8192).contains(&n) && n % 8 == 0);
+        debug_assert!((16..=8192).contains(&n) && n.is_multiple_of(8));
         let n4 = n / 4;
         let bits = n4.trailing_zeros();
         let general = !n.is_power_of_two();
@@ -196,7 +196,7 @@ fn general_fft(z: &mut [(i32, i32)], twiddle: &[(i32, i32)], scratch: &mut [(i32
     let mut size = total;
     let mut stride = 1;
     while size > 1 {
-        let radix = [2usize, 3, 5].into_iter().find(|p| size % p == 0).unwrap_or(size).min(5);
+        let radix = [2usize, 3, 5].into_iter().find(|p| size.is_multiple_of(*p)).unwrap_or(size).min(5);
         let m = size / radix;
         let (from, to): (&[(i32, i32)], &mut [(i32, i32)]) =
             if in_z { (&*z, &mut *scratch) } else { (&*scratch, &mut *z) };

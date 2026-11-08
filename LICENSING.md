@@ -54,8 +54,32 @@ but its licence forbids copying part of it, so nothing from it is in this reposi
 reports that they are open for inclusion. The source folder had no licence file,
 and these terms have not been independently confirmed. They are not covered by
 the licences above. `assets/icons/index.tsv` records each file's original number.
-The kernel embeds some of them: the pictures named in `libs/iconset/src/lib.rs`, and
-copies in `apps/desktop/bundle-src/*/icon*.ico`. The same caveat applies to those.
+The kernel embeds some of them: the pictures and sizes named in
+`libs/iconset/src/lib.rs` (drawn by the desktop, its apps and `feos-gui`'s
+icons), and copies in `apps/desktop/bundle-src/*/icon*.ico`. The same caveat
+applies to those.
+
+## Cursors
+
+`assets/cursors` holds the "Windows XP" cursor set by nibbler
+(<http://www.rw-designer.com/user/55973>), from
+<http://www.rw-designer.com/cursor-set/windows-xp-1>. Its own readme is kept
+verbatim as `assets/cursors/readme.txt`, and says:
+
+- "Most of these cursors are made by Microsoft", and that some (the pixellated
+  link cursors, the extended 3D gold, silver and blue sets, location and person
+  select, and a few cursors for the Magnified theme) are nibbler's own.
+- "License: Demo. This is a demonstration of a commercial work. You are free: To
+  evaluate the work to decide whether to buy it or not. For any other use, you
+  must purchase a license from the author."
+
+These cursors are **not** open-licensed, and not covered by the licences above.
+Including them in this repository, and embedding some of them in the kernel,
+was the project owner's decision, made with those terms in view. The kernel
+embeds the files named in `libs/gui/src/cursor.rs`. Anyone distributing the
+repository or a kernel built from it should settle these terms first, or
+replace the cursors. `assets/cursors/index.tsv` maps each file to its original
+name.
 
 ## Game data
 

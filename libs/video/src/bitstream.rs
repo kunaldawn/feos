@@ -163,7 +163,7 @@ impl<'a> BitReader<'a> {
     pub(crate) fn read_se(&mut self) -> Result<i32> {
         let value = self.read_ue()?;
         if value & 1 == 1 {
-            Ok(((value + 1) / 2) as i32)
+            Ok(value.div_ceil(2) as i32)
         } else {
             Ok(-((value / 2) as i32))
         }

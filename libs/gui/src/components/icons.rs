@@ -1,10 +1,15 @@
-//! A small, dependency-free icon set drawn with the painter primitives.
+//! The toolkit's icons.
 //!
-//! Icons are vector-ish: every glyph is defined on an 8x8 grid and scaled to
-//! the target rectangle. They use the same colours, clipping and focus rules as
-//! text, so they work inside windows, scroll areas and disabled controls.
+//! Where `assets/icons` has a picture of the same thing, an [`Icon`] draws that
+//! picture (see [`Icon::picture`]), in its own colours. The rest are small marks
+//! (chevrons, arrows, check marks, plus and minus, close) and symbols the
+//! iconset has nothing for; they are glyphs defined on an 8x8 grid, scaled to
+//! the target rectangle and drawn in the colour asked for, so they follow the
+//! same colour, clipping and focus rules as text.
 
 use feos_gfx::{Color, Rect};
+
+use feos_iconset::Stock;
 
 use crate::geometry::RectExt;
 use crate::math::{cos, sin};
@@ -243,6 +248,10 @@ pub fn paint_icon(painter: &mut Painter<'_, '_>, rect: Rect, icon: Icon, color: 
         return;
     }
     let (x, y, u) = origin(rect);
+    if let Some(stock) = icon.picture() {
+        paint_stock(painter, stock, Rect::new(x, y, u as u32, u as u32));
+        return;
+    }
     let cx = x + u / 2;
     let cy = y + u / 2;
 
@@ -723,6 +732,54 @@ pub fn paint_icon(painter: &mut Painter<'_, '_>, rect: Rect, icon: Icon, color: 
             seg(painter, rect, 7, 4, 6, 5, color);
             seg(painter, rect, 6, 5, 5, 5, color);
         }
+    }
+}
+
+/// Draws a picture from the iconset to fill `rect`.
+pub fn paint_stock(painter: &mut Painter<'_, '_>, stock: Stock, rect: Rect) {
+    feos_iconset::draw(painter, stock, rect);
+}
+
+impl feos_iconset::Target for Painter<'_, '_> {
+    fn visible(&self, rect: Rect) -> bool {
+        Painter::visible(self, rect)
+    }
+
+    fn blend_pixel(&mut self, x: i32, y: i32, color: Color, alpha: u8) {
+        Painter::blend_pixel(self, x, y, color, alpha);
+    }
+}
+
+impl Icon {
+    /// The iconset picture this icon is drawn as, if it has one.
+    ///
+    /// Icons whose colour carries meaning stay glyphs even where a picture
+    /// exists: the rating's stars are filled by colour, and play and lock sit
+    /// beside pause and unlock, which have no picture.
+    pub const fn picture(self) -> Option<Stock> {
+        Some(match self {
+            Icon::Info => Stock::Info,
+            Icon::Error => Stock::Error,
+            Icon::Help => Stock::Help,
+            Icon::Search => Stock::Search,
+            Icon::Settings => Stock::Gear,
+            Icon::Home => Stock::Home,
+            Icon::User => Stock::Users,
+            Icon::Calendar => Stock::Calendar,
+            Icon::File => Stock::GenericFile,
+            Icon::Folder => Stock::Folder,
+            Icon::Trash => Stock::RecycleBin,
+            Icon::Edit => Stock::Edit,
+            Icon::Copy => Stock::Copy,
+            Icon::Mail => Stock::Mail,
+            Icon::Globe => Stock::Globe,
+            Icon::Database => Stock::Drive,
+            Icon::Cpu => Stock::Chip,
+            Icon::Package => Stock::Software,
+            Icon::LogOut => Stock::LogOff,
+            Icon::Terminal => Stock::Terminal,
+            _ => return None,
+        })
     }
 }
 

@@ -719,7 +719,7 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
     /// One that makes no sense changes nothing.
     pub fn apply_setting(&mut self, key: &str, value: &str) {
         let mut line = Text::<64>::new();
-        let _ = write!(line, "{key}: {value}\n");
+        let _ = writeln!(line, "{key}: {value}");
         let mut next = self.config;
         next.apply_settings(line.as_str());
         if next != self.config {
@@ -1973,7 +1973,7 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
 
         if let Some(seconds) = self.resolution_prompt {
             let answer = render_resolution_prompt(&mut ui, &theme, self.work_area, seconds);
-            let answer = answer.or_else(|| {
+            let answer = answer.or({
                 if enter_pressed {
                     Some(true)
                 } else if escape_pressed {
@@ -2035,7 +2035,11 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             || self.drag.is_some()
             || in_bar
             || in_toast;
-        let cursor_shape = if over_desktop_menu {
+        // A text field the desktop drew itself, such as the Run dialog's,
+        // asks for the text beam.
+        let cursor_shape = if ui.cursor() != CursorShape::Arrow {
+            ui.cursor()
+        } else if over_desktop_menu {
             CursorShape::Arrow
         } else {
             window_cursor_shape(&self.windows, pointer)
@@ -3398,9 +3402,7 @@ fn render_run_dialog<const N: usize>(
     );
 
     let icon = Rect::new(panel.x + 16, panel.y + 38, 32, 32);
-    ui.painter.fill_rounded_rect(icon, 4, theme.caption_button);
-    ui.painter
-        .draw_text_centered(icon, ">", theme.caption_glyph, 2);
+    feos_iconset::draw(&mut ui.painter, feos_iconset::Stock::Run, icon);
 
     ui.painter.draw_text_ellipsis(
         Rect::new(
@@ -3446,6 +3448,9 @@ fn render_run_dialog<const N: usize>(
     );
     ui.painter.fill_rect(field, theme.window_content);
     ui.painter.stroke_rect(field, 1, theme.menu_separator);
+    if field.contains(ui.pointer()) {
+        ui.set_cursor(CursorShape::Text);
+    }
     let text_rect = Rect::new(
         field.x + 4,
         field.y + 1,
@@ -4161,6 +4166,7 @@ fn run_hosted_app<const N: usize>(
         origin,
         pointer_active,
         keyboard_active,
+        cursor: feos_gui::CursorShape::Arrow,
     };
     let mut started = window.app_started;
     if !started {
@@ -4190,6 +4196,11 @@ fn run_hosted_app<const N: usize>(
         Err(died) => return hosted_failed(runtime, windows, index, died),
     };
     if let Some(slot) = windows.get_mut(index) {
+        slot.cursor = if pointer_active {
+            context.cursor
+        } else {
+            feos_gui::CursorShape::Arrow
+        };
         let elapsed = clock.ticks().wrapping_sub(started_at) as u128;
         let micros = elapsed * 1_000_000 / clock.frequency().max(1) as u128;
         slot.cpu_us = slot.cpu_us.saturating_add(micros as u64);
@@ -4375,8 +4386,18 @@ fn window_cursor_shape<const N: usize>(
     let Some(window) = windows.get(index) else {
         return paint::CursorShape::Arrow;
     };
-    if !window.open || window.state != WindowState::Normal {
+    if !window.open || window.state == WindowState::Minimized {
         return paint::CursorShape::Arrow;
+    }
+    // Over its content, a hosted app picks the pointer (a text beam over a
+    // text field, say).
+    let content_cursor = if window::content_rect(window.rect).contains(pointer) {
+        window.cursor
+    } else {
+        paint::CursorShape::Arrow
+    };
+    if window.state != WindowState::Normal {
+        return content_cursor;
     }
 
     match resize_edge_at(window.rect, pointer) {
@@ -4384,7 +4405,7 @@ fn window_cursor_shape<const N: usize>(
         Some(ResizeEdge::Top | ResizeEdge::Bottom) => paint::CursorShape::SizeVertical,
         Some(ResizeEdge::TopLeft | ResizeEdge::BottomRight) => paint::CursorShape::SizeNwse,
         Some(ResizeEdge::TopRight | ResizeEdge::BottomLeft) => paint::CursorShape::SizeNesw,
-        None => paint::CursorShape::Arrow,
+        None => content_cursor,
     }
 }
 

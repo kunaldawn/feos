@@ -469,7 +469,7 @@ pub fn day_of_week(now_ms: u64) -> u8 {
 }
 
 fn is_leap(year: u32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 fn days_in_month(year: u32, month: u32) -> u32 {

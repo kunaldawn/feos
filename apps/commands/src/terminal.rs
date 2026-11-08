@@ -673,7 +673,7 @@ impl TerminalState {
     }
 
     /// Notices that the task finished the command, and shows a new prompt.
-    fn poll_worker(&mut self) {
+    fn poll_worker(&mut self, clock: Option<&'static dyn Clock>) {
         self.drain();
         let Some(worker) = self.worker.as_ref() else {
             return;
@@ -703,6 +703,35 @@ impl TerminalState {
             self.set_screen_variables();
         }
         self.finish_command();
+        self.take_typeahead(clock);
+    }
+
+    /// Gives the shell what was typed while the command ran and the command
+    /// didn't read, as a terminal's input queue would: a line typed ahead runs
+    /// next, instead of being left in the pipe for whatever reads it later.
+    fn take_typeahead(&mut self, clock: Option<&'static dyn Clock>) {
+        let Some(worker) = self.worker.as_ref() else {
+            return;
+        };
+        let mut typed = Vec::new();
+        let mut buffer = [0u8; 256];
+        while let Transfer::Moved(count) = worker.input_waker.try_read(&mut buffer) {
+            if count == 0 {
+                break;
+            }
+            typed.extend_from_slice(&buffer[..count]);
+        }
+        let mut presses = Vec::new();
+        let mut decoder = feos_keys::ByteDecoder::new();
+        for byte in typed {
+            decoder.feed(byte, &mut |press| presses.push(press));
+        }
+        decoder.flush(&mut |press| presses.push(press));
+        // A line among them starts a command, and what follows it is that
+        // command's typeahead in turn.
+        for press in presses {
+            self.press(press, clock);
+        }
     }
 
     fn set_screen_variables(&mut self) {
@@ -1183,7 +1212,7 @@ impl App for Terminal {
             return WindowFrame::Close;
         };
 
-        state.poll_worker();
+        state.poll_worker(Some(context.platform.clock));
         if context.keyboard_active {
             let events: Vec<Event> = context.input.events().collect();
             let has_text = events.iter().any(|event| matches!(event, Event::Text(_)));
@@ -1654,6 +1683,7 @@ mod tests {
             origin: Point::new(0, 0),
             pointer_active: false,
             keyboard_active: true,
+            cursor: feos_gui::CursorShape::Arrow,
         };
         assert!(Terminal.open_window(&context));
 
@@ -1676,6 +1706,7 @@ mod tests {
             origin: Point::new(0, 0),
             pointer_active: false,
             keyboard_active: true,
+            cursor: feos_gui::CursorShape::Arrow,
         };
         let _ = Terminal.frame_window(&mut context);
 
@@ -1708,6 +1739,40 @@ mod tests {
         let error = lines.iter().position(|line| line.starts_with("cat:")).unwrap();
         let two = lines.iter().position(|line| line == "two").unwrap();
         assert!(one < error && error < two, "{lines:?}");
+    }
+
+    #[test]
+    fn keys_typed_during_a_command_it_did_not_read_go_to_the_shell() {
+        let mut state = TerminalState::new(None);
+        let (output, _out_writer) = pipe::create().unwrap();
+        let (key_reader, input) = pipe::create().unwrap();
+        let link = Arc::new(Link::new());
+        let cancel = state.shell.lock().cancel_token();
+        state.worker = Some(Worker {
+            link: link.clone(),
+            output,
+            input,
+            input_waker: key_reader,
+            cancel,
+        });
+        // A command is handed to the task, and more is typed before it ends.
+        typed(&mut state, "true");
+        enter(&mut state);
+        assert!(state.running);
+        assert_eq!(link.job.lock().take().as_deref(), Some("true"));
+        typed(&mut state, "echo next");
+        enter(&mut state);
+        typed(&mut state, "echo after");
+
+        link.busy.store(false, Ordering::Release);
+        state.poll_worker(None);
+        // The first line typed ahead runs, and the rest waits for it in turn.
+        assert!(state.running);
+        assert_eq!(link.job.lock().take().as_deref(), Some("echo next"));
+        link.busy.store(false, Ordering::Release);
+        state.poll_worker(None);
+        assert!(!state.running);
+        assert_eq!(state.editor.text().iter().collect::<String>(), "echo after");
     }
 
     #[test]

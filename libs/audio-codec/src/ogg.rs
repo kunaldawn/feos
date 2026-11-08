@@ -335,7 +335,7 @@ impl<'a> PacketReader<'a> {
                     return Err(AudioError::InvalidData("Ogg packet is too large"));
                 }
                 if total > self.packet.capacity() {
-                    let wanted = total.max(self.packet.capacity() * 2).max(4096).min(MAX_PACKET);
+                    let wanted = total.max(self.packet.capacity() * 2).clamp(4096, MAX_PACKET);
                     self.packet
                         .try_reserve_exact(wanted - self.packet.len())
                         .map_err(|_| AudioError::OutOfMemory)?;

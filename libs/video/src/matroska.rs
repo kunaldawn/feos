@@ -30,14 +30,14 @@ const ID_TRACK_NUMBER: u32 = 0xd7;
 const ID_TRACK_TYPE: u32 = 0x83;
 const ID_CODEC_ID: u32 = 0x86;
 const ID_CODEC_PRIVATE: u32 = 0x63a2;
-const ID_DEFAULT_DURATION: u32 = 0x23e3_83;
+const ID_DEFAULT_DURATION: u32 = 0x0023_e383;
 const ID_VIDEO: u32 = 0xe0;
 const ID_PIXEL_WIDTH: u32 = 0xb0;
 const ID_PIXEL_HEIGHT: u32 = 0xba;
 const ID_DISPLAY_WIDTH: u32 = 0x54b0;
 const ID_DISPLAY_HEIGHT: u32 = 0x54ba;
 const ID_DISPLAY_UNIT: u32 = 0x54b2;
-const ID_COLOUR_SPACE: u32 = 0x2eb5_24;
+const ID_COLOUR_SPACE: u32 = 0x002e_b524;
 const ID_COLOUR: u32 = 0x55b0;
 const ID_MATRIX_COEFFICIENTS: u32 = 0x55b1;
 const ID_RANGE: u32 = 0x55b9;
@@ -50,7 +50,7 @@ const ID_CONTENT_ENCODING: u32 = 0x6240;
 const ID_CONTENT_COMPRESSION: u32 = 0x5034;
 const ID_COMPRESSION_ALGO: u32 = 0x4254;
 const ID_COMPRESSION_SETTINGS: u32 = 0x4255;
-const ID_TIMESTAMP_SCALE: u32 = 0x2ad7_b1;
+const ID_TIMESTAMP_SCALE: u32 = 0x002a_d7b1;
 const ID_CLUSTER_TIMESTAMP: u32 = 0xe7;
 const ID_SIMPLE_BLOCK: u32 = 0xa3;
 const ID_BLOCK_GROUP: u32 = 0xa0;
@@ -507,8 +507,8 @@ where
     let frames = data.get(pos).copied().ok_or(VideoError::UnexpectedEnd)? as usize + 1;
     pos += 1;
     let mut sizes = [0usize; 256];
-    let total_fixed;
-    match lacing {
+    
+    let total_fixed = match lacing {
         1 => {
             // Xiph lacing: each size is a sequence of 255-continuation bytes.
             let mut total = 0usize;
@@ -527,7 +527,7 @@ where
                 *size = value;
                 total = total.checked_add(value).ok_or(VideoError::Overflow)?;
             }
-            total_fixed = total;
+            total
         }
         2 => {
             let remaining = block
@@ -540,7 +540,7 @@ where
             for size in sizes.iter_mut().take(frames - 1) {
                 *size = remaining / frames;
             }
-            total_fixed = remaining / frames * (frames - 1);
+            remaining / frames * (frames - 1)
         }
         _ => {
             // EBML lacing: the first size, then signed differences. The last
@@ -565,9 +565,9 @@ where
                     total = total.checked_add(previous).ok_or(VideoError::Overflow)?;
                 }
             }
-            total_fixed = total;
+            total
         }
-    }
+    };
     let remaining = block
         .end
         .checked_sub(pos)

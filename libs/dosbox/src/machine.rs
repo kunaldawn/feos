@@ -797,8 +797,8 @@ impl Bus for SystemBus {
                 InterruptAction::Continue
             }
             0x33 => {
-                let action = self.mouse.int33(regs);
-                action
+                
+                self.mouse.int33(regs)
             }
             0x67 if regs.ah() == 0xDE && self.emm.enabled => {
                 let SystemBus {
@@ -1379,7 +1379,7 @@ impl DosBox {
     /// whether that changed anything. [`render`](Self::render) does this too; a
     /// caller that draws on another thread calls this and copies the buffer.
     pub fn refresh_screen(&mut self) -> bool {
-        let blink = (self.bus.now_ms / 500) % 2 == 0;
+        let blink = (self.bus.now_ms / 500).is_multiple_of(2);
         if blink != self.last_blink {
             self.bus.vga.dirty = true;
             self.last_blink = blink;

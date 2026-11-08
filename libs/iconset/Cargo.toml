@@ -8,5 +8,4 @@ license.workspace = true
 
 [dependencies]
 feos-gfx = { workspace = true }
-feos-gui = { workspace = true }
 feos-image = { workspace = true }

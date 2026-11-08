@@ -158,7 +158,7 @@ impl Heap {
 
     /// Reads a free-list entry, refusing a corrupt link.
     fn free_entry(&self, offset: usize) -> Option<Header> {
-        if offset % HEADER != 0 || offset.checked_add(HEADER)? > self.size {
+        if !offset.is_multiple_of(HEADER) || offset.checked_add(HEADER)? > self.size {
             return None;
         }
         // SAFETY: the bounds were checked above.
@@ -174,7 +174,7 @@ impl Heap {
         let address = allocation as usize;
         if address < self.base + HEADER
             || address >= self.base + self.size
-            || address % HEADER != 0
+            || !address.is_multiple_of(HEADER)
         {
             return Err(HeapError::NotInArena);
         }

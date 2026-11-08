@@ -14,6 +14,8 @@
 //! | JPEG   | baseline, extended sequential and progressive, 8-bit; gray, YCbCr, RGB, CMYK, YCCK | no |
 //! | BMP    | 1/4/8/16/24/32-bit uncompressed, bitfields, RLE8 and RLE4 | 24-bit |
 //! | ICO    | PNG and 1/4/8/24/32-bit DIB payloads, with the AND mask | no |
+//! | CUR    | as ICO, with the hot spot and the screen-inverting pixels ([`cur`]) | no |
+//! | ANI    | RIFF `ACON` of CUR or ICO frames, with `rate` and `seq ` ([`ani`]) | no |
 //! | PNM    | P1-P6 ASCII and binary, 8/16-bit | P6 |
 //! | QOI    | yes | yes |
 //!
@@ -36,7 +38,9 @@
 
 extern crate alloc;
 
+pub mod ani;
 pub mod bmp;
+pub mod cur;
 mod error;
 pub mod ico;
 pub mod jpeg;
@@ -148,7 +152,7 @@ pub fn scratch_len(input: &[u8]) -> Result<usize> {
 ///
 /// `out` must be at least [`ImageInfo::rgba_len`] bytes. `scratch` must be at
 /// least [`scratch_len`] bytes for the same input.
-pub fn decode<'a>(input: &[u8], out: &'a mut [u8], scratch: &mut [u8]) -> Result<ImageInfo> {
+pub fn decode(input: &[u8], out: &mut [u8], scratch: &mut [u8]) -> Result<ImageInfo> {
     match detect(input).ok_or(ImageError::UnknownFormat)? {
         ImageFormat::Png => png::decode(input, out, scratch),
         ImageFormat::Jpeg => jpeg::decode(input, out),

@@ -92,6 +92,8 @@ fn codebook_row(per_index: i8, index: usize) -> &'static [i8; LTP_ORDER] {
         0 => &LTP_VQ_0_Q7[index],
         1 => &LTP_VQ_1_Q7[index],
         2 => &LTP_VQ_2_Q7[index],
+        // The index was decoded from a three-symbol distribution.
+        #[allow(clippy::panic)]
         _ => panic!("unsupported LTP periodicity index {per_index}"),
     }
 }

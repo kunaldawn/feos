@@ -407,7 +407,7 @@ impl<D: WritableBlockDevice> Inner<D> {
     fn write(&mut self, start: u64, data: &[u8], class: WriteClass) -> Result<(), FsError> {
         let blocks = (data.len() / self.block_size) as u64;
         let end = start.checked_add(blocks).ok_or(FsError::OutOfBounds)?;
-        if data.len() % self.block_size != 0 {
+        if !data.len().is_multiple_of(self.block_size) {
             return Err(FsError::InvalidBuffer);
         }
         if end > self.block_count {
@@ -459,7 +459,7 @@ impl<D: WritableBlockDevice> Inner<D> {
     fn read(&mut self, start: u64, out: &mut [u8]) -> Result<(), FsError> {
         let blocks = (out.len() / self.block_size) as u64;
         let end = start.checked_add(blocks).ok_or(FsError::OutOfBounds)?;
-        if out.len() % self.block_size != 0 {
+        if !out.len().is_multiple_of(self.block_size) {
             return Err(FsError::InvalidBuffer);
         }
         if end > self.block_count {

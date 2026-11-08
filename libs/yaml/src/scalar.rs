@@ -93,7 +93,7 @@ impl<'a> YamlScalar<'a> {
     /// Returns `None` if the buffer is too small or the source has an invalid
     /// escape. The parser validates escapes before constructing a document, so
     /// the latter is only possible for hand-built values.
-    pub fn decode_into<'b>(self, out: &'b mut [u8]) -> Option<&'b str> {
+    pub fn decode_into(self, out: &mut [u8]) -> Option<&str> {
         let mut writer = Writer { out, written: 0 };
         match self.style {
             ScalarStyle::Plain => writer.plain(self.raw.as_bytes())?,
@@ -233,6 +233,8 @@ impl<'b> Writer<'b> {
     /// split a character. Folding follows YAML: runs of ordinary lines join
     /// with a space, blank lines become line breaks, and lines indented beyond
     /// the content keep their breaks.
+    // Offsets here come from byte scans that stop only at ASCII bytes or the end, so they fall on character boundaries.
+    #[allow(clippy::string_slice)]
     fn block(&mut self, raw: &str, indent: u8, folded: bool) -> Option<()> {
         #[derive(PartialEq)]
         enum Previous {

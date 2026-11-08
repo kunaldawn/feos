@@ -459,9 +459,8 @@ impl H264Stream {
                     // Hold the frame first so that a buffer too small for it can
                     // be replaced and the frame requested again.
                     let size = (frame.width, frame.height, shown);
-                    frame_to_rgba(&frame, &self.coefficients, out).map_err(|error| {
+                    frame_to_rgba(&frame, &self.coefficients, out).inspect_err(|_error| {
                         self.held = Some((shown, frame.clone()));
-                        error
                     })?;
                     self.held = Some((shown, frame));
                     return Ok(Some(size));

@@ -270,8 +270,16 @@ Source: [`icons.rs`](icons.rs)
 | `ui.icon_button_sized(size, icon, primary)` | Square icon button with explicit size. | `Response` |
 | `ui.icon_button_at(rect, icon, primary)` | Icon button in a caller-provided rectangle. | `Response` |
 | `paint_icon(painter, rect, icon, color)` | Direct painter helper used by custom components. | — |
+| `paint_stock(painter, stock, rect)` | Draw any `feos_iconset::Stock` picture, re-exported as `feos_gui::Stock`. | — |
 
-`Icon::ALL` contains 72 bitmap icons:
+`Icon::ALL` contains 72 icons. Those with a matching picture in `assets/icons`
+draw it in its own colours and ignore `color`: `Info`, `Error`, `Help`,
+`Search`, `Settings`, `Home`, `User`, `Calendar`, `File`, `Folder`, `Trash`,
+`Edit`, `Copy`, `Mail`, `Globe`, `Database`, `Cpu`, `Package`, `LogOut` and
+`Terminal` (`Icon::picture` gives the mapping). The rest are glyphs on an 8x8
+grid, drawn in `color`: the small marks, `Star` (the rating fills it by
+colour), `Play` and `Lock` (which sit beside `Pause` and `Unlock`), and the
+symbols the iconset has no picture for:
 
 `ChevronUp`, `ChevronDown`, `ChevronLeft`, `ChevronRight`, `ArrowUp`,
 `ArrowDown`, `ArrowLeft`, `ArrowRight`, `Check`, `Close`, `Plus`, `Minus`,
@@ -283,6 +291,18 @@ Source: [`icons.rs`](icons.rs)
 `MapPin`, `Globe`, `Code`, `Database`, `Cpu`, `Cloud`, `Bookmark`, `Tag`,
 `Flag`, `LogIn`, `LogOut`, `Undo`, `Redo`, `Shield`, `Sliders`, `Cart`,
 `CreditCard`, `Package`, `Terminal`, `Link`.
+
+## Cursors
+
+Source: [`../cursor.rs`](../cursor.rs)
+
+| Function | Purpose |
+| --- | --- |
+| `draw_cursor_shape(painter, x, y, shape)` | Draw a `CursorShape` with its hot spot at `x`, `y`. |
+| `draw_cursor_shape_at(painter, x, y, shape, elapsed_ms)` | The same, for an animated shape `elapsed_ms` after it appeared. |
+| `cursor_bounds(x, y, shape)` | The area the shape covers, to restore before drawing it elsewhere. |
+| `cursor_frame_left(shape, elapsed_ms)` | How long until an animated shape changes. |
+| `ui.set_cursor(shape)`, `ui.cursor()` | Ask for a pointer this frame; text fields ask for `Text`, `hyperlink_button` for `Link`. |
 
 ## Charts
 

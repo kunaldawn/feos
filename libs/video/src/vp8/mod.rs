@@ -404,7 +404,7 @@ impl Vp8Decoder {
     fn resize(&mut self, width: u32, height: u32) -> Result<()> {
         self.width = width;
         self.height = height;
-        let (cols, rows) = ((width as usize + 15) / 16, (height as usize + 15) / 16);
+        let (cols, rows) = ((width as usize).div_ceil(16), (height as usize).div_ceil(16));
         if cols == self.mb_cols && rows == self.mb_rows {
             return Ok(());
         }

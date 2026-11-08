@@ -18,6 +18,8 @@ pub(super) fn nlsf2a(lpc_q12: &mut [i16], nlsf_q15: &[i16], order: usize) {
     let ordering = match order {
         10 => &[0usize, 9, 6, 3, 4, 5, 8, 1, 2, 7][..],
         16 => &[0usize, 15, 8, 7, 4, 11, 12, 3, 2, 13, 10, 5, 6, 9, 14, 1][..],
+        // The two SILK codebooks have orders 10 and 16.
+        #[allow(clippy::panic)]
         _ => panic!("unsupported LPC order {order}"),
     };
 

@@ -375,12 +375,11 @@ impl VirtioInput {
                     self.pending_right = Some(down);
                 }
             }
-            input::BTN_MIDDLE => {
-                if self.middle != down {
+            input::BTN_MIDDLE
+                if self.middle != down => {
                     self.middle = down;
                     self.pending_middle = Some(down);
                 }
-            }
             _ => {}
         }
     }
@@ -573,10 +572,7 @@ impl VirtioInput {
     /// Returns the next pointer report, if any.
     pub fn poll(&mut self) -> Option<PointerEvent> {
         loop {
-            match self.process_next()? {
-                Some(report) => return Some(report),
-                None => {}
-            }
+            if let Some(report) = self.process_next()? { return Some(report) }
         }
     }
 

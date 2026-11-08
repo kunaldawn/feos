@@ -85,6 +85,8 @@ pub struct Ui<'a, 'b, 's, const N: usize = 32> {
     pointer_occluded: bool,
     /// Stacking level of the overlay being drawn (0 is the page).
     overlay_level: usize,
+    /// The pointer a widget under it asked for this frame.
+    cursor: crate::cursor::CursorShape,
 }
 
 impl<'a, 'b, 's, const N: usize> Ui<'a, 'b, 's, N> {
@@ -127,6 +129,7 @@ impl<'a, 'b, 's, const N: usize> Ui<'a, 'b, 's, N> {
             space_pressed: false,
             pointer_occluded: false,
             overlay_level: 0,
+            cursor: crate::cursor::CursorShape::Arrow,
         };
         ui.scan_events();
 
@@ -156,6 +159,18 @@ impl<'a, 'b, 's, const N: usize> Ui<'a, 'b, 's, N> {
         }
 
         ui
+    }
+
+    /// Asks for `shape` as the pointer this frame. Widgets call it while
+    /// hovered: text fields ask for the text beam and links for the hand.
+    pub fn set_cursor(&mut self, shape: crate::cursor::CursorShape) {
+        self.cursor = shape;
+    }
+
+    /// The pointer asked for this frame, the arrow if nothing asked. A windowed
+    /// app hands it to the desktop through `WindowContext::cursor`.
+    pub fn cursor(&self) -> crate::cursor::CursorShape {
+        self.cursor
     }
 
     fn scan_events(&mut self) {

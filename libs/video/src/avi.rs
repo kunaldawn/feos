@@ -358,7 +358,7 @@ fn apply_idx1(input: &[u8], number: u8, index: &mut Index) -> bool {
 fn apply_idx1_entries(entries: &[u8], number: u8, index: &mut Index) -> bool {
     const AVIIF_KEYFRAME: u32 = 0x10;
     let mut at = 0usize;
-    for entry in entries.chunks_exact(16) {
+    for entry in entries.as_chunks::<16>().0 {
         let id = [entry[0], entry[1], entry[2], entry[3]];
         if !is_video_chunk(&id, number) {
             continue;
@@ -430,13 +430,10 @@ struct AudioTiming {
 
 impl AudioTiming {
     fn next(&mut self, size: usize) -> u64 {
-        let ms = if self.sample_size != 0 && self.bytes_per_second != 0 {
-            self.bytes * 1000 / self.bytes_per_second as u64
-        } else if self.stream_rate != 0 {
-            self.count * self.scale * 1000 / self.stream_rate
-        } else {
-            0
-        };
+        let by_bytes = if self.sample_size != 0 { (self.bytes * 1000).checked_div(self.bytes_per_second as u64) } else { None };
+        let ms = by_bytes
+            .or_else(|| (self.count * self.scale * 1000).checked_div(self.stream_rate))
+            .unwrap_or(0);
         self.bytes += size as u64;
         self.count += 1;
         ms

@@ -154,7 +154,7 @@ pub fn encode_rgba(width: u32, height: u32, pixels: &[u8], out: &mut [u8]) -> Re
 
     let mut pos = HEADER_LEN;
     let mut previous = [0u8, 0, 0, 255];
-    for pixel in pixels[..pixel_len].chunks_exact(4) {
+    for pixel in pixels[..pixel_len].as_chunks::<4>().0 {
         if pixel[3] == previous[3] {
             out[pos] = 0xfe;
             out[pos + 1] = pixel[0];

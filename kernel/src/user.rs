@@ -512,9 +512,8 @@ fn sys_write(slot: usize, process: &Process, fd: usize, address: usize, length: 
             }
             let result = with_user_buffer(process, address, length, false, |piece| {
                 tree.write_at(file.path(), file.offset, piece)
-                    .map(|moved| {
+                    .inspect(|&moved| {
                         file.offset += moved as u64;
-                        moved
                     })
                     .map_err(fs_errno)
             });
@@ -547,9 +546,8 @@ fn sys_read(slot: usize, process: &Process, fd: usize, address: usize, length: u
             };
             with_user_buffer(process, address, length, true, |piece| {
                 tree.read_at(file.path(), file.offset, piece)
-                    .map(|moved| {
+                    .inspect(|&moved| {
                         file.offset += moved as u64;
-                        moved
                     })
                     .map_err(fs_errno)
             })
@@ -892,7 +890,7 @@ fn sys_mmap(slot: usize, process: &mut Process, length: usize, prot: usize) -> i
 }
 
 fn sys_munmap(slot: usize, process: &mut Process, address: usize, length: usize) -> isize {
-    if length == 0 || address % PAGE_SIZE != 0 {
+    if length == 0 || !address.is_multiple_of(PAGE_SIZE) {
         return -errno::EINVAL;
     }
     let Some(length) = length.checked_next_multiple_of(PAGE_SIZE) else {

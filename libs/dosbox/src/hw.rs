@@ -172,8 +172,8 @@ impl Pics {
     /// Acknowledges the waiting interrupt and returns its vector.
     pub fn acknowledge(&mut self) -> Option<u8> {
         let line = self.master.pending()?;
-        let vector;
-        if line == 2 {
+        
+        let vector = if line == 2 {
             let Some(inner) = self.slave.pending() else {
                 self.update();
                 return None;
@@ -182,10 +182,10 @@ impl Pics {
             if !self.slave.auto_eoi {
                 self.slave.isr |= 1 << inner;
             }
-            vector = self.slave.base.wrapping_add(inner);
+            self.slave.base.wrapping_add(inner)
         } else {
-            vector = self.master.base.wrapping_add(line);
-        }
+            self.master.base.wrapping_add(line)
+        };
         if line != 2 {
             self.master.irr &= !(1 << line);
         }

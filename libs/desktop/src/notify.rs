@@ -254,8 +254,13 @@ fn draw_entry<const N: usize>(
         .stroke_rounded_rect(rect, 4, 1, theme.menu_border);
     ui.painter
         .fill_rect(Rect::new(rect.x + 1, rect.y + 1, 5, rect.height - 2), accent);
+    let picture = match entry.level {
+        Level::Info => feos_iconset::Stock::Info,
+        Level::Error => feos_iconset::Stock::Error,
+    };
+    feos_iconset::draw(&mut ui.painter, picture, Rect::new(rect.x + 12, rect.y + 7, 16, 16));
     ui.painter.draw_text_ellipsis(
-        Rect::new(rect.x + 14, rect.y + 6, rect.width.saturating_sub(22), 18),
+        Rect::new(rect.x + 34, rect.y + 6, rect.width.saturating_sub(42), 18),
         &feos_text::display_name(entry.title.as_str()),
         theme.menu_text,
         1,

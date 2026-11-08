@@ -44,7 +44,7 @@ struct Measure {
 
 impl Measure {
     fn add(&mut self, samples: &[i16]) {
-        for frame in samples.chunks_exact(CHANNELS) {
+        for frame in samples.as_chunks::<CHANNELS>().0 {
             for channel in 0..CHANNELS {
                 self.peak[channel] = self.peak[channel].max((frame[channel] as i32).abs());
                 if self.last[channel] <= 0 && frame[channel] > 0 {

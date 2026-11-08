@@ -204,7 +204,7 @@ impl<T: Transport> VirtioBlk<T> {
 
     /// Checks that a transfer is whole blocks inside the device.
     fn check_range(&self, start: u64, len: usize) -> Result<(), BlockIoError> {
-        if len % self.block_size != 0 {
+        if !len.is_multiple_of(self.block_size) {
             return Err(BlockIoError::OutOfRange);
         }
         let blocks = (len / self.block_size) as u64;
@@ -274,7 +274,7 @@ impl<T: Transport> VirtioBlk<T> {
                     polls += WAIT_COST;
                 }
                 _ => {
-                    if polls % POLLS_PER_RELAX == 0 {
+                    if polls.is_multiple_of(POLLS_PER_RELAX) {
                         (self.relax)();
                     }
                     core::hint::spin_loop();
