@@ -59,7 +59,8 @@ here. What made MilkDrop what it was is its presets, and those are portable:
 per-pixel equations, the warp mesh, waveforms in all eight modes, MilkDrop 2's
 custom waves and shapes, motion vectors, borders, video echo and the output
 filters. MilkDrop 2 presets that use HLSL pixel shaders load and run everything
-except the shaders. Any `.milk` file on the system is picked up.
+except the shaders. Presets are read from `/media/milkdrop`, or from anywhere on
+the system when that folder is missing or empty.
 
 To see presets without booting, render them on the host:
 

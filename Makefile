@@ -442,6 +442,15 @@ clean: games-unlink
 docker-build:
 	docker build -t $(IMAGE) .
 
+# The x86_64 guest runs under KVM when this is an x86_64 host and /dev/kvm can be
+# opened: scripts/qemu-x64.sh picks KVM when it finds the device, so it's passed in.
+# Emulating the CPU (TCG) works too, only much slower. FEOS_ACCEL=tcg forces it.
+DOCKER_KVM_ARGS = kvm_args=""; \
+	if [ "$(1)" = x64 ] && [ "$$(uname -m)" = x86_64 ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then \
+		kvm_args="--device /dev/kvm"; \
+	fi; \
+	if [ -n "$$FEOS_ACCEL" ]; then kvm_args="$$kvm_args -e FEOS_ACCEL=$$FEOS_ACCEL"; fi;
+
 # Opens a real QEMU window. The serial shell stays in this terminal.
 #
 # `docker-run` is an alias for the AArch64 target. Both targets use the same
@@ -466,7 +475,8 @@ define DOCKER_RUN_BODY
 			case "$$audiod" in *server=*) ;; *) audiod="$$audiod,server=unix:$(PULSE_SOCKET)";; esac;; \
 		wav*) mkdir -p target/audio; audio_args="-v $(CURDIR)/target/audio:/out";; \
 	esac; \
-	docker run --rm -it \
+	$(DOCKER_KVM_ARGS) \
+	docker run --rm -it $$kvm_args \
 		-e DISPLAY \
 		-e GDK_BACKEND=x11 \
 		-e NO_AT_BRIDGE=1 \
@@ -504,7 +514,8 @@ define DOCKER_RUN_VNC_BODY
 			case "$$audiod" in *server=*) ;; *) audiod="$$audiod,server=unix:$(PULSE_SOCKET)";; esac;; \
 		wav*) mkdir -p target/audio; audio_args="-v $(CURDIR)/target/audio:/out";; \
 	esac; \
-	docker run --rm -it -p 127.0.0.1:5900:5900 \
+	$(DOCKER_KVM_ARGS) \
+	docker run --rm -it -p 127.0.0.1:5900:5900 $$kvm_args \
 		-e FEOS_ARCH=$(1) \
 		-e FEOS_DISPLAY=vnc=0.0.0.0:0 \
 		-e FEOS_AUDIODEV="$$audiod" \

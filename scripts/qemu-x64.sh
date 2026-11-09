@@ -1,5 +1,5 @@
 #!/bin/sh
-# Boot the x86_64 kernel in QEMU's q35 machine with ramfb display, PS/2 input,
+# Boot the x86_64 kernel in QEMU's q35 machine with a virtio-gpu display, PS/2 input,
 # Intel HDA audio and the serial console on stdio.
 #
 #   ./scripts/qemu-x64.sh [path/to/kernel.elf]
@@ -16,6 +16,15 @@
 # created sparse at FEOS_DISK_SIZE (default 512M) if missing, and the kernel
 # formats a blank disk on first boot, so files survive reboots. Delete it to start
 # over, or set FEOS_DISK=none to boot with no disk and a root in RAM.
+#
+# FEOS_GPU is the display device. The default, virtio-gpu, is told which parts of
+# the screen changed, so QEMU redraws only those and nothing at all while the
+# screen is still. ramfb (FEOS_GPU=ramfb) has no such channel: QEMU repaints the
+# whole screen on every refresh, which on a slow or HiDPI host display keeps
+# QEMU's main loop busy enough to starve the disk, input and sound it also runs.
+#
+# FEOS_ACCEL is QEMU's accelerator: `kvm` or `tcg`. By default it's KVM when this
+# is an x86_64 host and /dev/kvm can be opened, and TCG (emulation) otherwise.
 set -eu
 
 KERNEL_ELF="${1:-target/x86_64-feos/release/feos}"
@@ -24,6 +33,15 @@ AUDIODEV="${FEOS_AUDIODEV:-wav,id=snd0,path=target/audio/qemu.wav,out.frequency=
 SMP="${FEOS_SMP:-4}"
 MEM="${FEOS_MEM:-512M}"
 QEMU="${FEOS_QEMU:-qemu-system-x86_64}"
+GPU="${FEOS_GPU:-virtio-gpu-pci,xres=1024,yres=768}"
+ACCEL="${FEOS_ACCEL:-}"
+if [ -z "$ACCEL" ]; then
+    if [ "$(uname -m)" = x86_64 ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+        ACCEL=kvm
+    else
+        ACCEL=tcg
+    fi
+fi
 
 if [ ! -f "$KERNEL_ELF" ]; then
     echo "kernel not found: $KERNEL_ELF" >&2
@@ -74,21 +92,25 @@ if [ "$DISK" != "none" ]; then
     DISK_ARGS="-drive if=none,id=disk0,format=raw,file=$DISK -device virtio-blk-pci,drive=disk0"
 fi
 
-# `-vga none` makes ramfb the only display. q35 supplies the PS/2 controller
+# `-vga none` makes the GPU the only display. q35 supplies the PS/2 controller
 # and the fw_cfg I/O ports the display and audio drivers use.
+# `use-timer=off` has the codec take sound from the guest's ring when the host's
+# audio wants it. With its timer, QEMU copies into an 8 KiB buffer on a clock and
+# throws the whole buffer away (43 ms of sound) whenever the host falls behind.
 # FEOS_QEMU_ARGS is deliberately word-split: it holds extra QEMU arguments.
 # shellcheck disable=SC2086
 exec "$QEMU" \
     -machine q35 \
+    -accel "$ACCEL" \
     -cpu max \
     -smp "$SMP" \
     -m "$MEM" \
     -net none \
     -vga none \
-    -device ramfb \
+    -device "$GPU" \
     -audiodev "$AUDIODEV" \
     -device intel-hda \
-    -device hda-output,audiodev=snd0 \
+    -device hda-output,audiodev=snd0,use-timer=off \
     -display "$DISPLAY_BACKEND" \
     -serial mon:stdio \
     -kernel "$KERNEL_BIN" \

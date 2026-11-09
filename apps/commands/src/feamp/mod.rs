@@ -221,7 +221,7 @@ impl Player {
         let before = self.tracks.len();
         let mut found = Vec::new();
         let tracks = &self.tracks;
-        walk_files(self.fs, |node, name| {
+        walk_files(self.fs, self.fs.root(), |node, name| {
             if is_audio_file(name) && !tracks.iter().any(|track| track.node == node) && found.try_reserve(1).is_ok() {
                 found.push(node);
             }
@@ -1063,15 +1063,21 @@ impl Player {
 /// Most nodes a walk visits, so a huge disk can't stall a window.
 const WALK_LIMIT: usize = 100_000;
 
-/// Calls `visit` with every file under the root, and its name. It walks the
+/// Top-level directories a walk of the whole system leaves out: `/rom` is the
+/// built-in image again when the root is a disk seeded from it, so its files
+/// would all be listed twice, and `/dev` holds devices.
+const WALK_SKIP: [&str; 2] = ["rom", "dev"];
+
+/// Calls `visit` with every file under `start`, and its name. It walks the
 /// tree, rather than counting node IDs, as a mounted volume's IDs needn't be
-/// dense.
-pub(crate) fn walk_files(fs: &dyn FileSystem, mut visit: impl FnMut(NodeId, &str)) {
+/// dense. From the root, it leaves out [`WALK_SKIP`].
+pub(crate) fn walk_files(fs: &dyn FileSystem, start: NodeId, mut visit: impl FnMut(NodeId, &str)) {
     let mut stack = Vec::new();
     if stack.try_reserve(64).is_err() {
         return;
     }
-    stack.push(fs.root());
+    let root = fs.root();
+    stack.push(start);
     let mut seen = 0;
     while let Some(dir) = stack.pop() {
         for index in 0..fs.child_count(dir) {
@@ -1087,6 +1093,9 @@ pub(crate) fn walk_files(fs: &dyn FileSystem, mut visit: impl FnMut(NodeId, &str
                     visit(node, name);
                 }
             } else if fs.is_dir(node) && stack.try_reserve(1).is_ok() {
+                if dir == root && fs.name(node).is_some_and(|name| WALK_SKIP.contains(&name)) {
+                    continue;
+                }
                 stack.push(node);
             }
         }
@@ -1278,6 +1287,36 @@ mod tests {
             fs.write(node, 0, &bytes).unwrap();
         }
         std::boxed::Box::leak(std::boxed::Box::new(fs))
+    }
+
+    #[test]
+    fn a_walk_skips_the_rom_copy_and_devices() {
+        use feos_fs::WritableFileSystem;
+        extern crate std;
+        let mut fs = feos_fs::vfs::RamFs::new(1 << 20);
+        let root = fs.root();
+        let mut make = |path: &[&str]| {
+            let mut dir = root;
+            for name in &path[..path.len() - 1] {
+                dir = fs.lookup(dir, name).unwrap_or_else(|| fs.create_dir(dir, name).unwrap());
+            }
+            fs.create_file(dir, path[path.len() - 1]).unwrap()
+        };
+        let song = make(&["media", "music", "song.mp3"]);
+        make(&["rom", "media", "music", "song.mp3"]);
+        make(&["dev", "audio.mp3"]);
+        let deeper = make(&["home", "rom", "kept.mp3"]);
+        let mut seen = std::vec::Vec::new();
+        walk_files(&fs, fs.root(), |node, _| seen.push(node));
+        seen.sort();
+        let mut want = std::vec![song, deeper];
+        want.sort();
+        assert_eq!(seen, want);
+        // Asked to start inside, it goes there.
+        let rom = fs.resolve("/rom").unwrap();
+        let mut count = 0;
+        walk_files(&fs, rom, |_, _| count += 1);
+        assert_eq!(count, 1);
     }
 
     #[test]

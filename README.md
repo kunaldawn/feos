@@ -71,6 +71,10 @@ make docker-run-vnc-x64
 vncviewer localhost:5900
 ```
 
+**Speed.** On an x86_64 host the x86_64 targets pass `/dev/kvm` into the container when you
+can open it, and the guest runs under KVM at close to native speed; otherwise QEMU emulates
+the CPU (`FEOS_ACCEL=tcg` forces that). The AArch64 port is always emulated on a PC.
+
 **Sound.** The Docker targets pick the QEMU audio backend from `DOCKER_AUDIODEV`. Unless
 `AUDIODEV` is given on the command line, that's `pa,id=snd0` (PulseAudio or PipeWire) when
 the socket `PULSE_SOCKET` (default `/run/user/<uid>/pulse/native`) exists, and otherwise the
@@ -120,7 +124,8 @@ boot, so files survive reboots (`FEOS_DISK=none` boots with a RAM root instead).
 | `make run QEMU_SMP=8 QEMU_MEM=1G` | Eight CPUs and 1 GiB (`QEMU_SMP_X64` for `run-x64`) |
 | `make run AUDIODEV=pa,id=snd0` | Live PulseAudio/PipeWire output |
 | `make run QEMU_EXTRA="-netdev user,id=n0 -device virtio-net-pci,netdev=n0"` | A network card: the run scripts otherwise boot with `-net none` |
-| `make run QEMU_EXTRA="-device virtio-gpu-pci"` | A virtio-gpu, used instead of ramfb |
+| `FEOS_GPU=ramfb make run` | ramfb instead of the default virtio-gpu, which QEMU has to repaint in full on every refresh |
+| `FEOS_ACCEL=tcg make run-x64` | Emulate the CPU even when KVM is available (it's used by default on an x86_64 host) |
 | `FEOS_MACHINE=virt,gic-version=3 ./scripts/qemu.sh <kernel>` | AArch64 with a GICv3 |
 
 On AArch64 the run target adds a virtio tablet and keyboard (`POINTER_FLAGS`,

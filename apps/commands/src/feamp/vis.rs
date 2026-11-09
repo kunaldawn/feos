@@ -34,6 +34,8 @@ const TARGET_FPS: u64 = 30;
 const MAX_RENDER: (usize, usize) = (320, 240);
 /// Most presets listed.
 const MAX_PRESETS: usize = 1024;
+/// Where presets are installed.
+const PRESET_DIR: &str = "/media/milkdrop";
 /// How long a preset's name shows after it starts.
 const NAME_MS: u64 = 4_000;
 
@@ -90,14 +92,25 @@ pub fn is_open() -> bool {
 /// Every `.milk` file, by name.
 fn find_presets(fs: &dyn FileSystem) -> Vec<NodeId> {
     let mut found: Vec<NodeId> = Vec::new();
-    super::walk_files(fs, |node, name| {
+    // Where they're installed, which is quick to read; the whole system only when
+    // that's missing or empty.
+    if let Some(dir) = fs.resolve(PRESET_DIR) {
+        presets_under(fs, dir, &mut found);
+    }
+    if found.is_empty() {
+        presets_under(fs, fs.root(), &mut found);
+    }
+    found.sort_by(|a, b| fs.name(*a).unwrap_or("").cmp(fs.name(*b).unwrap_or("")));
+    found
+}
+
+fn presets_under(fs: &dyn FileSystem, start: NodeId, found: &mut Vec<NodeId>) {
+    super::walk_files(fs, start, |node, name| {
         let is_preset = name.len() > 5 && name[name.len() - 5..].eq_ignore_ascii_case(".milk");
         if is_preset && found.len() < MAX_PRESETS && found.try_reserve(1).is_ok() {
             found.push(node);
         }
     });
-    found.sort_by(|a, b| fs.name(*a).unwrap_or("").cmp(fs.name(*b).unwrap_or("")));
-    found
 }
 
 /// Reads and loads preset `node`. Returns its name, or `None` if it won't load.

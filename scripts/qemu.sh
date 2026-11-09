@@ -1,5 +1,5 @@
 #!/bin/sh
-# Boot the kernel in QEMU's aarch64 `virt` machine with ramfb display, a
+# Boot the kernel in QEMU's aarch64 `virt` machine with a virtio-gpu display, a
 # virtio tablet pointer, a virtio keyboard and an Intel HDA audio device. Set
 # FEOS_QEMU_ARGS to replace the input devices and add QEMU arguments (`-accel kvm`).
 #
@@ -20,6 +20,11 @@
 # created sparse at FEOS_DISK_SIZE (default 512M) if missing, and the kernel
 # formats a blank disk on first boot, so files survive reboots. Delete it to start
 # over, or set FEOS_DISK=none to boot with no disk and a root in RAM.
+#
+# FEOS_GPU is the display device. The default, virtio-gpu, is told which parts of
+# the screen changed, so QEMU redraws only those. ramfb (FEOS_GPU=ramfb) makes QEMU
+# repaint the whole screen on every refresh, which can starve the disk, input and
+# sound that QEMU's main loop also runs: see qemu-x64.sh.
 set -eu
 
 KERNEL="${1:-target/aarch64-unknown-none/release/feos}"
@@ -28,6 +33,7 @@ AUDIODEV="${FEOS_AUDIODEV:-wav,id=snd0,path=target/audio/qemu.wav,out.frequency=
 SMP="${FEOS_SMP:-4}"
 MEM="${FEOS_MEM:-512M}"
 QEMU="${FEOS_QEMU:-qemu-system-aarch64}"
+GPU="${FEOS_GPU:-virtio-gpu-pci,xres=1024,yres=768}"
 
 if [ ! -f "$KERNEL" ]; then
     echo "kernel not found: $KERNEL" >&2
@@ -46,6 +52,9 @@ if [ "$DISK" != "none" ]; then
     DISK_ARGS="-drive if=none,id=disk0,format=raw,file=$DISK -device virtio-blk-device,drive=disk0"
 fi
 
+# `use-timer=off` has the codec take sound from the guest's ring when the host's
+# audio wants it. With its timer, QEMU copies into an 8 KiB buffer on a clock and
+# throws the whole buffer away (43 ms of sound) whenever the host falls behind.
 # FEOS_QEMU_ARGS is deliberately word-split: it holds extra QEMU arguments.
 # shellcheck disable=SC2086
 exec "$QEMU" \
@@ -54,10 +63,10 @@ exec "$QEMU" \
     -smp "$SMP" \
     -m "$MEM" \
     -net none \
-    -device ramfb \
+    -device "$GPU" \
     -audiodev "$AUDIODEV" \
     -device intel-hda \
-    -device hda-output,audiodev=snd0 \
+    -device hda-output,audiodev=snd0,use-timer=off \
     -display "$DISPLAY_BACKEND" \
     -serial mon:stdio \
     -kernel "$KERNEL" \
