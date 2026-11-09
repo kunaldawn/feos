@@ -29,6 +29,9 @@ ffmpeg -v error -y -i mpeg2-stereo.mp2 -f s16le mpeg2-stereo.mp2.s16
 ffmpeg -v error -y -f mp3 -i layer1.mp1 -f s16le layer1.mp1.s16
 ffmpeg -v error -y -i floor0.ogg -f s16le floor0.ogg.s16
 
+# MP3 gapless reference: ffmpeg drops the Info frame, the encoder delay and padding.
+ffmpeg -v error -y -i tone.mp3 -f s16le tone.mp3.s16
+
 # FLAC. Hashes of the decoded output are in tests/audio.rs.
 SRC='sine=f=440:r=44100:d=0.15[a];sine=f=1171:r=44100:d=0.15[b];anoisesrc=d=0.15:r=44100:c=pink:a=0.01:s=7[n];[a][b]amerge=2[ab];[n]asplit[n1][n2];[n1][n2]amerge=2[nn];[ab][nn]amix=normalize=0[o]'
 ffmpeg $F -filter_complex "$SRC" -map '[o]' -c:a flac -compression_level 8 -sample_fmt s16 -fflags +bitexact -f flac tone.flac

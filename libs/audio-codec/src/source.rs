@@ -132,7 +132,7 @@ const MPEG_BITRATES: [[u16; 16]; 5] = [
 
 /// What an MPEG audio frame header says: `(bit rate, sample rate, samples per frame,
 /// Xing header offset from the frame's start)`.
-fn mpeg_header(bytes: &[u8]) -> Option<(u32, u32, u32, usize)> {
+fn mpeg_header(bytes: &[u8]) -> Option<(u32, u32)> {
     let head = bytes.get(..4)?;
     if head[0] != 0xff || head[1] & 0xe0 != 0xe0 {
         return None;
@@ -159,18 +159,7 @@ fn mpeg_header(bytes: &[u8]) -> Option<(u32, u32, u32, usize)> {
         2 => base / 2,
         _ => base / 4,
     };
-    let samples = match (layer, mpeg1) {
-        (3, _) => 384,
-        (1, false) => 576,
-        _ => 1152,
-    };
-    let mono = head[3] >> 6 == 3;
-    let xing = match (mpeg1, mono) {
-        (true, false) => 36,
-        (true, true) | (false, false) => 21,
-        (false, true) => 13,
-    };
-    Some((bitrate, rate, samples, xing))
+    Some((bitrate, rate))
 }
 
 impl SourceStream {
@@ -264,36 +253,18 @@ impl SourceStream {
     fn open_mp3(file: &dyn Source, cache: &mut Cache, start: u64) -> Result<(AudioInfo, Inner)> {
         let data = cache.bytes(file, start, WINDOW);
         let at = (0..data.len().saturating_sub(4))
-            .find(|&at| mpeg_header(&data[at..]).is_some_and(|(rate, ..)| rate != 0))
+            .find(|&at| mpeg_header(&data[at..]).is_some_and(|(bitrate, _)| bitrate != 0))
             .ok_or(AudioError::InvalidData("no MPEG audio frame found"))?;
-        let (bitrate, rate, samples, xing) =
-            mpeg_header(&data[at..]).ok_or(AudioError::UnknownFormat)?;
+        let (bitrate, rate) = mpeg_header(&data[at..]).ok_or(AudioError::UnknownFormat)?;
         let channels = if data[at + 3] >> 6 == 3 { 1 } else { 2 };
-        let mut toc = None;
-        let mut frames_in_header = None;
-        if let Some(tag) = data.get(at + xing..at + xing + 120) {
-            if &tag[..4] == b"Xing" || &tag[..4] == b"Info" {
-                let flags = u32::from_be_bytes([tag[4], tag[5], tag[6], tag[7]]);
-                let mut pos = 8;
-                if flags & 1 != 0 {
-                    frames_in_header =
-                        Some(u32::from_be_bytes([tag[pos], tag[pos + 1], tag[pos + 2], tag[pos + 3]]));
-                    pos += 4;
-                }
-                if flags & 2 != 0 {
-                    pos += 4;
-                }
-                if flags & 4 != 0 {
-                    let mut table = [0u8; 100];
-                    table.copy_from_slice(&tag[pos..pos + 100]);
-                    toc = Some(table);
-                }
-            }
-        }
+        // The header and LAME tag, which give the length (without the encoder's
+        // silence, which the decoder drops), and a seek table.
+        let tag = crate::mp3_decode::xing_tag(&data[at..]);
+        let toc = tag.and_then(|tag| tag.toc);
         let start = start + at as u64;
         let bytes = file.len().saturating_sub(start);
-        let frames = match frames_in_header {
-            Some(count) => count as u64 * samples as u64,
+        let frames = match tag.and_then(|tag| tag.length()) {
+            Some(length) => length,
             None => bytes.saturating_mul(8).saturating_mul(rate as u64) / bitrate.max(1) as u64,
         };
         let info = AudioInfo {
@@ -633,7 +604,13 @@ impl SourceStream {
                     None => frame as u128 * 65536 / total as u128,
                 };
                 mp3.pos = mp3.start + (bytes as u128 * fraction / 65536) as u64;
-                mp3.decoder = Mp3Decoder::new();
+                // From the top, the header frame and leading silence are dropped
+                // again; from anywhere else, only the end is still to be kept to.
+                mp3.decoder = if frame == 0 {
+                    Mp3Decoder::new()
+                } else {
+                    mp3.decoder.after_seek(frame)
+                };
                 self.position = frame;
                 self.skip_to = frame;
             }

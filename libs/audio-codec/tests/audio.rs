@@ -1,6 +1,6 @@
 use feos_audio_codec::{
     aac, aiff, decode, detect, flac, info, ogg, opus, scratch_len, vorbis, wav, AudioError,
-    AudioFormat,
+    AudioFormat, AudioStream,
 };
 
 const WAV16: &[u8] = include_bytes!("data/pcm16.wav");
@@ -388,6 +388,31 @@ fn vorbis_matches_ffmpeg_within_tolerance() {
         assert!(worst <= 2, "worst sample error {worst}");
         assert!(rms <= 0.5, "RMS error {rms}");
     }
+}
+
+#[test]
+fn mp3_is_gapless_and_matches_ffmpeg_sample_for_sample() {
+    // LAME-style files start with an Info frame of silence, then the encoder's
+    // delay; both are dropped, and the end padding too, as ffmpeg does. Before,
+    // the music came 2257 samples late and the length was wrong.
+    let reference = s16le(include_bytes!("data/tone.mp3.s16"));
+    let stated = info(MP3).unwrap();
+    let channels = stated.channels as usize;
+    assert_eq!(stated.frames as usize * channels, reference.len(), "stated length");
+    let mut out = vec![0i16; reference.len() + 8192];
+    let decoded = decode(MP3, &mut out, &mut []).unwrap();
+    out.truncate(decoded.frames * channels);
+    assert_eq!(out.len(), reference.len(), "decoded length");
+    // Aligned: the very first samples agree, so nothing is shifted.
+    let (worst, rms) = compare(&out, &reference);
+    assert!(worst <= 3 && rms <= 1.0, "worst {worst}, rms {rms}");
+    let mut streamed = Vec::new();
+    let mut stream = AudioStream::open(MP3).unwrap();
+    let mut chunk = vec![0i16; stream.max_chunk_samples()];
+    while let Some(frames) = stream.next_chunk(&mut chunk).unwrap() {
+        streamed.extend_from_slice(&chunk[..frames * channels]);
+    }
+    assert_eq!(streamed, out, "streaming gives the same");
 }
 
 #[test]

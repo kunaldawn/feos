@@ -3,10 +3,115 @@
 //! The actual decoder is a vendored copy of Raph Levien's safe-Rust port of
 //! minimp3 (MIT OR Apache-2.0), with Layers I and II ported here from minimp3
 //! itself (CC0). See `src/mp3/mod.rs` for attribution.
+//!
+//! # Gapless playback
+//!
+//! An encoder starts each file with silence (its own delay, plus the 529
+//! samples a Layer III decoder's output lags by) and pads the end out to a whole
+//! frame. LAME, and ffmpeg through it, writes a silent first frame holding an
+//! Xing or Info header and a LAME tag that says how much. When the first frame
+//! has that header, [`Mp3Decoder`] gives nothing for it, drops the leading
+//! silence and stops at the stated end, as ffmpeg and other players do, so
+//! the music starts on its first sample and lengths are exact.
 
 use crate::error::{AudioError, Result};
 use crate::mp3::{Decoder, FrameInfo, MAX_SAMPLES_PER_FRAME};
 use crate::{AudioFormat, AudioInfo, DecodedAudio};
+
+/// How many samples a Layer III decoder's output lags its input by.
+const DECODER_DELAY: u64 = 529;
+
+/// What an Xing or Info header, and a LAME tag after it, say about a file.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct XingTag {
+    /// Audio frames in the file, not counting the one holding the header.
+    pub frames: Option<u32>,
+    /// Samples (per channel) in each frame.
+    pub samples_per_frame: u32,
+    /// The encoder's delay and end padding, in samples, from a LAME tag.
+    pub delay: u32,
+    pub padding: u32,
+    /// The 100-entry seek table, if there is one.
+    pub toc: Option<[u8; 100]>,
+}
+
+impl XingTag {
+    /// Leading samples to drop: the encoder's delay and the decoder's.
+    pub fn skip(&self) -> u64 {
+        DECODER_DELAY + self.delay as u64
+    }
+
+    /// The samples (per channel) of music, when the header gives a frame count.
+    pub fn length(&self) -> Option<u64> {
+        let frames = self.frames? as u64 * self.samples_per_frame as u64;
+        Some(frames.saturating_sub(self.delay as u64 + self.padding as u64))
+    }
+}
+
+/// Reads the Xing or Info header in a Layer III frame, `frame` starting at its
+/// header. `None` when it isn't there.
+pub fn xing_tag(frame: &[u8]) -> Option<XingTag> {
+    let head = frame.get(..4)?;
+    if head[0] != 0xff || head[1] & 0xe0 != 0xe0 {
+        return None;
+    }
+    let version = (head[1] >> 3) & 3; // 3: MPEG 1, 2: MPEG 2, 0: MPEG 2.5
+    let layer = (head[1] >> 1) & 3; // 1: Layer III
+    if version == 1 || layer != 1 {
+        return None;
+    }
+    let mpeg1 = version == 3;
+    let mono = head[3] >> 6 == 3;
+    let crc = if head[1] & 1 == 0 { 2 } else { 0 };
+    let side = match (mpeg1, mono) {
+        (true, false) => 32,
+        (true, true) => 17,
+        (false, false) => 17,
+        (false, true) => 9,
+    };
+    let mut at = 4 + crc + side;
+    let id = frame.get(at..at + 4)?;
+    if id != b"Xing" && id != b"Info" {
+        return None;
+    }
+    let word = |at: usize| -> Option<u32> {
+        let bytes = frame.get(at..at + 4)?;
+        Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    };
+    let flags = word(at + 4)?;
+    at += 8;
+    let mut tag = XingTag {
+        samples_per_frame: if mpeg1 { 1152 } else { 576 },
+        ..XingTag::default()
+    };
+    if flags & 1 != 0 {
+        tag.frames = Some(word(at)?);
+        at += 4;
+    }
+    if flags & 2 != 0 {
+        at += 4;
+    }
+    if flags & 4 != 0 {
+        let mut toc = [0u8; 100];
+        toc.copy_from_slice(frame.get(at..at + 100)?);
+        tag.toc = Some(toc);
+        at += 100;
+    }
+    if flags & 8 != 0 {
+        at += 4;
+    }
+    // The LAME tag: 9 bytes of encoder name, then at 21 the delay and padding
+    // as two 12-bit numbers. Encoders other than LAME and ffmpeg's leave it out
+    // or fill it with something else.
+    if let Some(lame) = frame.get(at..at + 24) {
+        if [&b"LAME"[..], b"Lavf", b"Lavc"].contains(&&lame[..4]) {
+            let (a, b, c) = (lame[21] as u32, lame[22] as u32, lame[23] as u32);
+            tag.delay = (a << 4) | (b >> 4);
+            tag.padding = ((b & 0x0f) << 8) | c;
+        }
+    }
+    Some(tag)
+}
 
 /// A stateful MP3 decoder.
 ///
@@ -18,6 +123,13 @@ pub struct Mp3Decoder {
     frame: FrameInfo,
     channels: usize,
     sample_rate: usize,
+    /// Whether a frame has been seen, so the next one isn't the first.
+    started: bool,
+    /// Leading samples (per channel) still to drop.
+    skip: u64,
+    /// Samples (per channel) given out so far, and the most there are.
+    given: u64,
+    end: Option<u64>,
 }
 
 impl Default for Mp3Decoder {
@@ -34,6 +146,22 @@ impl Mp3Decoder {
             frame: FrameInfo::default(),
             channels: 0,
             sample_rate: 0,
+            started: false,
+            skip: 0,
+            given: 0,
+            end: None,
+        }
+    }
+
+    /// A decoder for after a jump into the middle of the stream at `frame`
+    /// (in samples per channel). It keeps the stream's end, but looks for no
+    /// header, as the first frame it sees won't be the file's first.
+    pub fn after_seek(&self, frame: u64) -> Self {
+        Self {
+            started: true,
+            given: frame,
+            end: self.end,
+            ..Self::new()
         }
     }
 
@@ -74,6 +202,30 @@ impl Mp3Decoder {
             self.channels = self.frame.channels;
             self.sample_rate = self.frame.hz;
         }
+        if !self.started {
+            self.started = true;
+            let header = input.get(self.frame.frame_offset..consumed).unwrap_or(&[]);
+            if let Some(tag) = xing_tag(header) {
+                // The header's frame is silence: nothing of it is music.
+                self.skip = tag.skip();
+                self.end = tag.length();
+                return Ok(consumed);
+            }
+        }
+        // Leading silence off the front, and padding off the end.
+        let mut first = 0;
+        let mut samples = samples;
+        if self.skip > 0 {
+            let dropped = (self.skip as usize).min(samples);
+            self.skip -= dropped as u64;
+            first = dropped;
+            samples -= dropped;
+        }
+        if let Some(end) = self.end {
+            samples = samples.min(end.saturating_sub(self.given) as usize);
+        }
+        self.given += samples as u64;
+        let first = first * self.frame.channels;
         let count = samples
             .checked_mul(self.frame.channels)
             .ok_or(AudioError::Overflow)?;
@@ -85,7 +237,7 @@ impl Mp3Decoder {
                     available: out.len(),
                 });
             }
-            out[*written..end].copy_from_slice(&pcm[..count]);
+            out[*written..end].copy_from_slice(&pcm[first..first + count]);
             *written = end;
         }
         Ok(consumed)
@@ -100,10 +252,23 @@ pub fn info(input: &[u8]) -> Result<AudioInfo> {
     let mut frames = 0u64;
     let mut sample_rate = 0usize;
     let mut channels = 0usize;
+    let mut tag = None;
+    let mut first = true;
     while pos < input.len() {
         let samples = decoder.decode_frame(&input[pos..], None, &mut frame);
         if frame.frame_bytes == 0 {
             break;
+        }
+        if first {
+            first = false;
+            let end = pos.saturating_add(frame.frame_bytes).min(input.len());
+            tag = xing_tag(input.get(pos + frame.frame_offset..end).unwrap_or(&[]));
+            if tag.is_some() {
+                sample_rate = frame.hz;
+                channels = frame.channels;
+                pos += frame.frame_bytes;
+                continue;
+            }
         }
         if samples != 0 {
             if channels == 0 {
@@ -116,6 +281,14 @@ pub fn info(input: &[u8]) -> Result<AudioInfo> {
     }
     if channels == 0 {
         return Err(AudioError::InvalidData("no MP3 frame found"));
+    }
+    // What the decoder will give: the stated length, or what's there less the
+    // leading silence.
+    if let Some(tag) = tag {
+        frames = frames.saturating_sub(tag.skip());
+        if let Some(length) = tag.length() {
+            frames = frames.min(length);
+        }
     }
     Ok(AudioInfo {
         sample_rate: sample_rate as u32,

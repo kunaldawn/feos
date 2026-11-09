@@ -247,6 +247,28 @@ mod source {
     }
 
     #[test]
+    fn mp3_lengths_are_exact_and_a_seek_keeps_the_end() {
+        let data = std::fs::read(format!("{SOUND}/tone.mp3")).unwrap();
+        let memory = AudioStream::open(&data).unwrap();
+        let mut file = SourceStream::open(Box::new(Slow(data.clone()))).unwrap();
+        // Both read the LAME tag, so both know the length to the sample.
+        let total = file.info().frames;
+        assert_eq!(memory.info().frames, total);
+        let channels = file.info().channels as usize;
+        let mut chunk = vec![0i16; 1 << 18];
+        assert_eq!(drain_file(&mut file, &mut chunk).len() as u64, total * channels as u64);
+        // A jump lands near its target, and the padding at the end still goes.
+        let target = total / 2;
+        file.seek(target).unwrap();
+        let rest = drain_file(&mut file, &mut chunk).len() as u64 / channels as u64;
+        assert!(rest <= total - target, "{rest} frames after seeking to {target} of {total}");
+        assert!(rest * 10 >= (total - target) * 9, "{rest} frames after seeking to {target} of {total}");
+        // And from the top, it's the whole file again.
+        file.seek(0).unwrap();
+        assert_eq!(drain_file(&mut file, &mut chunk).len() as u64, total * channels as u64);
+    }
+
+    #[test]
     fn adts() {
         compare("tone.aac", false);
     }
