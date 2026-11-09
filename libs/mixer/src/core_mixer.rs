@@ -13,6 +13,9 @@ pub const MAX_STREAMS: usize = 8;
 pub const MAX_VOLUME: u8 = 100;
 /// Output frames each stream's ring holds: a quarter of a second.
 pub const RING_FRAMES: usize = 12_000;
+/// Output frames the scope keeps, for visualisers: 170 ms, which reaches back
+/// past the device's queue to what's being heard.
+pub const SCOPE_FRAMES: usize = 8192;
 
 /// Output channels: the driver's format is stereo.
 const CHANNELS: usize = 2;
@@ -61,6 +64,13 @@ pub struct Mixer {
     serial: u32,
     volume: u8,
     muted: bool,
+    /// The mix before the master volume, interleaved: what visualisers see.
+    scope: [i16; SCOPE_FRAMES * CHANNELS],
+    /// Frames ever written to the scope; the next goes at this modulo its size.
+    scope_frames: u64,
+    /// Frames the device still had queued after the last pump: how far behind
+    /// the newest mixed frame the one being heard is.
+    device_queued: usize,
 }
 
 impl Default for Mixer {
@@ -78,6 +88,9 @@ impl Mixer {
             serial: 0,
             volume: MAX_VOLUME,
             muted: false,
+            scope: [0; SCOPE_FRAMES * CHANNELS],
+            scope_frames: 0,
+            device_queued: 0,
         }
     }
 
@@ -258,9 +271,11 @@ impl Mixer {
         if longest == 0 {
             return 0;
         }
-        let master = if self.muted { 0 } else { curve(self.volume) };
-        // Summed wide, then limited once, so that loud streams clip only as much
-        // as their sum does.
+        let master = if self.muted { 0 } else { curve(self.volume) } as i64;
+        // Summed wide at each stream's own gain, then limited once, so that
+        // loud streams clip only as much as their sum does. The scope takes
+        // the sum before the master volume, so a visualiser still moves with
+        // the sound turned down.
         let mut sum = [0i32; CHUNK_FRAMES * CHANNELS];
         let mut done = 0;
         while done < samples {
@@ -270,7 +285,7 @@ impl Mixer {
                 if slot.paused {
                     continue;
                 }
-                let gain = (curve(slot.gain) as i64 * master as i64) >> 15;
+                let gain = curve(slot.gain) as i64;
                 let count = chunk.min(slot.len);
                 let capacity = slot.ring.len();
                 for (index, total) in sum[..count].iter_mut().enumerate() {
@@ -282,15 +297,52 @@ impl Mixer {
                 slot.mixed += (count / CHANNELS) as u64;
             }
             for (target, total) in out[done..done + chunk].iter_mut().zip(&sum) {
-                *target = (*total).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                let level = (*total as i64 * master) >> 15;
+                *target = level.clamp(i16::MIN as i64, i16::MAX as i64) as i16;
+            }
+            for pair in sum[..chunk].chunks_exact(CHANNELS) {
+                let at = (self.scope_frames % SCOPE_FRAMES as u64) as usize * CHANNELS;
+                for (channel, total) in pair.iter().enumerate() {
+                    self.scope[at + channel] = (*total).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                }
+                self.scope_frames += 1;
             }
             done += chunk;
         }
         longest
     }
 
+    /// Fills `out` (interleaved stereo, whole frames) with the newest mix that
+    /// has reached the speaker, before the master volume, and returns how many
+    /// frames have ever been mixed. A count that stops moving means nothing is
+    /// playing; what's in `out` is then the last that was.
+    pub fn scope(&self, out: &mut [i16]) -> u64 {
+        let frames = out.len() / CHANNELS;
+        let held = self.scope_frames.min(SCOPE_FRAMES as u64) as usize;
+        // The device's queue is still to be heard: step back over it, as far
+        // as the scope reaches.
+        let behind = self.device_queued.min(held.saturating_sub(frames.min(held)));
+        let end = self.scope_frames - behind as u64;
+        let available = (held - behind).min(frames);
+        let pad = frames - available;
+        out[..pad * CHANNELS].fill(0);
+        for index in 0..available {
+            let frame = end - (available - index) as u64;
+            let at = (frame % SCOPE_FRAMES as u64) as usize * CHANNELS;
+            let to = (pad + index) * CHANNELS;
+            out[to..to + CHANNELS].copy_from_slice(&self.scope[at..at + CHANNELS]);
+        }
+        self.scope_frames
+    }
+
     /// Hands the device as much as it wants right now. Returns the frames given.
     pub fn pump(&mut self, device: &dyn Audio) -> usize {
+        let given = self.fill(device);
+        self.device_queued = device.queued() / CHANNELS;
+        given
+    }
+
+    fn fill(&mut self, device: &dyn Audio) -> usize {
         let mut given = 0;
         let mut chunk = [0i16; CHUNK_FRAMES * CHANNELS];
         loop {
@@ -587,5 +639,26 @@ mod tests {
         let device = Device::new();
         assert_eq!(mixer.pump(&device), 0);
         assert!(device.taken.borrow().is_empty());
+    }
+
+    #[test]
+    fn the_scope_sees_the_mix_before_the_master_volume() {
+        let mut mixer = Mixer::new();
+        let id = mixer.open(STEREO_48K, 1).unwrap();
+        let samples: std::vec::Vec<i16> = (0..2000).flat_map(|i| [i as i16, -(i as i16)]).collect();
+        assert_eq!(mixer.write(id, &samples), samples.len());
+        mixer.set_muted(true);
+        let mut out = [0i16; 2 * 1000];
+        assert_eq!(mixer.mix(&mut out), 1000);
+        assert!(out.iter().all(|s| *s == 0), "muted output is silent");
+        let mut scope = [0i16; 8];
+        assert_eq!(mixer.scope(&mut scope), 1000);
+        // The newest four frames, 996 to 999, at full gain.
+        assert_eq!(scope, [996, -996, 997, -997, 998, -998, 999, -999]);
+        // Before anything, the scope is silence.
+        let fresh = Mixer::new();
+        let mut empty = [7i16; 4];
+        assert_eq!(fresh.scope(&mut empty), 0);
+        assert_eq!(empty, [0; 4]);
     }
 }

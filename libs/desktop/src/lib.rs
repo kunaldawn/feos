@@ -1221,6 +1221,7 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             if !was_open {
                 window.bundle.set(app.id());
                 window.args.set(args.unwrap_or(app.manifest.args.as_str()));
+                window.frameless = app.manifest.frameless;
             } else if let Some(args) = args {
                 if !window.args.eq_str(args) {
                     window.args.set(args);
@@ -1338,6 +1339,7 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
         if let Some(window) = self.windows.get_mut(slot) {
             window.bundle.set(app.id());
             window.args.set(args.unwrap_or(app.manifest.args.as_str()));
+            window.frameless = app.manifest.frameless;
         }
         Some(slot)
     }
@@ -3729,6 +3731,16 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
         theme.window_border_inactive
     };
     let rect = window.rect;
+    if window.frameless {
+        if rect.is_empty() {
+            return outcome;
+        }
+        render_content(
+            ui, theme, windows, catalog, index, &window, rect, work_area, input, platform,
+            pointer_active, keyboard_active, paint_app, scratch, now_ms, &mut outcome,
+        );
+        return outcome;
+    }
     if rect.width < 80 || rect.height < 40 {
         return outcome;
     }
@@ -3908,6 +3920,59 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
 
     // Content -------------------------------------------------------------
     let content = window::content_rect(rect);
+    render_content(
+        ui, theme, windows, catalog, index, &window, content, work_area, input, platform,
+        pointer_active, keyboard_active, paint_app, scratch, now_ms, &mut outcome,
+    );
+
+    // Resize handles ------------------------------------------------------
+    // These are registered last so they take priority over the title bar and
+    // content interactions underneath them.
+    resize_edges(ui, windows, index, rect, work_area);
+
+    // Resize grip ---------------------------------------------------------
+    if window.state == WindowState::Normal && rect.width > 140 && rect.height > 100 {
+        let grip = Rect::new(rect.right_i32() - 14, rect.bottom_i32() - 14, 14, 14);
+        let grip_color = if ui.pointer_over(grip) {
+            theme.menu_text
+        } else {
+            theme.menu_muted
+        };
+        for step in 0..3 {
+            let offset = step * 4;
+            ui.painter.fill_rect(
+                Rect::new(grip.right_i32() - 4 - offset, grip.bottom_i32() - 3, 3, 1),
+                grip_color,
+            );
+            ui.painter.fill_rect(
+                Rect::new(grip.right_i32() - 3, grip.bottom_i32() - 4 - offset, 1, 3),
+                grip_color,
+            );
+        }
+    }
+    outcome
+}
+
+/// Draws a window's content, where its app (if it has one) runs.
+#[allow(clippy::too_many_arguments)]
+fn render_content<const UI: usize, const N: usize, const A: usize>(
+    ui: &mut Ui<'_, '_, '_, UI>,
+    theme: &DesktopTheme,
+    windows: &mut WindowManager<N>,
+    catalog: &AppCatalog<A>,
+    index: usize,
+    window: &DesktopWindow,
+    content: Rect,
+    work_area: Rect,
+    input: &Input,
+    platform: Option<&Platform>,
+    pointer_active: bool,
+    keyboard_active: bool,
+    paint_app: bool,
+    scratch: Option<&mut [u32]>,
+    now_ms: u64,
+    outcome: &mut WindowOutcome,
+) {
     let clip = ui.painter.push_clip(content);
     if paint_app {
         ui.painter.fill_rect(content, theme.window_bg);
@@ -3938,7 +4003,7 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
                             runtime,
                             windows,
                             index,
-                            &window,
+                            window,
                             &mut surface,
                             input,
                             platform,
@@ -3947,6 +4012,7 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
                             &theme.ui,
                             pointer_active,
                             keyboard_active,
+                            work_area,
                         );
                         ui.painter.blit(
                             content.x,
@@ -3963,7 +4029,7 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
                             runtime,
                             windows,
                             index,
-                            &window,
+                            window,
                             &mut surface,
                             input,
                             platform,
@@ -3972,6 +4038,7 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
                             &theme.ui,
                             pointer_active,
                             keyboard_active,
+                            work_area,
                         );
                     }
                 }
@@ -4115,33 +4182,6 @@ fn render_window<const UI: usize, const N: usize, const A: usize>(
 
     ui.painter.restore_clip(clip);
 
-    // Resize handles ------------------------------------------------------
-    // These are registered last so they take priority over the title bar and
-    // content interactions underneath them.
-    resize_edges(ui, windows, index, rect, work_area);
-
-    // Resize grip ---------------------------------------------------------
-    if window.state == WindowState::Normal && rect.width > 140 && rect.height > 100 {
-        let grip = Rect::new(rect.right_i32() - 14, rect.bottom_i32() - 14, 14, 14);
-        let grip_color = if ui.pointer_over(grip) {
-            theme.menu_text
-        } else {
-            theme.menu_muted
-        };
-        for step in 0..3 {
-            let offset = step * 4;
-            ui.painter.fill_rect(
-                Rect::new(grip.right_i32() - 4 - offset, grip.bottom_i32() - 3, 3, 1),
-                grip_color,
-            );
-            ui.painter.fill_rect(
-                Rect::new(grip.right_i32() - 3, grip.bottom_i32() - 4 - offset, 1, 3),
-                grip_color,
-            );
-        }
-    }
-
-    outcome
 }
 
 /// Lets a hosted app clean up. Its window's task does that too, a new one if the old one
@@ -4200,6 +4240,7 @@ fn run_hosted_app<const N: usize>(
     theme: &feos_gui::Theme,
     pointer_active: bool,
     keyboard_active: bool,
+    work_area: Rect,
 ) -> bool {
     let mut context = WindowContext {
         args: window.args.as_str(),
@@ -4213,6 +4254,7 @@ fn run_hosted_app<const N: usize>(
         pointer_active,
         keyboard_active,
         cursor: feos_gui::CursorShape::Arrow,
+        request: feos_app::WindowRequest::None,
     };
     let mut started = window.app_started;
     if !started {
@@ -4251,7 +4293,39 @@ fn run_hosted_app<const N: usize>(
         let micros = elapsed * 1_000_000 / clock.frequency().max(1) as u128;
         slot.cpu_us = slot.cpu_us.saturating_add(micros as u64);
     }
+    apply_request(windows, index, context.request, work_area);
     closed
+}
+
+/// Does what a window's app asked for in its frame.
+fn apply_request<const N: usize>(
+    windows: &mut WindowManager<N>,
+    index: usize,
+    request: feos_app::WindowRequest,
+    work_area: Rect,
+) {
+    match request {
+        feos_app::WindowRequest::None => {}
+        feos_app::WindowRequest::Move { dx, dy } => {
+            windows.move_by(index, dx, dy, work_area);
+        }
+        feos_app::WindowRequest::Resize { width, height } => {
+            if let Some(window) = windows.get_mut(index) {
+                if window.state == WindowState::Normal && width > 0 && height > 0 {
+                    window.rect = Rect::new(
+                        window.rect.x,
+                        window.rect.y,
+                        width.min(work_area.width.max(1) * 2),
+                        height.min(work_area.height.max(1) * 2),
+                    );
+                    window.restore = window.rect;
+                }
+            }
+        }
+        feos_app::WindowRequest::Minimize => {
+            windows.minimize(index);
+        }
+    }
 }
 
 /// Registers the eight invisible resize grips around a normal window.
@@ -4268,7 +4342,7 @@ fn resize_edges<const UI: usize, const N: usize>(
 ) {
     let resizable = windows
         .get(index)
-        .is_some_and(|window| window.open && window.state == WindowState::Normal);
+        .is_some_and(|window| window.open && window.state == WindowState::Normal && !window.frameless);
     if !resizable {
         return;
     }
@@ -4437,7 +4511,7 @@ fn window_cursor_shape<const N: usize>(
     }
     // Over its content, a hosted app picks the pointer (a text beam over a
     // text field, say).
-    let content_cursor = if window::content_rect(window.rect).contains(pointer) {
+    let content_cursor = if window.content().contains(pointer) {
         window.cursor
     } else {
         paint::CursorShape::Arrow

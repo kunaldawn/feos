@@ -68,7 +68,7 @@ Rules that keep the layers separate (details in `docs/architecture.md`):
 
 **Boot flow.** The kernel is entered by QEMU `-kernel` (multiboot on x86_64, bare ELF with a DTB on AArch64) or by the UEFI loader in `boot/efi`, which passes a `feos_bootinfo::Handoff`. `kmain` initialises the console and vectors, reads firmware's tables (`libs/firmware`: DTB, multiboot, ACPI), sets up RAM (`kernel/src/memory.rs`), the interrupt controller, display, audio, input, USB and the network (`libs/net`, see `docs/networking.md`), builds `Platform`, starts the scheduler and secondaries, then runs the desktop session (`feos_desktop_app::run_session`). When that ends, it drops into the serial shell (`feos_shell::run`).
 
-**Apps and the desktop.** A shell command is a unit struct implementing `feos_app::App`, listed in `REGISTRY` in `apps/commands/src/lib.rs`. Desktop Start-menu entries are separate: `.fapp` bundles (ZIP/TAR with `manifest.yaml` and an icon) in `apps/desktop/apps/`, embedded by `apps/desktop/build.rs`. A manifest's `entry` names a `REGISTRY` command, so a new GUI app usually needs both. Windowed apps implement `App::windowed`, `open_window` and `frame_window`, and draw into a content-sized `Canvas` the desktop provides. Session config is `apps/desktop/desktop.yaml`, embedded at build time. Pictures come from `assets/icons` through `feos-iconset` (bundles carry `.ico` copies), and the pointer from `assets/cursors` (`.cur`/`.ani`, decoded by `feos-image`).
+**Apps and the desktop.** A shell command is a unit struct implementing `feos_app::App`, listed in `REGISTRY` in `apps/commands/src/lib.rs`. Desktop Start-menu entries are separate: `.fapp` bundles (ZIP/TAR with `manifest.yaml` and an icon) in `apps/desktop/apps/`, embedded by `apps/desktop/build.rs`. A manifest's `entry` names a `REGISTRY` command, so a new GUI app usually needs both. Windowed apps implement `App::windowed`, `open_window` and `frame_window`, and draw into a content-sized `Canvas` the desktop provides. Session config is `apps/desktop/desktop.yaml`, embedded at build time. Pictures come from `assets/icons` through `feos-iconset` (bundles carry `.ico` copies), and the pointer from `assets/cursors` (`.cur`/`.ani`, decoded by `feos-image`). `assets/music` and `assets/milkdrop` go into the filesystem image as `/media/music` and `/media/milkdrop` (`ASSETS` in `boards/common/fs_image_build.rs`).
 
 **GUI.** `feos-gui` is immediate-mode and caller-owned: apps hold all state, `Ui` allocates nothing and keeps no widget tree or z-order, so floating surfaces must be drawn late in the frame. Component reference: `libs/gui/src/components/README.md`.
 
@@ -81,6 +81,6 @@ Rules that keep the layers separate (details in `docs/architecture.md`):
 ## Documentation
 
 - `docs/architecture.md`: layers, interrupt path, audio, video and filesystem paths.
-- `docs/desktop.md`, `docs/terminal.md`, `docs/networking.md`, `docs/dosbox.md`, `docs/dosbox-gap.md`: subsystem references.
+- `docs/desktop.md`, `docs/terminal.md`, `docs/networking.md`, `docs/dosbox.md`, `docs/dosbox-gap.md`, `docs/feamp.md`: subsystem references.
 - `README.md`: feature and command reference. Parts are stale (pending a rewrite), so trust `docs/architecture.md` and the code over it.
 - `vnext.md` is an audit; `vnext-todo.md` tracks what's been done about it.

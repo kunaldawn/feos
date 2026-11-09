@@ -14,6 +14,8 @@ pub mod audio_worker;
 pub mod coreutils;
 pub mod decode_worker;
 pub mod displayd;
+pub mod equalizer;
+pub mod feamp;
 pub mod files;
 pub mod fsflush;
 pub mod gfx;
@@ -63,6 +65,8 @@ pub static REGISTRY: &[&dyn App] = &[
     &files::Files,
     &player::Player,
     &music::Music,
+    &feamp::FeAmp,
+    &feamp::vis::MilkDrop,
     &image_viewer::ImageViewer,
     &play::Play,
     &rec::Rec,

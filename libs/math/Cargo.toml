@@ -1,0 +1,9 @@
+[package]
+name = "feos-math"
+description = "Floating-point functions that `core` lacks: roots, logs, powers and trigonometry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]

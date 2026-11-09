@@ -8467,6 +8467,7 @@ mod tests {
             pointer_active: true,
             keyboard_active: true,
             cursor: feos_gui::CursorShape::Arrow,
+            request: feos_app::WindowRequest::None,
         };
         if open {
             assert!(open_window(fs, &context));

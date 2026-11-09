@@ -193,6 +193,13 @@ window:
   height: 520
 ```
 
+`window.frameless: true` gives the app no title bar or border: the whole
+window is its canvas, at exactly `width` by `height`, and it can't be resized
+from its edges. Such an app draws its own chrome and asks for moves, resizes
+and minimizing through `WindowContext::request` (`WindowRequest::Move`,
+`Resize`, `Minimize`), which the desktop applies after the frame. FeAmp is the
+example: see `docs/feamp.md`.
+
 The scanner detects bundles from their archive magic, not from the file
 suffix, so a renamed bundle still shows up. Files that are not archives are
 ignored; malformed bundles are counted as skipped. Duplicate ids are rejected
@@ -261,6 +268,8 @@ during the frame. Apps built on `feos_gui::Ui` pass on `Ui::cursor()`, which
 text fields set to the text beam and links to the hand; File Explorer sets it
 for its address and search fields and its task links. The desktop shows it
 while the pointer is over that window's content and not on a resize edge.
+`WindowContext::request` works the same way for a frameless window's moves,
+resizes and minimizing.
 
 Apps that return `true` from `App::foreground` but not `App::windowed` still use
 the older synchronous path with `Context::viewport` and `Context::suspend_area`

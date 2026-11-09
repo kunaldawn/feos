@@ -1,0 +1,13 @@
+id: feamp
+name: FeAmp
+version: 1.0.0
+entry: feamp
+category: Multimedia
+description: Classic skinned music player with an equalizer and MilkDrop visuals
+icon: icon.ico
+icon_medium: icon-32.ico
+icon_small: icon-16.ico
+window:
+  width: 275
+  height: 464
+  frameless: true

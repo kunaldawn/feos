@@ -33,7 +33,7 @@ use feos_audio::AudioFormat;
 use feos_hal::Audio;
 use feos_sync::Mutex;
 
-pub use core_mixer::{Mixer, StreamId, MAX_STREAMS, MAX_VOLUME, RING_FRAMES};
+pub use core_mixer::{Mixer, StreamId, MAX_STREAMS, MAX_VOLUME, RING_FRAMES, SCOPE_FRAMES};
 
 /// How long the task sleeps between refills, in milliseconds.
 const PERIOD_MS: u64 = 5;
@@ -203,6 +203,14 @@ pub fn muted() -> bool {
 /// Mutes or unmutes the output.
 pub fn set_muted(muted: bool) {
     MIXER.lock().set_muted(muted);
+}
+
+/// The sound being heard now, for a visualiser: see [`Mixer::scope`]. Fills
+/// `out` with interleaved stereo at the device's rate
+/// ([`feos_audio::DRIVER_FORMAT`]) and returns the count of frames ever
+/// mixed, which stops moving when nothing plays.
+pub fn scope(out: &mut [i16]) -> u64 {
+    MIXER.lock().scope(out)
 }
 
 /// How many streams are open.

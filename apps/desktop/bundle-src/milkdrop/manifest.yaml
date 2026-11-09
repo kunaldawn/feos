@@ -1,0 +1,12 @@
+id: milkdrop
+name: MilkDrop
+version: 1.0.0
+entry: milkdrop
+category: Multimedia
+description: MilkDrop visualization of whatever is playing
+icon: icon.ico
+icon_medium: icon-32.ico
+icon_small: icon-16.ico
+window:
+  width: 514
+  height: 414

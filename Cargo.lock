@@ -38,6 +38,8 @@ dependencies = [
  "feos-iconset",
  "feos-image",
  "feos-keys",
+ "feos-math",
+ "feos-milkdrop",
  "feos-mixer",
  "feos-sh",
  "feos-sync",
@@ -504,6 +506,17 @@ dependencies = [
  "feos-console",
  "feos-gui",
  "feos-hal",
+]
+
+[[package]]
+name = "feos-math"
+version = "0.1.0"
+
+[[package]]
+name = "feos-milkdrop"
+version = "0.1.0"
+dependencies = [
+ "feos-math",
 ]
 
 [[package]]

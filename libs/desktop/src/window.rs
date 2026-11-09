@@ -158,6 +158,9 @@ pub struct DesktopWindow {
     pub launched: bool,
     /// The pointer the hosted app asked for over its content in its last frame.
     pub cursor: feos_gui::CursorShape,
+    /// The app draws its own title bar and border: the desktop draws no frame,
+    /// and the whole rectangle is content.
+    pub frameless: bool,
 }
 
 impl DesktopWindow {
@@ -185,7 +188,17 @@ impl DesktopWindow {
         pid: None,
         launched: false,
         cursor: feos_gui::CursorShape::Arrow,
+        frameless: false,
     };
+
+    /// Where the app draws: inside the frame, or everything if it has none.
+    pub fn content(&self) -> Rect {
+        if self.frameless {
+            self.rect
+        } else {
+            content_rect(self.rect)
+        }
+    }
 }
 
 /// A fixed-capacity window manager.
@@ -279,6 +292,7 @@ impl<const N: usize> WindowManager<N> {
         window.open = true;
         window.pid = None;
         window.launched = false;
+        window.frameless = false;
         self.focus(index);
         Some(index)
     }
@@ -660,6 +674,9 @@ impl<const N: usize> WindowManager<N> {
             .enumerate()
             .filter(|(_, window)| window.open && window.state != WindowState::Minimized)
             .filter(|(_, window)| {
+                if window.frameless {
+                    return window.rect.contains(point);
+                }
                 content_rect(window.rect)
                     .inset_each(BORDER, 0, BORDER, BORDER)
                     .contains(point)
@@ -786,6 +803,19 @@ mod tests {
         assert_eq!(wm.focused(), Some(index));
         assert!(wm.toggle_minimize(index));
         assert_eq!(wm.get(index).unwrap().state, WindowState::Minimized);
+    }
+
+    #[test]
+    fn a_frameless_window_is_all_content() {
+        let mut wm = WindowManager::<4>::new();
+        let index = wm.open(0, "Amp", WORK, 275, 116, 10).unwrap();
+        let rect = wm.get(index).unwrap().rect;
+        // With a frame, the top edge is the title bar's.
+        assert_eq!(wm.topmost_content_at(Point::new(rect.x + 10, rect.y + 2)), None);
+        wm.get_mut(index).unwrap().frameless = true;
+        assert_eq!(wm.get(index).unwrap().content(), rect);
+        assert_eq!(wm.topmost_content_at(Point::new(rect.x + 10, rect.y + 2)), Some(index));
+        assert_eq!(wm.topmost_content_at(Point::new(rect.x, rect.y)), Some(index));
     }
 
     #[test]

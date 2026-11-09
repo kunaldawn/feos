@@ -4,7 +4,8 @@
 **AArch64 `virt`** and **x86_64 `q35`**. It's a monolithic, preemptive, multi-core kernel
 with an XP-style desktop, a Bash-compatible shell with POSIX core utilities, a TCP/IP
 stack, writable FAT32, exFAT and native filesystems, a media player with its own audio and
-video decoders, isolated user programs in ring 3 / EL0, and FEOS-DOS, an x86 virtual machine
+video decoders, FeAmp (a classic-style MP3 player with MilkDrop visualisations),
+isolated user programs in ring 3 / EL0, and FEOS-DOS, an x86 virtual machine
 and DOS that runs real protected-mode DOS games.
 
 Everything from the boot code to the codecs is in this repository; the only host requirement
@@ -23,6 +24,7 @@ for building and running it is Docker (or Rust and QEMU).
 - [Highlights](#highlights)
 - [Quick start](#quick-start)
 - [Screenshots](#screenshots)
+- [FeAmp and MilkDrop](#feamp-and-milkdrop)
 - [Features](#features)
 - [Command reference](#command-reference)
 - [Media formats](#media-formats)
@@ -43,7 +45,7 @@ for building and running it is Docker (or Rust and QEMU).
 | Storage | FAT32, exFAT and a journalled native filesystem read-write, FAT12/16 read-only, MBR and GPT, a RAM root when there's no disk, changes synced about once a second |
 | Network | Ethernet, ARP, IPv4, ICMP, UDP, TCP, DHCP and DNS; `ifconfig`, `ping`, `nslookup`, `wget`, `nc` |
 | Desktop | Windows XP-style session: taskbar, Start menu, window manager, six colour schemes, an iconset and the XP cursor set, live resolution changes, settings that persist |
-| Apps | File Explorer with content search, Terminal, Task Manager, Settings, Media Player, Music, Image Viewer, Component Gallery, System Information, FEOS-DOS |
+| Apps | FeAmp with a 10-band EQ and playlist, MilkDrop visualiser, File Explorer with content search, Terminal, Task Manager, Settings, Media Player, Music, Image Viewer, Component Gallery, System Information, FEOS-DOS |
 | Shell | Bash-compatible language (functions, pipelines, redirection, here-docs, arithmetic, `[[ ]]`, traps, job control) and about 80 utilities |
 | Media | H.264 (incl. High 10, 4:2:2, interlaced), VP8, MPEG-1, MJPEG, GIF; AAC/HE-AAC, Opus, MP3, FLAC, Vorbis, WAV, AIFF, AU; PNG, JPEG, BMP, ICO, QOI |
 | FEOS-DOS | 386 interpreter with protected and virtual-8086 mode, x87, DPMI 0.9 host, VCPI, XMS/EMS, VGA/VESA, OPL3 and Sound Blaster 16 |
@@ -160,6 +162,61 @@ All taken from the current kernels under QEMU at 1024x768.
 | ![Media Player](docs/screenshots/media-player.png) **Media Player** paused on an H.264 MP4 with AAC sound and SRT subtitles | ![Settings](docs/screenshots/settings.png) **Settings** switching the whole desktop to the olive scheme |
 | ![FEOS-DOS](docs/screenshots/feos-dos.png) **FEOS-DOS** on the x86_64 port | ![User program](docs/screenshots/x64-user-program.png) A **ring-3 user program** (`/bin/wdemo`) drawing its own window, and System Information, on x86_64 |
 | ![Component Gallery](docs/screenshots/component-gallery.png) The **Component Gallery**, `feos-gui`'s widgets and charts with demo data | ![Image Viewer](docs/screenshots/image-viewer.png) **Image Viewer** showing a JPEG |
+| ![FeAmp and MilkDrop](docs/screenshots/feamp.png) **FeAmp** playing with the equalizer and playlist open, beside **MilkDrop** | ![MilkDrop presets](docs/screenshots/milkdrop-presets.png) Six **MilkDrop** presets, each with its frame rate |
+
+## FeAmp and MilkDrop
+
+> *It really whips the crab's shell!*
+
+![FeAmp playing a demo track beside MilkDrop running "Aderrasi - Kevlar Abyss" on x86_64](docs/screenshots/feamp.png)
+
+**FeAmp** is a love letter to the late-90s desktop music player, written from scratch in Rust
+on `feos-gfx`. It has the classic three-panel stack:
+the main window with a green LED clock, scrolling title, bitrate and spectrum analyser; a
+10-band graphic equalizer that really filters the sound; and a playlist that reads ID3v2
+tags. The window has no frame and draws its own title bars, so you can drag, shade,
+double-size and minimise it. Every pixel of the skin is drawn in code. There are no bitmaps.
+
+<table>
+<tr>
+<td width="38%"><img src="docs/screenshots/feamp-skin.png" alt="FeAmp's main window, equalizer and playlist at 2x"></td>
+<td>
+
+- **Transport**: `Z X C V B` for previous, play, pause, stop and next, as fingers remember them;
+  seek bar, volume and balance with the value shown in the title display while you drag
+- **Equalizer**: 10 bands from 60 Hz to 16 kHz at ±12 dB, preamp, a curve preview and
+  presets (Rock, Pop, Dance, Techno, ...), applied in the audio task as RBJ peaking filters
+- **Playlist**: every sound file on the system, artist and title from ID3v2 (2.2 to 2.4),
+  durations from Xing headers, shuffle, repeat, sort, add and remove
+- **Visualiser**: click the spectrum to cycle spectrum, oscilloscope and off; `Ctrl+K` opens MilkDrop
+- **Demo tracks**: two original synthesised songs by "The FeOS Band" in `/media/music`
+
+</td>
+</tr>
+</table>
+
+**MilkDrop** brings the visualisations. Winamp's vis plugins are Windows x86 DLLs and can't
+run here, so `feos-milkdrop` is an engine for the presets themselves. It has an EEL2
+expression compiler, per-frame and per-pixel equations on a 40x30 warp mesh, a
+feedback-warp renderer in fixed point, waveforms, custom waves and shapes, motion vectors,
+borders and video echo. It all runs in software on the CPU, fed by FFT beat detection
+on the mixer's output. 49 classic presets by Geiss, Rovastar, Krash, Aderrasi, Unchained and
+others ship in `/media/milkdrop`; drop any `.milk` file there and it shows up.
+
+![Six MilkDrop presets rendering live in QEMU, with their frame rates](docs/screenshots/milkdrop-presets.png)
+
+| Key | MilkDrop |
+|-----|----------|
+| `Space` / `N` / `→` | next preset (a click does too) |
+| `Backspace` / `P` / `←` | previous preset |
+| `R` | random order |
+| `L` | lock the current preset (otherwise it moves on every 20 seconds) |
+| `Enter` | show the preset's name |
+| `F` | show the frame rate |
+| `F1` | help |
+
+Start them from the Start menu, the desktop icons, or a Terminal with `feamp` and
+`milkdrop`. Details are in [`docs/feamp.md`](docs/feamp.md).
 
 ## Features
 
@@ -290,7 +347,7 @@ uname     uniq     uptime   wc       whoami   xargs    yes      zcat
 | Area | Commands |
 |------|----------|
 | Desktop | `desktop` (`wm`): the session, or `list`, `status`, `run <id>`, `menu`, `service ...`; `settings` |
-| Windows | `terminal` (`term`), `files` (`explorer`), `taskmgr` (`task-manager`, `tm`), `player` (`media-player`, `video`) `[--speed] [path]`, `music [file]`, `viewer <file>` (`image-viewer`), `gui` (Component Gallery), `dosbox` (`dos`, `feos-dos`) |
+| Windows | `terminal` (`term`), `files` (`explorer`), `taskmgr` (`task-manager`, `tm`), `player` (`media-player`, `video`) `[--speed] [path]`, `music [file]`, `viewer <file>` (`image-viewer`), `feamp`, `milkdrop` (`visualizer`), `gui` (Component Gallery), `dosbox` (`dos`, `feos-dos`) |
 | Processes | `ps`, `spawn <command> [args]`, `kill [-SIGNAL] <pid>`, `renice <priority> <pid>`, `taskset <mask> <pid>`, `tick [count] [ms] [busy]`, `sleep <ms>` |
 | Sound | `play [--at seconds \| --speed] <file>`, `rec <seconds> <file.wav>`, `tone [ms]` |
 | Network | `ifconfig` (`ip`) `[-s]`, `ping [-c n] [-s size] <host>`, `nslookup <name>`, `wget [-O file] <url>`, `nc [...] <host> <port>`, `nc -l [-k] [...] <port>` |
@@ -443,6 +500,7 @@ libs/               hal app console sync irq sched heap frames firmware bootinfo
                     gfx gui desktop iconset init bundle keys text json yaml
                     image video h264 audio audio-codec opus mixer
                     sh coreutils                    shell
+                    math milkdrop                   floating-point maths, MilkDrop engine
                     dosbox                          FEOS-DOS
                     port-io
 apps/commands/      the app registry: Terminal, Explorer, Task Manager, Media Player, ...
@@ -450,7 +508,8 @@ apps/shell/         the shell's console and registry adapter
 apps/desktop/       the desktop session, desktop.yaml, bundle-src/ and apps/*.fapp
 apps/dosbox/        the FEOS-DOS window and serial front end
 user/               the user-program workspace: runtime, link.ld, src/bin/
-assets/             icons/ (the iconset) and cursors/ (the XP cursor set)
+assets/             icons/ (the iconset), cursors/ (the XP cursor set), and music/ and
+                    milkdrop/ (mounted at /media/music and /media/milkdrop)
 data/games/         the DOS game library and its exFAT image
 scripts/            run, build, boot-test, disk and table-generation scripts
 docs/               architecture, desktop, terminal, networking and FEOS-DOS references
@@ -495,5 +554,9 @@ Not covered by those licences:
   included by the project owner's decision; settle those terms or replace them before
   distributing the repository or a kernel built from it.
 - **Icons** (`assets/icons`): supplied by the owner as open for inclusion, unconfirmed.
+- **MilkDrop presets** (`assets/milkdrop`): by their named authors, from the original
+  MilkDrop preset pack as kept by projectM; see
+  [`assets/milkdrop/README.txt`](assets/milkdrop/README.txt). FeAmp's name, skin and demo
+  music are original to this project.
 - **Games** (`data/games`): third-party shareware, demos and freeware under each title's own
   terms; see [`data/games/README.md`](data/games/README.md).

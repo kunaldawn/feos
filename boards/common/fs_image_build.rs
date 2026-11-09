@@ -31,6 +31,7 @@ pub fn generate(data_dir: &Path) {
     let mut found = Vec::new();
     collect(&root, "", &mut found);
     collect_user_programs(data_dir, &mut found);
+    collect_assets(data_dir, &mut found);
     found.sort_by(|left, right| left.0.cmp(&right.0));
 
     let mut entries = std::vec![EntryInfo {
@@ -170,6 +171,31 @@ fn write_if_changed(path: &Path, contents: &str) {
         }
     }
     fs::write(path, contents).expect("write generated fs image");
+}
+
+/// Asset directories that go into the image, and where: FeAmp's demo music
+/// and its MilkDrop presets live with the rest of the repository's assets.
+const ASSETS: [(&str, &str); 2] = [("music", "media/music"), ("milkdrop", "media/milkdrop")];
+
+/// Adds [`ASSETS`] from the repository's `assets/` directory.
+fn collect_assets(data_dir: &Path, found: &mut Vec<(String, bool, PathBuf)>) {
+    let assets = data_dir.join("../../assets");
+    for (source, target) in ASSETS {
+        let dir = assets.join(source);
+        if !dir.is_dir() {
+            continue;
+        }
+        println!("cargo:rerun-if-changed={}", dir.display());
+        // Each target's parent must be in the tree: make any that aren't.
+        let mut parent = String::new();
+        for part in target.split('/') {
+            parent = if parent.is_empty() { part.to_string() } else { format!("{parent}/{part}") };
+            if !found.iter().any(|(rel, is_dir, _)| *is_dir && *rel == parent) {
+                found.push((parent.clone(), true, dir.clone()));
+            }
+        }
+        collect(&dir, target, found);
+    }
 }
 
 /// Adds the user programs built for this architecture, if `make user-arm` or `make

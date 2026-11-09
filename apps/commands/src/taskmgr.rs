@@ -5952,6 +5952,7 @@ mod behavior_tests {
             pointer_active: false,
             keyboard_active: false,
             cursor: feos_gui::CursorShape::Arrow,
+            request: feos_app::WindowRequest::None,
         };
         assert!(app.open_window(&context));
         assert!(app.animates());
@@ -6346,6 +6347,7 @@ mod fuzz_tests {
                     pointer_active: true,
                     keyboard_active: true,
                     cursor: feos_gui::CursorShape::Arrow,
+                    request: feos_app::WindowRequest::None,
                 };
                 if !open {
                     assert!(app.open_window(&context));

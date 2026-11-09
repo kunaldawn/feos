@@ -39,6 +39,9 @@ pub struct Manifest {
     pub window_width: u32,
     /// Preferred initial window height.
     pub window_height: u32,
+    /// The app draws its own title bar and border (`window.frameless: true`),
+    /// so the desktop draws none, and the size is the content's own.
+    pub frameless: bool,
 }
 
 impl Manifest {
@@ -56,6 +59,7 @@ impl Manifest {
         args: Text::EMPTY,
         window_width: 0,
         window_height: 0,
+        frameless: false,
     };
 
     /// Parses a manifest from YAML.
@@ -113,6 +117,12 @@ impl Manifest {
             {
                 manifest.window_height = value.clamp(160, 2048) as u32;
             }
+            if let Some(value) = document
+                .get(window, "frameless")
+                .and_then(|node| document.as_bool(node))
+            {
+                manifest.frameless = value;
+            }
         }
 
         Ok(manifest)
@@ -168,6 +178,14 @@ mod tests {
         assert_eq!(manifest.version.as_str(), "1.0.0");
         assert_eq!(manifest.window_width, 640);
         assert_eq!(manifest.window_height, 420);
+        assert!(!manifest.frameless);
+    }
+
+    #[test]
+    fn a_window_can_ask_for_no_frame() {
+        let manifest = Manifest::parse("id: amp\nwindow:\n  width: 275\n  height: 464\n  frameless: true\n").unwrap();
+        assert!(manifest.frameless);
+        assert_eq!((manifest.window_width, manifest.window_height), (275, 464));
     }
 
     #[test]

@@ -1685,6 +1685,7 @@ mod tests {
             pointer_active: false,
             keyboard_active: true,
             cursor: feos_gui::CursorShape::Arrow,
+            request: feos_app::WindowRequest::None,
         };
         assert!(Terminal.open_window(&context));
 
@@ -1709,6 +1710,7 @@ mod tests {
             pointer_active: false,
             keyboard_active: true,
             cursor: feos_gui::CursorShape::Arrow,
+            request: feos_app::WindowRequest::None,
         };
         let _ = Terminal.frame_window(&mut context);
 

@@ -22,6 +22,8 @@ feos-hal = { workspace = true }
 feos-iconset = { workspace = true }
 feos-image = { workspace = true }
 feos-keys = { workspace = true }
+feos-math = { workspace = true }
+feos-milkdrop = { workspace = true }
 feos-mixer = { workspace = true }
 feos-sh = { workspace = true }
 feos-sync = { workspace = true }

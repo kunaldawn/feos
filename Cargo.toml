@@ -75,6 +75,8 @@ feos-json = { path = "libs/json" }
 feos-keys = { path = "libs/keys" }
 feos-net = { path = "libs/net" }
 feos-iconset = { path = "libs/iconset" }
+feos-math = { path = "libs/math" }
+feos-milkdrop = { path = "libs/milkdrop" }
 feos-mixer = { path = "libs/mixer" }
 feos-port-io = { path = "libs/port-io" }
 feos-sched = { path = "libs/sched" }

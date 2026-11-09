@@ -25,6 +25,7 @@ use feos_sync::Mutex;
 use feos_video::{audio_track, audio_track_from_source, AudioCodec, AudioTrack};
 
 use crate::decode_worker::{read_file, FileSource, MAX_MEDIA_BYTES};
+use crate::equalizer::{EqSettings, Equalizer};
 
 /// How long the task sleeps with the mixer full, or with nothing to do.
 const SLEEP_MS: u64 = 5;
@@ -116,6 +117,8 @@ struct Inner {
     info: Option<TrackInfo>,
     failure: Option<AudioFailure>,
     ended: bool,
+    /// Equaliser and balance, applied to what's decoded.
+    eq: EqSettings,
 }
 
 /// What the window learns from a report.
@@ -155,6 +158,7 @@ impl AudioPipe {
                 info: None,
                 failure: None,
                 ended: false,
+                eq: EqSettings::FLAT,
             }),
             position_ms: AtomicU64::new(0),
         }
@@ -217,6 +221,11 @@ impl AudioPipe {
     /// Plays at this many times normal speed, without changing the pitch.
     pub fn set_tempo(&self, tempo: f32) {
         self.inner.lock().tempo = tempo;
+    }
+
+    /// Sets the equaliser and balance. Takes effect from the next packet.
+    pub fn set_eq(&self, settings: EqSettings) {
+        self.inner.lock().eq = settings;
     }
 
     /// Pauses or resumes.
@@ -638,17 +647,31 @@ pub fn play_media(
     let mut bad_packets = 0u32;
     let mut tempo = 1.0f32;
     let mut stretch: Option<Wsola> = None;
+    let mut equalizer: Option<Equalizer> = None;
     loop {
         if processes.kill_requested() {
             return Finished::Interrupted;
         }
-        let (want_pause, seek, want_tempo) = {
+        let (want_pause, seek, want_tempo, eq) = {
             let mut inner = pipe.inner.lock();
             if inner.owner != identity || inner.media != media {
                 return Finished::Interrupted;
             }
-            (inner.paused, inner.seek.take(), inner.tempo)
+            (inner.paused, inner.seek.take(), inner.tempo, inner.eq)
         };
+        if eq.is_neutral() {
+            equalizer = None;
+        } else if let Some(now) = puller.format() {
+            let wanted = (now.sample_rate(), now.channels() as usize);
+            match equalizer.as_mut() {
+                Some(current) if current.format() == wanted => {
+                    if current.settings() != eq {
+                        current.set(eq);
+                    }
+                }
+                _ => equalizer = Some(Equalizer::new(now.sample_rate(), now.channels(), eq)),
+            }
+        }
         let here = base_ms + stream.played_frames() * 1000 / OUTPUT_RATE * tempo_percent(tempo) / 100;
         // A new tempo is a seek to where it's got to, as what's queued has the old one.
         let seek = match seek {
@@ -668,6 +691,9 @@ pub fn play_media(
         if let Some(ms) = seek {
             if let Some(stretch) = stretch.as_mut() {
                 stretch.reset();
+            }
+            if let Some(equalizer) = equalizer.as_mut() {
+                equalizer.reset();
             }
             stream.flush();
             priming = true;
@@ -714,6 +740,9 @@ pub fn play_media(
                     bad_packets = 0;
                     at = 0;
                     len = frames * puller.channels();
+                    if let Some(equalizer) = equalizer.as_mut() {
+                        equalizer.process(&mut chunk[..len]);
+                    }
                     if let Some(stretch) = stretch.as_mut() {
                         let _ = stretch.push(&chunk[..len]);
                         len = stretch.pull(&mut chunk);
@@ -774,6 +803,8 @@ pub struct AudioTask;
 pub static PLAYER_PIPE: AudioPipe = AudioPipe::new();
 /// The Music window's pipe.
 pub static MUSIC_PIPE: AudioPipe = AudioPipe::new();
+/// FeAmp's pipe.
+pub static FEAMP_PIPE: AudioPipe = AudioPipe::new();
 
 impl App for AudioTask {
     fn name(&self) -> &'static str {
@@ -796,6 +827,7 @@ impl App for AudioTask {
         let pipe = match words.next() {
             Some("player") => &PLAYER_PIPE,
             Some("music") => &MUSIC_PIPE,
+            Some("feamp") => &FEAMP_PIPE,
             _ => return 2,
         };
         let Some(identity) = words.next().and_then(|word| word.parse().ok()) else {

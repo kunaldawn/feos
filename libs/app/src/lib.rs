@@ -592,6 +592,33 @@ pub enum WindowFrame {
     Close,
 }
 
+/// Something a window asks of the desktop at the end of a frame, through
+/// [`WindowContext::request`]. A frameless window (see the bundle manifest's
+/// `window.frameless`) draws its own title bar, so it moves, sizes and
+/// minimizes itself this way.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum WindowRequest {
+    /// Nothing.
+    #[default]
+    None,
+    /// Move the window by this many pixels.
+    Move {
+        /// Rightward.
+        dx: i32,
+        /// Downward.
+        dy: i32,
+    },
+    /// Make the window this size, keeping its top-left corner where it is.
+    Resize {
+        /// The new width.
+        width: u32,
+        /// The new height.
+        height: u32,
+    },
+    /// Minimize the window to its taskbar button.
+    Minimize,
+}
+
 /// Everything a windowed application sees for one frame.
 pub struct WindowContext<'a, 'b> {
     /// Arguments the application was opened with.
@@ -622,6 +649,9 @@ pub struct WindowContext<'a, 'b> {
     /// [`CursorShape::Text`](feos_gui::CursorShape::Text), say. The desktop
     /// shows it while the pointer is over the content and not on an edge.
     pub cursor: feos_gui::CursorShape,
+    /// What the app asks of the desktop, set during the frame. It starts as
+    /// [`WindowRequest::None`] each frame.
+    pub request: WindowRequest,
 }
 
 impl WindowContext<'_, '_> {
