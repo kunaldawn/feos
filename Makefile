@@ -25,8 +25,9 @@ PULSE_SOCKET ?= /run/user/$(shell id -u)/pulse/native
 
 # QEMU audio backend. ALSA is used when the host exposes `/dev/snd` (Linux),
 # otherwise QEMU writes a WAV under target/audio so the guest's output can
-# still be verified. The WAV backend is pinned to the codec's native format so
-# the capture is not resampled. Override with e.g.
+# still be verified. The run scripts pin every backend (unless it names its own
+# `out.frequency`) to the codec's 48 kHz, so QEMU never resamples the guest's
+# sound: its resampler is audibly harsh. Override with e.g.
 #   make run AUDIODEV=pa,id=snd0
 #   make run AUDIODEV=wav,id=snd0,path=/tmp/qemu.wav
 # The backend id must stay `snd0`, because the HDA codec is attached to it.

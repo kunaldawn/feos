@@ -34,6 +34,23 @@ SMP="${FEOS_SMP:-4}"
 MEM="${FEOS_MEM:-512M}"
 QEMU="${FEOS_QEMU:-qemu-system-x86_64}"
 GPU="${FEOS_GPU:-virtio-gpu-pci,xres=1024,yres=768}"
+
+# The guest's HDA stream is 48 kHz stereo s16. A backend left to its defaults
+# (`pa,id=snd0`, `alsa,id=snd0`) runs at 44.1 kHz, and QEMU then converts the
+# guest's sound with its own resampler, which is audibly harsh: measured against
+# ffmpeg, the same MP3 comes out at 20-50 dB SNR instead of 86. So unless the
+# caller chose a rate, the backend takes the guest's, and nothing is converted.
+case "$AUDIODEV" in
+    none,* | *out.frequency=*) ;;
+    *) AUDIODEV="$AUDIODEV,out.frequency=48000" ;;
+esac
+# PulseAudio is fed from QEMU's main loop, which a GTK window also draws in, holding
+# the lock the guest's device accesses need. A redraw stalls it long enough that
+# PulseAudio's default ~46 ms buffer runs dry, and the music stutters: with FeAmp
+# playing, 5-37 ms gaps every few seconds. 100 ms rides them out.
+case "$AUDIODEV" in
+    pa,* | pa) case "$AUDIODEV" in *out.latency=*) ;; *) AUDIODEV="$AUDIODEV,out.latency=100000" ;; esac ;;
+esac
 ACCEL="${FEOS_ACCEL:-}"
 if [ -z "$ACCEL" ]; then
     if [ "$(uname -m)" = x86_64 ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
