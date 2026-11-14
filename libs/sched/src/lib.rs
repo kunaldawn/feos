@@ -21,6 +21,16 @@
 //! longer, which is how load evens out. A task can name the CPUs it may use. A task
 //! passed over too many times gets one turn at the top, so a low priority means
 //! slow, not stopped.
+//!
+//! # User programs in the kernel
+//!
+//! A user program's task spends part of its life in the kernel, carrying out its
+//! system calls and resolving its page faults, and that kernel work holds things a
+//! kill can't take back: references, buffers and promises on its stack. So a task
+//! whose [in-call count](TaskFacts::in_call) is nonzero is never reaped and never
+//! held off the CPU by a stop. A kill wakes it, its call unwinds, and it ends itself;
+//! a stop waits for it to be about to go back to the program. Kernel-linked apps keep
+//! the older rules: they're reaped at any point they hold no lock, and stop at once.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -84,6 +94,10 @@ pub trait TaskFacts {
     fn lock_depth(&self, slot: usize) -> u32;
     /// Live heap bytes owned by the task in `slot`.
     fn heap_bytes(&self, slot: usize) -> usize;
+    /// How deep the user program in `slot` is in the kernel: nonzero from when a
+    /// system call or fault takes it there (or it starts, loading) until it's about to
+    /// resume the program. Always zero for a kernel-linked app.
+    fn in_call(&self, slot: usize) -> u32;
 }
 
 /// The result of asking to kill a process.
@@ -128,8 +142,11 @@ pub struct Task {
     /// Scheduler ticks consumed by this task across all CPUs.
     pub cpu_ticks: u64,
     /// Held off the CPU by job control until it is resumed. Only a pending kill
-    /// overrides this, because a task must run to reach a safe point.
+    /// overrides this, because a task must run to reach a safe point. A user
+    /// program in a call isn't held until it has left it.
     pub stopped: bool,
+    /// The system needs this task: it can't be killed or stopped.
+    pub protected: bool,
     /// How urgent the task is, up to [`PRIORITY_MAX`].
     pub priority: u8,
     /// The CPU whose queue the task is on.
@@ -176,6 +193,7 @@ impl<const TASKS: usize, const CPUS: usize> Table<TASKS, CPUS> {
             kill_deadline: 0,
             cpu_ticks: 0,
             stopped: false,
+            protected: false,
             priority: 0,
             home: 0,
             affinity: 0,
@@ -253,6 +271,7 @@ impl<const TASKS: usize, const CPUS: usize> Table<TASKS, CPUS> {
             kill_deadline: 0,
             cpu_ticks: 0,
             stopped: false,
+            protected: false,
             priority: PRIORITY_NORMAL,
             home,
             affinity: 0,
@@ -323,15 +342,33 @@ impl<const TASKS: usize, const CPUS: usize> Table<TASKS, CPUS> {
         self.tasks[slot].wait = Wait::Nothing;
         self.tasks[slot].kill_pending = false;
         self.tasks[slot].stopped = false;
+        self.tasks[slot].protected = false;
+    }
+
+    /// Marks `pid` as one the system needs, like the boot task: it can't be killed or
+    /// stopped. Returns `false` when there's no such task.
+    pub fn set_protected(&mut self, pid: u32) -> bool {
+        match self.find_pid(pid) {
+            Some(slot) => {
+                self.tasks[slot].protected = true;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Holds or releases `pid`. Returns `false` when it can't be: no such
-    /// process, or the boot task, which the system needs running.
+    /// process, or the boot task or another the system needs running.
+    ///
+    /// A kernel-linked app is held from its CPU's next tick. A user program in a
+    /// call carries on until it's about to resume the program, so that it's never
+    /// held with a kernel lock or a half-made change: see [`TaskFacts::in_call`].
     pub fn set_stopped(&mut self, pid: u32, stopped: bool) -> bool {
         if pid == self.tasks[0].pid {
             return false;
         }
         match self.find_pid(pid) {
+            Some(slot) if self.tasks[slot].protected => false,
             Some(slot) => {
                 self.tasks[slot].stopped = stopped;
                 true
@@ -348,14 +385,30 @@ impl<const TASKS: usize, const CPUS: usize> Table<TASKS, CPUS> {
 
     /// Returns `true` when the flagged task in `slot` can be reaped now.
     ///
-    /// Holding a lock always defers: reaping then would strand the lock. Live
-    /// heap defers only until the deadline, which gives a task that polls
-    /// `kill_requested` time to unwind and free it.
+    /// Holding a lock always defers: reaping then would strand the lock. So does
+    /// a user program's being in a call, which ends itself instead once the call has
+    /// unwound. Live heap defers only until the deadline, which gives a task that
+    /// polls `kill_requested` time to unwind and free it.
     fn reapable(&self, slot: usize, now: u64, facts: &impl TaskFacts) -> bool {
         let task = &self.tasks[slot];
         task.kill_pending
             && facts.lock_depth(slot) == 0
+            && facts.in_call(slot) == 0
             && (facts.heap_bytes(slot) == 0 || now >= task.kill_deadline)
+    }
+
+    /// Whether job control is holding the task in `slot` off the CPU now.
+    fn held(&self, slot: usize, facts: &impl TaskFacts) -> bool {
+        let task = &self.tasks[slot];
+        task.stopped && !task.kill_pending && facts.in_call(slot) == 0
+    }
+
+    /// Whether the task in `slot` should stop before it next resumes its program: a
+    /// stop, or a kill, came while it was in a call. The kernel asks on the way back to
+    /// the program, and switches instead of going straight there.
+    pub fn stop_or_kill_pending(&self, slot: usize) -> bool {
+        let task = &self.tasks[slot];
+        task.stopped || task.kill_pending
     }
 
     /// Asks for `pid` to die.
@@ -372,6 +425,9 @@ impl<const TASKS: usize, const CPUS: usize> Table<TASKS, CPUS> {
         let Some(slot) = self.find_pid(pid) else {
             return KillOutcome::NotFound;
         };
+        if self.tasks[slot].protected {
+            return KillOutcome::Protected;
+        }
         if self.tasks[slot].kill_pending {
             return KillOutcome::AlreadyPending;
         }
@@ -530,7 +586,7 @@ impl<const TASKS: usize, const CPUS: usize> Table<TASKS, CPUS> {
                 self.reap(slot, facts);
                 continue;
             }
-            if self.tasks[slot].stopped && !self.tasks[slot].kill_pending {
+            if self.held(slot, facts) {
                 continue;
             }
             if let Some(count) = queued.get_mut(self.tasks[slot].home as usize) {
@@ -543,13 +599,10 @@ impl<const TASKS: usize, const CPUS: usize> Table<TASKS, CPUS> {
         let mut best_rank = (0u8, 0u8);
         for step in 1..=TASKS {
             let slot = (start + step) % TASKS;
-            let task = &self.tasks[slot];
-            if task.state != State::Ready
-                || (task.stopped && !task.kill_pending)
-                || !self.allowed(slot, cpu)
-            {
+            if self.tasks[slot].state != State::Ready || self.held(slot, facts) || !self.allowed(slot, cpu) {
                 continue;
             }
+            let task = &self.tasks[slot];
             let urgency = if task.passed_over >= STARVATION_LIMIT {
                 PRIORITY_MAX + 1
             } else {
@@ -656,6 +709,7 @@ mod tests {
     struct Facts {
         depth: [u32; TASKS],
         heap: [usize; TASKS],
+        calls: [u32; TASKS],
     }
 
     impl TaskFacts for Facts {
@@ -665,6 +719,10 @@ mod tests {
 
         fn heap_bytes(&self, slot: usize) -> usize {
             self.heap[slot]
+        }
+
+        fn in_call(&self, slot: usize) -> u32 {
+            self.calls[slot]
         }
     }
 
@@ -1229,5 +1287,126 @@ mod tests {
         // It holds a lock, so it has to run to release it.
         let switch = table.switch(0, Request::Yield, 0, &facts);
         assert_eq!(switch.next, Some(slot));
+    }
+
+    #[test]
+    fn user_slot_in_call_not_reapable() {
+        // Its call holds what a reap would abandon, so it has to unwind instead,
+        // however long that takes and whatever heap it has.
+        let mut table = table();
+        let mut facts = Facts::default();
+        let (slot, pid) = spawn(&mut table);
+        facts.calls[slot] = 1;
+        assert_eq!(table.kill(pid, 0, GRACE, &facts), KillOutcome::Pending);
+        assert_eq!(state(&table, slot), State::Ready);
+        assert_eq!(table.switch(1, Request::Preempt, 1, &facts).next, Some(slot));
+        let switch = table.switch(1, Request::Preempt, GRACE * 10, &facts);
+        assert!(!switch.reaped);
+        assert_eq!(switch.next, Some(slot));
+
+        // Blocked in its call, a kill wakes it rather than reaping it.
+        let mut table = self::table();
+        let mut facts = Facts::default();
+        let (slot, pid) = spawn(&mut table);
+        facts.calls[slot] = 1;
+        assert_eq!(table.switch(1, Request::Preempt, 0, &facts).next, Some(slot));
+        table.switch(1, Request::Wait(0x10), 0, &facts);
+        assert_eq!(state(&table, slot), State::Blocked);
+        assert_eq!(table.kill(pid, 0, GRACE, &facts), KillOutcome::Pending);
+        assert_eq!(state(&table, slot), State::Ready);
+        assert_eq!(table.leaked_bytes, 0);
+    }
+
+    #[test]
+    fn user_slot_in_user_reapable() {
+        // Back in its program, it holds nothing of the kernel's, so it goes at once.
+        let mut table = table();
+        let mut facts = Facts::default();
+        let (slot, pid) = spawn(&mut table);
+        facts.calls[slot] = 1;
+        assert_eq!(table.switch(1, Request::Preempt, 0, &facts).next, Some(slot));
+        assert_eq!(table.kill(pid, 0, GRACE, &facts), KillOutcome::Pending);
+        assert!(!table.switch(1, Request::Preempt, 1, &facts).reaped);
+
+        facts.calls[slot] = 0;
+        let switch = table.switch(1, Request::Yield, 2, &facts);
+        assert!(switch.reaped);
+        assert_eq!(state(&table, slot), State::Free);
+
+        // And one that's off the CPU, in its program, dies on the spot.
+        let (ready, ready_pid) = spawn(&mut table);
+        assert_eq!(table.kill(ready_pid, 3, GRACE, &facts), KillOutcome::Killed);
+        assert_eq!(state(&table, ready), State::Free);
+    }
+
+    #[test]
+    fn kernel_app_reaping_unchanged() {
+        // No call count: reaped when it holds no lock and no heap, or past the grace.
+        let mut table = table();
+        let mut facts = Facts::default();
+        let (slot, pid) = spawn(&mut table);
+        facts.heap[slot] = 64;
+        table.switch(1, Request::Preempt, 0, &facts);
+        assert_eq!(table.kill(pid, 0, GRACE, &facts), KillOutcome::Pending);
+        assert!(!table.switch(1, Request::Preempt, GRACE - 1, &facts).reaped);
+        let switch = table.switch(1, Request::Preempt, GRACE, &facts);
+        assert!(switch.reaped);
+        assert_eq!(table.leaked_bytes, 64);
+
+        let (locked, locked_pid) = spawn(&mut table);
+        facts.depth[locked] = 1;
+        facts.heap[locked] = 0;
+        assert_eq!(table.kill(locked_pid, 0, GRACE, &facts), KillOutcome::Pending);
+        assert_eq!(state(&table, locked), State::Ready);
+        facts.depth[locked] = 0;
+        table.switch(1, Request::Preempt, 1, &facts);
+        assert_eq!(state(&table, locked), State::Free);
+    }
+
+    #[test]
+    fn user_stop_deferred_in_call() {
+        let mut table = table();
+        let mut facts = Facts::default();
+        let (slot, pid) = spawn(&mut table);
+        facts.calls[slot] = 1;
+        assert!(table.set_stopped(pid, true));
+        assert!(table.stop_or_kill_pending(slot));
+        // Still in its call, so it keeps being chosen until it's done with it.
+        assert_eq!(table.switch(0, Request::Yield, 0, &facts).next, Some(slot));
+        assert_eq!(table.switch(0, Request::Yield, 0, &facts).next, Some(0));
+        // Out of the call, at the boundary: now it's held.
+        facts.calls[slot] = 0;
+        for _ in 0..4 {
+            assert_eq!(table.switch(0, Request::Yield, 0, &facts).next, Some(0));
+        }
+        assert!(table.set_stopped(pid, false));
+        assert!(!table.stop_or_kill_pending(slot));
+        assert_eq!(table.switch(0, Request::Yield, 0, &facts).next, Some(slot));
+    }
+
+    #[test]
+    fn kernel_app_stop_immediate() {
+        let mut table = table();
+        let facts = Facts::default();
+        let (slot, pid) = spawn(&mut table);
+        assert_eq!(table.switch(1, Request::Preempt, 0, &facts).next, Some(slot));
+        assert!(table.set_stopped(pid, true));
+        // Off its CPU at the next tick, and not chosen again.
+        let switch = table.switch(1, Request::Preempt, 0, &facts);
+        assert_eq!(switch.save, Some(slot));
+        assert_eq!(switch.next, None);
+        assert_eq!(table.switch(0, Request::Yield, 0, &facts).next, Some(0));
+    }
+
+    #[test]
+    fn a_protected_task_cannot_be_killed_or_stopped() {
+        let mut table = table();
+        let facts = Facts::default();
+        let (slot, pid) = spawn(&mut table);
+        assert!(table.set_protected(pid));
+        assert_eq!(table.kill(pid, 0, GRACE, &facts), KillOutcome::Protected);
+        assert!(!table.set_stopped(pid, true));
+        assert_eq!(state(&table, slot), State::Ready);
+        assert!(!table.set_protected(999));
     }
 }

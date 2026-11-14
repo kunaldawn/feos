@@ -2755,6 +2755,43 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
 - **Boot:** `user`, `fault`, `sched`, `jobs` (the shell stops a user program in the middle
   of a file write; another program writes the same mount while it's stopped; it resumes and
   finishes), both ports, smp=1 and smp=4.
+- **As built (deviations):**
+  - v1 has no call for a program to kill another (`KILL` is 1c.8), so the checks whose
+    parent kills a child mid-call (`kill-during-blocked-read`, `kill-during-long-write`,
+    `kill-mid-call-storm`, `fault-storm`) are driven by the kernel instead, as
+    `ktest ukill`, with `utest --block-read`, `utest --long-write PATH MIB`,
+    `malicious --call-loop` and `malicious --fault-loop` as the children. `user` and
+    `fault` run it, with `ktest teardown`. They move into `utest` and `malicious` proper
+    once `KILL` exists. `fault-in-kernel-thread` is in `utest` as specified.
+  - `fault-storm` can't reserve a million pages before 1a.3: `MMAP` still promises a
+    frame per page, so the child maps, touches and unmaps 16 MiB at a time, forever, and
+    is killed three times while at it; each kill must take under two seconds.
+  - Teardown records the exit only once it's done: a reaped task is "running" to
+    `wait` until the reaper has freed its frames and closed its pipes, so a parent that
+    has waited never sees a child's pipe end still open. The queue is `MAX_TASKS * 2`
+    entries; `SPAWN` drains it itself if it's ever full.
+  - The reaper is a kernel task in a slot of its own, protected like PID 1
+    (`Table::set_protected`: no kill, no stop), so 30 slots are left for everything else.
+  - No arch change was needed: `sched::on_user_fault` copies the trap's frame into the
+    slot's user frame when it isn't already there (x86_64 takes exceptions on the CPU's
+    fault stack), then starts `fault_entry` exactly as `on_syscall` starts `syscall_entry`.
+    Every fault from user mode goes through `fault_entry`, not only those with an address.
+  - The in-call count is `TaskFacts::in_call`, nonzero only for user programs; the table
+    has no separate user flag. A stop sets `stopped` at once as before, and
+    `Table::switch` just doesn't hold a task whose count is nonzero; the kernel sends the
+    return to the program through the scheduler when `sched::ATTENTION` says a stop or
+    kill may be waiting.
+  - `FEOS_BOOT_TEST_CPU` applies to both ports (default `cortex-a53` on AArch64, `max` on
+    x86_64), and `FEOS_BOOT_TEST_MEM` to every guest whose phase doesn't choose its RAM.
+  - `ktest teardown` kills its 100 programs blocked in a read, and 20 `spin`s at EL0 or
+    ring 3 beside them, so the reaper's path is taken too; it needs all 100 mid-call and
+    all 120 torn down in task context.
+  - `fault-in-kernel-thread` shows the timer ticking by a `utest --ticker` child that
+    sleeps 2 ms at a time and sends its wake times through a pipe: at least one has to fall
+    inside the fault loop, on one CPU as on several.
+  - `ktest ukill` adds `kill-while-spawning`: a kernel task kills each of 50 programs by
+    the PID it's about to get, often before `spawn` returns, and each must end killed, not
+    see the kill as an error from its first read.
 
 ### 1a.3 Frame counts, VMAs, anonymous `MMAP2`, `MADVISE`, `MSYNC`
 

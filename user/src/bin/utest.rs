@@ -1,4 +1,12 @@
 //! Runs through the system calls and reports each one. Exits zero if all passed.
+//!
+//! Also the children some kernel tests kill part way through a call, since a program
+//! can't kill one itself until there's a call for it:
+//!     utest --block-read                 reads standard input until it ends
+//!     utest --ticker                     sends the time every couple of milliseconds
+//!     utest --long-write PATH MIB        writes MIB MiB to PATH, a MiB per call, or
+//!                                        forever with 0, over its first 4 MiB, and
+//!                                        says how much it wrote
 
 #![no_std]
 #![no_main]
@@ -7,8 +15,8 @@ use core::sync::atomic::AtomicU32;
 
 use feos_user::abi::{self, errno, open as flags, prot, seek as whence};
 use feos_user::{
-    close, entry, futex_wait, futex_wake, getpid, mmap, mprotect, munmap, open, pipe, println, read, seek,
-    sleep_ms, spawn, spawn_io, uptime_ms, wait, write, Args,
+    close, entry, futex_wait, futex_wake, getpid, mmap, mprotect, munmap, open, parse_number, pipe, println,
+    read, seek, sleep_ms, spawn, spawn_io, uptime_ms, wait, write, Args,
 };
 
 struct Report {
@@ -292,9 +300,141 @@ fn test_time_and_futex(report: &mut Report) {
     report.check("futex-wake-nobody", futex_wake(&word, 10) == 0);
 }
 
+/// Faults on 10,000 pages it was promised, each resolved by the kernel in a kernel
+/// thread with interrupts on, while another program spins: both get through. A third
+/// sleeps a couple of milliseconds at a time and sends the time it woke at, so a wake
+/// that falls inside the loop shows the timer went on ticking and the scheduler went on
+/// switching while this was faulting, on one CPU as on several.
+fn test_faults_in_kernel_threads(report: &mut Report) {
+    const PAGES: usize = 10_000;
+    let spinner = spawn("/bin/spin", &["/bin/spin", "4", "300"]);
+    let (stamps, ticker) = match pipe() {
+        Ok((reader, writer)) => {
+            let ticker = spawn_io("/bin/utest", &["/bin/utest", "--ticker"], abi::INHERIT, writer);
+            close(writer);
+            (reader, ticker)
+        }
+        Err(_) => (usize::MAX, -1),
+    };
+    // Its first wake says it's running.
+    let mut good = spinner > 0 && ticker > 0 && read_stamp(stamps).is_some();
+    let start = uptime_ms();
+    let length = PAGES * abi::PAGE_SIZE;
+    let area = mmap(length, prot::READ | prot::WRITE);
+    good &= area > 0;
+    if area > 0 {
+        let base = area as usize as *mut u32;
+        for page in 0..PAGES {
+            // SAFETY: inside the mapping, which is writable. Each is a first touch.
+            unsafe { base.add(page * abi::PAGE_SIZE / 4).write_volatile(page as u32) };
+        }
+    }
+    let faulted = uptime_ms();
+    if area > 0 {
+        let base = area as usize as *mut u32;
+        for page in 0..PAGES {
+            // SAFETY: as above.
+            good &= unsafe { base.add(page * abi::PAGE_SIZE / 4).read_volatile() } == page as u32;
+        }
+        good &= munmap(area as usize, length) == 0;
+    }
+    // Every wake up to the end of the faults, and the first after.
+    let mut during = 0;
+    while let Some(stamp) = read_stamp(stamps) {
+        if stamp > faulted {
+            break;
+        }
+        during += usize::from(stamp >= start);
+    }
+    close(stamps);
+    let ticked = if ticker > 0 { wait(ticker as usize) } else { -1 };
+    let spun = if spinner > 0 { wait(spinner as usize) } else { -1 };
+    let elapsed = faulted - start;
+    println!("utest faulted on {PAGES} lazy pages beside a spinner in {elapsed} ms, with {during} timed wakes meanwhile");
+    report.check("fault-in-kernel-thread", good && spun == 0 && ticked == 0 && during > 0);
+}
+
+/// The next wake time `--ticker` sent, or nothing once it can't.
+fn read_stamp(fd: usize) -> Option<isize> {
+    let mut bytes = [0u8; 8];
+    let mut got = 0;
+    while got < bytes.len() {
+        let count = read(fd, &mut bytes[got..]);
+        if count <= 0 {
+            return None;
+        }
+        got += count as usize;
+    }
+    Some(i64::from_le_bytes(bytes) as isize)
+}
+
+/// Sleeps two milliseconds at a time, sending the time after each, until nobody reads
+/// them or ten seconds have passed.
+fn ticker() -> i32 {
+    let start = uptime_ms();
+    while uptime_ms() - start < 10_000 {
+        sleep_ms(2);
+        let stamp = (uptime_ms() as i64).to_le_bytes();
+        if write(1, &stamp) != stamp.len() as isize {
+            return 0;
+        }
+    }
+    1
+}
+
+/// Reads standard input until it ends: a child to kill while it's blocked.
+fn block_read() -> i32 {
+    let mut buffer = [0u8; 64];
+    while read(0, &mut buffer) > 0 {}
+    0
+}
+
+/// Writes a MiB a call to `path`, `mib` times, or forever with zero, over and over the
+/// same few MiB, so that the file stays small however long it goes on.
+fn long_write(path: &str, mib: usize) -> i32 {
+    const WINDOW: usize = 4;
+    let chunk = 1024 * 1024;
+    let buffer = mmap(chunk, prot::READ | prot::WRITE);
+    if buffer < 0 {
+        return 1;
+    }
+    // SAFETY: just mapped, a MiB, writable.
+    let bytes = unsafe { core::slice::from_raw_parts_mut(buffer as usize as *mut u8, chunk) };
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = index as u8;
+    }
+    let fd = open(path, flags::WRITE | flags::CREATE | flags::TRUNCATE);
+    if fd < 0 {
+        return 1;
+    }
+    let mut written = 0;
+    while mib == 0 || written < mib {
+        if written % WINDOW == 0 && seek(fd as usize, 0, whence::SET) != 0 {
+            return 1;
+        }
+        if write(fd as usize, bytes) != chunk as isize {
+            return 1;
+        }
+        written += 1;
+    }
+    close(fd as usize);
+    println!("utest long-write wrote {written} MiB to {path}");
+    0
+}
+
 fn main(args: Args) -> i32 {
     if args.has("--hog") {
         return hog();
+    }
+    if args.has("--block-read") {
+        return block_read();
+    }
+    if args.has("--ticker") {
+        return ticker();
+    }
+    if let Some(path) = args.value_of("--long-write") {
+        let mib = args.get(3).and_then(parse_number).unwrap_or(0);
+        return long_write(path, mib);
     }
     let mut report = Report { failed: 0 };
     report.check("argv", args.get(0).is_some_and(|name| name.ends_with("utest")));
@@ -303,6 +443,7 @@ fn main(args: Args) -> i32 {
     test_files(&mut report);
     test_processes(&mut report);
     test_time_and_futex(&mut report);
+    test_faults_in_kernel_threads(&mut report);
     test_exhaustion(&mut report);
     if report.failed == 0 {
         println!("utest: all ok");

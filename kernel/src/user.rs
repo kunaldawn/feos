@@ -108,7 +108,8 @@ fn fault_in(process: &Process, address: usize, length: usize) -> Result<(), isiz
 
 /// A memory fault from the program in `slot`, at `address`: if it's a page the program
 /// was promised, it gets its frame. `true` if the program can try again. Called from
-/// the fault handler, with interrupts masked, while the program isn't in a call.
+/// `sched::fault_entry`, the fault's kernel thread, with interrupts on: so it can wait
+/// for a lock, and later for a file's page.
 pub fn resolve_fault(slot: usize, address: usize) -> bool {
     let Some(process) = process(slot) else {
         return false;
@@ -551,6 +552,10 @@ fn with_user_buffer(
     done as isize
 }
 
+/// What a call that gave up waiting because its task is being killed returns. Nobody
+/// sees it: `sched::syscall_entry` ends the task instead.
+const KILLED: isize = -errno::EPIPE;
+
 fn sys_write(slot: usize, process: &Process, fd: usize, address: usize, length: usize) -> isize {
     let table = files(slot);
     let Some(entry) = table.fds.get_mut(fd) else {
@@ -563,10 +568,10 @@ fn sys_write(slot: usize, process: &Process, fd: usize, address: usize, length: 
     };
     if let Some(error) = stream {
         return with_user_buffer(process, address, length, false, |piece| {
-            if sched::write_stream(slot, error, piece) {
-                Ok(piece.len())
-            } else {
-                Err(-errno::EPIPE)
+            match sched::write_stream(slot, error, piece) {
+                Ok(true) => Ok(piece.len()),
+                Ok(false) => Err(-errno::EPIPE),
+                Err(pipe::Killed) => Err(KILLED),
             }
         });
     }
@@ -575,12 +580,10 @@ fn sys_write(slot: usize, process: &Process, fd: usize, address: usize, length: 
             let Some(id) = PipeId::from_raw(*id) else {
                 return -errno::EBADF;
             };
-            with_user_buffer(process, address, length, false, |piece| {
-                if pipe::write_id(id, piece) {
-                    Ok(piece.len())
-                } else {
-                    Err(-errno::EPIPE)
-                }
+            with_user_buffer(process, address, length, false, |piece| match pipe::write_wait(id, piece) {
+                Ok(true) => Ok(piece.len()),
+                Ok(false) => Err(-errno::EPIPE),
+                Err(pipe::Killed) => Err(KILLED),
             })
         }
         Fd::File(file) if file.writable => {
@@ -615,13 +618,15 @@ fn sys_read(slot: usize, process: &Process, fd: usize, address: usize, length: u
         // A pipe read returns what's there, not what was asked for, as soon as it has
         // something: with a short count, `with_user_buffer` stops.
         Fd::Stdin => with_user_buffer(process, address, length, true, |piece| {
-            Ok(sched::read_stdin(slot, piece))
+            sched::read_stdin(slot, piece).map_err(|pipe::Killed| KILLED)
         }),
         Fd::PipeRead(id) => {
             let Some(id) = PipeId::from_raw(*id) else {
                 return -errno::EBADF;
             };
-            with_user_buffer(process, address, length, true, |piece| Ok(pipe::read_id(id, piece)))
+            with_user_buffer(process, address, length, true, |piece| {
+                pipe::read_wait(id, piece).map_err(|pipe::Killed| KILLED)
+            })
         }
         Fd::File(file) if file.readable => {
             let Some(tree) = tree() else {

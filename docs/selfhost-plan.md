@@ -23,8 +23,9 @@
 | Stage | State | Tested by |
 |---|---|---|
 | 1a.1 Memory on first touch, `mprotect`, `PROT_NONE`, 4 GiB per-process limit, machine-wide promises | done | `make test-vm` (8 new tests); boot phase `user` on both ports (`utest` lazy-memory and `mprotect` checks, 10 new `malicious` probes, frame-leak count) |
-| 1a.2 User work in kernel mode: faults on the kernel stack, cooperative kill, teardown in task context | next | |
-| 1a.3–1f.1 The rest of phase 1, as staged in `docs/feos-abi-v2.md` section 12 and ticked in `docs/selfhost-todo.md` | | |
+| 1a.2 User work in kernel mode: faults on the kernel stack, cooperative kill, teardown in task context | done | `make test-sched` (5 new tests), `make test-app` (`pipe_wait_returns_killed`); boot phases `user`, `fault`, `sched`, `jobs`, `ram` on both ports at smp=1 and smp=4, and on AArch64 with `FEOS_BOOT_TEST_CPU=max` (`utest` `fault-in-kernel-thread`, `ktest ukill`, `ktest teardown`, frame-leak count) |
+| 1a.3 Frame counts, VMAs, anonymous `MMAP2`, `MADVISE`, `MSYNC` | next | |
+| 1a.4–1f.1 The rest of phase 1, as staged in `docs/feos-abi-v2.md` section 12 and ticked in `docs/selfhost-todo.md` | | |
 
 ## The one unavoidable seed
 

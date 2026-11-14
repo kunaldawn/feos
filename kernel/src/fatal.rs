@@ -10,8 +10,10 @@
 //! For a kernel thread, ending a task isn't full isolation. They share one address
 //! space, so one that scribbled on someone else's memory before it faulted has done
 //! it, and nothing can tell. What it held under a lock is safe; what it allocated stays
-//! allocated, and is reported as a leak. A user program's fault comes this way too, and
-//! there it's all there is to it: see [`crate::user`].
+//! allocated, and is reported as a leak. A user program's fault isn't decided here at
+//! all: the trap hands it to a kernel thread on the task's own stack, which gives the
+//! program its page or ends it (see [`sched::on_user_fault`]). Only a fault from user
+//! mode with the task not there, which can't happen, stops the machine.
 //!
 //! Stopping the machine is:
 //! mask this CPU's interrupts, stop every other CPU with an
@@ -140,13 +142,22 @@ fn report_task() {
 /// Takes a CPU exception: ends the task if that's safe, and otherwise reports it
 /// and stops the machine. Returns `true` having replaced the frame.
 pub fn on_exception(info: &Fault, frame: &mut Frame) -> bool {
-    // A program touching memory it was promised: give it the page and carry on.
-    if info.from_user() {
-        if let (Some(address), Some(slot)) = (info.fault_address(), sched::current_user_slot()) {
-            if crate::user::resolve_fault(slot, address as usize) {
-                return true;
-            }
+    // A program's own doing is the program's business, decided with interrupts on: a
+    // page it was promised, or the end of it.
+    if info.from_user() && info.is_task_fault() {
+        let fault = sched::UserFault {
+            address: info.fault_address(),
+            name: info.syndrome_name(),
+            instruction: info.instruction(),
+        };
+        if sched::on_user_fault(fault, frame) {
+            return true;
         }
+        begin();
+        let _ = writeln!(Report, "\n[fatal] a fault from user mode, from a task that wasn't there");
+        let _ = info.write_report(&mut Report);
+        report_location();
+        Port::halt()
     }
     let overflow = info.fault_address().and_then(sched::stack_overflow_at);
     if info.is_task_fault() && frame.interrupts_were_enabled() && sched::contain_failure() {
@@ -183,6 +194,22 @@ pub fn on_exception(info: &Fault, frame: &mut Frame) -> bool {
     let _ = info.write_report(&mut Report);
     report_location();
     Port::halt()
+}
+
+/// Reports a user program's fault that ends it. Called in its kernel thread, with
+/// interrupts on, so the console can be waited for.
+pub fn report_user_fault(fault: &sched::UserFault) {
+    let console = feos_console::hold();
+    report_task();
+    match fault.address {
+        Some(address) => {
+            let _ = writeln!(Report, "{} at {address:#x}, ip={:#x}; ended", fault.name, fault.instruction);
+        }
+        None => {
+            let _ = writeln!(Report, "{}, ip={:#x}; ended", fault.name, fault.instruction);
+        }
+    }
+    drop(console);
 }
 
 /// Ends the task if that's safe, and otherwise reports the panic and stops the

@@ -6,6 +6,17 @@
 //! and can tell a double free from a real one. A search is linear in the frames
 //! passed over, which is fine for how rarely this is called.
 //!
+//! # Counts
+//!
+//! Beside the bitmap, each frame has four bytes of [metadata](Meta): a map count (the
+//! page-table entries, and other owners such as a shared-anonymous object, that point
+//! at it), a pin count (copies in flight through it) and a few flags. A frame handed
+//! out by [`alloc_counted`](Frames::alloc_counted) is freed when the last of both goes,
+//! whichever that is, so a copy that pinned a frame keeps it alive past an unmap. A
+//! frame from [`alloc`](Frames::alloc) has no counts and goes back with
+//! [`free`](Frames::free). A count at its cap refuses another reference rather than
+//! wrap: the caller says `ENOMEM` for a mapping and `EAGAIN` for a pin.
+//!
 //! The crate holds the algorithm only. The kernel owns the static and the lock.
 
 #![cfg_attr(not(test), no_std)]
@@ -22,6 +33,61 @@ pub enum FreeError {
     NotOurs,
     /// A frame in the run wasn't allocated: a double free.
     NotAllocated,
+    /// A frame in the run is counted: it goes when its counts reach zero, not before.
+    Counted,
+}
+
+/// Why a count couldn't change.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CountError {
+    /// The address isn't on a frame boundary, or isn't RAM this allocator has.
+    NotOurs,
+    /// The frame isn't counted, or has no reference of the kind to drop: a double put.
+    NotCounted,
+    /// The count is at its cap.
+    Saturated,
+}
+
+/// Most map references one frame can have.
+pub const MAX_MAPS: u32 = (1 << 20) - 1;
+/// Most copies one frame can be pinned by at once.
+pub const MAX_PINS: u32 = (1 << 9) - 1;
+
+/// One frame's counts and flags, packed into a word.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Meta(u32);
+
+const MAP_BITS: u32 = MAX_MAPS;
+const PIN_SHIFT: u32 = 20;
+const PIN_BITS: u32 = MAX_PINS << PIN_SHIFT;
+
+impl Meta {
+    /// Page-table entries and other owners pointing at the frame.
+    pub const fn maps(self) -> u32 {
+        self.0 & MAP_BITS
+    }
+
+    /// Copies in flight through the frame.
+    pub const fn pins(self) -> u32 {
+        (self.0 & PIN_BITS) >> PIN_SHIFT
+    }
+
+    /// Whether every flag in `flags` is set.
+    pub const fn has(self, flags: u32) -> bool {
+        self.0 & flags == flags
+    }
+}
+
+/// Flags in a frame's [`Meta`].
+pub mod flag {
+    /// The page cache owns the frame, rather than an anonymous mapping.
+    pub const PAGE_CACHE: u32 = 1 << 29;
+    /// The frame is shared copy-on-write.
+    pub const COPY_ON_WRITE: u32 = 1 << 30;
+    /// The instruction cache has been made to agree with the frame's contents.
+    pub const ICACHE_SYNCED: u32 = 1 << 31;
+    /// Every flag there is.
+    pub const ALL: u32 = PAGE_CACHE | COPY_ON_WRITE | ICACHE_SYNCED;
 }
 
 /// Frames, up to `WORDS * 64` of them, from physical address `base` up.
@@ -30,6 +96,8 @@ pub struct Frames<const WORDS: usize> {
     free: [u64; WORDS],
     /// Set bit: ever added as RAM. A free is refused for anything else.
     ram: [u64; WORDS],
+    /// Counts and flags, a word of them per frame.
+    meta: [[Meta; WORD_BITS]; WORDS],
     base: u64,
     total: usize,
     available: usize,
@@ -43,6 +111,7 @@ impl<const WORDS: usize> Frames<WORDS> {
         Self {
             free: [0; WORDS],
             ram: [0; WORDS],
+            meta: [[Meta(0); WORD_BITS]; WORDS],
             base: base & !(FRAME_SIZE - 1),
             total: 0,
             available: 0,
@@ -80,7 +149,7 @@ impl<const WORDS: usize> Frames<WORDS> {
         (((start - self.base) / FRAME_SIZE) as usize, ((end - self.base) / FRAME_SIZE) as usize)
     }
 
-    fn get(bits: &[u64; WORDS], frame: usize) -> bool {
+    fn bit(bits: &[u64; WORDS], frame: usize) -> bool {
         bits[frame / WORD_BITS] >> (frame % WORD_BITS) & 1 != 0
     }
 
@@ -128,7 +197,7 @@ impl<const WORDS: usize> Frames<WORDS> {
                 frame += WORD_BITS;
                 continue;
             }
-            if !Self::get(&self.free, frame) {
+            if !Self::bit(&self.free, frame) {
                 frame += 1;
                 continue;
             }
@@ -141,7 +210,7 @@ impl<const WORDS: usize> Frames<WORDS> {
             }
             if let Some(blocker) = (frame..frame + count)
                 .take_while(|&candidate| candidate < frames)
-                .find(|&candidate| !Self::get(&self.free, candidate))
+                .find(|&candidate| !Self::bit(&self.free, candidate))
             {
                 frame = blocker + 1;
                 continue;
@@ -174,19 +243,136 @@ impl<const WORDS: usize> Frames<WORDS> {
             return Err(FreeError::NotOurs);
         }
         for frame in start..end {
-            if !Self::get(&self.ram, frame) {
+            if !Self::bit(&self.ram, frame) {
                 return Err(FreeError::NotOurs);
             }
-            if Self::get(&self.free, frame) {
+            if Self::bit(&self.free, frame) {
                 return Err(FreeError::NotAllocated);
+            }
+            if self.meta_at(frame).0 & (MAP_BITS | PIN_BITS) != 0 {
+                return Err(FreeError::Counted);
             }
         }
         for frame in start..end {
             self.free[frame / WORD_BITS] |= 1 << (frame % WORD_BITS);
+            *self.meta_mut(frame) = Meta(0);
         }
         self.available += count;
         self.hint = self.hint.min(start / WORD_BITS);
         Ok(())
+    }
+
+    fn meta_at(&self, frame: usize) -> Meta {
+        self.meta[frame / WORD_BITS][frame % WORD_BITS]
+    }
+
+    fn meta_mut(&mut self, frame: usize) -> &mut Meta {
+        &mut self.meta[frame / WORD_BITS][frame % WORD_BITS]
+    }
+
+    /// The index of an allocated frame at `address`.
+    fn allocated(&self, address: u64) -> Result<usize, CountError> {
+        if !address.is_multiple_of(FRAME_SIZE) || address < self.base || address >= self.limit() {
+            return Err(CountError::NotOurs);
+        }
+        let frame = ((address - self.base) / FRAME_SIZE) as usize;
+        if !Self::bit(&self.ram, frame) || Self::bit(&self.free, frame) {
+            return Err(CountError::NotOurs);
+        }
+        Ok(frame)
+    }
+
+    /// Takes one frame with a map count of one, the caller's reference. It's freed when
+    /// that and every later reference and pin are gone.
+    pub fn alloc_counted(&mut self) -> Option<u64> {
+        let address = self.alloc(1, 1)?;
+        let frame = ((address - self.base) / FRAME_SIZE) as usize;
+        *self.meta_mut(frame) = Meta(1);
+        Some(address)
+    }
+
+    /// A counted frame's counts and flags.
+    pub fn meta(&self, address: u64) -> Result<Meta, CountError> {
+        self.allocated(address).map(|frame| self.meta_at(frame))
+    }
+
+    /// Adds a map reference to a counted frame that has one already.
+    pub fn get(&mut self, address: u64) -> Result<(), CountError> {
+        let frame = self.allocated(address)?;
+        let meta = self.meta_mut(frame);
+        match meta.maps() {
+            0 => Err(CountError::NotCounted),
+            MAX_MAPS => Err(CountError::Saturated),
+            _ => {
+                meta.0 += 1;
+                Ok(())
+            }
+        }
+    }
+
+    /// Drops a map reference. Returns whether that freed the frame: it was the last
+    /// reference, and nothing has it pinned.
+    pub fn put(&mut self, address: u64) -> Result<bool, CountError> {
+        let frame = self.allocated(address)?;
+        let meta = self.meta_mut(frame);
+        if meta.maps() == 0 {
+            return Err(CountError::NotCounted);
+        }
+        meta.0 -= 1;
+        Ok(self.free_if_unused(frame))
+    }
+
+    /// Pins a counted frame that's mapped, for a copy through it.
+    pub fn pin(&mut self, address: u64) -> Result<(), CountError> {
+        let frame = self.allocated(address)?;
+        let meta = self.meta_mut(frame);
+        if meta.maps() == 0 {
+            return Err(CountError::NotCounted);
+        }
+        if meta.pins() == MAX_PINS {
+            return Err(CountError::Saturated);
+        }
+        meta.0 += 1 << PIN_SHIFT;
+        Ok(())
+    }
+
+    /// Drops a pin. Returns whether that freed the frame, its last mapping having gone
+    /// while the copy was using it.
+    pub fn unpin(&mut self, address: u64) -> Result<bool, CountError> {
+        let frame = self.allocated(address)?;
+        let meta = self.meta_mut(frame);
+        if meta.pins() == 0 {
+            return Err(CountError::NotCounted);
+        }
+        meta.0 -= 1 << PIN_SHIFT;
+        Ok(self.free_if_unused(frame))
+    }
+
+    /// Sets or clears flags of a counted frame.
+    pub fn set_flags(&mut self, address: u64, flags: u32, on: bool) -> Result<(), CountError> {
+        let frame = self.allocated(address)?;
+        let meta = self.meta_mut(frame);
+        if meta.0 & (MAP_BITS | PIN_BITS) == 0 {
+            return Err(CountError::NotCounted);
+        }
+        let flags = flags & flag::ALL;
+        if on {
+            meta.0 |= flags;
+        } else {
+            meta.0 &= !flags;
+        }
+        Ok(())
+    }
+
+    fn free_if_unused(&mut self, frame: usize) -> bool {
+        if self.meta_at(frame).0 & (MAP_BITS | PIN_BITS) != 0 {
+            return false;
+        }
+        *self.meta_mut(frame) = Meta(0);
+        self.free[frame / WORD_BITS] |= 1 << (frame % WORD_BITS);
+        self.available += 1;
+        self.hint = self.hint.min(frame / WORD_BITS);
+        true
     }
 
     /// Bytes of RAM added.
@@ -315,6 +501,107 @@ mod tests {
         allocator.reserve(0, (frames as u64 - 2) * FRAME_SIZE);
         assert_eq!(allocator.alloc(3, 1), None);
         assert_eq!(allocator.alloc(2, 1), Some((frames as u64 - 2) * FRAME_SIZE));
+    }
+
+    #[test]
+    fn count_up_and_down_frees_at_zero() {
+        let mut allocator = ram(4);
+        let frame = allocator.alloc_counted().unwrap();
+        assert_eq!(allocator.free_bytes(), 3 * FRAME_SIZE);
+        allocator.get(frame).unwrap();
+        allocator.get(frame).unwrap();
+        assert_eq!(allocator.meta(frame).unwrap().maps(), 3);
+        assert_eq!(allocator.put(frame), Ok(false));
+        assert_eq!(allocator.put(frame), Ok(false));
+        assert_eq!(allocator.free_bytes(), 3 * FRAME_SIZE);
+        assert_eq!(allocator.put(frame), Ok(true));
+        assert_eq!(allocator.free_bytes(), 4 * FRAME_SIZE);
+        // And handed out again, with no counts left over.
+        let again = allocator.alloc(1, 1).unwrap();
+        assert_eq!(again, frame);
+        assert_eq!(allocator.meta(again).unwrap(), Meta::default());
+        allocator.free(again, 1).unwrap();
+    }
+
+    #[test]
+    fn double_free_refused() {
+        let mut allocator = ram(4);
+        let frame = allocator.alloc_counted().unwrap();
+        // A counted frame doesn't go back by hand while it's referenced.
+        assert_eq!(allocator.free(frame, 1), Err(FreeError::Counted));
+        assert_eq!(allocator.put(frame), Ok(true));
+        // Gone: a second put, a get, a pin or a free are all refused.
+        assert_eq!(allocator.put(frame), Err(CountError::NotOurs));
+        assert_eq!(allocator.get(frame), Err(CountError::NotOurs));
+        assert_eq!(allocator.pin(frame), Err(CountError::NotOurs));
+        assert_eq!(allocator.free(frame, 1), Err(FreeError::NotAllocated));
+        // A frame that was never counted has no reference to drop.
+        let plain = allocator.alloc(1, 1).unwrap();
+        assert_eq!(allocator.put(plain), Err(CountError::NotCounted));
+        assert_eq!(allocator.get(plain), Err(CountError::NotCounted));
+        assert_eq!(allocator.unpin(plain), Err(CountError::NotCounted));
+        assert_eq!(allocator.put(plain + 1), Err(CountError::NotOurs));
+        assert_eq!(allocator.free_bytes(), 3 * FRAME_SIZE);
+        allocator.free(plain, 1).unwrap();
+    }
+
+    #[test]
+    fn map_count_saturation_refused() {
+        let mut allocator = ram(2);
+        let frame = allocator.alloc_counted().unwrap();
+        for _ in 1..MAX_MAPS {
+            allocator.get(frame).unwrap();
+        }
+        assert_eq!(allocator.meta(frame).unwrap().maps(), MAX_MAPS);
+        assert_eq!(allocator.get(frame), Err(CountError::Saturated));
+        // The pins and flags beside it weren't touched by the refused one.
+        assert_eq!(allocator.meta(frame).unwrap().pins(), 0);
+        for _ in 0..MAX_MAPS - 1 {
+            assert_eq!(allocator.put(frame), Ok(false));
+        }
+        assert_eq!(allocator.put(frame), Ok(true));
+        assert_eq!(allocator.free_bytes(), 2 * FRAME_SIZE);
+    }
+
+    #[test]
+    fn pin_cap_refused() {
+        let mut allocator = ram(2);
+        let frame = allocator.alloc_counted().unwrap();
+        for _ in 0..MAX_PINS {
+            allocator.pin(frame).unwrap();
+        }
+        assert_eq!(allocator.pin(frame), Err(CountError::Saturated));
+        assert_eq!(allocator.meta(frame).unwrap().maps(), 1);
+        // Unmapped while pinned: it stays until the last copy is done with it.
+        assert_eq!(allocator.put(frame), Ok(false));
+        assert_eq!(allocator.free_bytes(), FRAME_SIZE);
+        // Nothing new may pin or map it once its mappings are gone.
+        assert_eq!(allocator.get(frame), Err(CountError::NotCounted));
+        assert_eq!(allocator.pin(frame), Err(CountError::NotCounted));
+        for _ in 0..MAX_PINS - 1 {
+            assert_eq!(allocator.unpin(frame), Ok(false));
+        }
+        assert_eq!(allocator.unpin(frame), Ok(true));
+        assert_eq!(allocator.free_bytes(), 2 * FRAME_SIZE);
+    }
+
+    #[test]
+    fn flags_live_beside_the_counts() {
+        let mut allocator = ram(2);
+        let frame = allocator.alloc_counted().unwrap();
+        allocator.set_flags(frame, flag::ICACHE_SYNCED | flag::COPY_ON_WRITE, true).unwrap();
+        allocator.get(frame).unwrap();
+        let meta = allocator.meta(frame).unwrap();
+        assert!(meta.has(flag::ICACHE_SYNCED | flag::COPY_ON_WRITE));
+        assert!(!meta.has(flag::PAGE_CACHE));
+        assert_eq!(meta.maps(), 2);
+        allocator.set_flags(frame, flag::COPY_ON_WRITE, false).unwrap();
+        assert!(!allocator.meta(frame).unwrap().has(flag::COPY_ON_WRITE));
+        allocator.put(frame).unwrap();
+        assert_eq!(allocator.put(frame), Ok(true));
+        // The next owner starts with none.
+        let again = allocator.alloc_counted().unwrap();
+        assert_eq!(allocator.meta(again).unwrap(), Meta(1));
     }
 
     /// Random allocations against a model of who owns what.

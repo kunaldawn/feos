@@ -559,6 +559,314 @@ fn test_uspawn(rounds: usize) -> i32 {
     i32::from(failed != 0 || leaked_frames != 0 || pipes_after > pipes_before)
 }
 
+/// Starts a user program, with `stdin` as its standard input if given.
+fn spawn_program(argv: &[&str], stdin: Option<&feos_app::pipe::PipeReader>) -> Option<u32> {
+    let mut block = feos_app::ArgBlock::new();
+    if !block.push_all(argv) {
+        return None;
+    }
+    let io = SpawnIo { stdin, ..SpawnIo::default() };
+    sched::spawn_user(argv[0], block, "/", io, sched::RawStreams::default()).ok()
+}
+
+/// Waits up to a few seconds for the free frames to be back to `target`, as what's being
+/// given back is given back with interrupts on, by tasks that have to be scheduled.
+fn wait_for_frames(target: usize) {
+    for _ in 0..3000 {
+        if memory::free_bytes() >= target {
+            return;
+        }
+        sched::sleep_ms(1);
+    }
+}
+
+/// Waits up to two seconds for `pid` to be blocked: in a call, waiting.
+fn wait_until_blocked(pid: u32) -> bool {
+    for _ in 0..2000 {
+        if sched::PROCESSES.detail(pid).is_some_and(|detail| detail.blocked) {
+            return true;
+        }
+        sched::sleep_ms(1);
+    }
+    false
+}
+
+/// What's in use now: free frames, heap and pipes.
+fn baseline() -> (usize, usize, usize) {
+    sched::sleep_ms(200);
+    (memory::free_bytes(), crate::allocator::stats().used_bytes, feos_app::pipe::in_use())
+}
+
+/// Whether what was in use at `before` is again: every frame back, the heap within what
+/// caches may keep, and no more pipes.
+fn back_to(before: (usize, usize, usize), label: &str) -> bool {
+    wait_for_frames(before.0);
+    let frames = memory::free_bytes();
+    let heap = crate::allocator::stats().used_bytes;
+    let pipes = feos_app::pipe::in_use();
+    let leaked_frames = before.0.saturating_sub(frames) / 4096;
+    let leaked_heap = heap.saturating_sub(before.1);
+    println!(
+        "[ktest] {label}: frames-free={}->{frames} leaked-frames={leaked_frames} leaked-heap={leaked_heap} pipes={}->{pipes}",
+        before.0, before.2
+    );
+    leaked_frames == 0 && leaked_heap <= 64 * 1024 && pipes <= before.2
+}
+
+/// User programs killed in the middle of system calls and faults: each call unwinds
+/// and its task ends itself, and what it held comes back. The kernel is the killer
+/// here because a program can't kill anything until stage 1c.8 gives it a call to.
+fn test_ukill() -> i32 {
+    let processes = &sched::PROCESSES;
+    let mut failed = 0;
+    let mut verdict = |name: &str, good: bool, detail: core::fmt::Arguments<'_>| {
+        println!("[ktest] ukill {name}: {} ({detail})", if good { "ok" } else { "FAILED" });
+        failed += usize::from(!good);
+    };
+
+    // Blocked in a read of a pipe: killed, the read gives up, and the pipe's last
+    // reader goes with the task, so the writer sees a broken pipe.
+    let before = baseline();
+    match feos_app::pipe::create() {
+        Some((reader, writer)) => {
+            let pid = spawn_program(&["/bin/utest", "--block-read"], Some(&reader));
+            drop(reader);
+            let blocked = pid.is_some_and(wait_until_blocked);
+            let status = pid.and_then(|pid| {
+                let _ = processes.try_kill(pid);
+                processes.wait(pid)
+            });
+            let broken = !writer.write(b"x");
+            drop(writer);
+            let good = blocked && status == Some(feos_app::EXIT_KILLED) && broken;
+            verdict(
+                "kill-during-blocked-read",
+                good && back_to(before, "ukill kill-during-blocked-read"),
+                format_args!("blocked={blocked} status={status:?} epipe={broken}"),
+            );
+        }
+        None => verdict("kill-during-blocked-read", false, format_args!("no pipe")),
+    }
+
+    // A MiB per call to a file: the kill lands in one, or between.
+    let before = baseline();
+    let path = "/tmp/ktest-long-write";
+    let pid = spawn_program(&["/bin/utest", "--long-write", path, "0"], None);
+    processes.sleep_ms(500);
+    let status = pid.and_then(|pid| {
+        let _ = processes.try_kill(pid);
+        processes.wait(pid)
+    });
+    if let Some(tree) = sched::platform().filesystem.and_then(|filesystem| filesystem.tree()) {
+        let _ = tree.remove_file(path);
+    }
+    verdict(
+        "kill-during-long-write",
+        status == Some(feos_app::EXIT_KILLED) && back_to(before, "ukill kill-during-long-write"),
+        format_args!("status={status:?}"),
+    );
+
+    // A child forever spawning, writing and reading, killed and started again.
+    let before = baseline();
+    let mut killed = 0;
+    let mut odd = 0;
+    for round in 0..200u64 {
+        let Some(pid) = spawn_program(&["/bin/malicious", "--call-loop"], None) else {
+            odd += 1;
+            continue;
+        };
+        processes.sleep_ms(1 + round % 7);
+        let _ = processes.try_kill(pid);
+        match processes.wait(pid) {
+            Some(feos_app::EXIT_KILLED) => killed += 1,
+            _ => odd += 1,
+        }
+    }
+    // Its own children end by themselves, killed parent or not.
+    processes.sleep_ms(500);
+    verdict(
+        "kill-mid-call-storm",
+        killed == 200 && back_to(before, "ukill kill-mid-call-storm"),
+        format_args!("killed={killed} other={odd}"),
+    );
+
+    // A child taking page faults as fast as it can still dies promptly when killed.
+    let before = baseline();
+    let mut slowest = 0;
+    let mut killed = 0;
+    for _ in 0..3 {
+        let Some(pid) = spawn_program(&["/bin/malicious", "--fault-loop"], None) else {
+            continue;
+        };
+        processes.sleep_ms(700);
+        let start = sched::CLOCK.uptime_ms();
+        let _ = processes.try_kill(pid);
+        if processes.wait(pid) == Some(feos_app::EXIT_KILLED) {
+            killed += 1;
+        }
+        slowest = slowest.max(sched::CLOCK.uptime_ms() - start);
+    }
+    verdict(
+        "fault-storm",
+        killed == 3 && slowest < 2000 && back_to(before, "ukill fault-storm"),
+        format_args!("killed={killed} slowest-kill={slowest}ms"),
+    );
+
+    // Killed by another task while it's being spawned, before its PID is even handed
+    // back: the kill is kept, and the program ends at its first boundary as killed,
+    // never seeing the kill as an error from a call.
+    let before = baseline();
+    let (killed, early, odd) = kill_while_spawning();
+    verdict(
+        "kill-while-spawning",
+        killed == KILL_WHILE_SPAWNING_ROUNDS && back_to(before, "ukill kill-while-spawning"),
+        format_args!("killed={killed} during-spawn={early} other={odd}"),
+    );
+
+    println!("[ktest] ukill: {failed} failed");
+    i32::from(failed != 0)
+}
+
+/// Spawns a program blocking on a pipe over and over, while a kernel task tries to
+/// kill each one by the PID it's about to get. Says how many ended killed, how many of
+/// the kills landed before the spawn had returned, and how many went otherwise.
+fn kill_while_spawning() -> (usize, usize, usize) {
+    use core::sync::atomic::AtomicBool;
+
+    static TARGET: AtomicU32 = AtomicU32::new(0);
+    static SPAWNED: AtomicBool = AtomicBool::new(false);
+    static STOP: AtomicBool = AtomicBool::new(false);
+    static EARLY: AtomicUsize = AtomicUsize::new(0);
+    TARGET.store(0, Ordering::Release);
+    STOP.store(false, Ordering::Release);
+    EARLY.store(0, Ordering::Relaxed);
+    let mut killed = 0;
+    let mut odd = 0;
+
+    let processes = &sched::PROCESSES;
+    let Some((reader, writer)) = feos_app::pipe::create() else {
+        return (0, 0, 1);
+    };
+    // It spins rather than sleeps, so on another CPU its kill can land while the
+    // spawner is painting the new task's stack.
+    let killer = Box::new(|| {
+        while !STOP.load(Ordering::Acquire) {
+            let target = TARGET.load(Ordering::Acquire);
+            if target == 0 || sched::PROCESSES.try_kill(target) == feos_app::KillResult::NotFound {
+                core::hint::spin_loop();
+                continue;
+            }
+            if !SPAWNED.load(Ordering::Acquire) {
+                EARLY.fetch_add(1, Ordering::Relaxed);
+            }
+            let _ = TARGET.compare_exchange(target, 0, Ordering::AcqRel, Ordering::Acquire);
+        }
+        0
+    });
+    let Ok(killer_pid) = processes.spawn_task("ktest-killer", SpawnIo::default(), killer) else {
+        return (0, 0, 1);
+    };
+    // PIDs are handed out in order, and nothing else is spawning.
+    let mut next = killer_pid.wrapping_add(1).max(2);
+    for _ in 0..KILL_WHILE_SPAWNING_ROUNDS {
+        SPAWNED.store(false, Ordering::Release);
+        TARGET.store(next, Ordering::Release);
+        let pid = spawn_program(&["/bin/utest", "--block-read"], Some(&reader));
+        SPAWNED.store(true, Ordering::Release);
+        let Some(pid) = pid else {
+            TARGET.store(0, Ordering::Release);
+            odd += 1;
+            continue;
+        };
+        if pid != next {
+            // Something else took the PID: kill this one here instead.
+            TARGET.store(0, Ordering::Release);
+            let _ = processes.try_kill(pid);
+        }
+        // Killed in its spawn, its load or its read, it must end killed: a read that
+        // gave up with an error would let it end by itself, with status 0.
+        match processes.wait(pid) {
+            Some(feos_app::EXIT_KILLED) if pid == next => killed += 1,
+            _ => odd += 1,
+        }
+        next = pid.wrapping_add(1).max(2);
+    }
+    STOP.store(true, Ordering::Release);
+    processes.wait(killer_pid);
+    drop(reader);
+    drop(writer);
+    (killed, EARLY.load(Ordering::Relaxed), odd)
+}
+
+const KILL_WHILE_SPAWNING_ROUNDS: usize = 50;
+
+/// Kills 100 user programs in the middle of system calls, and 20 more at EL0 or ring 3
+/// beside them for the reaper: every teardown runs in task context with interrupts on,
+/// and everything comes back.
+fn test_teardown() -> i32 {
+    const BATCHES: usize = 10;
+    const IN_CALL: usize = 10;
+    const IN_USER: usize = 2;
+    let processes = &sched::PROCESSES;
+    let before = baseline();
+    let (own_before, queued_before, unsafe_before) = sched::teardown_counts();
+    let mut mid_call = 0;
+    let mut at_user = 0;
+    let mut odd = 0;
+    for _ in 0..BATCHES {
+        let Some((reader, writer)) = feos_app::pipe::create() else {
+            odd += IN_CALL + IN_USER;
+            continue;
+        };
+        // Each with whether it's to be killed in a call, and whether it was.
+        let mut pids = [(0u32, false, false); IN_CALL + IN_USER];
+        let mut count = 0;
+        for index in 0..pids.len() {
+            let call = index < IN_CALL;
+            let argv: &[&str] = if call { &["/bin/utest", "--block-read"] } else { &["/bin/spin", "5", "0"] };
+            match spawn_program(argv, Some(&reader)) {
+                Some(pid) => {
+                    pids[count] = (pid, call, false);
+                    count += 1;
+                }
+                None => odd += 1,
+            }
+        }
+        drop(reader);
+        for (pid, call, blocked) in &mut pids[..count] {
+            *blocked = *call && wait_until_blocked(*pid);
+        }
+        for (pid, ..) in &pids[..count] {
+            let _ = processes.try_kill(*pid);
+        }
+        for (pid, call, blocked) in &pids[..count] {
+            match (processes.wait(*pid), *call, *blocked) {
+                (Some(feos_app::EXIT_KILLED), true, true) => mid_call += 1,
+                (Some(feos_app::EXIT_KILLED), false, _) => at_user += 1,
+                _ => odd += 1,
+            }
+        }
+        drop(writer);
+    }
+    let killed = mid_call + at_user;
+    let (own_after, queued_after, unsafe_after) = sched::teardown_counts();
+    let own = own_after - own_before;
+    let queued = queued_after - queued_before;
+    let wrong = unsafe_after - unsafe_before;
+    let whole = back_to(before, "teardown");
+    let all = BATCHES * (IN_CALL + IN_USER);
+    let good = mid_call == BATCHES * IN_CALL
+        && at_user == BATCHES * IN_USER
+        && own + queued >= all
+        && wrong == 0
+        && whole;
+    println!(
+        "[ktest] teardown: killed={killed} mid-call={mid_call} at-user={at_user} other={odd} by-self={own} \
+         by-queue={queued} outside-task-context={wrong} ok={good}"
+    );
+    i32::from(!good)
+}
+
 /// Says what the frames and memory look like right now.
 fn test_user_memory() -> i32 {
     println!(
@@ -578,7 +886,7 @@ impl App for KernelTest {
     }
 
     fn usage(&self) -> &'static str {
-        "ktest <uspawn [n]|user-memory|cpus|fp|irqs|mem|priority|affinity|timer|panic|overflow|overflow-locked|null|task-panic>"
+        "ktest <uspawn [n]|ukill|teardown|user-memory|cpus|fp|irqs|mem|priority|affinity|timer|panic|overflow|overflow-locked|null|task-panic>"
     }
 
     fn description(&self) -> &'static str {
@@ -588,6 +896,8 @@ impl App for KernelTest {
     fn run(&self, context: &mut Context<'_>) -> i32 {
         match context.args.trim() {
             "user-memory" => test_user_memory(),
+            "ukill" => test_ukill(),
+            "teardown" => test_teardown(),
             uspawn if uspawn.starts_with("uspawn") => {
                 let rounds = uspawn["uspawn".len()..].trim().parse().unwrap_or(320);
                 test_uspawn(rounds)

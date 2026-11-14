@@ -30,10 +30,26 @@
 //! The grace period lets a process that polls `kill_requested` unwind and free
 //! it, and whatever it still owns after that is reported as leaked.
 //!
+//! A user program is different while it's in the kernel, in a system call or a page
+//! fault: what the call holds is on its kernel stack, so the slot's in-call count
+//! keeps it from being reaped there at all. A kill wakes it instead, every wait it can
+//! be in gives up, and the call unwinds to [`syscall_entry`] (or [`fault_entry`]),
+//! which ends the task. A stop waits for the same point, the way back to the
+//! program, so a stopped program never holds a kernel lock.
+//!
+//! # Teardown
+//!
+//! What a task leaves behind (its address space, the pipes it held) is given back in
+//! task context with interrupts on, never in the trap that takes it off the table.
+//! A task that ends itself does it on the way out. One that's reaped, by a kill or a
+//! failure, is queued by [`collect_exits`] in a fixed queue, and a reaper task drains
+//! it. Either way, its exit is only recorded, and `wait` only returns, once that's
+//! done.
+//!
 //! # Exit status and a task's console
 //!
-//! A task's exit status goes into a small ring of recent exits as it leaves the
-//! table, so a slot never waits for a parent to collect it. A task can have
+//! A task's exit status goes into a small ring of recent exits once it has left the
+//! table and been torn down, so a slot never waits for a parent to collect it. A task can have
 //! pipes as its console: everything it prints goes there. Pipes need no heap and
 //! record who holds them, so whatever a task held closes when it goes, even if a
 //! kill gave it no chance to run its destructors.
@@ -45,7 +61,7 @@ use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::ptr::addr_of;
 use core::ptr::addr_of_mut;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use feos_app::pipe::{self, PipeHooks, PipeId};
 use feos_app::{
@@ -145,6 +161,43 @@ static IN_USER: [AtomicBool; MAX_TASKS] = [const { AtomicBool::new(false) }; MAX
 
 /// What to load for the task in each slot: its page tables, or zero for the kernel's.
 static ROOT: [AtomicUsize; MAX_TASKS] = [const { AtomicUsize::new(0) }; MAX_TASKS];
+
+/// How deep the user program in each slot is in the kernel: one from when it starts
+/// (loading is the kernel's work) and from each system call or fault, until it's about
+/// to resume the program. Zero for kernel-linked apps. Only the slot's own CPU changes
+/// it, in a trap. While it's nonzero the task isn't reaped or held by a stop: see
+/// `feos-sched`.
+static IN_CALL: [AtomicU32; MAX_TASKS] = [const { AtomicU32::new(0) }; MAX_TASKS];
+
+/// A kill or a stop may be waiting for the task in each slot at the way back to its
+/// program. A hint, so that returning from a call needn't take the scheduler's lock:
+/// the table says for certain.
+static ATTENTION: [AtomicBool; MAX_TASKS] = [const { AtomicBool::new(false) }; MAX_TASKS];
+
+/// What a user program's fault was, kept from the trap for [`fault_entry`].
+#[derive(Clone, Copy)]
+pub struct UserFault {
+    /// The address of a memory fault.
+    pub address: Option<u64>,
+    /// What kind of fault it was.
+    pub name: &'static str,
+    /// The instruction that faulted.
+    pub instruction: u64,
+}
+
+struct FaultNotes([UnsafeCell<UserFault>; MAX_TASKS]);
+
+// SAFETY: a slot's note is written by the trap that takes its task out of EL0 or ring 3
+// and read by that task in `fault_entry`, which the write happens before.
+unsafe impl Sync for FaultNotes {}
+
+static FAULT_NOTES: FaultNotes = FaultNotes(
+    [const { UnsafeCell::new(UserFault { address: None, name: "", instruction: 0 }) }; MAX_TASKS],
+);
+
+/// The task in each slot gave back what it held itself, on its way out, so there's
+/// nothing left to queue for the reaper when it leaves the table.
+static TORN_DOWN: [AtomicBool; MAX_TASKS] = [const { AtomicBool::new(false) }; MAX_TASKS];
 
 /// What the kernel keeps about a task beyond scheduling policy.
 struct Task {
@@ -313,6 +366,10 @@ impl TaskFacts for Facts {
 
     fn heap_bytes(&self, slot: usize) -> usize {
         HEAP_BYTES[slot].load(Ordering::Acquire)
+    }
+
+    fn in_call(&self, slot: usize) -> u32 {
+        IN_CALL[slot].load(Ordering::Acquire)
     }
 }
 
@@ -502,7 +559,7 @@ pub fn end_task_from_trap(frame: &mut Frame) {
 
 /// Ends the calling task, from a panic in it.
 pub fn end_task() -> ! {
-    exit_current(EXIT_FAULTED)
+    exit_task(EXIT_FAULTED, false)
 }
 
 /// Lowest address of a spawned task's stack.
@@ -609,13 +666,14 @@ fn resume_frame(slot: usize) -> *mut Frame {
 /// Called on the CPU's exception stack with interrupts masked. `frame` is where the
 /// trap saved what was running. The assembly stub returns to the selected process
 /// (or to the idle loop). `request` runs under the scheduler lock.
+///
+/// Nothing a task leaves behind is given back here: [`collect_exits`] only queues it.
 fn reschedule(frame: &mut Frame, request: impl FnOnce() -> Request, tick: bool) {
     let cpu = this_cpu();
     let now = Port::services().ticks();
     let period = Port::timer_period();
     let idle_hint = Port::take_idle_hint();
-    let mut gone = GoneTasks::new();
-    {
+    let idle = {
         let mut scheduler = SCHEDULER.lock();
         let scheduler = &mut *scheduler;
         let request = request();
@@ -651,9 +709,19 @@ fn reschedule(frame: &mut Frame, request: impl FnOnce() -> Request, tick: bool) 
 
         let switch = scheduler.table.switch(cpu, request, now, &Facts);
 
-        // The outgoing task's frame is already where it belongs.
         match switch.next {
-            Some(slot) if switch.save == Some(slot) => {}
+            // The outgoing task carries on, from the frame the trap saved: unless that
+            // was its kernel half, on its way back to its program.
+            Some(slot) if switch.save == Some(slot) => {
+                let resume = resume_frame(slot);
+                if !core::ptr::eq(frame as *const Frame, resume) {
+                    // Its tables too, as on the way out of `on_switch_request`: a
+                    // program's first entry comes here from a task that loaded it on
+                    // the kernel's tables.
+                    Port::activate_user_tables(ROOT[slot].load(Ordering::Relaxed), asid(slot));
+                    Port::resume(resume);
+                }
+            }
             Some(slot) => {
                 Port::activate_user_tables(ROOT[slot].load(Ordering::Relaxed), asid(slot));
                 Port::resume(resume_frame(slot));
@@ -666,16 +734,18 @@ fn reschedule(frame: &mut Frame, request: impl FnOnce() -> Request, tick: bool) 
                 CURRENT[cpu].store(0, Ordering::Relaxed);
             }
         }
-        collect_exits(scheduler, &mut gone);
+        let collected = collect_exits(scheduler);
+        let idle = announce(scheduler, collected);
 
         // CPU 0 services the audio stream on its tick, whatever it's doing.
         let idle_limit = if cpu == 0 { period } else { period.saturating_mul(IDLE_TICKS) };
         Port::timer_arm(scheduler.table.next_deadline(cpu, now, period, idle_limit));
-    }
+        idle
+    };
     if tick {
         TIMER_INTERRUPTS[cpu].fetch_add(1, Ordering::Relaxed);
     }
-    gone.finish();
+    kick(idle);
 }
 
 /// Timer interrupts each CPU has taken. Idle CPUs should take few.
@@ -683,56 +753,99 @@ pub fn timer_interrupts(cpu: usize) -> u64 {
     TIMER_INTERRUPTS.get(cpu).map_or(0, |count| count.load(Ordering::Relaxed))
 }
 
-/// Tasks that left the table during one scheduler pass. Anything beyond this
-/// many is caught by the next pass.
-struct GoneTasks {
-    pids: [u32; 4],
-    /// Their address spaces, for those that had one.
-    spaces: [Option<crate::user::Process>; 4],
-    count: usize,
+/// What a task that has left the table still has to give back, until someone in task
+/// context does. Its exit is recorded only after that, so a `wait` that returns means
+/// its pipes are closed and its frames are free.
+struct Teardown {
+    /// [`EMPTY`], [`QUEUED`] or [`TAKEN`]. Only [`collect_exits`] fills an entry and only
+    /// [`finish_teardown`] empties one, both under the scheduler lock, so a reader with
+    /// that lock sees the record whole. Taking one is a compare-and-swap.
+    state: AtomicU8,
+    record: UnsafeCell<ExitRecord>,
+    process: UnsafeCell<Option<crate::user::Process>>,
 }
 
-impl GoneTasks {
-    const fn new() -> Self {
-        Self {
-            pids: [0; 4],
-            spaces: [const { None }; 4],
-            count: 0,
-        }
-    }
+// SAFETY: the cells belong to whoever moved `state` to its current value: the filler
+// until it's `QUEUED`, then the one that took it. The record is only read under the
+// scheduler lock, and doesn't change while the entry is in use.
+unsafe impl Sync for Teardown {}
 
-    const fn is_full(&self) -> bool {
-        self.count == self.pids.len()
-    }
+const EMPTY: u8 = 0;
+const QUEUED: u8 = 1;
+const TAKEN: u8 = 2;
 
-    /// Closes what the tasks held, frees their memory and wakes anyone waiting for them.
-    /// Call with the scheduler lock released: all of those take locks of their own.
-    fn finish(mut self) {
-        if self.count == 0 {
-            return;
-        }
-        for pid in &self.pids[..self.count] {
-            pipe::release_pid(*pid);
-        }
-        for space in &mut self.spaces[..self.count] {
-            if let Some(space) = space.take() {
-                space.destroy();
-            }
-        }
-        EXIT_SEQUENCE.fetch_add(1, Ordering::Release);
-        futex_wake(&EXIT_SEQUENCE, usize::MAX);
+/// Room for every slot to have gone at once, and gone again after being reused.
+const TEARDOWN_ENTRIES: usize = MAX_TASKS * 2;
+
+static TEARDOWNS: [Teardown; TEARDOWN_ENTRIES] = [const {
+    Teardown {
+        state: AtomicU8::new(EMPTY),
+        record: UnsafeCell::new(ExitRecord { pid: 0, code: 0, parent: 0 }),
+        process: UnsafeCell::new(None),
     }
+}; TEARDOWN_ENTRIES];
+
+/// Changes whenever a teardown is queued, for the reaper to wait on.
+static TEARDOWN_SEQUENCE: AtomicU32 = AtomicU32::new(0);
+
+/// Teardowns done by the task itself and by whoever took them from the queue, and
+/// those that, against the rules, ran without a task or with interrupts masked.
+static TEARDOWNS_SELF: AtomicUsize = AtomicUsize::new(0);
+static TEARDOWNS_QUEUED: AtomicUsize = AtomicUsize::new(0);
+static TEARDOWNS_UNSAFE: AtomicUsize = AtomicUsize::new(0);
+
+/// How many teardowns have run: by tasks on their way out, from the queue, and
+/// outside task context (which should be none).
+pub fn teardown_counts() -> (usize, usize, usize) {
+    (
+        TEARDOWNS_SELF.load(Ordering::Acquire),
+        TEARDOWNS_QUEUED.load(Ordering::Acquire),
+        TEARDOWNS_UNSAFE.load(Ordering::Acquire),
+    )
 }
 
-/// Records the exit of every task that has left the table.
-fn collect_exits(scheduler: &mut Scheduler, gone: &mut GoneTasks) {
+/// Counts a teardown about to run, and whether it's where teardowns belong.
+fn note_teardown(counter: &AtomicUsize) {
+    if !(Port::irqs_enabled() && with_current_slot().is_some()) {
+        TEARDOWNS_UNSAFE.fetch_add(1, Ordering::AcqRel);
+    }
+    counter.fetch_add(1, Ordering::AcqRel);
+}
+
+/// What [`collect_exits`] did, for [`announce`].
+#[derive(Clone, Copy, Default)]
+struct Collected {
+    /// Every task that has left the table has been collected.
+    complete: bool,
+    /// An exit was recorded.
+    recorded: bool,
+    /// A teardown was queued.
+    queued: bool,
+}
+
+/// Records the exit of every task that has left the table and has given back what it
+/// held, and queues the rest for teardown. Runs under the scheduler lock, often in a
+/// trap, so it only moves things: see [`drain_teardowns`].
+fn collect_exits(scheduler: &mut Scheduler) -> Collected {
+    let mut collected = Collected { complete: true, ..Collected::default() };
     for slot in 1..MAX_TASKS {
-        if gone.is_full() {
-            return;
-        }
         if !scheduler.tasks[slot].live || scheduler.table.tasks()[slot].state != State::Free {
             continue;
         }
+        let torn_down = TORN_DOWN[slot].load(Ordering::Acquire);
+        let entry = if torn_down {
+            None
+        } else {
+            match TEARDOWNS.iter().find(|entry| entry.state.load(Ordering::Acquire) == EMPTY) {
+                Some(entry) => Some(entry),
+                // The slot stays as it is, uncollected, for a later pass: nobody can
+                // reserve it meanwhile, since `spawn_entry` collects everything first.
+                None => {
+                    collected.complete = false;
+                    continue;
+                }
+            }
+        };
         // Its CPU time passes to its parent, for `time`. The table keeps the count until
         // the slot is next reserved.
         let spent = scheduler.table.tasks()[slot].cpu_ticks.wrapping_add(CHILD_TICKS[slot].load(Ordering::Relaxed));
@@ -753,25 +866,137 @@ fn collect_exits(scheduler: &mut Scheduler, gone: &mut GoneTasks) {
             },
             parent: task.parent,
         };
-        gone.pids[gone.count] = record.pid;
         // Nothing runs on these tables now: every CPU that did changed tables before
         // it let the slot go. After this flush, the slot's ASID is clean for the next.
         if ROOT[slot].swap(0, Ordering::Relaxed) != 0 {
             Port::flush_user_space(asid(slot));
         }
         IN_USER[slot].store(false, Ordering::Relaxed);
-        gone.spaces[gone.count] = crate::user::take_process(slot);
-        gone.count += 1;
-        let next = scheduler.next_exit;
-        scheduler.exits[next] = record;
-        scheduler.next_exit = (next + 1) % EXIT_RECORDS;
+        match entry {
+            None => {
+                record_exit(scheduler, record);
+                collected.recorded = true;
+            }
+            Some(entry) => {
+                // SAFETY: the entry is empty, and only this, under the scheduler lock,
+                // fills one.
+                unsafe {
+                    *entry.record.get() = record;
+                    *entry.process.get() = crate::user::take_process(slot);
+                }
+                entry.state.store(QUEUED, Ordering::Release);
+                collected.queued = true;
+            }
+        }
+    }
+    collected
+}
+
+fn record_exit(scheduler: &mut Scheduler, record: ExitRecord) {
+    let next = scheduler.next_exit;
+    scheduler.exits[next] = record;
+    scheduler.next_exit = (next + 1) % EXIT_RECORDS;
+}
+
+/// Wakes whoever [`collect_exits`] has news for: tasks waiting for an exit, and the
+/// reaper. Under the scheduler lock, as a futex wake would take it. Returns an idle CPU
+/// to [`kick`] once the lock is released.
+fn announce(scheduler: &mut Scheduler, collected: Collected) -> Option<usize> {
+    let mut woken = 0;
+    if collected.recorded {
+        EXIT_SEQUENCE.fetch_add(1, Ordering::Release);
+        woken += scheduler.table.wake_key(&EXIT_SEQUENCE as *const AtomicU32 as usize, usize::MAX);
+    }
+    if collected.queued {
+        TEARDOWN_SEQUENCE.fetch_add(1, Ordering::Release);
+        woken += scheduler.table.wake_key(&TEARDOWN_SEQUENCE as *const AtomicU32 as usize, usize::MAX);
+    }
+    (woken > 0).then(|| scheduler.table.idle_cpu(this_cpu())).flatten()
+}
+
+/// Gives back what queued tasks left behind, and records their exits. Call in task
+/// context with interrupts on: closing pipes and freeing frames take locks of their own.
+fn drain_teardowns() {
+    for entry in &TEARDOWNS {
+        if entry
+            .state
+            .compare_exchange(QUEUED, TAKEN, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            continue;
+        }
+        // SAFETY: taking the entry made its cells this task's, and the record doesn't
+        // change until it's empty again.
+        let (record, process) = unsafe { (*entry.record.get(), (*entry.process.get()).take()) };
+        note_teardown(&TEARDOWNS_QUEUED);
+        pipe::release_pid(record.pid);
+        if let Some(process) = process {
+            process.destroy();
+        }
+        finish_teardown(entry, record);
     }
 }
 
-/// The slot of the task running on this CPU, if it was running its program when the
-/// CPU trapped. Call with interrupts masked.
-pub fn current_user_slot() -> Option<usize> {
-    current_slot().filter(|slot| IN_USER[*slot].load(Ordering::Relaxed))
+/// Records the exit of a task whose teardown is done, and empties its queue entry.
+fn finish_teardown(entry: &Teardown, record: ExitRecord) {
+    let idle = {
+        let mut scheduler = SCHEDULER.lock();
+        record_exit(&mut scheduler, record);
+        entry.state.store(EMPTY, Ordering::Release);
+        announce(&mut scheduler, Collected { complete: true, recorded: true, queued: false })
+    };
+    kick(idle);
+}
+
+/// Whether `pid` has left the table but its teardown hasn't finished, and if so, its
+/// parent. Call under the scheduler lock.
+fn tearing_down(pid: u32) -> Option<u32> {
+    if pid == 0 {
+        return None;
+    }
+    TEARDOWNS.iter().find_map(|entry| {
+        if entry.state.load(Ordering::Acquire) == EMPTY {
+            return None;
+        }
+        // SAFETY: see `Teardown`: the caller holds the scheduler lock.
+        let record = unsafe { *entry.record.get() };
+        (record.pid == pid).then_some(record.parent)
+    })
+}
+
+/// Gives back what the calling task holds, on its way out: its address space and its
+/// pipes, with interrupts on. Then there's nothing for the reaper to do.
+fn teardown_self() {
+    let Some(slot) = with_current_slot() else {
+        return;
+    };
+    if slot == 0 {
+        return;
+    }
+    // Off its own tables first. A preemption from here on loads the kernel's, since
+    // there's no root for it to load.
+    let flags = Port::irq_save_and_disable();
+    if ROOT[slot].swap(0, Ordering::Relaxed) != 0 {
+        Port::activate_user_tables(0, 0);
+        Port::flush_user_space(asid(slot));
+    }
+    Port::irq_restore(flags);
+    note_teardown(&TEARDOWNS_SELF);
+    let process = crate::user::take_process(slot);
+    pipe::release_pid(SLOT_PID[slot].load(Ordering::Acquire));
+    if let Some(process) = process {
+        process.destroy();
+    }
+    TORN_DOWN[slot].store(true, Ordering::Release);
+}
+
+/// The reaper: a kernel task that gives back what killed and failed tasks left behind.
+fn reaper() -> i32 {
+    loop {
+        let seen = TEARDOWN_SEQUENCE.load(Ordering::Acquire);
+        drain_teardowns();
+        futex_wait(&TEARDOWN_SEQUENCE, seen);
+    }
 }
 
 /// Whether this CPU is in its idle loop. Call with interrupts masked.
@@ -794,10 +1019,29 @@ pub fn on_switch_request(frame: &mut Frame) {
     // SAFETY: only this CPU touches its entry, and interrupts are masked here.
     let pending = unsafe { *PENDING[this_cpu()].0.get() };
     if matches!(pending, PendingRequest::ToUser) {
-        // The same task carries on, so there's nothing to decide. A kill waits for the
-        // tick, as it does for any task that's running.
         if let Some(slot) = current_slot() {
+            // Out of the call: from here the task is its program's, and can be reaped
+            // or held like any other.
+            let depth = &IN_CALL[slot];
+            depth.store(depth.load(Ordering::Relaxed).saturating_sub(1), Ordering::Release);
             IN_USER[slot].store(true, Ordering::Relaxed);
+            // A kill or a stop that came during the call takes effect here, at the
+            // boundary, through the scheduler. Otherwise the same task carries on, so
+            // there's nothing to decide.
+            if ATTENTION[slot].load(Ordering::Acquire) {
+                let waiting = {
+                    let scheduler = SCHEDULER.lock();
+                    let waiting = scheduler.table.stop_or_kill_pending(slot);
+                    if !waiting {
+                        ATTENTION[slot].store(false, Ordering::Release);
+                    }
+                    waiting
+                };
+                if waiting {
+                    reschedule(frame, || Request::Yield, false);
+                    return;
+                }
+            }
             Port::activate_user_tables(ROOT[slot].load(Ordering::Relaxed), asid(slot));
             Port::resume(USER_FRAMES.0[slot].get());
         }
@@ -842,14 +1086,17 @@ pub fn on_syscall(_frame: &mut Frame) {
     let Some(slot) = current_slot() else {
         return;
     };
+    enter_kernel(slot, syscall_entry as *const () as usize);
+}
+
+/// Turns the user program in `slot`, which has just trapped from EL0 or ring 3, into a
+/// kernel thread at `entry`, at the top of its kernel stack. That stack is free: a task
+/// only uses it while it's in the kernel.
+fn enter_kernel(slot: usize, entry: usize) {
     IN_USER[slot].store(false, Ordering::Relaxed);
-    let thread = Frame::new_task(
-        syscall_entry as *const () as usize,
-        slot,
-        stack_bottom(slot) + STACK_SIZE,
-        task_exit as *const () as usize,
-    );
-    // SAFETY: this is the running task's frame, and nothing is using it: it's at EL0.
+    IN_CALL[slot].fetch_add(1, Ordering::AcqRel);
+    let thread = Frame::new_task(entry, slot, stack_bottom(slot) + STACK_SIZE, task_exit as *const () as usize);
+    // SAFETY: this is the running task's frame, and nothing is using it: it was at EL0.
     unsafe { TASK_FRAMES.0[slot].get().write(thread) };
     Port::resume(TASK_FRAMES.0[slot].get());
 }
@@ -860,8 +1107,66 @@ extern "C" fn syscall_entry(slot: usize) -> ! {
     // SAFETY: the task is here, not at EL0, so nothing else is using its user frame.
     let (number, args) = unsafe { ((*user).syscall_number(), (*user).syscall_args()) };
     let result = crate::user::syscall(slot, number, args);
+    // A kill gave the call reason to stop waiting, and it has unwound: what it held
+    // has gone with it, so the task can end here.
+    end_if_killed(slot);
     // SAFETY: as above.
     unsafe { (*user).set_syscall_result(result as usize) };
+    return_to_user()
+}
+
+/// Handles a fault from a user program, on the CPU's exception stack: hands it to
+/// [`fault_entry`], a kernel thread on the task's own stack, which can wait for what
+/// it needs with interrupts on. Returns `false`, to stop the machine, if the task
+/// wasn't at EL0 or ring 3: the fault's frame would have nowhere to go.
+pub fn on_user_fault(fault: UserFault, frame: &mut Frame) -> bool {
+    let Some(slot) = current_slot() else {
+        return false;
+    };
+    if !IN_USER[slot].load(Ordering::Relaxed) {
+        return false;
+    }
+    let user = USER_FRAMES.0[slot].get();
+    // A port whose faults save their frame somewhere else, on a fault stack, has the
+    // program's registers there; they belong in its user frame.
+    if !core::ptr::eq(frame as *const Frame, user) {
+        // SAFETY: the task is in this trap, so nothing else is using its user frame.
+        unsafe { user.write(*frame) };
+    }
+    // SAFETY: see `FaultNotes`.
+    unsafe { FAULT_NOTES.0[slot].get().write(fault) };
+    enter_kernel(slot, fault_entry as *const () as usize);
+    true
+}
+
+/// A user fault's kernel half: gives the program the page it was promised, or ends it.
+/// The single place a fault from user mode is decided, which is where a signal frame
+/// will be built.
+extern "C" fn fault_entry(slot: usize) -> ! {
+    // SAFETY: see `FaultNotes`.
+    let fault = unsafe { *FAULT_NOTES.0[slot].get() };
+    let resolved = fault
+        .address
+        .is_some_and(|address| crate::user::resolve_fault(slot, address as usize));
+    if !resolved {
+        crate::fatal::report_user_fault(&fault);
+        FAULTED[slot].store(true, Ordering::Release);
+        exit_task(EXIT_FAULTED, true);
+    }
+    end_if_killed(slot);
+    return_to_user()
+}
+
+/// Ends the calling user task if a kill is waiting for it. Its call has unwound, so
+/// nothing of the kernel's is held on its stack.
+fn end_if_killed(slot: usize) {
+    if ATTENTION[slot].load(Ordering::Acquire) && kill_requested() {
+        exit_task(EXIT_KILLED, true);
+    }
+}
+
+/// Goes back to the calling task's program, from its user frame.
+fn return_to_user() -> ! {
     switch_with(PendingRequest::ToUser);
     unreachable!("a task came back from EL0 without a trap");
 }
@@ -872,8 +1177,8 @@ pub fn enter_user(slot: usize, root: usize, frame: Frame) -> ! {
     // SAFETY: the task is running here, so nothing else is using its user frame.
     unsafe { USER_FRAMES.0[slot].get().write(frame) };
     ROOT[slot].store(root, Ordering::Relaxed);
-    switch_with(PendingRequest::ToUser);
-    unreachable!("a task came back from EL0 without a trap");
+    end_if_killed(slot);
+    return_to_user()
 }
 
 /// Ends the calling task, for a user program's `exit`.
@@ -928,22 +1233,22 @@ fn offer_signal(pid: u32, number: u32) -> bool {
 }
 
 /// Reads a user program's standard input. Zero at end of file, or if it has none.
-pub fn read_stdin(slot: usize, out: &mut [u8]) -> usize {
+pub fn read_stdin(slot: usize, out: &mut [u8]) -> Result<usize, pipe::Killed> {
     match PipeId::from_raw(STDIN[slot].load(Ordering::Acquire)) {
-        Some(id) => pipe::read_id(id, out),
-        None => 0,
+        Some(id) => pipe::read_wait(id, out),
+        None => Ok(0),
     }
 }
 
 /// Writes to a user program's standard output or error, which go wherever a
 /// kernel-linked app's print would. `false` if nobody's left to read it.
-pub fn write_stream(slot: usize, error: bool, bytes: &[u8]) -> bool {
+pub fn write_stream(slot: usize, error: bool, bytes: &[u8]) -> Result<bool, pipe::Killed> {
     let console = if error { &STDERR[slot] } else { &STDOUT[slot] };
     match PipeId::from_raw(console.load(Ordering::Acquire)) {
-        Some(id) => pipe::write_id(id, bytes),
+        Some(id) => pipe::write_wait(id, bytes),
         None => {
             feos_console::write_bytes(bytes);
-            true
+            Ok(true)
         }
     }
 }
@@ -1013,11 +1318,21 @@ pub fn sleep_ms(ms: u64) {
 
 /// Marks the calling process as finished and switches away for good.
 fn exit_current(code: i32) -> ! {
+    exit_task(code, true)
+}
+
+/// Marks the calling process as finished and switches away for good, having given back
+/// what it holds if `teardown` and it can. A task ending for a failure leaves that to
+/// the reaper: what it was in the middle of may not be in a state to look at.
+fn exit_task(code: i32, teardown: bool) -> ! {
     {
         let mut scheduler = SCHEDULER.lock();
         if let Some(slot) = scheduler.table.current(this_cpu()) {
             scheduler.tasks[slot].exit_code = code;
         }
+    }
+    if teardown && can_block() {
+        teardown_self();
     }
     switch_with(PendingRequest::Exit);
     unreachable!("the scheduler resumed a task that exited");
@@ -1095,18 +1410,35 @@ fn spawn_entry(
 ) -> Result<u32, SpawnError> {
     // Slot 0 belongs to the shell and is never reused. A slot that's free but hasn't
     // had its exit collected still holds its address space, so everything gone has to
-    // be collected before one can be taken.
+    // be collected before one can be taken. If the teardown queue is full, this task
+    // empties it.
+    let user = matches!(entry, Entry::User(..));
     let (slot, pid) = loop {
-        let mut scheduler = SCHEDULER.lock();
-        let mut gone = GoneTasks::new();
-        collect_exits(&mut scheduler, &mut gone);
-        let more = gone.is_full();
-        let reserved = if more { None } else { scheduler.table.reserve() };
-        drop(scheduler);
-        gone.finish();
-        if !more {
+        let (collected, reserved, idle) = {
+            let mut scheduler = SCHEDULER.lock();
+            let collected = collect_exits(&mut scheduler);
+            let reserved = if collected.complete { scheduler.table.reserve() } else { None };
+            // What a kill or a stop looks at is reset before the lock goes, and so
+            // before the PID can be found: one that comes while the stack is being
+            // painted has its hint kept.
+            if let Some((slot, _)) = reserved {
+                LOCK_DEPTH[slot].store(0, Ordering::Release);
+                // A program starts in the kernel, loading itself.
+                IN_CALL[slot].store(u32::from(user), Ordering::Release);
+                ATTENTION[slot].store(false, Ordering::Release);
+                TORN_DOWN[slot].store(false, Ordering::Release);
+                HEAP_BYTES[slot].store(0, Ordering::Release);
+            }
+            let idle = announce(&mut scheduler, collected);
+            (collected, reserved, idle)
+        };
+        kick(idle);
+        if collected.complete {
             break reserved.ok_or(SpawnError::NoFreeSlot)?;
         }
+        // Whatever this can't take is being torn down by someone else already.
+        drain_teardowns();
+        yield_now();
     };
 
     // Painting the stack takes a while, so it happens with interrupts on. The
@@ -1117,8 +1449,6 @@ fn spawn_entry(
     unsafe { paint_stack(bottom, top) };
     let started_ms = CLOCK.uptime_ms();
 
-    LOCK_DEPTH[slot].store(0, Ordering::Release);
-    HEAP_BYTES[slot].store(0, Ordering::Release);
     FAULTED[slot].store(false, Ordering::Release);
     CAUGHT[slot].store(0, Ordering::Release);
     PENDING_SIGNALS[slot].store(0, Ordering::Release);
@@ -1271,7 +1601,8 @@ fn route_console(bytes: &[u8], error: bool) -> bool {
 
 fn try_wait(pid: u32) -> WaitStatus {
     let scheduler = SCHEDULER.lock();
-    if scheduler.table.find_pid(pid).is_some() {
+    // Until its teardown is done, a task that has gone is as good as running.
+    if scheduler.table.find_pid(pid).is_some() || tearing_down(pid).is_some() {
         return WaitStatus::Running;
     }
     for back in 1..=EXIT_RECORDS {
@@ -1309,6 +1640,10 @@ pub fn wait_child(pid: u32, parent: u32) -> Option<i32> {
                 if scheduler.tasks[slot].parent != parent {
                     return None;
                 }
+            } else if let Some(its_parent) = tearing_down(pid) {
+                if its_parent != parent {
+                    return None;
+                }
             } else {
                 for back in 1..=EXIT_RECORDS {
                     let index = (scheduler.next_exit + EXIT_RECORDS - back) % EXIT_RECORDS;
@@ -1330,16 +1665,19 @@ pub fn wait_child(pid: u32, parent: u32) -> Option<i32> {
 fn kill_process(pid: u32) -> KillResult {
     let grace = Port::services().frequency() / 1000 * KILL_GRACE_MS;
     let now = Port::services().ticks();
-    let mut gone = GoneTasks::new();
     let (outcome, idle) = {
         let mut scheduler = SCHEDULER.lock();
+        let slot = scheduler.table.find_pid(pid);
         let outcome = scheduler.table.kill(pid, now, grace, &Facts);
-        collect_exits(&mut scheduler, &mut gone);
-        (outcome, scheduler.table.idle_cpu(this_cpu()))
+        if let (Some(slot), KillOutcome::Pending) = (slot, outcome) {
+            ATTENTION[slot].store(true, Ordering::Release);
+        }
+        let collected = collect_exits(&mut scheduler);
+        let woken = announce(&mut scheduler, collected);
+        (outcome, woken.or(scheduler.table.idle_cpu(this_cpu())))
     };
     // The task may have to run to reach its safe point.
     kick(idle);
-    gone.finish();
     match outcome {
         KillOutcome::Killed => KillResult::Killed,
         KillOutcome::Pending => KillResult::Pending,
@@ -1571,6 +1909,10 @@ impl Processes for ProcessManager {
         let (done, idle) = {
             let mut scheduler = SCHEDULER.lock();
             let done = scheduler.table.set_stopped(pid, stopped);
+            // A program in a call stops on its way back to the program, which looks.
+            if let (true, true, Some(slot)) = (done, stopped, scheduler.table.find_pid(pid)) {
+                ATTENTION[slot].store(true, Ordering::Release);
+            }
             (done, scheduler.table.idle_cpu(this_cpu()))
         };
         kick(idle);
@@ -1686,6 +2028,20 @@ pub fn start(tick_hz: u64) {
     STARTED.store(true, Ordering::Release);
     Port::timer_start(tick_hz);
     Port::irq_enable();
+    start_reaper();
+}
+
+/// Starts the task that gives back what killed and failed tasks left behind. The
+/// system needs it, so it can't be killed or stopped.
+fn start_reaper() {
+    match spawn_entry("reaper", Entry::Task(Box::new(reaper)), SpawnIo::default(), RawStreams::default()) {
+        Ok(pid) => {
+            let mut scheduler = SCHEDULER.lock();
+            scheduler.table.set_protected(pid);
+            scheduler.table.set_priority(pid, feos_sched::PRIORITY_NORMAL + 2);
+        }
+        Err(error) => feos_console::println!("[sched] no reaper: {error:?}"),
+    }
 }
 
 /// Joins the scheduler from a secondary CPU.

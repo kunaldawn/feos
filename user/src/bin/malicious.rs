@@ -6,6 +6,10 @@
 //! don't end anything, so the parent makes those calls itself and checks the error.
 //!
 //! Exits zero only when every probe was blocked.
+//!
+//! Two more modes are children for kernel tests to kill, over and over, which a program
+//! can't do itself until there's a call for it: `--call-loop` keeps the kernel busy with
+//! `spawn`, `write` and `read`, and `--fault-loop` with page faults.
 
 #![no_std]
 #![no_main]
@@ -304,9 +308,51 @@ fn run_child(tally: &mut Tally, program: &str, name: &str) {
     tally.report(name, status == FAULTED, status);
 }
 
+/// Spawns, writes and reads for as long as it lives: whenever a kill lands, it's
+/// likely to be in one of those, holding a pipe, a slot or a buffer.
+fn call_loop() -> i32 {
+    let mut buffer = [0u8; 256];
+    loop {
+        let child = spawn("/bin/hello", &["/bin/hello", "--quiet"]);
+        if let Ok((reader, writer)) = feos_user::pipe() {
+            feos_user::write(writer, &buffer);
+            feos_user::read(reader, &mut buffer);
+            close(reader);
+            close(writer);
+        }
+        if child > 0 {
+            wait(child as usize);
+        }
+    }
+}
+
+/// Takes page faults for as long as it lives: a mapping's worth, given back, again.
+fn fault_loop() -> i32 {
+    let mut length = 16 * 1024 * 1024;
+    loop {
+        let area = mmap(length, prot::READ | prot::WRITE);
+        if area < 0 {
+            length = (length / 2).max(4096);
+            continue;
+        }
+        let mut page = 0;
+        while page < length {
+            write_at(area as usize + page);
+            page += 4096;
+        }
+        feos_user::munmap(area as usize, length);
+    }
+}
+
 fn main(args: Args) -> i32 {
     if let Some(name) = args.value_of("--probe") {
         return probe(name);
+    }
+    if args.has("--call-loop") {
+        return call_loop();
+    }
+    if args.has("--fault-loop") {
+        return fault_loop();
     }
     if args.has("--sp-syscall") {
         return syscall_on_kernel_sp();

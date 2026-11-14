@@ -5,6 +5,10 @@
     ./scripts/boot-test.py x64 target/x86_64-feos/release/feos
 
 Exits non-zero, printing the serial log, when a step fails.
+
+FEOS_BOOT_TEST_ONLY picks one phase (see `main`). FEOS_BOOT_TEST_SMP, FEOS_BOOT_TEST_CPU
+and FEOS_BOOT_TEST_MEM set the CPUs, the CPU model and the RAM a guest gets where a
+phase doesn't choose them itself: 4, cortex-a53 on AArch64 and max on x86_64, and 512M.
 """
 
 import base64
@@ -31,21 +35,31 @@ def work_path(kernel, name):
     return os.path.join(os.path.dirname(os.path.abspath(kernel)), "boot-test-" + name)
 
 
-def qemu_command(arch, kernel, disk_args=(), display=("-device", "ramfb"), smp=None, memory="512M", machine="virt", net_args=None, virtio_input=True):
+def default_cpu(arch):
+    return os.environ.get("FEOS_BOOT_TEST_CPU") or ("cortex-a53" if arch == "arm" else "max")
+
+
+def default_smp():
+    return int(os.environ.get("FEOS_BOOT_TEST_SMP", "4"))
+
+
+def qemu_command(arch, kernel, disk_args=(), display=("-device", "ramfb"), smp=None, memory=None, machine="virt", net_args=None, virtio_input=True):
     # Set by the tests that care; otherwise, what the ports are normally run with.
-    smp = str(smp or os.environ.get("FEOS_BOOT_TEST_SMP", "4"))
+    smp = str(smp or default_smp())
+    memory = memory or os.environ.get("FEOS_BOOT_TEST_MEM", "512M")
+    cpu = default_cpu(arch)
     common = ["-m", memory] + (list(net_args) if net_args else ["-net", "none"]) + ["-display", "none"] + list(display)
     common += ["-audiodev", "none,id=snd0"]
     common += ["-device", "intel-hda", "-device", "hda-output,audiodev=snd0"]
     common += ["-serial", "mon:stdio"] + list(disk_args)
     if arch == "arm":
         inputs = ["-device", "virtio-tablet-device", "-device", "virtio-keyboard-device"] if virtio_input else []
-        return ["qemu-system-aarch64", "-machine", machine, "-cpu", "cortex-a53", "-smp", smp] + common + inputs + [
+        return ["qemu-system-aarch64", "-machine", machine, "-cpu", cpu, "-smp", smp] + common + inputs + [
             "-kernel", kernel]
     # QEMU's multiboot loader needs a flat image, not the linked ELF.
     flat = work_path(kernel, "kernel.bin")
     subprocess.run([os.environ.get("OBJCOPY", "objcopy"), "-O", "binary", kernel, flat], check=True)
-    return ["qemu-system-x86_64", "-machine", "q35", "-cpu", "max", "-smp", smp, "-vga", "none"] + common + [
+    return ["qemu-system-x86_64", "-machine", "q35", "-cpu", cpu, "-smp", smp, "-vga", "none"] + common + [
         "-kernel", flat]
 
 
@@ -646,7 +660,12 @@ def fault_test(arch, kernel):
     guest.send("spawn tick 1000 10000\r")
     pid = guest.capture(r"started pid (\d+): tick")
     guest.run(f"kill {pid}", f"killed pid {pid}")
-    guest.run("ktest cpus", "ran-on=4")
+    guest.run("ktest cpus", f"ran-on={default_smp()}")
+    # User programs fault, and are killed in the middle of calls and faults, with their
+    # faults decided in kernel threads.
+    guest.run("/bin/malicious --probe null-write; echo user-fault-$?", "user-fault-139")
+    ukill(guest, arch, "fault")
+    guest.run(f"echo survived-$((6 * 7))", "survived-42")
     guest.send("poweroff\r")
     guest.wait_exit()
 
@@ -1312,6 +1331,7 @@ def el_test(arch, kernel):
 
 
 def user_command(arch, kernel, cpu=None, smp=4):
+    # The phase chooses its own CPU counts: each part checks what it needs of them.
     command = qemu_command(arch, kernel, smp=str(smp))
     if cpu:
         command[command.index("-cpu") + 1] = cpu
@@ -1335,6 +1355,24 @@ def run_malicious(guest, arch, label):
     if bad or "got through" in text[start:]:
         fail(guest, f"malicious: not blocked: {bad}")
     print(f"user {arch} {label}: {len(probes)} probes blocked: " + " ".join(name for name, _ in probes), flush=True)
+
+
+def ukill(guest, arch, label):
+    """User programs killed mid-call and mid-fault, by the kernel since no program can
+    kill yet, and 100 teardowns, all in task context. Everything comes back."""
+    guest.send("ktest ukill\r")
+    report = guest.capture(r"\[ktest\] (ukill: \d+ failed)", 600)
+    text = guest.log[:guest.mark].decode(errors="replace")
+    start = text.rfind("ktest ukill")
+    for line in re.findall(r"\[ktest\] (ukill [^\r\n]*)", text[start:]):
+        print(f"{label} {arch}: {line}", flush=True)
+    if report != "ukill: 0 failed":
+        fail(guest, report)
+    guest.send("ktest teardown\r")
+    report = guest.capture(r"\[ktest\] (teardown: killed[^\r\n]*)", 600)
+    print(f"{label} {arch}: {report}", flush=True)
+    if "outside-task-context=0 ok=true" not in report:
+        fail(guest, report)
 
 
 def user_test(arch, kernel):
@@ -1451,6 +1489,7 @@ def user_test(arch, kernel):
         fail(guest, f"leak: {match.group(0)}")
     if not (exited and faulted and killed):
         fail(guest, f"not every way of ending was tried: {match.group(0)}")
+    ukill(guest, arch, "user")
 
     # A surface goes back too, with nobody having looked at it.
     guest.send("ktest user-memory\r")
@@ -2243,6 +2282,22 @@ def jobs_test(arch, kernel):
     guest.run("kill %%; wait; echo reaped-$?", "reaped-")
     guest.run("ps | grep -c spin; echo none", "none")
     print(f"jobs {arch}: Ctrl-Z, fg, bg and kill on an app and a user program", flush=True)
+
+    # A user program stopped while it's writing a file stops on its way out of the call,
+    # holding nothing: another program can write the same filesystem meanwhile.
+    guest.send("/bin/utest --long-write /tmp/j-stopped 1000\r")
+    time.sleep(1.5)
+    guest.send("\x1a")
+    guest.expect("Stopped  /bin/utest")
+    guest.run("ps | grep -c stopped", "\n1")
+    guest.run("/bin/utest --long-write /tmp/j-other 8; echo other-$?", "wrote 8 MiB")
+    guest.expect("other-0")
+    guest.run("ps | grep -c stopped", "\n1")
+    guest.send("fg\r")
+    guest.expect("wrote 1000 MiB", 300)
+    guest.run("echo resumed-$?", "resumed-0")
+    guest.run("rm /tmp/j-stopped /tmp/j-other; echo removed-$((2 + 3))", "removed-5")
+    print(f"jobs {arch}: a user program stopped mid-write let another write, then finished", flush=True)
 
     # Standard input on the serial console. What's typed ahead of a command that doesn't
     # read stays for the shell.

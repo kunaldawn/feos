@@ -28,7 +28,7 @@ section has each stage's scope and its exact tests. The bit is the stage's featu
 
 ### 1a Memory
 - [x] 1a.1 Memory on first touch, `mprotect`, `PROT_NONE`, 4 GiB per-process limit, machine-wide promises (bit 0; `make test-vm`; boot `user`, `fault`, `ram`, `sched` on both ports)
-- [ ] 1a.2 User work in kernel mode: faults on the kernel stack, cooperative kill, stops at the user boundary, teardown in task context, boot-test CPU/memory knobs (bit 1)
+- [x] 1a.2 User work in kernel mode: faults on the kernel stack, cooperative kill, stops at the user boundary, teardown in task context, boot-test CPU/memory knobs (bit 1; `make test-sched test-app`; `ktest ukill`, `ktest teardown`; boot `user`, `fault`, `sched`, `jobs`, `ram` on both ports at smp=1 and smp=4, and `user`, `fault`, `sched`, `ram` on AArch64 with `FEOS_BOOT_TEST_CPU=max`)
 - [ ] 1a.3 Frame counts, VMAs, anonymous `MMAP2`, `MADVISE`, `MSYNC`, page-table charging, shared-anonymous objects, `ENOSYS` for reserved numbers (bit 2)
 - [ ] 1a.4 Page cache, stable node ids, file mappings (private copy-on-write, shared read-only), `PROT_EXEC` on files, `ETXTBSY` (bit 3)
 - [ ] 1a.5 Shared writable file mappings with write-back (bit 4)

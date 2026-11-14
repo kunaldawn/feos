@@ -32,7 +32,7 @@ pub const USER_END: usize = 0x14_0000_0000;
 pub const USER_IMAGE_END: usize = 0x11_0000_0000;
 /// One past the top of the initial stack. There's an unmapped page above it.
 pub const USER_STACK_TOP: usize = USER_END - 0x1000;
-/// Bytes of the initial stack, all mapped from the start.
+/// Bytes of the initial stack, promised from the start and given frames on first touch.
 pub const USER_STACK_SIZE: usize = 128 * 1024;
 /// Unmapped space below the stack, so that an overflow faults instead of reaching
 /// anything `mmap` handed out.
@@ -42,9 +42,14 @@ pub const USER_MMAP_END: usize = USER_STACK_TOP - USER_STACK_SIZE - USER_STACK_G
 
 /// Bytes of a page: the granularity of `mmap` and of an ELF segment's placement.
 pub const PAGE_SIZE: usize = 4096;
-/// Most memory one process can have mapped, in bytes. A machine with less to spare
-/// says `ENOMEM` sooner.
+/// Most memory one process can have charged or owned, in bytes: pages promised to it,
+/// frames it has that no promise covers, and its page tables. A reservation with no
+/// access, or one made with `MAP_NORESERVE`, isn't charged, so it can be larger. A
+/// machine with less to spare says `ENOMEM` sooner.
 pub const USER_MEMORY_LIMIT: usize = 4 * 1024 * 1024 * 1024;
+/// Most mappings one process can have: each `mmap` adds one, unless it joins a
+/// neighbour, and a `munmap` or `mprotect` in the middle of one splits it.
+pub const MAX_VMAS: usize = 16384;
 /// Open files one process can have, standard streams included.
 pub const MAX_FDS: usize = 16;
 /// Longest path a call accepts.
@@ -58,6 +63,9 @@ pub const SURFACE_MAX_SIDE: usize = 1920;
 
 /// Exit status of a process a CPU fault ended.
 pub const EXIT_FAULTED: i32 = 139;
+/// Exit status of a process ended because a page it touched couldn't be given a frame:
+/// a `MAP_NORESERVE` page on a machine with none to spare. `128 + SIGBUS`.
+pub const EXIT_BUS: i32 = 135;
 /// Exit status when the file could be read but isn't a program this machine can run.
 pub const EXIT_NOT_EXECUTABLE: i32 = 126;
 /// Exit status when there's no such file.
@@ -83,9 +91,14 @@ pub mod nr {
     pub const GETPID: usize = 7;
     /// `mmap(length, prot) -> address`: zeroed, private, anonymous memory. `prot` is
     /// from [`prot`](super::prot), or zero for none, as a guard. The memory is promised
-    /// when this returns, and gets its frames when it's first touched.
+    /// when this returns, whatever `prot` says, and gets its frames when it's first
+    /// touched.
+    ///
+    /// Superseded by [`MMAP2`], which is this with `MAP_PRIVATE | MAP_ANONYMOUS`, except
+    /// that `MMAP2` promises only the pages that could need a frame.
     pub const MMAP: usize = 8;
-    /// `munmap(address, length) -> 0`: only what `mmap` handed out.
+    /// `munmap(address, length) -> 0`: any of the program's mappings but the window
+    /// surface, holes and all. What's unmapped faults when it's next touched.
     pub const MUNMAP: usize = 9;
     /// `spawn(path, path_length, argv, argc, stdin_fd, stdout_fd) -> pid`, where
     /// `argv` points at `argc` [`UserStr`](super::UserStr)s and a stream of
@@ -132,10 +145,27 @@ pub mod nr {
     pub const UNLINK: usize = 28;
     /// `link(existing, length, path, length) -> 0`: another name for a file.
     pub const LINK: usize = 29;
-    /// `mprotect(address, length, prot) -> 0`: changes what can be done with pages
-    /// `mmap` handed out. `prot` is from [`prot`](super::prot), and zero is no access at
-    /// all; a page keeps what's in it either way.
+    /// `mprotect(address, length, prot) -> 0`: changes what can be done with any of the
+    /// program's mappings but the window surface. `prot` is from [`prot`](super::prot),
+    /// and zero is no access at all; a page keeps what's in it either way. `ENOMEM` if
+    /// part of the range isn't mapped, and nothing changes. Only the program's own code,
+    /// never written, may be executable: `EACCES` for anything else.
     pub const MPROTECT: usize = 30;
+    /// `mmap2(hint, length, prot, flags, fd, offset) -> address`, flags from
+    /// [`map`](super::map). Only anonymous memory so far: a file is `ENODEV`.
+    pub const MMAP2: usize = 31;
+    /// `madvise(address, length, advice) -> 0`, advice from [`madv`](super::madv).
+    pub const MADVISE: usize = 32;
+    /// `msync(address, length, flags) -> 0`, flags from [`ms`](super::ms). Nothing can
+    /// be dirty yet, so it only checks its arguments.
+    pub const MSYNC: usize = 33;
+    /// The first number of the calls `docs/feos-abi-v2.md` adds. Every number from here
+    /// to [`LAST_RESERVED`] is taken, and is `ENOSYS` until the stage that brings it.
+    pub const FIRST_V2: usize = 31;
+    /// The last number `docs/feos-abi-v2.md` gives out.
+    pub const LAST_RESERVED: usize = 108;
+    /// The first reserved number with no call behind it yet.
+    pub const FIRST_UNIMPLEMENTED: usize = 34;
 }
 
 /// Leaves the owner or group as it is, in [`nr::CHOWN`].
@@ -207,6 +237,8 @@ pub mod errno {
     pub const ENOEXEC: isize = 8;
     /// No process slot free.
     pub const EBUSY: isize = 16;
+    /// That kind of file can't be mapped.
+    pub const ENODEV: isize = 19;
 }
 
 /// Flags for [`nr::OPEN`].
@@ -230,8 +262,63 @@ pub mod seek {
 /// Access `mmap` is asked for. Memory is never both writable and executable, and
 /// anonymous memory is never executable at all.
 pub mod prot {
+    pub const NONE: usize = 0;
     pub const READ: usize = 1 << 0;
     pub const WRITE: usize = 1 << 1;
+    /// Only for [`nr::MPROTECT`](super::nr::MPROTECT) and [`nr::MMAP2`](super::nr::MMAP2),
+    /// and only for a program's own code: v1's `MMAP` refuses it with `EINVAL`.
+    pub const EXEC: usize = 1 << 2;
+}
+
+/// Flags for [`nr::MMAP2`]: exactly one of [`SHARED`](map::SHARED), [`PRIVATE`](map::PRIVATE)
+/// and [`SHARED_VALIDATE`](map::SHARED_VALIDATE), and any of the rest. Linux's values.
+pub mod map {
+    pub const SHARED: usize = 0x01;
+    pub const PRIVATE: usize = 0x02;
+    /// The same as [`SHARED`]: every flag is checked anyway.
+    pub const SHARED_VALIDATE: usize = 0x03;
+    /// Where [`SHARED`], [`PRIVATE`] and [`SHARED_VALIDATE`] go.
+    pub const TYPE: usize = 0x0f;
+    /// At exactly `hint`, replacing whatever was there.
+    pub const FIXED: usize = 0x10;
+    pub const ANONYMOUS: usize = 0x20;
+    /// No promise: a page that can't get a frame when it's touched ends the process
+    /// with [`EXIT_BUS`](super::EXIT_BUS).
+    pub const NORESERVE: usize = 0x4000;
+    /// Every page given its frame before the call returns.
+    pub const POPULATE: usize = 0x8000;
+    /// Accepted, and means nothing.
+    pub const STACK: usize = 0x20000;
+    /// At exactly `hint`, or `EEXIST` if anything's there.
+    pub const FIXED_NOREPLACE: usize = 0x10_0000;
+    /// Every flag there is.
+    pub const ALL: usize = SHARED_VALIDATE | FIXED | ANONYMOUS | NORESERVE | POPULATE | STACK | FIXED_NOREPLACE;
+}
+
+/// Advice for [`nr::MADVISE`]. Linux's values.
+pub mod madv {
+    pub const NORMAL: usize = 0;
+    pub const RANDOM: usize = 1;
+    pub const SEQUENTIAL: usize = 2;
+    pub const WILLNEED: usize = 3;
+    /// Private pages lose their frames, and read as zeroes next time.
+    pub const DONTNEED: usize = 4;
+    /// As [`DONTNEED`].
+    pub const FREE: usize = 8;
+    pub const DONTFORK: usize = 10;
+    pub const DOFORK: usize = 11;
+    pub const HUGEPAGE: usize = 14;
+    pub const NOHUGEPAGE: usize = 15;
+    pub const DONTDUMP: usize = 16;
+    pub const DODUMP: usize = 17;
+}
+
+/// Flags for [`nr::MSYNC`]: exactly one of [`ASYNC`](ms::ASYNC) and [`SYNC`](ms::SYNC),
+/// and maybe [`INVALIDATE`](ms::INVALIDATE). Linux's values.
+pub mod ms {
+    pub const ASYNC: usize = 1;
+    pub const INVALIDATE: usize = 2;
+    pub const SYNC: usize = 4;
 }
 
 /// "Use this process's own" for a stream passed to [`nr::SPAWN`].
@@ -288,6 +375,42 @@ mod tests {
         for address in [USER_BASE, USER_IMAGE_END, USER_MMAP_END, USER_STACK_TOP, USER_END] {
             assert_eq!(address % PAGE_SIZE, 0);
         }
+    }
+
+    #[test]
+    fn error_numbers_are_linux() {
+        let linux = [
+            (errno::EPERM, 1), (errno::ENOENT, 2), (errno::EIO, 5), (errno::ENOEXEC, 8),
+            (errno::EBADF, 9), (errno::ECHILD, 10), (errno::EAGAIN, 11), (errno::ENOMEM, 12),
+            (errno::EACCES, 13), (errno::EFAULT, 14), (errno::EBUSY, 16), (errno::EEXIST, 17),
+            (errno::ENODEV, 19), (errno::EISDIR, 21), (errno::EINVAL, 22), (errno::EMFILE, 24),
+            (errno::ENOSPC, 28), (errno::EPIPE, 32), (errno::ENAMETOOLONG, 36),
+            (errno::ENOSYS, 38), (errno::ENOTSUP, 95), (errno::ETIMEDOUT, 110),
+        ];
+        for (ours, theirs) in linux {
+            assert_eq!(ours, theirs);
+        }
+    }
+
+    #[test]
+    fn memory_constants_are_linux() {
+        assert_eq!((prot::NONE, prot::READ, prot::WRITE, prot::EXEC), (0, 1, 2, 4));
+        assert_eq!((map::SHARED, map::PRIVATE, map::SHARED_VALIDATE), (1, 2, 3));
+        assert_eq!((map::FIXED, map::ANONYMOUS, map::NORESERVE, map::POPULATE), (0x10, 0x20, 0x4000, 0x8000));
+        assert_eq!((map::STACK, map::FIXED_NOREPLACE), (0x20000, 0x100000));
+        assert_eq!(map::ALL, 0x12_c033);
+        assert_eq!((madv::NORMAL, madv::RANDOM, madv::SEQUENTIAL, madv::WILLNEED, madv::DONTNEED), (0, 1, 2, 3, 4));
+        assert_eq!((madv::FREE, madv::DONTFORK, madv::DOFORK), (8, 10, 11));
+        assert_eq!((madv::HUGEPAGE, madv::NOHUGEPAGE, madv::DONTDUMP, madv::DODUMP), (14, 15, 16, 17));
+        assert_eq!((ms::ASYNC, ms::INVALIDATE, ms::SYNC), (1, 2, 4));
+        assert_eq!(EXIT_BUS, 128 + 7);
+    }
+
+    #[test]
+    fn the_new_numbers_are_where_the_design_puts_them() {
+        assert_eq!((nr::MMAP2, nr::MADVISE, nr::MSYNC), (31, 32, 33));
+        assert_eq!(nr::FIRST_V2, nr::MMAP2);
+        assert!(nr::FIRST_UNIMPLEMENTED > nr::MSYNC && nr::FIRST_UNIMPLEMENTED <= nr::LAST_RESERVED);
     }
 
     #[test]

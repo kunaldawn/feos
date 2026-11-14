@@ -268,6 +268,25 @@ locks and the per-CPU state.
   up to a second unless something's due, and is woken by an IPI when there's work. CPU
   0 keeps to 10 ms because the audio stream is looked after on its tick. CPU time is
   accounted from elapsed time, since there's no longer one tick per tick.
+- **Kills and stops.** A kill ends a task at a safe point: holding no lock, and either
+  owning no heap or past a 200 ms grace period. A stop holds it off the CPU from its next
+  tick. That's for kernel-linked apps. A user program in the kernel (a system call, a page
+  fault, or loading) has a nonzero *in-call count* (`IN_CALL`, reported through
+  `TaskFacts::in_call`), and while it does it's never reaped and never held: a kill sets
+  `kill_pending` and wakes it, every wait a call can reach gives up (pipe reads and writes
+  return `pipe::Killed`, futex waits and sleeps end, `wait` returns), the call unwinds, and
+  `syscall_entry` or `fault_entry` ends the task. A stop takes effect on the way back to the
+  program, so a stopped program never holds the VFS mutex or anything else.
+  `sched::ATTENTION` is the hint that sends the return through the scheduler. `spawn`
+  clears it in the same critical section that reserves the slot, before the PID can be
+  found, so a kill that lands while the task is still being set up isn't forgotten.
+- **Teardown in task context.** What a task leaves behind (its address space, the pipes it
+  held) is given back with interrupts on, never in the trap that takes it off the table. A
+  task that ends itself does it on its way out (`teardown_self`). One reaped by a kill or
+  failure is moved by `collect_exits` into a fixed queue (`TEARDOWNS`), which the reaper
+  task drains; `spawn` drains it too if it's full. The exit is recorded only once teardown
+  is done, so a `wait` that returns means the child's pipes are closed and its frames are
+  free. The reaper is protected: it can't be killed or stopped.
 - The process service (`Processes` in `libs/app`) is the only interface apps use.
 
 ### Locks
@@ -363,7 +382,11 @@ A system call doesn't run in the trap. `sched::on_syscall` points the slot's ker
 `syscall_entry`, at the top of the task's kernel stack, and resumes that: an ordinary
 kernel thread that can block, take interrupts and be preempted. When it's done, it writes the
 result into the user frame and traps to go back. The arch crates know nothing about what a
-call means.
+call means. A fault from the program goes the same way: `sched::on_user_fault` copies its
+registers into the user frame (on x86_64 an exception's frame is on the CPU's fault stack)
+and starts `fault_entry` on the kernel stack, which resolves it with interrupts on, or
+reports it and ends the program. The kernel stack is only free while the task is at EL0 or
+ring 3, so a fault from user mode when the slot isn't `IN_USER` stops the machine.
 
 **Pointers.** The kernel never dereferences a user address. `feos-vm` walks the process's
 tables for each one, checks the whole range before anything happens, and uses the frame
@@ -373,7 +396,7 @@ its tables can't change during a call. A second thread would need something more
 
 **Memory that arrives on first touch.** `mmap` reserves pages (`AddressSpace::reserve`):
 their entries are invalid to the hardware and say so in software bits, and a frame comes
-when the program first touches one. The fault comes to `fatal::on_exception`, which asks
+when the program first touches one. The fault comes to `fault_entry`, which asks
 `user::resolve_fault` before treating it as a fault, and a page it gives a zeroed frame is
 retried. A call that copies to or from such a page commits it first (`user::fault_in`). The
 memory is promised when `mmap` returns, not when it's touched: each process has a limit
@@ -386,9 +409,10 @@ frame and contents in a soft entry. Anonymous memory is never executable.
 
 **Frames** all come from `feos-frames`, one at a time, and are all reachable from the
 process's tables, so they go back whichever way it ends: exit, fault, kill, or failing
-during load. `sched::collect_exits` takes the address space under the lock, once no CPU has
-it loaded, and `GoneTasks::finish` frees it. A section that has a frame in hand that isn't
-yet in a table holds off a kill. Files need no cleaning up, being a path and a position,
+during load. A program that ends itself frees its address space on the way out, off its own
+tables; one reaped at EL0 or ring 3 has it taken by `sched::collect_exits` under the lock,
+once no CPU has it loaded, and freed by the reaper. A section that has a frame in hand that
+isn't yet in a table holds off a kill, as does any call. Files need no cleaning up, being a path and a position,
 and pipes are closed by `release_pid` as for any task. A surface's frames aren't the
 program's, as a window may be reading them while it dies: they're counted, and the last
 user frees them.
@@ -749,7 +773,7 @@ instructions or touches MMIO. The split makes most logic host-testable:
   QEMU.
 - The kernel is tested by booting. `scripts/boot-test.py` boots a kernel headless and
   drives the serial shell, through phases `FEOS_BOOT_TEST_ONLY` can select: `storage`,
-  `milestone`, `partition`, `format`, `install`, `persistence`, `gpu`, `transport`, `smp`, `irq`, `ram`, `fault`, `sched`, `gicv3`, `net`, `usb`, `efi`, `el`, `input`, `user`, `hosted`, `jobs`, `names`, `settings`, `terminal`, `search`, `resolution`, `fonts`, `native`. The `efi`
+  `milestone`, `partition`, `format`, `install`, `persistence`, `gpu`, `transport`, `smp`, `irq`, `ram`, `fault`, `sched`, `gicv3`, `net`, `usb`, `efi`, `el`, `input`, `user`, `hosted`, `jobs`, `names`, `settings`, `terminal`, `search`, `resolution`, `fonts`, `native`. `FEOS_BOOT_TEST_SMP`, `FEOS_BOOT_TEST_CPU` and `FEOS_BOOT_TEST_MEM` set a guest's CPUs, CPU model and RAM where a phase doesn't choose (4, `cortex-a53` or `max`, 512M). The `efi`
   phase needs the loader built, and everything in it runs on OVMF or AAVMF from the image. What can only be seen from inside the
   kernel, such as which CPU a task ran on or what's in an XMM register across a
   preemption, is in `kernel/src/ktest.rs`, the `ktest` shell command. Some of it stops

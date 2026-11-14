@@ -297,46 +297,64 @@ pub fn try_write_id(id: PipeId, bytes: &[u8]) -> Transfer {
     Transfer::Moved(count)
 }
 
-/// Writes everything to a pipe by id, blocking while it is full. Returns
-/// `false` when the readers have gone or the caller is being killed.
-pub fn write_id(id: PipeId, mut bytes: &[u8]) -> bool {
+/// A wait in a pipe ended because the calling task is being killed. What was asked
+/// for may have partly happened, which nobody will look at: the task is going.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Killed;
+
+/// Writes everything to a pipe by id, blocking while it is full. `Ok(false)` when
+/// the readers have gone, and [`Killed`] when the caller is being killed: a user
+/// program's call has to tell that apart from a broken pipe, so it can unwind.
+pub fn write_wait(id: PipeId, mut bytes: &[u8]) -> Result<bool, Killed> {
     let slot = id.slot();
     while !bytes.is_empty() {
         let seen = slot.wakes.load(Ordering::Acquire);
         match try_write_id(id, bytes) {
             Transfer::Moved(count) => bytes = &bytes[count..],
-            Transfer::Closed => return false,
+            Transfer::Closed => return Ok(false),
             Transfer::WouldBlock => {
                 if interrupted() {
-                    return false;
+                    return Err(Killed);
                 }
                 futex_wait(&slot.wakes, seen);
             }
         }
     }
-    true
+    Ok(true)
 }
 
-/// Reads at least one byte from a pipe by id, blocking while it is empty.
-/// Returns zero at end of file, or when the caller is being killed.
-pub fn read_id(id: PipeId, out: &mut [u8]) -> usize {
+/// Reads at least one byte from a pipe by id, blocking while it is empty. `Ok(0)`
+/// at end of file, and [`Killed`] when the caller is being killed.
+pub fn read_wait(id: PipeId, out: &mut [u8]) -> Result<usize, Killed> {
     if out.is_empty() {
-        return 0;
+        return Ok(0);
     }
     let slot = id.slot();
     loop {
         let seen = slot.wakes.load(Ordering::Acquire);
         match try_read_id(id, out) {
-            Transfer::Moved(count) => return count,
-            Transfer::Closed => return 0,
+            Transfer::Moved(count) => return Ok(count),
+            Transfer::Closed => return Ok(0),
             Transfer::WouldBlock => {
                 if interrupted() {
-                    return 0;
+                    return Err(Killed);
                 }
                 futex_wait(&slot.wakes, seen);
             }
         }
     }
+}
+
+/// Writes everything to a pipe by id, blocking while it is full. Returns
+/// `false` when the readers have gone or the caller is being killed.
+pub fn write_id(id: PipeId, bytes: &[u8]) -> bool {
+    write_wait(id, bytes).unwrap_or(false)
+}
+
+/// Reads at least one byte from a pipe by id, blocking while it is empty.
+/// Returns zero at end of file, or when the caller is being killed.
+pub fn read_id(id: PipeId, out: &mut [u8]) -> usize {
+    read_wait(id, out).unwrap_or(0)
 }
 
 /// Adds a reference to a pipe's write end on behalf of `pid`. The kernel uses
@@ -704,5 +722,42 @@ mod tests {
         }
         drop(writer);
         assert_eq!(thread.join().unwrap(), 64 * 4096);
+    }
+
+    #[test]
+    fn pipe_wait_returns_killed() {
+        // Only this thread is "being killed": the hook answers per thread, so the
+        // other tests running alongside don't see it. No PID, so nothing's tracked.
+        std::thread_local! {
+            static KILLED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+        }
+        install_hooks(PipeHooks {
+            current_pid: || 0,
+            interrupted: || KILLED.with(|killed| killed.get()),
+        });
+        let (reader, writer) = create().unwrap();
+        let mut out = [0u8; 8];
+
+        // An empty pipe with a writer: a read would block, so a killed caller is told.
+        KILLED.with(|killed| killed.set(true));
+        assert_eq!(read_wait(reader.id(), &mut out), Err(Killed));
+        assert_eq!(read_id(reader.id(), &mut out), 0);
+        // What's there is still read: the kill only ends a wait.
+        assert!(writer.try_write(b"ab") == Transfer::Moved(2));
+        assert_eq!(read_wait(reader.id(), &mut out), Ok(2));
+
+        // A full pipe: the writer would block.
+        let data = [3u8; COPY_CHUNK];
+        while writer.try_write(&data) != Transfer::WouldBlock {}
+        assert_eq!(write_wait(writer.id(), b"x"), Err(Killed));
+        assert!(!writer.write(b"x"));
+
+        // Not being killed, a broken pipe and end of file are what they always were.
+        KILLED.with(|killed| killed.set(false));
+        drop(reader);
+        assert_eq!(write_wait(writer.id(), b"x"), Ok(false));
+        let (reader, writer) = create().unwrap();
+        drop(writer);
+        assert_eq!(read_wait(reader.id(), &mut out), Ok(0));
     }
 }
