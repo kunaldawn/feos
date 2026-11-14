@@ -18,6 +18,7 @@
 	path = ports/src/make
 	url = https://git.savannah.gnu.org/git/make.git
 	shallow = true
+	feos-tag = 4.4.1
 [submodule "ports/src/gitoxide"]
 	path = ports/src/gitoxide
 	url = https://github.com/GitoxideLabs/gitoxide

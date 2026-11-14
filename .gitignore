@@ -1,3 +1,5 @@
 target/
 user/out/
 boards/qemu-virt/disk*.img
+# Vendored crates have their own src/target/ directories (cc's target tables).
+!ports/vendor/**/target/

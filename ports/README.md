@@ -90,7 +90,13 @@ don't exist yet. When one does, add it to the keep list.
 
 ## Checking that it really is offline
 
-In the `localhost/feos` container, with `--network none` and the tree mounted at `/src`:
+After re-vendoring, `git ls-files --others --ignored --exclude-standard ports/` must
+print nothing: an ignore rule that matches a vendored file (the root `target/` once
+matched `cc`'s `src/target/`) leaves it out of the commit, and only a fresh clone
+notices.
+
+Then, from a fresh clone (`git clone`, `scripts/ports-init.sh`), in the `localhost/feos`
+container with `--network none` and the tree mounted at `/src`:
 
 ```sh
 make build-arm build-x64

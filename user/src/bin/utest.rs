@@ -257,11 +257,19 @@ fn test_exhaustion(report: &mut Report) {
     let status = if late > 0 { wait(late as usize) } else { -1 };
     println!("utest a program started when memory was short ended with {status}");
     report.check("short-of-memory-is-an-answer", status == 0 || status == 126);
+    // Hogs that start late can find the machine already promised away and fail to load
+    // (126): `mmap` only promises frames, so the first hogs fill memory before the last
+    // are loaded. Either is an answer. Anything else (a crash, a kill) is not, and at
+    // least one hog must have run, or nothing here was short of memory.
     let mut all = true;
+    let mut ran = 0;
     for child in children {
-        all &= child > 0 && wait(child as usize) == 0;
+        let status = if child > 0 { wait(child as usize) } else { -1 };
+        all &= status == 0 || status == 126;
+        ran += usize::from(status == 0);
     }
-    report.check("everyone-short-of-memory-survived", all);
+    println!("utest {ran} of {} hogs ran", children.len());
+    report.check("everyone-short-of-memory-survived", all && ran > 0);
     let after = mmap(32 * 1024 * 1024, prot::READ | prot::WRITE);
     report.check("memory-came-back-after-exhaustion", after > 0);
     if after > 0 {

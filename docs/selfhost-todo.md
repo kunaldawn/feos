@@ -17,7 +17,8 @@ each call, plus hostile cases in `malicious`; `make check-arm check-x64 clippy` 
 - [ ] Forks under github.com/kunaldawn for the patched ones (rust, llvm-project, relibc, libc) and `git submodule set-url` to them; rust's fork marks its unused submodules `update = none` so plain `git clone --recursive` works too *(needs the forks created; pushing needs the owner's OK)*
 - [x] Every crates.io dependency vendored under `ports/vendor/` (rust's workspace, cargo, `library/`, stdarch, bootstrap, cranelift, gitoxide: 1239 packages, 190 platform-unreachable ones stubbed by `ports/prune-vendor.py`, 864 MB), with source replacement and `net.offline` in `ports/.cargo/config.toml` and the root `.cargo/config.toml`
 - [x] Offline check of the working tree: both kernels, rust's bootstrap and `gix` (`max-pure`) build in `localhost/feos` with `--network none`
-- [ ] Offline check from a fresh `git clone` + `scripts/ports-init.sh`, once the submodules are committed and the forks pushed
+- [x] Offline check from a fresh `git clone` + `scripts/ports-init.sh` (of `8fcd4866`, with the fixes below): all 13 submodules at their pins; then with `--network none` and an empty target volume, both kernels, rust's bootstrap, `gix` and the `user` boot phase on both ports. It found: Savannah refuses fetch-by-hash (make now fetches by `feos-tag`), and root `.gitignore`'s `target/` had dropped 16 vendored files of `cc`
+- [ ] Repeat the fresh-clone check once the forks exist and the submodules point at them
 - [ ] Reference build of rust 1.99.1 + LLVM from source on Linux: memory, disk, time, tool list *(hardware: tight on 14 GB)*
 
 ## Phase 1: kernel interface
