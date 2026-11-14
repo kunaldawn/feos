@@ -1,0 +1,32 @@
+[package]
+name = "thorin-dwp"
+authors = [ "David Wood <david.wood2@arm.com>" ]
+categories = ["development-tools::debugging"]
+description = "Library for building DWARF packages from input DWARF objects and packages"
+homepage = "https://docs.rs/thorin-dwp"
+keywords = ["dwarf", "split-dwarf", "dwarf-package", "dwarf-object", "dwp"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/rust-lang/thorin"
+version = "0.10.0"
+edition = "2021"
+
+[dependencies]
+tracing = "0.1.44"
+hashbrown = "0.16.0"
+
+[dependencies.gimli]
+version  = "0.33.0"
+default-features = false
+# `gimli/std` pulls in `fallible-iterator` which we don't use, but can't opt out of, because of
+# cargo#8832.
+features = [ "read", "write", "std" ]
+
+[dependencies.object]
+version = "0.38.0"
+default-features = false
+features = [ "archive", "read", "write", "compression" ]
+
+[lib]
+name = "thorin"
+bench = false

@@ -1,0 +1,6 @@
+{
+  "git": {
+    "sha1": "873a0649350c486caf67be772828a4f36bb4734c"
+  },
+  "path_in_vcs": "crates/cargo-util-schemas"
+}

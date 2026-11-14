@@ -1,0 +1,25 @@
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
+[advisories]
+yanked = "deny"
+ignore = []
+
+[licenses]
+# We want really high confidence when inferring licenses from text
+confidence-threshold = 0.93
+allow = ["MIT", "BSD-3-Clause", "Apache-2.0"]
+exceptions = [{ allow = ["Unicode-3.0"], name = "unicode-ident" }]
+
+[bans]
+multiple-versions = "allow" # We don't maintain Cargo lockfile, so this isn't really feasible to deny
+wildcards = "deny"          # Dependencies should not be specified with '*'
+
+[sources]
+unknown-registry = "deny" # crates.io is allowed and a known register by default
+unknown-git = "deny"

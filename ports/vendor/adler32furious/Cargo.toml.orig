@@ -1,0 +1,74 @@
+[package]
+name = "adler32furious"
+version = "0.1.1"
+description = "Fast Adler-32 checksums with SIMD for x86 and AArch64"
+edition = "2024"
+# The AVX-512 and AVX-VNNI intrinsics were stabilized in 1.89.
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/srijs/adler32furious"
+categories = ["algorithms", "compression", "no-std"]
+keywords = ["adler32", "checksum", "zlib", "simd"]
+exclude = ["/.github", "/bench", "/fuzz"]
+
+[features]
+default = ["std"]
+# Runtime CPU feature detection. Without it, the implementation is picked at
+# compile time from the enabled target features.
+std = []
+
+[dev-dependencies]
+libdeflater = "1.26"
+proptest = "1"
+
+[lib]
+bench = false
+
+[lints]
+workspace = true
+
+[workspace]
+# The benchmarks live in their own crate, to keep their dependencies out of
+# this one.
+members = ["bench"]
+
+[profile.bench]
+debug = true
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Bit-twiddling and SIMD code casts between integer widths on purpose.
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+cast_lossless = "allow"
+inline_always = "allow"
+# `use core::arch::x86_64::*` is the norm for intrinsics.
+wildcard_imports = "allow"
+# Unrolled SIMD kernels are long by nature.
+too_many_lines = "allow"
+# CPU feature sets are naturally a bag of bools.
+struct_excessive_bools = "allow"
+# Tests build large fixed-size buffers on the stack.
+large_stack_arrays = "allow"
+# Docs name CPU instructions (AVX512VNNI) that are not code.
+doc_markdown = "allow"
+# Per-arch `select` functions share one signature even when one cannot fail.
+unnecessary_wraps = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+# Unsafe code must explain itself.
+undocumented_unsafe_blocks = "warn"
+missing_safety_doc = "warn"
+multiple_unsafe_ops_per_block = "allow"
+dbg_macro = "warn"
+todo = "warn"
+print_stdout = "warn"
+print_stderr = "warn"

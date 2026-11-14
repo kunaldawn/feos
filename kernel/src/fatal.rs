@@ -140,6 +140,14 @@ fn report_task() {
 /// Takes a CPU exception: ends the task if that's safe, and otherwise reports it
 /// and stops the machine. Returns `true` having replaced the frame.
 pub fn on_exception(info: &Fault, frame: &mut Frame) -> bool {
+    // A program touching memory it was promised: give it the page and carry on.
+    if info.from_user() {
+        if let (Some(address), Some(slot)) = (info.fault_address(), sched::current_user_slot()) {
+            if crate::user::resolve_fault(slot, address as usize) {
+                return true;
+            }
+        }
+    }
     let overflow = info.fault_address().and_then(sched::stack_overflow_at);
     if info.is_task_fault() && frame.interrupts_were_enabled() && sched::contain_failure() {
         // The task holds no lock, so this one can be waited for, and the machine carries

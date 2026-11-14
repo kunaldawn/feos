@@ -1,0 +1,39 @@
+default:
+  # When updating this line, you also need to update
+  # rust-toolchain.toml
+  image: "rust:1.90-bookworm"
+  before_script:
+    - "curl -sL https://deb.nodesource.com/setup_22.x | bash"
+    - "apt-get update -y"
+    - "apt-get install -yq nodejs"
+test:
+  script:
+    - "bash test-ci.sh clean"
+makepage:
+  script:
+    - "cargo run --release --example dictionary"
+    - "cp -rv examples public"
+  pages: true
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  artifacts:
+    paths:
+      - public
+workflow:
+  # run on merge requests and pushes on the default branch
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+codspeed:
+  id_tokens:
+    CODSPEED_TOKEN:
+      aud: codspeed.io
+  stage: test
+  before_script:
+    - curl -fsSL https://github.com/CodSpeedHQ/runner/releases/latest/download/codspeed-runner-installer.sh  | bash -s -- --quiet
+    - cargo install cargo-codspeed --locked
+    # Build the benchmark target(s)
+    - cargo codspeed build
+  script:
+    # Run the benchmarks
+    - codspeed run --mode instrumentation -- cargo codspeed run

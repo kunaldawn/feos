@@ -22,6 +22,7 @@
 
 use core::cell::UnsafeCell;
 use core::mem;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use feos_abi::{errno, nr, open as open_flags, seek as seek_whence, Event, UserStr};
 use feos_app::pipe::{self, PipeId};
@@ -30,7 +31,7 @@ use feos_elf::Limits;
 use feos_fs::vfs::{VfsTree, ACCESS_EXECUTE, ACCESS_READ, ACCESS_WRITE};
 use feos_fs::{FileKind, FsError};
 use feos_hal::{Arch, Clock, PageAccess};
-use feos_vm::{AddressSpace, FrameSource, MapError, PAGE_SIZE};
+use feos_vm::{AddressSpace, CommitError, FrameSource, MapError, Protection, PAGE_SIZE};
 
 use crate::sched::{self, RawStreams};
 use crate::{memory, surface, Frame, Port};
@@ -50,6 +51,82 @@ impl FrameSource for KernelFrames {
 
     fn free(&mut self, frame: usize) {
         memory::free_frames(frame, 1);
+    }
+}
+
+/// Pages promised to programs, across the machine, that don't have frames yet. A
+/// promise is only made if the free frames cover it and every other promise.
+static UNBACKED: AtomicUsize = AtomicUsize::new(0);
+
+/// Frames no promise may count on: page tables, kernel stacks and the rest come from
+/// the same allocator, and have to be there when a promise is kept.
+const SPARE_FRAMES: usize = 4096;
+
+/// Whether `pages` more could be promised, or mapped now, with every promise kept.
+fn room_for(pages: usize) -> bool {
+    let free = memory::free_bytes() / PAGE_SIZE;
+    UNBACKED
+        .load(Ordering::Acquire)
+        .checked_add(pages)
+        .and_then(|wanted| wanted.checked_add(SPARE_FRAMES))
+        .is_some_and(|wanted| wanted <= free)
+}
+
+/// Promises `pages`, if [`room_for`] them.
+fn promise(pages: usize) -> bool {
+    UNBACKED
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+            let wanted = held.checked_add(pages)?;
+            let free = memory::free_bytes() / PAGE_SIZE;
+            (wanted.checked_add(SPARE_FRAMES)? <= free).then_some(wanted)
+        })
+        .is_ok()
+}
+
+/// Takes back promises that have been kept, or that nobody needs any more.
+fn release(pages: usize) {
+    if pages != 0 {
+        UNBACKED.fetch_sub(pages, Ordering::AcqRel);
+    }
+}
+
+/// Gives every page of a user range the kernel is about to copy through its frame.
+/// What isn't mapped is left for the copy to refuse.
+fn fault_in(process: &Process, address: usize, length: usize) -> Result<(), isize> {
+    let before = process.space.unbacked();
+    let result = {
+        let _no_kill = NoKill::new();
+        process.space.commit_range(address, length, &mut KernelFrames)
+    };
+    release(before - process.space.unbacked());
+    match result {
+        Ok(()) => Ok(()),
+        Err(CommitError::OutOfMemory) => Err(-errno::ENOMEM),
+        Err(CommitError::NotMapped) => Err(-errno::EFAULT),
+    }
+}
+
+/// A memory fault from the program in `slot`, at `address`: if it's a page the program
+/// was promised, it gets its frame. `true` if the program can try again. Called from
+/// the fault handler, with interrupts masked, while the program isn't in a call.
+pub fn resolve_fault(slot: usize, address: usize) -> bool {
+    let Some(process) = process(slot) else {
+        return false;
+    };
+    let page = address - address % PAGE_SIZE;
+    let result = {
+        let _no_kill = NoKill::new();
+        process.space.commit(page, &mut KernelFrames)
+    };
+    match result {
+        Ok(true) => {
+            release(1);
+            Port::sync_user_tables();
+            true
+        }
+        // It had its frame: this is a fault about what was done with it. Or it isn't
+        // mapped, or the machine broke its promise (the spare ran out): the program ends.
+        Ok(false) | Err(_) => false,
     }
 }
 
@@ -90,6 +167,7 @@ impl Process {
         }
         let tables = self.space.root();
         let root = self.root;
+        release(self.space.unbacked());
         self.space.destroy(&mut KernelFrames);
         if root != tables && root != 0 {
             memory::free_frames(root, 1);
@@ -290,7 +368,7 @@ fn load(slot: usize, path: &str, args: &ArgBlock) -> Result<(usize, Frame), i32>
         let length = (segment.page_end() - segment.page_start()) as usize;
         {
             let _no_kill = NoKill::new();
-            if process.space.map_new(start, length, access, &mut KernelFrames).is_err() {
+            if !room_for(length / PAGE_SIZE) || process.space.map_new(start, length, access, &mut KernelFrames).is_err() {
                 say(format_args!("{path}: out of memory, or overlapping segments"));
                 return Err(feos_abi::EXIT_NOT_EXECUTABLE);
             }
@@ -328,10 +406,11 @@ fn load(slot: usize, path: &str, args: &ArgBlock) -> Result<(usize, Frame), i32>
     let writable = PageAccess { write: true, execute: false };
     {
         let _no_kill = NoKill::new();
-        if process
-            .space
-            .map_new(stack_low, feos_abi::USER_STACK_SIZE, writable, &mut KernelFrames)
-            .is_err()
+        if !room_for(feos_abi::USER_STACK_SIZE / PAGE_SIZE)
+            || process
+                .space
+                .map_new(stack_low, feos_abi::USER_STACK_SIZE, writable, &mut KernelFrames)
+                .is_err()
         {
             say(format_args!("{path}: out of memory"));
             return Err(feos_abi::EXIT_NOT_EXECUTABLE);
@@ -401,6 +480,7 @@ fn user_path<'a>(
         return Err(-errno::ENAMETOOLONG);
     }
     let mut given = [0u8; feos_abi::PATH_MAX];
+    fault_in(process, pointer, length)?;
     process
         .space
         .copy_in(pointer, &mut given[..length])
@@ -441,6 +521,9 @@ fn with_user_buffer(
         return -errno::EFAULT;
     }
     let length = length.min(feos_abi::IO_CHUNK);
+    if let Err(error) = fault_in(process, address, length) {
+        return error;
+    }
     if process.space.validate(address, length, write).is_err() {
         return -errno::EFAULT;
     }
@@ -621,6 +704,9 @@ fn sys_stat(slot: usize, process: &Process, pointer: usize, length: usize, out: 
     let bytes = unsafe {
         core::slice::from_raw_parts(&result as *const feos_abi::Stat as *const u8, mem::size_of::<feos_abi::Stat>())
     };
+    if let Err(error) = fault_in(process, out, bytes.len()) {
+        return error;
+    }
     match process.space.copy_out(out, bytes) {
         Ok(()) => 0,
         Err(_) => -errno::EFAULT,
@@ -851,12 +937,28 @@ fn sys_seek(slot: usize, fd: usize, offset: isize, whence: usize) -> isize {
     }
 }
 
+/// What a `prot` from a program asks for, if it's something that can be given.
+/// Anonymous memory is never executable.
+fn protection(prot: usize) -> Option<Protection> {
+    let read = feos_abi::prot::READ;
+    let write = feos_abi::prot::WRITE;
+    match prot {
+        0 => Some(None),
+        p if p == read => Some(Some(PageAccess { write: false, execute: false })),
+        p if p == read | write || p == write => Some(Some(PageAccess { write: true, execute: false })),
+        _ => None,
+    }
+}
+
 fn sys_mmap(slot: usize, process: &mut Process, length: usize, prot: usize) -> isize {
-    if prot & !(feos_abi::prot::READ | feos_abi::prot::WRITE) != 0 || prot == 0 {
+    let Some(protection) = protection(prot) else {
+        return -errno::EINVAL;
+    };
+    if length == 0 {
         return -errno::EINVAL;
     }
-    if length == 0 || length > feos_abi::USER_MEMORY_LIMIT {
-        return if length == 0 { -errno::EINVAL } else { -errno::ENOMEM };
+    if length > process.space.page_limit() * PAGE_SIZE {
+        return -errno::ENOMEM;
     }
     let Some(length) = length.checked_next_multiple_of(PAGE_SIZE) else {
         return -errno::ENOMEM;
@@ -869,45 +971,80 @@ fn sys_mmap(slot: usize, process: &mut Process, length: usize, prot: usize) -> i
     if next > feos_abi::USER_MMAP_END {
         return -errno::ENOMEM;
     }
-    let access = PageAccess {
-        write: prot & feos_abi::prot::WRITE != 0,
-        execute: false,
-    };
     let _ = slot;
+    let pages = length / PAGE_SIZE;
+    if !promise(pages) {
+        return -errno::ENOMEM;
+    }
     let result = {
         let _no_kill = NoKill::new();
-        process.space.map_new(address, length, access, &mut KernelFrames)
+        process.space.reserve(address, length, protection, &mut KernelFrames)
     };
-    Port::sync_user_tables();
     match result {
         Ok(()) => {
             process.mmap_next = next;
             address as isize
         }
-        Err(MapError::BadRange) => -errno::EINVAL,
-        Err(_) => -errno::ENOMEM,
+        Err(MapError::BadRange) => {
+            release(pages);
+            -errno::EINVAL
+        }
+        Err(_) => {
+            release(pages);
+            -errno::ENOMEM
+        }
+    }
+}
+
+/// Whether `[address, address + length)` is wholly memory `mmap` handed out, and not the
+/// window surface: what `munmap` and `mprotect` may change. Returns the page-rounded
+/// length.
+fn mmap_range(process: &Process, address: usize, length: usize) -> Option<usize> {
+    if length == 0 || !address.is_multiple_of(PAGE_SIZE) {
+        return None;
+    }
+    let length = length.checked_next_multiple_of(PAGE_SIZE)?;
+    let end = address.checked_add(length)?;
+    if address < feos_abi::USER_IMAGE_END || end > process.mmap_next {
+        return None;
+    }
+    if let Some((_, surface_at, surface_length)) = process.surface {
+        if address < surface_at + surface_length && surface_at < end {
+            return None;
+        }
+    }
+    Some(length)
+}
+
+fn sys_mprotect(slot: usize, process: &mut Process, address: usize, length: usize, prot: usize) -> isize {
+    let Some(protection) = protection(prot) else {
+        return -errno::EINVAL;
+    };
+    let Some(length) = mmap_range(process, address, length) else {
+        return -errno::EINVAL;
+    };
+    let asid = slot as u16 + 1;
+    let result = {
+        let _no_kill = NoKill::new();
+        process.space.protect(address, length, protection, &mut |page| {
+            Port::flush_user_page(page, asid);
+        })
+    };
+    Port::sync_user_tables();
+    match result {
+        Ok(()) => 0,
+        Err(MapError::NotMapped) => -errno::ENOMEM,
+        Err(_) => -errno::EINVAL,
     }
 }
 
 fn sys_munmap(slot: usize, process: &mut Process, address: usize, length: usize) -> isize {
-    if length == 0 || !address.is_multiple_of(PAGE_SIZE) {
-        return -errno::EINVAL;
-    }
-    let Some(length) = length.checked_next_multiple_of(PAGE_SIZE) else {
-        return -errno::EINVAL;
-    };
     // Only what `mmap` handed out: not the program, not the stack.
-    let Some(end) = address.checked_add(length) else {
+    let Some(length) = mmap_range(process, address, length) else {
         return -errno::EINVAL;
     };
-    if address < feos_abi::USER_IMAGE_END || end > process.mmap_next {
-        return -errno::EINVAL;
-    }
-    if let Some((_, surface_at, surface_length)) = process.surface {
-        if address < surface_at + surface_length && surface_at < end {
-            return -errno::EINVAL;
-        }
-    }
+    let end = address + length;
+    let before = process.space.unbacked();
     let asid = slot as u16 + 1;
     let result = {
         let _no_kill = NoKill::new();
@@ -915,6 +1052,7 @@ fn sys_munmap(slot: usize, process: &mut Process, address: usize, length: usize)
             Port::flush_user_page(page, asid);
         })
     };
+    release(before - process.space.unbacked());
     match result {
         Ok(_) => {
             // The last mapping can be reused, which keeps a program that keeps
@@ -949,7 +1087,7 @@ fn sys_spawn(slot: usize, process: &Process, args: [usize; 6]) -> isize {
             return -errno::EFAULT;
         };
         let mut raw = [0u8; 16];
-        if process.space.copy_in(at, &mut raw).is_err() {
+        if fault_in(process, at, raw.len()).is_err() || process.space.copy_in(at, &mut raw).is_err() {
             return -errno::EFAULT;
         }
         let mut word = [0u8; 8];
@@ -963,7 +1101,7 @@ fn sys_spawn(slot: usize, process: &Process, args: [usize; 6]) -> isize {
         if length > scratch.len() {
             return -errno::ENAMETOOLONG;
         }
-        if process.space.copy_in(pointer, &mut scratch[..length]).is_err() {
+        if fault_in(process, pointer, length).is_err() || process.space.copy_in(pointer, &mut scratch[..length]).is_err() {
             return -errno::EFAULT;
         }
         let Ok(text) = core::str::from_utf8(&scratch[..length]) else {
@@ -1003,7 +1141,7 @@ fn sys_spawn(slot: usize, process: &Process, args: [usize; 6]) -> isize {
 }
 
 fn sys_pipe(slot: usize, process: &Process, out: usize) -> isize {
-    if process.space.validate(out, 8, true).is_err() {
+    if fault_in(process, out, 8).is_err() || process.space.validate(out, 8, true).is_err() {
         return -errno::EFAULT;
     }
     let table = files(slot);
@@ -1036,6 +1174,9 @@ fn sys_pipe(slot: usize, process: &Process, out: usize) -> isize {
 }
 
 fn sys_futex_wait(process: &Process, address: usize, expected: usize, timeout_ms: usize) -> isize {
+    if let Err(error) = fault_in(process, address, 4) {
+        return error;
+    }
     let Ok(key) = process.space.translate_word(address) else {
         return -errno::EFAULT;
     };
@@ -1091,7 +1232,9 @@ fn sys_surface_create(process: &mut Process, width: usize, height: usize) -> isi
 }
 
 fn sys_poll_event(process: &Process, out: usize) -> isize {
-    if process.space.validate(out, mem::size_of::<Event>(), true).is_err() {
+    if fault_in(process, out, mem::size_of::<Event>()).is_err()
+        || process.space.validate(out, mem::size_of::<Event>(), true).is_err()
+    {
         return -errno::EFAULT;
     }
     let Some((index, _, _)) = process.surface else {
@@ -1148,6 +1291,7 @@ pub fn syscall(slot: usize, number: usize, args: [usize; 6]) -> isize {
         nr::UPTIME => sched::CLOCK.uptime_ms() as isize,
         nr::MMAP => sys_mmap(slot, process, args[0], args[1]),
         nr::MUNMAP => sys_munmap(slot, process, args[0], args[1]),
+        nr::MPROTECT => sys_mprotect(slot, process, args[0], args[1], args[2]),
         nr::SPAWN => sys_spawn(slot, process, args),
         nr::WAIT => match sched::wait_child(args[0] as u32, current_pid()) {
             Some(status) => status as isize,
@@ -1155,7 +1299,7 @@ pub fn syscall(slot: usize, number: usize, args: [usize; 6]) -> isize {
         },
         nr::PIPE => sys_pipe(slot, process, args[0]),
         nr::FUTEX_WAIT => sys_futex_wait(process, args[0], args[1], args[2]),
-        nr::FUTEX_WAKE => match process.space.translate_word(args[0]) {
+        nr::FUTEX_WAKE => match fault_in(process, args[0], 4).and_then(|()| process.space.translate_word(args[0]).map_err(|_| -errno::EFAULT)) {
             Ok(key) => sched::futex_wake_user(key, args[1]) as isize,
             Err(_) => -errno::EFAULT,
         },

@@ -1,0 +1,934 @@
+use anyhow::{bail, Context, Result};
+use clap::{ArgAction, CommandFactory, FromArgMatches};
+use clap_lex::OsStrExt;
+use lexopt::Arg;
+use std::env;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus};
+use std::str::FromStr;
+use wasmparser::Payload;
+use wit_component::StringEncoding;
+use wit_parser::{Resolve, WorldId};
+
+mod argfile;
+
+/// Representation of a flag passed to `wasm-ld`
+///
+/// Note that the parsing of flags in `wasm-ld` is not as uniform as parsing
+/// arguments via `clap`. For example if `--foo bar` is supported that doesn't
+/// mean that `--foo=bar` is supported. Similarly some options such as `--foo`
+/// support optional values as `--foo=bar` but can't be specified as
+/// `--foo bar`.
+///
+/// Finally there's currently only one "weird" flag which is `-shared` which has
+/// a single dash but a long name. That's specially handled elsewhere.
+///
+/// The general goal here is that we want to inherit `wasm-ld`'s CLI but also
+/// want to be able to reserve CLI flags for this linker itself, so `wasm-ld`'s
+/// arguments are parsed where our own are intermixed.
+struct LldFlag {
+    clap_name: &'static str,
+    long: Option<&'static str>,
+    short: Option<char>,
+    value: FlagValue,
+    nonstandard: bool,
+}
+
+impl LldFlag {
+    const fn nonstandard(self) -> Self {
+        LldFlag {
+            nonstandard: true,
+            ..self
+        }
+    }
+}
+
+enum FlagValue {
+    /// This option has no value, e.g. `-f` or `--foo`
+    None,
+
+    /// This option's value must be specified with `=`, for example `--foo=bar`
+    RequiredEqual(&'static str),
+
+    /// This option's value must be specified with ` `, for example `--foo bar`.
+    ///
+    /// I think that `wasm-ld` supports both `-f foo` and `-ffoo` for
+    /// single-character flags, but I haven't tested as putting a space seems to
+    /// work.
+    RequiredSpace(&'static str),
+
+    /// This option's value is optional but if specified it must use an `=` for
+    /// example `--foo=bar` or `--foo`.
+    Optional(&'static str),
+}
+
+/// This is a large macro which is intended to take CLI-looking syntax and turn
+/// each individual flag into a `LldFlag` specified above.
+macro_rules! flag {
+    // Long options specified as:
+    //
+    //     -f / --foo
+    //
+    // or just
+    //
+    //     --foo
+    //
+    // Options can look like `--foo`, `--foo=bar`, `--foo[=bar]`, or
+    // `--foo bar` to match the kinds of flags that LLD supports.
+    ($(-$short:ident /)? --$($flag:tt)*) => {
+        LldFlag {
+            clap_name: concat!("long_", $(stringify!($flag),)*),
+            long: Some(flag!(@name [] $($flag)*)),
+            short: flag!(@short $($short)?),
+            value: flag!(@value $($flag)*),
+            nonstandard: false,
+        }
+    };
+
+    // Short options specified as `-f` or `-f foo`.
+    (-$flag:tt $($val:tt)*) => {
+        LldFlag {
+            clap_name: concat!("short_", stringify!($flag)),
+            long: None,
+            short: Some(flag!(@char $flag)),
+            value: flag!(@value $flag $($val)*),
+            nonstandard: false,
+        }
+    };
+
+    // Generates the long name of a flag, collected within the `[]` argument to
+    // this macro. This will iterate over the flag given as the rest of the
+    // macro arguments and collect values into `[...]` and recurse.
+    //
+    // The first recursion case handles `foo-bar-baz=..` where Rust tokenizes
+    // this as `foo` then `-` then `bar` then ... If this is found then `foo-`
+    // is added to the name and then the macro recurses.
+    (@name [$($name:tt)*] $n:ident-$($rest:tt)*) => (flag!(@name [$($name)* $n-] $($rest)*));
+    // These are the ways options are represented, either `--foo bar`,
+    // `--foo=bar`, `--foo=bar`, or `--foo`. In all these cases discard the
+    // value itself and then recurse.
+    (@name [$($name:tt)*] $n:ident $_value:ident) => (flag!(@name [$($name)* $n]));
+    (@name [$($name:tt)*] $n:ident=$_value:ident) => (flag!(@name [$($name)* $n]));
+    (@name [$($name:tt)*] $n:ident[=$_value:ident]) => (flag!(@name [$($name)* $n]));
+    (@name [$($name:tt)*] $n:ident) => (flag!(@name [$($name)* $n]));
+    // If there's nothing left then the `$name` has collected everything so
+    // it's stringifyied and caoncatenated.
+    (@name [$($name:tt)*]) => (concat!($(stringify!($name),)*));
+
+    // This parses the value-style of the flag given. The recursion here looks
+    // similar to `@name` above. except that the four terminal cases all
+    // correspond to different variants of `FlagValue`.
+    (@value $n:ident - $($rest:tt)*) => (flag!(@value $($rest)*));
+    (@value $_flag:ident = $name:ident) => (FlagValue::RequiredEqual(stringify!($name)));
+    (@value $_flag:ident $name:ident) => (FlagValue::RequiredSpace(stringify!($name)));
+    (@value $_flag:ident [= $name:ident]) => (FlagValue::Optional(stringify!($name)));
+    (@value $_flag:ident) => (FlagValue::None);
+
+    // Helper for flags that have both a long and a short form to parse whether
+    // a short form was provided.
+    (@short) => (None);
+    (@short $name:ident) => (Some(flag!(@char $name)));
+
+    // Helper for getting the `char` of a short flag.
+    (@char $name:ident) => ({
+        let name = stringify!($name);
+        assert!(name.len() == 1);
+        name.as_bytes()[0] as char
+    });
+}
+
+const LLD_FLAGS: &[LldFlag] = &[
+    flag! { --allow-multiple-definition }.nonstandard(),
+    flag! { --allow-undefined-file=PATH }.nonstandard(),
+    flag! { --allow-undefined }.nonstandard(),
+    flag! { --Bdynamic }.nonstandard(),
+    flag! { --Bstatic }.nonstandard(),
+    flag! { --Bsymbolic }.nonstandard(),
+    flag! { --build-id[=VAL] }.nonstandard(),
+    flag! { --call_shared }.nonstandard(),
+    flag! { --check-features },
+    flag! { --color-diagnostics[=VALUE] }.nonstandard(),
+    flag! { --compress-relocations }.nonstandard(),
+    flag! { --cooperative-threading },
+    flag! { --demangle }.nonstandard(),
+    flag! { --dn }.nonstandard(),
+    flag! { --dy }.nonstandard(),
+    flag! { --emit-relocs }.nonstandard(),
+    flag! { --end-lib }.nonstandard(),
+    flag! { --entry SYM }.nonstandard(),
+    flag! { --error-limit=N },
+    flag! { --error-unresolved-symbols }.nonstandard(),
+    flag! { --experimental-pic },
+    flag! { --export-all },
+    flag! { -E / --export-dynamic }.nonstandard(),
+    flag! { --export-if-defined=SYM }.nonstandard(),
+    flag! { --export-memory[=NAME] },
+    flag! { --export-table },
+    flag! { --export=SYM }.nonstandard(),
+    flag! { --extra-features=LIST }.nonstandard(),
+    flag! { --fatal-warnings }.nonstandard(),
+    flag! { --features=LIST }.nonstandard(),
+    flag! { --gc-sections }.nonstandard(),
+    flag! { --global-base=VALUE },
+    flag! { --growable-table },
+    flag! { --import-memory[=NAME] },
+    flag! { --import-table },
+    flag! { --import-undefined }.nonstandard(),
+    flag! { --initial-heap=SIZE },
+    flag! { --initial-memory=SIZE },
+    flag! { --keep-section=NAME }.nonstandard(),
+    flag! { --lto-CGO=LEVEL },
+    flag! { --lto-debug-pass-manager },
+    flag! { --lto-O=LEVEL },
+    flag! { --lto-partitions=NUM },
+    flag! { -L PATH },
+    flag! { -l LIB },
+    flag! { --Map=FILE }.nonstandard(),
+    flag! { --max-memory=SIZE },
+    flag! { --merge-data-segments },
+    flag! { --mllvm=FLAG }.nonstandard(),
+    flag! { -m ARCH },
+    flag! { --no-allow-multiple-definition }.nonstandard(),
+    flag! { --no-check-features },
+    flag! { --no-color-diagnostics }.nonstandard(),
+    flag! { --no-demangle }.nonstandard(),
+    flag! { --no-entry }.nonstandard(),
+    flag! { --no-export-dynamic }.nonstandard(),
+    flag! { --no-fatal-warnings }.nonstandard(),
+    flag! { --no-gc-sections }.nonstandard(),
+    flag! { --no-growable-memory },
+    flag! { --no-merge-data-segments },
+    flag! { --no-pie }.nonstandard(),
+    flag! { --no-print-gc-sections }.nonstandard(),
+    flag! { --no-stack-first }.nonstandard(),
+    flag! { --no-shlib-sigcheck },
+    flag! { --no-whole-archive }.nonstandard(),
+    flag! { --noinhibit-exec }.nonstandard(),
+    flag! { --non_shared }.nonstandard(),
+    flag! { -O LEVEL },
+    flag! { --page-size=VALUE },
+    flag! { --pie }.nonstandard(),
+    flag! { --print-gc-sections }.nonstandard(),
+    flag! { -M / --print-map }.nonstandard(),
+    flag! { --relocatable }.nonstandard(),
+    flag! { --reproduce=VALUE },
+    flag! { --rpath=VALUE }.nonstandard(),
+    flag! { --save-temps }.nonstandard(),
+    flag! { --shared-memory },
+    flag! { --shared }.nonstandard(),
+    flag! { --soname=VALUE }.nonstandard(),
+    flag! { --stack-first }.nonstandard(),
+    flag! { --start-lib }.nonstandard(),
+    flag! { --static }.nonstandard(),
+    flag! { -s / --strip-all }.nonstandard(),
+    flag! { -S / --strip-debug }.nonstandard(),
+    flag! { --table-base=VALUE },
+    flag! { --thinlto-cache-dir=PATH },
+    flag! { --thinlto-cache-policy=VALUE },
+    flag! { --thinlto-jobs=N },
+    flag! { --threads=N }.nonstandard(),
+    flag! { -y / --trace-symbol=SYM }.nonstandard(),
+    flag! { -t / --trace }.nonstandard(),
+    flag! { --undefined=SYM }.nonstandard(),
+    flag! { --unresolved-symbols=VALUE }.nonstandard(),
+    flag! { --warn-unresolved-symbols }.nonstandard(),
+    flag! { --whole-archive }.nonstandard(),
+    flag! { --why-extract=MEMBER },
+    flag! { --wrap=VALUE }.nonstandard(),
+    flag! { -z OPT },
+];
+
+#[derive(Default)]
+struct App {
+    component: ComponentLdArgs,
+    lld_args: Vec<OsString>,
+}
+
+/// A linker to create a Component from input object files and libraries.
+///
+/// This application is an equivalent of `wasm-ld` except that it produces a
+/// component instead of a core wasm module. This application behaves very
+/// similarly to `wasm-ld` in that it takes the same inputs and flags, and it
+/// will internally invoke `wasm-ld`. After `wasm-ld` has been invoked the core
+/// wasm module will be turned into a component using component tooling and
+/// embedded information in the core wasm module.
+#[derive(clap::Parser, Default)]
+#[command(version, args_override_self = true)]
+struct ComponentLdArgs {
+    /// Which default WASI adapter, if any, to use when creating the output
+    /// component.
+    #[clap(long, name = "command|reactor|proxy|none")]
+    wasi_adapter: Option<WasiAdapter>,
+
+    /// Location of where to find `wasm-ld`.
+    ///
+    /// If not specified this is automatically detected.
+    #[clap(long, name = "PATH")]
+    wasm_ld_path: Option<PathBuf>,
+
+    /// Quoting syntax for response files.
+    #[clap(long, name = "STYLE")]
+    rsp_quoting: Option<String>,
+
+    /// Where to place the component output.
+    #[clap(short, long)]
+    output: PathBuf,
+
+    /// Print verbose output.
+    #[clap(short, long)]
+    verbose: bool,
+
+    /// Whether or not the output component is validated.
+    ///
+    /// This defaults to `false`.
+    #[clap(long, require_equals = true, value_name = "true|false")]
+    validate_component: Option<Option<bool>>,
+
+    /// Whether or not imports are deduplicated based on semver in the final
+    /// component.
+    ///
+    /// This defaults to `true`.
+    #[clap(long, require_equals = true, value_name = "true|false")]
+    merge_imports_based_on_semver: Option<Option<bool>>,
+
+    /// Adapters to use when creating the final component.
+    #[clap(long = "adapt", value_name = "[NAME=]MODULE", value_parser = parse_adapter)]
+    adapters: Vec<(String, Vec<u8>)>,
+
+    /// Whether or not "legacy" names are rejected during componentization.
+    ///
+    /// This option can be used to require the naming scheme outlined in
+    /// <https://github.com/WebAssembly/component-model/pull/378> to be used
+    /// and rejects all modules using the previous ad-hoc naming scheme.
+    ///
+    /// This defaults to `false`.
+    #[clap(long)]
+    reject_legacy_names: bool,
+
+    /// Whether or not the `cabi_realloc` function used by the adapter is backed
+    /// by `memory.grow`.
+    ///
+    /// By default the adapter will import `cabi_realloc` from the main module
+    /// and use that, but this can be used to instead back memory allocation
+    /// requests with `memory.grow` instead.
+    ///
+    /// This defaults to `false`.
+    #[clap(long)]
+    realloc_via_memory_grow: bool,
+
+    /// WIT file representing additional component type information to use.
+    ///
+    /// May be specified more than once.
+    ///
+    /// See also the `--string-encoding` option.
+    #[clap(long = "component-type", value_name = "WIT_FILE")]
+    component_types: Vec<PathBuf>,
+
+    /// String encoding to use when creating the final component.
+    ///
+    /// This may be either "utf8", "utf16", or "compact-utf16".  This value is
+    /// only used when one or more `--component-type` options are specified.
+    #[clap(long, value_parser = parse_encoding, default_value = "utf8")]
+    string_encoding: StringEncoding,
+
+    /// Skip the `wit-component`-based process to generate a component.
+    #[clap(long)]
+    skip_wit_component: bool,
+
+    /// Raw flags to pass to the end of the `lld` invocation in case they're
+    /// not already recognized by this wrapper executable.
+    #[clap(long)]
+    append_lld_flag: Vec<OsString>,
+}
+
+fn parse_adapter(s: &str) -> Result<(String, Vec<u8>)> {
+    let (name, path) = parse_optionally_name_file(s);
+    let wasm = wat::parse_file(path)?;
+    Ok((name.to_string(), wasm))
+}
+
+fn parse_encoding(s: &str) -> Result<StringEncoding> {
+    Ok(match s {
+        "utf8" => StringEncoding::UTF8,
+        "utf16" => StringEncoding::UTF16,
+        "compact-utf16" => StringEncoding::CompactUTF16,
+        _ => bail!("unknown string encoding: {s:?}"),
+    })
+}
+
+fn parse_optionally_name_file(s: &str) -> (&str, &str) {
+    let mut parts = s.splitn(2, '=');
+    let name_or_path = parts.next().unwrap();
+    match parts.next() {
+        Some(path) => (name_or_path, path),
+        None => {
+            let name = Path::new(name_or_path)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap();
+            let name = match name.find('.') {
+                Some(i) => &name[..i],
+                None => name,
+            };
+            (name, name_or_path)
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+enum WasiAdapter {
+    Command,
+    Reactor,
+    Proxy,
+    None,
+}
+
+impl FromStr for WasiAdapter {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "none" => Ok(WasiAdapter::None),
+            "command" => Ok(WasiAdapter::Command),
+            "reactor" => Ok(WasiAdapter::Reactor),
+            "proxy" => Ok(WasiAdapter::Proxy),
+            _ => bail!("unknown wasi adapter {s}, must be one of: none, command, reactor, proxy"),
+        }
+    }
+}
+
+pub fn main() {
+    let err = match run() {
+        Ok(()) => return,
+        Err(e) => e,
+    };
+    eprintln!("error: {err}");
+    if err.chain().len() > 1 {
+        eprintln!("\nCaused by:");
+        for (i, err) in err.chain().skip(1).enumerate() {
+            eprintln!("{i:>5}: {}", err.to_string().replace("\n", "\n       "));
+        }
+    }
+
+    std::process::exit(1);
+}
+
+fn run() -> Result<()> {
+    App::parse()?.run()
+}
+
+impl App {
+    /// Parse the CLI arguments into an `App` to run the linker.
+    ///
+    /// This is unfortunately nontrivial because the way `wasm-ld` takes
+    /// arguments is not compatible with `clap`. Namely flags like
+    /// `--whole-archive` are positional are processed in a stateful manner.
+    /// This means that the relative ordering of flags to `wasm-ld` needs to be
+    /// preserved. Additionally there are flags like `-shared` which clap does
+    /// not support.
+    ///
+    /// To handle this the `lexopt` crate is used to perform low-level argument
+    /// parsing. That's then used to determine whether the argument is intended
+    /// for `wasm-component-ld` or `wasm-ld`, so arguments are filtered into two
+    /// lists. Using these lists the arguments to `wasm-component-ld` are then
+    /// parsed. On failure a help message is presented with all `wasm-ld`
+    /// arguments added as well.
+    ///
+    /// This means that functionally it looks like `clap` parses everything when
+    /// in fact `lexopt` is used to filter out `wasm-ld` arguments and `clap`
+    /// only parses arguments specific to `wasm-component-ld`.
+    fn parse() -> Result<App> {
+        let mut args = argfile::expand().context("failed to expand @-response files")?;
+
+        // First remove `-flavor wasm` in case this is invoked as a generic LLD
+        // driver. We can safely ignore that going forward.
+        if let Some([flavor, wasm]) = args.get(1..3) {
+            if flavor == "-flavor" && wasm == "wasm" {
+                args.remove(1);
+                args.remove(1);
+            }
+        }
+
+        let mut command = ComponentLdArgs::command();
+        let mut lld_args = Vec::new();
+        let mut component_ld_args = vec![std::env::args_os().nth(0).unwrap()];
+        let mut parser = lexopt::Parser::from_iter(args);
+
+        fn handle_lld_arg(
+            lld: &LldFlag,
+            parser: &mut lexopt::Parser,
+            lld_args: &mut Vec<OsString>,
+        ) -> Result<()> {
+            let mut arg = OsString::new();
+            match (lld.short, lld.long) {
+                (_, Some(long)) => {
+                    arg.push("--");
+                    arg.push(long);
+                }
+                (Some(short), _) => {
+                    arg.push("-");
+                    arg.push(short.encode_utf8(&mut [0; 5]));
+                }
+                (None, None) => unreachable!(),
+            }
+            match lld.value {
+                FlagValue::None => {
+                    lld_args.push(arg);
+                }
+
+                FlagValue::RequiredSpace(_) => {
+                    lld_args.push(arg);
+                    lld_args.push(parser.value()?);
+                }
+
+                FlagValue::RequiredEqual(_) => {
+                    arg.push("=");
+                    arg.push(&parser.value()?);
+                    lld_args.push(arg);
+                }
+
+                // If the value is optional then the argument must have an `=`
+                // in the argument itself.
+                FlagValue::Optional(_) => {
+                    match parser.optional_value() {
+                        Some(val) => {
+                            arg.push("=");
+                            arg.push(&val);
+                        }
+                        None => {}
+                    }
+                    lld_args.push(arg);
+                }
+            }
+            Ok(())
+        }
+
+        loop {
+            if let Some(mut args) = parser.try_raw_args() {
+                if let Some(arg) = args.peek() {
+                    // If this is a `-...` flag then check to see if this is a
+                    // "nonstandard" flag like `-shared`. That's done by
+                    // looking at all `nonstandard` flags and testing if the
+                    // option is `-name...`. If so, then assume it's a nonstandard
+                    // flag and give it to LLD then move on.
+                    //
+                    // Note that if any flag has a value it'll get passed to
+                    // LLD below in `Arg::Value`, and otherwise if the option
+                    // has an embedded `=` in it that'll be handled here via
+                    // the `starts_with` check.
+                    //
+                    // Also note that `--foo` flags are all auto-skipped here
+                    // since the `starts_with` check won't pass for any of them
+                    // as `f.long` never starts with `-`.
+                    if let Some(flag) = arg.strip_prefix("-") {
+                        let for_lld = LLD_FLAGS
+                            .iter()
+                            .filter(|f| f.nonstandard)
+                            .filter_map(|f| f.long)
+                            .any(|f| flag.starts_with(f));
+                        if for_lld {
+                            lld_args.push(arg.to_owned());
+                            args.next();
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            match parser.next()? {
+                Some(Arg::Value(obj)) => {
+                    lld_args.push(obj);
+                }
+                Some(Arg::Short(c)) => match LLD_FLAGS.iter().find(|f| f.short == Some(c)) {
+                    Some(lld) => {
+                        handle_lld_arg(lld, &mut parser, &mut lld_args)?;
+                    }
+                    None => {
+                        component_ld_args.push(format!("-{c}").into());
+                        if let Some(arg) =
+                            command.get_arguments().find(|a| a.get_short() == Some(c))
+                        {
+                            if let ArgAction::Set = arg.get_action() {
+                                component_ld_args.push(parser.value()?);
+                            }
+                        }
+                    }
+                },
+                Some(Arg::Long(c)) => match LLD_FLAGS.iter().find(|f| f.long == Some(c)) {
+                    Some(lld) => {
+                        handle_lld_arg(lld, &mut parser, &mut lld_args)?;
+                    }
+                    None => {
+                        let mut flag = OsString::from(format!("--{c}"));
+                        if let Some(arg) = command.get_arguments().find(|a| a.get_long() == Some(c))
+                        {
+                            match arg.get_action() {
+                                ArgAction::Set | ArgAction::Append => {
+                                    flag.push("=");
+                                    flag.push(parser.value()?);
+                                }
+                                _ => (),
+                            }
+                        }
+                        component_ld_args.push(flag);
+                    }
+                },
+                None => break,
+            }
+        }
+
+        match command.try_get_matches_from_mut(component_ld_args.clone()) {
+            Ok(matches) => Ok(App {
+                component: ComponentLdArgs::from_arg_matches(&matches)?,
+                lld_args,
+            }),
+            Err(_) => {
+                add_wasm_ld_options(ComponentLdArgs::command()).get_matches_from(component_ld_args);
+                unreachable!();
+            }
+        }
+    }
+
+    fn run(&mut self) -> Result<()> {
+        let mut lld = self.lld();
+
+        // If a temporary output is needed make sure it has the same file name
+        // as the output of our command itself since LLD will embed this file
+        // name in the name section of the output.
+        let temp_dir = match self.component.output.parent() {
+            Some(parent) => tempfile::TempDir::new_in(parent)?,
+            None => tempfile::TempDir::new()?,
+        };
+        let temp_output = match self.component.output.file_name() {
+            Some(name) => temp_dir.path().join(name),
+            None => bail!(
+                "output of {:?} does not have a file name",
+                self.component.output
+            ),
+        };
+
+        // Shared libraries don't get wit-component run below so place the
+        // output directly at the desired output location. Otherwise output to a
+        // temporary location for wit-component to read and then the real output
+        // is created after wit-component runs.
+        if self.skip_wit_component() {
+            lld.output(&self.component.output);
+        } else {
+            lld.output(&temp_output);
+        }
+
+        let linker = &lld.exe;
+        let lld_flags = self
+            .lld_args
+            .iter()
+            .chain(&self.component.append_lld_flag)
+            .collect::<Vec<_>>();
+        let status = lld
+            .status(&temp_dir, &lld_flags)
+            .with_context(|| format!("failed to spawn {linker:?}"))?;
+        if !status.success() {
+            bail!("failed to invoke LLD: {status}");
+        }
+
+        if self.skip_wit_component() {
+            return Ok(());
+        }
+
+        let reactor_adapter =
+            wasi_preview1_component_adapter_provider::WASI_SNAPSHOT_PREVIEW1_REACTOR_ADAPTER;
+        let command_adapter =
+            wasi_preview1_component_adapter_provider::WASI_SNAPSHOT_PREVIEW1_COMMAND_ADAPTER;
+        let proxy_adapter =
+            wasi_preview1_component_adapter_provider::WASI_SNAPSHOT_PREVIEW1_PROXY_ADAPTER;
+        let mut core_module = std::fs::read(&temp_output)
+            .with_context(|| format!("failed to read {linker:?} output: {temp_output:?}"))?;
+
+        // Inspect the output module to see if it's a command or reactor.
+        let mut exports_start = false;
+        for payload in wasmparser::Parser::new(0).parse_all(&core_module) {
+            match payload {
+                Ok(Payload::ExportSection(e)) => {
+                    for export in e {
+                        if let Ok(e) = export {
+                            if e.name == "_start" {
+                                exports_start = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if !self.component.component_types.is_empty() {
+            let mut merged = None::<(Resolve, WorldId)>;
+            for wit_file in &self.component.component_types {
+                let mut resolve = Resolve::default();
+                let (package, _) = resolve
+                    .push_path(wit_file)
+                    .with_context(|| format!("unable to add component type {wit_file:?}"))?;
+
+                let world = resolve.select_world(&[package], None)?;
+
+                if let Some((merged_resolve, merged_world)) = &mut merged {
+                    let world = merged_resolve
+                        .merge(resolve)?
+                        .map_world(world, Default::default())?;
+                    merged_resolve.merge_worlds(world, *merged_world, &mut Default::default())?;
+                } else {
+                    merged = Some((resolve, world));
+                }
+            }
+
+            let Some((resolve, world)) = merged else {
+                unreachable!()
+            };
+
+            wit_component::embed_component_metadata(
+                &mut core_module,
+                &resolve,
+                world,
+                self.component.string_encoding,
+            )?;
+        }
+
+        let mut encoder = wit_component::ComponentEncoder::default()
+            .reject_legacy_names(self.component.reject_legacy_names)
+            .realloc_via_memory_grow(self.component.realloc_via_memory_grow);
+        if let Some(validate) = self.component.validate_component {
+            encoder = encoder.validate(validate.unwrap_or(true));
+        }
+        if let Some(merge) = self.component.merge_imports_based_on_semver {
+            encoder = encoder.merge_imports_based_on_semver(merge.unwrap_or(true));
+        }
+        encoder = encoder
+            .module(&core_module)
+            .context("failed to parse core wasm for componentization")?;
+        let adapter = self.component.wasi_adapter.unwrap_or(if exports_start {
+            WasiAdapter::Command
+        } else {
+            WasiAdapter::Reactor
+        });
+        let adapter = match adapter {
+            WasiAdapter::Command => Some(&command_adapter[..]),
+            WasiAdapter::Reactor => Some(&reactor_adapter[..]),
+            WasiAdapter::Proxy => Some(&proxy_adapter[..]),
+            WasiAdapter::None => None,
+        };
+
+        if let Some(adapter) = adapter {
+            encoder = encoder
+                .adapter("wasi_snapshot_preview1", adapter)
+                .context("failed to inject adapter")?;
+        }
+
+        for (name, adapter) in self.component.adapters.iter() {
+            encoder = encoder
+                .adapter(name, adapter)
+                .with_context(|| format!("failed to inject adapter {name:?}"))?;
+        }
+
+        let component = encoder.encode().context("failed to encode component")?;
+
+        std::fs::write(&self.component.output, &component).context(format!(
+            "failed to write output file: {:?}",
+            self.component.output
+        ))?;
+
+        Ok(())
+    }
+
+    fn skip_wit_component(&self) -> bool {
+        self.component.skip_wit_component
+            // Skip componentization with `--shared` since that's creating a
+            // shared library that's not a component yet.
+            || self.lld_args.iter().any(|s| s == "-shared" || s == "--shared")
+    }
+
+    fn lld(&self) -> Lld {
+        let mut lld = self.find_lld();
+        if self.component.verbose {
+            lld.verbose = true
+        }
+        lld
+    }
+
+    fn find_lld(&self) -> Lld {
+        if let Some(path) = &self.component.wasm_ld_path {
+            return Lld::new(path);
+        }
+
+        // Search for the first of `wasm-ld` or `rust-lld` in `$PATH`
+        let wasm_ld = format!("wasm-ld{}", env::consts::EXE_SUFFIX);
+        let rust_lld = format!("rust-lld{}", env::consts::EXE_SUFFIX);
+        for entry in env::split_paths(&env::var_os("PATH").unwrap_or_default()) {
+            if entry.join(&wasm_ld).is_file() {
+                return Lld::new(wasm_ld);
+            }
+            if entry.join(&rust_lld).is_file() {
+                let mut lld = Lld::new(rust_lld);
+                lld.needs_flavor = true;
+                return lld;
+            }
+        }
+
+        // Fall back to `wasm-ld` if the search failed to get an error message
+        // that indicates that `wasm-ld` was attempted to be found but couldn't
+        // be found.
+        Lld::new("wasm-ld")
+    }
+}
+
+/// Helper structure representing an `lld` invocation.
+struct Lld {
+    exe: PathBuf,
+    needs_flavor: bool,
+    verbose: bool,
+    output: Option<PathBuf>,
+}
+
+impl Lld {
+    fn new(exe: impl Into<PathBuf>) -> Lld {
+        Lld {
+            exe: exe.into(),
+            needs_flavor: false,
+            verbose: false,
+            output: None,
+        }
+    }
+
+    fn output(&mut self, dst: impl Into<PathBuf>) {
+        self.output = Some(dst.into());
+    }
+
+    fn status(&self, tmpdir: &tempfile::TempDir, args: &[&OsString]) -> Result<ExitStatus> {
+        // If we can probably pass `args` natively, try to do so. In some cases
+        // though just skip this entirely and go straight to below.
+        if !self.probably_too_big(args) {
+            match self.run(args) {
+                // If this subprocess failed to spawn because the arguments
+                // were too large, fall through to below.
+                Err(ref e) if self.command_line_too_big(e) => {
+                    if self.verbose {
+                        eprintln!("command line was too large, trying again...");
+                    }
+                }
+                other => return Ok(other?),
+            }
+        } else if self.verbose {
+            eprintln!("arguments probably too large {args:?}");
+        }
+
+        // The `args` are too big to be passed via the command line itself so
+        // encode the mall using "posix quoting" into an "argfile". This gets
+        // passed as `@foo` to lld and we also pass `--rsp-quoting=posix` to
+        // ensure that LLD always uses posix quoting. That means that we don't
+        // have to implement the dual nature of both posix and windows encoding
+        // here.
+        let mut argfile = Vec::new();
+        for arg in args {
+            for byte in arg.as_encoded_bytes() {
+                if *byte == b'\\' || *byte == b' ' {
+                    argfile.push(b'\\');
+                }
+                argfile.push(*byte);
+            }
+            argfile.push(b'\n');
+        }
+        let path = tmpdir.path().join("argfile_tmp");
+        std::fs::write(&path, &argfile).with_context(|| format!("failed to write {path:?}"))?;
+        let mut argfile_arg = OsString::from("@");
+        argfile_arg.push(&path);
+        let status = self.run(&[&"--rsp-quoting=posix".into(), &argfile_arg])?;
+        Ok(status)
+    }
+
+    /// Tests whether the `args` array is too large to execute natively.
+    ///
+    /// Windows `cmd.exe` has a very small limit of around 8k so perform a
+    /// guess up to 6k. This isn't 100% accurate.
+    fn probably_too_big(&self, args: &[&OsString]) -> bool {
+        let args_size = args
+            .iter()
+            .map(|s| s.as_encoded_bytes().len())
+            .sum::<usize>();
+        cfg!(windows) && args_size > 6 * 1024
+    }
+
+    /// Test if the OS failed to spawn a process because the arguments were too
+    /// long.
+    fn command_line_too_big(&self, err: &std::io::Error) -> bool {
+        #[cfg(unix)]
+        return err.raw_os_error() == Some(libc::E2BIG);
+        #[cfg(windows)]
+        return err.raw_os_error()
+            == Some(windows_sys::Win32::Foundation::ERROR_FILENAME_EXCED_RANGE as i32);
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = err;
+            return false;
+        }
+    }
+
+    fn run(&self, args: &[&OsString]) -> std::io::Result<ExitStatus> {
+        let mut cmd = Command::new(&self.exe);
+        if self.needs_flavor {
+            cmd.arg("-flavor").arg("wasm");
+        }
+        cmd.args(args);
+        if self.verbose {
+            cmd.arg("--verbose");
+        }
+        if let Some(output) = &self.output {
+            cmd.arg("-o").arg(output);
+        }
+        if self.verbose {
+            eprintln!("running {cmd:?}");
+        }
+        cmd.status()
+    }
+}
+
+fn add_wasm_ld_options(mut command: clap::Command) -> clap::Command {
+    use clap::Arg;
+
+    command = command.arg(
+        Arg::new("objects")
+            .action(ArgAction::Append)
+            .help("objects to pass to `wasm-ld`"),
+    );
+
+    for flag in LLD_FLAGS {
+        let mut arg = Arg::new(flag.clap_name).help("forwarded to `wasm-ld`");
+        if let Some(short) = flag.short {
+            arg = arg.short(short);
+        }
+        if let Some(long) = flag.long {
+            arg = arg.long(long);
+        }
+        arg = match flag.value {
+            FlagValue::RequiredEqual(name) | FlagValue::RequiredSpace(name) => {
+                arg.action(ArgAction::Set).value_name(name)
+            }
+            FlagValue::Optional(name) => arg
+                .action(ArgAction::Set)
+                .value_name(name)
+                .num_args(0..=1)
+                .require_equals(true),
+            FlagValue::None => arg.action(ArgAction::SetTrue),
+        };
+        arg = arg.help_heading("Options forwarded to `wasm-ld`");
+        command = command.arg(arg);
+    }
+
+    command
+}
+
+#[test]
+fn verify_app() {
+    ComponentLdArgs::command().debug_assert();
+    add_wasm_ld_options(ComponentLdArgs::command()).debug_assert();
+}

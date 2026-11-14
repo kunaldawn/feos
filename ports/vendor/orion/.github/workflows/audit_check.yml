@@ -1,0 +1,36 @@
+name: cargo deny (licenses, advisories, sources)
+
+permissions:
+  contents: read
+
+on:
+  push:
+    # Check immediately if dependencies are altered
+    paths:
+      - "**/Cargo.toml"
+    # Check also at midnight each day
+  schedule:
+    - cron: "0 0 * * *"
+
+# We don't need to run older workflows for the same PR's, since we always want the output of the newest ones.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-deny:
+    name: EmbarkStudios/cargo-deny
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        checks:
+          - advisories
+          - bans licenses sources
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@a531616d8ce3b9177443e48a1159bc945a099823 # v2.0.19
+        with:
+          command: check ${{ matrix.checks }}

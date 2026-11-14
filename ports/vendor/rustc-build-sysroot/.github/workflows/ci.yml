@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: ['master']
+
+env:
+  # GHA enables the sparse registry by default; make sure that also works for older nightlies.
+  CARGO_UNSTABLE_SPARSE_REGISTRY: 'true'
+
+jobs:
+  test:
+    name: Test Suite
+    strategy:
+      fail-fast: false
+      matrix:
+        rust:
+          - nightly
+          # Check a ~3 months old nightly as "oldest supported version"
+          - nightly-2026-01-01
+        # We want to run all of the above on Linux, macOS, windows-msvc, windows-gnu.
+        # The semantics of combining `include` with other things in GHA are very strange
+        # so this seems like the best way of doing that.
+        os:
+          - linux
+          - macos
+          - windows-gnu
+          - windows-msvc
+        include:
+          - os: linux
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos
+            runs-on: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-msvc
+            runs-on: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-gnu
+            runs-on: windows-latest
+            target: x86_64-pc-windows-gnu
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          targets: ${{ matrix.target }}
+          components: rust-src
+      - name: Run tests
+        run: cargo test --locked --target ${{ matrix.target }}
+
+  build-dir-new-layout:
+    name: Test Suite (build-dir-new-layout)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rust-src
+      - name: Run tests
+        run: CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT=true cargo test --locked
+
+  check:
+    name: Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.86.0
+          components: rustfmt, clippy
+      - name: rustfmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings

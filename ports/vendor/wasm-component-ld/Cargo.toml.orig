@@ -1,0 +1,43 @@
+[package]
+name = "wasm-component-ld"
+version = "0.5.27"
+edition = "2024"
+license = "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
+description = "Linker for `wasm32-wasip2`"
+repository = "https://github.com/bytecodealliance/wasm-component-ld"
+readme = "README.md"
+rust-version = "1.85.0"
+
+[package.metadata.binstall]
+pkg-url = "{repo}/releases/download/v{version}/{name}-v{version}-{target-arch}-{target-family}{archive-suffix}"
+bin-dir = "{name}-v{version}-{target-arch}-{target-family}/{bin}{binary-ext}"
+pkg-fmt = "tgz"
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "{repo}/releases/download/v{version}/{name}-v{version}-{target-arch}-macos{archive-suffix}"
+bin-dir = "{name}-v{version}-{target-arch}-macos/{bin}{binary-ext}"
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{repo}/releases/download/v{version}/{name}-v{version}-{target-arch}-macos{archive-suffix}"
+bin-dir = "{name}-v{version}-{target-arch}-macos/{bin}{binary-ext}"
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+[package.metadata.binstall.overrides.x86_64-pc-windows-gnu]
+pkg-fmt = "zip"
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.6.1", features = ['derive'] }
+clap_lex = "1.1.0"
+lexopt = "0.3.2"
+tempfile = "3.23.0"
+wasmparser = "0.254.0"
+wat = "1.254.0"
+wit-component = "0.254.0"
+wit-parser = "0.254.0"
+wasi-preview1-component-adapter-provider = "46.0.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+winsplit = "0.1"
+windows-sys = { version = "0.61.2", features = ['Win32_Foundation'] }

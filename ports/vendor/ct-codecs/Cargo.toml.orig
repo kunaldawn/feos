@@ -1,0 +1,22 @@
+[package]
+name = "ct-codecs"
+version = "1.1.7"
+authors = ["Frank Denis <github@pureftpd.org>"]
+edition = "2018"
+description = "Constant-time base64, base32, and hex codecs reimplemented in Rust"
+keywords = ["base64", "base32", "hex", "crypto"]
+license = "MIT"
+homepage = "https://github.com/jedisct1/rust-ct-codecs"
+repository = "https://github.com/jedisct1/rust-ct-codecs"
+categories = ["no-std", "cryptography", "encoding"]
+readme = "README.md"
+include = ["src/**/*.rs", "README.md", "LICENSE"]
+
+[profile.release]
+codegen-units = 1
+incremental = false
+panic = "abort"
+
+[features]
+default = ["std"]
+std = []

@@ -1,0 +1,37 @@
+name: Tests
+permissions:
+  contents: read
+on:
+  schedule:
+    - cron: "0 0 * * *" # Midnight of each day
+
+# We don't need to run older workflows for the same PR's, since we always want the output of the newest ones.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        toolchain:
+          - stable
+          - nightly
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: ${{ matrix.toolchain }}
+
+      - name: Run cargo test - debug
+        run: cargo test --all-features
+
+      - name: Run cargo test - release
+        run: cargo test --release --all-features

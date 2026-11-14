@@ -1,0 +1,20 @@
+[package]
+name = "odht"
+version = "0.3.1"
+edition = "2018"
+license = "MIT OR Apache-2.0"
+exclude = ["/.github/*"]
+description = "A Rust crate for hash tables that can be mapped from disk into memory without the need for up-front decoding."
+repository = "https://github.com/rust-lang/odht"
+
+[dependencies]
+cfg-if = "1.0.0"
+
+[dev-dependencies]
+rand = "0.8.2"
+rustc-hash = "1.1.0"
+quickcheck = "1"
+
+[features]
+nightly = []
+no_simd = []

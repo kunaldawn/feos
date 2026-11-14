@@ -30,3 +30,11 @@ rustflags = [
     "-C", "no-redzone=yes",
     "-C", "link-arg=-z", "-C", "link-arg=max-page-size=4096",
 ]
+
+# crates.io packages (std's, for the x86_64 build of `core` from rust-src) come
+# from ports/vendor, never the network. See ports/README.md.
+[source.crates-io]
+replace-with = "feos-vendor"
+
+[source.feos-vendor]
+directory = "ports/vendor"

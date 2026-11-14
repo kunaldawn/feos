@@ -7,7 +7,7 @@ use core::sync::atomic::AtomicU32;
 
 use feos_user::abi::{self, errno, open as flags, prot, seek as whence};
 use feos_user::{
-    close, entry, futex_wait, futex_wake, getpid, mmap, munmap, open, pipe, println, read, seek,
+    close, entry, futex_wait, futex_wake, getpid, mmap, mprotect, munmap, open, pipe, println, read, seek,
     sleep_ms, spawn, spawn_io, uptime_ms, wait, write, Args,
 };
 
@@ -40,10 +40,11 @@ fn test_memory(report: &mut Report) {
     report.check("mmap-is-zeroed-and-writable", good);
     report.check("munmap", munmap(first as usize, 3 * abi::PAGE_SIZE) == 0);
 
-    // Up to the limit, which is the kernel's to keep, and back.
-    let mut mapped = [0usize; 32];
+    // Up to the limit, which is the kernel's to keep, and back. Past the process's
+    // limit, so whichever of it and the machine's comes first.
+    let mut mapped = [0usize; 160];
     let mut count = 0;
-    let chunk = 8 * 1024 * 1024;
+    let chunk = 64 * 1024 * 1024;
     while count < mapped.len() {
         let address = mmap(chunk, rw);
         if address < 0 {
@@ -53,7 +54,7 @@ fn test_memory(report: &mut Report) {
         mapped[count] = address as usize;
         count += 1;
     }
-    println!("utest mapped {count} chunks of 8 MiB before the limit");
+    println!("utest mapped {count} chunks of 64 MiB before the limit");
     report.check("mmap-limit-reached", count > 0 && count < mapped.len());
     let mut all = true;
     for address in mapped[..count].iter().rev() {
@@ -63,6 +64,72 @@ fn test_memory(report: &mut Report) {
     let again = mmap(chunk, rw);
     report.check("memory-comes-back", again > 0);
     munmap(again as usize, chunk);
+}
+
+/// Memory that only gets frames when it's touched, and protection changes.
+fn test_lazy_memory(report: &mut Report) {
+    let rw = prot::READ | prot::WRITE;
+    // As much as the machine will promise, up to a gibibyte, of which only a little is
+    // touched.
+    let mut length = 1024 * 1024 * 1024;
+    let mut big = mmap(length, rw);
+    while big == -errno::ENOMEM && length > 16 * 1024 * 1024 {
+        length /= 2;
+        big = mmap(length, rw);
+    }
+    println!("utest lazily mapped {} MiB", length / (1024 * 1024));
+    let mut good = big > 0;
+    if good {
+        let base = big as usize as *mut u8;
+        for step in [0, 4096 * 3 + 7, length / 2, length - 1] {
+            // SAFETY: inside the mapping.
+            unsafe {
+                good &= base.add(step).read_volatile() == 0;
+                base.add(step).write_volatile(0x5a);
+                good &= base.add(step).read_volatile() == 0x5a;
+            }
+        }
+        // The kernel commits what it's given to fill, too.
+        let fd = open("/etc/motd", flags::READ);
+        if fd >= 0 {
+            let got = read(fd as usize, unsafe { core::slice::from_raw_parts_mut(base.add(length / 4), 64) });
+            good &= got > 0;
+            close(fd as usize);
+        }
+        good &= munmap(big as usize, length) == 0;
+    }
+    report.check("lazy-mmap-of-a-gibibyte", good);
+
+    let page = mmap(2 * abi::PAGE_SIZE, rw);
+    let mut good = page > 0;
+    if good {
+        let cell = page as usize as *mut u32;
+        // SAFETY: just mapped, writable.
+        unsafe { cell.write_volatile(0xfeed) };
+        good &= mprotect(page as usize, 2 * abi::PAGE_SIZE, prot::READ) == 0;
+        // SAFETY: still readable.
+        good &= unsafe { cell.read_volatile() } == 0xfeed;
+        good &= mprotect(page as usize, 2 * abi::PAGE_SIZE, 0) == 0;
+        good &= mprotect(page as usize, 2 * abi::PAGE_SIZE, rw) == 0;
+        // SAFETY: writable again, and kept what it had.
+        good &= unsafe { cell.read_volatile() } == 0xfeed;
+        unsafe { cell.add(abi::PAGE_SIZE / 4).write_volatile(1) };
+        // The kernel won't write into a page the program can't.
+        good &= mprotect(page as usize, abi::PAGE_SIZE, prot::READ) == 0;
+        let fd = open("/etc/motd", flags::READ);
+        if fd >= 0 {
+            let got = read(fd as usize, unsafe { core::slice::from_raw_parts_mut(page as usize as *mut u8, 16) });
+            good &= got == -errno::EFAULT;
+            close(fd as usize);
+        }
+        // Not past the end, and not over a hole.
+        good &= mprotect(page as usize, 64 * abi::PAGE_SIZE, prot::READ) == -errno::EINVAL;
+        good &= munmap(page as usize, 2 * abi::PAGE_SIZE) == 0;
+    }
+    report.check("mprotect", good);
+
+    let guard = mmap(abi::PAGE_SIZE, 0);
+    report.check("mmap-no-access", guard > 0 && munmap(guard as usize, abi::PAGE_SIZE) == 0);
 }
 
 fn test_files(report: &mut Report) {
@@ -224,6 +291,7 @@ fn main(args: Args) -> i32 {
     let mut report = Report { failed: 0 };
     report.check("argv", args.get(0).is_some_and(|name| name.ends_with("utest")));
     test_memory(&mut report);
+    test_lazy_memory(&mut report);
     test_files(&mut report);
     test_processes(&mut report);
     test_time_and_futex(&mut report);

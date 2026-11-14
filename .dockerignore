@@ -6,3 +6,7 @@ Dockerfile
 .dockerignore
 README.md
 data/
+# Toolchain sources (git submodules, several GB): no image build uses them.
+# ports/vendor stays: the x86_64 kernel's -Zbuild-std resolves std's lockfile
+# through it (see ports/README.md).
+ports/src/

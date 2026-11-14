@@ -1,5 +1,7 @@
 [workspace]
 resolver = "2"
+# Third-party sources (git submodules) are separate workspaces: see ports/README.md.
+exclude = ["ports"]
 members = [
     "kernel",
     "arch/*",

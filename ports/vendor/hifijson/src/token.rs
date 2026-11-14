@@ -1,0 +1,144 @@
+//! Tokens.
+
+/// What we expected to get, but did not get.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Expect {
+    /// `   ` or `]` or `,`
+    Value,
+    /// `[` or `{`
+    ValueOrEnd,
+    /// `[1` or `[1 2`
+    CommaOrEnd,
+    /// `{0: 1}`
+    String,
+    /// `{"a" 1}`
+    Colon,
+    /// `true false` (when parsing exactly one value)
+    Eof,
+}
+
+impl core::fmt::Display for Expect {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        use Expect::*;
+        match self {
+            Value => "value".fmt(f),
+            ValueOrEnd => "value or end of sequence".fmt(f),
+            CommaOrEnd => "comma or end of sequence".fmt(f),
+            String => "string".fmt(f),
+            Colon => "colon".fmt(f),
+            Eof => "end of file".fmt(f),
+        }
+    }
+}
+
+/// Lexing that does not require allocation.
+///
+/// Many functions in this trait, including
+/// [`Lex::exactly_one`], [`Lex::seq`], and [`Lex::expect`],
+/// take a custom "peek function" that implements
+/// `FnMut(&mut Self) -> Option<u8>`.
+/// That function is used to determine the next non-whitespace character.
+/// You can use [`Lex::ws_peek`] as JSON-compliant peek function.
+///
+/// The general policy for handling peeked characters is:
+/// When a function takes a `next: u8` character,
+/// then that character is assumed to be peeked; i.e.,
+/// [`crate::Read::peek_next`] must return `Some(next)`.
+/// This policy is helpful to determine where the input must be advanced,
+/// e.g. by using [`crate::Read::take_next`].
+pub trait Lex: crate::Read {
+    /// Skip input until the earliest non-whitespace character.
+    fn eat_whitespace(&mut self) {
+        self.skip_until(|c| !matches!(c, b' ' | b'\t' | b'\r' | b'\n'))
+    }
+
+    /// Skip whitespace and peek at the following character.
+    fn ws_peek(&mut self) -> Option<u8> {
+        self.eat_whitespace();
+        self.peek_next()
+    }
+
+    /// Parse a JSON token starting with a letter.
+    ///
+    /// This returns:
+    ///
+    /// - `Some(None)` if the input is "null",
+    /// - `Some(Some(b))` if the input is a boolean `b` ("true" or "false"), else
+    /// - `None`.
+    fn null_or_bool(&mut self) -> Option<Option<bool>> {
+        // we are calling this function without having advanced before
+        Some(match self.take_next() {
+            Some(b'n') if self.strip_prefix(b"ull") => None,
+            Some(b't') if self.strip_prefix(b"rue") => Some(true),
+            Some(b'f') if self.strip_prefix(b"alse") => Some(false),
+            _ => return None,
+        })
+    }
+
+    /// Take next character, discard it, and return mutable handle to lexer.
+    ///
+    /// This is useful in particular when parsing negative numbers,
+    /// where you want to discard `-` and immediately continue.
+    fn discarded(&mut self) -> &mut Self {
+        self.take_next();
+        self
+    }
+
+    /// Peek at next character, and discard it if it matches the expected character.
+    ///
+    /// Returns
+    /// `Some(())` if the peeked character matched the expected character, else
+    /// `None`.
+    ///
+    /// If [`bool::ok_or_else`] was stable, we could return a `bool` here.
+    fn expect(&mut self, pf: impl FnOnce(&mut Self) -> Option<u8>, expect: u8) -> Option<()> {
+        if pf(self) == Some(expect) {
+            self.take_next().map(|_| ())
+        } else {
+            None
+        }
+    }
+
+    /// Execute `f` for every item in the comma-separated sequence until `end`.
+    fn seq<E: From<Expect>, PF, F>(&mut self, end: u8, mut pf: PF, mut f: F) -> Result<(), E>
+    where
+        PF: FnMut(&mut Self) -> Option<u8>,
+        F: FnMut(u8, &mut Self) -> Result<(), E>,
+    {
+        let mut next = pf(self).ok_or(Expect::ValueOrEnd)?;
+        if next == end {
+            self.take_next();
+            return Ok(());
+        };
+
+        loop {
+            f(next, self)?;
+            next = pf(self).ok_or(Expect::CommaOrEnd)?;
+            if next == end {
+                self.take_next();
+                return Ok(());
+            } else if next == b',' {
+                self.take_next();
+                next = pf(self).ok_or(Expect::Value)?;
+            } else {
+                return Err(Expect::CommaOrEnd)?;
+            }
+        }
+    }
+
+    /// Parse once using given function and assure that the function has consumed all tokens.
+    fn exactly_one<T, E: From<Expect>, PF, F>(&mut self, mut pf: PF, f: F) -> Result<T, E>
+    where
+        PF: FnMut(&mut Self) -> Option<u8>,
+        F: FnOnce(u8, &mut Self) -> Result<T, E>,
+    {
+        let next = pf(self).ok_or(Expect::Value)?;
+        let v = f(next, self)?;
+        match pf(self) {
+            None => Ok(v),
+            Some(_) => Err(Expect::Eof)?,
+        }
+    }
+}
+
+impl<T> Lex for T where T: crate::Read {}

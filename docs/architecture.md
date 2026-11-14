@@ -371,6 +371,19 @@ through the kernel's mapping. So a wild pointer is an `EFAULT`, not a kernel fau
 there's no fixup table to get wrong. This depends on a process having one thread, so that
 its tables can't change during a call. A second thread would need something more.
 
+**Memory that arrives on first touch.** `mmap` reserves pages (`AddressSpace::reserve`):
+their entries are invalid to the hardware and say so in software bits, and a frame comes
+when the program first touches one. The fault comes to `fatal::on_exception`, which asks
+`user::resolve_fault` before treating it as a fault, and a page it gives a zeroed frame is
+retried. A call that copies to or from such a page commits it first (`user::fault_in`). The
+memory is promised when `mmap` returns, not when it's touched: each process has a limit
+(`USER_MEMORY_LIMIT`), and across the machine, `user::UNBACKED` counts what's promised and not
+yet backed, and a promise is only made when the free frames cover all of them and a spare
+(`SPARE_FRAMES`) for the kernel. So running out is `ENOMEM` from `mmap`, as before. If the
+kernel itself eats the spare and a promise can't be kept, the program faults and ends.
+`mprotect` changes access on what `mmap` handed out; a page with no access at all keeps its
+frame and contents in a soft entry. Anonymous memory is never executable.
+
 **Frames** all come from `feos-frames`, one at a time, and are all reachable from the
 process's tables, so they go back whichever way it ends: exit, fault, kill, or failing
 during load. `sched::collect_exits` takes the address space under the lock, once no CPU has
@@ -384,13 +397,13 @@ user frees them.
 
 - **Kernel-linked apps.** Those aren't behind it at all. They run as root, and `id` says so: a shell, its coreutils and every app are uid 0 and nothing checks them. Permissions apply to user programs.
 - **The filesystem, except where it has owners.** A program has a user and group, and on the [native filesystem](#the-native-filesystem) its modes are enforced at the system call boundary. FAT, exFAT and RAM mounts have no owners, so programs read and write all of those whoever they are. An open file is only checked when it's opened.
-- **Resources other than memory.** A program has a 64 MiB limit, but enough programs can fill the frames (they get `ENOMEM`), or the 32 process slots (they get `EBUSY`), and a program can write to the console, to disk or keep spinning. Nothing bills for it.
+- **Resources other than memory.** A program has a 4 GiB limit and the machine has its promises, but enough programs can promise all the frames (they get `ENOMEM`), or the 32 process slots (they get `EBUSY`), and a program can write to the console, to disk or keep spinning. Nothing bills for it.
 - **Bugs in the kernel.** A system call handler is kernel code, and a bug in one is a kernel bug. A panic there ends the process if it held no lock, and otherwise stops the machine.
 - **Side channels.** Nothing here tries, and there's no page table isolation.
 - **The x86_64 NMI window.** An NMI in the few instructions around `swapgs` would run with the wrong GS base. The only NMI is the fatal path's stop.
 
 Other limits: one thread per process, so a futex has nothing to wake but itself; no `fork`,
-`exec`, signals, demand paging, shared memory or `dup`; a program reading a terminal gets the
+`exec`, signals, file mappings, shared memory or `dup`; a program reading a terminal gets the
 shell's cooked lines, with no way to ask for raw keys; `mmap` addresses are only reused from the top; and
 surfaces are a fixed size, with no way to hear about a resize.
 

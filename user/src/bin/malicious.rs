@@ -186,7 +186,8 @@ const FAULTS: &[&str] = &[
     "kernel-read", "kernel-write", "kernel-exec", "device-read", "device-write", "null-read",
     "null-write", "high-read", "high-write", "noncanonical-read", "own-code-write",
     "own-rodata-write", "data-exec", "stack-exec", "mmap-exec", "use-after-munmap", "past-the-stack",
-    "stack-overflow", "sp-in-kernel",
+    "stack-overflow", "sp-in-kernel", "mprotect-read-only-write", "mprotect-none-read", "mmap-none-read",
+    "lazy-write-after-read-only",
 ];
 
 /// Runs one probe, in a child. Returns only if it wasn't stopped.
@@ -229,6 +230,27 @@ fn probe(name: &str) -> i32 {
             let page = mmap(4096, prot::READ | prot::WRITE) as usize;
             write_at(page);
             feos_user::munmap(page, 4096);
+            write_at(page);
+        }
+        "mprotect-read-only-write" => {
+            let page = mmap(4096, prot::READ | prot::WRITE) as usize;
+            write_at(page);
+            feos_user::mprotect(page, 4096, prot::READ);
+            write_at(page);
+        }
+        "mprotect-none-read" => {
+            let page = mmap(4096, prot::READ | prot::WRITE) as usize;
+            write_at(page);
+            feos_user::mprotect(page, 4096, 0);
+            core::hint::black_box(read_at(page));
+        }
+        "mmap-none-read" => {
+            let page = mmap(4096, 0) as usize;
+            core::hint::black_box(read_at(page));
+        }
+        "lazy-write-after-read-only" => {
+            // Read-only, and never touched: the first touch is the write.
+            let page = mmap(4096, prot::READ) as usize;
             write_at(page);
         }
         "past-the-stack" => {
@@ -325,6 +347,13 @@ fn main(args: Args) -> i32 {
     tally.call("mmap-huge", nr::MMAP, [usize::MAX, prot::READ, 0, 0, 0, 0], errno::ENOMEM);
     tally.call("mmap-nothing", nr::MMAP, [0, prot::READ, 0, 0, 0, 0], errno::EINVAL);
     tally.call("mmap-exec-flag", nr::MMAP, [4096, 4, 0, 0, 0, 0], errno::EINVAL);
+    tally.call("mprotect-kernel", nr::MPROTECT, [KERNEL, 4096, prot::READ, 0, 0, 0], errno::EINVAL);
+    tally.call("mprotect-own-code", nr::MPROTECT, [(probe as *const () as usize) & !4095, 4096, prot::READ | prot::WRITE, 0, 0, 0], errno::EINVAL);
+    tally.call("mprotect-own-stack", nr::MPROTECT, [feos_user::abi::USER_STACK_TOP - 4096, 4096, 0, 0, 0, 0], errno::EINVAL);
+    tally.call("mprotect-wraps", nr::MPROTECT, [usize::MAX & !4095, 8192, prot::READ, 0, 0, 0], errno::EINVAL);
+    let page = mmap(4096, prot::READ | prot::WRITE) as usize;
+    tally.call("mprotect-exec", nr::MPROTECT, [page, 4096, prot::READ | 4, 0, 0, 0], errno::EINVAL);
+    tally.call("mprotect-unaligned", nr::MPROTECT, [page + 1, 4096, prot::READ, 0, 0, 0], errno::EINVAL);
     tally.call("munmap-kernel", nr::MUNMAP, [KERNEL, 4096, 0, 0, 0, 0], errno::EINVAL);
     tally.call("munmap-own-code", nr::MUNMAP, [(probe as *const () as usize) & !4095, 4096, 0, 0, 0, 0], errno::EINVAL);
     tally.call("munmap-own-stack", nr::MUNMAP, [feos_user::abi::USER_STACK_TOP - 4096, 4096, 0, 0, 0, 0], errno::EINVAL);

@@ -1,0 +1,17 @@
+[package]
+name = "datafrog"
+version = "2.0.1"
+authors = ["Frank McSherry <fmcsherry@me.com>", "The Rust Project Developers", "Datafrog Developers"]
+license = "Apache-2.0/MIT"
+description = "Lightweight Datalog engine intended to be embedded in other Rust programs"
+readme = "README.md"
+keywords = ["datalog", "analysis"]
+repository = "https://github.com/rust-lang-nursery/datafrog"
+edition = "2018"
+
+[badges]
+is-it-maintained-issue-resolution = { repository = "https://github.com/rust-lang-nursery/datafrog" }
+is-it-maintained-open-issues = { repository = "https://github.com/rust-lang-nursery/datafrog" }
+
+[dev-dependencies]
+proptest = "0.8.7"

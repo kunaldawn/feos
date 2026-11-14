@@ -1,0 +1,213 @@
+on:
+  # Test on PRs for any branch
+  pull_request:
+    branches:
+      - "*"
+  push:
+    branches:
+      - master
+
+# We don't need to run older workflows for the same PR's, since we always want the output of the newest ones.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# NOTE: Should we use fail-fast: false?
+
+name: Tests
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test release + debug and features
+    strategy:
+      matrix:
+        toolchain:
+          - stable
+          - beta
+          - nightly
+          - 1.86.0 # MSRV
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install toolchain
+        env: 
+          TARGET_TOOLCHAIN: ${{ matrix.toolchain }}
+        run: rustup toolchain install "${TARGET_TOOLCHAIN}"
+        shell: bash
+
+      - name: Test debug-mode, default features
+        run: cargo test
+
+      - name: Test debug-mode, all features
+        run: cargo test --all-features
+
+      - name: Test debug-mode, no default features
+        run: cargo test --no-default-features
+
+      - name: Test debug-mode, no-default + alloc feature
+        run: cargo test --no-default-features --features alloc --tests
+
+      - name: Test debug-mode, no-default + serde feature (enables alloc)
+        run: cargo test --no-default-features --features serde --tests
+
+      - name: Test debug-mode, no-default + safe_api (without zeroize)
+        run: cargo test --no-default-features --features safe_api --tests
+      
+      - name: Test debug-mode, no-default + zeroize (zeroize-only)
+        run: cargo test --no-default-features --features zeroize --tests
+
+      - name: Test debug-mode, no-default + alloc + zeroize
+        run: cargo test --no-default-features --features alloc,zeroize --tests
+
+      - name: Test release-mode, default features
+        run: cargo test --release
+
+      - name: Test release-mode, all features
+        run: cargo test --release --all-features
+
+      - name: Test release-mode, no default features
+        run: cargo test --release --no-default-features
+
+      - name: Test release-mode, no-default + alloc feature
+        run: cargo test --release --no-default-features --features alloc --tests
+
+      - name: Test release-mode, no-default + serde feature (enables alloc)
+        run: cargo test --release --no-default-features --features serde --tests
+
+      - name: Test release-mode, no-default + safe_api (without zeroize)
+        run: cargo test --release --no-default-features --features safe_api --tests
+      
+      - name: Test release-mode, no-default + zeroize (zeroize-only)
+        run: cargo test --release --no-default-features --features zeroize --tests
+
+      - name: Test release-mode, no-default + alloc + zeroize
+        run: cargo test --release --no-default-features --features alloc,zeroize --tests
+
+  sanitizers:
+    name: Tests w. sanitizers
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install toolchain
+        run: rustup toolchain install nightly && rustup target add x86_64-unknown-linux-gnu
+
+      # Release (LeakSanitizer is enabled by default with AddressSanitizer for x86_64 Linux builds)
+      # https://github.com/google/sanitizers/wiki/AddressSanitizerLeakSanitizer
+      - run: RUSTFLAGS="-Z sanitizer=address" ASAN_OPTIONS="detect_odr_violation=0" cargo +nightly test --all-features --tests --release --target x86_64-unknown-linux-gnu
+      - run: RUSTFLAGS="-Z sanitizer=address" ASAN_OPTIONS="detect_odr_violation=0" cargo +nightly test --no-default-features --tests --release --target x86_64-unknown-linux-gnu
+
+  no_std:
+    name: no_std build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        toolchain:
+          - stable
+          - nightly
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: houseabsolute/actions-rust-cross@fe6ede73c7f0a50412ec05994e2aa5a7bf635eac # v1.0.7
+        with:
+          command: build
+          target: thumbv7em-none-eabi
+          args: "--release --no-default-features"
+
+  cross_compilation:
+    name: Linux/ARM - Release tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch:
+          - i686-unknown-linux-gnu
+          - armv7-unknown-linux-gnueabihf
+          - powerpc64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: houseabsolute/actions-rust-cross@fe6ede73c7f0a50412ec05994e2aa5a7bf635eac # v1.0.7
+        with:
+          command: test
+          target: ${{ matrix.arch }}
+          args: "--release"
+
+  # https://rustwasm.github.io/docs/book/reference/add-wasm-support-to-crate.html#maintaining-ongoing-support-for-webassembly
+  web_assembly:
+    name: WebAssembly - Release build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch:
+          - wasm32-unknown-unknown
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install toolchain
+        env: 
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: rustup toolchain install stable && rustup target add "${TARGET_ARCH}"
+        shell: bash
+
+      - run: cargo check --no-default-features --target ${WASM_TARGET}
+        # Remediation for potential template-injection: https://docs.zizmor.sh/audits/#template-injection
+        env:
+          WASM_TARGET: ${{ matrix.arch }}
+
+  docs:
+    name: Build documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install toolchain
+        run: rustup toolchain install stable
+
+      - run: cargo doc --no-deps --all-features
+
+  benches:
+    name: Build and check benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install toolchain
+        run: rustup toolchain install stable
+
+      - run: cargo test --benches
+
+  semver_checks:
+    name: Check SemVer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
+      
+      - run: cargo semver-checks

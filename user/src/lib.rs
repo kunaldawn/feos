@@ -225,6 +225,10 @@ pub fn munmap(address: usize, length: usize) -> isize {
     syscall(nr::MUNMAP, [address, length, 0, 0, 0, 0])
 }
 
+pub fn mprotect(address: usize, length: usize, prot: usize) -> isize {
+    syscall(nr::MPROTECT, [address, length, prot, 0, 0, 0])
+}
+
 /// Starts a program. `args` includes its own name.
 pub fn spawn(path: &str, args: &[&str]) -> isize {
     spawn_io(path, args, INHERIT, INHERIT)

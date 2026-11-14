@@ -1,0 +1,25 @@
+[package]
+authors = ["Bob Chatman <bob.chatman@gmail.com>"]
+categories = ["value-formatting", "no-std"]
+description = "Rust Port of human-format from node, formatting numbers for us, while the machines are still at bay."
+documentation = "https://docs.rs/human_format"
+homepage = "https://bobgneu.github.io/human-format-rs/"
+keywords = ["numbers", "formatting", "filesize", "human", "magnitude"]
+license = "MIT"
+name = "human_format"
+readme = "README.md"
+repository = "https://github.com/BobGneu/human-format-rs"
+version = "1.2.1"
+edition = "2024"
+resolver = "2"
+
+[lib]
+name = "human_format"
+path = "src/lib.rs"
+
+[badges]
+maintenance = { status = "passively-maintained" }
+
+[features]
+# Opt-in feature to enable the panicking `parse()` convenience wrapper.
+panic_parse = []

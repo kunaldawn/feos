@@ -1,0 +1,21 @@
+[package]
+name = "measureme"
+description = "Support crate for rustc's self-profiling feature"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+log.workspace = true
+parking_lot.workspace = true
+rustc-hash.workspace = true
+smallvec.workspace = true
+
+[features]
+nightly = []
+
+[target.'cfg(all(target_arch = "x86_64", target_os = "linux", not(target_env = "ohos")))'.dependencies]
+memmap2.workspace = true
+perf-event-open-sys.workspace = true

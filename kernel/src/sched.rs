@@ -768,6 +768,12 @@ fn collect_exits(scheduler: &mut Scheduler, gone: &mut GoneTasks) {
     }
 }
 
+/// The slot of the task running on this CPU, if it was running its program when the
+/// CPU trapped. Call with interrupts masked.
+pub fn current_user_slot() -> Option<usize> {
+    current_slot().filter(|slot| IN_USER[*slot].load(Ordering::Relaxed))
+}
+
 /// Whether this CPU is in its idle loop. Call with interrupts masked.
 pub fn is_idle() -> bool {
     current_slot().is_none()

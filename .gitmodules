@@ -1,0 +1,32 @@
+[submodule "ports/src/rust"]
+	path = ports/src/rust
+	url = https://github.com/rust-lang/rust
+	shallow = true
+[submodule "ports/src/relibc"]
+	path = ports/src/relibc
+	url = https://gitlab.redox-os.org/redox-os/relibc.git
+	shallow = true
+[submodule "ports/src/ninja"]
+	path = ports/src/ninja
+	url = https://github.com/ninja-build/ninja
+	shallow = true
+[submodule "ports/src/libc"]
+	path = ports/src/libc
+	url = https://github.com/rust-lang/libc
+	shallow = true
+[submodule "ports/src/make"]
+	path = ports/src/make
+	url = https://git.savannah.gnu.org/git/make.git
+	shallow = true
+[submodule "ports/src/gitoxide"]
+	path = ports/src/gitoxide
+	url = https://github.com/GitoxideLabs/gitoxide
+	shallow = true
+[submodule "ports/src/cmake"]
+	path = ports/src/cmake
+	url = https://github.com/Kitware/CMake
+	shallow = true
+[submodule "ports/src/cpython"]
+	path = ports/src/cpython
+	url = https://github.com/python/cpython
+	shallow = true

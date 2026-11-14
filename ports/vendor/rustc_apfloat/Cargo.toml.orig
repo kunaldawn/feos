@@ -1,0 +1,26 @@
+[workspace]
+members = ["fuzz"]
+
+[workspace.package]
+version = "0.2.3+llvm-462a31f5a5ab"
+edition = "2021"
+license = "Apache-2.0 WITH LLVM-exception"
+
+[package]
+name = "rustc_apfloat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository = "https://github.com/rust-lang/rustc_apfloat"
+description = "Rust port of C++ llvm::APFloat library"
+
+[dependencies]
+bitflags = "2.6.0"
+smallvec = { version = "1.11.0", features = ["const_generics", "union"] }
+
+[dev-dependencies]
+criterion = { version = "0.5.1", features = ["html_reports"] }
+
+[[bench]]
+name = "decimal"
+harness = false

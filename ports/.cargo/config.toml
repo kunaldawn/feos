@@ -1,0 +1,16 @@
+# Every cargo run under ports/ (rust's bootstrap, gitoxide, ...) takes crates.io
+# packages from ports/vendor and never from the network. A relative `directory`
+# here is relative to ports/, the parent of this .cargo directory.
+[source.crates-io]
+replace-with = "feos-vendor"
+
+[source.feos-vendor]
+directory = "vendor"
+
+[net]
+offline = true
+
+# The feos root's .cargo/config.toml defaults to the kernel target; builds
+# under ports/ are host programs unless they say otherwise.
+[build]
+target = "host-tuple"

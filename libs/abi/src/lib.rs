@@ -42,8 +42,9 @@ pub const USER_MMAP_END: usize = USER_STACK_TOP - USER_STACK_SIZE - USER_STACK_G
 
 /// Bytes of a page: the granularity of `mmap` and of an ELF segment's placement.
 pub const PAGE_SIZE: usize = 4096;
-/// Most memory one process can have mapped, in bytes.
-pub const USER_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
+/// Most memory one process can have mapped, in bytes. A machine with less to spare
+/// says `ENOMEM` sooner.
+pub const USER_MEMORY_LIMIT: usize = 4 * 1024 * 1024 * 1024;
 /// Open files one process can have, standard streams included.
 pub const MAX_FDS: usize = 16;
 /// Longest path a call accepts.
@@ -81,7 +82,8 @@ pub mod nr {
     /// `getpid() -> pid`
     pub const GETPID: usize = 7;
     /// `mmap(length, prot) -> address`: zeroed, private, anonymous memory. `prot` is
-    /// from [`prot`](super::prot).
+    /// from [`prot`](super::prot), or zero for none, as a guard. The memory is promised
+    /// when this returns, and gets its frames when it's first touched.
     pub const MMAP: usize = 8;
     /// `munmap(address, length) -> 0`: only what `mmap` handed out.
     pub const MUNMAP: usize = 9;
@@ -130,6 +132,10 @@ pub mod nr {
     pub const UNLINK: usize = 28;
     /// `link(existing, length, path, length) -> 0`: another name for a file.
     pub const LINK: usize = 29;
+    /// `mprotect(address, length, prot) -> 0`: changes what can be done with pages
+    /// `mmap` handed out. `prot` is from [`prot`](super::prot), and zero is no access at
+    /// all; a page keeps what's in it either way.
+    pub const MPROTECT: usize = 30;
 }
 
 /// Leaves the owner or group as it is, in [`nr::CHOWN`].

@@ -1,0 +1,136 @@
+on: [push, pull_request]
+permissions:
+  contents: read
+
+name: Basic tests
+
+# We don't need to run older workflows for the same PR's, since we always want the output of the newest ones.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Run full test suite
+    strategy:
+      matrix:
+        toolchain:
+          - stable
+          - nightly
+          - 1.88.0 # MSRV
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: ${{ matrix.toolchain }}
+
+      - name: Test debug-mode
+        run: cargo test --all-features
+
+      - name: Test debug-mode + serde
+        run: cargo test --features serde
+
+      - name: Test release-mode
+        run: cargo test --release --all-features
+
+      - name: Test no_std
+        run: cargo build --no-default-features --features v2,v3,v4
+
+      - name: Test only v2-full
+        run: cargo test --no-default-features --tests --features v2,std,paserk
+
+      - name: Test only v3-full
+        run: cargo test --no-default-features --tests --features v3,std,paserk
+
+      - name: Test only v4-full
+        run: cargo test --no-default-features --tests --features v4,std,paserk
+
+      - name: Test only v2-full + serde
+        run: cargo test --no-default-features --tests --features v2,std,paserk,serde
+
+      - name: Test only v3-full + serde
+        run: cargo test --no-default-features --tests --features v3,std,paserk,serde
+
+      - name: Test only v4-full + serde
+        run: cargo test --no-default-features --tests --features v4,std,paserk,serde
+
+  # https://rustwasm.github.io/docs/book/reference/add-wasm-support-to-crate.html#maintaining-ongoing-support-for-webassembly
+  web_assembly:
+    name: WebAssembly - Release build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch:
+          - wasm32-wasip1
+          - wasm32-wasip2
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: stable
+          targets: ${{ matrix.arch }}
+
+      - run: cargo check --no-default-features --features v2,v3,v4 --target ${WASM_TARGET}
+        # Remediation for potential template-injection: https://docs.zizmor.sh/audits/#template-injection
+        env:
+          WASM_TARGET: ${{ matrix.arch }}
+
+  cross_compilation:
+    name: Linux/ARM/Big-Endian/32-Bit - Release tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch:
+          - i686-unknown-linux-gnu
+          - armv7-unknown-linux-gnueabihf
+          - powerpc64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: houseabsolute/actions-rust-cross@9a1618ffb70e8374ab5f48fcccea3ebeacf57971
+        with:
+          command: test
+          target: ${{ matrix.arch }}
+          args: "--release --all-features"
+
+  docs:
+    name: Build documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: stable
+
+      - run: cargo doc --no-deps --all-features
+
+  semver_checks:
+    name: Check SemVer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: obi1kenobi/cargo-semver-checks-action@5b298c9520f7096a4683c0bd981a7ac5a7e249ae
+      
+      - run: cargo semver-checks
