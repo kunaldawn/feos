@@ -48,7 +48,8 @@ Relative paths are from `/`: external commands have no current directory.
 Retransmission on an RFC 6298 timer, with go-back-N after a timeout, and fast retransmit on
 three duplicate ACKs. Slow start and congestion avoidance (RFC 5681). Out-of-order
 reassembly, with a bound on what's held. Flow control with zero-window probes. All the
-close states, with TIME-WAIT of 30 s, which gives way when sockets run out. RFC 5961's
+close states, with TIME-WAIT of 30 s, which gives way when sockets run out (at 1024, of
+every kind together; the table grows from the heap as they're opened). RFC 5961's
 challenge ACK for a SYN or a reset that doesn't sit exactly at the next sequence number.
 
 ## What's tested, and how

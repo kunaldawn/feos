@@ -1389,3 +1389,64 @@ fn shell_state_is_send_for_the_terminal_static() {
     fn assert_send<T: Send>() {}
     assert_send::<Shell<'static>>();
 }
+
+// ----- Stage 1c.6: a program's environment -----
+
+/// Runs nothing, and keeps what each program it was asked to run would have been given.
+#[derive(Default)]
+struct ProgramHost {
+    runs: Vec<(String, Vec<String>, Vec<String>)>,
+}
+
+impl Host for ProgramHost {
+    fn run_external(
+        &mut self,
+        _name: &str,
+        _args: &[String],
+        _stdin: &mut dyn Input,
+        _stdout: &mut dyn Output,
+        _stderr: &mut dyn Output,
+        _background: bool,
+    ) -> Option<i32> {
+        None
+    }
+
+    fn run_program(
+        &mut self,
+        path: &str,
+        args: &[String],
+        env: &[String],
+        _cwd: &str,
+        _stdin: &mut dyn Input,
+        _stdout: &mut dyn Output,
+        _stderr: &mut dyn Output,
+        _background: bool,
+    ) -> Option<i32> {
+        self.runs.push((path.to_string(), args.to_vec(), env.to_vec()));
+        Some(0)
+    }
+}
+
+#[test]
+fn exported_variables_reach_the_spawn_request() {
+    let mut shell = Shell::new(None, &NoSystem);
+    let mut host = ProgramHost::default();
+    let mut input = BytesInput::empty();
+    let mut out = BytesOutput::new();
+    let mut err = BytesOutput::new();
+    let mut io = Io { stdin: &mut input, stdout: &mut out, stderr: &mut err };
+    for line in ["printf '\\177ELF' > /prog", "export SEEN=1; HIDDEN=2", "FOO=bar /prog --env", "/prog"] {
+        assert_eq!(shell.execute_line(line, &mut io, &mut host), 0, "{line}");
+    }
+    assert_eq!(host.runs.len(), 2);
+    let (path, args, env) = &host.runs[0];
+    assert_eq!((path.as_str(), args.as_slice()), ("/prog", ["--env".to_string()].as_slice()));
+    assert!(env.iter().any(|entry| entry == "FOO=bar"), "{env:?}");
+    assert!(env.iter().any(|entry| entry == "SEEN=1"));
+    assert!(env.iter().any(|entry| entry == "PATH=/bin:/usr/bin:/"));
+    assert!(!env.iter().any(|entry| entry.starts_with("HIDDEN=")));
+    // The command's own assignment was for it alone.
+    let (_, _, env) = &host.runs[1];
+    assert!(!env.iter().any(|entry| entry.starts_with("FOO=")));
+    assert!(env.iter().any(|entry| entry == "SEEN=1"));
+}

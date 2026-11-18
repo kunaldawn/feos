@@ -32,6 +32,7 @@ pub fn generate(data_dir: &Path) {
     collect(&root, "", &mut found);
     collect_user_programs(data_dir, &mut found);
     collect_assets(data_dir, &mut found);
+    collect_host_files(&mut found);
     found.sort_by(|left, right| left.0.cmp(&right.0));
 
     let mut entries = std::vec![EntryInfo {
@@ -195,6 +196,40 @@ fn collect_assets(data_dir: &Path, found: &mut Vec<(String, bool, PathBuf)>) {
             }
         }
         collect(&dir, target, found);
+    }
+}
+
+/// Files the image takes from the machine building it, where `fs/` has none of its own:
+/// the CA certificates rustls and OpenSSL look for (section 10.4 of the ABI design),
+/// which are public data every distribution keeps up to date, and too big to keep a
+/// copy of here. Each is the first candidate that exists; without one, the image goes
+/// without (webpki's compiled-in roots still work).
+const HOST_FILES: [(&str, &[&str]); 1] = [(
+    "etc/ssl/certs/ca-certificates.crt",
+    &["/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/cert.pem"],
+)];
+
+/// Adds [`HOST_FILES`].
+fn collect_host_files(found: &mut Vec<(String, bool, PathBuf)>) {
+    for (target, candidates) in HOST_FILES {
+        if found.iter().any(|(rel, _, _)| rel == target) {
+            continue;
+        }
+        let Some(source) = candidates.iter().map(Path::new).find(|path| path.is_file()) else {
+            continue;
+        };
+        println!("cargo:rerun-if-changed={}", source.display());
+        // Each directory on the way must be in the tree: make any that aren't.
+        let mut parent = String::new();
+        let mut parts: Vec<&str> = target.split('/').collect();
+        parts.pop();
+        for part in parts {
+            parent = if parent.is_empty() { part.to_string() } else { format!("{parent}/{part}") };
+            if !found.iter().any(|(rel, is_dir, _)| *is_dir && *rel == parent) {
+                found.push((parent.clone(), true, source.to_path_buf()));
+            }
+        }
+        found.push((target.to_string(), false, source.to_path_buf()));
     }
 }
 

@@ -131,6 +131,114 @@ pub unsafe fn unmap_range(
 const USER: u64 = 1 << 2;
 const NO_EXECUTE: u64 = 1 << 63;
 
+/// Bytes one page directory pointer table entry covers.
+const DIRECTORY_SPAN: usize = 1 << 30;
+
+/// Zeroes a page given over to being a table.
+///
+/// # Safety
+/// `table` must be a page nothing else uses.
+unsafe fn clear_table(table: usize) {
+    // SAFETY: as promised by the caller.
+    unsafe { core::ptr::write_bytes(table as *mut u8, 0, PAGE_SIZE) };
+}
+
+/// See `Arch::reserve_kernel_window`. The window's PDPT entry gets a page directory, and
+/// that a page table for each 2 MiB, all from the start: a process's PDPT copies the
+/// kernel's entries when it's made, so only what's below them can change later, and
+/// nothing below them is ever allocated or freed.
+///
+/// # Safety
+/// As for `Arch::reserve_kernel_window`.
+pub unsafe fn reserve_kernel_window(
+    base: usize,
+    size: usize,
+    alloc_table: &mut dyn FnMut() -> Option<usize>,
+) -> bool {
+    if !base.is_multiple_of(DIRECTORY_SPAN)
+        || size == 0
+        || size > DIRECTORY_SPAN
+        || !size.is_multiple_of(LARGE_PAGE)
+        || base / DIRECTORY_SPAN >= ENTRIES
+    {
+        return false;
+    }
+    let entry = addr_of!(pdpt).cast::<u64>().cast_mut().wrapping_add(base / DIRECTORY_SPAN);
+    // SAFETY: the index is inside the static table, as `base` was checked.
+    if unsafe { read_volatile(entry) } & PRESENT != 0 {
+        return false;
+    }
+    let Some(directory) = alloc_table() else {
+        return false;
+    };
+    // SAFETY: `alloc_table` gave this page to be a table.
+    unsafe { clear_table(directory) };
+    for index in 0..size / LARGE_PAGE {
+        let Some(table) = alloc_table() else {
+            return false;
+        };
+        // SAFETY: as above, for both tables.
+        unsafe {
+            clear_table(table);
+            (directory as *mut u64).add(index).write_volatile(table as u64 | PRESENT | WRITABLE);
+        }
+    }
+    // Not present to present: nothing to flush. Not user, so ring 3 never reaches it.
+    // SAFETY: the PDPT is the kernel's own, writable, and its entry was free.
+    unsafe { write_volatile(entry, directory as u64 | PRESENT | WRITABLE) };
+    true
+}
+
+/// The page table entry for `address` in a kernel window, or `None` if it isn't in one.
+fn window_entry(address: usize) -> Option<*mut u64> {
+    if address / DIRECTORY_SPAN >= ENTRIES {
+        return None;
+    }
+    // SAFETY: the index is inside the static table; the tables below a window's entry
+    // never change once made.
+    unsafe {
+        let top = read_volatile(addr_of!(pdpt).cast::<u64>().add(address / DIRECTORY_SPAN));
+        if top & PRESENT == 0 || top & LARGE != 0 {
+            return None;
+        }
+        let directory = read_volatile(((top & ADDRESS) as *const u64).add(address / LARGE_PAGE % ENTRIES));
+        if directory & PRESENT == 0 || directory & LARGE != 0 {
+            return None;
+        }
+        Some(((directory & ADDRESS) as *mut u64).add(address / PAGE_SIZE % ENTRIES))
+    }
+}
+
+/// See `Arch::map_kernel_page`.
+///
+/// # Safety
+/// As for `Arch::map_kernel_page`.
+pub unsafe fn map_kernel_page(address: usize, frame: usize) {
+    let Some(entry) = window_entry(address) else {
+        return;
+    };
+    let no_execute = if crate::cpu::has_nx() { NO_EXECUTE } else { 0 };
+    // SAFETY: the entry is the window's, and the caller's to change. A page that wasn't
+    // present can't be cached, so there's nothing to flush.
+    unsafe { write_volatile(entry, frame as u64 & ADDRESS | PRESENT | WRITABLE | no_execute) };
+}
+
+/// See `Arch::unmap_kernel_page`. Only this CPU forgets the page: the caller shoots it
+/// down elsewhere.
+///
+/// # Safety
+/// As for `Arch::unmap_kernel_page`.
+pub unsafe fn unmap_kernel_page(address: usize) {
+    let Some(entry) = window_entry(address) else {
+        return;
+    };
+    // SAFETY: as above; invalidating a TLB entry has no other effect.
+    unsafe {
+        write_volatile(entry, 0);
+        asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
+    }
+}
+
 /// How a user page table entry is written.
 pub fn user_bits() -> PageBits {
     PageBits {
@@ -145,9 +253,11 @@ pub fn user_bits() -> PageBits {
 }
 
 /// Puts a process's tables, `tables` being its page directory pointer table, under a
-/// new top table. The kernel's first 4 GiB are in the same table as user memory. The
-/// entries for it don't have the user bit, which makes all of it unreachable from ring
-/// 3 whatever's below them.
+/// new top table. The kernel's mappings below 512 GiB are in the same table as user
+/// memory: every present entry of the kernel's is copied, as AArch64 copies its whole
+/// top table, so what [`kernel_map_end`] counts is what a process has, and the boot check
+/// keeps those entries below the window. They don't have the user bit, which makes all
+/// of it unreachable from ring 3 whatever's below them.
 ///
 /// # Safety
 /// `tables` must be a table given over to this, past boot's changes to the kernel's.
@@ -159,13 +269,34 @@ pub unsafe fn prepare_user_tables(
     // SAFETY: as the caller promises for `tables`, and `alloc_table` for `top`.
     unsafe {
         core::ptr::write_bytes(top as *mut u8, 0, PAGE_SIZE);
-        for index in 0..4 {
+        for index in 0..ENTRIES {
             let entry = addr_of!(pdpt).cast::<u64>().add(index).read_volatile();
-            (tables as *mut u64).add(index).write_volatile(entry);
+            if entry & PRESENT != 0 {
+                (tables as *mut u64).add(index).write_volatile(entry);
+            }
         }
         (top as *mut u64).write_volatile(tables as u64 | PRESENT | WRITABLE | USER);
     }
     Some(top)
+}
+
+/// One past the highest address the kernel's tables map anything at. A process's top
+/// table has only entry 0, so a mapping under any other would be missing in a process;
+/// it counts here, past the window, so the boot check catches it. Its PDPT has every
+/// present entry of the kernel's.
+pub fn kernel_map_end() -> usize {
+    const PDPT_SPAN: usize = 1 << 30;
+    const PML4_SPAN: usize = 1 << 39;
+    let present = |table: *const u64, index: usize| {
+        // SAFETY: both tables have `ENTRIES`, and only boot changes them.
+        unsafe { table.add(index).read_volatile() & PRESENT != 0 }
+    };
+    let top = addr_of!(pml4).cast::<u64>();
+    if let Some(index) = (1..ENTRIES).rev().find(|&index| present(top, index)) {
+        return (index + 1) * PML4_SPAN;
+    }
+    let second = addr_of!(pdpt).cast::<u64>();
+    (0..ENTRIES).rev().find(|&index| present(second, index)).map_or(0, |index| (index + 1) * PDPT_SPAN)
 }
 
 /// Loads a process's tables, or the kernel's with `root` zero. There are no PCIDs here:
@@ -184,9 +315,38 @@ pub fn activate(root: usize) {
     }
 }
 
-/// Forgets one page on this CPU. No other CPU can have it: a process has one thread, and
-/// the CPU it last ran on flushed everything when it changed tables.
+/// Forgets one page on this CPU. Other CPUs that have the same tables loaded may have
+/// it too: the kernel asks them to [`flush_local`] with an IPI. A CPU that has changed
+/// tables since has forgotten it already, with everything else.
 pub fn flush_page(address: usize) {
     // SAFETY: invalidating a TLB entry has no other effect.
     unsafe { asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags)) };
+}
+
+/// Forgets every user translation on this CPU. There are no global user pages, so
+/// reloading CR3 with what it holds does it.
+pub fn flush_local() {
+    // SAFETY: rewriting CR3 with its own value only flushes the TLB.
+    unsafe {
+        asm!("mov {tmp}, cr3", "mov cr3, {tmp}", tmp = out(reg) _, options(nostack, preserves_flags));
+    }
+}
+
+/// Reads a word of the loaded user tables, with SMAP lifted for the one load.
+///
+/// # Safety
+/// `address` is mapped readable and aligned in the loaded tables.
+pub unsafe fn read_user_word(address: usize) -> u64 {
+    let value: u64;
+    if crate::cpu::has_smep_smap().1 {
+        // SAFETY: as the caller promises; `stac` and `clac` only change RFLAGS.AC, and
+        // interrupts can't see it set since each saves and restores RFLAGS.
+        unsafe {
+            asm!("stac", "mov {value}, [{address}]", "clac", value = out(reg) value, address = in(reg) address, options(nostack, readonly))
+        };
+    } else {
+        // SAFETY: as the caller promises.
+        unsafe { asm!("mov {value}, [{address}]", value = out(reg) value, address = in(reg) address, options(nostack, readonly, preserves_flags)) };
+    }
+    value
 }

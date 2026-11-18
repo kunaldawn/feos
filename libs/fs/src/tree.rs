@@ -266,6 +266,9 @@ pub(crate) struct NodeTable {
     pub(crate) nodes: Vec<Node>,
     /// Slots of removed nodes, reused by later additions.
     free: Vec<u32>,
+    /// Slots the VFS holds: their IDs are inode numbers something still refers to, so a
+    /// removal of one doesn't free it for reuse until it's let go.
+    kept: Vec<u32>,
     live: usize,
     /// Heap charged against [`MAX_TABLE_BYTES`] for names and child links.
     name_bytes: usize,
@@ -285,6 +288,7 @@ impl NodeTable {
                 None,
             )],
             free: Vec::new(),
+            kept: Vec::new(),
             live: 1,
             name_bytes: 0,
         }
@@ -401,8 +405,29 @@ impl NodeTable {
         slot.children = Vec::new();
         self.live -= 1;
         self.name_bytes = self.name_bytes.saturating_sub(released);
-        // If the free list can't grow, the slot is just not reused.
-        let _ = try_push(&mut self.free, node.0);
+        // If the free list can't grow, the slot is just not reused. A kept one waits.
+        if !self.kept.contains(&node.0) {
+            let _ = try_push(&mut self.free, node.0);
+        }
+        Ok(())
+    }
+
+    /// Keeps `node`'s slot from being reused after it's removed, or lets it go again. A
+    /// slot let go after its removal is free for reuse from then on.
+    pub(crate) fn keep(&mut self, node: NodeId, keep: bool) -> Result<(), FsError> {
+        if keep {
+            if !self.kept.contains(&node.0) {
+                try_push(&mut self.kept, node.0)?;
+            }
+            return Ok(());
+        }
+        let Some(at) = self.kept.iter().position(|&slot| slot == node.0) else {
+            return Ok(());
+        };
+        self.kept.swap_remove(at);
+        if self.nodes.get(node.0 as usize).is_some_and(|entry| !entry.alive) {
+            let _ = try_push(&mut self.free, node.0);
+        }
         Ok(())
     }
 

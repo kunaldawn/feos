@@ -71,7 +71,7 @@ fn the_host_formatter_makes_the_same_volume() {
 #[test]
 fn files_survive_a_remount_with_their_metadata() {
     let mut fs = fresh();
-    fs.set_time_source(|| Some(12345));
+    fs.set_time_source(|| Some(feos_fs::Timestamp::from_secs(12345)));
     let dir = fs.create_dir(NodeId::ROOT, "d\u{e9}").unwrap();
     let file = fs.create_file(dir, "file.txt").unwrap();
     assert_eq!(fs.write(file, 0, b"hello").unwrap(), 5);
@@ -84,7 +84,7 @@ fn files_survive_a_remount_with_their_metadata() {
     let meta = fs.posix(file).unwrap();
     assert_eq!(meta.mode, S_IFREG | 0o640);
     assert_eq!((meta.uid, meta.gid, meta.nlink), (1000, 100, 1));
-    assert_eq!(fs.times(file).modified, Some(12345));
+    assert_eq!(fs.times(file).modified, Some(feos_fs::Timestamp::from_secs(12345)));
     // A directory counts itself, `.`, and its subdirectories' `..`.
     assert_eq!(fs.posix(fs.resolve("/d\u{e9}").unwrap()).unwrap().nlink, 2);
     assert_eq!(fs.posix(NodeId::ROOT).unwrap().nlink, 3);

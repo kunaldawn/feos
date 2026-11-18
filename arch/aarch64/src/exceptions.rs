@@ -74,6 +74,26 @@ impl FaultInfo {
         }
     }
 
+    /// A translation, access flag or permission fault from EL0, which a change to the
+    /// tables can answer.
+    pub const fn memory_fault(&self) -> Option<feos_hal::MemoryFault> {
+        let class = self.exception_class();
+        if class != CLASS_USER_INSTRUCTION_ABORT && class != CLASS_USER_DATA_ABORT {
+            return None;
+        }
+        // The fault status code's top bits: 0b0001 translation, 0b0010 access flag,
+        // 0b0011 permission, at any level.
+        if !matches!((self.esr & 0x3f) >> 2, 0b0001..=0b0011) {
+            return None;
+        }
+        Some(feos_hal::MemoryFault {
+            address: self.far,
+            // `WnR`, for a data abort; cache maintenance counts as a write, as it should.
+            write: class == CLASS_USER_DATA_ABORT && self.esr & (1 << 6) != 0,
+            execute: class == CLASS_USER_INSTRUCTION_ABORT,
+        })
+    }
+
     /// Writes the general-purpose registers, four to a line.
     pub fn write_registers(&self, out: &mut dyn fmt::Write) -> fmt::Result {
         for (index, value) in self.regs.iter().enumerate() {

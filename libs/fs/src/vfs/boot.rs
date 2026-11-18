@@ -14,7 +14,8 @@ use alloc::vec::Vec;
 
 use feos_hal::BlockIo;
 
-use super::{join_path, DeviceKind, RamFs, Vfs, VfsTree, DEFAULT_QUOTA};
+use super::devfs::{DevFs, ProcFs, INSTALLED_VIEW};
+use super::{join_path, RamFs, Vfs, VfsTree, DEFAULT_QUOTA};
 use crate::block::{BlockDevice, DriverDevice};
 use crate::cache::BufferCache;
 use crate::partition::{read_partitions, Partition, PartitionInfo};
@@ -25,6 +26,8 @@ use crate::{attr, mount, EntryKind, FileSystem, FsError, NodeId, WritableFileSys
 const CACHE_BYTES: usize = 4 * 1024 * 1024;
 /// RAM for `/tmp`.
 const TMP_QUOTA: usize = 16 * 1024 * 1024;
+/// RAM for `/dev/shm`.
+const SHM_QUOTA: usize = 16 * 1024 * 1024;
 /// How much of a disk must read as zeros for it to count as blank.
 const BLANK_PROBE_BLOCKS: u64 = 64;
 /// Marks a root as seeded, so that deleting everything isn't undone next boot.
@@ -322,6 +325,8 @@ pub fn assemble<T: BlockIo + 'static>(
     if let Some(now) = now {
         vfs.set_time_source(now);
     }
+    // Files a crash left orphaned on the root: nothing can be using them yet.
+    let _ = vfs.clean_orphans("/");
 
     let rooted_on_disk = vfs.mounts().first().is_some_and(|root| root.source != "ram");
     if rooted_on_disk {
@@ -376,13 +381,38 @@ pub fn assemble<T: BlockIo + 'static>(
         }
     }
 
-    let _ = vfs.mount("/tmp", Box::new(RamFs::new(TMP_QUOTA)), false, "tmp");
-    let mut dev = RamFs::new(0);
-    let _ = dev.add_device(NodeId::ROOT, "null", DeviceKind::Null);
-    let _ = dev.add_device(NodeId::ROOT, "zero", DeviceKind::Zero);
-    let _ = vfs.mount("/dev", Box::new(dev), false, "dev");
+    // The kernel's own mounts (section 10.4 of the ABI design), the same whatever the
+    // root is: `/tmp` in RAM, so it's empty at every boot, open to everyone and sticky,
+    // so only an entry's owner (or root) takes it away; `/dev` with `/dev/shm` in it, a
+    // RAM directory like `/tmp` for POSIX shared memory; and `/proc`, which shows each
+    // program itself, through whatever view the kernel installs.
+    let _ = vfs.mount("/tmp", Box::new(RamFs::with_owners(TMP_QUOTA, 0o1777)), false, "tmp");
+    let _ = vfs.mount("/dev", Box::new(DevFs), false, "dev");
+    let _ = vfs.mount("/dev/shm", Box::new(RamFs::with_owners(SHM_QUOTA, 0o1777)), false, "shm");
+    let _ = vfs.mount("/proc", Box::new(ProcFs::new(&INSTALLED_VIEW)), false, "proc");
+    lay_out(&vfs);
 
     (Box::leak(Box::new(vfs)), log)
+}
+
+/// Directories every root has, made where they're missing: homes for `root` and `user`
+/// (as `/etc/passwd` names them), and where a sysroot's libraries and headers go.
+const LAYOUT_DIRS: [&str; 7] = ["/etc", "/root", "/home", "/home/user", "/usr", "/usr/lib", "/usr/include"];
+
+/// Makes what a POSIX program expects to find in the root and the image can't carry
+/// (it has no links, and an empty directory only with a hidden file in it): the
+/// directories of [`LAYOUT_DIRS`] and `/usr/bin` as a link to `/bin`. On a disk, once,
+/// since they stay; on the RAM root, at every boot. Nothing here is worth failing a boot
+/// over: a read-only or full root just goes without.
+fn lay_out(vfs: &Vfs) {
+    for dir in LAYOUT_DIRS {
+        if vfs.lstat(dir).is_err() {
+            let _ = vfs.create_dir(dir);
+        }
+    }
+    if vfs.lstat("/usr/bin").is_err() {
+        let _ = vfs.symlink("/bin", "/usr/bin");
+    }
 }
 
 fn seed_root(vfs: &Vfs, lower: &dyn FileSystem, fresh: bool, log: &mut BootLog) {

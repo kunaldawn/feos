@@ -170,6 +170,10 @@ impl FaultDetails for exceptions::FaultInfo {
         exceptions::FaultInfo::fault_address(self)
     }
 
+    fn memory_fault(&self) -> Option<feos_hal::MemoryFault> {
+        exceptions::FaultInfo::memory_fault(self)
+    }
+
     fn syndrome_name(&self) -> &'static str {
         exceptions::FaultInfo::syndrome_name(self)
     }
@@ -314,8 +318,31 @@ impl Arch for Aarch64 {
         unsafe { mmu::unmap_range(base, size, alloc_table) }
     }
 
+    unsafe fn reserve_kernel_window(
+        base: usize,
+        size: usize,
+        alloc_table: &mut dyn FnMut() -> Option<usize>,
+    ) -> bool {
+        // SAFETY: passed on from the caller.
+        unsafe { mmu::reserve_kernel_window(base, size, alloc_table) }
+    }
+
+    unsafe fn map_kernel_page(address: usize, frame: usize) {
+        // SAFETY: passed on from the caller.
+        unsafe { mmu::map_kernel_page(address, frame) }
+    }
+
+    unsafe fn unmap_kernel_page(address: usize) {
+        // SAFETY: passed on from the caller.
+        unsafe { mmu::unmap_kernel_page(address) }
+    }
+
     fn user_page_bits() -> PageBits {
         mmu::USER_BITS
+    }
+
+    fn kernel_map_end() -> usize {
+        mmu::kernel_map_end()
     }
 
     unsafe fn prepare_user_tables(
@@ -330,12 +357,32 @@ impl Arch for Aarch64 {
         mmu::activate(root, asid);
     }
 
+    fn user_asid_bits() -> u32 {
+        mmu::asid_bits()
+    }
+
+    // Every invalidation is the inner shareable kind, which every CPU carries out.
+    const USER_FLUSH_BROADCAST: bool = true;
+
     fn flush_user_space(asid: u16) {
         mmu::flush_space(asid);
     }
 
     fn flush_user_page(address: usize, asid: u16) {
         mmu::flush_page(address, asid);
+    }
+
+    fn flush_user_local() {
+        mmu::flush_local();
+    }
+
+    fn flush_user_all() {
+        mmu::flush_all();
+    }
+
+    unsafe fn read_user_word(address: usize) -> u64 {
+        // SAFETY: passed on from the caller.
+        unsafe { mmu::read_user_word(address) }
     }
 
     fn sync_user_tables() {
@@ -346,11 +393,27 @@ impl Arch for Aarch64 {
         mmu::sync_code(address, length);
     }
 
+    fn set_user_tls(value: usize) {
+        cpu::set_user_tls(value);
+    }
+
+    fn user_tls() -> usize {
+        cpu::user_tls()
+    }
+
+    fn user_hwcaps() -> (u64, u64) {
+        cpu::user_hwcaps()
+    }
+
+    // `msr tpidr_el0` is an EL0 instruction.
+    const USER_TLS_WRITABLE: bool = true;
+
     fn protection_summary() -> &'static str {
-        if cpu::has_pan() {
-            "execute-never, ASIDs, PAN"
-        } else {
-            "execute-never, ASIDs (this CPU has no PAN)"
+        match (cpu::has_pan(), mmu::asid_bits()) {
+            (true, 16) => "execute-never, 16-bit ASIDs, PAN",
+            (true, _) => "execute-never, 8-bit ASIDs, PAN",
+            (false, 16) => "execute-never, 16-bit ASIDs (this CPU has no PAN)",
+            (false, _) => "execute-never, 8-bit ASIDs (this CPU has no PAN)",
         }
     }
 }

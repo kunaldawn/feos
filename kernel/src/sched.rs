@@ -19,6 +19,9 @@
 //! executing on two cores at once. Idle cores run a tiny idle loop on a
 //! private stack. PID 1 is the shell and is never scheduled away permanently;
 //! every other slot can be filled by [`Processes::spawn`](feos_app::Processes::spawn).
+//! There are 1024 slots. Each but the shell's gets a stack of its own from `kstack` when
+//! it's taken, and `feos-sched` keeps bitmaps of them, so that nothing that happens
+//! often (a switch, a tick, a wake, collecting exits) looks at every slot.
 //!
 //! # Killing a process
 //!
@@ -46,6 +49,17 @@
 //! it. Either way, its exit is only recorded, and `wait` only returns, once that's
 //! done.
 //!
+//! # Threads
+//!
+//! A user program's process can have many tasks, its threads: each a slot of its own,
+//! with its own kernel stack, frames and thread pointer, sharing the process (and so its
+//! space and files) through the slot's reference to it. A thread's id is its slot's
+//! [`SLOT_PID`]; its process's pid, the first thread's id, is [`SLOT_TGID`]. Killing,
+//! stopping and waiting name the process and reach every thread (`feos-sched` has the
+//! rules). A process's exit status is decided once, by `EXIT` or a fault in any of its
+//! threads, which then has the others killed; its exit is recorded when its last thread
+//! is collected, and not before.
+//!
 //! # Exit status and a task's console
 //!
 //! A task's exit status goes into a small ring of recent exits once it has left the
@@ -61,7 +75,7 @@ use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::ptr::addr_of;
 use core::ptr::addr_of_mut;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use feos_app::pipe::{self, PipeHooks, PipeId};
 use feos_app::{
@@ -73,7 +87,7 @@ use feos_hal::{Arch, Board, Clock, IpiTarget, TrapContext};
 use feos_sched::{KillOutcome, Request, State, Table, TaskFacts};
 use feos_sync::{IrqSpinLock, SchedHooks};
 
-use crate::{Frame, Machine, Port};
+use crate::{kstack, Frame, Machine, Port};
 
 /// Number of process slots, including the shell.
 const MAX_TASKS: usize = MAX_PROCESSES;
@@ -85,46 +99,18 @@ const MAX_CPUS: usize = Port::MAX_CPUS;
 // would need to widen `feos_app::MAX_CPUS` as well.
 const _: () = assert!(MAX_CPUS <= feos_app::MAX_CPUS);
 
-/// Stack size reserved for each spawned process.
-///
-/// The shell keeps using the linker-provided kernel stack, so this is only
-/// allocated for the remaining slots.
-const STACK_SIZE: usize = 256 * 1024;
-
 /// Stack size used by a CPU's idle loop.
 const IDLE_STACK_SIZE: usize = 16 * 1024;
 
 /// How long a killed process with live heap may keep running to free it.
 const KILL_GRACE_MS: u64 = 200;
 
-/// Words at the bottom of a stack that must never change.
-const CANARY_WORDS: usize = 8;
-const CANARY: u64 = 0xdead_57ac_dead_57ac;
-/// Fills the rest of a stack, so the high-water mark can be measured.
-const STACK_FILL: u64 = 0x5a5a_5a5a_5a5a_5a5a;
-
 /// Unused memory the linker script leaves below the boot stack, as a guard.
 const BOOT_STACK_GAP: usize = 0x40000;
-
-/// Unmapped memory below each process stack, so an overflow faults right there. It's
-/// more than one page so that a large frame, or a chain of function calls that
-/// doesn't touch every page, can't step over it.
-const STACK_GAP: usize = 16 * 1024;
-const STACK_STRIDE: usize = STACK_SIZE + STACK_GAP;
 
 /// Exit status of a task ended for a CPU fault or a panic, as a shell would report
 /// a segmentation fault.
 const EXIT_FAULTED: i32 = 139;
-
-/// Process stacks, in `.bss` and outside the table, so an overflow can't reach
-/// the task's own saved state. Page aligned for the sake of the guard pages.
-#[repr(C, align(4096))]
-struct Stacks(UnsafeCell<[[u8; STACK_STRIDE]; MAX_TASKS - 1]>);
-
-// SAFETY: each stack is used by one task at a time, and the table says which.
-unsafe impl Sync for Stacks {}
-
-static STACKS: Stacks = Stacks(UnsafeCell::new([[0; STACK_STRIDE]; MAX_TASKS - 1]));
 
 /// Private idle stacks, one per CPU.
 #[repr(C, align(16))]
@@ -162,6 +148,12 @@ static IN_USER: [AtomicBool; MAX_TASKS] = [const { AtomicBool::new(false) }; MAX
 /// What to load for the task in each slot: its page tables, or zero for the kernel's.
 static ROOT: [AtomicUsize; MAX_TASKS] = [const { AtomicUsize::new(0) }; MAX_TASKS];
 
+/// The TLB bookkeeping of the space each slot's task runs in, beside [`ROOT`]: which
+/// CPUs have it, and its ASID. Null for the kernel's tables. It lives as long as the
+/// slot's process does, which outlives the slot's having it here.
+static TLBS: [AtomicPtr<crate::user::tlb::Tlb>; MAX_TASKS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_TASKS];
+
 /// How deep the user program in each slot is in the kernel: one from when it starts
 /// (loading is the kernel's work) and from each system call or fault, until it's about
 /// to resume the program. Zero for kernel-linked apps. Only the slot's own CPU changes
@@ -179,6 +171,8 @@ static ATTENTION: [AtomicBool; MAX_TASKS] = [const { AtomicBool::new(false) }; M
 pub struct UserFault {
     /// The address of a memory fault.
     pub address: Option<u64>,
+    /// A fault the page tables might answer, and what was tried.
+    pub memory: Option<feos_hal::MemoryFault>,
     /// What kind of fault it was.
     pub name: &'static str,
     /// The instruction that faulted.
@@ -192,12 +186,38 @@ struct FaultNotes([UnsafeCell<UserFault>; MAX_TASKS]);
 unsafe impl Sync for FaultNotes {}
 
 static FAULT_NOTES: FaultNotes = FaultNotes(
-    [const { UnsafeCell::new(UserFault { address: None, name: "", instruction: 0 }) }; MAX_TASKS],
+    [const { UnsafeCell::new(UserFault { address: None, memory: None, name: "", instruction: 0 }) }; MAX_TASKS],
 );
 
 /// The task in each slot gave back what it held itself, on its way out, so there's
 /// nothing left to queue for the reaper when it leaves the table.
 static TORN_DOWN: [AtomicBool; MAX_TASKS] = [const { AtomicBool::new(false) }; MAX_TASKS];
+
+/// Each slot's user thread pointer: what `SET_TLS` set, and on AArch64 whatever the
+/// program left in `TPIDR_EL0`, saved every time the thread leaves its CPU, in a call
+/// or not. Written back at every switch in, so no CPU caches whose it holds. Zero for
+/// kernel-linked apps, which never use it.
+static TLS: [AtomicUsize; MAX_TASKS] = [const { AtomicUsize::new(0) }; MAX_TASKS];
+
+/// The word each user thread's end clears, for `pthread_join`: zero for none.
+static CLEAR_WORD: [AtomicUsize; MAX_TASKS] = [const { AtomicUsize::new(0) }; MAX_TASKS];
+
+/// Free slots a user program can't take, by starting threads or programs: room for the
+/// kernel's own work, and for a shell to `kill` a thread bomb with. User programs stop at
+/// 960 tasks machine-wide.
+const KEEP_FOR_KERNEL: usize = 64;
+
+/// Most threads one process may have, its first included: as many as user programs can
+/// have at all, so the machine's limit is the one a bomb meets.
+pub const MAX_THREADS: usize = MAX_TASKS - KEEP_FOR_KERNEL;
+
+/// What a user program's new task may take: the slots above, and for a user other than
+/// root, at most half of what's left as tasks, and a quarter as processes.
+const USER_LIMITS: feos_sched::UserLimits = feos_sched::UserLimits {
+    keep: KEEP_FOR_KERNEL,
+    tasks_per_uid: 512,
+    processes_per_uid: 256,
+};
 
 /// What the kernel keeps about a task beyond scheduling policy.
 struct Task {
@@ -207,10 +227,11 @@ struct Task {
     app: Option<&'static dyn App>,
     /// What a task started by [`Processes::spawn_task`] runs, until it starts.
     entry: Option<Box<dyn FnOnce() -> i32 + Send>>,
-    /// The program a user task loads: no heap, because a task that goes to EL0 never
-    /// comes back to free any.
-    user_path: [u8; feos_abi::PATH_MAX],
-    user_path_len: usize,
+    /// The program a user task loads and where it starts, on the heap since a path may
+    /// be `PATH_MAX` long. Put here before the task is committed, and taken out by the
+    /// task as it starts, both under the lock and so neither allocating nor freeing
+    /// there: whatever was left in the slot is dropped once the lock is let go.
+    user_start: Option<Box<crate::user::UserStart>>,
     is_user: bool,
     /// Lowest and highest stack addresses, set when the task is created.
     stack: (usize, usize),
@@ -218,12 +239,20 @@ struct Task {
     started_ms: u64,
     /// PID of the task that started this one.
     parent: u32,
+    /// The slot of a thread of the parent, the one that started this task, where
+    /// [`collect_exits`] looks for it first. It may have gone, and its slot been reused.
+    parent_slot: u16,
     /// Spared by an interrupt to the parent.
     background: bool,
     /// The slot's PID hasn't had its exit recorded yet.
     live: bool,
     /// What [`collect_exits`] records. A kill leaves [`EXIT_KILLED`] here.
     exit_code: i32,
+    /// The status its process was given, by `EXIT` or a failure in any of its threads,
+    /// which every thread of it keeps: what its exit is recorded with, whichever thread
+    /// is last and however that one ended. Written under the scheduler lock for the
+    /// whole process at once, so the record can't miss it.
+    group_code: Option<i32>,
 }
 
 impl Task {
@@ -243,6 +272,9 @@ struct ExitRecord {
     pid: u32,
     code: i32,
     parent: u32,
+    /// The process's last thread: its exit is the process's. A thread before it leaves
+    /// only its teardown, which a wait still waits for.
+    last: bool,
 }
 
 struct Scheduler {
@@ -286,8 +318,15 @@ static LOCK_DEPTH: [AtomicU32; MAX_TASKS] = [const { AtomicU32::new(0) }; MAX_TA
 /// Live heap bytes owned by the task in each slot.
 static HEAP_BYTES: [AtomicUsize; MAX_TASKS] = [const { AtomicUsize::new(0) }; MAX_TASKS];
 
-/// PID in each slot, for attributing heap frees without the scheduler lock.
+/// Thread id in each slot, for attributing heap frees without the scheduler lock: the
+/// heap records a block's owner by it, so a block is charged to the thread, which is one
+/// slot, whatever its process.
 static SLOT_PID: [AtomicU32; MAX_TASKS] = [const { AtomicU32::new(0) }; MAX_TASKS];
+
+/// The process of the thread in each slot: its first thread's id. The same as
+/// [`SLOT_PID`] for kernel-linked apps and first threads. What pipes record a holder
+/// by, since the files a thread holds are its process's.
+static SLOT_TGID: [AtomicU32; MAX_TASKS] = [const { AtomicU32::new(0) }; MAX_TASKS];
 
 /// The pipes behind each slot's standard output and error, or zero for the
 /// registered console. Written while the slot is reserved, read by its task.
@@ -296,6 +335,19 @@ static STDOUT: [AtomicU32; MAX_TASKS] = [const { AtomicU32::new(0) }; MAX_TASKS]
 /// read through this; kernel-linked apps are handed their streams.
 static STDIN: [AtomicU32; MAX_TASKS] = [const { AtomicU32::new(0) }; MAX_TASKS];
 /// Who each task is. Everything starts as root, and only a user program can stop being.
+/// Each slot's process group and session, the same in every thread of a process, and
+/// changed only under the scheduler's lock (`SETPGID`, `SETSID`). The kernel's own tasks
+/// are in group 1 and session 1, the shell's, which is the terminal's session too.
+static SLOT_PGID: [AtomicU32; MAX_TASKS] = [const { AtomicU32::new(0) }; MAX_TASKS];
+static SLOT_SID: [AtomicU32; MAX_TASKS] = [const { AtomicU32::new(0) }; MAX_TASKS];
+/// Each thread's signal mask, bit `n - 1` for signal `n`: inherited by a new thread and
+/// by a spawned program, or set by `SPAWN2`'s `SETSIGMASK`. Nothing delivers signals
+/// yet (stage 1c.10 makes the mask mean something), so it's only kept.
+static SIGNAL_MASK: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_TASKS];
+
+/// The session and group the terminal's programs are in: the shell's.
+const TERMINAL_SESSION: u32 = 1;
+
 static TASK_UID: [AtomicU32; MAX_TASKS] = [const { AtomicU32::new(0) }; MAX_TASKS];
 static TASK_GID: [AtomicU32; MAX_TASKS] = [const { AtomicU32::new(0) }; MAX_TASKS];
 
@@ -304,10 +356,21 @@ pub fn credentials(slot: usize) -> (u32, u32) {
     (TASK_UID[slot].load(Ordering::Relaxed), TASK_GID[slot].load(Ordering::Relaxed))
 }
 
-/// Sets who the task in `slot` is, and what it starts from now on.
+/// Sets who the process of the task in `slot` is, every thread of it, and what it starts
+/// from now on. Under the scheduler lock, so a thread being started takes either the old
+/// or the new, and is counted here if it took the old.
 pub fn set_credentials(slot: usize, uid: u32, gid: u32) {
-    TASK_UID[slot].store(uid, Ordering::Relaxed);
-    TASK_GID[slot].store(gid, Ordering::Relaxed);
+    let mut scheduler = SCHEDULER.lock();
+    let tgid = SLOT_TGID[slot].load(Ordering::Relaxed);
+    // The caps count by the table's.
+    scheduler.table.set_uid(tgid, uid);
+    for other in 0..MAX_TASKS {
+        let task = &scheduler.table.tasks()[other];
+        if other == slot || (task.state != State::Free && task.tgid == tgid) {
+            TASK_UID[other].store(uid, Ordering::Relaxed);
+            TASK_GID[other].store(gid, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Signals each task handles itself, and those waiting for it, as `1 << number`.
@@ -348,9 +411,24 @@ enum PendingRequest {
     Wait(usize, u32),
     /// The same, and not past this counter value.
     WaitUntil(usize, u32, u64),
+    /// Block on a user program's futex word.
+    WaitUser(UserWait),
     Exit,
     /// Continue at EL0 or ring 3, from the slot's user frame.
     ToUser,
+}
+
+/// A user futex wait, for the scheduler to check and carry out under its lock.
+#[derive(Clone, Copy)]
+struct UserWait {
+    /// The kernel's address of the word, whose frame the waiter has pinned.
+    word: usize,
+    key: feos_sched::UserKey,
+    expected: u32,
+    /// The space's unmap count, and what the waiter saw of it with the word's key.
+    unmaps: usize,
+    seen: u32,
+    deadline: Option<u64>,
 }
 
 static PENDING: [PendingSwitch; MAX_CPUS] =
@@ -380,6 +458,56 @@ fn this_cpu() -> usize {
 /// The current task's slot. Call with interrupts masked, so it can't migrate.
 fn current_slot() -> Option<usize> {
     CURRENT[this_cpu()].load(Ordering::Relaxed).checked_sub(1)
+}
+
+/// Holds off a kill of the calling task for as long as it's alive, as a lock does: for
+/// a change that a kill part way through would leave half made, with nothing to finish
+/// or undo it. A failure under it stops the machine, as under any lock.
+pub(crate) struct NoKill;
+
+impl NoKill {
+    pub(crate) fn new() -> Self {
+        lock_enter();
+        Self
+    }
+}
+
+impl Drop for NoKill {
+    fn drop(&mut self) {
+        lock_exit();
+        take_kill_now();
+    }
+}
+
+/// A kill that waited for a [`NoKill`] to go takes effect now, rather than at whatever
+/// switch next finds the task outside one: a kernel app that takes one after another
+/// (`ps` reading every stack) is almost never outside one when a tick comes, and would
+/// otherwise outlive its kill indefinitely. Only a kernel app with no other lock and
+/// interrupts on: a program's thread in a call goes at its way back to its program.
+fn take_kill_now() {
+    if !can_block() {
+        return;
+    }
+    let flags = Port::irq_save_and_disable();
+    let due = current_slot().is_some_and(|slot| {
+        slot != 0
+            && ATTENTION[slot].load(Ordering::Acquire)
+            && LOCK_DEPTH[slot].load(Ordering::Acquire) == 0
+            && IN_CALL[slot].load(Ordering::Acquire) == 0
+    });
+    Port::irq_restore(flags);
+    // The switch reaps it, if nothing else (live heap in its grace) holds the kill off.
+    if due && kill_requested() {
+        yield_now();
+    }
+}
+
+/// The calling task's slot, if it has one: the same whichever CPU it's on.
+pub fn caller_slot() -> Option<usize> {
+    let flags = Port::irq_save_and_disable();
+    let slot = current_slot();
+    Port::irq_restore(flags);
+    slot
 }
 
 pub(crate) fn lock_enter() {
@@ -419,9 +547,15 @@ fn futex_wake(word: &AtomicU32, count: usize) {
     kick(idle);
 }
 
+/// `ms` milliseconds in timer ticks, saturating: a length that comes from a program can
+/// be anything, and one too long to count is forever rather than whatever it wraps to.
+fn ms_to_ticks(ms: u64) -> u64 {
+    u64::try_from(Port::services().frequency() as u128 * ms as u128 / 1000).unwrap_or(u64::MAX)
+}
+
 fn futex_wait_ms(word: &AtomicU32, expected: u32, ms: u64) {
     if can_block() {
-        let delta = (Port::services().frequency() as u128 * ms as u128 / 1000) as u64;
+        let delta = ms_to_ticks(ms);
         let deadline = Port::services().ticks().saturating_add(delta);
         switch_with(PendingRequest::WaitUntil(word as *const AtomicU32 as usize, expected, deadline));
     } else {
@@ -463,37 +597,6 @@ pub fn platform() -> &'static Platform {
     unsafe { (&*addr_of!(PLATFORM)).assume_init_ref() }
 }
 
-/// Fills the words `[bottom, end)` of a stack, with the canary at the bottom.
-///
-/// # Safety
-/// The range must be unused stack memory.
-unsafe fn paint_stack(bottom: usize, end: usize) {
-    let words = (end - bottom) / core::mem::size_of::<u64>();
-    let stack = bottom as *mut u64;
-    for word in 0..words {
-        let value = if word < CANARY_WORDS { CANARY } else { STACK_FILL };
-        // SAFETY: the caller owns the range, and stacks are 16-byte aligned.
-        unsafe { stack.add(word).write_volatile(value) };
-    }
-}
-
-/// Bytes of the stack starting at `bottom` that have ever been used.
-fn stack_high_water(bottom: usize, size: usize) -> usize {
-    if bottom == 0 {
-        return 0;
-    }
-    let total = size / core::mem::size_of::<u64>();
-    let stack = bottom as *const u64;
-    for word in CANARY_WORDS..total {
-        // SAFETY: the range is one of the kernel's stacks. Its owner may be
-        // writing to it, which at worst makes this estimate slightly stale.
-        if unsafe { stack.add(word).read_volatile() } != STACK_FILL {
-            return (total - word) * core::mem::size_of::<u64>();
-        }
-    }
-    0
-}
-
 /// Whether the task's stack still looks right: its canary is intact and its stack
 /// pointer is inside it.
 ///
@@ -507,11 +610,11 @@ fn stack_is_sound(scheduler: &Scheduler, slot: usize, frame: &Frame) -> bool {
         return true;
     }
 
-    let canary_end = bottom + CANARY_WORDS * core::mem::size_of::<u64>();
+    let canary_end = bottom + kstack::CANARY_WORDS * core::mem::size_of::<u64>();
     let sp = frame.stack_pointer();
     let stack = bottom as *const u64;
-    // SAFETY: the canary words are part of this task's stack.
-    let intact = (0..CANARY_WORDS).all(|word| unsafe { stack.add(word).read_volatile() } == CANARY);
+    // SAFETY: the canary words are part of this task's stack, which it has while it runs.
+    let intact = (0..kstack::CANARY_WORDS).all(|word| unsafe { stack.add(word).read_volatile() } == kstack::CANARY);
     // A program's stack pointer is the program's business.
     intact && (frame.is_user() || (canary_end..=top).contains(&sp))
 }
@@ -532,24 +635,54 @@ pub fn contain_failure() -> bool {
     if contained {
         if let Some(slot) = slot {
             FAULTED[slot].store(true, Ordering::Release);
+            // A thread of a program failing in its call ends the whole process: what the
+            // others share with it, its files and its space, may be half changed.
+            if ROOT[slot].load(Ordering::Relaxed) != 0 {
+                end_group(slot, EXIT_FAULTED);
+            }
         }
     }
     contained
+}
+
+/// Decides the exit status of the process of the user thread in `slot`, unless a thread
+/// of it already has, and asks each of its other threads to end, as a kill does: one in a
+/// call unwinds it first, one at its program goes at once. Every thread of it keeps the
+/// status, so whichever is last records it. The caller then ends its own thread.
+fn end_group(slot: usize, code: i32) {
+    let grace = Port::services().frequency() / 1000 * KILL_GRACE_MS;
+    let now = Port::services().ticks();
+    let idle = {
+        let mut scheduler = SCHEDULER.lock();
+        let scheduler = &mut *scheduler;
+        let tgid = scheduler.table.tasks()[slot].tgid;
+        let code = scheduler.tasks[slot].group_code.unwrap_or(code);
+        for other in 0..MAX_TASKS {
+            let task = scheduler.table.tasks()[other];
+            if task.tgid != tgid || (task.state == State::Free && !scheduler.tasks[other].live) {
+                continue;
+            }
+            scheduler.tasks[other].group_code = Some(code);
+            if other != slot && scheduler.table.kill_slot(other, now, grace, &Facts) == KillOutcome::Pending {
+                ATTENTION[other].store(true, Ordering::Release);
+            }
+        }
+        let collected = collect_exits(scheduler);
+        announce(scheduler, collected).or(scheduler.table.idle_cpu(this_cpu()))
+    };
+    kick(idle);
 }
 
 /// If `address` is in the guard page below the current task's stack, the bounds of
 /// that stack. For the fault path, so it must not wait.
 pub fn stack_overflow_at(address: u64) -> Option<(usize, usize)> {
     let slot = current_slot()?;
-    let (bottom, top) = if slot == 0 {
-        Machine::stack_range()
-    } else {
-        let bottom = stack_bottom(slot);
-        (bottom, bottom + STACK_SIZE)
-    };
-    let gap = if slot == 0 { BOOT_STACK_GAP } else { STACK_GAP };
     let address = address as usize;
-    (bottom.saturating_sub(gap)..bottom).contains(&address).then_some((bottom, top))
+    if slot != 0 {
+        return kstack::overflow_of(slot, address);
+    }
+    let (bottom, top) = Machine::stack_range();
+    (bottom.saturating_sub(BOOT_STACK_GAP)..bottom).contains(&address).then_some((bottom, top))
 }
 
 /// Ends the task whose fault trapped into `frame`, and swaps in the next task's.
@@ -562,13 +695,9 @@ pub fn end_task() -> ! {
     exit_task(EXIT_FAULTED, false)
 }
 
-/// Lowest address of a spawned task's stack.
-fn stack_bottom(slot: usize) -> usize {
-    STACKS.0.get() as usize + (slot - 1) * STACK_STRIDE + STACK_GAP
-}
-
-/// Takes the unused memory below every stack out of the page tables, so that
-/// overflowing one is a fault at the time, not corruption found out later.
+/// Takes the unused memory below the boot stack out of the page tables, so that
+/// overflowing it is a fault at the time, not corruption found out later. Every other
+/// task's stack is in the window `kstack` keeps, with a gap below it that's never mapped.
 ///
 /// Call on the boot CPU before others start: changing the tables is only simple
 /// with nobody else using them.
@@ -579,18 +708,12 @@ fn map_guard_pages() {
     };
     let (boot_bottom, _) = Machine::stack_range();
     // SAFETY: the linker script leaves this below the boot stack and nothing uses it.
-    let mut mapped = unsafe {
+    let mapped = unsafe {
         Port::unmap_range(boot_bottom - BOOT_STACK_GAP, BOOT_STACK_GAP, &mut alloc_table)
     };
-    for slot in 1..MAX_TASKS {
-        // SAFETY: nothing ever uses a stack's gap, by that stack or any other.
-        mapped &= unsafe {
-            Port::unmap_range(stack_bottom(slot) - STACK_GAP, STACK_GAP, &mut alloc_table)
-        };
-    }
-    // Stacks would still work without their guards, with the canaries as a backstop.
+    // The stack would still work without its guard, with the canaries as a backstop.
     if !mapped {
-        feos_console::println!("[mem] guard pages couldn't all be mapped");
+        feos_console::println!("[mem] the boot stack's guard couldn't be mapped");
     }
 }
 
@@ -603,7 +726,7 @@ pub fn init() {
     let here = addr_of!(bottom) as usize;
     // SAFETY: everything this far below the current frame is unused. Later
     // calls may go deeper than this margin, but they haven't happened yet.
-    unsafe { paint_stack(bottom, here.saturating_sub(16 * 1024).max(bottom)) };
+    unsafe { kstack::paint(bottom, here.saturating_sub(16 * 1024).max(bottom)) };
 
     let mut scheduler = SCHEDULER.lock();
     scheduler.table.init();
@@ -616,8 +739,11 @@ pub fn init() {
     CURRENT[0].store(1, Ordering::Release);
     Port::set_trap_frame(TASK_FRAMES.0[0].get());
     feos_sync::install_hooks(&HOOKS);
+    SLOT_TGID[0].store(1, Ordering::Release);
+    SLOT_PGID[0].store(TERMINAL_SESSION, Ordering::Release);
+    SLOT_SID[0].store(TERMINAL_SESSION, Ordering::Release);
     pipe::install_hooks(PipeHooks {
-        current_pid,
+        current_pid: current_tgid,
         interrupted: kill_requested,
     });
     feos_console::set_router(route_console);
@@ -646,10 +772,13 @@ fn idle_frame(cpu: usize) -> *mut Frame {
     frame
 }
 
-/// The address space ID of the task in a slot. Live spaces each have their own, and
-/// [`collect_exits`] clears the TLB of one before it can be used again.
-const fn asid(slot: usize) -> u16 {
-    slot as u16 + 1
+/// Loads the tables of the task in `slot` on this CPU, `cpu`, or the kernel's with no
+/// slot. With interrupts masked.
+fn load_tables(cpu: usize, slot: Option<usize>) {
+    match slot {
+        Some(slot) => crate::user::tlb::load(cpu, ROOT[slot].load(Ordering::Relaxed), TLBS[slot].load(Ordering::Relaxed)),
+        None => crate::user::tlb::load(cpu, 0, core::ptr::null()),
+    }
 }
 
 /// The frame the task in a slot resumes from.
@@ -707,7 +836,21 @@ fn reschedule(frame: &mut Frame, request: impl FnOnce() -> Request, tick: bool) 
         }
         scheduler.table.account_elapsed(cpu, now, period, idle_hint);
 
+        let outgoing = scheduler.table.current(cpu);
         let switch = scheduler.table.switch(cpu, request, now, &Facts);
+        // The thread pointer is a thread's: kept as one leaves the CPU, where a program
+        // can write it itself, and set as the next comes, always, so nothing a program
+        // left in the register (or, on x86_64, a selector load left in the FS base) is
+        // ever another's. Before the lock goes, so no other CPU runs the outgoing thread
+        // with what it had not yet saved.
+        if switch.next != outgoing {
+            if let (Some(slot), true) = (outgoing, Port::USER_TLS_WRITABLE) {
+                TLS[slot].store(Port::user_tls(), Ordering::Relaxed);
+            }
+            if let Some(slot) = switch.next {
+                Port::set_user_tls(TLS[slot].load(Ordering::Relaxed));
+            }
+        }
 
         match switch.next {
             // The outgoing task carries on, from the frame the trap saved: unless that
@@ -718,18 +861,18 @@ fn reschedule(frame: &mut Frame, request: impl FnOnce() -> Request, tick: bool) 
                     // Its tables too, as on the way out of `on_switch_request`: a
                     // program's first entry comes here from a task that loaded it on
                     // the kernel's tables.
-                    Port::activate_user_tables(ROOT[slot].load(Ordering::Relaxed), asid(slot));
+                    load_tables(cpu, Some(slot));
                     Port::resume(resume);
                 }
             }
             Some(slot) => {
-                Port::activate_user_tables(ROOT[slot].load(Ordering::Relaxed), asid(slot));
+                load_tables(cpu, Some(slot));
                 Port::resume(resume_frame(slot));
                 CURRENT[cpu].store(slot + 1, Ordering::Relaxed);
             }
             None => {
                 // No runnable process: park this CPU on its private idle stack.
-                Port::activate_user_tables(0, 0);
+                load_tables(cpu, None);
                 Port::resume(idle_frame(cpu));
                 CURRENT[cpu].store(0, Ordering::Relaxed);
             }
@@ -762,7 +905,8 @@ struct Teardown {
     /// that lock sees the record whole. Taking one is a compare-and-swap.
     state: AtomicU8,
     record: UnsafeCell<ExitRecord>,
-    process: UnsafeCell<Option<crate::user::Process>>,
+    /// The task's reference to its process, dropped in task context.
+    process: UnsafeCell<Option<alloc::sync::Arc<crate::user::Process>>>,
 }
 
 // SAFETY: the cells belong to whoever moved `state` to its current value: the filler
@@ -780,7 +924,7 @@ const TEARDOWN_ENTRIES: usize = MAX_TASKS * 2;
 static TEARDOWNS: [Teardown; TEARDOWN_ENTRIES] = [const {
     Teardown {
         state: AtomicU8::new(EMPTY),
-        record: UnsafeCell::new(ExitRecord { pid: 0, code: 0, parent: 0 }),
+        record: UnsafeCell::new(ExitRecord { pid: 0, code: 0, parent: 0, last: false }),
         process: UnsafeCell::new(None),
     }
 }; TEARDOWN_ENTRIES];
@@ -819,17 +963,20 @@ struct Collected {
     complete: bool,
     /// An exit was recorded.
     recorded: bool,
-    /// A teardown was queued.
+    /// A teardown was queued, or a stack left for the reaper to give back.
     queued: bool,
 }
 
 /// Records the exit of every task that has left the table and has given back what it
 /// held, and queues the rest for teardown. Runs under the scheduler lock, often in a
-/// trap, so it only moves things: see [`drain_teardowns`].
+/// trap, so it only moves things: see [`drain_teardowns`]. The table's bitmap of slots
+/// that have left says which to look at, so this costs next to nothing when none have.
 fn collect_exits(scheduler: &mut Scheduler) -> Collected {
     let mut collected = Collected { complete: true, ..Collected::default() };
-    for slot in 1..MAX_TASKS {
-        if !scheduler.tasks[slot].live || scheduler.table.tasks()[slot].state != State::Free {
+    let left = scheduler.table.left();
+    for slot in left.iter() {
+        if slot == 0 || !scheduler.tasks[slot].live || scheduler.table.tasks()[slot].state != State::Free {
+            scheduler.table.forget_left(slot);
             continue;
         }
         let torn_down = TORN_DOWN[slot].load(Ordering::Acquire);
@@ -847,42 +994,59 @@ fn collect_exits(scheduler: &mut Scheduler) -> Collected {
             }
         };
         // Its CPU time passes to its parent, for `time`. The table keeps the count until
-        // the slot is next reserved.
+        // the slot is next reserved. A thread's parent is its process's.
         let spent = scheduler.table.tasks()[slot].cpu_ticks.wrapping_add(CHILD_TICKS[slot].load(Ordering::Relaxed));
+        // The parent is looked for in the slot of the task that started this one first,
+        // so collecting a thousand threads' exits doesn't scan the table for each. Only
+        // when that task has gone, and its slot with it, are the parent's other threads
+        // searched for.
         let parent = scheduler.tasks[slot].parent;
-        if let Some(parent_slot) = (0..MAX_TASKS).find(|other| {
-            *other != slot && (*other == 0 || scheduler.tasks[*other].live) && SLOT_PID[*other].load(Ordering::Relaxed) == parent
-        }) {
+        let is_parent = |other: usize| {
+            other != slot && (other == 0 || scheduler.tasks[other].live) && SLOT_TGID[other].load(Ordering::Relaxed) == parent
+        };
+        let starter = usize::from(scheduler.tasks[slot].parent_slot);
+        let parent_slot = if is_parent(starter) { Some(starter) } else { (0..MAX_TASKS).find(|&other| is_parent(other)) };
+        if let Some(parent_slot) = parent_slot {
             CHILD_TICKS[parent_slot].fetch_add(spent, Ordering::Relaxed);
         }
+        // Only the last of a process's threads to be collected records its exit: before
+        // that, the process is still there.
+        let last = scheduler.table.last_of_group(slot);
         let task = &mut scheduler.tasks[slot];
         task.live = false;
+        let own = if FAULTED[slot].load(Ordering::Acquire) { EXIT_FAULTED } else { task.exit_code };
         let record = ExitRecord {
-            pid: SLOT_PID[slot].load(Ordering::Relaxed),
-            code: if FAULTED[slot].load(Ordering::Acquire) {
-                EXIT_FAULTED
-            } else {
-                task.exit_code
-            },
+            pid: SLOT_TGID[slot].load(Ordering::Relaxed),
+            code: task.group_code.unwrap_or(own),
             parent: task.parent,
+            last,
         };
         // Nothing runs on these tables now: every CPU that did changed tables before
-        // it let the slot go. After this flush, the slot's ASID is clean for the next.
-        if ROOT[slot].swap(0, Ordering::Relaxed) != 0 {
-            Port::flush_user_space(asid(slot));
-        }
+        // it let the slot go. The space's ASID is flushed when the space goes.
+        ROOT[slot].store(0, Ordering::Relaxed);
+        TLBS[slot].store(core::ptr::null_mut(), Ordering::Relaxed);
         IN_USER[slot].store(false, Ordering::Relaxed);
+        // Nothing runs on its stack either: the reaper gives it back.
+        kstack::idle(slot);
+        scheduler.table.forget_left(slot);
+        collected.queued = true;
         match entry {
-            None => {
+            None if last => {
                 record_exit(scheduler, record);
                 collected.recorded = true;
             }
+            None => {}
             Some(entry) => {
                 // SAFETY: the entry is empty, and only this, under the scheduler lock,
                 // fills one.
+                let process = crate::user::take_process(slot);
+                // Its CPU time passes to its process as it stops being live.
+                if let Some(process) = &process {
+                    process.fold_ticks(scheduler.table.tasks()[slot].cpu_ticks);
+                }
                 unsafe {
                     *entry.record.get() = record;
-                    *entry.process.get() = crate::user::take_process(slot);
+                    *entry.process.get() = process;
                 }
                 entry.state.store(QUEUED, Ordering::Release);
                 collected.queued = true;
@@ -929,19 +1093,30 @@ fn drain_teardowns() {
         // change until it's empty again.
         let (record, process) = unsafe { (*entry.record.get(), (*entry.process.get()).take()) };
         note_teardown(&TEARDOWNS_QUEUED);
-        pipe::release_pid(record.pid);
-        if let Some(process) = process {
-            process.destroy();
-        }
+        give_back(process, record.pid);
         finish_teardown(entry, record);
     }
 }
 
-/// Records the exit of a task whose teardown is done, and empties its queue entry.
+/// What a task gives back as it goes: its reference to its process, whose last gives
+/// back the process's files, pipes and, with its space's last, its memory; or, for a
+/// task with no process, the pipes it held as `pid`. In task context, with interrupts on.
+fn give_back(process: Option<alloc::sync::Arc<crate::user::Process>>, pid: u32) {
+    match process {
+        Some(process) => drop(process),
+        None => pipe::release_pid(pid),
+    }
+}
+
+/// Records the exit of a task whose teardown is done, if it was its process's last, and
+/// empties its queue entry. Waiters are woken either way: a wait for a process waits for
+/// every thread's teardown.
 fn finish_teardown(entry: &Teardown, record: ExitRecord) {
     let idle = {
         let mut scheduler = SCHEDULER.lock();
-        record_exit(&mut scheduler, record);
+        if record.last {
+            record_exit(&mut scheduler, record);
+        }
         entry.state.store(EMPTY, Ordering::Release);
         announce(&mut scheduler, Collected { complete: true, recorded: true, queued: false })
     };
@@ -977,26 +1152,40 @@ fn teardown_self() {
     // there's no root for it to load.
     let flags = Port::irq_save_and_disable();
     if ROOT[slot].swap(0, Ordering::Relaxed) != 0 {
-        Port::activate_user_tables(0, 0);
-        Port::flush_user_space(asid(slot));
+        TLBS[slot].store(core::ptr::null_mut(), Ordering::Relaxed);
+        load_tables(this_cpu(), None);
     }
     Port::irq_restore(flags);
     note_teardown(&TEARDOWNS_SELF);
     let process = crate::user::take_process(slot);
-    pipe::release_pid(SLOT_PID[slot].load(Ordering::Acquire));
-    if let Some(process) = process {
-        process.destroy();
+    {
+        // Its CPU time so far passes to its process, and from now on it isn't counted as
+        // live (see `process_cpu_ns`): both under the lock the count is read under. What it
+        // runs from here to its end is too little to matter.
+        let scheduler = SCHEDULER.lock();
+        if let Some(process) = &process {
+            process.fold_ticks(scheduler.table.tasks()[slot].cpu_ticks);
+        }
+        TORN_DOWN[slot].store(true, Ordering::Release);
     }
-    TORN_DOWN[slot].store(true, Ordering::Release);
+    give_back(process, SLOT_TGID[slot].load(Ordering::Acquire));
 }
 
-/// The reaper: a kernel task that gives back what killed and failed tasks left behind.
+/// The reaper: a kernel task that gives back what killed and failed tasks left behind,
+/// and the stacks of every task that has gone.
 fn reaper() -> i32 {
     loop {
         let seen = TEARDOWN_SEQUENCE.load(Ordering::Acquire);
         drain_teardowns();
+        kstack::trim();
         futex_wait(&TEARDOWN_SEQUENCE, seen);
     }
+}
+
+/// Gives back the stacks of tasks that have gone, now: for counting free frames, which
+/// shouldn't depend on whether the reaper has had its turn yet.
+pub fn trim_stacks() {
+    kstack::trim();
 }
 
 /// Whether this CPU is in its idle loop. Call with interrupts masked.
@@ -1042,7 +1231,7 @@ pub fn on_switch_request(frame: &mut Frame) {
                     return;
                 }
             }
-            Port::activate_user_tables(ROOT[slot].load(Ordering::Relaxed), asid(slot));
+            load_tables(this_cpu(), Some(slot));
             Port::resume(USER_FRAMES.0[slot].get());
         }
         return;
@@ -1071,6 +1260,19 @@ pub fn on_switch_request(frame: &mut Frame) {
                 Request::Yield
             }
         }
+        PendingRequest::WaitUser(wait) => {
+            // SAFETY: the word's frame is pinned, and the count is the waiter's space's,
+            // which its blocked task keeps. An unmap moves the count and then takes this
+            // lock to wake the range, so it can't fall between this check and the block.
+            let (word, unmaps) = unsafe { (&*(wait.word as *const AtomicU32), &*(wait.unmaps as *const AtomicU32)) };
+            if word.load(Ordering::Acquire) != wait.expected || unmaps.load(Ordering::Acquire) != wait.seen {
+                Request::Yield
+            } else if let Some(deadline) = wait.deadline {
+                Request::WaitUserUntil(wait.key, deadline)
+            } else {
+                Request::WaitUser(wait.key)
+            }
+        }
         PendingRequest::Exit | PendingRequest::ToUser => Request::Exit,
     };
     reschedule(frame, request, false);
@@ -1095,7 +1297,7 @@ pub fn on_syscall(_frame: &mut Frame) {
 fn enter_kernel(slot: usize, entry: usize) {
     IN_USER[slot].store(false, Ordering::Relaxed);
     IN_CALL[slot].fetch_add(1, Ordering::AcqRel);
-    let thread = Frame::new_task(entry, slot, stack_bottom(slot) + STACK_SIZE, task_exit as *const () as usize);
+    let thread = Frame::new_task(entry, slot, kstack::top(slot), task_exit as *const () as usize);
     // SAFETY: this is the running task's frame, and nothing is using it: it was at EL0.
     unsafe { TASK_FRAMES.0[slot].get().write(thread) };
     Port::resume(TASK_FRAMES.0[slot].get());
@@ -1139,19 +1341,34 @@ pub fn on_user_fault(fault: UserFault, frame: &mut Frame) -> bool {
     true
 }
 
-/// A user fault's kernel half: gives the program the page it was promised, or ends it.
-/// The single place a fault from user mode is decided, which is where a signal frame
-/// will be built.
+/// A user fault's kernel half: gives the program the page its mapping says it should
+/// have, or ends it. The single place a fault from user mode is decided, which is where
+/// a signal frame will be built.
 extern "C" fn fault_entry(slot: usize) -> ! {
+    use crate::user::FaultOutcome;
     // SAFETY: see `FaultNotes`.
     let fault = unsafe { *FAULT_NOTES.0[slot].get() };
-    let resolved = fault
-        .address
-        .is_some_and(|address| crate::user::resolve_fault(slot, address as usize));
-    if !resolved {
-        crate::fatal::report_user_fault(&fault);
-        FAULTED[slot].store(true, Ordering::Release);
-        exit_task(EXIT_FAULTED, true);
+    let outcome = match fault.memory {
+        Some(memory) => crate::user::resolve_fault(slot, memory),
+        None => FaultOutcome::Segv,
+    };
+    match outcome {
+        FaultOutcome::Retry => {}
+        // Either way the whole process goes, as a signal's default action would take it:
+        // its other threads are killed.
+        FaultOutcome::Segv => {
+            crate::fatal::report_user_fault(&fault, false);
+            FAULTED[slot].store(true, Ordering::Release);
+            end_group(slot, EXIT_FAULTED);
+            exit_task(EXIT_FAULTED, true);
+        }
+        // Mapped, with no frame to give it. Not a fault of the program's code, so its
+        // status is its own and it isn't counted as failed.
+        FaultOutcome::Bus => {
+            crate::fatal::report_user_fault(&fault, true);
+            end_group(slot, feos_abi::EXIT_BUS);
+            exit_task(feos_abi::EXIT_BUS, true);
+        }
     }
     end_if_killed(slot);
     return_to_user()
@@ -1173,17 +1390,106 @@ fn return_to_user() -> ! {
 
 /// Starts the calling task's program. It never comes back here: its system calls run
 /// in [`syscall_entry`].
-pub fn enter_user(slot: usize, root: usize, frame: Frame) -> ! {
+pub fn enter_user(slot: usize, root: usize, tlb: &crate::user::tlb::Tlb, frame: Frame) -> ! {
     // SAFETY: the task is running here, so nothing else is using its user frame.
     unsafe { USER_FRAMES.0[slot].get().write(frame) };
+    // The space first: a switch that sees the root loads it with this.
+    TLBS[slot].store(core::ptr::from_ref(tlb).cast_mut(), Ordering::Relaxed);
     ROOT[slot].store(root, Ordering::Relaxed);
     end_if_killed(slot);
     return_to_user()
 }
 
-/// Ends the calling task, for a user program's `exit`.
+/// Runs the calling kernel task on the tables `root` of the space `tlb` keeps, wherever
+/// it's switched in, until [`return_tables`]: for self-tests that look at a space from
+/// a CPU. The space must outlive that.
+pub fn borrow_tables(root: usize, tlb: &crate::user::tlb::Tlb) {
+    let flags = Port::irq_save_and_disable();
+    if let Some(slot) = current_slot() {
+        TLBS[slot].store(core::ptr::from_ref(tlb).cast_mut(), Ordering::Relaxed);
+        ROOT[slot].store(root, Ordering::Relaxed);
+        load_tables(this_cpu(), Some(slot));
+    }
+    Port::irq_restore(flags);
+}
+
+/// Back to the kernel's tables, after [`borrow_tables`].
+pub fn return_tables() {
+    let flags = Port::irq_save_and_disable();
+    if let Some(slot) = current_slot() {
+        ROOT[slot].store(0, Ordering::Relaxed);
+        TLBS[slot].store(core::ptr::null_mut(), Ordering::Relaxed);
+        load_tables(this_cpu(), None);
+    }
+    Port::irq_restore(flags);
+}
+
+/// Ends the calling thread's whole process, for a user program's `exit`: every other
+/// thread of it is killed, and the process ends with `code` whichever thread is last.
 pub fn exit_user(code: i32) -> ! {
+    if let Some(slot) = with_current_slot() {
+        end_group(slot, code);
+    }
     exit_current(code)
+}
+
+/// Ends the calling user thread alone, for `THREAD_EXIT`. With its process's last
+/// thread, the process ends, with status 0 unless something decided otherwise.
+pub fn exit_thread() -> ! {
+    exit_current(0)
+}
+
+/// The thread id of the task in `slot`, the caller.
+pub fn tid(slot: usize) -> u32 {
+    SLOT_PID[slot].load(Ordering::Relaxed)
+}
+
+/// The word the end of the thread in `slot`, the caller, clears.
+pub fn clear_word(slot: usize) -> usize {
+    CLEAR_WORD[slot].load(Ordering::Relaxed)
+}
+
+/// Sets the thread pointer of the calling thread, in `slot`: its own copy and this
+/// CPU's register at once, with interrupts masked, so a switch can't save the old one
+/// over the new.
+pub fn set_tls(slot: usize, value: usize) {
+    let flags = Port::irq_save_and_disable();
+    TLS[slot].store(value, Ordering::Relaxed);
+    Port::set_user_tls(value);
+    Port::irq_restore(flags);
+}
+
+/// A process whose next `GETTID` from a thread that isn't its first faults in the kernel,
+/// for `ktest thread-fault`: zero for none. Nothing else arms it.
+static INJECT_FAULT: AtomicU32 = AtomicU32::new(0);
+
+/// Arms [`injected_fault`] for the process `pid`.
+pub fn arm_thread_fault(pid: u32) {
+    INJECT_FAULT.store(pid, Ordering::Release);
+}
+
+/// Faults, once, if a self-test armed a fault for this thread's process and it isn't the
+/// process's first thread: a real CPU fault in the middle of a call with nothing held, a
+/// read of the guard below this task's kernel stack, which ends the whole process.
+pub fn injected_fault(slot: usize) {
+    let tgid = SLOT_TGID[slot].load(Ordering::Relaxed);
+    if tgid == 0 || SLOT_PID[slot].load(Ordering::Relaxed) == tgid {
+        return;
+    }
+    if INJECT_FAULT.compare_exchange(tgid, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        let guard = kstack::range(slot).0 - 2 * 4096;
+        // SAFETY: not at all, on purpose: the guard is never mapped, so this faults, and
+        // the fault path ends the task.
+        let _ = unsafe { core::ptr::read_volatile(guard as *const u64) };
+    }
+}
+
+/// The calling task's process, its first thread's id, for the pipes it holds.
+fn current_tgid() -> u32 {
+    let flags = Port::irq_save_and_disable();
+    let pid = current_slot().map_or(0, |slot| SLOT_TGID[slot].load(Ordering::Relaxed));
+    Port::irq_restore(flags);
+    pid
 }
 
 /// The CPU this task was on a moment ago.
@@ -1215,12 +1521,12 @@ fn offer_signal(pid: u32, number: u32) -> bool {
     let bit = 1u32 << number;
     let idle = {
         let mut scheduler = SCHEDULER.lock();
-        let found = scheduler.table.tasks().iter().position(|task| {
-            task.pid == pid && !matches!(task.state, State::Free | State::Spawning)
-        });
-        let Some(slot) = found else {
+        let Some(slot) = scheduler.table.find_pid(pid) else {
             return false;
         };
+        if scheduler.table.tasks()[slot].state == State::Spawning {
+            return false;
+        }
         if CAUGHT[slot].load(Ordering::Relaxed) & bit == 0 {
             return false;
         }
@@ -1232,45 +1538,57 @@ fn offer_signal(pid: u32, number: u32) -> bool {
     true
 }
 
-/// Reads a user program's standard input. Zero at end of file, or if it has none.
-pub fn read_stdin(slot: usize, out: &mut [u8]) -> Result<usize, pipe::Killed> {
-    match PipeId::from_raw(STDIN[slot].load(Ordering::Acquire)) {
-        Some(id) => pipe::read_wait(id, out),
-        None => Ok(0),
-    }
+/// A user program's standard stream, 0 to 2: the pipe its task was given or inherited,
+/// or `None` for the console itself (stdin then reads as at end of file, and stdout and
+/// stderr go wherever a kernel-linked app's print would).
+pub fn stream_pipe(slot: usize, stream: usize) -> Option<PipeId> {
+    let streams = match stream {
+        0 => &STDIN,
+        1 => &STDOUT,
+        _ => &STDERR,
+    };
+    PipeId::from_raw(streams[slot].load(Ordering::Acquire))
 }
 
-/// Writes to a user program's standard output or error, which go wherever a
-/// kernel-linked app's print would. `false` if nobody's left to read it.
-pub fn write_stream(slot: usize, error: bool, bytes: &[u8]) -> Result<bool, pipe::Killed> {
-    let console = if error { &STDERR[slot] } else { &STDOUT[slot] };
-    match PipeId::from_raw(console.load(Ordering::Acquire)) {
-        Some(id) => pipe::write_wait(id, bytes),
-        None => {
-            feos_console::write_bytes(bytes);
-            Ok(true)
-        }
-    }
+/// Blocks a user program on its futex word `word` (the kernel's address of its pinned
+/// frame), named by `key`, while it holds `expected` and `unmaps` is still the count the
+/// caller saw, and not past the counter value `deadline`, and says whether it ran out of
+/// time. As with any futex, a wake can be spurious.
+pub fn futex_wait_user(
+    word: &AtomicU32,
+    key: feos_sched::UserKey,
+    expected: u32,
+    unmaps: (&AtomicU32, u32),
+    deadline: Option<u64>,
+) -> bool {
+    switch_with(PendingRequest::WaitUser(UserWait {
+        word: word as *const AtomicU32 as usize,
+        key,
+        expected,
+        unmaps: unmaps.0 as *const AtomicU32 as usize,
+        seen: unmaps.1,
+        deadline,
+    }));
+    deadline.is_some_and(|deadline| Port::services().ticks() >= deadline)
 }
 
-/// Blocks a user program on a word, identified by its kernel address, and says whether
-/// it ran out of time. As with any futex, a wake can be spurious.
-pub fn futex_wait_user(key: usize, expected: u32, timeout_ms: u64) -> bool {
-    if timeout_ms == 0 {
-        switch_with(PendingRequest::Wait(key, expected));
-        return false;
-    }
-    let delta = (Port::services().frequency() as u128 * timeout_ms as u128 / 1000) as u64;
-    let deadline = Port::services().ticks().saturating_add(delta);
-    switch_with(PendingRequest::WaitUntil(key, expected, deadline));
-    Port::services().ticks() >= deadline
-}
-
-/// Wakes up to `count` tasks blocked on a word. Returns how many.
-pub fn futex_wake_user(key: usize, count: usize) -> usize {
+/// Wakes up to `count` tasks blocked on a user futex word. Returns how many.
+pub fn futex_wake_user(key: feos_sched::UserKey, count: usize) -> usize {
     let (woken, idle) = {
         let mut scheduler = SCHEDULER.lock();
-        let woken = scheduler.table.wake_key(key, count);
+        let woken = scheduler.table.wake_user_key(key, count);
+        (woken, (woken > 0).then(|| scheduler.table.idle_cpu(this_cpu())).flatten())
+    };
+    kick(idle);
+    woken
+}
+
+/// Wakes every task blocked on a user futex word of `space` in `[low, high)`, which has
+/// just been unmapped.
+pub fn futex_wake_user_range(space: usize, low: u64, high: u64) -> usize {
+    let (woken, idle) = {
+        let mut scheduler = SCHEDULER.lock();
+        let woken = scheduler.table.wake_user_range(space, low, high);
         (woken, (woken > 0).then(|| scheduler.table.idle_cpu(this_cpu())).flatten())
     };
     kick(idle);
@@ -1312,8 +1630,65 @@ pub fn sleep_ms(ms: u64) {
         yield_now();
         return;
     }
-    let delta = (Port::services().frequency() as u128 * ms as u128 / 1000) as u64;
+    let delta = ms_to_ticks(ms);
     switch_with(PendingRequest::Sleep(Port::services().ticks().saturating_add(delta)));
+}
+
+/// The counter value `timeout_ms` from now, for a timed wait.
+pub fn deadline_in_ms(timeout_ms: u64) -> u64 {
+    Port::services().ticks().saturating_add(ms_to_ticks(timeout_ms))
+}
+
+/// Blocks the calling task until the counter reaches `deadline`. `false` if it was asked
+/// to end first: a kill wakes a sleeper, and a woken sleeper whose time hasn't come
+/// sleeps again unless that's why.
+pub fn sleep_until(deadline: u64) -> bool {
+    loop {
+        if Port::services().ticks() >= deadline {
+            return true;
+        }
+        if kill_requested() {
+            return false;
+        }
+        if !can_block() {
+            core::hint::spin_loop();
+            continue;
+        }
+        switch_with(PendingRequest::Sleep(deadline));
+    }
+}
+
+/// Nanoseconds of CPU time the thread in `slot` has used, as the scheduler accounts it.
+pub fn thread_cpu_ns(slot: usize) -> u64 {
+    let scheduler = SCHEDULER.lock();
+    ticks_as_ns(scheduler.table.tasks()[slot].cpu_ticks, scheduler.ticks_per_second)
+}
+
+/// Nanoseconds of CPU time every thread of `process` has used, live and ended. A thread
+/// is counted live until its time is folded into the process (as it tears itself down,
+/// or as it's collected), and both happen under this lock, so the sum never goes back.
+pub fn process_cpu_ns(process: &crate::user::Process) -> u64 {
+    let scheduler = SCHEDULER.lock();
+    let pid = process.pid();
+    let mut ticks = process.ended_ticks();
+    for slot in 1..MAX_TASKS {
+        if scheduler.tasks[slot].live
+            && !TORN_DOWN[slot].load(Ordering::Acquire)
+            && SLOT_TGID[slot].load(Ordering::Relaxed) == pid
+        {
+            ticks = ticks.wrapping_add(scheduler.table.tasks()[slot].cpu_ticks);
+        }
+    }
+    ticks_as_ns(ticks, scheduler.ticks_per_second)
+}
+
+/// How finely CPU time is accounted: one scheduler tick, in nanoseconds.
+pub fn cpu_resolution_ns() -> u64 {
+    ticks_as_ns(1, SCHEDULER.lock().ticks_per_second)
+}
+
+fn ticks_as_ns(ticks: u64, per_second: u64) -> u64 {
+    u64::try_from(ticks as u128 * feos_abi::NANOS_PER_SECOND as u128 / per_second.max(1) as u128).unwrap_or(u64::MAX)
 }
 
 /// Marks the calling process as finished and switches away for good.
@@ -1349,16 +1724,15 @@ extern "C" fn task_exit() -> ! {
 /// are copied onto the process stack before the app runs, so the slot can be
 /// reused after an exit without invalidating the app's `&str`.
 extern "C" fn app_entry(slot: usize) -> ! {
-    let (app, entry, block, user_path) = {
+    let (app, entry, block, user_start) = {
         let mut scheduler = SCHEDULER.lock();
         let task = &mut scheduler.tasks[slot];
-        let user_path = task.is_user.then_some((task.user_path, task.user_path_len));
-        (task.app, task.entry.take(), task.args, user_path)
+        let user_start = if task.is_user { task.user_start.take() } else { None };
+        (task.app, task.entry.take(), task.args, user_start)
     };
 
-    if let Some((path, length)) = user_path {
-        let path = core::str::from_utf8(&path[..length]).unwrap_or("");
-        exit_current(crate::user::start(slot, path, &block));
+    if let Some(start) = user_start {
+        exit_current(crate::user::start(slot, start));
     }
     if let Some(entry) = entry {
         exit_current(entry());
@@ -1389,17 +1763,54 @@ extern "C" fn app_entry(slot: usize) -> ! {
 enum Entry<'a> {
     App(&'static dyn App, ArgBlock),
     Task(Box<dyn FnOnce() -> i32 + Send>),
-    /// A program's path, its argv, and the directory relative paths start from.
-    User(&'a str, ArgBlock, &'a str),
+    /// A program, with its arguments as far as they fit in the table's block, for
+    /// showing: what it loads and starts with is the `UserStart` beside it.
+    User(ArgBlock, core::marker::PhantomData<&'a ()>),
 }
 
-/// Streams for a user program, where a parent program names them.
+/// Streams for a user program, where a parent program names them, and what else it
+/// inherits from one.
 #[derive(Clone, Copy, Default)]
 pub struct RawStreams {
     /// A pipe, or zero to inherit.
     pub stdin: u32,
     /// A pipe, or zero to inherit.
     pub stdout: u32,
+    /// The parent program's umask, or `None` for [`DEFAULT_UMASK`](crate::user::DEFAULT_UMASK).
+    pub umask: Option<u32>,
+    /// The process group and session it starts in.
+    pub group: SpawnGroup,
+    /// Its signal mask, or `None` for its creator's.
+    pub sigmask: Option<u64>,
+}
+
+/// Where a new program's process goes, among process groups and sessions. A program a
+/// kernel app starts always gets a group of its own in the terminal's session.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum SpawnGroup {
+    /// Its creator's group and session.
+    #[default]
+    Inherit,
+    /// A new group, its own pid, in its creator's session.
+    Own,
+    /// The group with this id, which has to be in its creator's session (`EPERM`).
+    Join(u32),
+    /// A new session and group, both its own pid.
+    NewSession,
+}
+
+/// Why a program's task couldn't be made.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SpawnFail {
+    Spawn(SpawnError),
+    /// An error number for the program that asked: a group it can't join.
+    Errno(isize),
+}
+
+impl From<SpawnError> for SpawnFail {
+    fn from(error: SpawnError) -> Self {
+        Self::Spawn(error)
+    }
 }
 
 fn spawn_entry(
@@ -1408,31 +1819,121 @@ fn spawn_entry(
     io: SpawnIo<'_>,
     raw: RawStreams,
 ) -> Result<u32, SpawnError> {
+    spawn_entry_with(name, entry, io, raw, None).map_err(|fail| match fail {
+        SpawnFail::Spawn(error) => error,
+        // Only a program's own group request can be refused, which kernel apps never make.
+        SpawnFail::Errno(_) => SpawnError::Unsupported,
+    })
+}
+
+/// The process group and session of a new task in `slot`, with pid `pid`, that the task
+/// in `creator` is starting: as `group` asks, if a program is starting it. Under the
+/// scheduler's lock.
+fn new_group(scheduler: &Scheduler, creator: Option<usize>, pid: u32, group: SpawnGroup) -> Result<(u32, u32), isize> {
+    let Some(creator) = creator.filter(|&creator| scheduler.tasks[creator].is_user) else {
+        return Ok((pid, TERMINAL_SESSION));
+    };
+    let (pgid, sid) = (SLOT_PGID[creator].load(Ordering::Relaxed), SLOT_SID[creator].load(Ordering::Relaxed));
+    match group {
+        SpawnGroup::Inherit => Ok((pgid, sid)),
+        SpawnGroup::Own => Ok((pid, sid)),
+        SpawnGroup::NewSession => Ok((pid, pid)),
+        SpawnGroup::Join(wanted) if group_in_session(scheduler, wanted, sid) => Ok((wanted, sid)),
+        SpawnGroup::Join(_) => Err(-feos_abi::errno::EPERM),
+    }
+}
+
+/// Whether a live program is in the process group `pgid`, in the session `sid`. Under the
+/// scheduler's lock.
+fn group_in_session(scheduler: &Scheduler, pgid: u32, sid: u32) -> bool {
+    (1..MAX_TASKS).any(|slot| {
+        let task = &scheduler.tasks[slot];
+        task.live
+            && task.is_user
+            && scheduler.table.tasks()[slot].state != State::Free
+            && SLOT_PGID[slot].load(Ordering::Relaxed) == pgid
+            && SLOT_SID[slot].load(Ordering::Relaxed) == sid
+    })
+}
+
+/// Starts a task: `entry`, and for a program `user_start`, what it loads and starts with.
+fn spawn_entry_with(
+    name: &str,
+    entry: Entry<'_>,
+    io: SpawnIo<'_>,
+    raw: RawStreams,
+    mut user_start: Option<Box<crate::user::UserStart>>,
+) -> Result<u32, SpawnFail> {
     // Slot 0 belongs to the shell and is never reused. A slot that's free but hasn't
     // had its exit collected still holds its address space, so everything gone has to
     // be collected before one can be taken. If the teardown queue is full, this task
     // empties it.
+    // What a program needs to start is on the heap already: nothing may be allocated
+    // under the scheduler's lock, where it's handed over.
     let user = matches!(entry, Entry::User(..));
-    let (slot, pid) = loop {
+    if user != user_start.is_some() {
+        return Err(SpawnFail::Spawn(SpawnError::Unsupported));
+    }
+    let mut refused = None;
+    let (slot, pid, (uid, gid), _no_kill) = loop {
         let (collected, reserved, idle) = {
             let mut scheduler = SCHEDULER.lock();
             let collected = collect_exits(&mut scheduler);
-            let reserved = if collected.complete { scheduler.table.reserve() } else { None };
+            // A new task is whoever started it, as of now: read under the lock that
+            // `set_credentials` takes, so the table's uid, which the caps count by, and
+            // the task's own can't differ however a `SETUID` races this. A program takes
+            // a slot only while that leaves some for the kernel, and its user has room
+            // for another.
+            let who = current_slot().map_or((0, 0), credentials);
+            let reserved = match (collected.complete, user) {
+                (false, _) => None,
+                (true, true) => scheduler.table.reserve_user(who.0, &USER_LIMITS),
+                (true, false) => scheduler.table.reserve(),
+            };
+            // From the reservation until the task is committed or the slot given back,
+            // the spawner can't be reaped: it would leave the slot reserved, and its
+            // stack half made (see `kstack::take`). A user program's spawn is in a call,
+            // which a kill waits for already; a kernel app's is held off here, under the
+            // lock a kill takes, so no tick comes between.
+            let mut reserved = reserved.map(|(slot, pid)| (slot, pid, who, NoKill::new()));
+            // Its group and session, decided as it's made, under the lock that changes
+            // them: a group it's to join is there now, or the spawn is refused. Its signal
+            // mask with them.
+            if let Some((slot, pid, ..)) = reserved {
+                let creator = current_slot();
+                match new_group(&scheduler, creator, pid, raw.group) {
+                    Ok((pgid, sid)) => {
+                        SLOT_PGID[slot].store(pgid, Ordering::Release);
+                        SLOT_SID[slot].store(sid, Ordering::Release);
+                        let inherited = creator.map_or(0, |creator| SIGNAL_MASK[creator].load(Ordering::Relaxed));
+                        SIGNAL_MASK[slot].store(raw.sigmask.unwrap_or(inherited), Ordering::Release);
+                    }
+                    Err(error) => {
+                        scheduler.table.cancel(slot);
+                        reserved = None;
+                        refused = Some(error);
+                    }
+                }
+            }
             // What a kill or a stop looks at is reset before the lock goes, and so
             // before the PID can be found: one that comes while the stack is being
             // painted has its hint kept.
-            if let Some((slot, _)) = reserved {
+            if let Some((slot, ..)) = reserved {
                 LOCK_DEPTH[slot].store(0, Ordering::Release);
                 // A program starts in the kernel, loading itself.
                 IN_CALL[slot].store(u32::from(user), Ordering::Release);
                 ATTENTION[slot].store(false, Ordering::Release);
                 TORN_DOWN[slot].store(false, Ordering::Release);
                 HEAP_BYTES[slot].store(0, Ordering::Release);
+                crate::user::forget_fault(slot);
             }
             let idle = announce(&mut scheduler, collected);
             (collected, reserved, idle)
         };
         kick(idle);
+        if let Some(error) = refused {
+            return Err(SpawnFail::Errno(error));
+        }
         if collected.complete {
             break reserved.ok_or(SpawnError::NoFreeSlot)?;
         }
@@ -1441,29 +1942,33 @@ fn spawn_entry(
         yield_now();
     };
 
-    // Painting the stack takes a while, so it happens with interrupts on. The
-    // reservation keeps the slot from being scheduled or reused meanwhile.
-    let bottom = stack_bottom(slot);
-    let top = bottom + STACK_SIZE;
-    // SAFETY: the slot is reserved, so nothing is using its stack.
-    unsafe { paint_stack(bottom, top) };
+    // The stack is made, and painted, with interrupts on. The reservation keeps the slot
+    // from being scheduled or reused meanwhile.
+    let size = if user { kstack::USER_STACK } else { kstack::KERNEL_STACK };
+    let Some((bottom, top)) = kstack::take(slot, size) else {
+        SCHEDULER.lock().table.cancel(slot);
+        return Err(SpawnError::NoFreeSlot.into());
+    };
+    // SAFETY: the slot is reserved and its stack just taken, so nothing is using it.
+    unsafe { kstack::paint(bottom, top) };
     let started_ms = CLOCK.uptime_ms();
 
     FAULTED[slot].store(false, Ordering::Release);
     CAUGHT[slot].store(0, Ordering::Release);
     PENDING_SIGNALS[slot].store(0, Ordering::Release);
     CHILD_TICKS[slot].store(0, Ordering::Release);
+    TLS[slot].store(0, Ordering::Release);
+    CLEAR_WORD[slot].store(0, Ordering::Release);
     SLOT_PID[slot].store(pid, Ordering::Release);
+    SLOT_TGID[slot].store(pid, Ordering::Release);
 
-    let flags = Port::irq_save_and_disable();
-    // A new task is whoever started it.
-    let creator = current_slot();
-    let (uid, gid) = creator.map_or((0, 0), credentials);
     TASK_UID[slot].store(uid, Ordering::Release);
     TASK_GID[slot].store(gid, Ordering::Release);
+    let flags = Port::irq_save_and_disable();
+    let creator = current_slot();
     let (parent, mut inherited_out, mut inherited_err, inherited_console, inherited_in) = match current_slot() {
         Some(parent) => (
-            SLOT_PID[parent].load(Ordering::Relaxed),
+            SLOT_TGID[parent].load(Ordering::Relaxed),
             STDOUT[parent].load(Ordering::Relaxed),
             STDERR[parent].load(Ordering::Relaxed),
             CONSOLE[parent].load(Ordering::Relaxed),
@@ -1477,9 +1982,8 @@ fn spawn_entry(
         inherited_out = inherited_console;
         inherited_err = inherited_console;
     }
-    let console = |given: Option<&pipe::PipeWriter>, inherited: u32| {
-        let id = given.map(|writer| writer.id()).or(PipeId::from_raw(inherited));
-        id.filter(|id| pipe::attach_writer(*id, pid)).map_or(0, PipeId::raw)
+    let writer = |given: Option<&pipe::PipeWriter>, inherited: u32| {
+        given.map(|writer| writer.id()).or(PipeId::from_raw(inherited))
     };
     if raw.stdout != 0 {
         inherited_out = raw.stdout;
@@ -1488,20 +1992,49 @@ fn spawn_entry(
         .stdin
         .map(|reader| reader.id())
         .or(PipeId::from_raw(if raw.stdin != 0 { raw.stdin } else { inherited_in }));
-    STDIN[slot].store(
-        stdin_id.filter(|id| pipe::attach_reader(*id, pid)).map_or(0, PipeId::raw),
-        Ordering::Release,
-    );
-    STDOUT[slot].store(console(io.stdout, inherited_out), Ordering::Release);
-    STDERR[slot].store(console(io.stderr, inherited_err), Ordering::Release);
-    CONSOLE[slot].store(console(io.console, inherited_console), Ordering::Release);
+    // Stdin, stdout, stderr and the console, and whether each is a read end. A pipe that
+    // has gone leaves its stream on the console; one there's no heap to record the child
+    // as holding fails the spawn, with what it took given back, rather than quietly send
+    // the child's output, or take its input, somewhere nobody asked.
+    let wanted = [
+        (stdin_id, true),
+        (writer(io.stdout, inherited_out), false),
+        (writer(io.stderr, inherited_err), false),
+        (writer(io.console, inherited_console), false),
+    ];
+    let mut held = [0u32; 4];
+    for (index, &(id, read)) in wanted.iter().enumerate() {
+        match pipe::attach_stream(id, read, pid) {
+            Ok(raw) => held[index] = raw,
+            Err(_) => {
+                for (&(_, read), &raw) in wanted.iter().zip(&held[..index]) {
+                    match PipeId::from_raw(raw) {
+                        Some(id) if read => pipe::close_reader_id(id, pid),
+                        Some(id) => pipe::close_writer_id(id, pid),
+                        None => {}
+                    }
+                }
+                let mut scheduler = SCHEDULER.lock();
+                kstack::idle(slot);
+                scheduler.table.cancel(slot);
+                return Err(SpawnError::NoMemory.into());
+            }
+        }
+    }
+    let [stdin, stdout, stderr, console] = held;
+    STDIN[slot].store(stdin, Ordering::Release);
+    STDOUT[slot].store(stdout, Ordering::Release);
+    STDERR[slot].store(stderr, Ordering::Release);
+    CONSOLE[slot].store(console, Ordering::Release);
 
-    let idle = {
+    // Whatever a task before left in the slot goes once the lock has.
+    let (idle, left) = {
         let mut scheduler = SCHEDULER.lock();
         let scheduler = &mut *scheduler;
         let task = &mut scheduler.tasks[slot];
         task.set_name(name);
         task.is_user = false;
+        let left = core::mem::replace(&mut task.user_start, user_start.take());
         match entry {
             Entry::App(app, args) => {
                 task.args = args;
@@ -1513,23 +2046,21 @@ fn spawn_entry(
                 task.app = None;
                 task.entry = Some(run);
             }
-            Entry::User(path, args, cwd) => {
-                let length = path.len().min(task.user_path.len());
-                task.user_path[..length].copy_from_slice(&path.as_bytes()[..length]);
-                task.user_path_len = length;
+            Entry::User(args, _) => {
                 task.is_user = true;
                 task.args = args;
                 task.app = None;
                 task.entry = None;
-                crate::user::reset_files(slot, cwd);
             }
         }
         task.stack = (bottom, top);
         task.started_ms = started_ms;
         task.parent = parent;
+        task.parent_slot = creator.unwrap_or(0) as u16;
         task.background = io.background;
         task.live = true;
         task.exit_code = EXIT_KILLED;
+        task.group_code = None;
         let frame = Frame::new_task(
             app_entry as *const () as usize,
             slot,
@@ -1539,9 +2070,10 @@ fn spawn_entry(
         // SAFETY: the slot is reserved, so nothing is running it or about to.
         unsafe { TASK_FRAMES.0[slot].get().write(frame) };
         scheduler.table.commit(slot);
-        scheduler.table.idle_cpu(this_cpu())
+        (scheduler.table.idle_cpu(this_cpu()), left)
     };
     kick(idle);
+    drop(left);
 
     Ok(pid)
 }
@@ -1572,11 +2104,167 @@ pub fn spawn_user(
     io: SpawnIo<'_>,
     raw: RawStreams,
 ) -> Result<u32, SpawnError> {
+    spawn_user_env(path, argv, &[], cwd, io, raw)
+}
+
+/// [`spawn_user`] with an environment, `KEY=VALUE` strings.
+pub fn spawn_user_env(
+    path: &str,
+    argv: ArgBlock,
+    env: &[&str],
+    cwd: &str,
+    io: SpawnIo<'_>,
+    raw: RawStreams,
+) -> Result<u32, SpawnError> {
     if path.len() > feos_abi::PATH_MAX {
         return Err(SpawnError::ArgsTooLong);
     }
+    let umask = raw.umask.unwrap_or(crate::user::DEFAULT_UMASK);
+    let start = crate::user::UserStart::new(path, &argv, env, cwd, umask)?;
     let name = path.rsplit('/').next().unwrap_or(path);
-    spawn_entry(name, Entry::User(path, argv, cwd), io, raw)
+    spawn_entry_with(name, Entry::User(argv, core::marker::PhantomData), io, raw, Some(start)).map_err(|fail| match fail {
+        SpawnFail::Spawn(error) => error,
+        SpawnFail::Errno(_) => SpawnError::Unsupported,
+    })
+}
+
+/// Starts a program a program asked for (`SPAWN2`, v1's `SPAWN`), with what it loads
+/// and starts with made already: its strings staged, and its descriptor table and
+/// image too for `SPAWN2`. `shown` is its arguments as far as the table shows them.
+pub fn spawn_program(name: &str, start: Box<crate::user::UserStart>, shown: ArgBlock, raw: RawStreams) -> Result<u32, SpawnFail> {
+    spawn_entry_with(name, Entry::User(shown, core::marker::PhantomData), SpawnIo::default(), raw, Some(start))
+}
+
+/// Why a thread couldn't be started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThreadError {
+    /// The process has [`MAX_THREADS`], or no slot is free to user programs, or the
+    /// process is ending.
+    Again,
+}
+
+/// Starts a thread of the calling user thread's process, in a slot of its own, at
+/// `frame` in its program: on the space whose tables are `root` and TLB bookkeeping
+/// `tlb`, with thread pointer `tls` and `clear_word` for its end. `adopt` gives the new
+/// slot its reference to the process, before anything can run it. The thread starts at
+/// its program, never in the kernel, so there's no call for a kill to unwind: until it
+/// first traps it can be reaped like any program at EL0 or ring 3.
+///
+/// The caller holds its process's creation lock, so the thread count can't change but
+/// by threads ending, and a fork or exec never sees half a thread.
+pub fn spawn_thread(
+    frame: Frame,
+    root: usize,
+    tlb: &crate::user::tlb::Tlb,
+    tls: usize,
+    clear_word: usize,
+    adopt: impl FnOnce(usize),
+) -> Result<u32, ThreadError> {
+    let Some(creator) = with_current_slot() else {
+        return Err(ThreadError::Again);
+    };
+    let (slot, tid) = loop {
+        let (collected, reserved, idle) = {
+            let mut scheduler = SCHEDULER.lock();
+            let collected = collect_exits(&mut scheduler);
+            let tgid = scheduler.table.tasks()[creator].tgid;
+            // A process whose status is decided is ending: its threads are being killed,
+            // and one started now would outlive the sweep. A kill that's under way is
+            // `reserve_thread`'s to refuse.
+            let ending = scheduler.tasks[creator].group_code.is_some();
+            let room = scheduler.table.threads(tgid) < MAX_THREADS;
+            let reserved = if collected.complete && room && !ending {
+                scheduler.table.reserve_user_thread(creator, &USER_LIMITS)
+            } else {
+                None
+            };
+            if let Some((slot, _)) = reserved {
+                LOCK_DEPTH[slot].store(0, Ordering::Release);
+                IN_CALL[slot].store(0, Ordering::Release);
+                ATTENTION[slot].store(false, Ordering::Release);
+                TORN_DOWN[slot].store(false, Ordering::Release);
+                HEAP_BYTES[slot].store(0, Ordering::Release);
+                IN_USER[slot].store(false, Ordering::Release);
+                crate::user::forget_fault(slot);
+            }
+            let idle = announce(&mut scheduler, collected);
+            (collected, reserved, idle)
+        };
+        kick(idle);
+        if collected.complete {
+            break reserved.ok_or(ThreadError::Again)?;
+        }
+        drain_teardowns();
+        yield_now();
+    };
+
+    // Its kernel stack, for its calls and faults, as any user task's.
+    let Some((bottom, top)) = kstack::take(slot, kstack::USER_STACK) else {
+        SCHEDULER.lock().table.cancel(slot);
+        return Err(ThreadError::Again);
+    };
+    // SAFETY: the slot is reserved and its stack just taken, so nothing is using it.
+    unsafe { kstack::paint(bottom, top) };
+    let started_ms = CLOCK.uptime_ms();
+
+    FAULTED[slot].store(false, Ordering::Release);
+    CAUGHT[slot].store(0, Ordering::Release);
+    PENDING_SIGNALS[slot].store(0, Ordering::Release);
+    CHILD_TICKS[slot].store(0, Ordering::Release);
+    TLS[slot].store(tls, Ordering::Release);
+    CLEAR_WORD[slot].store(clear_word, Ordering::Release);
+    SLOT_PID[slot].store(tid, Ordering::Release);
+    SLOT_TGID[slot].store(SLOT_TGID[creator].load(Ordering::Relaxed), Ordering::Release);
+    SIGNAL_MASK[slot].store(SIGNAL_MASK[creator].load(Ordering::Relaxed), Ordering::Release);
+    // The process's streams: its pipes are held by the process, not by a thread, so the
+    // thread only names them.
+    for streams in [&STDIN, &STDOUT, &STDERR, &CONSOLE] {
+        streams[slot].store(streams[creator].load(Ordering::Relaxed), Ordering::Release);
+    }
+    adopt(slot);
+    // SAFETY: the slot is reserved, so nothing is running it or about to.
+    unsafe { USER_FRAMES.0[slot].get().write(frame) };
+    TLBS[slot].store(core::ptr::from_ref(tlb).cast_mut(), Ordering::Relaxed);
+    ROOT[slot].store(root, Ordering::Relaxed);
+    IN_USER[slot].store(true, Ordering::Release);
+
+    let (idle, left) = {
+        let mut scheduler = SCHEDULER.lock();
+        let scheduler = &mut *scheduler;
+        // Who it is, as of now: a `SETUID` that came since the reservation is in the
+        // creator's by the time this lock is had.
+        TASK_UID[slot].store(TASK_UID[creator].load(Ordering::Relaxed), Ordering::Release);
+        TASK_GID[slot].store(TASK_GID[creator].load(Ordering::Relaxed), Ordering::Release);
+        // Its group and session are its process's, which change under this lock.
+        SLOT_PGID[slot].store(SLOT_PGID[creator].load(Ordering::Relaxed), Ordering::Release);
+        SLOT_SID[slot].store(SLOT_SID[creator].load(Ordering::Relaxed), Ordering::Release);
+        let (name, name_len, parent, parent_slot, background, group_code) = {
+            let task = &scheduler.tasks[creator];
+            (task.name, task.name_len, task.parent, task.parent_slot, task.background, task.group_code)
+        };
+        let task = &mut scheduler.tasks[slot];
+        task.name = name;
+        task.name_len = name_len;
+        task.is_user = true;
+        // A thread starts at its program: nothing to load. Nothing is freed here either.
+        let left = task.user_start.take();
+        task.args = ArgBlock::new();
+        task.app = None;
+        task.entry = None;
+        task.stack = (bottom, top);
+        task.started_ms = started_ms;
+        task.parent = parent;
+        task.parent_slot = parent_slot;
+        task.background = background;
+        task.live = true;
+        task.exit_code = EXIT_KILLED;
+        task.group_code = group_code;
+        scheduler.table.commit(slot);
+        (scheduler.table.idle_cpu(this_cpu()), left)
+    };
+    kick(idle);
+    drop(left);
+    Ok(tid)
 }
 
 /// Sends what the calling task prints to its own console, when it has one.
@@ -1630,6 +2318,91 @@ fn wait_for(pid: u32) -> Option<i32> {
     }
 }
 
+/// Whether the task in `slot` is a live thread of a program. Under the scheduler's lock.
+fn is_live_program(scheduler: &Scheduler, slot: usize) -> bool {
+    slot != 0 && scheduler.tasks[slot].live && scheduler.tasks[slot].is_user && scheduler.table.tasks()[slot].state != State::Free
+}
+
+/// `GETPPID` for the program in `slot`: its parent, or 1 (the shell, which doesn't reap
+/// it) once its parent has gone. Pids aren't reused until the counter wraps, so a parent
+/// that's there is the one that started it.
+pub fn parent_pid(slot: usize) -> u32 {
+    let scheduler = SCHEDULER.lock();
+    let parent = scheduler.tasks[slot].parent;
+    if parent != 0 && scheduler.table.find_pid(parent).is_some() {
+        parent
+    } else {
+        1
+    }
+}
+
+/// The process group and session of the process `pid`, or of the caller in `slot` for
+/// 0: `GETPGID` and `GETSID`. `ESRCH` if there's no such process.
+pub fn group_of(slot: usize, pid: u32) -> Result<(u32, u32), isize> {
+    let scheduler = SCHEDULER.lock();
+    let target = if pid == 0 { Some(slot) } else { scheduler.table.find_pid(pid) };
+    let target = target.ok_or(-feos_abi::errno::ESRCH)?;
+    Ok((SLOT_PGID[target].load(Ordering::Relaxed), SLOT_SID[target].load(Ordering::Relaxed)))
+}
+
+/// Gives every thread of the process in `slot` this group and session. Under the
+/// scheduler's lock, which is where they change.
+fn set_group_of(scheduler: &Scheduler, slot: usize, pgid: u32, sid: u32) {
+    for member in scheduler.table.group_members(slot) {
+        if scheduler.table.tasks()[member].state != State::Free {
+            SLOT_PGID[member].store(pgid, Ordering::Release);
+            SLOT_SID[member].store(sid, Ordering::Release);
+        }
+    }
+}
+
+/// `SETPGID` from the program in `slot`, with `pid` and `pgid` already 0 or positive.
+pub fn set_process_group(slot: usize, pid: u32, pgid: u32) -> Result<(), isize> {
+    use feos_abi::errno::{EPERM, ESRCH};
+    let scheduler = SCHEDULER.lock();
+    let me = SLOT_TGID[slot].load(Ordering::Relaxed);
+    let session = SLOT_SID[slot].load(Ordering::Relaxed);
+    let pid = if pid == 0 { me } else { pid };
+    // The caller, or a child of it; one in another session is there but out of reach.
+    let target = if pid == me {
+        slot
+    } else {
+        let child = scheduler.table.find_pid(pid).filter(|&child| is_live_program(&scheduler, child) && scheduler.tasks[child].parent == me);
+        let child = child.ok_or(-ESRCH)?;
+        if SLOT_SID[child].load(Ordering::Relaxed) != session {
+            return Err(-EPERM);
+        }
+        child
+    };
+    // A session leader stays where it is.
+    if SLOT_SID[target].load(Ordering::Relaxed) == pid {
+        return Err(-EPERM);
+    }
+    let pgid = if pgid == 0 { pid } else { pgid };
+    if pgid != pid && !group_in_session(&scheduler, pgid, session) {
+        return Err(-EPERM);
+    }
+    set_group_of(&scheduler, target, pgid, session);
+    Ok(())
+}
+
+/// `SETSID` from the program in `slot`: a new session and group, both its pid. `EPERM`
+/// if a group already has its pid, its own or one another process joined.
+pub fn new_session(slot: usize) -> Result<u32, isize> {
+    let scheduler = SCHEDULER.lock();
+    let me = SLOT_TGID[slot].load(Ordering::Relaxed);
+    if (1..MAX_TASKS).any(|other| is_live_program(&scheduler, other) && SLOT_PGID[other].load(Ordering::Relaxed) == me) {
+        return Err(-feos_abi::errno::EPERM);
+    }
+    set_group_of(&scheduler, slot, me, me);
+    Ok(me)
+}
+
+/// Task slots, threads included: what `SYSINFO` says.
+pub const fn task_slots() -> usize {
+    MAX_TASKS
+}
+
 /// Waits for a child of `parent`. `None` if it isn't one, or its status has gone.
 pub fn wait_child(pid: u32, parent: u32) -> Option<i32> {
     loop {
@@ -1667,10 +2440,10 @@ fn kill_process(pid: u32) -> KillResult {
     let now = Port::services().ticks();
     let (outcome, idle) = {
         let mut scheduler = SCHEDULER.lock();
-        let slot = scheduler.table.find_pid(pid);
         let outcome = scheduler.table.kill(pid, now, grace, &Facts);
-        if let (Some(slot), KillOutcome::Pending) = (slot, outcome) {
-            ATTENTION[slot].store(true, Ordering::Release);
+        // Every thread of it that has to get to its boundary to go looks there.
+        if outcome == KillOutcome::Pending {
+            note_attention(&scheduler.table, pid);
         }
         let collected = collect_exits(&mut scheduler);
         let woken = announce(&mut scheduler, collected);
@@ -1687,26 +2460,30 @@ fn kill_process(pid: u32) -> KillResult {
     }
 }
 
-/// PID of the calling task, or 0 outside any task. Call with interrupts masked.
+/// Has every live thread of `pid` that a kill or a stop is waiting for look for it on
+/// its way back to its program. Under the scheduler lock.
+fn note_attention(table: &Table<MAX_TASKS, MAX_CPUS>, pid: u32) {
+    for (slot, task) in table.tasks().iter().enumerate() {
+        if task.state != State::Free && task.tgid == pid && (task.kill_pending || task.stopped) {
+            ATTENTION[slot].store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Thread id of the calling task, or 0 outside any task. Call with interrupts masked.
 pub fn current_pid_fast() -> u32 {
     current_slot().map_or(0, |slot| SLOT_PID[slot].load(Ordering::Relaxed))
 }
 
-/// Adjusts the heap bytes charged to `pid`, which may have exited since.
+/// Adjusts the heap bytes charged to the thread `pid`, which may have exited since.
 ///
-/// A process freeing another's block is normal, so this searches by PID; there
-/// are few slots. Blocks from a PID that has gone are charged to nobody. The
-/// caller holds the heap lock, so charges can't race each other.
+/// A process freeing another's block is normal, so this searches by thread id, looking
+/// first at the calling task's slot, whose block it nearly always is (the heap calls with
+/// interrupts masked, so the slot is still this CPU's). Blocks from a thread that has
+/// gone are charged to nobody. The caller holds the heap lock, so charges can't race
+/// each other.
 pub fn charge_heap(pid: u32, delta: isize) {
-    if pid == 0 || delta == 0 {
-        return;
-    }
-    let Some(slot) = SLOT_PID.iter().position(|slot| slot.load(Ordering::Relaxed) == pid) else {
-        return;
-    };
-    let bytes = &HEAP_BYTES[slot];
-    let current = bytes.load(Ordering::Relaxed);
-    bytes.store(current.saturating_add_signed(delta), Ordering::Release);
+    feos_sched::charge_heap_hinted(&SLOT_PID, &HEAP_BYTES, pid, delta, current_slot());
 }
 
 /// CPUs that have joined the scheduler.
@@ -1737,17 +2514,41 @@ fn current_pid() -> u32 {
     pid
 }
 
+/// One entry per process, its threads counted in it: the first thread found speaks for
+/// it, and the CPU time is all of theirs.
+///
+/// Under the innermost lock, so it's one pass over the table: a process is entered at
+/// its first slot found, and the rest of its threads are added from its ring of members
+/// there and marked, so no thread looks for its process among the entries made already.
 fn snapshot(out: &mut [ProcessInfo]) -> usize {
+    /// A slot of a process with no room in `out`.
+    const LEFT_OUT: u16 = u16::MAX;
+    let shown = |state: State| !matches!(state, State::Free | State::Spawning);
+    // Which entry each slot has been counted in, plus one; zero for none yet.
+    let mut counted = [0u16; MAX_TASKS];
     let mut count = 0;
     let scheduler = SCHEDULER.lock();
-    for (slot, policy) in scheduler.table.tasks().iter().enumerate() {
-        if matches!(policy.state, State::Free | State::Spawning) || count == out.len() {
+    let tasks = scheduler.table.tasks();
+    for (slot, policy) in tasks.iter().enumerate() {
+        if !shown(policy.state) || counted[slot] != 0 {
+            continue;
+        }
+        let members = scheduler
+            .table
+            .group_members(slot)
+            .filter(|&member| shown(tasks[member].state) && tasks[member].tgid == policy.tgid);
+        if count == out.len() {
+            for member in members {
+                counted[member] = LEFT_OUT;
+            }
             continue;
         }
 
         let task = &scheduler.tasks[slot];
-        out[count] = ProcessInfo {
-            pid: policy.pid,
+        let (bottom, top) = task.stack;
+        let entry = &mut out[count];
+        *entry = ProcessInfo {
+            pid: policy.tgid,
             state: match policy.state {
                 State::Running => ProcessState::Running,
                 State::Free | State::Spawning => ProcessState::Exited,
@@ -1758,13 +2559,24 @@ fn snapshot(out: &mut [ProcessInfo]) -> usize {
             name_len: task.name_len as u8,
             cpu_ticks: policy.cpu_ticks,
             started_ms: task.started_ms,
-            memory_bytes: STACK_SIZE,
+            memory_bytes: top - bottom,
             threads: 1,
             priority: policy.priority,
             parent: task.parent,
             background: task.background,
         };
         count += 1;
+        // Slots before this one were all looked at already, and none was this process's.
+        for member in members {
+            counted[member] = count as u16;
+            if member == slot {
+                continue;
+            }
+            let (bottom, top) = scheduler.tasks[member].stack;
+            entry.threads = entry.threads.saturating_add(1);
+            entry.cpu_ticks = entry.cpu_ticks.wrapping_add(tasks[member].cpu_ticks);
+            entry.memory_bytes += top - bottom;
+        }
     }
     count
 }
@@ -1779,12 +2591,14 @@ fn detail(pid: u32) -> Option<ProcessDetail> {
         (slot, blocked, policy.kill_pending, policy.stopped, bottom, top, policy.home, policy.affinity)
     };
     // The scan walks the whole stack, so it runs with interrupts on. If the task
-    // exits in the meantime, the figure is merely out of date.
+    // exits in the meantime, the figure is merely out of date: a stack being read isn't
+    // given back until the read is done.
+    let stack_used = if slot == 0 { kstack::measure(bottom, top - bottom) } else { kstack::high_water(slot) };
     Some(ProcessDetail {
         blocked,
         kill_pending,
         stack_size: top - bottom,
-        stack_used: stack_high_water(bottom, top - bottom),
+        stack_used,
         heap_bytes: HEAP_BYTES[slot].load(Ordering::Acquire),
         stopped,
         cpu,
@@ -1792,7 +2606,8 @@ fn detail(pid: u32) -> Option<ProcessDetail> {
     })
 }
 
-fn kill_requested() -> bool {
+/// Whether the current task has been asked to end.
+pub(crate) fn kill_requested() -> bool {
     let scheduler = SCHEDULER.lock();
     scheduler
         .table
@@ -1803,12 +2618,7 @@ fn kill_requested() -> bool {
 fn system_info() -> SystemInfo {
     let scheduler = SCHEDULER.lock();
     let table = &scheduler.table;
-    let mut processes = 0;
-    for task in table.tasks() {
-        if matches!(task.state, State::Ready | State::Running | State::Blocked) {
-            processes += 1;
-        }
-    }
+    let (processes, threads) = table.counts();
     let mut cpu_ticks = [0u64; feos_app::MAX_CPUS];
     let mut cpu_idle_ticks = [0u64; feos_app::MAX_CPUS];
     let cpus = MAX_CPUS.min(feos_app::MAX_CPUS);
@@ -1821,7 +2631,7 @@ fn system_info() -> SystemInfo {
         idle_ticks: table.idle_ticks,
         ticks_per_second: scheduler.ticks_per_second,
         processes,
-        threads: processes,
+        threads,
         cpus: table.online(),
         cpu_ticks,
         cpu_idle_ticks,
@@ -1858,6 +2668,7 @@ impl Processes for ProcessManager {
         &self,
         path: &str,
         argv: &[&str],
+        env: &[&str],
         cwd: &str,
         io: SpawnIo<'_>,
     ) -> Result<u32, SpawnError> {
@@ -1865,7 +2676,7 @@ impl Processes for ProcessManager {
         if !block.push(path) || !block.push_all(argv) {
             return Err(SpawnError::ArgsTooLong);
         }
-        spawn_user(path, block, cwd, io, RawStreams::default())
+        spawn_user_env(path, block, env, cwd, io, RawStreams::default())
     }
 
     fn wait(&self, pid: u32) -> Option<i32> {
@@ -1910,8 +2721,8 @@ impl Processes for ProcessManager {
             let mut scheduler = SCHEDULER.lock();
             let done = scheduler.table.set_stopped(pid, stopped);
             // A program in a call stops on its way back to the program, which looks.
-            if let (true, true, Some(slot)) = (done, stopped, scheduler.table.find_pid(pid)) {
-                ATTENTION[slot].store(true, Ordering::Release);
+            if done && stopped {
+                note_attention(&scheduler.table, pid);
             }
             (done, scheduler.table.idle_cpu(this_cpu()))
         };
@@ -2002,18 +2813,10 @@ impl Clock for KernelClock {
         sleep_ms(ms);
     }
 
-    /// The hardware clock is read once and then counted forward from uptime: the
+    /// The hardware clock is read at boot and then counted forward (see `time`): the
     /// taskbar asks every frame, and reading a CMOS clock is slow port I/O.
     fn unix_time(&self) -> Option<u64> {
-        static BOOT_TIME: AtomicU64 = AtomicU64::new(0);
-        let uptime = self.uptime_ms() / 1000;
-        let known = BOOT_TIME.load(Ordering::Relaxed);
-        if known != 0 {
-            return Some(known + uptime);
-        }
-        let now = crate::Machine::unix_time()?;
-        BOOT_TIME.store(now.saturating_sub(uptime), Ordering::Relaxed);
-        Some(now)
+        crate::time::unix_time()
     }
 }
 

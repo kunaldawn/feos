@@ -7,14 +7,16 @@
 #![no_std]
 #![no_main]
 
-use feos_user::abi::{errno, open as flags, KEEP};
+use feos_user::abi::{access, at, errno, open as flags, Timespec, KEEP};
 use feos_user::{
-    chmod, chown, close, entry, eprintln, error_name, getgid, getuid, link, mkdir, open, println, read, setuid,
-    spawn, stat, unlink, wait, write, Args,
+    chmod, chown, close, entry, eprintln, error_name, faccessat, fchmodat, fchownat, getgid, getuid, link, linkat, mkdir,
+    open, println, read, readlinkat, renameat, setuid, spawn, stat, symlinkat, unlink, utimensat, wait, write, Args,
 };
 
+const CWD: i32 = at::FDCWD;
+
 struct Paths {
-    buffer: [u8; 512],
+    buffer: [u8; 2048],
     used: usize,
 }
 
@@ -34,7 +36,7 @@ impl Paths {
     }
 }
 
-static mut PATHS: Paths = Paths { buffer: [0; 512], used: 0 };
+static mut PATHS: Paths = Paths { buffer: [0; 2048], used: 0 };
 
 fn path(directory: &str, name: &str) -> &'static str {
     // SAFETY: one thread, and no reference is kept to the struct itself.
@@ -158,6 +160,21 @@ fn native(directory: &str) -> i32 {
     score.expect("a link in root's 0755", link(public, path(root_dir, "no")), -errno::EACCES);
     score.expect("chmod of root's", chmod(public, 0o666), -errno::EPERM);
     score.expect("chown, not being root", chown(public, 1000, KEEP), -errno::EPERM);
+    // The `*at` calls, as v1's: a mode, an owner, times and names of root's are root's.
+    score.expect("fchmodat of root's", fchmodat(CWD, public, 0o666, 0), -errno::EPERM);
+    score.expect("fchownat, not being root", fchownat(CWD, public, 1000, KEEP, 0), -errno::EPERM);
+    score.expect("fchownat leaving both", fchownat(CWD, public, KEEP, u32::MAX as usize, 0), 0);
+    let old = [Timespec { sec: 1_600_000_000, nsec: 0 }; 2];
+    score.expect("utimensat of root's to a time", utimensat(CWD, public, Some(&old), 0), -errno::EPERM);
+    score.expect("utimensat of root's 0644 to now", utimensat(CWD, public, None, 0), -errno::EACCES);
+    score.expect("faccessat reading 0600 of root's", faccessat(CWD, secret, access::R_OK, 0), -errno::EACCES);
+    score.expect("faccessat reading 0644 of root's", faccessat(CWD, public, access::R_OK, 0), 0);
+    score.expect("faccessat writing 0644 of root's", faccessat(CWD, public, access::W_OK, 0), -errno::EACCES);
+    score.expect("faccessat running 0644 of root's", faccessat(CWD, script, access::X_OK, 0), -errno::EACCES);
+    score.expect("renameat out of root's 0755", renameat(CWD, public, CWD, path(shared, "taken"), 0), -errno::EACCES);
+    score.expect("renameat into root's 0755", renameat(CWD, path(directory, "theirs"), CWD, path(root_dir, "no"), 0), -errno::EACCES);
+    score.expect("symlinkat in root's 0755", symlinkat("anywhere", CWD, path(root_dir, "no")), -errno::EACCES);
+    score.expect("linkat into root's 0755", linkat(CWD, public, CWD, path(root_dir, "no"), 0), -errno::EACCES);
     score.expect("going back to root", setuid(0, 0), -errno::EPERM);
     let pid = spawn(script, &[]);
     if pid >= 0 {
@@ -186,6 +203,18 @@ fn native(directory: &str) -> i32 {
         Err(error) => score.expect("stat of the link", error, 0),
     }
     score.expect("removing one", unlink(path(shared, "again")), 0);
+    score.expect("linkat in 0777", linkat(CWD, mine, CWD, path(shared, "linked"), 0), 0);
+    score.expect("renameat its own over its own", renameat(CWD, path(shared, "linked"), CWD, path(shared, "moved"), 0), 0);
+    score.expect("symlinkat in 0777", symlinkat("mine", CWD, path(shared, "sym")), 0);
+    let mut target = [0u8; 16];
+    score.expect("readlinkat of it", readlinkat(CWD, path(shared, "sym"), &mut target), 4);
+    match feos_user::fstatat(CWD, path(shared, "sym"), at::SYMLINK_NOFOLLOW) {
+        Ok(info) => score.expect("the link is its own", info.uid as isize, 1000),
+        Err(error) => score.expect("lstat of the link", error, 0),
+    }
+    score.expect("fchmodat of its own", fchmodat(CWD, mine, 0o600, 0), 0);
+    score.expect("utimensat of its own", utimensat(CWD, mine, Some(&old), 0), 0);
+    score.expect("faccessat of its own 0600", faccessat(CWD, mine, access::R_OK | access::W_OK, 0), 0);
     score.expect("a directory of its own", mkdir(path(shared, "mydir")), 0);
     score.expect("the file given to it", put(path(directory, "theirs"), b"changed"), 0);
 

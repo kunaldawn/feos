@@ -147,6 +147,7 @@ pub fn on_exception(info: &Fault, frame: &mut Frame) -> bool {
     if info.from_user() && info.is_task_fault() {
         let fault = sched::UserFault {
             address: info.fault_address(),
+            memory: info.memory_fault(),
             name: info.syndrome_name(),
             instruction: info.instruction(),
         };
@@ -198,10 +199,13 @@ pub fn on_exception(info: &Fault, frame: &mut Frame) -> bool {
 
 /// Reports a user program's fault that ends it. Called in its kernel thread, with
 /// interrupts on, so the console can be waited for.
-pub fn report_user_fault(fault: &sched::UserFault) {
+pub fn report_user_fault(fault: &sched::UserFault, no_frame: bool) {
     let console = feos_console::hold();
     report_task();
     match fault.address {
+        Some(address) if no_frame => {
+            let _ = writeln!(Report, "no frame for the page at {address:#x}, ip={:#x}; ended", fault.instruction);
+        }
         Some(address) => {
             let _ = writeln!(Report, "{} at {address:#x}, ip={:#x}; ended", fault.name, fault.instruction);
         }

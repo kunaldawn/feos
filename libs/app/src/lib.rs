@@ -25,6 +25,7 @@ pub mod pipe;
 pub mod shell;
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::cell::Cell;
 
 use feos_fs::FileSystem;
@@ -54,8 +55,9 @@ pub struct BoardInfo {
     pub bss_range: (usize, usize),
 }
 
-/// Maximum number of processes the kernel can track at once.
-pub const MAX_PROCESSES: usize = 32;
+/// Maximum number of tasks the kernel can track at once: processes and their threads,
+/// each a slot of the scheduler's table.
+pub const MAX_PROCESSES: usize = 1024;
 
 /// Maximum number of CPUs the scheduler can report in [`SystemInfo`].
 ///
@@ -102,7 +104,8 @@ pub struct ProcessInfo {
     pub started_ms: u64,
     /// Resident stack/process memory charged to this process, in bytes.
     pub memory_bytes: usize,
-    /// Number of threads in the process (currently always one).
+    /// Number of threads in the process: one for a kernel-linked app, and for a user
+    /// program as many as it has started and not yet ended, its first included.
     pub threads: u16,
     /// Scheduler priority, from 0 to [`PRIORITY_MAX`]. Larger is more urgent, and
     /// [`PRIORITY_NORMAL`] is what a process gets unless someone changes it.
@@ -135,23 +138,71 @@ impl ProcessInfo {
     }
 }
 
-/// Collects `pid` and its descendants from a snapshot, parents first, and
-/// returns how many there are.
-pub fn process_tree(infos: &[ProcessInfo], pid: u32, out: &mut [u32; MAX_PROCESSES]) -> usize {
-    out[0] = pid;
-    let mut count = 1;
-    let mut next = 0;
-    while next < count {
-        let parent = out[next];
-        next += 1;
-        for info in infos {
-            if info.parent == parent && count < MAX_PROCESSES && !out[..count].contains(&info.pid) {
-                out[count] = info.pid;
-                count += 1;
+/// A copy of the process table, on the heap: a thousand entries are too many for any
+/// task's stack. Take one with [`ProcessSnapshot::take`].
+pub struct ProcessSnapshot {
+    infos: Vec<ProcessInfo>,
+}
+
+impl ProcessSnapshot {
+    /// Copies every live process. `None` when the heap has no room for the copy: the
+    /// caller can't tell what's running, which isn't the same as nothing running, so it
+    /// tries again later rather than acting on an empty list.
+    pub fn take<P: Processes + ?Sized>(processes: &P) -> Option<Self> {
+        let mut infos = Vec::new();
+        infos.try_reserve_exact(MAX_PROCESSES).ok()?;
+        infos.resize(MAX_PROCESSES, ProcessInfo::EMPTY);
+        let count = processes.snapshot(&mut infos).min(MAX_PROCESSES);
+        infos.truncate(count);
+        Some(Self { infos })
+    }
+
+    /// The processes, in the order the kernel reported them.
+    pub fn as_slice(&self) -> &[ProcessInfo] {
+        &self.infos
+    }
+
+    /// The entry for `pid`, if it was there.
+    pub fn find(&self, pid: u32) -> Option<&ProcessInfo> {
+        self.infos.iter().find(|info| info.pid == pid)
+    }
+
+    /// Whether `pid` was there and hadn't exited.
+    pub fn is_live(&self, pid: u32) -> bool {
+        self.find(pid).is_some_and(|info| info.state != ProcessState::Exited)
+    }
+
+    /// `pid` and its descendants, parents first. `None` when the heap is short.
+    pub fn tree(&self, pid: u32) -> Option<Vec<u32>> {
+        let mut out = Vec::new();
+        out.try_reserve_exact(self.infos.len() + 1).ok()?;
+        // Each entry is taken once, which a flag per entry says in constant time, so a
+        // full table is a million steps and not a billion.
+        let mut taken = Vec::new();
+        taken.try_reserve_exact(self.infos.len()).ok()?;
+        taken.extend(self.infos.iter().map(|info| info.pid == pid));
+        out.push(pid);
+        let mut next = 0;
+        while next < out.len() {
+            let parent = out[next];
+            next += 1;
+            for (info, taken) in self.infos.iter().zip(taken.iter_mut()) {
+                if info.parent == parent && !*taken {
+                    *taken = true;
+                    out.push(info.pid);
+                }
             }
         }
+        Some(out)
     }
-    count
+}
+
+impl core::ops::Deref for ProcessSnapshot {
+    type Target = [ProcessInfo];
+
+    fn deref(&self) -> &[ProcessInfo] {
+        &self.infos
+    }
 }
 
 /// System-wide scheduler and process accounting.
@@ -303,6 +354,8 @@ pub enum SpawnError {
     ArgsTooLong,
     /// This kernel, or test double, can't do what was asked.
     Unsupported,
+    /// No memory for what the new process needed, such as holding the pipe it was given.
+    NoMemory,
 }
 
 /// Kernel process-management service.
@@ -350,13 +403,15 @@ pub trait Processes: Sync {
     }
 
     /// Starts the user program at `path` in a new process, with its own address space.
-    /// `argv` doesn't include the program's name, and `cwd` is the directory relative
-    /// paths in it start from. A program that can't be loaded isn't an error here: the
-    /// process ends straight away with a status of 126 or 127.
+    /// `argv` doesn't include the program's name, `env` is its environment (`KEY=VALUE`
+    /// strings), and `cwd` is the directory relative paths in it start from. A program
+    /// that can't be loaded isn't an error here: the process ends straight away with a
+    /// status of 126 or 127.
     fn spawn_user(
         &self,
         _path: &str,
         _argv: &[&str],
+        _env: &[&str],
         _cwd: &str,
         _io: SpawnIo<'_>,
     ) -> Result<u32, SpawnError> {
@@ -878,6 +933,74 @@ mod tests {
         fn snapshot(&self, _out: &mut [ProcessInfo]) -> usize {
             0
         }
+    }
+
+    /// A full table: PIDs 1 to 1024, each the child of the one before.
+    struct Full;
+
+    impl Processes for Full {
+        fn spawn(&self, _app: &'static dyn App, _args: &str) -> Result<u32, SpawnError> {
+            Err(SpawnError::NoFreeSlot)
+        }
+
+        fn kill(&self, _pid: u32) -> bool {
+            false
+        }
+
+        fn current(&self) -> u32 {
+            1
+        }
+
+        fn snapshot(&self, out: &mut [ProcessInfo]) -> usize {
+            for (index, info) in out.iter_mut().enumerate() {
+                let pid = index as u32 + 1;
+                *info = ProcessInfo { pid, parent: pid - 1, state: ProcessState::Ready, ..ProcessInfo::EMPTY };
+            }
+            out.len()
+        }
+    }
+
+    #[test]
+    fn process_snapshot_of_1024() {
+        let snapshot = ProcessSnapshot::take(&Full).unwrap();
+        assert_eq!(snapshot.len(), MAX_PROCESSES);
+        assert!(snapshot.is_live(1) && snapshot.is_live(MAX_PROCESSES as u32));
+        assert!(!snapshot.is_live(MAX_PROCESSES as u32 + 1));
+        assert_eq!(snapshot.find(700).map(|info| info.parent), Some(699));
+        // The deepest tree there can be, every process the child of the one before.
+        let tree = snapshot.tree(1).unwrap();
+        assert_eq!(tree.len(), MAX_PROCESSES);
+        assert!(tree.iter().copied().eq(1..=MAX_PROCESSES as u32));
+        assert_eq!(snapshot.tree(1000).unwrap(), (1000..=MAX_PROCESSES as u32).collect::<Vec<_>>());
+        // Through the trait object the apps hold, too.
+        let processes: &dyn Processes = &Full;
+        assert_eq!(ProcessSnapshot::take(processes).unwrap().len(), MAX_PROCESSES);
+    }
+
+    #[test]
+    fn the_process_tree_lists_parents_before_their_children() {
+        struct Some6;
+        impl Processes for Some6 {
+            fn spawn(&self, _app: &'static dyn App, _args: &str) -> Result<u32, SpawnError> {
+                Err(SpawnError::NoFreeSlot)
+            }
+            fn kill(&self, _pid: u32) -> bool {
+                false
+            }
+            fn current(&self) -> u32 {
+                1
+            }
+            fn snapshot(&self, out: &mut [ProcessInfo]) -> usize {
+                let pairs = [(1, 0), (2, 1), (3, 2), (4, 3), (5, 1), (6, 2)];
+                for (info, (pid, parent)) in out.iter_mut().zip(pairs) {
+                    *info = ProcessInfo { pid, parent, ..ProcessInfo::EMPTY };
+                }
+                pairs.len()
+            }
+        }
+        let snapshot = ProcessSnapshot::take(&Some6).unwrap();
+        assert_eq!(snapshot.tree(2).unwrap(), [2, 3, 6, 4]);
+        assert_eq!(snapshot.tree(9).unwrap(), [9], "a PID with no entry is a tree of one");
     }
 
     #[test]

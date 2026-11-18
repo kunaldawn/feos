@@ -26,8 +26,8 @@ use crate::fat32::{fat_time_to_unix, fat_timestamp};
 use crate::tree::{path_component, try_push, try_zeroed, ClusterSet, EntryLocation, NodeTable};
 use crate::volume::Volume;
 use crate::{
-    attr, CheckReport, EntryKind, FileSystem, FsError, NodeId, NodeTimes, TimeSource, VolumeStats,
-    WritableFileSystem, MAX_PATH_DEPTH,
+    attr, CheckReport, EntryKind, FileSystem, FsError, NodeId, NodeTimes, TimeSource, Timestamp,
+    VolumeStats, WritableFileSystem, MAX_PATH_DEPTH,
 };
 
 const EXFAT_SIGNATURE: &[u8; 8] = b"EXFAT   ";
@@ -43,6 +43,11 @@ const MAX_DIRECTORY_BYTES: u64 = 256 * 1024 * 1024;
 
 /// `VolumeFlags` bit: the volume may be inconsistent.
 const VOLUME_DIRTY: u16 = 0x0002;
+/// A bit of a file entry's first reserved byte (6) that says the set is on its way out:
+/// the old name of a file a rename is moving over another. Should a crash leave it and
+/// the name it moves to both naming the file's clusters, the check drops this one. It's
+/// never left set, and the set's checksum counts it like any other byte.
+const LEAVING: u8 = 0x80;
 
 const ENTRY_END: u8 = 0x00;
 const ENTRY_BITMAP: u8 = 0x81;
@@ -83,6 +88,8 @@ pub struct Exfat<D: BlockDevice> {
     orphans: Vec<u64>,
     /// Files whose set is whole but for its checksum, likewise.
     bad_checksums: Vec<u32>,
+    /// Files marked [`LEAVING`], likewise.
+    leaving: Vec<u32>,
     /// `(start, length)` of the bitmap and up-case table, which no node owns.
     system_streams: Vec<(u32, u64)>,
     now: Option<TimeSource>,
@@ -193,6 +200,7 @@ impl<D: BlockDevice> Exfat<D> {
             torn: Vec::new(),
             orphans: Vec::new(),
             bad_checksums: Vec::new(),
+            leaving: Vec::new(),
             system_streams: Vec::new(),
             now: None,
         };
@@ -445,6 +453,9 @@ impl<D: BlockDevice> Exfat<D> {
 
         if !checksum_good {
             try_push(&mut self.bad_checksums, node)?;
+        }
+        if info.leaving && info.kind == EntryKind::File && self.dirty {
+            try_push(&mut self.leaving, node)?;
         }
 
         if info.kind == EntryKind::Directory && info.data_length > 0 {
@@ -854,7 +865,7 @@ impl<D: WritableBlockDevice> Exfat<D> {
         Ok(())
     }
 
-    fn now(&self) -> Option<u64> {
+    fn now(&self) -> Option<Timestamp> {
         self.now.and_then(|now| now())
     }
 
@@ -1359,11 +1370,10 @@ impl<D: WritableBlockDevice> Exfat<D> {
         self.volume
             .write_u64_le(location.stream + 24, data_length)?;
         let now = self.now();
-        let stamp = now.and_then(fat_timestamp);
-        if let Some((day, time)) = stamp {
-            let value = (day as u32) << 16 | time as u32;
+        let stamp = now.and_then(encode_stamp);
+        if let Some((value, tens)) = stamp {
             self.volume.write_u32_le(location.primary + 12, value)?;
-            self.volume.write_u32_le(location.primary + 16, value)?;
+            self.volume.write_bytes(location.primary + 21, &[tens])?;
         }
         if let Some(entry) = self.nodes.get_mut(node) {
             entry.start_cluster = start;
@@ -1374,9 +1384,9 @@ impl<D: WritableBlockDevice> Exfat<D> {
                 entry.size = data_length;
                 entry.valid_size = valid_size;
             }
-            if stamp.is_some() {
-                entry.times.modified = now;
-                entry.times.accessed = now;
+            if let Some(now) = now.filter(|_| stamp.is_some()) {
+                // Never the access time: that's `noatime`, only ever set when asked.
+                entry.times.modified = kept(now, true);
             }
         }
         self.update_set_checksum(parent, location)
@@ -1569,11 +1579,13 @@ impl<D: WritableBlockDevice> Exfat<D> {
         primary[0] = ENTRY_FILE;
         primary[1] = secondary as u8;
         primary[4..6].copy_from_slice(&attributes.to_le_bytes());
-        if let Some((day, time)) = self.now().and_then(fat_timestamp) {
-            let value = ((day as u32) << 16 | time as u32).to_le_bytes();
+        if let Some((value, tens)) = self.now().and_then(encode_stamp) {
+            let value = value.to_le_bytes();
             primary[8..12].copy_from_slice(&value);
             primary[12..16].copy_from_slice(&value);
             primary[16..20].copy_from_slice(&value);
+            primary[20] = tens;
+            primary[21] = tens;
         }
         if let Some([old_primary, _]) = &template {
             // A rename changes the name and nothing else: attributes and
@@ -1648,13 +1660,14 @@ impl<D: WritableBlockDevice> Exfat<D> {
 
     /// Fills in a node's facts to match the entry just written.
     fn stamp_new_node(&mut self, node: NodeId, attributes: u8) {
-        let now = self.now().filter(|&now| fat_timestamp(now).is_some());
+        let now = self.now();
         if let Some(entry) = self.nodes.get_mut(node) {
             entry.attributes = attributes;
             entry.times = NodeTimes {
-                created: now,
-                modified: now,
-                accessed: now,
+                created: now.and_then(|now| kept(now, true)),
+                modified: now.and_then(|now| kept(now, true)),
+                accessed: now.and_then(|now| kept(now, false)),
+                changed: None,
             };
         }
     }
@@ -1817,6 +1830,96 @@ impl<D: WritableBlockDevice> Exfat<D> {
             .reparent(node, new_parent, String::from(new_name), new_location)
     }
 
+    /// An entry was made, taken or renamed in `directory`, so its own set's modification
+    /// time is now. The root has no set, and no time. Only a timestamp: the change it
+    /// follows has happened whether or not this lands.
+    fn touch_directory(&mut self, directory: NodeId) {
+        let Some(now) = self.now() else {
+            return;
+        };
+        let Some((word, tens)) = encode_stamp(now) else {
+            return;
+        };
+        let Some((location, parent)) = self.nodes.get(directory).and_then(|entry| Some((entry.entry?, entry.parent?))) else {
+            return;
+        };
+        self.volume.class = WriteClass::Dir;
+        let written = self.volume.write_u32_le(location.primary + 12, word).is_ok()
+            && self.volume.write_bytes(location.primary + 21, &[tens]).is_ok()
+            && self.update_set_checksum(NodeId(parent), location).is_ok();
+        if written {
+            if let Some(entry) = self.nodes.get_mut(directory) {
+                entry.times.modified = kept(now, true);
+            }
+        }
+    }
+
+    /// A file moved over another, in steps a crash can come between and the check can
+    /// still make whole: the moving set is marked [`LEAVING`], then the replaced set takes
+    /// its primary and stream entries' facts (its name entries stay), then the moving set
+    /// goes, then the replaced file's clusters. Each lands before the next is written.
+    /// The replaced set's two entries may be in different sectors and land apart, but
+    /// each says one whole file, so the check keeps the set either way, the old file or
+    /// the new; a crash after them leaves two names for the new one, and the check drops
+    /// the marked one. A directory moved over an empty one is the two steps of removing
+    /// it and renaming, which a crash can come between.
+    fn rename_over_node(&mut self, node: NodeId, new_parent: NodeId, replaced: NodeId) -> Result<(), FsError> {
+        if node == NodeId::ROOT || replaced == NodeId::ROOT || node == replaced {
+            return Err(FsError::Unsupported);
+        }
+        let (kind, old_parent, old_location) = {
+            let entry = self.nodes.get(node).ok_or(FsError::NotFound)?;
+            (entry.kind, entry.parent.ok_or(FsError::Unsupported)?, entry.entry.ok_or(FsError::Corrupt)?)
+        };
+        let victim = self.nodes.get(replaced).ok_or(FsError::NotFound)?;
+        let (victim_kind, victim_parent, victim_location, victim_name) =
+            (victim.kind, victim.parent.ok_or(FsError::Unsupported)?, victim.entry.ok_or(FsError::Corrupt)?, victim.name.clone());
+        let (victim_start, victim_contiguous, victim_length) = (victim.start_cluster, victim.contiguous, victim.data_length);
+        if victim_parent != new_parent.0 {
+            return Err(FsError::NotFound);
+        }
+        if kind == EntryKind::Directory || victim_kind == EntryKind::Directory {
+            if kind != victim_kind {
+                return Err(if kind == EntryKind::Directory { FsError::NotDirectory } else { FsError::IsDirectory });
+            }
+            if self.nodes.is_ancestor(node, new_parent) {
+                return Err(FsError::Unsupported);
+            }
+            self.remove_node(replaced)?;
+            return self.rename_node(node, new_parent, &victim_name);
+        }
+        if old_location.stream == 0 || victim_location.stream == 0 {
+            return Err(FsError::Corrupt);
+        }
+
+        self.volume.class = WriteClass::Dir;
+        let moving = self.volume.read_array::<32>(old_location.primary)?;
+        self.volume.write_bytes(old_location.primary + 6, &[moving[6] | LEAVING])?;
+        self.update_set_checksum(NodeId(old_parent), old_location)?;
+        self.volume.commit()?;
+        let moving_stream = self.volume.read_array::<32>(old_location.stream)?;
+        let mut primary = self.volume.read_array::<32>(victim_location.primary)?;
+        let mut stream = self.volume.read_array::<32>(victim_location.stream)?;
+        // The set count and checksum stay the replaced set's; the attributes and times
+        // are the file's.
+        primary[4..].copy_from_slice(&moving[4..]);
+        primary[6] &= !LEAVING;
+        // Its name's length and hash stay; where the data is, and how much, are the file's.
+        stream[1] = moving_stream[1];
+        stream[8..16].copy_from_slice(&moving_stream[8..16]);
+        stream[20..32].copy_from_slice(&moving_stream[20..32]);
+        self.volume.write_bytes(victim_location.stream, &stream)?;
+        self.volume.write_bytes(victim_location.primary, &primary)?;
+        self.update_set_checksum(new_parent, victim_location)?;
+        self.volume.commit()?;
+        self.delete_entry_set(NodeId(old_parent), old_location)?;
+        self.nodes.remove(replaced)?;
+        self.nodes.reparent(node, new_parent, victim_name, victim_location)?;
+        // Durably named by nothing before its clusters can be anything else's.
+        self.volume.commit()?;
+        self.free_stream(victim_start, victim_contiguous, victim_length)
+    }
+
     fn write_file(&mut self, node: NodeId, offset: usize, data: &[u8]) -> Result<usize, FsError> {
         let (old_size, old_valid, start_cluster, contiguous, data_length, kind) = {
             let entry = self.nodes.get(node).ok_or(FsError::NotFound)?;
@@ -1908,22 +2011,81 @@ impl<D: WritableBlockDevice> Exfat<D> {
 impl<D: WritableBlockDevice> WritableFileSystem for Exfat<D> {
     fn create_file(&mut self, parent: NodeId, name: &str) -> Result<NodeId, FsError> {
         self.ensure_writable()?;
-        self.create_file_node(parent, name)
+        let node = self.create_file_node(parent, name)?;
+        self.touch_directory(parent);
+        Ok(node)
     }
 
     fn create_dir(&mut self, parent: NodeId, name: &str) -> Result<NodeId, FsError> {
         self.ensure_writable()?;
-        self.create_dir_node(parent, name)
+        let node = self.create_dir_node(parent, name)?;
+        self.touch_directory(parent);
+        Ok(node)
     }
 
     fn remove(&mut self, node: NodeId) -> Result<(), FsError> {
         self.ensure_writable()?;
-        self.remove_node(node)
+        let parent = self.nodes.parent(node);
+        self.remove_node(node)?;
+        if let Some(parent) = parent {
+            self.touch_directory(parent);
+        }
+        Ok(())
     }
 
     fn rename(&mut self, node: NodeId, new_parent: NodeId, new_name: &str) -> Result<(), FsError> {
         self.ensure_writable()?;
-        self.rename_node(node, new_parent, new_name)
+        let old_parent = self.nodes.parent(node);
+        self.rename_node(node, new_parent, new_name)?;
+        if let Some(old_parent) = old_parent.filter(|&old_parent| old_parent != new_parent) {
+            self.touch_directory(old_parent);
+        }
+        self.touch_directory(new_parent);
+        Ok(())
+    }
+
+    fn rename_over(
+        &mut self,
+        node: NodeId,
+        new_parent: NodeId,
+        new_name: &str,
+        replaced: NodeId,
+        keep: Option<(NodeId, &str)>,
+    ) -> Result<(), FsError> {
+        self.ensure_writable()?;
+        if self.lookup_name(new_parent, new_name) != Some(replaced) {
+            return Err(FsError::NotFound);
+        }
+        match keep {
+            // A file still in use keeps its own set, so the name's has to go elsewhere
+            // first; an orphan doesn't outlive a crash anyway.
+            Some((directory, name)) => {
+                let old_parent = self.nodes.parent(node);
+                let spelled = self.name(replaced).map(String::from).ok_or(FsError::NotFound)?;
+                self.rename_node(replaced, directory, name)?;
+                if let Err(error) = self.rename_node(node, new_parent, new_name) {
+                    // The name mustn't be left naming nothing, nor the file an orphan no one
+                    // knows of: back where it was, in the slot just freed, which needs no
+                    // new room.
+                    let _ = self.rename_node(replaced, new_parent, &spelled);
+                    return Err(error);
+                }
+                if let Some(old_parent) = old_parent.filter(|&old_parent| old_parent != new_parent) {
+                    self.touch_directory(old_parent);
+                }
+                self.touch_directory(new_parent);
+                Ok(())
+            }
+            None => {
+                let old_parent = self.nodes.parent(node);
+                self.rename_over_node(node, new_parent, replaced)?;
+                if let Some(old_parent) = old_parent.filter(|&old_parent| old_parent != new_parent) {
+                    self.touch_directory(old_parent);
+                }
+                self.touch_directory(new_parent);
+                Ok(())
+            }
+        }
     }
 
     fn write(&mut self, node: NodeId, offset: usize, data: &[u8]) -> Result<usize, FsError> {
@@ -1934,6 +2096,10 @@ impl<D: WritableBlockDevice> WritableFileSystem for Exfat<D> {
     fn set_len(&mut self, node: NodeId, size: usize) -> Result<(), FsError> {
         self.ensure_writable()?;
         self.set_file_len(node, size)
+    }
+
+    fn keep_id(&mut self, node: NodeId, _ino: u64, keep: bool) -> Result<(), FsError> {
+        self.nodes.keep(node, keep)
     }
 
     fn flush(&mut self) -> Result<(), FsError> {
@@ -1979,15 +2145,22 @@ impl<D: WritableBlockDevice> WritableFileSystem for Exfat<D> {
         let parent = NodeId(entry.parent.ok_or(FsError::Unsupported)?);
         let mut stored = entry.times;
         self.volume.class = WriteClass::Dir;
+        // Each word, and where its 10 ms count goes if it has one.
         let fields = [
-            (times.created, 8u64),
-            (times.modified, 12),
-            (times.accessed, 16),
+            (times.created, 8u64, Some(20u64)),
+            (times.modified, 12, Some(21)),
+            (times.accessed, 16, None),
         ];
-        for (value, offset) in fields {
-            if let Some((day, time)) = value.and_then(fat_timestamp) {
-                self.volume
-                    .write_u32_le(location.primary + offset, (day as u32) << 16 | time as u32)?;
+        for (value, offset, fine) in fields {
+            let Some(value) = value else {
+                continue;
+            };
+            if let Some((word, tens)) = encode_stamp(value) {
+                self.volume.write_u32_le(location.primary + offset, word)?;
+                if let Some(at) = fine {
+                    self.volume.write_bytes(location.primary + at, &[tens])?;
+                }
+                let value = kept(value, fine.is_some());
                 match offset {
                     8 => stored.created = value,
                     12 => stored.modified = value,
@@ -2054,6 +2227,32 @@ impl<D: WritableBlockDevice> Exfat<D> {
             let location = entry.entry.ok_or(FsError::Corrupt)?;
             self.update_set_checksum(parent, location)?;
             report.repaired_sets += 1;
+        }
+        // A rename over a file that stopped part way: the old name goes if the new one
+        // has its clusters, and otherwise the rename never happened, and loses its mark.
+        for node in core::mem::take(&mut self.leaving) {
+            let node = NodeId(node);
+            let Some(entry) = self.nodes.get(node) else {
+                continue;
+            };
+            let (start, length) = (entry.start_cluster, entry.data_length);
+            let parent = NodeId(entry.parent.ok_or(FsError::Corrupt)?);
+            let location = entry.entry.ok_or(FsError::Corrupt)?;
+            let limit = self.nodes.id_limit() as u32;
+            let shared = start >= 2
+                && length > 0
+                && (0..limit).map(NodeId).any(|other| {
+                    other != node
+                        && self.nodes.kind(other) == Some(EntryKind::File)
+                        && self.nodes.get(other).is_some_and(|entry| entry.start_cluster == start)
+                });
+            if shared {
+                self.drop_entry(node, &mut report)?;
+            } else {
+                let flags = self.volume.read_array::<1>(location.primary + 6)?[0];
+                self.volume.write_bytes(location.primary + 6, &[flags & !LEAVING])?;
+                self.update_set_checksum(parent, location)?;
+            }
         }
 
         let mut used = ClusterSet::new(self.cluster_count)?;
@@ -2265,6 +2464,7 @@ struct PendingEntry {
     location: EntryLocation,
     attributes: u16,
     times: NodeTimes,
+    leaving: bool,
 }
 
 /// One directory entry's contribution to a `SetChecksum`, which skips the
@@ -2279,18 +2479,42 @@ fn checksum_entry(mut checksum: u16, entry: &[u8], primary: bool) -> u16 {
     checksum
 }
 
-/// Reads a file entry's timestamps: each a FAT time in the low half of a word,
-/// and a FAT date in the high half.
+/// Reads a file entry's timestamps: each a FAT time in the low half of a word, and a
+/// FAT date in the high half, the creation and modification times with a count of 10 ms
+/// beyond them (0 to 199, the odd second included). exFAT keeps no status change time.
 fn entry_times(entry: &[u8]) -> NodeTimes {
-    let stamp = |at: usize| {
+    let stamp = |at: usize, tens: Option<u8>| {
         let word = u32::from_le_bytes([entry[at], entry[at + 1], entry[at + 2], entry[at + 3]]);
-        fat_time_to_unix((word >> 16) as u16, word as u16)
+        decode_stamp(word, tens.unwrap_or(0))
     };
     NodeTimes {
-        created: stamp(8),
-        modified: stamp(12),
-        accessed: stamp(16),
+        created: stamp(8, Some(entry[20])),
+        modified: stamp(12, Some(entry[21])),
+        accessed: stamp(16, None),
+        changed: None,
     }
+}
+
+/// A time as a file entry keeps it: the FAT date and time word, and the 10 ms count past
+/// its two-second step. `None` before 1980 and past 2107.
+fn encode_stamp(time: Timestamp) -> Option<(u32, u8)> {
+    let (day, clock) = fat_timestamp(time.secs())?;
+    let tens = (time.secs() % 2) * 100 + u64::from(time.subsec_nanos()) / 10_000_000;
+    Some(((day as u32) << 16 | clock as u32, tens as u8))
+}
+
+/// The time a file entry's word and 10 ms count say. A count past 199 is not one a
+/// writer made, and adds nothing.
+fn decode_stamp(word: u32, tens: u8) -> Option<Timestamp> {
+    let seconds = fat_time_to_unix((word >> 16) as u16, word as u16)?;
+    let tens = if tens < 200 { u64::from(tens) } else { 0 };
+    Some(Timestamp(Timestamp::from_secs(seconds).0 + tens * 10_000_000))
+}
+
+/// What a file entry keeps of `time`, with its 10 ms count or (an access time) without.
+fn kept(time: Timestamp, fine: bool) -> Option<Timestamp> {
+    let (word, tens) = encode_stamp(time)?;
+    decode_stamp(word, if fine { tens } else { 0 })
 }
 
 /// Where the entries of a set that isn't whole are.
@@ -2334,6 +2558,7 @@ struct FileSet {
     count: u8,
     stored_checksum: u16,
     checksum: u16,
+    leaving: bool,
 }
 
 impl FileSet {
@@ -2361,6 +2586,7 @@ impl FileSet {
             count: entry[1].saturating_add(1),
             stored_checksum: u16::from_le_bytes([entry[2], entry[3]]),
             checksum: checksum_entry(0, entry, true),
+            leaving: entry[6] & LEAVING != 0,
         }
     }
 
@@ -2447,6 +2673,7 @@ impl FileSet {
             },
             attributes: self.attributes,
             times: self.times,
+            leaving: self.leaving,
         })
     }
 }

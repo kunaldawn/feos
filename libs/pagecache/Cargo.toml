@@ -1,0 +1,13 @@
+[package]
+name = "feos-pagecache"
+description = "The page cache: file pages in frames, shared by every mapping of a file"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+feos-sync = { workspace = true }

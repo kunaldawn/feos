@@ -162,8 +162,8 @@ impl<T: Transport> VirtioNet<T> {
     }
 
     fn offer_rx(&mut self, index: usize) {
-        let header = self.buffers.rx_headers[index].as_ptr() as u64;
-        let frame = self.buffers.rx[index].as_ptr() as u64;
+        let header = feos_hal::dma::bus_address(self.buffers.rx_headers[index].as_ptr() as usize);
+        let frame = feos_hal::dma::bus_address(self.buffers.rx[index].as_ptr() as usize);
         let chain = [
             Segment {
                 addr: header,
@@ -220,12 +220,12 @@ impl<T: Transport + Send> NetDevice for VirtioNet<T> {
         // Never written: a zero header asks for no offloads.
         let chain = [
             Segment {
-                addr: self.buffers.tx_headers[index].as_ptr() as u64,
+                addr: feos_hal::dma::bus_address(self.buffers.tx_headers[index].as_ptr() as usize),
                 len: self.header_size as u32,
                 device_writes: false,
             },
             Segment {
-                addr: self.buffers.tx[index].as_ptr() as u64,
+                addr: feos_hal::dma::bus_address(self.buffers.tx[index].as_ptr() as usize),
                 len: frame.len() as u32,
                 device_writes: false,
             },

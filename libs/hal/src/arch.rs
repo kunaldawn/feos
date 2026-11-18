@@ -90,6 +90,15 @@ impl PageBits {
     }
 }
 
+/// A fault on a page: what was tried where, for deciding whether a change to the page
+/// tables answers it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryFault {
+    pub address: u64,
+    pub write: bool,
+    pub execute: bool,
+}
+
 /// What a CPU fault can say about itself.
 pub trait FaultDetails {
     /// Whether this is something a task did, as opposed to the machine failing, so
@@ -101,6 +110,10 @@ pub trait FaultDetails {
     fn from_user(&self) -> bool;
     /// The address a memory fault was on, if this is one.
     fn fault_address(&self) -> Option<u64>;
+    /// A fault the page tables could answer: a page not there, or not allowed what was
+    /// tried. Not an alignment fault, an address the tables can't hold, or a broken
+    /// table, which no mapping fixes.
+    fn memory_fault(&self) -> Option<MemoryFault>;
     /// Human-readable name of the fault.
     fn syndrome_name(&self) -> &'static str;
     /// The address of the instruction that faulted.
@@ -222,8 +235,49 @@ pub trait Arch: Clock + Cpu + Power + Sized + 'static {
         alloc_table: &mut dyn FnMut() -> Option<usize>,
     ) -> bool;
 
+    /// Sets up `[base, base + size)` as a window of the kernel's own, for memory it maps
+    /// a page at a time (task stacks) away from the identity map: empty, with every
+    /// table it will ever need taken now from `alloc_table`, so that
+    /// [`map_kernel_page`](Self::map_kernel_page) and
+    /// [`unmap_kernel_page`](Self::unmap_kernel_page) never allocate and can run on any
+    /// CPU. `base` is 1 GiB aligned, `size` at most 1 GiB, and nothing else is mapped
+    /// there. Returns `false` if the range isn't free, or tables run out.
+    ///
+    /// # Safety
+    /// Before any process's tables are made, which take the kernel's top-level entries
+    /// as they are then, and with no other CPU running.
+    unsafe fn reserve_kernel_window(
+        base: usize,
+        size: usize,
+        alloc_table: &mut dyn FnMut() -> Option<usize>,
+    ) -> bool;
+
+    /// Maps the page at `address`, in a window from
+    /// [`reserve_kernel_window`](Self::reserve_kernel_window), to the frame at `frame`:
+    /// ordinary memory, read-write, for the kernel only, never executable.
+    ///
+    /// # Safety
+    /// The page must be unmapped and the frame the caller's; nothing else may be
+    /// changing the same page's entry.
+    unsafe fn map_kernel_page(address: usize, frame: usize);
+
+    /// Takes a page mapped by [`map_kernel_page`](Self::map_kernel_page) out again, and
+    /// forgets it on every CPU where
+    /// [`USER_FLUSH_BROADCAST`](Self::USER_FLUSH_BROADCAST), otherwise on this one: there
+    /// the caller has each other CPU [`flush_user_local`](Self::flush_user_local), which
+    /// forgets these entries too, before the frame is reused.
+    ///
+    /// # Safety
+    /// Nothing may use the page again.
+    unsafe fn unmap_kernel_page(address: usize);
+
     /// How this port writes a user page table entry.
     fn user_page_bits() -> PageBits;
+
+    /// One past the highest address the kernel's own mappings cover, RAM and device
+    /// windows alike. A process's window has to start at or above it, since a process's
+    /// top table holds the kernel's entries beside its own; boot checks that it does.
+    fn kernel_map_end() -> usize;
 
     /// Readies `tables`, a user top table from `feos-vm`, to be loaded: the kernel has
     /// to stay mapped, for the supervisor only, in every process. Returns what to give
@@ -239,14 +293,45 @@ pub trait Arch: Clock + Cpu + Power + Sized + 'static {
     ) -> Option<usize>;
 
     /// Loads a process's tables on this CPU, or the kernel's own with `root` zero.
-    /// `asid` is unique among live spaces and below 256. Call with interrupts masked.
+    /// `asid` is the space's, unique among the spaces whose entries any CPU may hold, and
+    /// below `1 << user_asid_bits()`; zero with `root` zero. Call with interrupts masked.
     fn activate_user_tables(root: usize, asid: u16);
 
-    /// Forgets anything cached about a space that's going away. On every CPU.
+    /// How wide this CPU's address space IDs are, as the kernel has set them up: 8 or
+    /// 16 bits, or 0 if there are none and every change of tables flushes the TLB.
+    fn user_asid_bits() -> u32;
+
+    /// Whether [`flush_user_page`](Self::flush_user_page) and
+    /// [`flush_user_space`](Self::flush_user_space) reach every CPU, as a broadcast
+    /// invalidation does. Where they don't, the kernel has to ask each other CPU that may
+    /// hold a space's entries to [`flush_user_local`](Self::flush_user_local), and wait
+    /// for it, before what an entry pointed at can be reused: a TLB shootdown.
+    const USER_FLUSH_BROADCAST: bool;
+
+    /// Forgets anything cached about a space that's going away: on every CPU where
+    /// [`USER_FLUSH_BROADCAST`](Self::USER_FLUSH_BROADCAST), otherwise on this one.
     fn flush_user_space(asid: u16);
 
-    /// Forgets anything cached about one user page. On every CPU.
+    /// Forgets anything cached about one user page: on every CPU where
+    /// [`USER_FLUSH_BROADCAST`](Self::USER_FLUSH_BROADCAST), otherwise on this one.
     fn flush_user_page(address: usize, asid: u16);
+
+    /// Forgets every user translation this CPU has cached, whatever its space: what a
+    /// remote flush (a shootdown's interrupt) does on the CPU it reaches.
+    fn flush_user_local();
+
+    /// Forgets every user translation of every space, on every CPU: for a new ASID
+    /// generation. Only called where there are ASIDs.
+    fn flush_user_all();
+
+    /// Reads the word at `address` in the user tables this CPU has loaded, as the
+    /// program would, past SMAP or PAN. For self-tests that check what a space maps;
+    /// nothing else may use it.
+    ///
+    /// # Safety
+    /// `address` must be mapped readable, and 8-byte aligned, in the loaded tables: a
+    /// fault here is the kernel's.
+    unsafe fn read_user_word(address: usize) -> u64;
 
     /// Makes changes to user page tables visible to the table walker.
     fn sync_user_tables();
@@ -257,4 +342,24 @@ pub trait Arch: Clock + Cpu + Power + Sized + 'static {
 
     /// What memory protection this CPU has turned on, for the boot log.
     fn protection_summary() -> &'static str;
+
+    /// Sets this CPU's user thread pointer: `TPIDR_EL0` on AArch64, the FS base on
+    /// x86_64. `value` is zero or in the user window: on x86_64 a non-canonical base
+    /// would fault in the kernel. Call with interrupts masked.
+    fn set_user_tls(value: usize);
+
+    /// What this CPU's user thread pointer holds. Call with interrupts masked.
+    fn user_tls() -> usize;
+
+    /// The aux vector's `AT_HWCAP` and `AT_HWCAP2` for a program on this machine, in
+    /// Linux's encoding (section 7.2 of `docs/feos-abi-v2.md`): what a program may rely
+    /// on, since it can't always ask the CPU itself.
+    fn user_hwcaps() -> (u64, u64);
+
+    /// Whether a program can change its thread pointer without a call, so the kernel
+    /// keeps what it finds there whenever the thread leaves the CPU. Where it can't
+    /// (x86_64, with `CR4.FSGSBASE` clear: a selector load can still clobber the FS base,
+    /// which nothing should keep) the kernel's own copy is the thread's, written back at
+    /// every switch in.
+    const USER_TLS_WRITABLE: bool;
 }

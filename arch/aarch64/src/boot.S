@@ -162,7 +162,10 @@ secondary_entry:
  * Nothing's above to trap: the kernel doesn't use EL2 or EL3, and this leaves the
  * minimum that lets EL1 run as if they weren't there.
  */
-.equ SCTLR_EL1_KNOWN, 0x30d00800      /* the RES1 bits; MMU and caches off, little endian */
+/* The RES1 bits; MMU and caches off, little endian; and EL0 may read CTR_EL0 (UCT, bit
+ * 15) and use `dc zva` (DZE, bit 14), but not maintain caches by address (UCI clear) or
+ * mask interrupts (UMA clear): what docs/feos-abi-v2.md section 1 promises programs. */
+.equ SCTLR_EL1_KNOWN, 0x30d0c800
 .equ SCTLR_EL2_KNOWN, 0x30c50830      /* the same for EL2 */
 .equ HCR_RW, (1 << 31)                /* EL1 is AArch64, and nothing else is set */
 .equ CPTR_EL2_KNOWN, 0x33ff           /* the RES1 bits; FP/SIMD doesn't trap */
@@ -351,7 +354,12 @@ invalidate_dcache:
  *
  *   0x00_0000_0000  1 GiB    Device   GIC, UART, fw_cfg, virtio, low PCIe MMIO
  *   0x00_4000_0000  3 GiB    Normal   RAM
- *   0x40_0000_0000  1 GiB    Device   PCIe ECAM
+ *   0x0f_c000_0000  1 GiB    Device   PCIe ECAM, which is at 0x40_0000_0000
+ *
+ * The ECAM is the one thing not identity mapped. QEMU puts it at 256 GiB, inside
+ * the window a process has (64 GiB up), and every process's top table holds the
+ * kernel's entries beside its own, so it's mapped at the last gigabyte below the
+ * window instead (`PCIE_ECAM_BASE` in the board says where).
  *
  * Exclusive access to RAM needs Normal memory: with the MMU off, every access
  * is Device-nGnRnE, where load-exclusive is implementation-defined and the
@@ -366,7 +374,8 @@ invalidate_dcache:
 
 .equ RAM_BLOCK_FIRST, 1
 .equ RAM_BLOCK_COUNT, 3
-.equ ECAM_BLOCK, 256
+.equ ECAM_PHYS_BLOCK, 256
+.equ ECAM_VIRT_BLOCK, 63
 .equ BLOCK_SIZE, 0x40000000
 
 .equ MAIR_VALUE, 0xff00               /* 0: Device-nGnRnE, 1: Normal write-back */
@@ -395,8 +404,8 @@ build_page_table:
     cmp  x1, #RAM_BLOCK_FIRST + RAM_BLOCK_COUNT
     b.lo 1b
 
-    ldr  x1, =(ECAM_BLOCK * BLOCK_SIZE + PT_BLOCK_DEVICE)
-    str  x1, [x0, #ECAM_BLOCK * 8]
+    ldr  x1, =(ECAM_PHYS_BLOCK * BLOCK_SIZE + PT_BLOCK_DEVICE)
+    str  x1, [x0, #ECAM_VIRT_BLOCK * 8]
     dsb  ish
     ret
 .size build_page_table, . - build_page_table
@@ -406,7 +415,13 @@ enable_mmu:
     ldr  x0, =MAIR_VALUE
     msr  mair_el1, x0
     ldr  x0, =TCR_VALUE
-    msr  tcr_el1, x0
+    /* 16-bit ASIDs (TCR_EL1.AS) where ID_AA64MMFR0_EL1.ASIDBits says the CPU has them. */
+    mrs  x1, id_aa64mmfr0_el1
+    ubfx x1, x1, #4, #4
+    cmp  x1, #2
+    b.ne 1f
+    orr  x0, x0, #(1 << 36)
+1:  msr  tcr_el1, x0
     adrp x0, page_table
     add  x0, x0, :lo12:page_table
     msr  ttbr0_el1, x0

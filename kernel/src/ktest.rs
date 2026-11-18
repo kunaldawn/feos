@@ -478,7 +478,7 @@ fn test_uspawn(rounds: usize) -> i32 {
     };
     let wait_for_frames = |target: usize| {
         for _ in 0..1000 {
-            if memory::free_bytes() >= target {
+            if free_bytes_settled() >= target {
                 return;
             }
             sched::sleep_ms(1);
@@ -487,7 +487,7 @@ fn test_uspawn(rounds: usize) -> i32 {
 
     // Whatever else is running settles first, and is counted the same way after.
     sched::sleep_ms(200);
-    let frames_before = memory::free_bytes();
+    let frames_before = free_bytes_settled();
     let heap_before = crate::allocator::stats().used_bytes;
     let pipes_before = feos_app::pipe::in_use();
 
@@ -546,7 +546,7 @@ fn test_uspawn(rounds: usize) -> i32 {
     }
 
     wait_for_frames(frames_before);
-    let frames_after = memory::free_bytes();
+    let frames_after = free_bytes_settled();
     let heap_after = crate::allocator::stats().used_bytes;
     let leaked_frames = frames_before.saturating_sub(frames_after) / 4096;
     let leaked_heap = heap_after.saturating_sub(heap_before);
@@ -569,11 +569,20 @@ fn spawn_program(argv: &[&str], stdin: Option<&feos_app::pipe::PipeReader>) -> O
     sched::spawn_user(argv[0], block, "/", io, sched::RawStreams::default()).ok()
 }
 
+/// Free bytes, once the page cache has let go of every page nothing maps and the stacks
+/// of tasks that have gone are back: what's left in use is what's in use, whatever files
+/// were read lately and whether the reaper has had its turn.
+fn free_bytes_settled() -> usize {
+    crate::pagecache::drop_idle();
+    sched::trim_stacks();
+    memory::free_bytes()
+}
+
 /// Waits up to a few seconds for the free frames to be back to `target`, as what's being
 /// given back is given back with interrupts on, by tasks that have to be scheduled.
 fn wait_for_frames(target: usize) {
     for _ in 0..3000 {
-        if memory::free_bytes() >= target {
+        if free_bytes_settled() >= target {
             return;
         }
         sched::sleep_ms(1);
@@ -594,14 +603,14 @@ fn wait_until_blocked(pid: u32) -> bool {
 /// What's in use now: free frames, heap and pipes.
 fn baseline() -> (usize, usize, usize) {
     sched::sleep_ms(200);
-    (memory::free_bytes(), crate::allocator::stats().used_bytes, feos_app::pipe::in_use())
+    (free_bytes_settled(), crate::allocator::stats().used_bytes, feos_app::pipe::in_use())
 }
 
 /// Whether what was in use at `before` is again: every frame back, the heap within what
 /// caches may keep, and no more pipes.
 fn back_to(before: (usize, usize, usize), label: &str) -> bool {
     wait_for_frames(before.0);
-    let frames = memory::free_bytes();
+    let frames = free_bytes_settled();
     let heap = crate::allocator::stats().used_bytes;
     let pipes = feos_app::pipe::in_use();
     let leaked_frames = before.0.saturating_sub(frames) / 4096;
@@ -610,7 +619,21 @@ fn back_to(before: (usize, usize, usize), label: &str) -> bool {
         "[ktest] {label}: frames-free={}->{frames} leaked-frames={leaked_frames} leaked-heap={leaked_heap} pipes={}->{pipes}",
         before.0, before.2
     );
-    leaked_frames == 0 && leaked_heap <= 64 * 1024 && pipes <= before.2
+    let good = leaked_frames == 0 && leaked_heap <= 64 * 1024 && pipes <= before.2;
+    if !good {
+        // Where the frames are, to tell a leak from something still being given back.
+        let (cached, idle) = crate::pagecache::counts();
+        println!(
+            "[ktest] {label}: cache-pages={cached} cache-idle={idle} cache-dirty={} stack-bytes={} promised={} orphans={}",
+            crate::pagecache::dirty(),
+            crate::kstack::bytes(),
+            crate::user::promised(),
+            crate::user::orphans()
+        );
+        sched::sleep_ms(5000);
+        println!("[ktest] {label}: 5 s later frames-free={}", free_bytes_settled());
+    }
+    good
 }
 
 /// User programs killed in the middle of system calls and faults: each call unwinds
@@ -725,6 +748,204 @@ fn test_ukill() -> i32 {
 
     println!("[ktest] ukill: {failed} failed");
     i32::from(failed != 0)
+}
+
+/// The threads the process `pid` has, as the process table counts them.
+fn threads_of(pid: u32) -> usize {
+    feos_app::ProcessSnapshot::take(&sched::PROCESSES)
+        .and_then(|processes| processes.find(pid).map(|process| usize::from(process.threads)))
+        .unwrap_or(0)
+}
+
+/// Runs a user program with its output in a pipe, printing only its last line and any
+/// that says something failed, and returns its status.
+fn run_quietly(argv: &[&str]) -> Option<i32> {
+    let (out_reader, out_writer) = feos_app::pipe::create()?;
+    let io = SpawnIo { stdout: Some(&out_writer), stderr: Some(&out_writer), ..SpawnIo::default() };
+    let mut block = feos_app::ArgBlock::new();
+    if !block.push_all(argv) {
+        return None;
+    }
+    let pid = sched::spawn_user(argv[0], block, "/", io, sched::RawStreams::default()).ok();
+    drop(out_writer);
+    let pid = pid?;
+    let mut line = [0u8; 160];
+    let mut length = 0;
+    let mut last = [0u8; 160];
+    let mut last_length = 0;
+    let mut chunk = [0u8; 256];
+    // Until the program has ended, not until its output does: a child of it may hold the
+    // pipe for longer.
+    let mut ended = None;
+    loop {
+        let got = match out_reader.try_read(&mut chunk) {
+            feos_app::pipe::Transfer::Moved(got) => got,
+            feos_app::pipe::Transfer::Closed => break,
+            feos_app::pipe::Transfer::WouldBlock => {
+                if ended.is_some() {
+                    break;
+                }
+                if let feos_app::WaitStatus::Exited(status) = sched::PROCESSES.try_wait(pid) {
+                    ended = Some(status);
+                    continue;
+                }
+                sched::sleep_ms(5);
+                continue;
+            }
+        };
+        for &byte in &chunk[..got] {
+            if byte != b'\n' {
+                if length < line.len() {
+                    line[length] = byte;
+                    length += 1;
+                }
+                continue;
+            }
+            let text = core::str::from_utf8(&line[..length]).unwrap_or("?");
+            if text.contains("FAILED") {
+                println!("{text}");
+            }
+            last = line;
+            last_length = length;
+            length = 0;
+        }
+    }
+    let status = ended.or_else(|| sched::PROCESSES.wait(pid));
+    println!("[ktest] kstack: {}: {}", argv[0], core::str::from_utf8(&last[..last_length]).unwrap_or("?"));
+    status
+}
+
+/// User threads' kernel stacks are 64 KiB: this drives the deepest calls and faults
+/// there are (every call `utest` makes, file mappings and write-back on the filesystem
+/// at `dir`, which on the native one goes through its journal, and threads by the
+/// hundred), then checks that no thread used more than half its stack. Every stack is
+/// painted when it's taken and measured as it's given back.
+fn test_kstack(dir: &str) -> i32 {
+    sched::trim_stacks();
+    crate::kstack::reset_peaks();
+    println!("[ktest] kstack: driving utest, mtest on {dir} and ttest");
+    let programs: [&[&str]; 3] = [&["/bin/utest"], &["/bin/mtest", "--dir", dir], &["/bin/ttest"]];
+    let mut failed = 0;
+    for argv in programs {
+        if run_quietly(argv) != Some(0) {
+            println!("[ktest] kstack: {} failed", argv[0]);
+            failed += 1;
+        }
+    }
+    sched::trim_stacks();
+    let (user, kernel) = crate::kstack::peaks();
+    let half = crate::kstack::USER_STACK / 2;
+    let ok = failed == 0 && user > 0 && user <= half;
+    println!(
+        "[ktest] kstack: user-peak={user} of {} (half {half}) kernel-peak={kernel} of {} dir={dir} \
+         stacks-held={} failed={failed} ok={ok}",
+        crate::kstack::USER_STACK,
+        crate::kstack::KERNEL_STACK,
+        crate::kstack::bytes()
+    );
+    i32::from(!ok)
+}
+
+/// Kernel apps killed over and over while they take stacks (spawning) and read others'
+/// (as `ps` does): a kill lands only once they're done, so no stack is left `TRIMMING`,
+/// no reader is left counted, and no slot is left reserved. `trim_stacks` returning at
+/// all says the first; the counts and a spawn after say the rest.
+fn test_kstack_kill() -> i32 {
+    const CHURNERS: usize = 6;
+    const ROUNDS: usize = 40;
+    let processes = &sched::PROCESSES;
+    sched::trim_stacks();
+    let before = crate::kstack::bytes();
+    let mut killed = 0;
+    let mut odd = 0;
+    let mut seed = CLOCK_SEED.fetch_add(0x9e37_79b9, Ordering::Relaxed) | 1;
+    for _ in 0..ROUNDS {
+        let mut pids = [0u32; CHURNERS];
+        for pid in pids.iter_mut() {
+            let task = Box::new(|| -> i32 {
+                loop {
+                    let child = Box::new(|| 0);
+                    let _ = sched::PROCESSES.spawn_task("ktest-kchild", SpawnIo::default(), child);
+                    for slot in 1..64 {
+                        core::hint::black_box(crate::kstack::high_water(slot));
+                    }
+                }
+            });
+            match processes.spawn_task("ktest-churn", SpawnIo::default(), task) {
+                Ok(spawned) => *pid = spawned,
+                Err(_) => odd += 1,
+            }
+        }
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        sched::sleep_ms(1 + seed % 15);
+        for &pid in pids.iter().filter(|&&pid| pid != 0) {
+            let _ = processes.try_kill(pid);
+            match processes.wait(pid) {
+                Some(feos_app::EXIT_KILLED) => killed += 1,
+                _ => odd += 1,
+            }
+        }
+    }
+    // Its children end by themselves: give them a moment to be collected.
+    sched::sleep_ms(200);
+    sched::trim_stacks();
+    let (readers, trimming) = crate::kstack::in_flight();
+    let after = crate::kstack::bytes();
+    let spawned = processes.spawn_task("ktest-after", SpawnIo::default(), Box::new(|| 7));
+    let after_status = spawned.ok().and_then(|pid| processes.wait(pid));
+    let ok = odd == 0
+        && killed == ROUNDS * CHURNERS
+        && readers == 0
+        && trimming == 0
+        && after <= before
+        && after_status == Some(7);
+    println!(
+        "[ktest] kstack-kill: killed={killed} odd={odd} readers={readers} trimming={trimming} \
+         stacks={before}->{after} spawn-after={after_status:?} ok={ok}"
+    );
+    i32::from(!ok)
+}
+
+static CLOCK_SEED: AtomicU64 = AtomicU64::new(0x2545_f491_4f6c_dd1d);
+
+/// A fault in the kernel, in the middle of one thread's call, ends that thread's whole
+/// process with status 139: its other threads, all waiting in calls, are killed through
+/// the cooperative path, and everything the process had comes back.
+fn test_thread_fault() -> i32 {
+    let processes = &sched::PROCESSES;
+    let before = baseline();
+    let Some((reader, writer)) = feos_app::pipe::create() else {
+        println!("[ktest] thread-fault: no pipe");
+        return 1;
+    };
+    let pid = spawn_program(&["/bin/ttest", "--fault-victim"], Some(&reader));
+    drop(reader);
+    let Some(pid) = pid else {
+        println!("[ktest] thread-fault: /bin/ttest didn't start");
+        return 1;
+    };
+    // Every thread started, and each waiting.
+    let mut threads = 0;
+    for _ in 0..2000 {
+        threads = threads_of(pid);
+        if threads == 4 {
+            break;
+        }
+        sched::sleep_ms(1);
+    }
+    sched::sleep_ms(50);
+    sched::arm_thread_fault(pid);
+    let _ = writer.write(b"x");
+    let status = processes.wait(pid);
+    drop(writer);
+    sched::arm_thread_fault(0);
+    let left = threads_of(pid);
+    let whole = back_to(before, "thread-fault");
+    let good = threads == 4 && status == Some(139) && left == 0 && whole;
+    println!("[ktest] thread-fault: threads={threads} status={status:?} left={left} ok={good}");
+    i32::from(!good)
 }
 
 /// Spawns a program blocking on a pipe over and over, while a kernel task tries to
@@ -867,15 +1088,702 @@ fn test_teardown() -> i32 {
     i32::from(!good)
 }
 
-/// Says what the frames and memory look like right now.
-fn test_user_memory() -> i32 {
+/// Most words `ktest drive` passes on to its program.
+const DRIVE_WORDS: usize = 16;
+
+/// Runs a user program with its standard streams on pipes, passes on what it prints,
+/// and answers each `?frames` line it prints with the free frame count, which a program
+/// can't see for itself until `SYSINFO`. The program is told with `--frames`. Its status
+/// is the result.
+fn test_drive(words: &str) -> i32 {
+    let mut argv = [""; DRIVE_WORDS + 1];
+    let mut count = 0;
+    for word in words.split_whitespace().take(DRIVE_WORDS) {
+        argv[count] = word;
+        count += 1;
+    }
+    if count == 0 {
+        println!("usage: ktest drive PROGRAM [ARGS...]");
+        return 2;
+    }
+    argv[count] = "--frames";
+    let mut block = feos_app::ArgBlock::new();
+    if !block.push_all(&argv[..=count]) {
+        println!("[ktest] drive: too many arguments");
+        return 2;
+    }
+    let (Some((stdin_reader, stdin_writer)), Some((out_reader, out_writer))) =
+        (feos_app::pipe::create(), feos_app::pipe::create())
+    else {
+        println!("[ktest] drive: no pipes");
+        return 1;
+    };
+    let io = SpawnIo {
+        stdin: Some(&stdin_reader),
+        stdout: Some(&out_writer),
+        stderr: Some(&out_writer),
+        ..SpawnIo::default()
+    };
+    let pid = sched::spawn_user(argv[0], block, "/", io, sched::RawStreams::default());
+    // The program and its children have the other ends now: the output ends when the
+    // last of them goes.
+    drop(stdin_reader);
+    drop(out_writer);
+    let Ok(pid) = pid else {
+        println!("[ktest] drive: {} didn't start", argv[0]);
+        return 1;
+    };
+    let mut line = [0u8; 512];
+    let mut length = 0;
+    let mut chunk = [0u8; 256];
+    let mut answered = 0usize;
+    loop {
+        let got = out_reader.read(&mut chunk);
+        if got == 0 {
+            break;
+        }
+        for &byte in &chunk[..got] {
+            if byte != b'\n' && length < line.len() {
+                line[length] = byte;
+                length += 1;
+                continue;
+            }
+            let text = core::str::from_utf8(&line[..length]).unwrap_or("?");
+            if text == "?frames" {
+                let mut number = [0u8; 24];
+                let digits = decimal(free_bytes_settled() / 4096, &mut number);
+                let _ = stdin_writer.write(digits);
+                answered += 1;
+            } else {
+                println!("{text}");
+            }
+            length = 0;
+        }
+    }
+    let status = sched::PROCESSES.wait(pid).unwrap_or(feos_app::EXIT_KILLED);
+    println!("[ktest] drive: {} ended with status {status}, {answered} frame counts given", argv[0]);
+    status
+}
+
+/// Writes `value` and a newline into `out`, and returns what was written.
+fn decimal(mut value: usize, out: &mut [u8; 24]) -> &[u8] {
+    let mut at = out.len() - 1;
+    out[at] = b'\n';
+    loop {
+        at -= 1;
+        out[at] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    &out[at..]
+}
+
+/// A program dirtying every page of a shared mapping of a `mib` MiB file at `path` as
+/// fast as it can, killed by the kernel (a program can't kill until stage 1c.8): what it
+/// dirtied is written back as its space goes, so the file holds, page by page, one whole
+/// pass's number or the one before, never a torn page, and every frame comes back once
+/// the file has gone.
+fn test_dirty_storm(path: &str, mib: u64) -> i32 {
+    let Some(tree) = sched::platform().filesystem.and_then(|filesystem| filesystem.tree()) else {
+        println!("[ktest] dirty-storm: no filesystem");
+        return 1;
+    };
+    let processes = &sched::PROCESSES;
+    let size = mib << 20;
+    let before = baseline();
+    let _ = tree.remove_file(path);
+    if let Err(error) = tree.create_file(path).and_then(|()| tree.truncate(path, size)) {
+        println!("[ktest] dirty-storm: can't make {path}: {error:?}");
+        return 1;
+    }
+    let pid = spawn_program(&["/bin/malicious", "--dirty-storm", path], None);
+    // Killed once every page is dirty, so its first pass is over, and a while into the
+    // next: however slow the filesystem is to fill the pages.
+    let pages = (size / 4096) as usize;
+    let mut waited = 0;
+    while crate::pagecache::dirty() < pages && waited < 120_000 {
+        processes.sleep_ms(10);
+        waited += 10;
+    }
+    processes.sleep_ms(500);
+    let start = sched::CLOCK.uptime_ms();
+    let status = pid.and_then(|pid| {
+        let _ = processes.try_kill(pid);
+        processes.wait(pid)
+    });
+    let teardown = sched::CLOCK.uptime_ms() - start;
+    let mut page = [0u8; 4096];
+    let (mut low, mut high, mut torn) = (u64::MAX, 0u64, 0usize);
+    let mut first_error = None;
+    for index in 0..size / 4096 {
+        let got = tree.read_at(path, index * 4096, &mut page);
+        if got != Ok(4096) {
+            first_error.get_or_insert((index, got));
+            torn += 1;
+            continue;
+        }
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&page[..8]);
+        let pass = u64::from_ne_bytes(word);
+        torn += usize::from(page[8..].iter().any(|&byte| byte != 0));
+        low = low.min(pass);
+        high = high.max(pass);
+    }
+    let _ = tree.remove_file(path);
+    let whole = torn == 0 && low >= 1 && high - low <= 1;
+    let good = status == Some(feos_app::EXIT_KILLED) && whole && back_to(before, "dirty-storm frames");
     println!(
-        "[ktest] frames-free={} heap-used={} pipes={}",
+        "[ktest] dirty-storm: {mib} MiB status={status:?} passes={low}..={high} torn-pages={torn}          kill-and-write-back={teardown}ms first-bad-read={first_error:?} ok={good}"
+    );
+    i32::from(!good)
+}
+
+/// Says what the frames and memory look like right now, once the page cache has let go
+/// of the pages nothing maps, and what it keeps.
+fn test_user_memory() -> i32 {
+    sched::trim_stacks();
+    let dropped = crate::pagecache::drop_idle();
+    let (cached, idle) = crate::pagecache::counts();
+    println!(
+        "[ktest] frames-free={} heap-used={} pipes={} promised={} cache-pages={cached} cache-idle={idle} cache-dropped={dropped} orphans={} locks={}",
         memory::free_bytes(),
         crate::allocator::stats().used_bytes,
-        feos_app::pipe::in_use()
+        feos_app::pipe::in_use(),
+        crate::user::promised(),
+        crate::user::orphans(),
+        crate::user::locks()
     );
     0
+}
+
+/// A program waiting in `F_SETLKW` for a lock another holds is killed (stage 1c.5): its
+/// wait ends, it never gets the lock, and the holder's lock is all the table has; then
+/// the holder is killed too, and the table is empty. The kernel kills, as no program can
+/// until stage 1c.8.
+fn test_setlkw_killed() -> i32 {
+    let processes = &sched::PROCESSES;
+    let path = "/tmp/ktest-setlkw";
+    let before = baseline();
+    let locks_before = crate::user::locks();
+    let Some((reader, writer)) = feos_app::pipe::create() else {
+        println!("[ktest] setlkw-killed: FAILED (no pipe)");
+        return 1;
+    };
+    let holder = spawn_program(&["/bin/malicious", "--lock-hold", path], Some(&reader));
+    let held = holder.is_some_and(wait_until_blocked);
+    let held_locks = crate::user::locks();
+    let waiter = if held { spawn_program(&["/bin/malicious", "--setlkw-wait", path], None) } else { None };
+    let waiting = waiter.is_some_and(wait_until_blocked);
+    // Long enough that a wrongly granted lock would have been had and reported.
+    processes.sleep_ms(200);
+    let waiting_locks = crate::user::locks();
+    let waiter_status = waiter.and_then(|pid| {
+        let _ = processes.try_kill(pid);
+        processes.wait(pid)
+    });
+    let after_waiter = crate::user::locks();
+    let holder_status = holder.and_then(|pid| {
+        let _ = processes.try_kill(pid);
+        processes.wait(pid)
+    });
+    drop(reader);
+    drop(writer);
+    let after_holder = crate::user::locks();
+    if let Some(tree) = sched::platform().filesystem.and_then(|filesystem| filesystem.tree()) {
+        let _ = tree.remove_file(path);
+    }
+    let good = held
+        && waiting
+        && held_locks == locks_before + 1
+        && waiting_locks == held_locks
+        && waiter_status == Some(feos_app::EXIT_KILLED)
+        && after_waiter == held_locks
+        && holder_status == Some(feos_app::EXIT_KILLED)
+        && after_holder == locks_before
+        && back_to(before, "setlkw-killed");
+    println!(
+        "[ktest] setlkw-killed: {} (held={held} waiting={waiting} locks={locks_before}->{held_locks}->{waiting_locks}->{after_waiter}->{after_holder} waiter={waiter_status:?} holder={holder_status:?})",
+        if good { "ok" } else { "FAILED" }
+    );
+    i32::from(!good)
+}
+
+/// Where the TLB, ASID and futex tests map their page in a space of their own.
+const TEST_PAGE: usize = feos_abi::USER_MMAP_BASE + 0x10_0000;
+
+/// Waits up to `ms` for `stage` to reach `wanted`.
+fn wait_stage(stage: &AtomicU32, wanted: u32, ms: u64) -> bool {
+    let deadline = sched::CLOCK.uptime_ms() + ms;
+    while stage.load(Ordering::Acquire) < wanted {
+        if sched::CLOCK.uptime_ms() > deadline {
+            return false;
+        }
+        sched::sleep_ms(1);
+    }
+    true
+}
+
+/// A page mapped in a space, read on CPU 1 so its TLB has it, unmapped from CPU 0 while
+/// CPU 1 has interrupts masked: on a port whose flushes don't reach other CPUs the
+/// unmap has to wait for CPU 1 to take the shootdown, and the frame isn't freed until
+/// it has. Then the page is mapped again with another frame, and CPU 1 must read that,
+/// not what a stale entry would give it.
+fn test_tlb() -> i32 {
+    static STAGE: AtomicU32 = AtomicU32::new(0);
+    static FIRST: AtomicU64 = AtomicU64::new(0);
+    static SECOND: AtomicU64 = AtomicU64::new(0);
+    static HELD: AtomicU32 = AtomicU32::new(0);
+    static ON_CPU: AtomicU32 = AtomicU32::new(u32::MAX);
+    let processes = &sched::PROCESSES;
+    if sched::online_cpus() < 2 {
+        println!("[ktest] tlb: skipped=one-cpu ok=true");
+        return 0;
+    }
+    let Some(space) = crate::user::TestSpace::new() else {
+        println!("[ktest] tlb: no memory");
+        return 1;
+    };
+    let Some(frame) = space.map_word(TEST_PAGE, 0x1111) else {
+        println!("[ktest] tlb: can't map");
+        return 1;
+    };
+    STAGE.store(0, Ordering::Release);
+    HELD.store(0, Ordering::Release);
+    let me = processes.current();
+    processes.set_affinity(me, 1 << 0);
+    processes.sleep_ms(20);
+    let address = &space as *const crate::user::TestSpace as usize;
+    let task = Box::new(move || {
+        // On CPU 1 before anything: it was pinned there just after it started.
+        processes.sleep_ms(50);
+        // SAFETY: the test waits for this task before the space goes.
+        let space = unsafe { &*(address as *const crate::user::TestSpace) };
+        sched::borrow_tables(space.mm().root(), space.mm().tlb());
+        let flags = Port::irq_save_and_disable();
+        ON_CPU.store(Port::cpu_index() as u32, Ordering::Release);
+        // SAFETY: mapped and readable in the tables just loaded.
+        FIRST.store(unsafe { Port::read_user_word(TEST_PAGE) }, Ordering::Release);
+        STAGE.store(1, Ordering::Release);
+        // With interrupts masked, the shootdown can't be answered: the unmap waits, and
+        // the frame stays.
+        while STAGE.load(Ordering::Acquire) < 2 {
+            core::hint::spin_loop();
+        }
+        let until = Port::services().ticks() + Port::services().frequency() / 5;
+        let mut held = 1;
+        while Port::services().ticks() < until {
+            if memory::frame_refs(frame) == 0 {
+                held = 0;
+            }
+        }
+        HELD.store(held, Ordering::Release);
+        Port::irq_restore(flags);
+        while STAGE.load(Ordering::Acquire) < 3 {
+            core::hint::spin_loop();
+        }
+        let flags = Port::irq_save_and_disable();
+        // SAFETY: mapped again before stage 3.
+        SECOND.store(unsafe { Port::read_user_word(TEST_PAGE) }, Ordering::Release);
+        Port::irq_restore(flags);
+        sched::return_tables();
+        STAGE.store(4, Ordering::Release);
+        0
+    });
+    let Ok(pid) = processes.spawn_task("ktest-tlb", SpawnIo::default(), task) else {
+        return 1;
+    };
+    processes.set_affinity(pid, 1 << 1);
+    let started = wait_stage(&STAGE, 1, 5000);
+    let (shootdowns, held_back) = crate::user::tlb::shootdown_counts();
+    let start = Port::services().ticks();
+    STAGE.store(2, Ordering::Release);
+    let unmapped = space.unmap(TEST_PAGE);
+    let waited_ms = (Port::services().ticks() - start) * 1000 / Port::services().frequency();
+    let freed = memory::frame_refs(frame) == 0;
+    let (shootdowns_after, held_after) = crate::user::tlb::shootdown_counts();
+    let remapped = space.map_word(TEST_PAGE, 0x2222).is_some();
+    STAGE.store(3, Ordering::Release);
+    let finished = wait_stage(&STAGE, 4, 5000);
+    processes.wait(pid);
+    processes.set_affinity(me, 0);
+    drop(space);
+    let (first, second) = (FIRST.load(Ordering::Acquire), SECOND.load(Ordering::Acquire));
+    let held = HELD.load(Ordering::Acquire) == 1;
+    let cpu = ON_CPU.load(Ordering::Acquire);
+    let sent = shootdowns_after - shootdowns;
+    // Where flushes are broadcast there's nothing to wait for, so nothing is held.
+    let shot = if <Port as Arch>::USER_FLUSH_BROADCAST {
+        sent == 0
+    } else {
+        sent >= 1 && held && held_after > held_back && waited_ms >= 150
+    };
+    let ok = started && finished && unmapped && remapped && cpu == 1 && first == 0x1111 && second == 0x2222 && freed && shot;
+    println!(
+        "[ktest] tlb: cpu={cpu} first={first:#x} second={second:#x} shootdowns={sent} held-back={} waited-ms={waited_ms} \
+         held-until-ack={held} freed-after={freed} broadcast={} ok={ok}",
+        held_after - held_back,
+        <Port as Arch>::USER_FLUSH_BROADCAST
+    );
+    i32::from(!ok)
+}
+
+/// ASIDs under load: `count` user programs alive at once, more than 8-bit ASIDs can tell
+/// apart, with ASIDs forced to 8 bits, each reading back words of its own over and over
+/// while they all share every CPU, so tables are loaded on each all the time and the
+/// generation rolls over again and again with programs running everywhere. They start
+/// together, held by a pipe each reads until it ends. Every one must see only its own,
+/// and say so on a pipe this reads to its end, which is when the last has gone (their
+/// statuses can't tell: v1 keeps the last 64 exits' only). Everything they used must
+/// come back.
+fn test_asid_load(count: usize) -> i32 {
+    let before = baseline();
+    let (generation, bits) = crate::user::tlb::asid_state();
+    crate::user::tlb::force_asid_bits(8);
+    let mut started = 0;
+    let mut good = 0;
+    let pipes = feos_app::pipe::create().zip(feos_app::pipe::create());
+    if let Some(((gate, open), (said, say))) = pipes {
+        for _ in 0..count {
+            let mut block = feos_app::ArgBlock::new();
+            if !block.push_all(&["/bin/utest", "--asid-check", "200"]) {
+                break;
+            }
+            let io = SpawnIo { stdin: Some(&gate), stdout: Some(&say), stderr: Some(&say), ..SpawnIo::default() };
+            if sched::spawn_user("/bin/utest", block, "/", io, sched::RawStreams::default()).is_err() {
+                break;
+            }
+            started += 1;
+        }
+        drop(gate);
+        drop(say);
+        // Every one of them holds the gate's reader: closing its writer starts them all.
+        drop(open);
+        // Each says `asid-ok` and nothing else when all was well: count whole lines.
+        let mut line = [0u8; 16];
+        let mut length = 0;
+        let mut chunk = [0u8; 512];
+        loop {
+            let got = said.read(&mut chunk);
+            if got == 0 {
+                break;
+            }
+            for &byte in &chunk[..got] {
+                if byte == b'\n' {
+                    good += usize::from(&line[..length.min(line.len())] == b"asid-ok");
+                    length = 0;
+                } else {
+                    if length < line.len() {
+                        line[length] = byte;
+                    }
+                    length += 1;
+                }
+            }
+        }
+    }
+    let failed = started - good.min(started);
+    let (now, _) = crate::user::tlb::asid_state();
+    crate::user::tlb::force_asid_bits(bits);
+    let rollovers = now - generation;
+    let back = back_to(before, "asid-load-back");
+    let ok = started == count && failed == 0 && back && (bits == 0 || rollovers >= 2);
+    let forced = if bits == 0 { 0 } else { 8 };
+    println!(
+        "[ktest] asid-load: programs={started}/{count} failed={failed} bits={bits}->{forced} generations={rollovers} ok={ok}"
+    );
+    i32::from(!ok)
+}
+
+/// 1024 spaces at once, as many as there are tasks, each with its own word at the same
+/// address, every one loaded in turn and read, twice, on CPU 0: with ASIDs forced to 8
+/// bits that runs out of them four times a pass, so
+/// the generation rolls over and spaces get new ones, and each must still see only its
+/// own. Meanwhile, with two CPUs, CPU 1 keeps a space of its own loaded with interrupts
+/// masked, reading its word: every rollover must find it loaded there and reserve its
+/// ASID, so no space on CPU 0 is given that ASID in a later generation, and when CPU 1
+/// loads it again it keeps it.
+fn test_asid_rollover() -> i32 {
+    const SPACES: usize = 1024;
+    const MAGIC: u64 = 0x5eed_0000_0000;
+    const HELPER: u64 = MAGIC | 0xffff;
+    static STAGE: AtomicU32 = AtomicU32::new(0);
+    static HELPER_CONTEXT: AtomicU64 = AtomicU64::new(0);
+    static HELPER_WRONG: AtomicU32 = AtomicU32::new(0);
+    static HELPER_KEPT: AtomicU32 = AtomicU32::new(0);
+    let processes = &sched::PROCESSES;
+    let me = processes.current();
+    processes.set_affinity(me, 1 << 0);
+    processes.sleep_ms(20);
+    let (generation, bits) = crate::user::tlb::asid_state();
+    crate::user::tlb::force_asid_bits(8);
+    STAGE.store(0, Ordering::Release);
+    HELPER_CONTEXT.store(0, Ordering::Release);
+    HELPER_WRONG.store(0, Ordering::Release);
+    HELPER_KEPT.store(0, Ordering::Release);
+    // The space CPU 1 keeps loaded, and the task that does.
+    let helper_space = if sched::online_cpus() >= 2 {
+        crate::user::TestSpace::new().filter(|space| space.map_word(TEST_PAGE, HELPER).is_some())
+    } else {
+        None
+    };
+    let mut helper = None;
+    if let Some(space) = &helper_space {
+        let address = space as *const crate::user::TestSpace as usize;
+        let task = Box::new(move || {
+            // On CPU 1 before anything: it was pinned there just after it started.
+            processes.sleep_ms(50);
+            // SAFETY: the test waits for this task before the space goes.
+            let space = unsafe { &*(address as *const crate::user::TestSpace) };
+            let flags = Port::irq_save_and_disable();
+            sched::borrow_tables(space.mm().root(), space.mm().tlb());
+            HELPER_CONTEXT.store(space.mm().tlb().context(), Ordering::Release);
+            STAGE.store(1, Ordering::Release);
+            // Masked, so this CPU never changes tables while CPU 0 rolls the ASIDs over.
+            let mut wrong = 0;
+            while STAGE.load(Ordering::Acquire) < 2 {
+                // SAFETY: mapped readable in the tables just loaded.
+                if unsafe { Port::read_user_word(TEST_PAGE) } != HELPER {
+                    wrong += 1;
+                }
+            }
+            Port::irq_restore(flags);
+            // Loaded again, in the generation CPU 0 left: the reserved ASID is kept.
+            sched::borrow_tables(space.mm().root(), space.mm().tlb());
+            let flags = Port::irq_save_and_disable();
+            // SAFETY: as above.
+            if unsafe { Port::read_user_word(TEST_PAGE) } != HELPER {
+                wrong += 1;
+            }
+            let (before, after) = (HELPER_CONTEXT.load(Ordering::Acquire), space.mm().tlb().context());
+            Port::irq_restore(flags);
+            sched::return_tables();
+            HELPER_WRONG.store(wrong, Ordering::Release);
+            HELPER_KEPT.store(u32::from(before as u16 == after as u16), Ordering::Release);
+            STAGE.store(3, Ordering::Release);
+            0
+        });
+        if let Ok(pid) = processes.spawn_task("ktest-asid", SpawnIo::default(), task) {
+            processes.set_affinity(pid, 1 << 1);
+            helper = Some(pid);
+        }
+    }
+    let helper_loaded = helper.is_none() || wait_stage(&STAGE, 1, 5000);
+    let helper_context = HELPER_CONTEXT.load(Ordering::Acquire);
+    let mut spaces = alloc::vec::Vec::new();
+    for index in 0..SPACES {
+        let Some(space) = crate::user::TestSpace::new() else {
+            break;
+        };
+        if space.map_word(TEST_PAGE, MAGIC | index as u64).is_none() {
+            break;
+        }
+        spaces.push(space);
+    }
+    let made = spaces.len();
+    let mut wrong = 0;
+    // Spaces on CPU 0 given CPU 1's ASID in a generation after it loaded it.
+    let mut collided = 0;
+    for _ in 0..2 {
+        for (index, space) in spaces.iter().enumerate() {
+            sched::borrow_tables(space.mm().root(), space.mm().tlb());
+            let flags = Port::irq_save_and_disable();
+            // SAFETY: mapped readable in the tables just loaded, which stay loaded with
+            // interrupts masked.
+            let value = unsafe { Port::read_user_word(TEST_PAGE) };
+            let context = space.mm().tlb().context();
+            Port::irq_restore(flags);
+            if value != MAGIC | index as u64 {
+                wrong += 1;
+            }
+            if helper_context != 0 && context >> 16 > helper_context >> 16 && context as u16 == helper_context as u16 {
+                collided += 1;
+            }
+        }
+    }
+    sched::return_tables();
+    let (now, _) = crate::user::tlb::asid_state();
+    STAGE.store(2, Ordering::Release);
+    let helper_ok = match helper {
+        Some(pid) => {
+            let finished = wait_stage(&STAGE, 3, 5000);
+            processes.wait(pid);
+            // Only a port with ASIDs has one to keep.
+            let kept = bits == 0 || HELPER_KEPT.load(Ordering::Acquire) == 1;
+            finished && kept && HELPER_WRONG.load(Ordering::Acquire) == 0
+        }
+        None => true,
+    };
+    processes.set_affinity(me, 0);
+    drop(spaces);
+    drop(helper_space);
+    crate::user::tlb::force_asid_bits(bits);
+    let rollovers = now - generation;
+    // The forced width is one generation; running out of 255 takes at least another.
+    let ok = helper_loaded
+        && made == SPACES
+        && wrong == 0
+        && collided == 0
+        && helper_ok
+        && (bits == 0 || rollovers >= 2);
+    let forced = if bits == 0 { 0 } else { 8 };
+    let other_cpu = if helper.is_some() { "cpu1" } else { "none" };
+    println!(
+        "[ktest] asid-rollover: spaces={made} bits={bits}->{forced} generations={rollovers} wrong={wrong} \
+         other-cpu={other_cpu} collided={collided} other-ok={helper_ok} ok={ok}"
+    );
+    i32::from(!ok)
+}
+
+/// `THREAD_EXIT` with its clear word inside the range it unmaps: the word is zeroed while
+/// it's still mapped, before the range goes, and the range goes. A program can't see
+/// this, since the unmap wakes the word's waiters too, so it's read through the frame.
+fn test_thread_exit_clear() -> i32 {
+    let Some(space) = crate::user::TestSpace::new() else {
+        return 1;
+    };
+    // A word away from the page's start, as a start block's is.
+    let word = TEST_PAGE + 0x80;
+    if space.map_word(TEST_PAGE, 0).is_none() || space.mm().copy_out(word, &1u32.to_ne_bytes()).is_err() {
+        return 1;
+    }
+    let result = space.exit_clearing(word);
+    let ok = matches!(result, Some((0, true)));
+    let (cleared, unmapped) = result.map_or(("no", false), |(value, gone)| (if value == 0 { "yes" } else { "no" }, gone));
+    println!("[ktest] thread-exit-clear: cleared={cleared} unmapped={unmapped} ok={ok}");
+    i32::from(!ok)
+}
+
+/// A kernel waiter on a word and a user waiter on a word whose frame is the same one:
+/// neither's wake reaches the other, whichever comes first. Then an unmap wakes the user
+/// waiter, whose word has gone.
+fn test_futex_namespace() -> i32 {
+    static KERNEL_WOKE: AtomicU32 = AtomicU32::new(0);
+    static USER_WOKE: AtomicU32 = AtomicU32::new(0);
+    let processes = &sched::PROCESSES;
+    let Some(space) = crate::user::TestSpace::new() else {
+        return 1;
+    };
+    let Some(frame) = space.map_word(TEST_PAGE, 0) else {
+        return 1;
+    };
+    let Ok(key) = space.mm().futex_key(TEST_PAGE) else {
+        return 1;
+    };
+    KERNEL_WOKE.store(0, Ordering::Release);
+    USER_WOKE.store(0, Ordering::Release);
+    let address = &space as *const crate::user::TestSpace as usize;
+    // SAFETY: the frame is the space's, mapped until the last round, and the identity
+    // map makes its address the kernel's.
+    let word = unsafe { &*(frame as *const AtomicU32) };
+    let spawn_kernel = || {
+        processes.spawn_task(
+            "ktest-kwait",
+            SpawnIo::default(),
+            Box::new(move || {
+                // SAFETY: as above; the test waits for this task.
+                let word = unsafe { &*(frame as *const AtomicU32) };
+                feos_sync::futex_wait(word, 0);
+                KERNEL_WOKE.fetch_add(1, Ordering::AcqRel);
+                0
+            }),
+        )
+    };
+    let spawn_user = || {
+        processes.spawn_task(
+            "ktest-uwait",
+            SpawnIo::default(),
+            Box::new(move || {
+                // SAFETY: as above.
+                let space = unsafe { &*(address as *const crate::user::TestSpace) };
+                let word = unsafe { &*(frame as *const AtomicU32) };
+                let unmaps = space.mm().unmap_count();
+                sched::futex_wait_user(word, key, 0, (unmaps, unmaps.load(Ordering::Acquire)), None);
+                USER_WOKE.fetch_add(1, Ordering::AcqRel);
+                0
+            }),
+        )
+    };
+    let counts = || (KERNEL_WOKE.load(Ordering::Acquire), USER_WOKE.load(Ordering::Acquire));
+    let mut ok = true;
+    let mut report = alloc::string::String::new();
+    for kernel_first in [true, false] {
+        let (Ok(kernel), Ok(user)) = (spawn_kernel(), spawn_user()) else {
+            return 1;
+        };
+        processes.sleep_ms(100);
+        let before = counts();
+        let (first_woken, after_first) = if kernel_first {
+            feos_sync::futex_wake(word, usize::MAX);
+            processes.sleep_ms(100);
+            (0, counts())
+        } else {
+            let woken = sched::futex_wake_user(key, usize::MAX);
+            processes.sleep_ms(100);
+            (woken, counts())
+        };
+        let second_woken = if kernel_first {
+            sched::futex_wake_user(key, usize::MAX)
+        } else {
+            feos_sync::futex_wake(word, usize::MAX);
+            0
+        };
+        processes.wait(kernel);
+        processes.wait(user);
+        let (k, u) = before;
+        let round_ok = if kernel_first {
+            after_first == (k + 1, u) && second_woken == 1
+        } else {
+            after_first == (k, u + 1) && first_woken == 1
+        };
+        ok &= round_ok;
+        let _ = core::fmt::Write::write_fmt(
+            &mut report,
+            format_args!("{}-first={} ", if kernel_first { "kernel" } else { "user" }, if round_ok { "separate" } else { "CROSSED" }),
+        );
+    }
+    // A wait on a word that's unmapped is woken by the unmap.
+    let Ok(user) = spawn_user() else {
+        return 1;
+    };
+    processes.sleep_ms(100);
+    let before = USER_WOKE.load(Ordering::Acquire);
+    space.unmap(TEST_PAGE);
+    processes.sleep_ms(100);
+    let unmap_wakes = USER_WOKE.load(Ordering::Acquire) == before + 1;
+    processes.wait(user);
+    // And so is a wait, as a program's, on a word whose page is discarded: its frame is
+    // no longer the word's, and the zero page that replaces it still holds what the
+    // waiter expected, so nothing but the discard would wake it.
+    let remapped = space.map_word(TEST_PAGE, 0).is_some();
+    let waiter = processes.spawn_task(
+        "ktest-dwait",
+        SpawnIo::default(),
+        Box::new(move || {
+            // SAFETY: as above.
+            let space = unsafe { &*(address as *const crate::user::TestSpace) };
+            let result = space.wait_word(TEST_PAGE, 0);
+            USER_WOKE.fetch_add(1, Ordering::AcqRel);
+            i32::from(result != 0)
+        }),
+    );
+    let Ok(waiter) = waiter else {
+        return 1;
+    };
+    processes.sleep_ms(100);
+    let before = USER_WOKE.load(Ordering::Acquire);
+    let discarded = space.discard(TEST_PAGE);
+    processes.sleep_ms(100);
+    let discard_wakes = remapped && discarded && USER_WOKE.load(Ordering::Acquire) == before + 1;
+    if !discard_wakes {
+        // Not to leave the waiter blocked on a test that failed.
+        let _ = space.mm().futex_key(TEST_PAGE).map(|key| sched::futex_wake_user(key, usize::MAX));
+    }
+    processes.wait(waiter);
+    drop(space);
+    ok &= unmap_wakes && discard_wakes;
+    println!("[ktest] futex-namespace: {report}unmap-wakes={unmap_wakes} discard-wakes={discard_wakes} ok={ok}");
+    i32::from(!ok)
 }
 
 struct KernelTest;
@@ -886,7 +1794,7 @@ impl App for KernelTest {
     }
 
     fn usage(&self) -> &'static str {
-        "ktest <uspawn [n]|ukill|teardown|user-memory|cpus|fp|irqs|mem|priority|affinity|timer|panic|overflow|overflow-locked|null|task-panic>"
+        "ktest <uspawn [n]|ukill|setlkw-killed|teardown|kstack [DIR]|kstack-kill|thread-fault|tlb|asid-rollover|asid-load [n]|futex-namespace|thread-exit-clear|drive PROGRAM [ARGS]|dirty-storm PATH MIB|user-memory|cpus|fp|irqs|mem|priority|affinity|timer|panic|overflow|overflow-locked|null|task-panic>"
     }
 
     fn description(&self) -> &'static str {
@@ -896,8 +1804,30 @@ impl App for KernelTest {
     fn run(&self, context: &mut Context<'_>) -> i32 {
         match context.args.trim() {
             "user-memory" => test_user_memory(),
+            "tlb" => test_tlb(),
+            "asid-rollover" => test_asid_rollover(),
+            load if load.starts_with("asid-load") => {
+                let count = load["asid-load".len()..].trim().parse().unwrap_or(300);
+                test_asid_load(count)
+            }
+            "futex-namespace" => test_futex_namespace(),
+            "thread-exit-clear" => test_thread_exit_clear(),
             "ukill" => test_ukill(),
+            "setlkw-killed" => test_setlkw_killed(),
+            "thread-fault" => test_thread_fault(),
             "teardown" => test_teardown(),
+            "kstack-kill" => test_kstack_kill(),
+            kstack if kstack.starts_with("kstack") => {
+                let dir = kstack["kstack".len()..].trim();
+                test_kstack(if dir.is_empty() { "/tmp" } else { dir })
+            }
+            drive if drive.starts_with("drive ") => test_drive(&drive["drive ".len()..]),
+            storm if storm.starts_with("dirty-storm") => {
+                let mut words = storm["dirty-storm".len()..].split_whitespace();
+                let path = words.next().unwrap_or("/tmp/ktest-dirty-storm");
+                let mib = words.next().and_then(|mib| mib.parse().ok()).unwrap_or(8);
+                test_dirty_storm(path, mib)
+            }
             uspawn if uspawn.starts_with("uspawn") => {
                 let rounds = uspawn["uspawn".len()..].trim().parse().unwrap_or(320);
                 test_uspawn(rounds)

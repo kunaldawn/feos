@@ -82,6 +82,8 @@ pub enum FsError {
     Busy,
     /// Symbolic links went round too many times.
     Loop,
+    /// The file is mapped to run, so it can't be changed.
+    TextBusy,
 }
 
 impl FsError {
@@ -102,6 +104,7 @@ impl FsError {
             Self::Busy => "Device or resource busy",
             Self::Loop => "Too many levels of symbolic links",
             Self::PermissionDenied => "Permission denied",
+            Self::TextBusy => "Text file busy",
         }
     }
 }
@@ -1093,7 +1096,8 @@ fn shared_error(error: feos_fs::FsError) -> FsError {
         Tree::ReadOnly => FsError::ReadOnly,
         Tree::Busy => FsError::Busy,
         Tree::SymlinkLoop => FsError::Loop,
-        Tree::PermissionDenied => FsError::PermissionDenied,
+        Tree::PermissionDenied | Tree::NotPermitted => FsError::PermissionDenied,
+        Tree::TextBusy => FsError::TextBusy,
         _ => FsError::Io,
     }
 }

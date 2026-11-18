@@ -164,6 +164,10 @@ impl FaultDetails for exceptions::FaultInfo {
         exceptions::FaultInfo::fault_address(self)
     }
 
+    fn memory_fault(&self) -> Option<feos_hal::MemoryFault> {
+        exceptions::FaultInfo::memory_fault(self)
+    }
+
     fn syndrome_name(&self) -> &'static str {
         exceptions::FaultInfo::syndrome_name(self)
     }
@@ -309,8 +313,31 @@ impl Arch for X86_64 {
         unsafe { mmu::unmap_range(base, size, alloc_table) }
     }
 
+    unsafe fn reserve_kernel_window(
+        base: usize,
+        size: usize,
+        alloc_table: &mut dyn FnMut() -> Option<usize>,
+    ) -> bool {
+        // SAFETY: passed on from the caller.
+        unsafe { mmu::reserve_kernel_window(base, size, alloc_table) }
+    }
+
+    unsafe fn map_kernel_page(address: usize, frame: usize) {
+        // SAFETY: passed on from the caller.
+        unsafe { mmu::map_kernel_page(address, frame) }
+    }
+
+    unsafe fn unmap_kernel_page(address: usize) {
+        // SAFETY: passed on from the caller.
+        unsafe { mmu::unmap_kernel_page(address) }
+    }
+
     fn user_page_bits() -> PageBits {
         mmu::user_bits()
+    }
+
+    fn kernel_map_end() -> usize {
+        mmu::kernel_map_end()
     }
 
     unsafe fn prepare_user_tables(
@@ -325,6 +352,13 @@ impl Arch for X86_64 {
         mmu::activate(root);
     }
 
+    fn user_asid_bits() -> u32 {
+        // No PCIDs: every change of tables flushes, see `mmu::activate`.
+        0
+    }
+
+    const USER_FLUSH_BROADCAST: bool = false;
+
     fn flush_user_space(_asid: u16) {
         // Every change of tables flushes: see `mmu::activate`.
     }
@@ -333,9 +367,40 @@ impl Arch for X86_64 {
         mmu::flush_page(address);
     }
 
+    fn flush_user_local() {
+        mmu::flush_local();
+    }
+
+    fn flush_user_all() {
+        mmu::flush_local();
+    }
+
+    unsafe fn read_user_word(address: usize) -> u64 {
+        // SAFETY: passed on from the caller.
+        unsafe { mmu::read_user_word(address) }
+    }
+
     fn sync_user_tables() {}
 
     fn sync_user_code(_address: usize, _length: usize) {}
+
+    fn set_user_tls(value: usize) {
+        cpu::set_user_tls(value);
+    }
+
+    fn user_tls() -> usize {
+        cpu::user_tls()
+    }
+
+    fn user_hwcaps() -> (u64, u64) {
+        // `CPUID.1:EDX`, as Linux gives it; there's no `AT_HWCAP2` on x86_64 here.
+        (u64::from(core::arch::x86_64::__cpuid(1).edx), 0)
+    }
+
+    // `CR4.FSGSBASE` is clear: only a selector load changes the FS base from ring 3, and
+    // what that leaves isn't the thread's, so the kernel's copy is written at every
+    // switch in, with nothing cached per CPU.
+    const USER_TLS_WRITABLE: bool = false;
 
     fn protection_summary() -> &'static str {
         match (cpu::has_nx(), cpu::has_smep_smap()) {

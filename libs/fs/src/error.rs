@@ -55,6 +55,15 @@ pub enum FsError {
     SymlinkLoop,
     /// This user isn't allowed to.
     PermissionDenied,
+    /// The file is mapped to run, so it can't be changed.
+    TextBusy,
+    /// Nobody may do this here, root included: a synthesised node in `/dev` or `/proc`,
+    /// or another user's file in a sticky directory (`EPERM`).
+    NotPermitted,
+    /// The two names are on different mounts, and this can't cross (`EXDEV`).
+    CrossDevice,
+    /// A directory can't be moved under itself (`EINVAL`).
+    InvalidMove,
 }
 
 impl fmt::Display for FsError {
@@ -84,6 +93,10 @@ impl fmt::Display for FsError {
             Self::IsDirectory => "is a directory",
             Self::SymlinkLoop => "too many levels of symbolic links",
             Self::PermissionDenied => "permission denied",
+            Self::TextBusy => "text file busy",
+            Self::NotPermitted => "operation not permitted",
+            Self::CrossDevice => "can't move across mounts",
+            Self::InvalidMove => "can't move a directory under itself",
         };
         f.write_str(message)
     }

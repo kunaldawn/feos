@@ -35,7 +35,7 @@ impl Promises {
             return true;
         }
         self.held
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
                 let wanted = held.checked_add(pages)?;
                 (wanted.checked_add(self.spare)? <= free).then_some(wanted)
             })
@@ -58,7 +58,7 @@ impl Promises {
         }
         let result = self
             .held
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| held.checked_sub(pages));
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| held.checked_sub(pages));
         if result.is_ok() {
             return true;
         }

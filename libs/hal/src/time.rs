@@ -106,9 +106,109 @@ pub const fn days_in_month(year: u32, month: u8) -> u8 {
     }
 }
 
+/// Nanoseconds in a second.
+const NANOS: u128 = 1_000_000_000;
+
+/// A counter value as nanoseconds, rounded down. The product needs 128 bits, as in
+/// [`ticks_to_ms`](crate::ticks_to_ms). Zero for a zero frequency.
+pub const fn ticks_to_ns(ticks: u64, frequency: u64) -> u64 {
+    if frequency == 0 {
+        return 0;
+    }
+    let ns = ticks as u128 * NANOS / frequency as u128;
+    if ns > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        ns as u64
+    }
+}
+
+/// The first counter value at which [`ticks_to_ns`] reads at least `ns`: a deadline in
+/// nanoseconds as one the scheduler can wait for, never early. Saturates, so a deadline
+/// past the counter's range is one it never reaches.
+pub const fn ns_to_ticks(ns: u64, frequency: u64) -> u64 {
+    let ticks = (ns as u128 * frequency as u128).div_ceil(NANOS);
+    if ticks > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        ticks as u64
+    }
+}
+
+/// One period of a counter, rounded up to a whole nanosecond: the resolution a clock read
+/// from it has.
+pub const fn period_ns(frequency: u64) -> u64 {
+    if frequency == 0 {
+        return 1;
+    }
+    let period = NANOS.div_ceil(frequency as u128);
+    if period == 0 {
+        1
+    } else {
+        period as u64
+    }
+}
+
+/// The wall clock as an offset from monotonic time, given a reading of a clock that
+/// counts whole seconds taken at monotonic time `now`: `wall = monotonic + offset`. The
+/// reading is the second that began at or before `now`, so the offset this gives is at
+/// most a second behind; taken just as the second changes, it's exact. A wall clock that
+/// reads earlier than the monotonic time (no clock, or a broken one) is the epoch at boot.
+pub const fn wall_offset(seconds: u64, now: u64) -> u64 {
+    let wall = seconds as u128 * NANOS;
+    if wall > now as u128 {
+        let offset = wall - now as u128;
+        if offset > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            offset as u64
+        }
+    } else {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counter_values_become_nanoseconds_and_back() {
+        // QEMU's AArch64 counter, 62.5 MHz: 16 ns a period.
+        assert_eq!(ticks_to_ns(62_500_000, 62_500_000), 1_000_000_000);
+        assert_eq!(ticks_to_ns(1, 62_500_000), 16);
+        assert_eq!(period_ns(62_500_000), 16);
+        // A 3 GHz TSC: a period is a third of a nanosecond, reported as one.
+        assert_eq!(period_ns(3_000_000_000), 1);
+        assert_eq!(period_ns(1_000_000_007), 1);
+        assert_eq!(period_ns(999_999_999), 2);
+        assert_eq!(period_ns(0), 1);
+        assert_eq!(ticks_to_ns(5, 0), 0);
+        // Days of uptime at 3 GHz don't overflow the product.
+        assert_eq!(ticks_to_ns(3_000_000_000 * 86_400 * 100, 3_000_000_000), 86_400 * 100 * 1_000_000_000);
+    }
+
+    #[test]
+    fn a_deadline_is_never_reached_early() {
+        for frequency in [62_500_000u64, 1_000_000_000, 2_899_999_999, 24_000_000, 7] {
+            for ns in [0u64, 1, 15, 16, 17, 999_999_999, 1_000_000_001, 123_456_789_012] {
+                let ticks = ns_to_ticks(ns, frequency);
+                assert!(ticks_to_ns(ticks, frequency) >= ns, "{ns} at {frequency}");
+                // And not late by more than a period.
+                if ticks > 0 {
+                    assert!(ticks_to_ns(ticks - 1, frequency) < ns, "{ns} at {frequency}");
+                }
+            }
+        }
+        assert_eq!(ns_to_ticks(u64::MAX, 3_000_000_000), u64::MAX);
+    }
+
+    #[test]
+    fn the_wall_offset_is_the_reading_less_the_time_it_was_taken() {
+        assert_eq!(wall_offset(1_800_000_000, 5_000_000_000), 1_800_000_000 * 1_000_000_000 - 5_000_000_000);
+        assert_eq!(wall_offset(0, 5_000_000_000), 0);
+        assert_eq!(wall_offset(3, 5_000_000_000), 0);
+    }
 
     #[test]
     fn known_dates_convert_both_ways() {

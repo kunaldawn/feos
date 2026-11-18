@@ -309,7 +309,7 @@ impl<T: Transport> VirtioBlk<T> {
             let take = (len - done).min(self.max_request);
             let block = start + (done / self.block_size) as u64;
             let data = Segment {
-                addr: (address + done) as u64,
+                addr: feos_hal::dma::bus_address(address + done),
                 len: take as u32,
                 device_writes,
             };

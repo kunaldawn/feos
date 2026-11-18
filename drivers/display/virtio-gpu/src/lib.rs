@@ -136,12 +136,12 @@ impl<T: Transport> VirtioGpu<T> {
         self.memory.response[..HEADER_LEN].fill(0);
         let segments = [
             Segment {
-                addr: core::ptr::addr_of!(self.memory.request) as u64,
+                addr: feos_hal::dma::bus_address(core::ptr::addr_of!(self.memory.request) as usize),
                 len: len as u32,
                 device_writes: false,
             },
             Segment {
-                addr: core::ptr::addr_of!(self.memory.response) as u64,
+                addr: feos_hal::dma::bus_address(core::ptr::addr_of!(self.memory.response) as usize),
                 len: RESPONSE_LEN as u32,
                 device_writes: true,
             },

@@ -322,7 +322,7 @@ impl VirtioInput {
         // Fill the queue before the device is told where it lives.
         self.queue.reset();
         for index in 0..QUEUE_SIZE {
-            let buffer = core::ptr::addr_of!(self.buffers[index]) as u64;
+            let buffer = feos_hal::dma::bus_address(core::ptr::addr_of!(self.buffers[index]) as usize);
             let segment = Segment {
                 addr: buffer,
                 len: 8,

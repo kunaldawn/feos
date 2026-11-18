@@ -6,6 +6,33 @@
 //! change and reading what it wrote.
 
 use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+/// The kernel's translation from its addresses to bus addresses, or zero for none.
+static TRANSLATION: AtomicUsize = AtomicUsize::new(0);
+
+/// Installs how kernel addresses that aren't identity mapped are turned into bus
+/// addresses: `translate` returns `None` for an address that is its own bus address.
+/// The kernel's task stacks are in a window of their own, away from the RAM behind them,
+/// and a driver may be handed a buffer on one; each stack's frames are contiguous, so a
+/// buffer on it is contiguous on the bus too. Call once during boot.
+pub fn set_translation(translate: fn(usize) -> Option<u64>) {
+    TRANSLATION.store(translate as usize, Ordering::Release);
+}
+
+/// The bus address to give a device for the kernel's `address`: the address itself, the
+/// identity map's, unless it's in a range the kernel maps elsewhere. Every address a
+/// driver hands a device goes through here, since a caller's buffer may be on a stack.
+#[inline]
+pub fn bus_address(address: usize) -> u64 {
+    let hook = TRANSLATION.load(Ordering::Acquire);
+    if hook == 0 {
+        return address as u64;
+    }
+    // SAFETY: only `set_translation` stores this, from a valid function pointer.
+    let translate: fn(usize) -> Option<u64> = unsafe { core::mem::transmute(hook) };
+    translate(address).unwrap_or(address as u64)
+}
 
 /// Orders earlier writes to DMA memory before later writes.
 #[inline]
@@ -58,8 +85,9 @@ mod imp {
 ///
 /// Shared with hardware behind the compiler's back, so it's in an [`UnsafeCell`]
 /// and only reached through volatile accesses, and its address is what's handed to
-/// the device. Every board identity-maps RAM today, so [`phys`](Self::phys) is the
-/// address; a board that didn't would change this one function.
+/// the device. Every board identity-maps RAM, so [`phys`](Self::phys) is the address,
+/// unless the buffer is somewhere the kernel maps elsewhere (a task's stack): see
+/// [`bus_address`].
 #[repr(transparent)]
 pub struct DmaBuf<T> {
     value: UnsafeCell<T>,
@@ -79,7 +107,7 @@ impl<T> DmaBuf<T> {
 
     /// The bus address to give the device.
     pub fn phys(&self) -> u64 {
-        self.value.get() as usize as u64
+        bus_address(self.value.get() as usize)
     }
 
     /// A raw pointer to the value, for accessing part of it.

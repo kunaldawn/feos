@@ -518,6 +518,57 @@ fn sockets_run_out_with_an_error_and_a_closed_handle_stays_invalid() {
 }
 
 #[test]
+fn sockets_beyond_64() {
+    // A table of every kind, well past the 64 it once was: connections, listeners and
+    // datagram sockets, the last of each still found by what arrives for it.
+    let mut rig = Rig::configured();
+    let mut connections = Vec::new();
+    for owner in 0..100 {
+        connections.push(connected(&mut rig, owner));
+    }
+    let mut listeners = Vec::new();
+    for port in 0..20u16 {
+        listeners.push(rig.stack.tcp_listen(8000 + port, 4, 1).unwrap());
+    }
+    let mut datagrams = Vec::new();
+    while connections.len() + listeners.len() + datagrams.len() < MAX_SOCKETS {
+        datagrams.push(rig.stack.udp_bind(0, 2).unwrap());
+    }
+    assert_eq!(MAX_SOCKETS, 1024);
+    assert_eq!(rig.stack.udp_bind(0, 2), Err(NetError::NoResources));
+    assert_eq!(rig.stack.tcp_listen(9999, 4, 1), Err(NetError::NoResources));
+    let stats = rig.stack.stats();
+    assert_eq!((stats.tcp_sockets, stats.udp_sockets as usize), (120, datagrams.len()));
+    let mut ids: Vec<u32> = connections.iter().map(|(id, _)| id.0).chain(listeners.iter().map(|id| id.0)).collect();
+    ids.extend(datagrams.iter().map(|(id, _)| id.0));
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), MAX_SOCKETS, "every handle its own");
+
+    // The newest datagram socket gets what's sent to its port, and nobody else does.
+    let (last, port) = *datagrams.last().unwrap();
+    rig.deliver(udp_to_host(GATEWAY, 53, port, b"last"));
+    rig.poll();
+    let mut out = [0u8; 16];
+    assert_eq!(rig.stack.udp_recv_from(last, &mut out).unwrap().map(|(length, _)| length), Some(4));
+    assert_eq!(rig.stack.udp_recv_from(datagrams[0].0, &mut out), Ok(None));
+
+    // And the hundredth connection its data.
+    let (id, peer) = connections.last().unwrap();
+    rig.deliver(tcp_to_host(GATEWAY, peer, b"data"));
+    rig.poll();
+    assert_eq!(rig.stack.tcp_recv(*id, &mut out, rig.now), Ok(Some(4)));
+    assert_eq!(&out[..4], b"data");
+
+    // One given back is one more to be had, at the same index.
+    let (middle, _) = datagrams[500];
+    rig.stack.close(middle, rig.now);
+    let (again, _) = rig.stack.udp_bind(0, 2).unwrap();
+    assert_eq!(again.0 & 0xffff, middle.0 & 0xffff);
+    assert_eq!(rig.stack.udp_bind(0, 2), Err(NetError::NoResources));
+}
+
+#[test]
 fn a_full_device_holds_segments_back_and_they_go_later() {
     let mut rig = Rig::configured();
     let (id, _) = connected(&mut rig, 1);

@@ -457,7 +457,7 @@ impl EntryInfo {
             size: fs.size(node),
             is_dir: fs.is_dir(node),
             type_index: type_index(node, fs),
-            modified: fs.times(node).modified,
+            modified: fs.times(node).modified.map(feos_fs::Timestamp::secs),
         }
     }
 }
@@ -6692,7 +6692,7 @@ fn draw_properties(
         body.x + 8,
         y,
         "Modified",
-        format_time(times.modified).as_str(),
+        format_time(times.modified.map(feos_fs::Timestamp::secs)).as_str(),
     );
     y += 20;
     paint_property_line(
@@ -6700,7 +6700,7 @@ fn draw_properties(
         body.x + 8,
         y,
         "Created",
-        format_time(times.created).as_str(),
+        format_time(times.created.map(feos_fs::Timestamp::secs)).as_str(),
     );
     let attributes = fs.attributes(node);
     painter.draw_text(body.x + 8, body.bottom_i32() - 60, "Attributes", MUTED, 1);
@@ -8429,9 +8429,9 @@ mod tests {
     #[test]
     fn dates_sort_oldest_first() {
         let tree = live_tree();
-        tree.set_times("/b.txt", NodeTimes { modified: Some(2_000), ..NodeTimes::NONE }).unwrap();
+        tree.set_times("/b.txt", NodeTimes { modified: Some(feos_fs::Timestamp::from_secs(2_000)), ..NodeTimes::NONE }).unwrap();
         tree.write_file("/c.txt", b"", false).unwrap();
-        tree.set_times("/c.txt", NodeTimes { modified: Some(1_000), ..NodeTimes::NONE }).unwrap();
+        tree.set_times("/c.txt", NodeTimes { modified: Some(feos_fs::Timestamp::from_secs(1_000)), ..NodeTimes::NONE }).unwrap();
         let mut state = live_state(tree);
         state.set_sort(SortKey::Modified);
         state.refresh(tree);

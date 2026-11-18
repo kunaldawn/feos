@@ -19,8 +19,14 @@
 //! through the kernel's own mapping of the frame, which the identity map makes the
 //! frame's physical address. So a wild pointer from a program is a failed lookup
 //! here, not a fault in the kernel, and there's no fixup table: nothing to get wrong
-//! and no fault to take. It also lets SMAP and PAN stay on all the time. A process
-//! has one thread, so nothing changes its tables during a call.
+//! and no fault to take. It also lets SMAP and PAN stay on all the time.
+//!
+//! The kernel keeps a space behind a lock, so its tables only change under it. A copy
+//! that would wait, or take long, doesn't hold the lock: [`Mm::translate_and_pin`]
+//! readies a page and pins its frame in one step under it, and the copy runs on the
+//! pinned frame with the lock released. Another thread may unmap the page meanwhile;
+//! the frame stays until the pin goes (see `feos-frames`), so the copy is never into
+//! memory that's been given to someone else.
 //!
 //! # Charging
 //!
@@ -41,14 +47,16 @@ extern crate alloc;
 
 pub use feos_hal::{PageAccess, PageBits};
 
+pub mod asid;
 mod mm;
 mod promise;
 mod shared;
 pub mod vma;
 
-pub use mm::{Access, FaultError, MapRequest, Mm, MmError, Pinned, Place};
+pub use feos_pagecache::{FileKey, FileRef};
+pub use mm::{Access, Ctx, FaultError, FileMap, FilePages, Layout, MapRequest, Mm, MmError, NoFiles, PinError, Pinned, Place, WordKey};
 pub use promise::Promises;
-pub use shared::SharedAnon;
+pub use shared::{ObjectRef, SharedAnon};
 pub use vma::{Backing, Prot, Vma};
 
 /// Bytes in a page.
@@ -87,7 +95,11 @@ pub trait FrameSource {
 /// bits nor its valid bit are up here.
 const SOFT: u64 = 1 << 58;
 const SOFT_FRAME: u64 = 1 << 62;
-const SOFT_BITS: u64 = SOFT | SOFT_FRAME;
+/// Software bit, in a valid entry or a soft one: the frame is the page cache's, not the
+/// space's own, so it's never written through this entry. Ignored by the hardware on
+/// both ports (AArch64 leaves bits 55 to 58 to software; x86 ignores 52 to 58).
+const CACHED: u64 = 1 << 57;
+const SOFT_BITS: u64 = SOFT | SOFT_FRAME | CACHED;
 
 /// A user pointer that isn't good for the access asked of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,9 +141,9 @@ pub struct AddressSpace {
 pub(crate) enum Entry {
     Empty,
     /// Valid to the hardware.
-    Present { frame: usize, writable: bool, executable: bool },
+    Present { frame: usize, writable: bool, executable: bool, cached: bool },
     /// Holds a frame no access is allowed to.
-    Hidden { frame: usize },
+    Hidden { frame: usize, cached: bool },
 }
 
 impl AddressSpace {
@@ -142,7 +154,8 @@ impl AddressSpace {
             return None;
         }
         // Soft entries have to be told from everything a port writes.
-        if (bits.present | bits.address) & SOFT_BITS != 0 {
+        let port = bits.present | bits.address | bits.leaf | bits.writable | bits.read_only | bits.no_execute;
+        if port & SOFT_BITS != 0 {
             return None;
         }
         let root = new_table(frames)?;
@@ -258,14 +271,16 @@ impl AddressSpace {
 
     fn decode(&self, entry: u64) -> Entry {
         let frame = (entry & self.bits.address) as usize;
+        let cached = entry & CACHED != 0;
         if entry & self.bits.present != 0 {
             Entry::Present {
                 frame,
                 writable: self.bits.is_writable(entry),
                 executable: entry & self.bits.no_execute == 0,
+                cached,
             }
         } else if entry & SOFT_FRAME != 0 {
-            Entry::Hidden { frame }
+            Entry::Hidden { frame, cached }
         } else {
             Entry::Empty
         }
@@ -274,10 +289,11 @@ impl AddressSpace {
     fn encode(&self, entry: Entry) -> u64 {
         match entry {
             Entry::Empty => 0,
-            Entry::Present { frame, writable, executable } => {
-                frame as u64 | self.bits.leaf(PageAccess { write: writable, execute: executable })
+            Entry::Present { frame, writable, executable, cached } => {
+                let cached = if cached { CACHED } else { 0 };
+                frame as u64 | self.bits.leaf(PageAccess { write: writable, execute: executable }) | cached
             }
-            Entry::Hidden { frame } => frame as u64 | SOFT | SOFT_FRAME,
+            Entry::Hidden { frame, cached } => frame as u64 | SOFT | SOFT_FRAME | if cached { CACHED } else { 0 },
         }
     }
 
@@ -292,19 +308,6 @@ impl AddressSpace {
                 true
             }
             None => matches!(entry, Entry::Empty),
-        }
-    }
-
-    /// As [`set`](Self::set), making the tables if they aren't there.
-    pub(crate) fn set_making(&mut self, address: usize, entry: Entry, frames: &mut dyn FrameSource) -> bool {
-        let value = self.encode(entry);
-        match self.leaf_slot_or_new(address, frames) {
-            Some((table, index)) => {
-                // SAFETY: the slot is in a table of this space.
-                unsafe { write_entry(table, index, value) };
-                true
-            }
-            None => false,
         }
     }
 
@@ -475,7 +478,8 @@ impl AddressSpace {
     /// Copies `data` to user memory, which must be writable by the program.
     pub fn copy_out(&self, address: usize, data: &[u8]) -> Result<(), BadAddress> {
         self.validate(address, data.len(), true)?;
-        // SAFETY: nothing else writes these tables during a call.
+        // SAFETY: the caller holds the space (its lock, in the kernel), so nothing
+        // changes these tables during the copy.
         unsafe { self.fill(address, data) }
     }
 

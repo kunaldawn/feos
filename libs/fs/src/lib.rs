@@ -193,18 +193,59 @@ pub mod attr {
     pub const SETTABLE: u8 = READ_ONLY | HIDDEN | SYSTEM | ARCHIVE;
 }
 
-/// When a node was last touched, in seconds since the Unix epoch.
+/// A moment, in nanoseconds since the Unix epoch: 64 bits of them reach the year 2554.
+/// Each filesystem keeps what it can of one (nanoseconds on the RAM mounts and the native
+/// format, 10 ms on exFAT, 2 s on FAT) and reports what it kept.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+pub struct Timestamp(pub u64);
+
+impl Timestamp {
+    /// Nanoseconds in a second.
+    pub const NANOS: u64 = 1_000_000_000;
+
+    /// Whole seconds since the epoch.
+    pub const fn from_secs(seconds: u64) -> Self {
+        Self(seconds.saturating_mul(Self::NANOS))
+    }
+
+    /// Seconds and nanoseconds past them (below a second), saturating past 2554.
+    pub const fn from_parts(seconds: u64, nanos: u32) -> Self {
+        Self(seconds.saturating_mul(Self::NANOS).saturating_add(nanos as u64 % Self::NANOS))
+    }
+
+    /// Whole seconds since the epoch.
+    pub const fn secs(self) -> u64 {
+        self.0 / Self::NANOS
+    }
+
+    /// Nanoseconds past the whole second.
+    pub const fn subsec_nanos(self) -> u32 {
+        (self.0 % Self::NANOS) as u32
+    }
+
+    /// Cut down to a multiple of `unit` nanoseconds: what a filesystem that keeps no finer
+    /// keeps of it.
+    pub const fn truncated(self, unit: u64) -> Self {
+        Self(self.0 - self.0 % unit)
+    }
+}
+
+/// When a node was last touched.
 ///
 /// `None` means the volume doesn't say. That's usual on one written by something
 /// with no clock, which leaves the date fields zero.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct NodeTimes {
     /// Created.
-    pub created: Option<u64>,
+    pub created: Option<Timestamp>,
     /// Contents last changed.
-    pub modified: Option<u64>,
-    /// Last read. FAT keeps only the date.
-    pub accessed: Option<u64>,
+    pub modified: Option<Timestamp>,
+    /// Last read. FAT keeps only the date. Nothing updates it on a read (`noatime`):
+    /// only setting it does.
+    pub accessed: Option<Timestamp>,
+    /// Status last changed: contents, owner, mode, links or name. FAT and exFAT keep
+    /// none, and report `None`.
+    pub changed: Option<Timestamp>,
 }
 
 impl NodeTimes {
@@ -213,6 +254,7 @@ impl NodeTimes {
         created: None,
         modified: None,
         accessed: None,
+        changed: None,
     };
 }
 
@@ -260,7 +302,7 @@ impl CheckReport {
 }
 
 /// Where a writable filesystem gets the time from.
-pub type TimeSource = fn() -> Option<u64>;
+pub type TimeSource = fn() -> Option<Timestamp>;
 
 /// A read-only filesystem view.
 ///
@@ -493,6 +535,37 @@ pub trait WritableFileSystem: FileSystem + Send {
     /// Moves `node` into `new_parent` and gives it `new_name`.
     fn rename(&mut self, node: NodeId, new_parent: NodeId, new_name: &str) -> Result<(), FsError>;
 
+    /// Moves `node` into `new_parent` as `new_name`, where `replaced` is now, in one step:
+    /// whatever is looked at, or found after a crash, `new_name` is `replaced` or `node`,
+    /// never neither. `replaced` goes as [`remove`](Self::remove) would take it, or with
+    /// `keep` is moved there instead (a file still in use, kept as an orphan). The caller
+    /// has checked the kinds: a file over a file, or a directory over an empty one.
+    ///
+    /// The default does it in two steps, which nothing in between can see, the tree's
+    /// lock being held, but which a crash can come between: FAT and exFAT keep it for
+    /// `keep`, and nothing else for anything.
+    fn rename_over(
+        &mut self,
+        node: NodeId,
+        new_parent: NodeId,
+        new_name: &str,
+        replaced: NodeId,
+        keep: Option<(NodeId, &str)>,
+    ) -> Result<(), FsError> {
+        let Some((directory, name)) = keep else {
+            self.remove(replaced)?;
+            return self.rename(node, new_parent, new_name);
+        };
+        let spelled = alloc::string::String::from(self.name(replaced).ok_or(FsError::NotFound)?);
+        self.rename(replaced, directory, name)?;
+        if let Err(error) = self.rename(node, new_parent, new_name) {
+            // Back where it was, so the name names something and no orphan goes unknown.
+            let _ = self.rename(replaced, new_parent, &spelled);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Writes `data` at `offset`, extending the file when necessary.
     ///
     /// Returns the number of bytes written. A gap between the old end of file
@@ -532,6 +605,11 @@ pub trait WritableFileSystem: FileSystem + Send {
         Err(FsError::Unsupported)
     }
 
+    /// What device `node` is, if it's a device node rather than a file of bytes.
+    fn device(&self, _node: NodeId) -> Option<vfs::DeviceKind> {
+        None
+    }
+
     /// Owner, group, mode and links, on a filesystem that keeps them. `None` means it
     /// doesn't, as FAT doesn't, and that nothing about a file's owner should be enforced.
     fn posix(&self, _node: NodeId) -> Option<native::PosixMeta> {
@@ -556,6 +634,35 @@ pub trait WritableFileSystem: FileSystem + Send {
     /// Checks the volume through and through, on a filesystem with a checker of its own.
     fn fsck(&mut self, _repair: bool) -> Result<native::FsckReport, FsError> {
         Err(FsError::Unsupported)
+    }
+
+    /// Keeps the inode number `node` reports (`ino`) from being given to a new file once
+    /// `node` is removed, while something still refers to it; with `keep` false, lets it
+    /// go again. Required, since a filesystem that reuses its numbers has to say how not to.
+    fn keep_id(&mut self, node: NodeId, ino: u64, keep: bool) -> Result<(), FsError>;
+
+    /// The node whose inode number is `ino`, on a filesystem that keeps inode numbers of
+    /// its own ([`posix`](Self::posix)). Others report a node's ID, plus one.
+    fn node_with_ino(&self, _ino: u64) -> Option<NodeId> {
+        None
+    }
+
+    /// The name of a node whose name isn't stored but made up when asked, where
+    /// [`name`](FileSystem::name) says `None`: a synthesised tree's (`/proc/<pid>`,
+    /// `/proc/<pid>/fd/<n>`), which a listing still has to show.
+    fn dynamic_name(&self, _node: NodeId) -> Option<alloc::string::String> {
+        None
+    }
+
+    /// Whether `node` is a link, and where it leads, in one look, on a filesystem that
+    /// makes its links up when asked (`/proc`): `Ok(Some(target))` for a link, `Ok(None)`
+    /// for anything else, `Err` for a node that has gone. What it makes up can change
+    /// between one call and the next (another thread's `dup3` over a descriptor), so the
+    /// tree mustn't put a link together from a `size` and a `try_read` there: a read
+    /// that came up short would make the link a regular file. `None`, the default: the
+    /// filesystem keeps its links as files, which the tree reads.
+    fn synthesised_link(&self, _node: NodeId) -> Option<Result<Option<alloc::string::String>, FsError>> {
+        None
     }
 }
 

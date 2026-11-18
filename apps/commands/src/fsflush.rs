@@ -1,22 +1,37 @@
 //! `fsflush`: writes the shared tree's changes to disk about once a second.
 //!
-//! It starts with the first change, not at boot, so a session that writes nothing
-//! has one more free process slot and no disk traffic. A crash loses what changed
-//! since the last pass, but the filesystem stays consistent.
+//! It starts at boot, with a writable tree: it only writes when something changed, so a
+//! session that writes nothing has no disk traffic. (It used to start with the first
+//! change, to save a slot of 32; now a task's stack is frames, and one that came and
+//! stayed partway through would look like a leak to everything counting frames.) If it's
+//! killed, the next change starts another. A crash loses what changed since the last
+//! pass, but the filesystem stays consistent.
+//!
+//! Whether there's a flusher is asked of the scheduler, by its PID: a heartbeat alone
+//! can't tell a killed flusher from one whose pass is slow (a sync waiting its turn at
+//! the tree while a dying program's 64 MiB of mapped pages are written back, say), and
+//! taking the second for the first started another flusher each time, which stayed.
 
 use core::ptr;
-use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
-use feos_app::{App, Context, Platform};
+use feos_app::{App, Context, Platform, WaitStatus};
 
 const PERIOD_MS: u64 = 1000;
-/// Silent for this long, the flusher isn't running: someone killed it.
+/// Beaten within this long, the flusher is certainly running, without asking.
 const STALE_AFTER_MS: u64 = 5000;
 /// Heartbeat value before any flusher has started.
 const NEVER: u64 = u64::MAX;
 
+/// No flusher has been started, or the last couldn't be.
+const NO_FLUSHER: u32 = 0;
+/// One is being started. The shell's PID, which is never a flusher's.
+const STARTING: u32 = 1;
+
 static PLATFORM: AtomicPtr<Platform> = AtomicPtr::new(ptr::null_mut());
 static HEARTBEAT_MS: AtomicU64 = AtomicU64::new(NEVER);
+/// The flusher's PID, [`NO_FLUSHER`] or [`STARTING`].
+static FLUSHER_PID: AtomicU32 = AtomicU32::new(NO_FLUSHER);
 
 /// The flusher process.
 pub struct FsFlush;
@@ -67,23 +82,37 @@ fn on_change() {
     if beat != NEVER && now.saturating_sub(beat) < STALE_AFTER_MS {
         return;
     }
-    // Claim it now, so that a burst of changes doesn't start several.
+    // Silent a while: gone, or only slow. A flusher still alive (or still being torn
+    // down) is left to it.
+    let pid = FLUSHER_PID.load(Ordering::Acquire);
+    if pid == STARTING || (pid != NO_FLUSHER && platform.processes.try_wait(pid) == WaitStatus::Running) {
+        return;
+    }
+    // Claim it, so that a burst of changes, or changes on several CPUs, start one.
+    if FLUSHER_PID.compare_exchange(pid, STARTING, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return;
+    }
     HEARTBEAT_MS.store(now, Ordering::Release);
-    if platform.processes.spawn(&FLUSHER, "").is_err() {
-        // No free slot, so nothing would ever flush this. Do it here, and try
-        // for a flusher again with the next change.
-        HEARTBEAT_MS.store(NEVER, Ordering::Release);
-        if let Some(tree) = platform.filesystem.and_then(|fs| fs.tree()) {
-            let _ = tree.sync();
+    match platform.processes.spawn(&FLUSHER, "") {
+        Ok(pid) => FLUSHER_PID.store(pid, Ordering::Release),
+        Err(_) => {
+            // No free slot, so nothing would ever flush this. Do it here, and try
+            // for a flusher again with the next change.
+            HEARTBEAT_MS.store(NEVER, Ordering::Release);
+            FLUSHER_PID.store(NO_FLUSHER, Ordering::Release);
+            if let Some(tree) = platform.filesystem.and_then(|fs| fs.tree()) {
+                let _ = tree.sync();
+            }
         }
     }
 }
 
-/// Arranges for the flusher to start with the tree's first change.
+/// Starts the flusher, and arranges for another to start with a change if it's gone.
 pub fn install(platform: &'static Platform) {
     PLATFORM.store(ptr::from_ref(platform).cast_mut(), Ordering::Release);
     if let Some(tree) = platform.filesystem.and_then(|fs| fs.tree()) {
         tree.set_change_hook(on_change);
+        on_change();
     }
 }
 

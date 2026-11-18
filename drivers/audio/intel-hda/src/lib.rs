@@ -384,8 +384,8 @@ impl Controller {
         self.corb_wp = 0;
         self.rirb_rp = 0;
 
-        let corb = addr_of!(self.corb.0) as u64;
-        let rirb = addr_of!(self.rirb.0) as u64;
+        let corb = feos_hal::dma::bus_address(addr_of!(self.corb.0) as usize);
+        let rirb = feos_hal::dma::bus_address(addr_of!(self.rirb.0) as usize);
 
         self.write8(CORBCTL, 0);
         self.write32(CORBLBASE, corb as u32);
@@ -626,7 +626,7 @@ impl Controller {
         self.ring.write = write;
         self.ring.cleared = cleared;
 
-        let bdl_address = addr_of!(self.bdl.0) as u64;
+        let bdl_address = feos_hal::dma::bus_address(addr_of!(self.bdl.0) as usize);
         let base = self.stream_base();
         dma::wmb();
         // SAFETY: stream descriptor registers inside the controller BAR.
@@ -649,7 +649,7 @@ impl Controller {
     /// Describes the whole ring to the controller. Entries raise no interrupt:
     /// QEMU also pauses DMA until such an interrupt is acknowledged.
     fn setup_bdl(&mut self) {
-        let start = addr_of!(self.pcm.0) as u64;
+        let start = feos_hal::dma::bus_address(addr_of!(self.pcm.0) as usize);
         for index in 0..BDL_ENTRIES {
             let entry = BdlEntry {
                 address: start + (index * BDL_ENTRY_BYTES) as u64,
@@ -756,7 +756,7 @@ impl Controller {
             }
         }
 
-        let start = addr_of!(self.capture_pcm.0) as u64;
+        let start = feos_hal::dma::bus_address(addr_of!(self.capture_pcm.0) as usize);
         for index in 0..BDL_ENTRIES {
             let entry = BdlEntry {
                 address: start + (index * BDL_ENTRY_BYTES) as u64,
@@ -771,7 +771,7 @@ impl Controller {
         let position = unsafe { read_volatile((base + SD_LPIB) as *const u32) };
         self.capture = Ring::new(position);
         self.capture_taken = 0;
-        let bdl_address = addr_of!(self.capture_bdl.0) as u64;
+        let bdl_address = feos_hal::dma::bus_address(addr_of!(self.capture_bdl.0) as usize);
         dma::wmb();
         // SAFETY: stream descriptor registers inside the controller BAR.
         unsafe {

@@ -15,7 +15,7 @@ import zlib
 BLOCK = 4096
 JOURNAL_MAX = (BLOCK - 24) // 4
 INODES_PER_BLOCK = BLOCK // 128
-VERSION = 1
+VERSION = 2
 
 
 def main():

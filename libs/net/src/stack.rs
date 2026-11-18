@@ -13,8 +13,9 @@ use crate::dhcp::{self, Change, Client};
 use crate::tcp::{self, Incoming, Outgoing, Tcb};
 use crate::wire::{self, Arp, ETHERTYPE_ARP, ETHERTYPE_IPV4, ETH_HEADER, IP_HEADER, MAC_BROADCAST, MAX_FRAME, PROTO_ICMP, PROTO_TCP, PROTO_UDP, TCP_ACK, TCP_RST, TCP_SYN, UDP_HEADER};
 
-/// Sockets at once, of all kinds.
-pub const MAX_SOCKETS: usize = 64;
+/// Sockets at once, of all kinds: one for every task there can be. The table grows from
+/// the heap as they're opened, so an idle stack holds only what it has used.
+pub const MAX_SOCKETS: usize = 1024;
 /// Neighbours remembered.
 const ARP_ENTRIES: usize = 32;
 /// How long a neighbour's address is believed.
@@ -824,6 +825,7 @@ impl Stack {
         let index = match free {
             Some(index) => index,
             None if self.slots.len() < MAX_SOCKETS => {
+                self.slots.try_reserve(1).map_err(|_| NetError::NoResources)?;
                 self.slots.push(Slot::default());
                 self.slots.len() - 1
             }

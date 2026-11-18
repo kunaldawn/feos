@@ -722,7 +722,7 @@ mod old_fat {
         let inner = fs.resolve("/SUB/INNER.BIN").unwrap();
         assert_eq!(fs.read_to_vec(inner).unwrap(), b"inner");
         // 2024-03-15 12:30:10.
-        assert_eq!(fs.times(inner).modified, Some(1_710_505_810));
+        assert_eq!(fs.times(inner).modified, Some(feos_fs::Timestamp::from_secs(1_710_505_810)));
     }
 
     #[test]
@@ -773,5 +773,84 @@ mod old_fat {
         let fs = Fat16::mount(RamDisk::from_bytes(bytes, SECTOR).unwrap()).unwrap();
         let doc = fs.resolve("/DOC.TXT").unwrap();
         assert!(fs.read_to_vec(doc).is_err());
+    }
+}
+
+/// The filesystems a rename over a file has to be atomic on, crash or no crash.
+#[derive(Clone, Copy, Debug)]
+enum Kind {
+    Fat32,
+    Exfat,
+    Native,
+}
+
+fn formatted(kind: Kind, size: usize) -> Arc<Vec<u8>> {
+    let mut disk = RamDisk::new(size, BLOCK).unwrap();
+    match kind {
+        Kind::Fat32 => format_fat32(&mut disk, "CRASH").unwrap(),
+        Kind::Exfat => feos_fs::format_exfat(&mut disk, "CRASH").unwrap(),
+        Kind::Native => feos_fs::native::format(&mut disk, 0).unwrap(),
+    }
+    Arc::new(disk.into_data())
+}
+
+/// Mounted as a boot does it, and checked as a boot after a crash does.
+fn mounted(kind: Kind, disk: RamDisk, context: &str) -> Box<dyn WritableFileSystem> {
+    let mut fs: Box<dyn WritableFileSystem> = match kind {
+        Kind::Fat32 => Box::new(Fat32::mount(disk).unwrap_or_else(|error| panic!("{context}: mount: {error}"))),
+        Kind::Exfat => Box::new(feos_fs::Exfat::mount(disk).unwrap_or_else(|error| panic!("{context}: mount: {error}"))),
+        Kind::Native => Box::new(feos_fs::Native::mount(disk).unwrap_or_else(|error| panic!("{context}: mount: {error}"))),
+    };
+    assert!(!fs.is_damaged(), "{context}: damaged at mount");
+    fs.check().unwrap_or_else(|error| panic!("{context}: check: {error}"));
+    assert!(!fs.is_read_only(), "{context}: read-only after the check");
+    fs
+}
+
+#[test]
+fn rename_replaces_file_atomically() {
+    const SIZE: usize = 40 * 1024 * 1024;
+    let old: Vec<u8> = (0..9000u32).map(|value| value as u8).collect();
+    let new = vec![0xa5u8; 13_000];
+    let (old_far, new_far) = (vec![3u8; 100], vec![4u8; 70_000]);
+    for kind in [Kind::Fat32, Kind::Exfat, Kind::Native] {
+        let base = formatted(kind, SIZE);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Recorder { size: SIZE, blocks: BTreeMap::new(), base: base.clone(), log: log.clone() };
+        let vfs = match kind {
+            Kind::Fat32 => Vfs::new(Box::new(Fat32::mount(BufferCache::new(recorder, 256 * 1024).unwrap()).unwrap()), false, "d"),
+            Kind::Exfat => Vfs::new(Box::new(feos_fs::Exfat::mount(BufferCache::new(recorder, 256 * 1024).unwrap()).unwrap()), false, "d"),
+            Kind::Native => Vfs::new(Box::new(feos_fs::Native::mount(recorder).unwrap()), false, "d"),
+        };
+        vfs.create_dir("/d").unwrap();
+        vfs.create_dir("/x").unwrap();
+        vfs.write_file("/d/to", &old, false).unwrap();
+        vfs.write_file("/d/from", &new, false).unwrap();
+        vfs.write_file("/d/far", &old_far, false).unwrap();
+        vfs.write_file("/x/from", &new_far, false).unwrap();
+        vfs.sync().unwrap();
+        let synced = log.lock().unwrap().len();
+        // Within a directory, and from another one.
+        assert_eq!(vfs.rename_replacing("/d/from", "/d/to", false, None, &|_| false), Ok(None));
+        assert_eq!(vfs.rename_replacing("/x/from", "/d/far", false, None, &|_| false), Ok(None));
+        vfs.sync().unwrap();
+        let run = Run { base, log: log.lock().unwrap().clone(), promises: Vec::new() };
+        let mut rng = Rng(0x5eed);
+        for cut in synced..=run.log.len() {
+            for keep_all in [true, false] {
+                let context = format!("{kind:?} cut {cut}/{} in order {keep_all}", run.log.len());
+                let fs = mounted(kind, disk_at(&run, cut, &mut rng, keep_all), &context);
+                walk(&*fs, NodeId::ROOT, &context);
+                for (path, before, after) in [("/d/to", &old, &new), ("/d/far", &old_far, &new_far)] {
+                    let node = fs.resolve(path).unwrap_or_else(|| panic!("{context}: {path} named nothing"));
+                    let data = fs.read_to_vec(node).unwrap();
+                    assert!(data == *before || data == *after, "{context}: {path} is {} bytes of neither", data.len());
+                }
+            }
+        }
+        let fs = mounted(kind, disk_at(&run, run.log.len(), &mut rng, true), "the end");
+        assert_eq!(fs.read_to_vec(fs.resolve("/d/to").unwrap()).unwrap(), new, "{kind:?}");
+        assert_eq!(fs.read_to_vec(fs.resolve("/d/far").unwrap()).unwrap(), new_far, "{kind:?}");
+        assert!(fs.resolve("/d/from").is_none() && fs.resolve("/x/from").is_none(), "{kind:?}");
     }
 }

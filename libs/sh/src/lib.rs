@@ -126,7 +126,9 @@ pub trait Host {
     ) -> Option<i32>;
 
     /// Runs a user program: the file at the absolute `path`, which holds an ELF image.
-    /// `args` doesn't include its name, and `cwd` is where relative paths start from.
+    /// `args` doesn't include its name, `env` is the shell's exported variables as
+    /// `NAME=value` (the program's environment), and `cwd` is where relative paths start
+    /// from.
     ///
     /// Returns `None` when this host can't run programs.
     #[allow(clippy::too_many_arguments)]
@@ -134,6 +136,7 @@ pub trait Host {
         &mut self,
         _path: &str,
         _args: &[String],
+        _env: &[String],
         _cwd: &str,
         _stdin: &mut dyn Input,
         _stdout: &mut dyn Output,

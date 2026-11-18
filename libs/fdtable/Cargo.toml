@@ -1,0 +1,12 @@
+[package]
+name = "feos-fdtable"
+description = "A process's file descriptor table: lowest free, growth up to a limit, dup3, cloexec and ranges"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]

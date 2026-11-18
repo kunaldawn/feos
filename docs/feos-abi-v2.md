@@ -464,8 +464,8 @@ Exactly one of `MS_ASYNC` 1, `MS_SYNC` 4, optionally `MS_INVALIDATE` 2 (`EINVAL`
 otherwise); range rules as `MADVISE`. `MS_SYNC` writes back the dirty pages of shared file
 mappings in the range before it returns (`EIO` if the filesystem fails); `MS_ASYNC` does
 nothing (there's no background write-back to start); `MS_INVALIDATE` has nothing to do,
-since every mapping of a file shares the cache's frames. Until stage 1a.5 nothing can be
-dirty, so the call only validates.
+since every mapping of a file shares the cache's frames. (Until stage 1a.5 nothing could
+be dirty, so the call only validated.)
 
 `mremap`, `mlock`, `munlock`, `mlockall`, `munlockall` and `brk` have no calls: see the
 `Pal` table.
@@ -700,7 +700,8 @@ Flags: one access mode (`O_RDONLY` 0, `O_WRONLY` 1, `O_RDWR` 2; 3 is `EINVAL`), 
 - `O_CREAT` creates a regular file owned by the caller (`EEXIST` with `O_EXCL` if anything
   is there, a dangling link included). Without `O_CREAT`, a missing file is `ENOENT`.
 - `O_DIRECTORY`: `ENOTDIR` unless it's a directory. A directory may be opened `O_RDONLY`
-  (for `GETDENTS`, `*at` and `FCHDIR`); with write access it's `EISDIR`.
+  (for `GETDENTS`, `*at` and `FCHDIR`); with write access it's `EISDIR`. With `O_CREAT`
+  it's `EINVAL`, whatever is there, as on Linux 6.4 and later.
 - `O_NOFOLLOW`: `ELOOP` if the last component is a symbolic link, unless `O_PATH` too, in
   which case the fd refers to the link itself.
 - `O_PATH`: needs only search permission on the way; the fd works with `*at` calls,
@@ -892,7 +893,8 @@ Pipe semantics for v2 (v1's pool changes underneath, see stage 1b.5): capacity a
 completes unless interrupted; a read returns what's there as soon as there's something;
 end of file once every write OFD has closed; a write with no read OFD left fails with
 `EPIPE` and raises `SIGPIPE` on the writing thread (stage 1c.9). `ENFILE` past the
-machine's pipes or 256 held by one process.
+pipes a program may have of the machine's, or past 64 made by one process that are still
+alive, wherever their ends have gone (stage 1b.5 says why 64).
 
 #### 62 `FCHDIR`, 63 `GETCWD`
 
@@ -1062,7 +1064,7 @@ semantics: the lock belongs to the OFD, so it's shared by `dup`, `FORK` and inhe
 and goes when the last descriptor for that OFD closes. Converting between shared and
 exclusive isn't atomic (BSD isn't either). With `LOCK_NB` a conflict is `EAGAIN`
 (`EWOULDBLOCK`); without it the call blocks (`EINTR` on a signal). Any fd for a regular
-file or directory, any access mode. cargo's `target/` and registry locks are this.
+file or directory, any access mode (record locks, unlike `flock`, take no directory). cargo's `target/` and registry locks are this.
 
 #### 70 `IOCTL`
 
@@ -2015,8 +2017,9 @@ The window grows to the whole of the 3-level tree `libs/vm` walks: 64 GiB to 512
 Both ports already give a process a whole 512 GiB top-level entry (AArch64's 39-bit
 `TTBR0` table, x86_64's PML4 entry 0 with its own PDPT), and the kernel's identity map
 stays below `USER_BASE` (stage 1a.6 adds a boot check that RAM and every mapped device
-region end below it, and stops the machine with a clear message if not). All of this is
-stage 1a.6, which is also when `ABI_VERSION` becomes 2.
+region end below it, and stops the machine with a clear message if not; AArch64's ECAM,
+which QEMU puts at 256 GiB, is mapped at 63 GiB for it). All of this is stage 1a.6, which
+is also when `ABI_VERSION` becomes 2.
 
 | Constant | v1 | v2 | |
 |---|---|---|---|
@@ -2028,7 +2031,7 @@ stage 1a.6, which is also when `ABI_VERSION` becomes 2.
 | `USER_MMAP_END` | `USER_STACK_TOP - stack - guard` | `USER_STACK_TOP - USER_ARGS_SIZE - USER_STACK_SIZE - USER_STACK_GUARD` (`0x7f_bf5f_f000`) | derived, so `the_layout_fits_together`'s equality still holds |
 | `USER_STACK_TOP` | `0x13_ffff_f000` | `0x7f_ffff_f000` | one past the argument area, an unmapped page above |
 | `USER_ARGS_SIZE` | | 2 MiB | the argument area: the initial stack block of [7.1](#71-the-initial-stack-and-registers) (argc to the strings, at most `SPAWN_ARG_MAX` of strings and pointers plus the aux vector and `UserStr`s), reserved separately so it never eats into the stack below |
-| `USER_STACK_SIZE` | 128 KiB, mapped at once | 8 MiB, reserved and charged, given frames on first touch | the main thread's stack, directly below the argument area: the full 8 MiB is free at `main` whatever the arguments, which clang's cc1 (it notes the stack bottom at `main` and assumes `DesiredStackSize`) and rustc's main thread rely on |
+| `USER_STACK_SIZE` | 128 KiB, mapped at once | 8 MiB, reserved, charged and given frames as it's touched (stage 1b.5; the argument area too) | the main thread's stack, directly below the argument area: the full 8 MiB is free at `main` whatever the arguments, which clang's cc1 (it notes the stack bottom at `main` and assumes `DesiredStackSize`) and rustc's main thread rely on |
 | `USER_STACK_GUARD` | 16 MiB | 1 GiB | unmapped below the stack |
 | `USER_END` | `0x14_0000_0000` | `0x80_0000_0000` | one past the highest user address |
 | `USER_MEMORY_LIMIT` | 4 GiB | 64 GiB | most memory one process may have charged or owned (from 1a.3: promised, committed and page tables; before 1a.3, mapped); the machine says `ENOMEM` sooner |
@@ -2126,9 +2129,11 @@ instead whenever it isn't run as a command, for both the file it opens and `$ORI
   the interpreter's entry, with `AT_BASE` and `AT_ENTRY` set. relibc's `ld.so` is
   self-relocating, which is all this needs.
 - `PT_LOAD` segments are mapped as private file mappings through the page cache (not
-  copied: stage 1a.4), so a program's text is shared by every process running it and
-  read on first touch; the part of a segment past its file size is anonymous zeroed
-  memory, with the page that straddles the boundary copied and its tail cleared at load.
+  copied), so a program's text is shared by every process running it and read on first
+  touch; the part of a segment past its file size is anonymous zeroed memory, with the
+  page that straddles the boundary copied and its tail cleared at load. (As built in
+  1a.4, only read-only segments with no zeroed tail are mapped from the cache, populated
+  at load; the rest are copied, until 1f.1: see 1a.4's deviations.)
 - `PT_TLS` is the program's business (libc reads it through `AT_PHDR`). `PT_GNU_STACK`
   is ignored: the stack is never executable. `PT_GNU_RELRO`, `PT_GNU_EH_FRAME`,
   `PT_GNU_PROPERTY` and `PT_NOTE` are accepted and left to the program. `PT_DYNAMIC` is
@@ -2666,13 +2671,14 @@ a missing or non-executable program as a child exiting 127 or 126, a full table 
 | `READ`, `WRITE` (2, 1) | `EAGAIN` for `O_NONBLOCK`, `EINTR` and restart under signals, `SIGPIPE` on a broken pipe, work on sockets; on regular files, transfers longer than one `IO_CHUNK` complete instead of coming back short (1c.1); `EISDIR` on a directory | only with v2 state set; a v1 program never sees them, except `SIGPIPE`, whose default (ending the process) matches what v1 programs that ignore `EPIPE` would do next anyway, and the longer transfers, which a program written for short counts handles already |
 | `FUTEX_WAIT` (12), `FUTEX_WAKE` (13) | keyed by `(Mm, address)` or `(shared object, offset)` instead of the physical address (1b.1) | identical for a single-threaded process; it's what keeps copy-on-write from losing wakes |
 | `CLOSE` (4) | drops `fcntl` locks on the file, the OFD's `flock` with its last descriptor | only with v2 locks |
+| `OPEN` (3) | a directory opens for reading (it was `EISDIR`); `READ` of it is `EISDIR` (1c.1) | it only accepts what was refused; for writing it's still `EISDIR` |
 | `PATH_MAX` | 192 to 4096 | a limit that only grows; kernel path buffers move off the stack |
 | `MAX_FDS` | 16 to 1024, growable table | the same |
 | `USER_STACK_TOP`, `USER_END`, `USER_MMAP_END`, `USER_STACK_SIZE`, `USER_STACK_GUARD`, `USER_MEMORY_LIMIT`, new `USER_ARGS_SIZE` | new values (section 6, stage 1a.6) | layout constants describe where the kernel puts things; programs use the stack pointer they're given. The only in-tree uses are `malicious` probes, rebuilt with the change. This is a one-time revision recorded by `ABI_VERSION` 2 |
 | `USER_MEMORY_LIMIT`'s meaning | from "pages mapped" to "pages charged or owned" (promised, committed, page tables), stage 1a.3 | it only lets more through (a `PROT_NONE` reservation no longer counts), except that page tables now count, which no v1 program comes near |
 | program start | the System V stack layout above the registers v1 sets | registers are unchanged, so v1 programs are too |
 | exit statuses | a signal-ended process has status "signal `s`" internally; v1's `WAIT` and the shell still see `128 + s` (139 for a fault) | identical to v1 for faults, the only signal v1 had |
-| exit status 135 | a new status v1's `WAIT` and the shell can see from stage 1a.4: `128 + SIGBUS`, for a file page past the end, a `MAP_NORESERVE` page with no frame, or a cache page with no frame | it arises from v2 mappings (file mappings and `MAP_NORESERVE` aren't reachable through v1 calls), and from one v1 case: a program's text is demand-paged through the cache from 1a.4, so on a machine out of unpromised frames a text page fault ends it with 135, where v1 copied the image at spawn and the same shortage failed the spawn with 126 |
+| exit status 135 | a new status v1's `WAIT` and the shell can see from stage 1a.4: `128 + SIGBUS`, for a file page past the end, a `MAP_NORESERVE` page with no frame, or a cache page with no frame | it arises from v2 mappings (file mappings and `MAP_NORESERVE` aren't reachable through v1 calls), and from one v1 case: a fault on a file page that can't be read, or whose fill a busy writer keeps throwing away. A program's text is mapped from the cache from 1a.4 but populated at load, so a shortage of frames still fails the spawn with 126; once 1f.1's loader maps segments to be read on first touch (7.3), a text page fault on a machine out of unpromised frames ends it with 135 instead |
 
 `malicious` probes whose expected result changes: `mprotect-own-code` (RW now succeeds by
 dropping execute, so the probe becomes "make it writable, write, make it executable again:
@@ -2808,7 +2814,7 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
   `release`; `USER_MEMORY_LIMIT` counting charged or owned pages; `MAP_POPULATE`. The
   promise accounting moves into `libs/vm` as a host-tested `Promises` type.
 - **Files:** `libs/abi/src/lib.rs`, `libs/frames/src/lib.rs`, `libs/vm/src/lib.rs` (new
-  `vma.rs`, `promise.rs`), `kernel/src/user.rs` (split into `kernel/src/user/{mod,memory}.rs`),
+  `vma.rs`, `promise.rs`), `kernel/src/user.rs` (split into `kernel/src/user/{mod,memory_calls}.rs`),
   `kernel/src/memory.rs`, `user/src/lib.rs`, new `user/src/bin/mtest.rs`,
   `user/src/bin/malicious.rs`, `scripts/boot-test.py`.
 - **Host tests:** `make test-frames`: `count_up_and_down_frees_at_zero`,
@@ -2838,6 +2844,97 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
   back), `table-sweep` (`mmap`/`munmap` sweeps across the window 1000 times: free frames
   back to baseline), `unimplemented-numbers-enosys` (34 to 108).
 - **Boot:** new phase `mmap` (runs `mtest`, smp=1 and smp=4, both ports); `user`.
+- **As built (deviations):**
+  - A program can't see free frames before `SYSINFO` (1c.6), so the checks that count them
+    (`mmap2-noreserve-sparse`, `prot-none-is-free`, `mmap2-populate`, the frames-back halves
+    of `madvise-dontneed-zeroes`, `vma-exhaustion` and `table-sweep`) are answered by the
+    kernel: `ktest drive PROGRAM` runs a program with `--frames` and its streams on pipes, and
+    answers each `?frames` line it prints with the free frame count on its standard input
+    (`feos_user::free_frames`). Run by hand, those parts say they're skipped. The `mmap`
+    phase runs `mtest` both ways and `malicious` driven, and checks the machine's free frames
+    are back where they started.
+  - `mmap2-shared-and-private` can't be written: `MAP_SHARED | MAP_PRIVATE` is 3, which is
+    `MAP_SHARED_VALIDATE`, which counts as shared. The refused mixture is neither, and the
+    probe is `mmap2-neither-shared-nor-private`, beside `mmap2-type-bits` (a value of the
+    type field that means nothing, `0x4`).
+  - `MMAP2`'s length is limited by the size of the mmap part of the window (`ENOMEM`), not by
+    the per-process limit: that limits what's charged, and a reservation under it may be
+    bigger, as `mmap2-noreserve-sparse` needs. A hint is used only if the whole range is free
+    and in the mmap part, not just the window, so a mapping can't land in the stack's guard
+    or among the image.
+  - Status 135 (`EXIT_BUS`) arrives here, not in 1a.4: a written `MAP_NORESERVE` page with no
+    frame to give ends the process with it. It's an ordinary exit, not counted as a fault.
+  - The program image isn't a file mapping until 1a.4, so W^X's "executable only straight
+    from the page cache" is, for now, "executable only in the image's own VMAs, never made
+    writable": `MPROTECT(PROT_EXEC)` of anything else, or of image code that has been
+    writable, is `EACCES`. `MADV_DONTNEED` leaves the image's pages alone, since there's no
+    file to read them again from. `mprotect-own-code` and `munmap-own-code` work on a page of
+    code of the probe's own (`victim_page`, `ret` padded to a page) so nothing running is
+    changed; `munmap-own-stack` and `mprotect-own-stack` become children that end with 139.
+  - `MAP_POPULATE` of a read-only private range maps the zero frame, which is what those
+    pages read as; of one that can't be populated with `MAP_FIXED`, the old mapping is
+    gone and the range is left unmapped.
+  - A charged range's table promise is kept by making the tables when the range is mapped
+    (promise, make, release, as for pages), and the empty-table sweep after `MUNMAP` keeps
+    any table a charged VMA still overlaps. `MAP_FIXED` takes the new range's charge before
+    the old range's goes, so a replace right at the limit can fail where a net count
+    wouldn't; it changes nothing when it does.
+  - A shared-anonymous object is charged whole, once, to the address space that made it (or
+    first made it writable), until its last VMA goes. With no `FORK` yet, every VMA of an
+    object is in that space; 1d.1 revisits the charge when objects cross processes.
+  - Pins: the frame metadata and `Mm::pin` exist and are host-tested
+    (`pinned_frame_outlives_unmap`), but the kernel's copies don't pin yet: with one thread
+    nothing can unmap during a call. 1b.1 makes them, as [2.1](#21-kernel-rules-the-calls-depend-on)
+    says. Likewise the futex wake on `munmap` and `MADV_DONTNEED` has nobody to wake; a futex
+    word in writable memory is given its own frame first, so its key can't move off the zero
+    frame under a waiter.
+  - The kernel-heap budget, for this stage's part, is `OBJECT_HEAP_LIMIT` (4 MiB per
+    address space, `ENOMEM`): it counts each shared-anonymous object's header and
+    directory (a pointer per 32 pages), which are sized by the object whether it's touched
+    or not, against the space that made it, until the object's last VMA goes. A `PROT_NONE`
+    reservation and a one-page remnant left by `MUNMAP` or `MAP_FIXED` cost their object's
+    full share, which the budget bounds. Leaves (32 frame addresses, 256 bytes) are made on
+    first touch and aren't budgeted: they're at most a 16th of the frames their objects
+    hold, and frames are bounded machine-wide by the promises. The VMA list is bounded by
+    `MAX_VMAS`. Everything here is taken fallibly, the object's reference count included
+    (`feos_vm::ObjectRef`, since `Arc::try_new` isn't stable): it's made inside a change
+    to a space, with a kill held off, where a failed allocation would stop the machine.
+    The general per-process heap budget of [2.1](#21-kernel-rules-the-calls-depend-on),
+    for the heap later stages' calls take, wasn't built yet; it came with 1c.1's
+    descriptions. Probes: `shared-remnants`
+    (2 GiB `PROT_NONE` shared reservations each cut to a page, until `ENOMEM`) and
+    `shared-flood` (three programs at once each make one-page shared mappings, written,
+    to the VMA cap, then one more: `ENOMEM` or 135, the machine up, frames back). Host
+    tests: `shared_object_heap_is_budgeted_and_remnants_keep_only_their_share`,
+    `small_shared_objects_are_small`, `every_charged_piece_of_an_object_has_its_tables`
+    (`MPROTECT` of a second piece of an already charged object makes that piece's tables),
+    `interleaved_pieces_of_objects_are_charged_once_each`,
+    `lent_frames_count_against_the_limit`.
+  - A window surface's frames are user memory: `SURFACE_CREATE` promises them before
+    taking them and they count against `USER_MEMORY_LIMIT` as owned frames, released with
+    the address space (the window may hold the frames themselves a little longer).
+  - The standing check's `FEOS_BOOT_TEST_CPU=max` runs on AArch64 cover `mmap`, `user`,
+    `fault`, `sched` and `ram`.
+  - `MPROTECT(PROT_EXEC)` syncs the range's frames to the point of unification before the
+    entries change (AArch64), since the loader syncs only segments executable at load.
+    A first write to a page that read the zero frame clears its entry and flushes before
+    writing the new one (break-before-make).
+  - Faults say what was tried: `FaultDetails::memory_fault` (both ports) gives the address,
+    write and execute, and only for faults a mapping could answer (translation, access flag
+    and permission faults; not alignment, address-size or reserved-bit ones). The same fault
+    twice with nothing between flushes the page; a third ends the program, so a fault the
+    tables can't explain never loops. With threads (1b.2), "nothing between" also means no
+    other thread's unmap, protection change or discard (`UserMm::revokes`).
+  - v1's calls: `MPROTECT` over a hole is `ENOMEM` (it was `EINVAL`), and `PROT_EXEC` on
+    anonymous memory `EACCES` (it was `EINVAL`), as section 3.1 says; `utest`'s `mprotect`
+    check and the probe (now `mprotect-anon-exec`) changed with them. v1's `MMAP` still
+    refuses `PROT_EXEC` with `EINVAL`, and still places first fit with guard pages, which is
+    what its bump allocator gave a program that never unmapped.
+  - The kernel side is `kernel/src/user/{mod,memory_calls}.rs`: `memory` would read as the
+    crate's frame allocator, which `user` uses. `libs/vm` gained `mm.rs` (the address space)
+    and `shared.rs` beside `vma.rs` and `promise.rs`; its page-table layer keeps only the
+    soft entry for a page that has a frame and no access. The frame metadata is a 4 MiB table
+    beside the bitmap, in the kernel's `.bss`.
 
 ### 1a.4 Page cache, stable node ids, file mappings, `PROT_EXEC` on files, `ETXTBSY`
 
@@ -2878,7 +2975,7 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
   `etxtbsy-open-write`, `etxtbsy-map-exec`, `rename-keeps-ino`, `program-text-shared` (two
   copies of `spin` share frames: free frames drop by less than two images).
 - **Malicious:** `mmap-file-shared-write` (`ENODEV`; the expectation changes in 1a.5),
-  `mmap-dir` (`ENODEV`), `mmap-pipe` (`ENODEV`), `mmap-writeonly-fd` (`EACCES`),
+  `mmap-dir` (`ENODEV`; the expectation changes in 1c.2), `mmap-pipe` (`ENODEV`), `mmap-writeonly-fd` (`EACCES`),
   `mmap-unaligned-offset` (`EINVAL`), `mmap-offset-overflow` (`EOVERFLOW`),
   `exec-own-written-page` (write code into a private file mapping, `mprotect` exec:
   `EACCES`), `write-running-binary` (open `/bin/malicious` for writing: `ETXTBSY`).
@@ -2886,6 +2983,104 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
   `persistence`, `ram` at 192 MiB (`mtest`'s `cache-pressure` check: map files totalling
   more than free memory and read them through; reclaim keeps up and no promised page
   fails), `terminal` (the shell's `cp` over a running program reports "text file busy").
+- **As built (deviations):**
+  - Lock order: the cache's locks are leaves. The tree's hook (`feos_fs::vfs::FileHook`)
+    runs under the tree's lock and takes the cache's, so the cache never holds a lock of
+    its own while it calls the tree: a fill reads the file with none held and puts the page
+    in only if the file's change count hasn't moved since (a write or truncation bumps it);
+    otherwise it reads again. Holding and letting go of a file (`VfsTree::hold`/`release`)
+    are the exception that let `release` be called under the tree's lock: it only takes a
+    spin lock of its own, and the filesystem is told at the tree's next locked call.
+  - Truncation takes the pages past the new end out of the truncating program's tables
+    before its call returns, but out of another program's only at that program's next call
+    or fault (the reverse map marks it): changing one address space from outside it needs
+    the `Mm` lock and TLB shootdown of 1b.1. Until then the other program may still read
+    what it had mapped; the frames stay alive by the entries' counts, so nothing is read
+    after it's freed. Pages it hadn't touched fault with `SIGBUS` at once.
+  - A removed file's cached pages go at once, and its mappings keep only the pages they
+    have; the rest fault with `SIGBUS`. Orphans that stay readable arrive with `UNLINKAT`
+    (1c.2). The cache lets go of its hold when the file is removed: nothing can name a removed
+    file in 1a.4, so its number may be reused; `ino_not_recycled_while_referenced` checks the
+    tree's side, which 1c.2's orphans will use.
+  - The cache's reference on its frame is a map count, plus the frame's `PAGE_CACHE` flag,
+    rather than the owner kind alone: a page nothing maps is one whose count is 1. Entries
+    pointing at the cache's frames carry a software bit (bit 57, ignored by the hardware on
+    both ports), which is how `libs/vm` tells them from copies without asking the frame
+    table. "Instruction cache synced" is a bit in the cache's slot for the page, not the
+    frame's flag, since the cache is what changes the page.
+  - The LRU of unmapped clean pages is a clock with a second chance over the cached files,
+    and the pages nothing maps are counted exactly (`KernelFrames::put` tells the cache when a
+    page-table entry's put leaves it the only reference). Promises count those pages as
+    frames to be had; after every change to an address space they're turned back into free
+    frames until the free frames cover every promise and the spare, and an allocation of a
+    promised page that finds no free frame takes one back, so a promised page never fails. A
+    fill that finds the free frames short of the promises by any number (page tables and
+    kernel stacks take free frames without asking) takes back that many first.
+  - The writable-open count lives in the file's cache entry: v1 `OPEN` for writing makes the
+    entry, counts a writer (or fails with `ETXTBSY`) before any truncation, and the process
+    holds it by fd until `CLOSE` or teardown. A kernel app's write or truncation counts as a
+    write in progress from the hook's question to its answer, so `PROT_EXEC` can't be mapped
+    in the middle of one.
+  - The loader maps code and read-only data from the cache, populated at load (so a running
+    program's pages are all there even if its file is removed), when a segment's file offset
+    and address agree within a page and it has no zeroed tail; writable segments, and any
+    other, are copied as before, and keep 1a.3's image rule for `PROT_EXEC`.
+  - `ETXTBSY` for `MMAP2` is decided in `libs/vm`'s `map`, after placement is checked, so a
+    bad `MAP_FIXED` address is reported first. `/dev/zero` maps as anonymous memory, and
+    any other device node is `ENODEV`. v1 fds are paths, and aren't normalised, so what a
+    node is comes from the node the path reaches (`Stat::device`, from the filesystem's
+    `FileSystem::device`), not from the path's text: `mmap-dev-null-alias` ("//dev/./null",
+    `ENODEV`) and `mmap-dev-zero-alias-exec` ("/tmp/../dev/zero" with `PROT_EXEC`, `EACCES`)
+    check it.
+  - Writable segments, and segments with a zeroed tail, are still copied at load rather
+    than mapped privately from the file as 7.3 describes, though `libs/vm` has private file
+    copy-on-write: a segment with a tail would have to be split into a file mapping and an
+    anonymous one with the straddling page copied, which the loader doesn't do yet, and the
+    pages of a writable segment are nearly all written (data, relocations) and would be
+    copied anyway, so sharing them saves little. The cached segments are populated at load,
+    so a shortage still fails the spawn with 126, not a text fault with 135 as section 11
+    first said. Both move to 7.3's design with the loader rework of 1f.1.
+  - The page cache's slots have no dirty bit yet: nothing can write a cached page except
+    the tree's hook, which writes the file first, so every cached page is clean and reclaim
+    has nothing to skip. The bit comes with the dirty pages of shared writable mappings in
+    1a.5, where reclaim and write-back first need it.
+  - A truncation tells a file's mappers whenever it takes whole pages off, not only when a
+    page it dropped was mapped from the cache: a private copy of a page past the new end
+    isn't a frame of the cache's, and goes too (`mmap-file-truncate-private-sigbus`, and
+    `truncate_tells_mappers_with_only_private_copies` in `make test-pagecache`).
+  - A fault's fill is thrown away and read again if the file changed meanwhile, anywhere in
+    it (the change count is the file's); since a fault holds kills off, it reads at most
+    `FILL_TRIES` (8) times, and stops as soon as its task is being killed, before ending with
+    status 135. A busy writer can make a reader of the same file fault with 135 that way; a
+    per-page change count would remove that, if it's ever seen.
+  - A program's buffer for v1 `WRITE` is copied into a kernel buffer a page at a time before
+    the tree sees it, and the cache's write hook moves rather than copies: a buffer that's a
+    mapping of the file being written is the cached frame the hook updates
+    (`mmap-file-write-from-itself`).
+  - Boot checks run for the stage on AArch64 with `FEOS_BOOT_TEST_CPU=max`: `user`, and in
+    the stage's verification run the other phases section 12's standing checks want there
+    (`mmap`, `fault`, `sched`, `ram`).
+  - `mmap-dir`: v1 `OPEN` refuses directories, so the probe opens a file and puts a
+    directory at its path before mapping. `mmap2-file-enodev` became `mmap2-file-write-exec`.
+  - `rename-keeps-ino` has no rename call to use until `RENAMEAT` (1c.4): it's a shell `mv`
+    between two `mtest --ino` runs, in the `mmap` (RAM `/tmp` and root), `native` and
+    `persistence` (FAT on a disk) phases, beside the host test on all four filesystems.
+  - `program-text-shared` runs two `/bin/cat`s blocked on pipes rather than two `spin`s,
+    since a program can't end a `spin` until `KILL`: the second copy has to cost fewer free
+    frames than the first (driven by `ktest drive`, whose frame counts now let go of the
+    cache's unmapped pages first, as `ktest user-memory` and the leak baselines do).
+  - `cache-pressure` is `mtest --cache-pressure MIB --dir DIR`, run by the `ram` phase at
+    192 MiB with a blank 512 MiB disk as the root: files in RAM would be kernel heap, not
+    frames. It writes files totalling more than the free frames, maps them all, reads them
+    through with `MADV_DONTNEED` behind, then writes every page of a 16 MiB region promised
+    before the reading started. The file checks run with `--dir` on `/tmp`, the root, a
+    native mount and a FAT disk.
+  - `MADV_WILLNEED` reads file pages into the cache in the call. The VFS's `Stat` gained
+    `dev` (v1's `feos_abi::Stat` didn't: `Stat2` is 1c.2's), and `FileHook::unmounting` lets
+    the cache drop what it holds of a mount being unmounted, which a hold would otherwise
+    keep mounted.
+  - `arch/aarch64/src/mmu.rs` needed no change: `Arch::sync_user_code` on the frame, once
+    per frame and again after a write, is the sync.
 
 ### 1a.5 Shared writable file mappings
 
@@ -2913,6 +3108,81 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
   killed; the file holds whole pages of old or new data, and frames come back).
 - **Boot:** `mmap`, `native`, `persistence` (data written through a mapping and synced
   survives a reboot, on the native and FAT mounts).
+- **As built (deviations):**
+  - "A page stays dirty while it's mapped writable": once an entry is writable, writes
+    through it don't fault, so the cache can't tell whether a page changed after its bytes
+    were taken. A page is cleaned by a write-back if no entry had its frame when its bytes
+    were taken (the cache's reference alone, read under the file's lock, which every new
+    entry takes; a write after that faults, and the fault's `mark_dirty` clears the
+    page's `taken` bit, which the cleaning needs), or if the file had no writable shared
+    mapping then and has none after, and none came and went between (a generation the
+    file's writable-mapping count bumps). So a page still mapped writable somewhere is
+    written at every write-back point, and one whose entries are gone is cleaned by the
+    write-back after its unmap however many other writable mappings the file has; dirty
+    pages can't outlive their mappings and pin frames nobody is charged for
+    (`unmapped_page_is_clean_while_the_file_is_mapped_writable`).
+  - Write-back goes through a new `VfsTree::write_back(file, offset, buffer, fill)`: by
+    identity, under the tree's lock, with the page's bytes taken by `fill` inside it, so no
+    write through the tree (whose hook updates the cached page and the file together) can
+    come between taking them and writing them; it doesn't call the hook (the bytes are the
+    cache's already) and never writes past the file's end.
+  - `MSYNC(MS_SYNC)` writes back the dirty pages in its range and then flushes the
+    filesystems (`sync_if_dirty`), so synced data is on the disk, which is what the
+    `persistence` check (pull the plug after `msync`) needs; `EIO` if either fails.
+    `MUNMAP` and a `MAP_FIXED` over a mapping write back the pages unmapped (of shared
+    mappings, and of private ones of a file with dirty pages, whose entries may be what
+    kept those dirty), so a one-page unmap costs a page's work; every v1 `CLOSE` of a
+    file (v1 fds aren't shared, so each close is a last close) writes back the whole file;
+    none of them flush. At exit, `Process::destroy` (task context) unmaps those mappings
+    one at a time, with no heap, and writes back each one's pages. Finding the next dirty
+    page stops at the first one and at the range's end, so a write-back is linear in the
+    pages it covers. A failed write-back, the tree refusing before it takes the bytes
+    (a read-only mount or file) included, is `EIO` and leaves its pages dirty
+    (`write_back_refused_before_taking_the_bytes_is_eio`): reclaim skips them and promises
+    don't count them (`PageCache::reclaimable` is idle pages less dirty ones), until a
+    later write-back succeeds or the file is removed or unmounted, which drops them.
+  - A write or truncation through the tree that fails part way (`Change::Failed`) drops
+    only the clean pages of its range that no entry has, to be read again. Dirty pages
+    are kept, being newer than the file, and their write-back puts them over what the
+    failure left; so are pages an entry has, since an entry left on a frame the cache had
+    let go would be written where no write-back looks. Those mappings go on seeing what
+    they saw until the page is unmapped and taken back, while a read through the tree sees
+    what the failure left (`failed_change_keeps_dirty_and_mapped_pages`).
+  - `READ` lays the file's dirty pages over what the tree returned
+    (`PageCache::read_dirty`), rather than reading through the cache, and only when some
+    page anywhere is dirty. `with_user_buffer` now copies through its bounce page both
+    ways: a read straight into a shared mapping of the file being read would put the tree's
+    bytes over the dirty page before they could be laid over.
+  - A growth of a file (a write or truncation past its end) zeroes what a shared writable
+    mapping wrote past the old end of the old last page, which was never the file's
+    (`growth_clears_what_a_mapping_wrote_past_the_end` in `make test-pagecache`).
+  - The `EACCES` for `MAP_SHARED | PROT_WRITE` on an fd not open for writing comes after
+    the offset checks and before the node is looked at, so `/dev/zero` gets it too, as on
+    Linux. `mprotect(PROT_WRITE)` of a shared mapping made from such an fd is `EACCES` too
+    (the VMA remembers whether its fd could write), and the probe
+    `mprotect-shared-readonly-fd-write` checks it. `mprotect` from read-write to
+    read-execute of one shared mapping is `ETXTBSY`: its own writable count is still there
+    when the executable one is asked for.
+  - `mmap-shared-write-of-exec-mapped` can't be reached through `MMAP2`: a v1 fd open for
+    writing counts as a writer until it's closed, so a file mapped to run can't have one.
+    The probe maps the file shared read-only from a read-write fd, closes the fd, maps the
+    file to run, and then `mprotect`s the shared mapping writable: `ETXTBSY`.
+  - `dirty-storm` is `ktest dirty-storm PATH MIB` driving `malicious --dirty-storm PATH`,
+    since a program can't kill until 1c.8: 64 MiB on the FAT root of the `persistence`
+    phase, and 12 MiB on `/tmp` in the `mmap` phase (`/tmp`'s RAM quota is 16 MiB). The
+    child writes its pass number into the first word of every page, over and over; "whole
+    pages of old or new data" is every page holding one pass's number, at most one pass
+    apart, and nothing else. The kill comes once every page is dirty (the cache's dirty
+    count, so the first pass is over) and half a second more, however slow the mount is to
+    fill. On the FAT root the 64 MiB take about 100 s to write back, since the FAT driver
+    walks the file's cluster chain on every call; native and FAT are otherwise unchanged.
+  - `mmap-shared-msync-persists` and `mmap-shared-munmap-persists` read the file in a child
+    with `READ`, which sees dirty pages anyway. That the data reached the filesystem is
+    `mtest --persist PATH TEXT` (write through a mapping, `msync`, unmap) followed by the
+    shell's `cat`, a kernel app that reads the tree and not the cache, in the `mmap`
+    (`/tmp`), `native` and `persistence` phases, and again after pulling the plug in the
+    last two.
+  - `FSYNC` arrives with 1c.2; until then `MSYNC(MS_SYNC)` is the only durable point.
 
 ### 1a.6 The larger window and the v2 layout, `ABI_VERSION` 2
 
@@ -2935,6 +3205,73 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
   `mmap2-fixed-at-user-end` (`ENOMEM`); `mmap2-fixed-below-base` (`ENOMEM`).
 - **Boot:** `mmap`, `user`, `ram` with `FEOS_BOOT_TEST_MEM=8G` on both ports (on x86_64
   this also exercises the 64-bit PCI hole check of [section 13](#13-risks-and-open-points)).
+- **As built (deviations):**
+  - AArch64's identity map wasn't all below `USER_BASE`: `boot.S` mapped QEMU `virt`'s
+    PCIe ECAM, at 256 GiB, as an identity 1 GiB block, which the 512 GiB window now
+    covers (and `prepare_user_tables` copies every kernel entry into a process's top
+    table). It's mapped at 63 GiB instead, the last gigabyte below the window, the one
+    kernel mapping that isn't identity; `PCIE_ECAM_BASE` in `boards/qemu-virt` is that
+    address (`PCIE_ECAM_PHYS` the real one). Nothing gives the ECAM's address to a
+    device, so nothing else changed. The probe `ecam-read` checks a program can't reach
+    it on either port.
+  - The boot check is `check_below_user_window` in `kernel/src/memory.rs`, with a new
+    `Arch::kernel_map_end` (one past the highest present entry of the kernel's top
+    tables; on x86_64, a PML4 entry other than 0 counts as past the window, since a
+    process wouldn't have it, and x86_64's `prepare_user_tables` copies every present
+    kernel PDPT entry, not just the first four, so the check counts what a process has) and the RAM in use (below `Board::RAM_LIMIT`), rather than
+    a list of device regions per board: every device the kernel touches is in that map,
+    so checking the map covers them all, and a board can't forget one. It logs
+    `[mem] kernel mappings end at ...: below the user window at 0x1000000000`, which the
+    `ram` phase looks for, and panics with both ends otherwise. With 8 GiB the x86_64
+    check passes trivially: the boot map is the first 4 GiB, and the PCI driver already
+    moves BARs above 4 GiB below it, so q35's 64-bit hole is never mapped.
+  - The argument area and the stack are two `Place::Exact` anonymous private mappings,
+    both charged, as section 6 says, so a program is promised 10 MiB at start where it
+    was 128 KiB. On a 512 MiB guest (about 240 MiB of frames free after the heap) that's
+    room for about 22 programs at once before a spawn fails for want of promises, fewer
+    than the 31 user slots; nothing in the boot phases runs that many, but 1b.4's 1024
+    slots will want the stack's charge revisited (charging it as it's touched, say). The
+    VMA list joins them
+    (same protection, adjacent). What's in the argument area is still v1's block (strings
+    at the top, the `UserStr` array below, the first stack pointer at the array): the
+    System V block of 7.1 comes with `SPAWN2`. A const assertion in `kernel/src/user`
+    checks `PROCESS_ARGS_MAX` and the `UserStr`s fit the 2 MiB.
+  - `USER_PIE_BASE` and `USER_INTERP_BASE` are defined now (with the interpreter area
+    asserted to be the gigabyte just below `USER_MMAP_BASE`); nothing uses them until 1f.1.
+    The mmap area moves from `USER_IMAGE_END` to `USER_MMAP_BASE`, so an `MMAP2` with
+    `MAP_FIXED` in the interpreter's gigabyte is `ENOMEM` (`mmap2-fixed-interp-area`).
+    There's no feature mask to set bit 5 in until 1c.6.
+  - `OBJECT_HEAP_LIMIT` stays 4 MiB: enough for shared-anonymous objects totalling
+    64 GiB (`USER_MEMORY_LIMIT`), no longer the whole mmap area; a `PROT_NONE` shared
+    reservation larger than that is `ENOMEM`.
+  - The user checks are in `mtest` (`layout_checks`): `stack-8m` goes 7.5 MiB below the
+    argument area's bottom (`main` starts inside the area) a kilobyte a call, writing
+    each frame; `stack-below-args`
+    checks the first stack pointer (`Args::address`, the `UserStr` array) and the current
+    one are in the argument area and writes a byte every MiB of the 8 MiB below it;
+    `stack-overflow-faults` recurses without end and must end with 139, having written
+    its stack pointer to a file once within the stack's last 64 KiB, which the parent
+    reads back (any stack size ends in 139, so the status alone doesn't show the child
+    got past 8 MiB). `mmap-above-64g` also makes the top page of the gigabyte writable and writes it; `mmap2-noreserve-64g`
+    uses `MAP_NORESERVE` (otherwise `mprotect` to writable would promise 64 GiB) and,
+    under `ktest drive`, checks the cost is the pages touched and their tables.
+  - Tests that leaned on the 4 GiB limit were rescaled: `v1-mmap-unchanged` maps two
+    halves of the limit plus a gigabyte, `mmap2-charged-past-the-limit` asks for the limit
+    plus a gigabyte, charged. On the boot tests' guests the machine-wide promise would
+    refuse those too, with the same `ENOMEM`, so they don't show the 64 GiB limit itself,
+    which `the_page_limit_is_kept` in `feos-vm` checks. The probe was
+    `mmap2-over-the-limit`, renamed so it doesn't claim more. `munmap-own-stack` and
+    `mprotect-own-stack` work on the stack's top page, below the argument area (at
+    `USER_STACK_TOP - PAGE_SIZE` they'd be in the argument area now); `munmap-own-args`
+    and `mprotect-own-args` do the same to the argument area's top page.
+    `table-sweep` maps and unmaps at four or five points a round spread over
+    the whole 446 GiB area instead of one per gigabyte, which would be 446 calls a round.
+    New probes beside the doc's: `mmap2-fixed-interp-area`, `mmap2-fixed-in-stack-guard`,
+    `stack-guard-read` (a read of the byte below the stack: 139) and `ecam-read`;
+    `mmap2-fixed-outside-window` stays.
+  - `FEOS_BOOT_TEST_MEM` doesn't reach the `ram` phase, which names its sizes: it gained
+    an `8G` boot (also checking the boot check's line), and `mmap` and `user` ran again
+    with `FEOS_BOOT_TEST_MEM=8G`.
 
 ### 1b.1 `Process` and `Mm` shared and refcounted (no new calls)
 
@@ -2967,6 +3304,79 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
   own memory), `ktest futex-namespace` (a kernel waiter and a user waiter whose words have
   the same physical address: neither wake reaches the other).
 - **Boot:** `user`, `smp`, `sched`, `fault`, both ports, smp=4.
+- **As built (deviations):**
+  - `kernel/src/user/process.rs` has `Process` (pid, the v1 file table behind its own
+    mutex, an `Arc<UserMm>`) and `UserMm` (the `Mm` behind a `feos_sync::Mutex`, the
+    loadable root, a futex id, an unmap count, the window surface, its `Tlb`); a slot holds
+    an `Arc<Process>`, which `collect_exits` only moves into the teardown queue, and the
+    last references drop in task context (the space's end writes back, as
+    `Process::destroy` did). The cwd a spawn gives is kept per slot until the process
+    exists, since `spawn_entry` runs under the scheduler's lock, where nothing may be
+    allocated. uid and gid, the reverse-map space number (`Layout::space`) and the
+    truncation zap flags stay per slot: with one thread per process they're the same
+    thing, and 1b.2 moves them to the process and the Mm.
+  - There's no fork yet, so "fork re-checking entries" is for 1d.1. Every change holds
+    the Mm's lock throughout; the fault path still reads a file page with it held, which
+    the lock order allows. `read`/`write` copy the fd's entry out of the table and put the
+    offset back after, so the file table isn't held across a pipe or console wait.
+  - `Mm::translate_and_pin` (fault in, then pin, under the lock) and `Pinned::unpin`
+    (without the lock) in `feos-vm`; `UserMm::copy_in`/`copy_out` and `with_user_buffer`
+    pin one page at a time, copy with the lock released, and never pin across a wait:
+    data from the program is copied to a bounce buffer and unpinned before the call waits,
+    data for it is pinned after. What a pipe read took for a page another thread unmapped
+    meanwhile is lost, and the call returns what it moved, or `EFAULT`.
+  - User futex keys are `feos_sched::UserKey { space, offset }` with `Wait::UserKey` and
+    `Wait::UserKeyUntil` (the timed one now, not in 1b.3: v1 `FUTEX_WAIT` has a timeout),
+    `Table::wake_user_key` and `wake_user_range`. A private word's `space` is the Mm's id
+    (a counter, tagged odd, rather than its address, so a freed Mm's can't be reused); a
+    shared one's is the address of its shared-anonymous object or of the file's cache
+    entry, with the byte offset in it (`Mm::word_key`, `Mm::shared_words`). The frame is
+    pinned from the check to the resume. Since an unmap can wake the range before a waiter
+    that checked its word has blocked, the Mm keeps an unmap count, read with the key and
+    checked under the scheduler's lock with the word, and bumped before the wake.
+    `MUNMAP`, a replacing `MAP_FIXED` and `MADV_DONTNEED`/`MADV_FREE` (whose discarded
+    frame is no longer the word's) wake their range.
+  - ASIDs: rather than a number in a per-slot atomic, a slot has a pointer beside `ROOT`
+    (`TLBS`) to its space's `user::tlb::Tlb`: the CPUs that have it loaded and its ASID
+    context. The allocator, with generations, reserved ASIDs for the spaces loaded at a
+    rollover and `tlbi vmalle1is`, is `feos_vm::asid` (host-tested), glued in
+    `kernel/src/user/tlb.rs`, which is also where tables are loaded (`tlb::load`) for both
+    ports. `boot.S` sets `TCR_EL1.AS` where `ID_AA64MMFR0_EL1.ASIDBits` says 16, and
+    `mmu::asid_bits` stops the machine if the two disagree; the boot log's protection line
+    says which width. "Forced into 8-bit mode" is the allocator's width
+    (`tlb::force_asid_bits`), with `TCR_EL1.AS` left alone: 8-bit ASIDs work the same
+    under it. `Arch` gained `user_asid_bits`, `USER_FLUSH_BROADCAST`, `flush_user_local`,
+    `flush_user_all` and, for the self-tests only, `read_user_word` (`ldtr`; a load under
+    `stac`), and `Board` gained `IPI_TLB` (vector 51 on q35; SGI 2 on `virt`, enabled
+    and never sent).
+  - x86_64's shootdown: each change runs through a `tlb::Gather`, which flushes this CPU,
+    notes which others have the space, and holds the frames the change gives back (up to
+    64, then a shootdown makes room) until they've acknowledged; each CPU has an asked and
+    a done count, so concurrent shootdowns need no lock. A CPU withdraws from a space only
+    after loading other tables (which flushes without PCIDs). With one thread per process
+    a space is only ever loaded on the CPU running it, so outside `ktest tlb` no shootdown
+    is sent yet.
+  - `ktest tlb` doesn't make CPU 1 fault, which would be a kernel fault: CPU 1 reads the
+    page (`Arch::read_user_word`), then holds interrupts masked for 200 ms while CPU 0
+    unmaps it, checking the frame's count stays up all that time; CPU 0 checks the unmap
+    waited and the frame was freed by the time it returned, maps the page again with
+    another frame, and CPU 1 must read the new value, not the stale entry's. On AArch64
+    there's no shootdown to wait for, which it also checks. `ktest asid-rollover` keeps
+    300 spaces of its own (`user::TestSpace`, never run) alive at once and loads and reads
+    each twice on CPU 0, while (with two CPUs) CPU 1 holds a space of its own loaded with
+    interrupts masked, reading its word: no space on CPU 0 may be given CPU 1's ASID in a
+    later generation (the rollover reserved it), and CPU 1 loading it again keeps it. On
+    x86_64 it checks only that each sees its own word. A CPU's tables are written while
+    the ASID lock is still held, so a rollover can't fall between its active context
+    changing and the tables it names being loaded. `ktest futex-namespace` also checks an
+    unmap and an `MADV_DONTNEED` each wake a user waiter, the latter one waiting as a
+    program does, its frame pinned. `malicious` probes futex words unmapped, `PROT_NONE`,
+    misaligned for a wake, at the window's top and past it, and read-only holding the
+    wrong value (`EAGAIN`, the pin let go), with a frame-leak check after. All three run in the `smp`
+    phase, at smp=4 and smp=1 (`tlb` skips with one CPU), with a frame-leak check around
+    them. Extra host tests: `futex_words_are_named_by_what_maps_them` in `make test-vm`,
+    and four for `feos_vm::asid`.
+  - There's no feature mask to set bit 6 in until 1c.6.
 
 ### 1b.2 Threads: `THREAD_CREATE`, `THREAD_EXIT`, `GETTID`, `SET_TLS`, FP state, user-mode controls
 
@@ -3017,6 +3427,61 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
 - **Ktest:** `ktest thread-fault` (a fault injected into one thread's call ends the whole
   process with 139 and leaves the others' state freed).
 - **Boot:** new phase `threads` (smp=1, smp=4), `user`, `fault`.
+- **As built (deviations):**
+  - `feos_sched::Task` has `pid` (the thread id) and `tgid`; `find_pid` takes a pid and finds
+    the first thread while it lives, else any; `find_tid`, `threads`, `reserve_keeping`,
+    `reserve_thread` (refused for a creator being killed), `kill_slot` and `last_of_group`
+    are new; kill, stop, priority, affinity and `wake_pid` act on every thread. An extra host
+    test, `user_reservations_keep_slots_for_the_kernel`.
+  - The decided exit status isn't in the `Process`: it's `group_code` in every thread's
+    kernel scheduler entry, written for the whole process under the scheduler lock by `EXIT`,
+    a fault from the program (`SIGSEGV`/`SIGBUS` end the process, as their default action
+    will) or a contained fault or panic in a call (`contain_failure`). The record is written
+    under the same lock, so it can't miss a decision racing the last thread's end. The record
+    for the last thread collected is the process's; a queued teardown of an earlier thread
+    still counts as "tearing down" for `wait`.
+  - uid and gid stay per slot: a thread copies its creator's, and `SETUID` sets every thread's
+    under the scheduler lock. The reverse-map space number moved to the `UserMm` (a number
+    from a pool of `2 * MAX_PROCESSES`, not the first thread's slot, which another process can
+    reuse while the space lives on); the truncation zap flags are by that number.
+  - Pipes are held in the process's name (`SLOT_TGID`; the pipe hooks' `current_pid`), and
+    released when the last reference to the `Process` drops (`Process::drop`), not per
+    task. Heap blocks stay charged by thread id, which names one slot (`SLOT_PID`).
+  - With the 32-slot table until 1b.4, the thread cap is `sched::MAX_THREADS` = 24 and the
+    slots kept for kernel apps are `KEEP_FOR_KERNEL` = 4, which user program spawns respect
+    too. A new thread starts straight at its program from a fresh user frame (no kernel half
+    until its first trap), with its creator's streams, credentials, priority and CPUs.
+  - `clear_word` is only written by `THREAD_EXIT`: until `THREAD_KILL` (1c.10) a thread ends
+    otherwise only with its whole process, when "the process is still running" is false.
+  - TLS: `Arch::set_user_tls`, `user_tls` and `USER_TLS_WRITABLE` (true on AArch64, where
+    `reschedule` saves `TPIDR_EL0` whenever a slot leaves the CPU). Every switch in writes the
+    incoming slot's value, kernel apps' included (zero). `cpu::protect` also zeroes
+    `TPIDRRO_EL0`. They're in `arch/*/src/{cpu,lib}.rs`; `irq.rs` didn't need to change, as
+    both ports' frames already held every FP/SIMD register per task.
+  - `AT_HWCAP`: there's no aux vector until 1c.6. SVE traps at EL0 already (`CPACR_EL1.ZEN`
+    clear), so 1c.6 must leave `HWCAP_SVE` out. On x86_64 `protect` clears `CR4.OSXSAVE`,
+    `FSGSBASE`, `TSD` and `PCE` outright (nothing ever set the first two); `ttest
+    user-mode-controls` checks `cpuid` reports OSXSAVE clear.
+  - `tls-survives-migration` in `ttest` relies on the scheduler moving its threads; the
+    "affinity changes" are the `threads` phase running `ttest --migrate 3000` while it
+    `taskset`s the process every 200 ms, since no call sets affinity. `fs-selector-reload`'s
+    other process is a child, `ttest --tls-watch`, which shares a CPU with the reloader for
+    certain at smp=1. `leader-exits-first` ends the process from the other thread with
+    `EXIT(7)` so the status says `GETPID` matched; `last-thread-exit-status-0` checks the
+    status-0 case.
+  - `thread-exit-unmap-image-only` is a thread unmapping a page of the image no thread runs
+    (`malicious`'s victim page): allowed, and the first thread sees the page gone and ends
+    with 0. `thread-bomb` runs twice and must make as many threads both times; the `threads`
+    phase also holds one (`--thread-bomb --hold`) while the shell runs `ps` (its new `THR`
+    column) and `kill`. `umip-sgdt` is reported skipped where `cpuid` shows no UMIP. Extra
+    probes: `thread-create-{data,null}-entry`, `thread-create-kernel-stack`,
+    `thread-create-stack-past-window`, `thread-create-kernel-tls`, `clear-word-unaligned`,
+    `set-tls-noncanonical`, `set-tls-high`. No call here takes a struct, so no `toctou-*`.
+  - `ktest thread-fault` arms a fault (`sched::arm_thread_fault`) for the next `GETTID` from a
+    thread of `ttest --fault-victim` that isn't its first: a read of the guard below that
+    slot's kernel stack, in the call with nothing held. It checks status 139, no threads
+    left, and frames, heap and pipes back.
+  - No new error numbers. There's no feature mask to set bit 7 in until 1c.6.
 
 ### 1b.3 Time and deadlines: `FUTEX_WAIT2`, `CLOCK_GETTIME`, `CLOCK_GETRES`, `NANOSLEEP`
 
@@ -3042,6 +3507,51 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
   `toctou-nanosleep` (a thread rewriting the `Timespec` during the call).
 - **Boot:** new phase `time` (the boot test passes the host's UTC time to `rtest` and checks
   the guest's), both ports.
+- **As built (deviations):**
+  - The clocks are in a new `kernel/src/time.rs` (monotonic nanoseconds, the wall-clock
+    offset, the `rtc` task that takes the RTC again at its second's edge, keeping the
+    larger of that and boot's coarse offset so `CLOCK_REALTIME` never steps back), the calls in
+    `kernel/src/user/time_calls.rs`. `boards/*` didn't need to change: `Board::unix_time`
+    already reads the PL031 or the CMOS clock. The tick and nanosecond arithmetic
+    (`ticks_to_ns`, `ns_to_ticks`, which rounds up so a deadline is never early,
+    `period_ns`, `wall_offset`) is in `libs/hal/src/time.rs`, tested by `make test-hal`;
+    `make test-rtc` is unchanged and passes. `KernelClock::unix_time`, the desktop's clock,
+    reads the same offset, so the taskbar and `CLOCK_REALTIME` agree.
+  - Monotonic time is clamped by one atomic to the latest value any CPU has returned, since
+    TSCs firmware didn't line up may disagree by a little across CPUs.
+  - `Wait::UserKeyUntil` already existed (1b.1, for v1's timed `FUTEX_WAIT`); this stage
+    uses it for absolute deadlines and adds the two host tests. `futex_wait_user` takes the
+    counter deadline itself, and v1's `FUTEX_WAIT` makes its millisecond timeout into one.
+  - CPU-time clocks are in scheduler ticks (10 ms), which `CLOCK_GETRES` reports. A thread's
+    count is folded into `Process::ended_ticks` as it stops being counted live (in
+    `teardown_self`, or in `collect_exits` for a thread reaped by a kill), both under the
+    scheduler lock the sum is read under, so it never counts a thread twice or goes back;
+    the little a thread runs after its own teardown isn't counted.
+  - `EINTR` is in `libs/abi` but nothing returns it until signal handlers (1c.9), so
+    `NANOSLEEP` never writes `remain` yet; `remain` is still checked to be in the window
+    (`EFAULT`). `EOPNOTSUPP` is added as the name for v1's `ENOTSUP` (95). The 32-bit
+    argument rule of section 1 is `feos_abi::int_arg`, first used for `expected`.
+  - `FUTEX_WAIT2` checks `clock` whether or not there's a deadline (only `CLOCK_MONOTONIC`
+    and `CLOCK_REALTIME`), and checks every argument, the deadline's `Timespec` included,
+    before it looks at the word. `NANOSLEEP` takes only `CLOCK_MONOTONIC`, `CLOCK_REALTIME`
+    and `CLOCK_BOOTTIME`, as Linux does; the coarse and raw clocks are `EINVAL` there and
+    read as their base clocks in `CLOCK_GETTIME`. The clock id is a full 64-bit argument
+    (section 1 doesn't list it as 32-bit), so upper bits are `EINVAL`.
+  - `rtest` has an extra check, `futex-wake-before-deadline` (one call, ended by the
+    waker's wake 50 ms in: the waker's `futex_wake` has to have woken one), and `nanosleep-absolute` and
+    `futex-deadline-*` cover `CLOCK_REALTIME` deadlines too. Extra `malicious` probes:
+    `nanosleep-nsec-upper-half`, `-absolute-negative`, `-bad-clock`, `-coarse-clock`,
+    `-clock-upper-bits`, `-bad-flags`, `-kernel-request`, `-null-request`,
+    `-kernel-remain`, `clock-id-upper-bits`, `clock-getres-bad-id`,
+    `clock-gettime-kernel-out`, `clock-gettime-code-out`, `clock-getres-kernel-out`,
+    `futex-wait2-bad-clock`, `-bad-clock-no-deadline`, `-nsec-overflow`,
+    `-negative-deadline`, `-kernel-word`.
+    `toctou-nanosleep` flips the request between a 1 us interval and an invalid one
+    (`nsec` out of range, `sec` negative) 2000 times: every call sleeps or says `EINVAL`.
+  - The `time` phase runs at smp=4 and smp=1, checks the boot's `[time]` line and that
+    every frame comes back. The `malicious` probes run in the `user` phase.
+  - No feature mask to set bit 8 in until 1c.6, and nothing to say "no RTC" in until
+    `SYSINFO` (1c.6).
 
 ### 1b.4 1024 task slots: the scheduler and kernel stacks
 
@@ -3066,6 +3576,99 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
 - **Ktest:** `ktest kstack`.
 - **Boot:** `sched`, `threads`, `user`, `smp` (the shell runs `spawn 200 spin` and `ps`
   lists them).
+- **As built (deviations):**
+  - The stacks are in a new `kernel/src/kstack.rs`. The window is at 62 GiB (the gigabyte
+    below AArch64's moved ECAM), 512 KiB per slot with the stack at its top, so the never
+    mapped gap below is at least 256 KiB. `Arch::reserve_kernel_window` makes all its
+    tables at boot (one directory and 256 leaf tables, 1 MiB) before any process copies
+    the kernel's top-level entries, so `Arch::map_kernel_page`/`unmap_kernel_page` never
+    allocate or change a shared table; an unmap is a broadcast `tlbi vaae1is` on AArch64
+    and a shootdown to every other CPU on x86_64 (`tlb::shootdown_all`). `stack_bottom` is
+    gone (`kstack::range`, `top`); `stack_overflow_at` asks `kstack::overflow_of`.
+  - Not in the plan, and needed: a stack isn't identity mapped any more, and drivers hand
+    devices caller buffers that can be on one (virtio-blk and USB disk transfers, fw-cfg's
+    descriptor). A stack's frames are contiguous, and `feos_hal::dma::bus_address`, a hook
+    the kernel installs, turns a window address into its frame's; every driver's device
+    addresses (and `DmaBuf::phys`) now go through it.
+  - A stack is taken with its slot (reusing the last one when it's the right size), goes
+    idle when the exit is collected, and is given back by the reaper. Counting free frames
+    (`ktest user-memory`, the ktests' settled counts) trims idle stacks first, so frame
+    counts don't depend on whether the reaper has run. `ps` reads another task's stack
+    under a reader count that keeps a trim off it. The high-water mark is measured as each
+    stack is given back; `ktest kstack [DIR]` runs `utest`, `mtest --dir DIR` and `ttest`
+    and checks the deepest user-thread use is at most half of 64 KiB. The `threads` phase
+    boots with a native disk and runs it on `/native0`.
+  - The futex buckets are a bitmap of slots per bucket (64 for kernel words, 64 for user
+    words), not per-slot lists: as fixed and allocation-free, and a bucket walked in slot
+    order wakes exactly whom the scan woke, which the differential test needs. There's also
+    a set of every user waiter (for `wake_user_range`), of timed sleepers (`next_deadline`,
+    `wake_expired`), and of starved tasks. Every state, wait or priority change goes through
+    `Table::update`. The exit-pending bitmap is `Table::left`/`forget_left`. Collecting
+    an exit is constant time too, not a scan of every slot: `Table::last_of_group` asks a
+    ring of each process's members (its slots that are live or have left unforgotten,
+    linked through `group_next`/`group_prev`, kept by `reserve_user_thread`, `cancel`,
+    `forget_left` and a reservation of an unforgotten slot), and the parent whose
+    `CHILD_TICKS` an exit's CPU time goes to is looked for first in the slot of the task
+    that started it (`Task::parent_slot`, a thread taking its process's); only when that
+    one has gone is the table searched. `last_of_group_after_1024_threads`, and the
+    differential tests compare the rings against a scan after every step.
+  - The reference the tests compare against is in the crate under `cfg(test)`: a table with
+    `scan` set decides by the old `take_next` (kept as `take_next_scan`) and walks every
+    slot with the same checks elsewhere. The three differential tests run two tables through
+    random traces (spawns, threads, every request, kills, stops, wakes, priority and
+    affinity changes, lock/heap/in-call facts) and compare everything after every step.
+  - Per-uid caps: 512 tasks and 256 processes for a user other than root (`UserLimits`,
+    `Table::reserve_user`, `reserve_user_thread`, `Task::uid`, `set_uid`, kept by `SETUID`);
+    root is only held to the 64 kept slots, and `MAX_THREADS` is 960, so the machine's
+    limit is the one a bomb meets. Extra host tests `per_uid_caps` and
+    `heap_charge_hint_is_only_a_hint` (heap charges look at the caller's slot first instead
+    of searching 1024); an extra `malicious` probe, `uid-thread-cap` (as uid 4242, exactly
+    511 threads beside the first, then `EAGAIN`). The process cap has no probe: each
+    process promises its 8 MiB stack, so a 512 MiB guest runs out of memory (`ENOMEM` at
+    load) long before 256; `per_uid_caps` covers it. 1a.6's item, the stack's charge
+    revisited so that 1024 slots can be reached by processes and not only by threads, was
+    not done here: it's deferred to 1b.5, whose scope now has it and the probe.
+  - A spawn reads its creator's uid and gid once, under the scheduler lock it reserves
+    the slot under (which `SETUID`'s `set_credentials` takes too), and gives the same pair
+    to the table, which the caps count by, and to `TASK_UID`/`TASK_GID`. It read them
+    twice, unlocked, before, and a sibling's `SETUID` between the reads made a child that
+    ran as 4242 but counted as root, with no cap on its threads. `malicious`
+    `setuid-spawn-race` starts children while another thread gives up root, three times
+    over, and checks each child running as 4242 stops at the cap.
+  - Kernel apps can't be reaped part way through a stack's change (`sched::NoKill`, the
+    guard `user` already had, holding the task's lock count up): a spawn holds it from
+    its reservation, taken under the scheduler lock so no tick comes between, to its
+    commit or cancel; `kstack::take`, `trim_idle` and `high_water` hold it too. A kill
+    then could leave a stack `TRIMMING` for good, which hung every `trim`, or a reader
+    counted for good, or a slot reserved with its stack `BUSY` and unmapped. A take no
+    longer spins on a reader: it yields and tries again. `ktest kstack-kill` (in the
+    `threads` phase) kills spawning, reading kernel apps 240 times and checks nothing is
+    left trimming, read or reserved.
+  - A kill that waited for a `NoKill` takes effect as it's dropped (`take_kill_now`: a
+    kernel app with no other lock and interrupts on yields, and the switch reaps it).
+    Found on the verification run: `kstack-kill`'s churners take one `NoKill` after
+    another reading 63 stacks, and a kill left to the next tick finding one outside them
+    hardly ever landed, so the test hung on both ports.
+  - `fsflush` now starts at boot rather than with the tree's first change. A stack is
+    frames now, so a task that came and stayed partway through a test (the flusher, on
+    the first write) read as 256 KiB leaked to every frame count.
+  - `ram`'s boot-log captures swapped order: the window check is printed after the RAM
+    line now, since the window's tables come from frames.
+    `system_info` counts with `Table::counts` instead of a `find_pid` per slot.
+  - `spawn` takes a count (`spawn [count] cmd`), and `spin` is a new command, for `spawn 200
+    spin`; the `smp` phase runs it at smp=4 and 1, checks `ps` lists all 200, kills them and
+    checks every frame comes back. The `threads` phase checks the held bomb stops at 960
+    tasks machine-wide (the sum of `ps`'s THR column, allowing for `ps` and the job).
+  - With `MAX_PROCESSES` 1024, `taskmgr`'s rows (kept in its state and built on the stack)
+    would overflow a 256 KiB stack, so it lists the first 128 processes until 1b.5's heap
+    snapshots; its end-tree and the terminal host's `for_tree` snapshots are on the heap
+    already. `ps`, `init` and `desktop` still have 72 KiB snapshots on their stacks (1b.5).
+  - No new error numbers, no new calls (`unimplemented-numbers-enosys` unchanged), and no
+    feature mask to set bit 9 in until 1c.6.
+  - Still owed: the standing checks' AArch64 runs with `FEOS_BOOT_TEST_CPU=max`. Only
+    `user` has run so; `fault`, `ram` and `sched`, and `threads` and `smp`, which use the
+    stack window most, haven't, though this stage changes the AArch64 kernel mappings
+    (`reserve_kernel_window`, and `unmap_kernel_page`'s broadcast `tlbi vaae1is`).
 
 ### 1b.5 What scales with tasks
 
@@ -3073,16 +3676,81 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
   `desktop`, `host`) moved to a heap snapshot API; the pipe pool growing on demand from the
   heap with a per-process cap and holders tracked beyond 32 (by OFD from 1c.1);
   `MAX_SOCKETS` 64 to 1024 in `libs/net`; AArch64 ASIDs for 1024 live Mms (the 8-bit
-  generation path under load).
+  generation path under load). From 1a.6 by way of 1b.4: the main stack's charge
+  revisited (charged as it's touched, say, which changes section 6's "reserved and
+  charged"), so that a 512 MiB guest can hold far more than about 22 programs, and with
+  it a `malicious` probe of the per-uid process cap (256), which 1b.4 could only check on
+  the host.
 - **Files:** `libs/app/src/{lib,pipe}.rs`, `apps/commands/src/{ps,taskmgr,host}.rs`,
   `libs/init`, `libs/desktop`, `libs/net/src/stack.rs`, `kernel/src/sched.rs`.
 - **Host tests:** `make test-app`: `pipe_pool_grows`, `holders_beyond_32`,
   `process_snapshot_of_1024`; `make test-net`: `sockets_beyond_64`; `make test-init` and
   `make test-desktop` (the snapshot API).
 - **Malicious:** `pipe-exhaustion` (`ENFILE` at the per-process cap; machine up, another
-  process can still make pipes).
+  process can still make pipes); `uid-process-cap` (as uid 4242, processes until
+  `EAGAIN`, exactly 256).
 - **Boot:** `sched`, `user`, `net`, `terminal` (`spawn 500 spin`, then `ps` and `taskmgr`
   list them).
+- **As built (deviations):**
+  - The snapshot API is `feos_app::ProcessSnapshot` (`take`, `find`, `is_live`, `tree`),
+    a heap copy of the table that's `None` when the heap is short. `process_tree` and its
+    `[u32; MAX_PROCESSES]` are gone (`ProcessSnapshot::tree`, a flag per entry so a full
+    table is a million steps). A failed snapshot is "don't know": `init` and the desktop
+    session skip the tick rather than take every service and window for gone, and a stop
+    or start that can't look takes the process to be alive. `taskmgr` builds its rows
+    (`Vec`s in its state, no longer 128 at most) from it, and `taskmgr --list` prints its
+    Processes list for the boot test. Extra host tests: `a_service_at_the_end_of_a_full_table_is_seen`
+    (`test-init`), `a_window_at_the_end_of_a_full_table_keeps_running` (`test-desktop`),
+    `the_process_tree_lists_parents_before_their_children` (moved to `test-app`).
+  - The pipe pool is 1024 slots in `.bss` (`MAX_PIPES`), a few words each; a pipe's 16 KiB
+    buffer and its holder list (a `Vec`, as long as there are holders) come from the heap
+    as it's made and go as its last end closes, both under the slot's lock, so a kernel app
+    killed at a tick can't strand either. The per-process cap (`PIPES_PER_PROCESS`, 64) is
+    on pipes a user program's process made that are still alive, wherever their ends have
+    gone, and a program can't take the last `KEPT_FOR_KERNEL` (64) of the pool; kernel apps,
+    trusted, have the whole pool and no cap (section 2.1's caps are on user-originated
+    memory). Section 3 had said 256 held; it's 64 made because the pool is 1024 slots with
+    64 kept for the kernel, so 256 would let four processes take all a program may, where
+    64 needs fifteen; and counting the pipes a process made, not those it holds, means it
+    can't get round the cap by handing the ends to children. At 16 KiB of heap a pipe, 64
+    is a MiB per process. v1 `PIPE` says `ENFILE` at either limit, where a full pool was `EMFILE`
+    before, and `ENOMEM` with no heap; `ENFILE` (23) is new in `libs/abi`. Holders are
+    still tracked by PID; by OFD is 1c.1's. Since recording a holder can now fail for want
+    of heap, a spawn whose stdio pipe (given or inherited) can't record the child fails
+    (`SpawnError::NoMemory`, `ENOMEM` from v1 `SPAWN`) with the ends it took and its slot
+    given back, where it used to fall back to the console; a pipe that has gone still
+    means the console. `snapshot` is one pass under the scheduler lock: a process's other
+    threads are added from its ring of members (`Table::group_members`) at its first slot,
+    not searched for among the entries, which was quadratic in the table. Extra host tests:
+    `a_pipe_given_away_still_counts_for_its_creator`, `programs_leave_the_kernel_its_pipes`,
+    `a_stream_with_no_heap_for_its_holder_fails_rather_than_falling_back` (`test-app`),
+    `group_members_walks_each_process_once` (`test-sched`).
+  - `pipe-exhaustion` can't hold 64 pipes in 16 descriptors, so it hands each on: child
+    `n` reads pipe `n` and holds pipe `n + 1`'s writer, the prober keeping the first writer
+    and the newest reader. It checks `ENFILE` at exactly 64, that another process makes a
+    pipe meanwhile, that closing the first writer ends the chain, and that pipes can be
+    made again after.
+  - `uid-process-cap`: as uid 4242, exactly 255 children beside itself (256 processes),
+    each reading one pipe whose 255 holders are then let go together. v1 `SPAWN` says
+    `EBUSY` at the cap, as for a full table, and the probe checks that; `SPAWN2` (1c.6) is
+    where `EAGAIN` belongs. v1 keeps the last 64 exits' statuses only, so of 255 children
+    ending together most `WAIT`s say `ECHILD`: both probes count that as ended (any other
+    status is a failure), and check the frames came back. `ktest asid-load` has the same
+    problem with 300, so its programs say `asid-ok` on a pipe it reads to its end.
+  - The main stack and the argument area are mapped `noreserve`: reserved whole, promised
+    and given frames page by page as touched, and a page touched with no frame to be had
+    is `SIGBUS` (status 135), as for `MAP_NORESERVE`. Section 6 says so now.
+  - `MAX_SOCKETS` is 1024; the slot table already grew on demand, and now does so with
+    `try_reserve`. Lookups are still scans of the slots in use.
+  - ASIDs needed no change in the allocator: `asids_for_1024_live_spaces` (`test-vm`)
+    drives 1024 live spaces on 8 CPUs against a model of every CPU's TLB, at 8 bits (over a
+    hundred rollovers) and 16 (none). `ktest asid-rollover` takes 1024 spaces now (in
+    `smp`), and a new `ktest asid-load [n]` (in `user`) forces 8 bits and runs 300
+    `utest --asid-check` programs at once, started together by one pipe, each reading back
+    its own pages as it yields; all must say so, the generation must roll over, and every
+    frame, pipe and heap byte come back.
+  - No new calls (`unimplemented-numbers-enosys` unchanged), and no feature bit to set
+    until 1c.6.
 
 ### 1c.1 Open file descriptions, the growable FD table, `DUP3`, `FCNTL`, `PIPE2`, `CLOSE_RANGE`
 
@@ -3114,6 +3782,100 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
   `close-range-reversed` (`EINVAL`).
 - **Boot:** new phase `posix-fs` (runs `ftest` on the RAM root, a FAT mount and a native
   mount), `user`, `permtest` in `native`.
+- **As built (deviations):**
+  - A file's open file description still names it by the path it was opened by, as v1's
+    `Fd` did, not by a VFS handle: the VFS's handles (`VfsTree::open`) have no positional
+    I/O and a machine-wide cap of 256, below one process's 1024 descriptors, and nothing
+    in 1c.1 can tell the two apart. Holding the node (a handle or its `FileId`) belongs
+    with 1c.2's orphans, where `UNLINKAT` of an open file has to keep it readable. The
+    path is the very `String` `user_path` made, at its exact length, in a `TryArc`
+    (`user::files::Path`), shared with `mmap2` (`MapFd::File`) rather than copied into a
+    `PATH_MAX` buffer.
+  - The kernel-heap budget of [2.1](#21-kernel-rules-the-calls-depend-on), for this
+    stage's part: each description and its path are charged to the process that opened
+    it (`Process::charge_heap`, a shared `HeapBudget` the charge holds, so it can outlive
+    the process), at `PROCESS_HEAP_LIMIT` (2 MiB: all 1024 descriptors with ~2000-byte
+    paths, or ~490 with 4000-byte ones), and every process's charges together are held to
+    a quarter of the kernel heap (`USER_HEAP_SHARE`), so the number of processes doesn't
+    matter; past either, `OPEN` or `PIPE2` is `ENOMEM`. The three standard-stream
+    descriptions a process starts with aren't charged, and the table's own growth (16
+    bytes a descriptor, `try_reserve`) is bounded by `MAX_FDS`. Descriptions and paths are
+    made fallibly, in `feos_sync::TryArc` (`Arc::try_new` isn't stable), the room taken
+    with `TryArc::reserve` before the call does anything it would have to undo: `OPEN`
+    before it makes a file or counts a writer, `PIPE2` before it makes the pipe. Probe
+    `fd-heap-budget` (eight children at once, each opening `/etc/motd` by a 4000-byte
+    name until refused: `ENOMEM` well short of the table's limit, then open again once
+    they're closed; the machine and the parent carry on).
+  - `O_APPEND` is one step with respect to other writes, as section 3.3 says, through a
+    write lock in the file's lock-table entry (`FileRef::write_lock`), which every write
+    to a file holds for its whole transfer, with the look at the end, and `O_TRUNC` for
+    its truncation, as Linux's inode lock does. Every description open for writing has
+    the entry already, for its writer's count. Writes through a shared mapping don't take
+    it, as on Linux. Check `append-two-processes` (`ftest`: two programs append 256
+    records of 512 bytes each to one file at once; all 512 land whole).
+  - `PATH_MAX` limits the string a program gives, relative or not; joined to the working
+    directory a relative one may come to more, so the VFS's own limit is `2 * 4096 + 1`
+    (a cwd of up to `PATH_MAX`, the slash and the path). Checks `path-relative-4096`
+    (`ftest`: a relative path of exactly 4096 bytes opens) and `path-4097-relative`
+    (malicious: `ENAMETOOLONG`).
+  - The new FS error mapping isn't in yet: no 1c.1 call resolves a path, and the v1 calls
+    that do keep their mapping. It comes with `OPENAT` (1c.2).
+  - Descriptions are `user::files::Ofd` in an `Arc`, the table `FdTable<Arc<Ofd>>` from
+    the new `libs/fdtable`, which hands back whatever it closes (a close, a `dup3` over an
+    open descriptor, `CLOSE_RANGE`, a failed insert) so the caller drops it with the
+    table's lock let go. A description's `Drop` does what v1's `CLOSE` did: closes a pipe
+    end, gives back a file's writer count (`ETXTBSY`) and writes back what its shared
+    mappings dirtied, now on the last close only. Teardown drops the process's table in
+    task context, as it did v1's.
+  - Pipe holders "by OFD" (1b.5's note) took the form of no holders at all: a program's
+    own pipes are made by `pipe::create_owned_for_program`, counted against their creator
+    as before but with no holder record, and their ends close only through
+    `pipe::close_owned` from the description's `Drop`. A program's standard streams are
+    still held by PID, by the task they were given to, so `release_pid` stays for them.
+    `pipe::write_some` (atomic up to `PIPE_BUF`, or all of a blocking write, or what fits
+    without blocking) and `pipe::read_some` are the transfers; an atomic write of 4096
+    bytes copies under the slot's lock in one go, twice the 2048 bytes a plain piece does.
+  - `PATH_MAX` 4096 put every kernel path buffer on the heap: `user_path` returns a
+    `String` (`try_reserve`, `ENOMEM`), the cwd is a `String` in `Files`, and the scheduler's
+    per-slot `user_path` array and the kernel's per-slot `START_CWD` (each 4 KiB a slot at
+    the new size, 8 MiB of `.bss` between them at 1024 slots) became one
+    `user::UserStart` box, made before the scheduler's lock is taken, handed over under it,
+    and freed by the task before it goes to EL0 or ring 3 (whatever a slot is left holding
+    is dropped once the lock has gone).
+  - v1 `OPEN` of a directory for reading now succeeds, as Linux's `open(O_RDONLY)` does,
+    where it was `EISDIR`: that's the only way a 1c.1 program has to reach `READ`'s
+    `EISDIR` (`read-dir-eisdir`), and it only accepts what was refused. For writing it's
+    still `EISDIR`. `utest`'s `open-directory` changed with it (and gained
+    `open-directory-for-writing`). `F_GETFL` reports `O_DIRECTORY` for it. `SEEK` on a pipe
+    or the console is `ESPIPE` (section 11); on a directory it moves an offset nothing
+    reads until 1c.2's cookies.
+  - `nr::IMPLEMENTED_LATER` lists the four numbers past `FIRST_UNIMPLEMENTED` that this
+    stage brings, and `nr::is_unimplemented` is what `unimplemented-numbers-enosys` loops
+    over now. New errnos: `ESPIPE`, `EFBIG` (a write at the largest offset), and
+    `EWOULDBLOCK` as `EAGAIN`'s other name. `F_GETLK`, `F_SETLK` and `F_SETLKW` are `EINVAL`
+    until 1c.5.
+  - A whole transfer on a file checks for a kill between `IO_CHUNK`s, and ends there
+    (the task then ends at the call's end, as any killed call's does); a large pipe write
+    does the same between pages, since a reader that keeps up never makes it wait, which
+    is where `pipe::write_some` looks. A `PIPE2` whose copy-out fails (another thread
+    unmapped the array) takes back only the descriptors that still name its own ends, as
+    another thread may have closed one and been given its number meanwhile. A pipe read
+    returns what's there after its first piece without waiting for more, where v1's went
+    on to block for a second page once a first full one had come.
+  - `ftest` has `--drain BYTES` for `pipe-large-write-completes`'s child, and checks a few
+    things beyond the names (`dup`, `F_SETFD`, a plain pipe's ends not close-on-exec,
+    the descriptions of `fd-1000` each having an offset of their own). Extra malicious
+    probes: `dup3-negative`, `dup3-flags`, `fcntl-cmd-upper-bits`, `fcntl-setfl-async`,
+    `fcntl-setfd-bits`, `fcntl-dupfd-past-the-table`, `fcntl-locks-not-yet`,
+    `fcntl-closed-fd`, `fd-upper-bits-fcntl`, `fd-upper-bits-dup3`, `fd-upper-bits-close`,
+    `pipe2-into-kernel`, `close-range-unknown-flag`, `close-range-upper-bits`.
+    `fd-exhaustion` runs in a child, which checks that `F_DUPFD`, `OPEN` and `PIPE` all
+    say `EMFILE` at exactly 1024 and that a `dup3` onto the last descriptor and an
+    `F_DUPFD` after a close still work; the parent then makes a pipe. No `toctou-*` probe:
+    no 1c.1 call takes a struct. No feature bit until 1c.6.
+  - `posix-fs` boots twice: no disk (the RAM root, `ftest --dir /tmp/ftest`), then a FAT
+    root beside a native disk (`/ftest` and `/native0/ftest`), each run checked for every
+    frame back, `fsck` of both volumes after.
 
 ### 1c.2 Opening, looking and directories
 
@@ -3151,7 +3913,98 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
   `unlinkat-root` (`EBUSY`), `umask-high-bits` (`EINVAL`), `orphan-dir-lookup` (`ENOENT`),
   `toctou-openat-path` (a thread flipping the path length during `OPENAT`: an error or the
   file, never a kernel fault).
-- **Boot:** `posix-fs`, `native`, `persistence`.
+- **Boot:** `posix-fs` (which runs `malicious` on its RAM-root boot, for the path probes),
+  `native`, `persistence`.
+- **As built (deviations):**
+  - A file's description now holds it by identity (`FileId`) and holds its lock-table
+    entry (the page cache's per-file `FileRef`), whatever its access mode, as do mappings
+    and a running program's cached text, so 1c.1's path-named descriptions are gone. Reads,
+    writes, `FTRUNCATE`, `SEEK_END` and `O_APPEND`'s look at the end go through new
+    `VfsTree` calls by identity (`read_file`, `write_file_at`, `truncate_file`,
+    `stat_file`), and `MMAP2` maps by identity too, so an unlinked file still reads,
+    writes and maps. The tree gained `resolve_path` (canonical path, facts and identity
+    from one walk), `orphan` and `clean_orphans`; `MAX_SYMLINK_HOPS` went from 8 to 40.
+  - The hold count is that entry's reference count less the cache's own (`pagecache::held`);
+    copies in flight pin frames, not files, and always run under a description or a
+    mapping that already counts, so they aren't counted apart. The orphan rename happens
+    only for a regular file's last link. Orphans are noted in a kernel list
+    (`user::fs_calls`) and removed by `sweep_orphans`, which runs at the end of every
+    system call, at each file description's last close and as each address space goes
+    (a load when there are none); `ktest user-memory` reports `orphans=N`, and `posix-fs`
+    requires 0 after each `ftest`. `clean_orphans` runs as each writable mount is made and
+    for the root in `vfs::assemble`. With no heap to note an orphan, it waits for its
+    mount's next making.
+  - Hiding is wider than the doc's: for programs any path component named `.feos-orphans`,
+    wherever it is, is `ENOENT`, given or reached through a link, and nothing can be made by
+    that name (a mount-root-only rule would need the mount table on every lookup, and a
+    program-made directory of that name would otherwise sit beside real orphans). Listings
+    of a mount's root leave it out for everyone, kernel apps included. v1's path calls hide
+    it too (`STAT`, `CHMOD`, `CHOWN`, `MKDIR`, `UNLINK`, `LINK`, `SPAWN` and `OPEN`): the
+    name given is refused in v1's path copy, and where a link in the directory a path is
+    in (or, for a call that follows it, the last) leads there, it's `ENOENT` too. `MKDIRAT`
+    makes the directory in the parent's canonical path, as `O_CREAT` does.
+  - Whether a file is held and its removal are atomic to new holds: `pagecache::file_for`
+    makes every hold under a kernel lock (`pagecache::removing`) that `remove_entry` and
+    `sweep_orphans` hold from asking to removing. A file removed with no orphan (by a
+    kernel app, whose removals never orphan) keeps its tree hold, and so its number, until
+    the cache entry's last reference goes, so a description or mapping left holding it
+    finds nothing rather than a file made since.
+  - `NAME_MAX`: a path with a name longer than 255 bytes is `ENAMETOOLONG` to every
+    program path call, v1's included, and RAM mounts refuse such names to kernel apps as
+    well. `GETDENTS` passes over an entry no `Dirent` can carry (a disk made elsewhere may
+    have one) rather than stopping there.
+  - `UNLINKAT` never follows the last component, a trailing slash or not: `link/` is
+    `ENOTDIR`, as on Linux, as is `file/`. `O_CREAT | O_DIRECTORY` is `EINVAL` whatever is
+    there (Linux 6.4). `FSTATAT(AT_SYMLINK_NOFOLLOW)` and `OPENAT(O_PATH | O_NOFOLLOW)` of
+    a link need search permission only on the way to the directory it's in, so a dangling
+    link, or one into a directory the caller can't search, still answers
+    (`fstatat-nofollow-dangling`).
+  - `libs/fs/src/vfs/path.rs` has the join, trailing-slash and hiding rules over the tree's
+    walk (which already keeps a canonical path, so `..` was physical); the snapshot and its
+    cookies are `libs/fs/src/vfs/listing.rs` (`Snapshot`), and `Dirent` encoding is in
+    `libs/abi`. The host tests are in `libs/fs/src/vfs/tests.rs`.
+  - v1's `OPEN` runs through the same code (`files::open`) with v1's error mapping, ignores
+    a trailing slash as it always did, and hides the orphans; v1's `UNLINK` makes an orphan
+    of a file in use, as `UNLINKAT` does. `O_CREAT` through a dangling link is `EEXIST`
+    (the tree makes no link targets).
+  - Descriptions remember the canonical path, which is what 1c.1's heap charge now counts,
+    so `fd-heap-budget` opens a file under fifteen 250-byte directories in `/tmp` instead
+    of `/etc/motd` by a 4000-byte name.
+  - 1b's `mmap-dir` (a file opened, then a directory put at its path) no longer wants
+    `ENODEV`: the description holds the unlinked file, so the probe now wants the mapping
+    to give that file's own bytes, never the directory's.
+  - `Stat2`: times at the filesystem's second resolution, `ctime` is `mtime` (until 1c.4),
+    `atime` is the stored access time or else `mtime`, `blksize` 4096, `blocks` the size in
+    4 KiB units, `rdev` 0 but for the console; device nodes say `S_IFCHR`, a pipe `S_IFIFO`.
+    `STAT_READ_ONLY` is the file's `read_only` (the mount or its attribute).
+  - `GETDENTS` fills at most 64 KiB a call. `FSYNC` of a directory syncs the tree.
+    `FTRUNCATE` of a description not open for writing is `EBADF` and past 4 GiB on a
+    filesystem out of room `EFBIG`. The umask is inherited through v1's `SPAWN`
+    (`RawStreams::umask`); a kernel app's program starts with `0o022`. The working
+    directory and `CURRENT_EXE`'s path are canonicalised when the program loads.
+  - No call makes a symbolic link until 1c.4, so `posix-fs` makes the two `ftest` uses
+    with the shell's `ln -s` (`DIR/ftest-hop`, `DIR/ftest-flink`). The shell's `rm`, which removes them after, now asks about the link itself (`stat_full`) rather than what it names, as both dangle by then. `fsync-writes-back-mapping`
+    tells write-back by the file's `mtime`: unchanged after a write through the mapping
+    2.5 s later (FAT keeps 2 s), later after `FSYNC`. `toctou-openat-path` has a thread
+    flip a byte of the path to a NUL (the length is a register, which nothing can change),
+    each call opening the file or saying `EINVAL`.
+  - Extra malicious probes: `openat-dirfd-upper-bits`, `openat-async`, `openat-access-3`,
+    `openat-tmpfile`, `openat-flags-upper-bits`, `openat-mode-upper-bits`,
+    `openat-empty-path`, `openat-kernel-path`, `path-with-nul`, `fstatat-flags`,
+    `fstatat-empty-path-bad-fd`, `getdents-into-kernel`, `getdents-negative-cookie`,
+    `getdents-seek-cur-moved`, `o-path-mmap`, `o-path-pread`, `o-path-fsync`,
+    `unlinkat-flags`, `orphan-dir-open`, `orphan-dir-make`, and, with an orphan made first
+    (`orphan-made`) so the directory is there to hide, `orphan-lookup`, `orphan-open`,
+    `orphan-dir-make-inside`, `orphan-unlinkat`, `orphan-v1-stat-dir`, `orphan-v1-stat`,
+    `orphan-v1-open`, `orphan-v1-mkdir`, `orphan-v1-mkdir-inside`, `orphan-v1-unlink`,
+    `orphan-v1-chmod`, `orphan-v1-link`, `orphan-v1-spawn` and `orphan-still-works`;
+    `name-too-long-mkdirat`, `name-too-long-openat`, `name-too-long-v1-mkdir`,
+    `name-too-long-v1-open`, `openat-creat-directory`,
+    `openat-creat-directory-makes-nothing`, `ftruncate-pipe`,
+    `ftruncate-read-only`, `pwrite-negative-offset`, `pread-pipe`, `fchdir-file`,
+    `getcwd-into-kernel`, `current-exe-into-kernel`, `fd-path-closed`. New errnos:
+    `ENOTDIR`, `ENOTEMPTY`, `ELOOP`, `EILSEQ`, `EROFS`, `ERANGE`, `EXDEV`. No feature bit
+    until 1c.6.
 
 ### 1c.3 `/dev`, `/proc/self` and the image layout
 
@@ -3181,6 +4034,67 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
   (`EPERM`), `proc-fd-of-other-pid` (`ENOENT`), `dev-tty-without-terminal` (`ENXIO`).
 - **Boot:** `posix-fs`, `user`, `persistence` (`/tmp` is empty after a reboot, `/home`
   isn't).
+- **As built (deviations):**
+  - `/dev` and `/proc` are ordinary mounts of the shared tree (`DevFs` and `ProcFs` in
+    `libs/fs/src/vfs/devfs.rs`), so every path call and kernel apps see them through the
+    tree's own walk, links included; there's no separate resolver. A link is what the tree
+    takes for one (a system-attribute file holding `XSym\n` and the target), made up when
+    read. `ProcFs` asks the kernel's `ProcessView` (`kernel/src/user/devfs.rs`) about the
+    *caller*, with the tree's lock held: the view takes the process's file table, so
+    nothing may call the tree holding that table (nothing does), and it reads a
+    description in place rather than taking a reference whose drop could call the tree.
+    A kernel app sees an empty `/proc`. `/dev/shm` is a RAM mount of its own on `/dev`.
+  - Changes inside `/dev` and `/proc` are a new `FsError::NotPermitted`, `EPERM` to both
+    ABIs (v1's `UNLINK`, `MKDIR`, `CHMOD` too). A user other than root meets the
+    directories' own modes first (`0o755`, `0o555`): `EACCES`, as on Linux.
+  - `/proc/self` is a relative link to `<pid>`, as Linux's is. `/proc/<pid>/fd/<n>` leads
+    to `FD_PATH(n)`, `/dev/console` for the console, `pipe:[n]` for a pipe. Following one
+    that leads nowhere (a pipe's, or a file's whose name has gone) reaches the descriptor
+    itself: `OPENAT` gives a new descriptor for the same description (`EACCES` if the
+    description can't do what the open asks, `ENOTDIR` with `O_DIRECTORY`), and
+    `FSTATAT` stats the descriptor. One that leads to the console (`/dev/stdout`,
+    `/dev/fd/1` of a console stream, or of a description `/dev/console` made) reaches the
+    descriptor too, so a user other than root, whom the node's `0o600` refuses, can still
+    open what it holds; `/dev/console` by name is judged by the node. A console
+    descriptor's `FSTAT` is the node's (mode, owner, `st_dev`, `st_ino`). One whose path
+    is still there is opened anew by that path, so a regular file gets a description of
+    its own, as on Linux. A target longer than a link may be (4096 bytes) reads as
+    `(too long)`, which leads nowhere, so following it reaches the descriptor as well, and
+    `ProcFs` answers "a link, and to where" in one look
+    (`WritableFileSystem::synthesised_link`), so a target that changes between looks never
+    makes the node a file. Directories under
+    `/proc` are `0o555`, owned by root. Opening `/dev/console` makes a description of the
+    console itself (`user::files::Object::Console`), whatever the thread's streams are.
+  - `FACCESSAT` and `READLINKAT` are stage 1c.4's, so `proc-self-exe-exists` checks with
+    `FSTATAT` (both ways) and v1's `STAT`, and the links' targets are checked through
+    `FSTATAT(AT_SYMLINK_NOFOLLOW)`'s size and `FD_PATH` of an `O_PATH` open through the
+    link. `dev-fd-dups` writes `/dev/fd/<n>` for a pipe it made, and a child whose
+    standard output is a pipe writes `/dev/fd/1` and `/dev/stdout` into it.
+  - `/tmp` and `/dev/shm` are `RamFs::with_owners`: they keep each node's mode and owner,
+    so permissions are enforced there now as on the native format (a file the shell writes
+    there is `0o644` and needs a `chmod` to run; the `user` phase's bad-file checks do
+    that, and `permtest --permissionless` moved from `/tmp` to the RAM root). The sticky
+    rule is `VfsTree::check_remove`, which `UNLINKAT` and v1's `UNLINK` use in place of
+    the parent's write check (`RENAMEAT` will in 1c.4). No hard links on RAM mounts.
+  - The layout the image can't carry (it has no links, nor empty directories) is made by
+    `vfs::assemble` where missing: `/root`, `/home/user`, `/usr/lib`, `/usr/include`, and
+    `/usr/bin` as a link to `/bin`; on a disk once, on the RAM root every boot. `/etc`'s
+    files are in `boards/qemu-virt/fs/etc`; users `root` (0) and `user` (1000, group
+    `users` 100). The CA bundle isn't kept in the tree: `fs_image_build.rs` takes the
+    build machine's (`/etc/ssl/certs/ca-certificates.crt` or the usual other places) when
+    it has one.
+  - Link targets may be 4096 bytes (were 1024), since `/proc` links lead to any path a
+    program opened. Listings learned names a filesystem makes up when asked
+    (`WritableFileSystem::dynamic_name`, for `/proc/<pid>` and the descriptors).
+  - Extra checks: `image-layout` (`ftest`); malicious `dev-create-exclusive`, `dev-mkdir`,
+    `dev-v1-mkdir`, `dev-v1-unlink-null`, `dev-chmod-null`, `dev-unlink-link`,
+    `dev-fd-create`, `proc-mkdir`, `proc-unlink-exe`, `proc-write-exe-link`,
+    `proc-rmdir-fd`, `proc-exe-of-other-pid`, `proc-fd-closed`, `proc-maps-missing`,
+    `dev-tty-v1`, `dev-urandom-not-yet`, `dev-full-mmap`, `dev-full-write`,
+    `proc-pipe-read-end-for-writing`, `proc-fd-long-path-write`; `ftest`'s
+    `dev-console-as-user`, and `etc-files-present` checks the CA bundle; host test
+    `procfs_links_stay_links`; `posix-fs` lists `/dev` and `/proc` from the shell.
+    New errno: `ENXIO`. No feature bit until 1c.6.
 
 ### 1c.4 Changing the tree, and times
 
@@ -3199,7 +4113,8 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
   `ram_times_are_nanoseconds`, `native_times_are_nanoseconds`,
   `native_old_image_reads_zero_nanoseconds`, `exfat_times_10ms`, `time_update_rules`
   (write sets mtime and ctime; create, unlink and rename set the directory's; chmod sets
-  ctime; reads change nothing).
+  ctime; reads change nothing; FAT and exFAT too, where there's no ctime to check),
+  `program_calls_judge_what_the_walk_finds`, `changes_by_identity_ask_of_the_file_changed`.
 - **User checks:** `rename-over-existing`, `rename-noreplace-eexist`, `rename-exdev`,
   `rename-dir-into-itself-einval`, `rename-over-open-file-still-reads`,
   `rename-over-running-program` (the `tempfile` persist pattern over a copy of a running
@@ -3217,6 +4132,100 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
   `PathAt` length during the call).
 - **Boot:** `posix-fs`, `native`, `persistence` (a rename and nanosecond times survive a
   reboot on the native mount).
+- **As built (deviations):**
+  - The calls are in a new `kernel/src/user/tree_calls.rs` (beside `fs_calls.rs`, which
+    has 1c.2's). The tree gained `VfsTree::rename_replacing` (a program's rename: never
+    across mounts, `FsError::CrossDevice`; never under itself, `FsError::InvalidMove`;
+    replacing in one step, with an `in_use` question asked under the tree's lock, so a
+    replaced file still held becomes an orphan in that same step), and by-identity
+    `chmod_file`, `chown_file`, `set_times_file` and `statfs_file` for the `AT_EMPTY_PATH`
+    forms and `FSTATVFS`, so a descriptor's file renamed or unlinked since is still the one
+    changed; `lchown` for a link's own owner; and `set_time_source`, which
+    the kernel calls with `time::file_time` (the wall clock to the nanosecond) once it has
+    a clock, the board's RTC in whole seconds standing in until then. Filesystems gained
+    `WritableFileSystem::rename_over`. `write_file_atomic`, kernel apps' safe replace, now
+    uses `rename_replacing` too, so its name is never missing either.
+  - Atomic across a crash: the native format renames over a file in one transaction.
+    FAT and exFAT mark the moving entry as leaving (bit `0x80` of FAT's `NTRes` byte, of
+    exFAT's first reserved byte, which the set's checksum covers), commit, have the
+    replaced entry take on the moving file's facts in place (its name stays), commit,
+    then remove the moving entry and free the replaced file's clusters; the mount-time
+    check drops a marked entry whose clusters another names and clears the mark
+    otherwise. A directory over an empty directory, and a replaced file kept as an orphan,
+    are two steps on FAT and exFAT, which nothing sees between (the tree's lock is held)
+    but a crash can come between: the moving name is still there, and the old one gone
+    (an orphan goes at the next mount anyway). `rename_replaces_file_atomically` is in
+    `libs/fs/tests/crash.rs` for the three disk formats (every cut, in order and with
+    unflushed writes at random), and in `libs/fs/src/vfs/tests.rs` for what anyone looking
+    sees, on all four kinds.
+  - `RENAMEAT` says `EBUSY` for the root, `.` or `..` as either last name, as Linux does;
+    moving a directory onto one it's inside is `ENOTEMPTY`, as on Linux (that one isn't
+    empty while it's there). Linux's extra rule, write permission on a directory moved to
+    another parent (for its `..`), isn't applied. Two names of one file leave both alone.
+  - Times are `feos_fs::Timestamp`, nanoseconds since the epoch in a `u64` (to 2554), so
+    `UTIMENSAT` refuses a time before the epoch (`EINVAL`). The native format is version 2:
+    each inode keeps the nanoseconds of its modification, change and creation times at
+    bytes 104, 108 and 112, and its access time whole at 116; a version 1 volume reads as
+    `.0` with no access time of its own (the modification time stands in) and is marked
+    version 2 when first mounted to write, so no older kernel drops the nanoseconds by
+    rewriting an inode; `scripts/mkfs-feos.py` writes version 2. exFAT keeps 10 ms for
+    creation and modification (its 10 ms counts) and two seconds for access; FAT two
+    seconds, and the day for access, which only `UTIMENSAT` sets there too. FAT and exFAT keep no change time (`Stat2::ctime` is
+    `mtime` there), but do update a directory's own modification time on making, removing
+    or renaming in it, as the RAM mounts and the native format do with its change time.
+    The native format's links are now `0o777`, as anyone may follow one.
+  - `SYMLINKAT` works on FAT and exFAT: the tree has always kept its links there (a small
+    system-attribute file), and the boot tests make them. Hard links are the native
+    format's only (`EOPNOTSUPP` on RAM, FAT and exFAT). `FCHOWNAT` on a filesystem with no
+    owners is `EOPNOTSUPP` (Linux's vfat says `EPERM`), as `FCHMODAT` is.
+  - `FSTATVFS` counts no files (`files`, `ffree`, `favail` zero, as Linux says for FAT),
+    and `bavail` is `bfree`. A pipe or the console is `EINVAL`, as for `FACCESSAT` with
+    `AT_EMPTY_PATH`; `FCHMODAT`, `FCHOWNAT` and `UTIMENSAT` say `EOPNOTSUPP` there.
+    `FACCESSAT`'s `EROFS` is for a read-only mount; a FAT file's read-only attribute
+    isn't looked at. `LINKAT` with `AT_EMPTY_PATH` of a file whose name has gone is
+    `ENOENT`, as on Linux. `SYNC` is `VfsTree::sync`; what mappings dirtied goes at
+    `FSYNC`, `MSYNC` and the last close, as before.
+  - `ftest` takes `--coarse` (FAT: two-second times, no modes or owners) and `--hard-links`
+    (the native format), which `posix-fs` passes for those runs, and the checks expect what
+    each keeps. `posix-fs` still makes 1c.2's two links with the shell's `ln -s`.
+    `persistence` adds a native disk for two more boots: `ftest --persist-write` renames a
+    file over another and sets its times to the nanosecond, and after a power-off
+    `ftest --persist-check` finds both. `permtest` checks the `*at` calls as user 1000 on
+    the native mount (modes, owners, times, access, renames, links), its path buffer
+    grown to 2 KiB.
+  - Extra malicious probes: `renameat-kernel-pathat-to`, `renameat-whiteout`,
+    `renameat-flags-upper-bits`, `pathat-reserved-nonzero-linkat`, `pathat-kernel-path`,
+    `linkat-flags`, `rename-root`, `symlinkat-target-nul`, `symlinkat-kernel-target`,
+    `symlinkat-refused-makes-nothing`, `readlinkat-not-a-link`, `readlinkat-into-kernel`,
+    `fchownat-uid-upper-bits`, `fchownat-flags`, `utimensat-negative-nsec`,
+    `utimensat-kernel-times`, `utimensat-flags`, `fchmodat-mode-bits`, `faccessat-mode`,
+    `faccessat-flags`, `fstatvfs-stream`, `fstatvfs-closed-fd`,
+    `fstatvfs-into-kernel-file`. `toctou-renameat` has a thread flip the `to` `PathAt`'s
+    length between the path's and 1 MiB: each call renames the file onto itself or says
+    `ENAMETOOLONG`. `fchownat-nonroot` runs in a child that gives up root, as does
+    `tree-swap-race`: as user 1000 it renames into, changes the mode and times of, and
+    makes links in its own directory while another thread keeps swapping that directory
+    for a link to one of root's, and the parent finds root's file and directory as they
+    were. No new errno.
+    No feature bit until 1c.6.
+  - What a call changes is judged under the tree's lock, against what the tree's own walk
+    reached, never on a path checked first and walked again (a directory on the way could
+    be swapped for a link between the two, and the change land in, say, `/bin`). The tree
+    takes a `feos_fs::vfs::Caller` for this: `rename_replacing` with one checks
+    `check_remove` on the old name and `check_remove` or write and search on the new
+    one's directory, and `link_as` and `symlink_as` the new name's directory, all under
+    the lock; each refuses `.feos-orphans` (`ENOENT`) wherever the walk led, and
+    `link_as` links only the file the kernel found reachable (`ENOENT` otherwise).
+    `symlink_as` makes the link its maker's in the same step. `FCHMODAT` and `UTIMENSAT`
+    change by the identity the path resolved to, through `chmod_file` and
+    `set_times_file`, whose `allow` closure checks the owner on the file's facts under the
+    lock (a directory or a link too). The kernel's own checks beforehand stay, for the
+    order of POSIX's errors. Not yet so: `MKDIRAT`, `OPENAT`'s `O_CREAT` and the v1 calls,
+    which still give a new file to its maker, and set its mode, by its path afterwards.
+  - `RENAME_NOREPLACE` is `EEXIST` for a name onto itself too, as Linux checks it before
+    its same-name shortcut. On FAT and exFAT, if the new file can't take a kept orphan's
+    name (only an I/O error can do that, the name's entries being the same size), the
+    orphan goes back under it.
 
 ### 1c.5 Locks: `FLOCK` and `fcntl` record locks
 
@@ -3239,6 +4248,72 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
   another process can still lock), `setlkw-killed` (a child blocked in `F_SETLKW` is killed;
   the lock table is clean), `toctou-setlk`.
 - **Boot:** `posix-fs`.
+- **As built (deviations):**
+  - The calls are in a new `kernel/src/user/lock_calls.rs` (beside `files.rs`, which
+    routes `F_GETLK`/`F_SETLK`/`F_SETLKW` to it with the descriptor table let go, and
+    calls it from every place a descriptor leaves the table: `CLOSE`, `DUP3` over an open
+    descriptor, `CLOSE_RANGE`). A process's record locks all go in its `Process`'s drop,
+    after its last thread; a description's `flock` in the description's drop. The lock
+    table is its own (`feos_locks::LockTable` behind one sleeping mutex, a leaf: nothing
+    else is taken with it held, and no user memory is copied under it), keyed by node
+    identity, not part of the page cache's per-file record that section 2 also calls the
+    lock table. A description already holds its file's identity stable; a directory's
+    description now remembers its `FileId` too, for `flock` on directories, but takes no
+    hold on it, so a directory removed while a description of it holds a `flock` could in
+    principle see its inode number given to a new directory that then meets the stale
+    lock (only `flock`, only until that description closes). For that reason a directory
+    takes no record locks: `F_SETLK`/`F_SETLKW`/`F_GETLK` on one are `EINVAL` (as for a
+    file that doesn't support locking), since a process's record lock would last until it
+    closed every descriptor or ended, not just that description.
+  - A range that reaches the largest offset (`i64::MAX`) is kept as one that runs to the
+    end, as Linux's `OFFSET_MAX` is, so merges and splits never make a lock whose
+    `l_start` or `l_len` doesn't fit an `i64` (`[1, i64::MAX]` and `[0, 0]` merge to
+    `l_len` 0, not 2^63), and `F_GETLK` reports such a lock with `l_len` 0.
+  - Record locks and `flock` locks never conflict with each other, as on Linux (BSD's do).
+    The per-process cap of 256 counts the `flock` locks a process took as well as its
+    record locks; a `flock` stays charged to the process that took it for as long as it
+    lasts, even through a description inherited by another. A change that adds no record
+    (a merge, an unlock at an end) is never refused for the caps; an unlock that would
+    split a lock at the cap is `ENOLCK`, as on Linux. The table never grows past
+    `MAX_LOCKS` records (about 220 KiB); it isn't charged to the processes' heap budgets.
+  - `EINTR` on a signal isn't there yet: signals are 1c.9's, so until then only a kill
+    ends a wait (which unwinds as every killed call does). A wait is a kernel futex wait on
+    one machine-wide counter that every release or downgrade moves on; refused attempts
+    never move it, so waiters can't wake each other forever.
+  - `FLOCK` and the lock commands on a pipe, the console or a standard stream are
+    `EINVAL`, and on an `O_PATH` descriptor `EBADF`. `F_GETLK` with `F_UNLCK` is
+    `EINVAL`; it doesn't check the descriptor's access, as on Linux; when nothing
+    conflicts it writes the request back with `kind` `F_UNLCK` and the padding zero. A
+    negative `length` locks the bytes before `start` (POSIX); a range starting before the
+    file is `EINVAL`, one past `i64::MAX` `EOVERFLOW`. If another thread closes the
+    descriptor while `F_SETLK(W)` takes its lock, the new lock is let go again, as on
+    Linux, rather than outlive every descriptor it could be undone through.
+  - `setlkw-killed` is `ktest setlkw-killed`, not a `malicious` probe: no program can kill
+    until 1c.8. The kernel starts `malicious --lock-hold` (a write lock, then waiting on
+    its standard input) and `malicious --setlkw-wait` (blocked in `F_SETLKW`), kills the
+    waiter (status killed, the table as it was), then the holder (the table back to what
+    it was before), and checks every frame and the heap came back. `ktest user-memory`
+    reports `locks=`, which `posix-fs` checks is zero after each `ftest` run and after
+    `malicious`.
+  - `ftest`'s other processes are itself with `--setlk`, `--getlk`, `--flock-wait`,
+    `--flock-exit`, `--sqlite-shared` and `--sqlite-hold`; `flock-exclusive-blocks` and
+    `sqlite-style` use pipes for their sync as the stage says. `sqlite-style` takes SQLite's
+    bytes (pending `0x40000000`, reserved, and the 510 shared) through SHARED, RESERVED,
+    PENDING and EXCLUSIVE with other processes checking each step, one holding SHARED so
+    EXCLUSIVE is refused until it ends. `flock-shared-shares` checks directories too.
+  - Extra malicious probes: `flock-no-op`, `flock-unknown-bit`, `flock-op-upper-bits`,
+    `flock-fd-upper-bits`, `flock-closed-fd`, `flock-console`, `flock-o-path`,
+    `setlk-o-path`, `getlk-kernel-pointer`, `getlk-into-read-only` (`F_GETLK`'s answer
+    faulting on the way out only), `setlk-directory`, `setlk-null`, `setlk-bad-kind`,
+    `setlk-bad-whence`, `setlk-negative-whence`, `setlk-before-the-file`,
+    `setlk-negative-length-past-start`, `setlk-length-overflows`, `getlk-unlck`,
+    `setlk-pipe`, `setlk-pipe-write-end`, and `fcntl-setlk-reads-first` in place of 1c.1's
+    `fcntl-locks-not-yet`. `toctou-setlk` has a thread flip the `struct flock`'s kind
+    between `F_WRLCK` and nonsense: each call locks or says `EINVAL`. `lock-exhaustion`
+    runs in a child, which also checks a merge still works at the cap. New errno `ENOLCK`
+    37; `nr::FIRST_UNIMPLEMENTED` is 70. No feature bit until 1c.6. The host tests add
+    `range_of_whence_and_lengths` and `matches_byte_model` (random locks by three
+    processes against a byte-by-byte model).
 
 ### 1c.6 `SPAWN2`, environments, process groups, `SYSINFO`, `GETRUSAGE`
 
@@ -3647,8 +4722,10 @@ After 1f.1, phase 1 is complete, and the next milestone is relibc's C hello worl
   synced. That's POSIX, and SQLite and `sem_open` don't need more; background write-back is
   phase 7 work.
 - **x86_64 MMIO above `USER_BASE`.** q35's 64-bit PCI hole sits above RAM; with a large
-  guest it can reach 64 GiB. 1a.4's boot check catches it; the fix then is moving the
-  window up a PML4 entry, which needs a fourth level in `libs/vm`.
+  guest it can reach 64 GiB. 1a.6's boot check catches it, should the kernel ever map it
+  (it doesn't: the x86_64 boot map is the first 4 GiB, and BARs above it are moved below);
+  the fix then is mapping the region below `USER_BASE`, as 1a.6 does for AArch64's ECAM,
+  or moving the window up a PML4 entry, which needs a fourth level in `libs/vm`.
 - **`/bin/sh` as a user program** is stage 1c.12, built over a small runtime of its own;
   once relibc exists (phase 2) it can move onto it, or a ported shell can replace it.
 - **Signals are the riskiest piece for isolation**: the kernel writes frames to user

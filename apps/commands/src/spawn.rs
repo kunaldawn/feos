@@ -12,7 +12,7 @@ impl App for Spawn {
     }
 
     fn usage(&self) -> &'static str {
-        "spawn <command> [args]"
+        "spawn [count] <command> [args]"
     }
 
     fn description(&self) -> &'static str {
@@ -20,7 +20,15 @@ impl App for Spawn {
     }
 
     fn run(&self, context: &mut Context<'_>) -> i32 {
-        let Some((command, args)) = context.argv.split_first() else {
+        // A number first is how many to start, as long as a command follows it.
+        let (count, argv) = match context.argv.split_first() {
+            Some((first, rest)) if !rest.is_empty() => match first.parse::<usize>() {
+                Ok(count) => (count, rest),
+                Err(_) => (1, context.argv),
+            },
+            _ => (1, context.argv),
+        };
+        let Some((command, args)) = argv.split_first() else {
             eprintln!("usage: {}", self.usage());
             eprintln!("type 'help' to list commands");
             return 2;
@@ -31,28 +39,40 @@ impl App for Spawn {
             return 127;
         };
 
-        let io = SpawnIo {
-            background: true,
-            ..SpawnIo::default()
-        };
-        match context.platform.processes.spawn_argv(app, args, io) {
-            Ok(pid) => {
-                println!("started pid {pid}: {command}");
-                0
+        for _ in 0..count {
+            let status = spawn_one(context, app, command, args);
+            if status != 0 {
+                return status;
             }
-            Err(error) => {
-                match error {
-                    SpawnError::NoFreeSlot => eprintln!(
-                        "no free process slot (at most {} background processes)",
-                        feos_app::MAX_PROCESSES - 1
-                    ),
-                    SpawnError::ArgsTooLong => {
-                        eprintln!("arguments too long (max {} bytes)", feos_app::PROCESS_ARGS_MAX)
-                    }
-                    SpawnError::Unsupported => eprintln!("spawn: not supported here"),
+        }
+        0
+    }
+}
+
+/// Starts one copy of `app` in the background.
+fn spawn_one(context: &Context<'_>, app: &'static dyn App, command: &str, args: &[&str]) -> i32 {
+    let io = SpawnIo {
+        background: true,
+        ..SpawnIo::default()
+    };
+    match context.platform.processes.spawn_argv(app, args, io) {
+        Ok(pid) => {
+            println!("started pid {pid}: {command}");
+            0
+        }
+        Err(error) => {
+            match error {
+                SpawnError::NoFreeSlot => eprintln!(
+                    "no free process slot (at most {} background processes)",
+                    feos_app::MAX_PROCESSES - 1
+                ),
+                SpawnError::ArgsTooLong => {
+                    eprintln!("arguments too long (max {} bytes)", feos_app::PROCESS_ARGS_MAX)
                 }
-                1
+                SpawnError::Unsupported => eprintln!("spawn: not supported here"),
+                SpawnError::NoMemory => eprintln!("spawn: out of memory"),
             }
+            1
         }
     }
 }

@@ -79,6 +79,9 @@ pub const IPI_STOP: u32 = 49;
 /// Vector of the IPI that asks a CPU to reschedule.
 pub const IPI_RESCHEDULE: u32 = 50;
 
+/// Vector of the IPI that asks a CPU to flush its user TLB entries: a shootdown.
+pub const IPI_TLB: u32 = 51;
+
 /// CPUs the board can bring up.
 pub const MAX_CPUS: usize = feos_arch_x86_64::smp::MAX_CPUS;
 
@@ -518,6 +521,7 @@ impl Board for QemuX86_64 {
     const TIMER_IRQ: u32 = TIMER_IRQ;
     const IPI_STOP: u32 = IPI_STOP;
     const IPI_RESCHEDULE: u32 = IPI_RESCHEDULE;
+    const IPI_TLB: u32 = IPI_TLB;
     const MAX_CPUS: usize = MAX_CPUS;
     /// Where QEMU's PCI hole starts at its lowest. RAM goes up to here, or stops at
     /// 2 GiB and carries on from 4 GiB, where the frame allocator doesn't reach.

@@ -21,6 +21,9 @@ feos-fs = { workspace = true }
 feos-gfx = { workspace = true }
 feos-gui = { workspace = true }
 feos-vm = { workspace = true }
+feos-pagecache = { workspace = true }
+feos-fdtable = { workspace = true }
+feos-locks = { workspace = true }
 feos-apps = { workspace = true }
 feos-console = { workspace = true }
 feos-desktop-app = { workspace = true }

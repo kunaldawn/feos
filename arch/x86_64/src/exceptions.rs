@@ -87,6 +87,19 @@ impl FaultInfo {
         }
     }
 
+    /// A page fault from ring 3 that a change to the tables can answer: not one about a
+    /// reserved bit, which means a broken table.
+    pub const fn memory_fault(&self) -> Option<feos_hal::MemoryFault> {
+        if self.index != 14 || !self.from_user() || self.esr & (1 << 3) != 0 {
+            return None;
+        }
+        Some(feos_hal::MemoryFault {
+            address: self.far,
+            write: self.esr & (1 << 1) != 0,
+            execute: self.esr & (1 << 4) != 0,
+        })
+    }
+
     /// Exception class. On x86 this is the vector itself.
     pub const fn exception_class(&self) -> u64 {
         self.index

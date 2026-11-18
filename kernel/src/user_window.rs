@@ -129,7 +129,7 @@ impl App for UserWindow {
             background: true,
             ..SpawnIo::default()
         };
-        match crate::sched::PROCESSES.spawn_user(PROGRAM, &words[..count], "/", io) {
+        match crate::sched::PROCESSES.spawn_user(PROGRAM, &words[..count], &[], "/", io) {
             Ok(pid) => {
                 self.pid.store(pid, Ordering::Release);
                 true
@@ -215,7 +215,7 @@ impl App for UserWindow {
     /// looking at its surface.
     fn run(&self, context: &mut Context<'_>) -> i32 {
         let processes = &crate::sched::PROCESSES;
-        match processes.spawn_user(PROGRAM, context.argv, "/", SpawnIo::default()) {
+        match processes.spawn_user(PROGRAM, context.argv, &[], "/", SpawnIo::default()) {
             Ok(pid) => processes.wait(pid).unwrap_or(feos_app::EXIT_KILLED),
             Err(_) => 126,
         }

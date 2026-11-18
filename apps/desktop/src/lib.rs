@@ -203,7 +203,7 @@ fn apps_signature(tree: &dyn feos_fs::VfsTree) -> AppsSignature {
                 hash = hash.wrapping_mul(0x100_0000_01b3) ^ byte as u64;
             }
             hash = hash.wrapping_mul(0x100_0000_01b3) ^ entry.stat.size;
-            let modified = entry.stat.times.modified.unwrap_or(0);
+            let modified = entry.stat.times.modified.map_or(0, |time| time.0);
             hash = hash.wrapping_mul(0x100_0000_01b3) ^ modified;
         }
     }
@@ -637,6 +637,7 @@ fn spawn_error_text(error: feos_app::SpawnError) -> &'static str {
         feos_app::SpawnError::NoFreeSlot => "no free process slot; end a task and try again",
         feos_app::SpawnError::ArgsTooLong => "its arguments are too long",
         feos_app::SpawnError::Unsupported => "the kernel could not start a process",
+        feos_app::SpawnError::NoMemory => "there isn't the memory; close something and try again",
     }
 }
 

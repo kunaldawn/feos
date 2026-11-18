@@ -37,6 +37,7 @@ pub mod renice;
 pub mod settings;
 pub mod sleep;
 pub mod spawn;
+pub mod spin;
 pub mod splash;
 pub mod subtitles;
 pub mod taskmgr;
@@ -56,6 +57,7 @@ pub static REGISTRY: &[&dyn App] = &[
     &ps::Ps,
     &taskmgr::TaskManager,
     &spawn::Spawn,
+    &spin::Spin,
     &kill::Kill,
     &renice::Renice,
     &renice::Taskset,

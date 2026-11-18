@@ -145,7 +145,7 @@ impl Ring {
     }
 
     fn phys(&self) -> u64 {
-        self.memory.0.as_ptr() as u64
+        feos_hal::dma::bus_address(self.memory.0.as_ptr() as usize)
     }
 
     fn slot_address(&self, index: usize) -> u64 {
@@ -329,7 +329,7 @@ impl Inner {
             }
         }
         if moved {
-            let base = self.events.0.as_ptr() as u64;
+            let base = feos_hal::dma::bus_address(self.events.0.as_ptr() as usize);
             let at = base + (self.event_index * core::mem::size_of::<Trb>()) as u64;
             // Bit 3 clears the Event Handler Busy flag: another interrupt may now come.
             write64(self.runtime + 0x20 + 0x18, at | 1 << 3);
@@ -374,7 +374,7 @@ impl Inner {
 
     fn submit_hid(&mut self, index: usize) {
         let hid = &mut self.hid[index];
-        let address = hid.buffer.0.as_ptr() as u64;
+        let address = feos_hal::dma::bus_address(hid.buffer.0.as_ptr() as usize);
         hid.ring.push(address, hid.length, trb::kind(trb::NORMAL) | trb::ISP | trb::IOC);
         let (slot, dci) = (hid.slot, hid.dci);
         self.ring_doorbell(slot, dci);
@@ -471,27 +471,27 @@ impl Xhci {
             for index in 0..scratch_count.min(PAGE / 8) {
                 let page: Box<Page> = zeroed();
                 let at = index * 8;
-                array.0[at..at + 8].copy_from_slice(&(page.0.as_ptr() as u64).to_le_bytes());
+                array.0[at..at + 8].copy_from_slice(&(feos_hal::dma::bus_address(page.0.as_ptr() as usize)).to_le_bytes());
                 scratchpad.push(page);
             }
-            dcbaa.0[..8].copy_from_slice(&(array.0.as_ptr() as u64).to_le_bytes());
+            dcbaa.0[..8].copy_from_slice(&(feos_hal::dma::bus_address(array.0.as_ptr() as usize)).to_le_bytes());
             scratchpad.push(array);
         }
         dma::wmb();
-        write64(op + op::DCBAAP, dcbaa.0.as_ptr() as u64);
+        write64(op + op::DCBAAP, feos_hal::dma::bus_address(dcbaa.0.as_ptr() as usize));
 
         let command = Ring::new();
         write64(op + op::CRCR, command.phys() | 1);
 
         let events: Box<EventMemory> = zeroed();
         let mut segment_table: Box<Page> = zeroed();
-        segment_table.0[..8].copy_from_slice(&(events.0.as_ptr() as u64).to_le_bytes());
+        segment_table.0[..8].copy_from_slice(&(feos_hal::dma::bus_address(events.0.as_ptr() as usize)).to_le_bytes());
         segment_table.0[8..12].copy_from_slice(&(EVENT_TRBS as u32).to_le_bytes());
         dma::wmb();
         let interrupter = runtime + 0x20;
         write32(interrupter + 0x08, 1);
-        write64(interrupter + 0x18, events.0.as_ptr() as u64);
-        write64(interrupter + 0x10, segment_table.0.as_ptr() as u64);
+        write64(interrupter + 0x18, feos_hal::dma::bus_address(events.0.as_ptr() as usize));
+        write64(interrupter + 0x10, feos_hal::dma::bus_address(segment_table.0.as_ptr() as usize));
         // A little moderation: 250 us.
         write32(interrupter + 0x04, 1000);
         // Clears a pending flag, and enables.
@@ -761,7 +761,7 @@ impl Xhci {
         let (ring_index, input_address) = {
             let mut inner = self.inner.lock();
             let at = usize::from(slot) * 8;
-            inner.dcbaa.0[at..at + 8].copy_from_slice(&(output.0.as_ptr() as u64).to_le_bytes());
+            inner.dcbaa.0[at..at + 8].copy_from_slice(&(feos_hal::dma::bus_address(output.0.as_ptr() as usize)).to_le_bytes());
             inner.rings.push(WaitedRing {
                 slot,
                 dci: 1,
@@ -769,7 +769,7 @@ impl Xhci {
                 finished: None,
             });
             let index = inner.rings.len() - 1;
-            let address = input.0.as_ptr() as u64;
+            let address = feos_hal::dma::bus_address(input.0.as_ptr() as usize);
             inner.memories.push(DeviceMemory {
                 _output: output,
                 input,
@@ -789,7 +789,7 @@ impl Xhci {
         }
 
         let transfer: Box<Page> = zeroed();
-        let buffer = transfer.0.as_ptr() as u64;
+        let buffer = feos_hal::dma::bus_address(transfer.0.as_ptr() as usize);
         // SAFETY: the page outlives the transfers below, which are the only things
         // writing it, each of them finished before it's read.
         let read = |bytes: usize| unsafe { core::slice::from_raw_parts(transfer.0.as_ptr(), bytes) };
@@ -819,7 +819,7 @@ impl Xhci {
                 memory.input.0.fill(0);
                 context_write(&mut memory.input.0, 0, stride, 1, 0b10);
                 write_ep0_context(&mut memory.input.0, stride, packet, dequeue);
-                memory.input.0.as_ptr() as u64
+                feos_hal::dma::bus_address(memory.input.0.as_ptr() as usize)
             };
             dma::wmb();
             if self
@@ -927,7 +927,7 @@ impl Xhci {
             }
             context_write(&mut memory.input.0, 0, stride, 1, add);
             write_slot_context(&mut memory.input.0, stride, device_speed, port_number, last as u32);
-            memory.input.0.as_ptr() as u64
+            feos_hal::dma::bus_address(memory.input.0.as_ptr() as usize)
         };
         dma::wmb();
         self.command(input_address, 0, trb::kind(trb::CONFIGURE_ENDPOINT) | u32::from(slot) << 24)
@@ -1218,7 +1218,7 @@ unsafe impl Send for UsbDisk {}
 impl UsbDisk {
     /// Inquires, waits until it's ready, and reads its size.
     fn start(&mut self) -> bool {
-        let page = self.page.0.as_ptr() as u64;
+        let page = feos_hal::dma::bus_address(self.page.0.as_ptr() as usize);
         // Everything here answers into the second half of the page.
         let reply = page + 1024;
         if self.scsi(&msc::inquiry(36), msc::Direction::In, Some((reply, 36))).is_err() {
@@ -1324,7 +1324,7 @@ impl UsbDisk {
         let wrapper = msc::build_cbw(tag, length as u32, direction, 0, command);
         self.page.0[..msc::CBW_LEN].copy_from_slice(&wrapper);
         dma::wmb();
-        let page = self.page.0.as_ptr() as u64;
+        let page = feos_hal::dma::bus_address(self.page.0.as_ptr() as usize);
 
         match self.bulk(false, page, msc::CBW_LEN)? {
             (code::SUCCESS, _) => {}
@@ -1398,7 +1398,7 @@ impl UsbDisk {
             let lba = u32::try_from(lba).map_err(|_| BlockIoError::OutOfRange)?;
             let command = if write { msc::write10(lba, blocks) } else { msc::read10(lba, blocks) };
             let direction = if write { msc::Direction::Out } else { msc::Direction::In };
-            match self.scsi(&command, direction, Some(((address + done) as u64, take))) {
+            match self.scsi(&command, direction, Some((feos_hal::dma::bus_address(address + done), take))) {
                 Ok(0) => {}
                 _ => return Err(BlockIoError::Io),
             }

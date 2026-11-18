@@ -398,6 +398,10 @@ name = "feos-elf"
 version = "0.1.0"
 
 [[package]]
+name = "feos-fdtable"
+version = "0.1.0"
+
+[[package]]
 name = "feos-firmware"
 version = "0.1.0"
 
@@ -485,6 +489,7 @@ dependencies = [
  "feos-console",
  "feos-desktop-app",
  "feos-elf",
+ "feos-fdtable",
  "feos-frames",
  "feos-fs",
  "feos-gfx",
@@ -492,7 +497,9 @@ dependencies = [
  "feos-hal",
  "feos-heap",
  "feos-irq",
+ "feos-locks",
  "feos-net",
+ "feos-pagecache",
  "feos-sched",
  "feos-shell",
  "feos-sync",
@@ -507,6 +514,10 @@ dependencies = [
  "feos-gui",
  "feos-hal",
 ]
+
+[[package]]
+name = "feos-locks"
+version = "0.1.0"
 
 [[package]]
 name = "feos-math"
@@ -540,6 +551,13 @@ dependencies = [
 [[package]]
 name = "feos-opus"
 version = "0.1.0"
+
+[[package]]
+name = "feos-pagecache"
+version = "0.1.0"
+dependencies = [
+ "feos-sync",
+]
 
 [[package]]
 name = "feos-port-io"
@@ -609,7 +627,10 @@ dependencies = [
 name = "feos-vm"
 version = "0.1.0"
 dependencies = [
+ "feos-abi",
  "feos-hal",
+ "feos-pagecache",
+ "feos-sync",
 ]
 
 [[package]]

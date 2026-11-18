@@ -24,12 +24,17 @@
 
 #![cfg_attr(not(test), no_std)]
 
+extern crate alloc;
+
 use core::cell::UnsafeCell;
 use core::hint::spin_loop;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
 pub mod irq;
+mod try_arc;
+
+pub use try_arc::{Reserved, TryArc};
 
 /// Spins on a contended [`SpinLock`] before offering the CPU to other tasks.
 const RELAX_SPINS: u32 = 4096;

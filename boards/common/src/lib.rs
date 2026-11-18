@@ -89,6 +89,15 @@ pub fn stack_range() -> (usize, usize) {
 /// Cached result of probing storage.
 static MOUNTED: SpinLock<Option<&'static dyn FileSystem>> = SpinLock::new(None);
 
+/// The board's RTC, in whole seconds, for timestamps until the kernel has a clock of its
+/// own to the nanosecond, which it then gives the tree (`VfsTree::set_time_source`).
+static RTC: SpinLock<Option<fn() -> Option<u64>>> = SpinLock::new(None);
+
+fn rtc_time() -> Option<feos_fs::Timestamp> {
+    let clock = (*RTC.lock())?;
+    clock().map(feos_fs::Timestamp::from_secs)
+}
+
 /// The filesystem apps browse. The first call probes `disks` and assembles the
 /// shared tree: see [`assemble`].
 pub fn mount_filesystem(
@@ -99,7 +108,8 @@ pub fn mount_filesystem(
     if let Some(filesystem) = *MOUNTED.lock() {
         return filesystem;
     }
-    let (filesystem, log) = assemble(embedded(), disks(), usb::take_disks(), Some(clock));
+    *RTC.lock() = Some(clock);
+    let (filesystem, log) = assemble(embedded(), disks(), usb::take_disks(), Some(rtc_time));
     for line in log {
         println!("{line}");
     }

@@ -57,8 +57,7 @@ use core::fmt::Write as _;
 use feos_app::isolate;
 use feos_app::shell::{Level, Notification};
 use feos_app::{
-    App, AppRegistry, Platform, ProcessInfo, ProcessState, Processes, SpawnError, WindowContext,
-    WindowFrame, MAX_PROCESSES,
+    App, AppRegistry, Platform, ProcessSnapshot, Processes, SpawnError, WindowContext, WindowFrame,
 };
 use feos_bundle::{AppCatalog, InstalledApp, ScanReport};
 use feos_gfx::{Canvas, Color, Point, Rect};
@@ -910,16 +909,14 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             }
         }
         for _ in 0..LOG_OFF_KILL_TRIES {
-            let mut live = [ProcessInfo::EMPTY; MAX_PROCESSES];
-            let count = processes.snapshot(&mut live);
+            // With no heap for the table, each is taken to be alive, and killed again.
+            let live = ProcessSnapshot::take(processes);
             let mut waiting = false;
             for slot in &mut self.pending_kill {
                 let Some(pid) = *slot else {
                     continue;
                 };
-                let alive = live[..count]
-                    .iter()
-                    .any(|process| process.pid == pid && process.state != ProcessState::Exited);
+                let alive = live.as_ref().is_none_or(|live| live.is_live(pid));
                 if !alive || processes.kill(pid) {
                     *slot = None;
                 } else {
@@ -1595,8 +1592,11 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
 
     fn finish_session_tick(&mut self, processes: &dyn Processes, mut changed: usize) -> usize {
 
-        let mut live = [ProcessInfo::EMPTY; MAX_PROCESSES];
-        let count = processes.snapshot(&mut live);
+        // With no heap for the table, nothing is known to have gone this tick: the next
+        // looks again, rather than taking every window's process for gone.
+        let Some(live) = ProcessSnapshot::take(processes) else {
+            return changed;
+        };
 
         // A closed window's process goes away with it. Keep asking until it
         // has: a kill can fail while the target is running on another CPU.
@@ -1604,10 +1604,7 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             let Some(pid) = *slot else {
                 continue;
             };
-            let alive = live[..count]
-                .iter()
-                .any(|process| process.pid == pid && process.state != ProcessState::Exited);
-            if !alive || processes.kill(pid) {
+            if !live.is_live(pid) || processes.kill(pid) {
                 *slot = None;
             }
         }
@@ -1619,10 +1616,7 @@ impl<const N: usize, const A: usize, const S: usize> Desktop<N, A, S> {
             let Some(pid) = window.pid else {
                 continue;
             };
-            let running = live[..count]
-                .iter()
-                .any(|process| process.pid == pid && process.state != ProcessState::Exited);
-            if !running {
+            if !live.is_live(pid) {
                 window.pid = None;
                 window.launched = false;
                 changed += 1;
@@ -4640,7 +4634,7 @@ fn draw_caption_button<const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use feos_app::{BoardInfo, Context, ProcessInfo, ProcessState};
+    use feos_app::{BoardInfo, Context, ProcessInfo, ProcessState, MAX_PROCESSES};
     use feos_gui::{Event, Key, Modifiers, MouseButton};
     use feos_hal::{Clock, Cpu, Power};
     use feos_sync::SpinLock;
@@ -4912,6 +4906,49 @@ mod tests {
         let window = desktop.windows().get(0).unwrap();
         assert!(!window.launched);
         assert_eq!(window.pid, None);
+    }
+
+    /// A full process table, the window's process its last entry: PIDs from 2, the
+    /// first spawned the 1024th.
+    struct FullTable;
+
+    impl Processes for FullTable {
+        fn spawn(&self, _app: &'static dyn App, _args: &str) -> Result<u32, SpawnError> {
+            Ok(MAX_PROCESSES as u32 + 1)
+        }
+
+        fn kill(&self, _pid: u32) -> bool {
+            false
+        }
+
+        fn current(&self) -> u32 {
+            1
+        }
+
+        fn snapshot(&self, out: &mut [ProcessInfo]) -> usize {
+            for (index, info) in out.iter_mut().take(MAX_PROCESSES).enumerate() {
+                *info = ProcessInfo { pid: index as u32 + 2, state: ProcessState::Running, ..ProcessInfo::EMPTY };
+            }
+            out.len().min(MAX_PROCESSES)
+        }
+    }
+
+    #[test]
+    fn a_window_at_the_end_of_a_full_table_keeps_running() {
+        let bytes = catalog_bundle("terminal", "dummy");
+        let entries = [DirEntry::new("terminal.fapp", &bytes)];
+        let mut desktop = Desktop::<4, 4, 2>::default();
+        desktop.scan(&entries);
+        desktop.work_area = Rect::new(0, 0, 800, 600);
+        let pid = MAX_PROCESSES as u32 + 1;
+        assert_eq!(desktop.launch(0, &Registry, &FullTable), LaunchOutcome::Spawned { window: 0, pid });
+        // A table read short of its end would lose the window's process.
+        for _ in 0..3 {
+            assert_eq!(desktop.tick_session(&FullTable), 0);
+        }
+        let window = desktop.windows().get(0).unwrap();
+        assert!(window.launched);
+        assert_eq!(window.pid, Some(pid));
     }
 
     #[test]

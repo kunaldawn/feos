@@ -16,7 +16,7 @@ pub mod dma;
 pub mod net;
 pub mod time;
 
-pub use arch::{Arch, FaultDetails, FirmwareConduit, PageAccess, PageBits, SecondaryEntry, TrapContext};
+pub use arch::{Arch, FaultDetails, FirmwareConduit, MemoryFault, PageAccess, PageBits, SecondaryEntry, TrapContext};
 
 /// A byte-oriented character device (UART, virtual console, ...).
 ///
@@ -494,6 +494,10 @@ pub trait Board {
     const IPI_STOP: u32;
     /// Interrupt ID that asks a CPU to reschedule.
     const IPI_RESCHEDULE: u32;
+    /// Interrupt ID that asks a CPU to flush its user TLB entries and say so: a TLB
+    /// shootdown, on a port whose flushes don't reach other CPUs by themselves (see
+    /// [`Arch::USER_FLUSH_BROADCAST`]). Enabled where it's never sent too.
+    const IPI_TLB: u32;
     /// CPUs the board can bring up.
     const MAX_CPUS: usize;
     /// RAM at or above this address isn't mapped cached, so it isn't used.

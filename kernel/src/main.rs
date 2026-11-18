@@ -10,11 +10,14 @@
 
 mod allocator;
 mod fatal;
+mod kstack;
 mod ktest;
 mod memory;
+mod pagecache;
 mod sched;
 mod smp;
 mod surface;
+mod time;
 mod user;
 mod user_window;
 
@@ -118,6 +121,7 @@ pub extern "C" fn kmain(boot_info: usize) -> ! {
     Machine::init_boot_info(boot_info);
     Port::set_firmware_conduit(Machine::firmware_conduit());
     memory::init();
+    user::init();
 
     // Drivers register their interrupts as they come up, so the controller goes
     // first. Nothing is delivered until the scheduler unmasks interrupts.
@@ -209,7 +213,18 @@ pub extern "C" fn kmain(boot_info: usize) -> ! {
 
     // Background processes read the platform through this static.
     sched::set_platform(platform);
+    pagecache::init();
     sched::init();
+    time::init();
+    // The board's RTC stamps files in whole seconds until now: from here, the kernel's
+    // clock to the nanosecond does.
+    if let Some(tree) = Machine::filesystem().tree() {
+        tree.set_time_source(time::file_time);
+    }
+    match time::unix_time() {
+        Some(seconds) => println!("[time] wall clock from the RTC: {seconds} s past the epoch"),
+        None => println!("[time] no RTC: the wall clock starts at the epoch"),
+    }
     feos_apps::fsflush::install(sched::platform());
 
     Port::set_switch_handler(sched::on_switch_request);
@@ -243,6 +258,7 @@ pub extern "C" fn kmain(boot_info: usize) -> ! {
     // Timer ticks and IRQ delivery begin here; the shell is PID 1 and the
     // boot CPU's currently running process.
     sched::start(smp::TICK_HZ);
+    time::start();
     feos_apps::displayd::install(sched::platform());
     feos_apps::netd::install(sched::platform());
 
@@ -312,6 +328,9 @@ fn on_irq(frame: &mut Frame) {
         }
     } else if id == Machine::IPI_STOP {
         fatal::stop_this_cpu();
+    } else if id == Machine::IPI_TLB {
+        // Another CPU waits for this to say it's done, with the frame it's freeing.
+        user::tlb::on_ipi();
     } else if !is_reschedule {
         // The handler quiets its device before the end-of-interrupt below, so a
         // level-triggered line doesn't come straight back.

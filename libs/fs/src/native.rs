@@ -16,7 +16,12 @@
 //! ```
 //!
 //! An inode has mode, owner, group, link count, size and times, and 12 direct, one indirect
-//! and one double indirect block pointers, with zero meaning a hole. A directory is a
+//! and one double indirect block pointers, with zero meaning a hole. The times are to the
+//! nanosecond: seconds of modification, status change and creation, then (from version 2)
+//! the nanoseconds of each in what was spare at the end, and the access time whole. A
+//! version 1 volume has zeros there, which read as `.0` and no access time of its own, and
+//! is made version 2 when it's first mounted to write, so that no older kernel drops the
+//! nanoseconds by rewriting its inodes. A directory is a
 //! file of fixed 256-byte entries: inode number, kind, and a name of up to 250 bytes. A
 //! symbolic link is what the VFS makes it, a file holding its target, with `S_IFLNK` set.
 //!
@@ -57,12 +62,18 @@ use alloc::vec::Vec;
 use crate::block::WritableBlockDevice;
 use crate::partition::crc32;
 use crate::tree::try_zeroed;
-use crate::{attr, CheckReport, EntryKind, FileSystem, FsError, NodeId, NodeTimes, TimeSource, VolumeStats, WritableFileSystem};
+use crate::{
+    attr, CheckReport, EntryKind, FileSystem, FsError, NodeId, NodeTimes, TimeSource, Timestamp, VolumeStats,
+    WritableFileSystem,
+};
 
 /// What the first eight bytes of the volume say.
 pub const MAGIC: &[u8; 8] = b"FEOSNFS1";
 
-const VERSION: u32 = 1;
+/// Inodes carry nanoseconds and an access time (stage 1c.4 of the ABI design).
+const VERSION: u32 = 2;
+/// Inodes whose times are whole seconds: still read, and made [`VERSION`] when written.
+const VERSION_SECONDS: u32 = 1;
 /// The filesystem's block size.
 pub const BLOCK: usize = 4096;
 const INODE_SIZE: usize = 128;
@@ -230,7 +241,8 @@ impl Layout {
 
     /// Reads a superblock, none of which is trusted until it adds up.
     fn decode(block: &[u8]) -> Result<Self, FsError> {
-        if &block[..8] != MAGIC || get_u32(block, 8) != VERSION || get_u32(block, 12) != BLOCK as u32 {
+        let version = get_u32(block, 8);
+        if &block[..8] != MAGIC || !(VERSION_SECONDS..=VERSION).contains(&version) || get_u32(block, 12) != BLOCK as u32 {
             return Err(FsError::InvalidBootSector);
         }
         if crc32(&block[..508]) != get_u32(block, 508) {
@@ -263,9 +275,13 @@ struct Inode {
     gid: u32,
     nlink: u32,
     size: u64,
+    /// Nanoseconds since the epoch, zero for none.
     modified: u64,
     changed: u64,
     created: u64,
+    /// Zero, on a version 1 volume and for a file no one has set it for: the modification
+    /// time stands in.
+    accessed: u64,
     direct: [u32; DIRECT],
     indirect: u32,
     double: u32,
@@ -280,14 +296,19 @@ impl Inode {
         put_u32(out, 8, self.gid);
         put_u32(out, 12, self.nlink);
         put_u64(out, 16, self.size);
-        put_u64(out, 24, self.modified);
-        put_u64(out, 32, self.changed);
-        put_u64(out, 40, self.created);
+        let nanos = Timestamp::NANOS;
+        put_u64(out, 24, self.modified / nanos);
+        put_u64(out, 32, self.changed / nanos);
+        put_u64(out, 40, self.created / nanos);
         for (index, pointer) in self.direct.iter().enumerate() {
             put_u32(out, 48 + index * 4, *pointer);
         }
         put_u32(out, 96, self.indirect);
         put_u32(out, 100, self.double);
+        put_u32(out, 104, (self.modified % nanos) as u32);
+        put_u32(out, 108, (self.changed % nanos) as u32);
+        put_u32(out, 112, (self.created % nanos) as u32);
+        put_u64(out, 116, self.accessed);
         let crc = crc32(&out[..124]);
         put_u32(out, 124, crc);
     }
@@ -301,6 +322,12 @@ impl Inode {
         for (index, pointer) in direct.iter_mut().enumerate() {
             *pointer = get_u32(data, 48 + index * 4);
         }
+        // Seconds, and the nanoseconds past them where version 2 put them (zero before,
+        // and anything not below a second isn't one written here).
+        let time = |seconds: usize, nanos: usize| {
+            let nanos = u64::from(get_u32(data, nanos)).min(Timestamp::NANOS - 1);
+            get_u64(data, seconds).saturating_mul(Timestamp::NANOS).saturating_add(nanos)
+        };
         Some(Self {
             mode: get_u16(data, 0),
             attributes: data[2],
@@ -308,9 +335,10 @@ impl Inode {
             gid: get_u32(data, 8),
             nlink: get_u32(data, 12),
             size: get_u64(data, 16),
-            modified: get_u64(data, 24),
-            changed: get_u64(data, 32),
-            created: get_u64(data, 40),
+            modified: time(24, 104),
+            changed: time(32, 108),
+            created: time(40, 112),
+            accessed: get_u64(data, 116),
             direct,
             indirect: get_u32(data, 96),
             double: get_u32(data, 100),
@@ -369,12 +397,13 @@ pub fn format<D: WritableBlockDevice>(device: &mut D, created: u64) -> Result<()
         }
         write(device, layout.bitmap_start + index, &bitmap[..])?;
     }
+    let at = created.saturating_mul(Timestamp::NANOS);
     let root = Inode {
         mode: S_IFDIR | 0o755,
         nlink: 1,
-        modified: created,
-        changed: created,
-        created,
+        modified: at,
+        changed: at,
+        created: at,
         ..Inode::default()
     };
     let mut table = new_block()?;
@@ -413,6 +442,9 @@ pub struct Native<D: WritableBlockDevice> {
     sequence: u64,
     nodes: Vec<Option<Node>>,
     free_nodes: Vec<u32>,
+    /// Inode numbers something still refers to, which a new file mustn't be given even
+    /// once they're free.
+    kept_inodes: Vec<u32>,
     live_nodes: usize,
     now: Option<TimeSource>,
     damaged: bool,
@@ -448,6 +480,7 @@ impl<D: WritableBlockDevice> Native<D> {
             sequence: 1,
             nodes: Vec::new(),
             free_nodes: Vec::new(),
+            kept_inodes: Vec::new(),
             live_nodes: 0,
             now: None,
             damaged: false,
@@ -458,6 +491,15 @@ impl<D: WritableBlockDevice> Native<D> {
         fs.load_bitmap()?;
         fs.load_inodes()?;
         fs.load_tree()?;
+        // From here its inodes may get nanoseconds, which a kernel that knows only
+        // version 1 would drop on writing one back: it's told not to mount it.
+        if get_u32(&first[..], 8) < VERSION && !fs.device.is_read_only() && !fs.damaged {
+            put_u32(&mut first[..], 8, VERSION);
+            let crc = crc32(&first[..508]);
+            put_u32(&mut first[..], 508, crc);
+            fs.write_home(0, &first[..])?;
+            fs.device.flush()?;
+        }
         Ok(fs)
     }
 
@@ -941,7 +983,7 @@ impl<D: WritableBlockDevice> Native<D> {
         let total = self.layout.inodes;
         let mut ino = self.next_inode.clamp(1, total);
         for _ in 0..total {
-            if !self.inodes.contains_key(&ino) {
+            if !self.inodes.contains_key(&ino) && !self.kept_inodes.contains(&ino) {
                 self.next_inode = ino + 1;
                 return Ok(ino);
             }
@@ -950,8 +992,9 @@ impl<D: WritableBlockDevice> Native<D> {
         Err(FsError::NoSpace)
     }
 
+    /// Nanoseconds since the epoch, zero with no clock.
     fn now(&self) -> u64 {
-        self.now.and_then(|now| now()).unwrap_or(0)
+        self.now.and_then(|now| now()).map_or(0, |now| now.0)
     }
 
     fn node_ref(&self, node: NodeId) -> Option<&Node> {
@@ -1158,6 +1201,44 @@ impl<D: WritableBlockDevice> Native<D> {
         self.store_inode(ino, directory)
     }
 
+    /// Sets an inode's status change time to now: it was renamed, or a name was taken
+    /// from it.
+    fn touch_inode(&mut self, ino: u32) -> Result<(), FsError> {
+        let mut inode = *self.inodes.get(&ino).ok_or(FsError::Corrupt)?;
+        inode.changed = self.now();
+        self.store_inode(ino, inode)
+    }
+
+    /// Moves a node in the in-memory tree to the entry at `slot` in `parent`, named `name`.
+    fn move_node(&mut self, node: NodeId, parent: NodeId, slot: u64, name: &str) -> Result<(), FsError> {
+        let old_parent = self.node_ref(node).ok_or(FsError::NotFound)?.parent;
+        self.nodes[old_parent as usize]
+            .as_mut()
+            .ok_or(FsError::Corrupt)?
+            .children
+            .retain(|child| *child != node.0);
+        self.nodes[parent.0 as usize].as_mut().ok_or(FsError::Corrupt)?.children.push(node.0);
+        let entry = self.nodes[node.0 as usize].as_mut().ok_or(FsError::Corrupt)?;
+        entry.parent = parent.0;
+        entry.slot = slot;
+        entry.name = String::from(name);
+        Ok(())
+    }
+
+    /// Forgets a node whose entry is gone from the disk.
+    fn drop_node(&mut self, node: NodeId) -> Result<(), FsError> {
+        let parent = self.node_ref(node).ok_or(FsError::NotFound)?.parent;
+        self.nodes[parent as usize]
+            .as_mut()
+            .ok_or(FsError::Corrupt)?
+            .children
+            .retain(|child| *child != node.0);
+        self.nodes[node.0 as usize] = None;
+        self.free_nodes.push(node.0);
+        self.live_nodes -= 1;
+        Ok(())
+    }
+
     fn create(&mut self, parent: NodeId, name: &str, mode: u16) -> Result<NodeId, FsError> {
         self.writable()?;
         self.make_room()?;
@@ -1172,6 +1253,7 @@ impl<D: WritableBlockDevice> Native<D> {
             modified: now,
             changed: now,
             created: now,
+            accessed: now,
             ..Inode::default()
         };
         self.store_inode(ino, inode)?;
@@ -1478,11 +1560,12 @@ impl<D: WritableBlockDevice> FileSystem for Native<D> {
     }
 
     fn times(&self, node: NodeId) -> NodeTimes {
-        let time = |value: u64| (value != 0).then_some(value);
+        let time = |value: u64| (value != 0).then_some(Timestamp(value));
         self.inode_of(node).map_or(NodeTimes::NONE, |inode| NodeTimes {
             created: time(inode.created),
             modified: time(inode.modified),
-            accessed: time(inode.modified),
+            accessed: time(inode.accessed).or(time(inode.modified)),
+            changed: time(inode.changed),
         })
     }
 
@@ -1579,17 +1662,89 @@ impl<D: WritableBlockDevice> WritableFileSystem for Native<D> {
         self.write_entry(&directory, old_slot, 0, 0, "")?;
         self.touch_directory(old_parent_ino)?;
         self.touch_directory(new_parent_ino)?;
-        self.nodes[old_parent as usize]
-            .as_mut()
-            .ok_or(FsError::Corrupt)?
-            .children
-            .retain(|child| *child != node.0);
-        self.nodes[new_parent.0 as usize].as_mut().ok_or(FsError::Corrupt)?.children.push(node.0);
-        let entry = self.nodes[node.0 as usize].as_mut().ok_or(FsError::Corrupt)?;
-        entry.parent = new_parent.0;
-        entry.slot = slot;
-        entry.name = String::from(new_name);
-        Ok(())
+        self.touch_inode(ino)?;
+        self.move_node(node, new_parent, slot, new_name)
+    }
+
+    fn rename_over(
+        &mut self,
+        node: NodeId,
+        new_parent: NodeId,
+        new_name: &str,
+        replaced: NodeId,
+        keep: Option<(NodeId, &str)>,
+    ) -> Result<(), FsError> {
+        self.writable()?;
+        self.make_room()?;
+        if node == NodeId::ROOT || replaced == NodeId::ROOT || node == replaced {
+            return Err(FsError::Busy);
+        }
+        let mut walk = new_parent;
+        loop {
+            if walk == node {
+                return Err(FsError::InvalidName);
+            }
+            match self.parent(walk) {
+                Some(parent) => walk = parent,
+                None => break,
+            }
+        }
+        let victim = self.node_ref(replaced).ok_or(FsError::NotFound)?;
+        if victim.parent != new_parent.0 || victim.name != new_name {
+            return Err(FsError::NotFound);
+        }
+        if !victim.children.is_empty() {
+            return Err(FsError::NotEmpty);
+        }
+        let (victim_ino, victim_slot) = (victim.ino, victim.slot);
+        let victim_mode = self.inodes.get(&victim_ino).ok_or(FsError::Corrupt)?.mode;
+        let entry = self.node_ref(node).ok_or(FsError::NotFound)?;
+        let (ino, old_parent, old_slot) = (entry.ino, entry.parent, entry.slot);
+        let mode = self.inodes.get(&ino).ok_or(FsError::Corrupt)?.mode;
+        let old_parent_ino = self.nodes[old_parent as usize].as_ref().ok_or(FsError::Corrupt)?.ino;
+        let new_parent_ino = self.node_ref(new_parent).ok_or(FsError::NotFound)?.ino;
+        // Where a kept one goes, found before anything changes.
+        let kept_at = match keep {
+            Some((directory, name)) => {
+                self.check_name(directory, name)?;
+                let directory_ino = self.node_ref(directory).ok_or(FsError::NotFound)?.ino;
+                Some((directory, directory_ino, name, self.free_slot(directory_ino)?))
+            }
+            None => None,
+        };
+        // All in one transaction: the name is the old file's or the new one's, as a
+        // crash leaves either all of it or none.
+        let directory = *self.inodes.get(&new_parent_ino).ok_or(FsError::Corrupt)?;
+        self.write_entry(&directory, victim_slot, ino, mode, new_name)?;
+        let directory = *self.inodes.get(&old_parent_ino).ok_or(FsError::Corrupt)?;
+        self.write_entry(&directory, old_slot, 0, 0, "")?;
+        match kept_at {
+            Some((_, directory_ino, name, slot)) => {
+                let directory = *self.inodes.get(&directory_ino).ok_or(FsError::Corrupt)?;
+                self.write_entry(&directory, slot, victim_ino, victim_mode, name)?;
+                self.touch_directory(directory_ino)?;
+                self.touch_inode(victim_ino)?;
+            }
+            None => {
+                let mut inode = *self.inodes.get(&victim_ino).ok_or(FsError::Corrupt)?;
+                inode.nlink = inode.nlink.saturating_sub(1);
+                if inode.nlink == 0 || inode.is_dir() {
+                    self.free_from(&mut inode, 0)?;
+                    self.clear_inode(victim_ino)?;
+                } else {
+                    inode.changed = self.now();
+                    self.store_inode(victim_ino, inode)?;
+                }
+            }
+        }
+        self.touch_directory(old_parent_ino)?;
+        self.touch_directory(new_parent_ino)?;
+        self.touch_inode(ino)?;
+        match kept_at {
+            Some((directory, _, name, slot)) => self.move_node(replaced, directory, slot, name)?,
+            None => self.drop_node(replaced)?,
+        }
+        self.move_node(node, new_parent, victim_slot, new_name)
     }
 
     fn write(&mut self, node: NodeId, offset: usize, data: &[u8]) -> Result<usize, FsError> {
@@ -1669,6 +1824,27 @@ impl<D: WritableBlockDevice> WritableFileSystem for Native<D> {
         self.store_inode(ino, inode)
     }
 
+    fn keep_id(&mut self, _node: NodeId, ino: u64, keep: bool) -> Result<(), FsError> {
+        let ino = u32::try_from(ino).map_err(|_| FsError::NotFound)?;
+        if keep {
+            if !self.kept_inodes.contains(&ino) {
+                self.kept_inodes.try_reserve(1).map_err(|_| FsError::OutOfMemory)?;
+                self.kept_inodes.push(ino);
+            }
+        } else if let Some(at) = self.kept_inodes.iter().position(|&kept| kept == ino) {
+            self.kept_inodes.swap_remove(at);
+        }
+        Ok(())
+    }
+
+    fn node_with_ino(&self, ino: u64) -> Option<NodeId> {
+        let ino = u32::try_from(ino).ok()?;
+        self.nodes
+            .iter()
+            .position(|node| node.as_ref().is_some_and(|node| node.ino == ino))
+            .map(|index| NodeId(index as u32))
+    }
+
     fn flush(&mut self) -> Result<(), FsError> {
         if self.failed {
             return Err(FsError::Io);
@@ -1690,7 +1866,8 @@ impl<D: WritableBlockDevice> WritableFileSystem for Native<D> {
         if !inode.is_dir() && attributes & attr::SYSTEM != 0 {
             let mut head = [0u8; SYMLINK_MAGIC.len()];
             if self.try_read(node, 0, &mut head)? == head.len() && head == *SYMLINK_MAGIC {
-                inode.mode = (inode.mode & !S_IFMT) | S_IFLNK;
+                // Anyone may follow a link: what it leads to says who may do what.
+                inode.mode = S_IFLNK | 0o777;
             }
         }
         inode.changed = self.now();
@@ -1703,10 +1880,13 @@ impl<D: WritableBlockDevice> WritableFileSystem for Native<D> {
         let ino = self.node_ref(node).ok_or(FsError::NotFound)?.ino;
         let mut inode = *self.inodes.get(&ino).ok_or(FsError::Corrupt)?;
         if let Some(created) = times.created {
-            inode.created = created;
+            inode.created = created.0;
         }
         if let Some(modified) = times.modified {
-            inode.modified = modified;
+            inode.modified = modified.0;
+        }
+        if let Some(accessed) = times.accessed {
+            inode.accessed = accessed.0;
         }
         inode.changed = self.now();
         self.store_inode(ino, inode)

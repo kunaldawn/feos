@@ -20,6 +20,13 @@ pub const DEFAULT_QUOTA: usize = 24 * 1024 * 1024;
 /// Deepest a tree can go here; more than a FAT volume, as paths are in memory.
 const MAX_DEPTH: usize = 48;
 
+/// Whether a new entry may be called `name`. No longer than a directory entry's record
+/// can carry: a name a program could make but never list would stop every listing of
+/// its directory at it.
+fn valid_name(name: &str) -> bool {
+    !(name.is_empty() || name == "." || name == ".." || name.contains('/') || name.len() > super::path::NAME_MAX)
+}
+
 /// Special behaviour of a device node.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DeviceKind {
@@ -27,6 +34,46 @@ pub enum DeviceKind {
     Null,
     /// Reads as endless zeros, discards writes.
     Zero,
+    /// Reads as endless zeros; every write is out of space (`/dev/full`).
+    Full,
+    /// The console: what a program opening it gets is the kernel's to say. Here it reads
+    /// as empty and discards writes.
+    Console,
+    /// The caller's terminal (`/dev/tty`): opening it is the kernel's to say, and, until
+    /// programs have terminals, is refused there. Here as `Null`.
+    Tty,
+}
+
+impl DeviceKind {
+    /// Its device number as Linux numbers it (`major << 8 | minor`), for `Stat2::rdev`.
+    pub const fn rdev(self) -> u64 {
+        match self {
+            Self::Null => 1 << 8 | 3,
+            Self::Zero => 1 << 8 | 5,
+            Self::Full => 1 << 8 | 7,
+            Self::Tty => 5 << 8,
+            Self::Console => 5 << 8 | 1,
+        }
+    }
+
+    /// What reading it at any offset gives: zeros to fill `out`, or nothing.
+    pub fn read(self, out: &mut [u8]) -> usize {
+        match self {
+            Self::Zero | Self::Full => {
+                out.fill(0);
+                out.len()
+            }
+            Self::Null | Self::Console | Self::Tty => 0,
+        }
+    }
+
+    /// What writing `length` bytes to it does: all taken and discarded, or out of space.
+    pub fn write(self, length: usize) -> Result<usize, FsError> {
+        match self {
+            Self::Full => Err(FsError::NoSpace),
+            _ => Ok(length),
+        }
+    }
 }
 
 enum Data {
@@ -45,17 +92,27 @@ struct RamNode {
     attributes: u8,
     times: NodeTimes,
     alive: bool,
+    /// Permission bits (with the sticky, set-user and set-group bits), owner and group:
+    /// kept and enforced only on a tree made [`with_owners`](RamFs::with_owners).
+    mode: u16,
+    uid: u32,
+    gid: u32,
 }
 
 /// A writable tree in RAM.
 pub struct RamFs {
     nodes: Vec<RamNode>,
     free: Vec<u32>,
+    /// Slots whose IDs something still refers to: not reused when they're removed.
+    kept: Vec<u32>,
     live: usize,
     used: usize,
     quota: usize,
     lower: Option<&'static dyn FileSystem>,
     now: Option<TimeSource>,
+    /// Keeps each node's mode and owner, as `/tmp` and `/dev/shm` need for their sticky
+    /// bit (section 10.4 of the ABI design): otherwise, like FAT, it keeps none.
+    owners: bool,
 }
 
 impl RamFs {
@@ -71,14 +128,29 @@ impl RamFs {
                 attributes: 0,
                 times: NodeTimes::NONE,
                 alive: true,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
             }],
             free: Vec::new(),
+            kept: Vec::new(),
             live: 1,
             used: 0,
             quota,
             lower: None,
             now: None,
+            owners: false,
         }
+    }
+
+    /// An empty tree that keeps owners and modes, and enforces them through the tree's
+    /// permission checks, its root owned by root with `root_mode` (`0o1777` for `/tmp`).
+    /// New nodes belong to root, `0o644` or `0o755`, until they're given away.
+    pub fn with_owners(quota: usize, root_mode: u16) -> Self {
+        let mut fs = Self::new(quota);
+        fs.owners = true;
+        fs.nodes[0].mode = root_mode & 0o7777;
+        fs
     }
 
     /// A tree that starts as a copy of `lower`, whose file data stays there
@@ -172,7 +244,7 @@ impl RamFs {
         if directory.kind != EntryKind::Directory {
             return Err(FsError::NotDirectory);
         }
-        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        if !valid_name(name) {
             return Err(FsError::InvalidName);
         }
         if self.lookup(parent, name).is_some() {
@@ -196,7 +268,7 @@ impl RamFs {
             .try_reserve_exact(name.len())
             .map_err(|_| FsError::OutOfMemory)?;
         owned.push_str(name);
-        let now = self.now.and_then(|now| now());
+        let now = self.now();
         let node = RamNode {
             name: owned,
             parent: Some(parent.0),
@@ -208,8 +280,12 @@ impl RamFs {
                 created: now,
                 modified: now,
                 accessed: now,
+                changed: now,
             },
             alive: true,
+            mode: if kind == EntryKind::File { 0o644 } else { 0o755 },
+            uid: 0,
+            gid: 0,
         };
         self.nodes
             .get_mut(parent.0 as usize)
@@ -231,7 +307,29 @@ impl RamFs {
         };
         self.nodes[parent.0 as usize].children.push(id);
         self.live += 1;
+        self.touch_directory(parent);
         Ok(NodeId(id))
+    }
+
+    fn now(&self) -> Option<crate::Timestamp> {
+        self.now.and_then(|now| now())
+    }
+
+    /// An entry was made, taken or renamed in `directory`: its contents changed.
+    fn touch_directory(&mut self, directory: NodeId) {
+        let now = self.now();
+        if let Some(entry) = self.node_mut(directory).filter(|_| now.is_some()) {
+            entry.times.modified = now;
+            entry.times.changed = now;
+        }
+    }
+
+    /// Something about `node` other than its contents changed: owner, mode, name.
+    fn touch_status(&mut self, node: NodeId) {
+        let now = self.now();
+        if let Some(entry) = self.node_mut(node).filter(|_| now.is_some()) {
+            entry.times.changed = now;
+        }
     }
 
     /// Moves a seeded file's bytes into RAM, ready to change.
@@ -265,13 +363,15 @@ impl RamFs {
         Ok(())
     }
 
+    /// A file's contents changed. Its access time stays: nothing here updates one but
+    /// setting it.
     fn touch(&mut self, node: NodeId) {
-        let now = self.now.and_then(|now| now());
+        let now = self.now();
         if let Some(entry) = self.node_mut(node) {
             entry.attributes |= attr::ARCHIVE;
             if now.is_some() {
                 entry.times.modified = now;
-                entry.times.accessed = now;
+                entry.times.changed = now;
             }
         }
     }
@@ -347,11 +447,7 @@ impl FileSystem for RamFs {
                 Ok(count)
             }
             Data::Lower(source, _) => self.lower.ok_or(FsError::Corrupt)?.try_read(*source, offset, out),
-            Data::Device(DeviceKind::Null) => Ok(0),
-            Data::Device(DeviceKind::Zero) => {
-                out.fill(0);
-                Ok(out.len())
-            }
+            Data::Device(kind) => Ok(kind.read(out)),
         }
     }
 
@@ -414,11 +510,48 @@ impl WritableFileSystem for RamFs {
         slot.children = Vec::new();
         self.used -= released;
         self.live -= 1;
-        // If the free list can't grow, the slot is just not reused.
-        if self.free.try_reserve(1).is_ok() {
+        // If the free list can't grow, the slot is just not reused. A kept one waits.
+        if !self.kept.contains(&node.0) && self.free.try_reserve(1).is_ok() {
             self.free.push(node.0);
         }
+        self.touch_directory(NodeId(parent));
         Ok(())
+    }
+
+    fn rename_over(
+        &mut self,
+        node: NodeId,
+        new_parent: NodeId,
+        new_name: &str,
+        replaced: NodeId,
+        keep: Option<(NodeId, &str)>,
+    ) -> Result<(), FsError> {
+        // Nothing to crash between here: the default's two steps, each checked first so
+        // that the second can't fail once the first is done.
+        let victim = self.node(replaced).ok_or(FsError::NotFound)?;
+        if victim.parent != Some(new_parent.0) || victim.name != new_name || node == replaced {
+            return Err(FsError::NotFound);
+        }
+        if !victim.children.is_empty() {
+            return Err(FsError::NotEmpty);
+        }
+        let mut ancestor = Some(new_parent.0);
+        while let Some(current) = ancestor {
+            if current == node.0 {
+                return Err(FsError::Unsupported);
+            }
+            ancestor = self.nodes.get(current as usize).and_then(|node| node.parent);
+        }
+        if let Some((directory, name)) = keep {
+            self.check_new_name(directory, name)?;
+        }
+        self.node(node).ok_or(FsError::NotFound)?;
+        self.nodes[new_parent.0 as usize].children.try_reserve(1).map_err(|_| FsError::OutOfMemory)?;
+        match keep {
+            Some((directory, name)) => self.rename(replaced, directory, name)?,
+            None => self.remove(replaced)?,
+        }
+        self.rename(node, new_parent, new_name)
     }
 
     fn rename(&mut self, node: NodeId, new_parent: NodeId, new_name: &str) -> Result<(), FsError> {
@@ -440,7 +573,7 @@ impl WritableFileSystem for RamFs {
             Some(_) => return Err(FsError::NameExists),
             None => {}
         }
-        if new_name.is_empty() || new_name == "." || new_name == ".." || new_name.contains('/') {
+        if !valid_name(new_name) {
             return Err(FsError::InvalidName);
         }
         let mut name = String::new();
@@ -459,6 +592,9 @@ impl WritableFileSystem for RamFs {
         let entry = &mut self.nodes[node.0 as usize];
         entry.parent = Some(new_parent.0);
         entry.name = name;
+        self.touch_directory(NodeId(old_parent));
+        self.touch_directory(new_parent);
+        self.touch_status(node);
         Ok(())
     }
 
@@ -467,8 +603,8 @@ impl WritableFileSystem for RamFs {
         if entry.kind != EntryKind::File {
             return Err(FsError::NotFile);
         }
-        if matches!(entry.data, Data::Device(_)) {
-            return Ok(data.len());
+        if let Data::Device(kind) = entry.data {
+            return kind.write(data.len());
         }
         let end = offset.checked_add(data.len()).ok_or(FsError::NoSpace)?;
         self.copy_up(node)?;
@@ -499,12 +635,31 @@ impl WritableFileSystem for RamFs {
         Ok(())
     }
 
+    fn keep_id(&mut self, node: NodeId, _ino: u64, keep: bool) -> Result<(), FsError> {
+        if keep {
+            if !self.kept.contains(&node.0) {
+                self.kept.try_reserve(1).map_err(|_| FsError::OutOfMemory)?;
+                self.kept.push(node.0);
+            }
+            return Ok(());
+        }
+        if let Some(at) = self.kept.iter().position(|&slot| slot == node.0) {
+            self.kept.swap_remove(at);
+            let gone = self.nodes.get(node.0 as usize).is_some_and(|entry| !entry.alive);
+            if gone && self.free.try_reserve(1).is_ok() {
+                self.free.push(node.0);
+            }
+        }
+        Ok(())
+    }
+
     fn flush(&mut self) -> Result<(), FsError> {
         Ok(())
     }
 
     fn set_attributes(&mut self, node: NodeId, attributes: u8) -> Result<(), FsError> {
         self.node_mut(node).ok_or(FsError::NotFound)?.attributes = attributes & attr::SETTABLE;
+        self.touch_status(node);
         Ok(())
     }
 
@@ -519,6 +674,7 @@ impl WritableFileSystem for RamFs {
         if times.accessed.is_some() {
             entry.times.accessed = times.accessed;
         }
+        self.touch_status(node);
         Ok(())
     }
 
@@ -529,6 +685,54 @@ impl WritableFileSystem for RamFs {
     fn make_device(&mut self, node: NodeId, kind: DeviceKind) -> Result<(), FsError> {
         self.resize(node, 0)?;
         self.node_mut(node).ok_or(FsError::NotFound)?.data = Data::Device(kind);
+        Ok(())
+    }
+
+    fn device(&self, node: NodeId) -> Option<DeviceKind> {
+        match self.node(node)?.data {
+            Data::Device(kind) => Some(kind),
+            _ => None,
+        }
+    }
+
+    fn posix(&self, node: NodeId) -> Option<crate::native::PosixMeta> {
+        use crate::native::{S_IFDIR, S_IFLNK, S_IFREG};
+        if !self.owners {
+            return None;
+        }
+        let entry = self.node(node)?;
+        // A link is a file marked as one, as the tree makes them.
+        let link = entry.attributes & attr::SYSTEM != 0
+            && matches!(&entry.data, Data::Owned(bytes) if bytes.starts_with(super::SYMLINK_MAGIC));
+        let mode = match entry.kind {
+            EntryKind::Directory => S_IFDIR | entry.mode,
+            EntryKind::File if link => S_IFLNK | 0o777,
+            EntryKind::File => S_IFREG | entry.mode,
+        };
+        Some(crate::native::PosixMeta { mode, uid: entry.uid, gid: entry.gid, nlink: 1, ino: u64::from(node.0) + 1 })
+    }
+
+    fn set_mode(&mut self, node: NodeId, mode: u16) -> Result<(), FsError> {
+        if !self.owners {
+            return Err(FsError::Unsupported);
+        }
+        self.node_mut(node).ok_or(FsError::NotFound)?.mode = mode & 0o7777;
+        self.touch_status(node);
+        Ok(())
+    }
+
+    fn set_owner(&mut self, node: NodeId, uid: Option<u32>, gid: Option<u32>) -> Result<(), FsError> {
+        if !self.owners {
+            return Err(FsError::Unsupported);
+        }
+        let entry = self.node_mut(node).ok_or(FsError::NotFound)?;
+        if let Some(uid) = uid {
+            entry.uid = uid;
+        }
+        if let Some(gid) = gid {
+            entry.gid = gid;
+        }
+        self.touch_status(node);
         Ok(())
     }
 }
@@ -545,6 +749,18 @@ mod tests {
         StaticNode::file("b.txt", Some(2), b"nested"),
     ];
     static LOWER: StaticFs = StaticFs::new(NODES);
+
+    #[test]
+    fn names_longer_than_a_directory_entry_carries_are_refused() {
+        let mut fs = RamFs::new(DEFAULT_QUOTA);
+        let root = fs.root();
+        let longest = "n".repeat(255);
+        fs.create_file(root, &longest).unwrap();
+        assert_eq!(fs.create_file(root, &"n".repeat(256)), Err(FsError::InvalidName));
+        assert_eq!(fs.create_dir(root, &"d".repeat(256)), Err(FsError::InvalidName));
+        let node = fs.lookup(root, &longest).unwrap();
+        assert_eq!(fs.rename(node, root, &"r".repeat(256)), Err(FsError::InvalidName));
+    }
 
     #[test]
     fn a_seeded_file_copies_up_only_when_written() {

@@ -18,6 +18,7 @@ const PROGRAM_HEADER_SIZE: usize = 56;
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
 const PT_INTERP: u32 = 3;
+const PT_PHDR: u32 = 6;
 const ET_EXEC: u16 = 2;
 /// `e_machine` of AArch64.
 pub const EM_AARCH64: u16 = 183;
@@ -113,6 +114,12 @@ pub struct Program {
     pub entry: u64,
     pub segments: [Segment; MAX_SEGMENTS],
     pub count: usize,
+    /// Where the program headers are in memory once loaded, for `AT_PHDR`: `PT_PHDR`'s
+    /// address, or else the address the `PT_LOAD` segment that covers them puts them at.
+    /// Zero if no segment loads them.
+    pub headers: u64,
+    /// How many program headers there are, for `AT_PHNUM`.
+    pub header_count: u16,
 }
 
 impl Program {
@@ -198,10 +205,14 @@ pub fn parse(head: &[u8], file_size: u64, limits: &Limits) -> Result<Program, Er
     let mut segments = [Segment::default(); MAX_SEGMENTS];
     let mut count = 0;
     let mut total = 0u64;
+    let mut phdr = None;
     for header in headers.as_chunks::<PROGRAM_HEADER_SIZE>().0 {
         let kind = read_u32(header, 0)?;
         if kind == PT_DYNAMIC || kind == PT_INTERP {
             return Err(Error::NotStatic);
+        }
+        if kind == PT_PHDR {
+            phdr = Some(read_u64(header, 16)?);
         }
         if kind != PT_LOAD {
             continue;
@@ -288,10 +299,21 @@ pub fn parse(head: &[u8], file_size: u64, limits: &Limits) -> Result<Program, Er
         return Err(Error::BadEntry);
     }
 
+    // Where the headers are once loaded: what `PT_PHDR` says, or where the segment holding
+    // their bytes in the file puts them, whole.
+    let table_size = (entries * PROGRAM_HEADER_SIZE) as u64;
+    let covered = loaded.iter().find_map(|segment| {
+        let into = (table as u64).checked_sub(segment.offset)?;
+        (into.checked_add(table_size)? <= segment.file_size).then(|| segment.address.checked_add(into)).flatten()
+    });
+    let headers = phdr.or(covered).unwrap_or(0);
+
     Ok(Program {
         entry,
         segments,
         count,
+        headers,
+        header_count: entries as u16,
     })
 }
 
@@ -309,6 +331,19 @@ mod tests {
 
     fn put(bytes: &mut [u8], at: usize, value: &[u8]) {
         bytes[at..at + value.len()].copy_from_slice(value);
+    }
+
+    #[test]
+    fn headers_are_found_where_they_load() {
+        // `good`'s headers are at offset 64, which no segment loads.
+        let program = parse(&good(), 0x3000, &LIMITS).unwrap();
+        assert_eq!((program.headers, program.header_count), (0, 2));
+        // A text segment from the file's start loads them.
+        let mut file = good();
+        header(&mut file, 0, PF_R | PF_X, 0, BASE, 0x1800, 0x1800);
+        put(&mut file, 24, &(BASE + 0x1000).to_le_bytes());
+        let program = parse(&file, 0x3000, &LIMITS).unwrap();
+        assert_eq!(program.headers, BASE + 64);
     }
 
     /// A good file: code at `BASE`, then data with a zeroed tail on the next page.

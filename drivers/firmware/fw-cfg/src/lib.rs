@@ -191,7 +191,7 @@ impl FwCfg {
         let mut access = DmaAccess {
             control: (((selector as u32) << 16) | CONTROL_SELECT | CONTROL_WRITE).to_be(),
             length: (data.len() as u32).to_be(),
-            address: (data.as_ptr() as u64).to_be(),
+            address: (feos_hal::dma::bus_address(data.as_ptr() as usize)).to_be(),
         };
 
         // The device reads the descriptor and the data when kicked, so both
@@ -201,7 +201,7 @@ impl FwCfg {
         // SAFETY: the descriptor is a live local, and the device is either
         // MMIO or a fixed I/O port range supplied by the board.
         unsafe {
-            let descriptor = addr_of_mut!(access) as u64;
+            let descriptor = feos_hal::dma::bus_address(addr_of_mut!(access) as usize);
             let high = ((descriptor >> 32) as u32).to_be();
             let low = (descriptor as u32).to_be();
 

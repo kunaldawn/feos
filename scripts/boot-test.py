@@ -192,6 +192,49 @@ def fail(guest, message):
     sys.exit(1)
 
 
+def rename_keeps_ino(guest, arch, directory, label):
+    """A file's inode number is the same after a rename, which the page cache and
+    mappings rely on: a shell `mv`, a kernel app's rename (`ftest`'s
+    `rename-over-existing` checks a program's)."""
+    guest.send(f"echo r > {directory}/ino-a; /bin/mtest --ino {directory}/ino-a; "
+               f"mv {directory}/ino-a {directory}/ino-b; /bin/mtest --ino {directory}/ino-b; "
+               f"rm {directory}/ino-b; echo ino-done-$((2 * 4))\r")
+    guest.expect("ino-done-8")
+    text = guest.log[-4000:].decode(errors="replace")
+    found = re.findall(r"mtest ino " + re.escape(directory) + r"/ino-[ab]: (\d+)", text)
+    if len(found) < 2 or found[-1] != found[-2]:
+        fail(guest, f"rename-keeps-ino on {directory}: {found}")
+    print(f"{label} {arch}: rename-keeps-ino on {directory or '/'}: ino {found[-1]}", flush=True)
+
+
+def dirty_storm(guest, arch, path, mib, label):
+    """A program dirtying every page of a shared file mapping as fast as it can, killed by
+    the kernel: what it wrote is written back with its space, each page one whole pass's,
+    and every frame comes back once the file is gone."""
+    guest.send(f"ktest dirty-storm {path} {mib}\r")
+    report = guest.capture(r"\[ktest\] (dirty-storm: [^\r\n]*)", 600)
+    print(f"{label} {arch}: {report}", flush=True)
+    if "ok=true" not in report:
+        fail(guest, report)
+
+
+def mapped_write_survives(guest, arch, kernel, args, path, text, mounted, label):
+    """Written through a shared mapping and `msync`ed, a file holds it: a kernel command,
+    which reads the filesystem and not the page cache, sees it, and so does the next boot
+    after the plug is pulled. Returns the new guest."""
+    guest.run("sync; echo pre-map-$?", "pre-map-0")
+    guest.run(f"/bin/mtest --persist {path} {text} 2>&1 | tail -1", "mtest persist: ok")
+    wanted = text.replace("$((3 * 7))", "21")
+    guest.run(f"cat {path}", wanted)
+    guest.crash()
+    guest = Guest(qemu_command(arch, kernel, args))
+    guest.expect(mounted, BOOT_TIMEOUT)
+    guest.boot_to_shell()
+    guest.run(f"cat {path}", wanted)
+    print(f"{label} {arch}: written through a mapping, synced, survived pulling the plug: {path}", flush=True)
+    return guest
+
+
 def persistence_test(arch, kernel):
     """Files outlive the machine, whether it shuts down or loses power."""
     disk = blank_disk(kernel, "disk.img")
@@ -225,6 +268,14 @@ def persistence_test(arch, kernel):
     guest.boot_to_shell()
     guest.run("cat /keep/synced.txt", "synced-25")
     guest.run("mkdir /keep/after && echo works-$? > /keep/after/f; cat /keep/after/f", "works-0")
+    # File mappings through the page cache, over the FAT root on a disk.
+    guest.run("mkdir /keep/mt; /bin/mtest --dir /keep/mt 2>&1 | tail -1", "mtest: all ok")
+    rename_keeps_ino(guest, arch, "/keep", "persistence")
+    # Shared writable mappings over FAT: 64 MiB dirtied and killed, and a synced write
+    # that outlives the machine.
+    dirty_storm(guest, arch, "/keep/storm", 64, "persistence")
+    guest = mapped_write_survives(guest, arch, kernel, args, "/keep/mapped.txt", "mapped-fat-$((3 * 7))",
+                                  "[fs] virtio0: mounted at /", "persistence")
     # Settings saved in one session are what the next one starts with.
     guest.run("printf 'theme: xp-blue\\nkeyboard: de\\n' > /etc/desktop.conf; sync; echo saved-$?", "saved-0")
     # Timestamps come from the hardware clock: a year nobody would make up.
@@ -235,6 +286,11 @@ def persistence_test(arch, kernel):
     guest.run("stat /keep/after/f | grep Modify | tr -d -c 0-9 | cut -c1-4 | sed s/^/stamp-/", f"stamp-{year}")
     guest.run("ln -s /keep/after/f /keep/link; cat /keep/link; readlink /keep/link", "/keep/after/f")
     guest.run("mount | grep -c 'on /tmp' | tr 1 T", "\nT")
+    # The layout of stage 1c.3: `/home` is on the disk and keeps what's put there, `/tmp`
+    # is RAM and starts empty at every boot.
+    guest.run("ls -d /root /home/user /usr/lib /usr/include | wc -l | tr 4 L", "\nL")
+    guest.run("readlink /usr/bin | tr / X", "Xbin")
+    guest.run("echo home-$((7 * 6)) > /home/user/kept; echo gone > /tmp/lost; sync; echo layout-$?", "layout-0")
     guest.send("poweroff\r")
     guest.wait_exit()
     fsck(disk)
@@ -243,9 +299,35 @@ def persistence_test(arch, kernel):
     guest.expect("settings restored: theme=xp-blue keyboard=de", BOOT_TIMEOUT)
     guest.boot_to_shell()
     guest.run("cat /keep/link", "works-0")
+    guest.run("cat /home/user/kept", "home-42")
+    guest.run("ls -A /tmp | wc -l | tr 0 Z", "\nZ")
+    print(f"persistence {arch}: /home kept what was put there, /tmp started empty", flush=True)
     guest.send("poweroff\r")
     guest.wait_exit()
     fsck(disk)
+
+    # Stage 1c.4: a file renamed over another with `RENAMEAT`, and times set to the
+    # nanosecond, are what a native mount has after the machine is turned off and on.
+    native = blank_disk(kernel, "disk-persist-native.img", 64 * 1024 * 1024)
+    subprocess.run([sys.executable, "scripts/mkfs-feos.py", native], check=True)
+    device = "virtio-blk-device" if arch == "arm" else "virtio-blk-pci"
+    both = args + ["-drive", f"if=none,id=n0,format=raw,file={native}", "-device", f"{device},drive=n0"]
+    guest = Guest(qemu_command(arch, kernel, both))
+    guest.expect("native filesystem mounted at /native0", BOOT_TIMEOUT)
+    guest.boot_to_shell()
+    guest.run("/bin/ftest --persist-write /native0 2>&1 | tail -1", "ftest persist-write: ok")
+    guest.send("poweroff\r")
+    guest.wait_exit()
+    guest = Guest(qemu_command(arch, kernel, both))
+    guest.expect("native filesystem mounted at /native0", BOOT_TIMEOUT)
+    guest.boot_to_shell()
+    guest.run("/bin/ftest --persist-check /native0 2>&1 | tail -1", "ftest persist-check: ok")
+    guest.run("fsck /native0", "/native0: clean")
+    print(f"persistence {arch}: a rename and nanosecond times survived a reboot on the native mount", flush=True)
+    guest.send("poweroff\r")
+    guest.wait_exit()
+    fsck(disk)
+    os.remove(native)
     os.remove(disk)
 
 
@@ -681,10 +763,16 @@ def fault_test(arch, kernel):
 def ram_test(arch, kernel):
     """The kernel uses whatever RAM it's given, however much that is."""
     # With 3 GiB on x86_64, QEMU puts the last of it above 4 GiB, where nothing reaches.
-    # Up to 2.75 GiB, it's all below the PCI hole.
-    for memory, mib in (("192M", 192), ("512M", 512), ("1G", 1024), ("2600M", 2600), ("3G", 2048 if arch == "x64" else 3072)):
+    # Up to 2.75 GiB, it's all below the PCI hole. With 8 GiB, QEMU's high regions (the
+    # 64-bit PCI hole on q35, the ECAM on virt) and the RAM above what's used all sit
+    # where the boot check has to find the kernel's mappings still below the user window.
+    big = 2048 if arch == "x64" else 3072
+    for memory, mib in (("192M", 192), ("512M", 512), ("1G", 1024), ("2600M", 2600), ("3G", big), ("8G", big)):
         guest = Guest(qemu_command(arch, kernel, memory=memory))
         report = guest.capture(r"\[mem\] (\d+ MiB of RAM)", BOOT_TIMEOUT)
+        window = guest.capture(r"\[mem\] (kernel mappings end at [^\r\n]*)", BOOT_TIMEOUT)
+        if "below the user window at 0x1000000000" not in window:
+            fail(guest, f"{memory}: no boot check of the user window: {window}")
         guest.boot_to_shell()
         guest.send("ktest mem\r")
         guest.expect("aligned=True intact=True restored=True".lower())
@@ -692,10 +780,32 @@ def ram_test(arch, kernel):
         # A little goes to firmware, and on x86 to its reserved low memory.
         if not mib - 32 <= total <= mib:
             fail(guest, f"{memory} of RAM reported as {total} MiB")
-        print(f"ram {arch} {memory}: {report}", flush=True)
+        print(f"ram {arch} {memory}: {report}; {window}", flush=True)
         guest.run("echo after-mem-$((6 * 7))", "after-mem-42")
         guest.send("poweroff\r")
         guest.wait_exit()
+
+    # Files mapped and read through, more than there's memory for, on a disk: the page
+    # cache takes back what nothing maps, and never a frame something was promised.
+    disk = blank_disk(kernel, "disk-pressure.img", DISK_SIZE)
+    guest = Guest(qemu_command(arch, kernel, disk_device(arch, disk), memory="192M"))
+    guest.boot_to_shell()
+    guest.send("ktest user-memory\r")
+    before = int(guest.capture(r"frames-free=(\d+) "))
+    free_mib = before // (1024 * 1024)
+    mib = max(160, free_mib + 64)
+    guest.send(f"mkdir -p /pressure; /bin/mtest --cache-pressure {mib} --dir /pressure; echo pressure-$?\r")
+    report = guest.capture(r"mtest (cache-pressure: [^\r\n]*)", 900)
+    guest.expect("pressure-0", 60)
+    print(f"ram {arch} 192M: {free_mib} MiB free, {report}", flush=True)
+    guest.send("ktest user-memory\r")
+    after = int(guest.capture(r"frames-free=(\d+) "))
+    if after != before:
+        fail(guest, f"frames leaked under cache pressure: {before} -> {after}")
+    guest.run("echo after-pressure-$((6 * 7))", "after-pressure-42")
+    guest.send("poweroff\r")
+    guest.wait_exit()
+    os.remove(disk)
 
 
 def irq_test(arch, kernel):
@@ -731,6 +841,68 @@ def irq_test(arch, kernel):
         os.remove(disk)
 
 
+def ps_rows(guest):
+    """The shell's `ps`, as (pid, threads, name) for each row."""
+    start = len(guest.log)
+    guest.send("ps; echo ps-$((40 + 2))\r")
+    guest.expect("ps-42", 120)
+    text = guest.log[start:].decode(errors="replace")
+    rows = re.findall(r"^[ *]\s*(\d+)\s+\d+\s+\S+\s+(\d+)\s+\d+/\d+\s+\d+\s+(\S[^\r\n]*?)\r?$", text, re.M)
+    return [(int(pid), int(threads), name) for pid, threads, name in rows]
+
+
+def taskmgr_rows(guest):
+    """`taskmgr --list`, the task manager's own process list, as (pid, name) rows."""
+    start = len(guest.log)
+    guest.send("taskmgr --list; echo listed-$((40 + 3))\r")
+    guest.expect("listed-43", 120)
+    text = guest.log[start:].decode(errors="replace")
+    if not re.search(r"\[taskmgr\] \d+ listed", text):
+        fail(guest, "taskmgr --list said nothing")
+    rows = re.findall(r"^\s*(\d+)\s+\d+\s+(\S[^\r\n]*?)\r?$", text, re.M)
+    return [(int(pid), name) for pid, name in rows]
+
+
+def many_tasks(guest, arch, label, count=200, taskmgr=False):
+    """Stage 1b.4's 1024 slots: `count` kernel tasks at once, each with a stack of its own
+    from the stack window, all listed by `ps` (and by the task manager, which builds its
+    list from a heap snapshot since 1b.5) and all killed, and every frame back."""
+    guest.send("ktest user-memory\r")
+    before = int(guest.capture(r"frames-free=(\d+) "))
+    start = len(guest.log)
+    guest.send(f"spawn {count} spin; echo spawned-$((1 + 1))\r")
+    guest.expect("spawned-2", 600)
+    pids = [int(pid) for pid in re.findall(rb"started pid (\d+): spin", guest.log[start:])]
+    if len(pids) != count:
+        fail(guest, f"spawn {count} spin started {len(pids)}")
+    listed = [pid for pid, _, name in ps_rows(guest) if name == "spin"]
+    if sorted(listed) != sorted(pids):
+        fail(guest, f"ps listed {len(listed)} of the {count} spin tasks")
+    if taskmgr:
+        listed = [pid for pid, name in taskmgr_rows(guest) if name == "spin"]
+        if sorted(listed) != sorted(pids):
+            fail(guest, f"taskmgr listed {len(listed)} of the {count} spin tasks")
+    # Typed a few characters at a time: with two hundred tasks runnable, the shell reads
+    # the console slowly enough for a whole line at once to overrun the UART's FIFO.
+    for at in range(0, len(pids), 20):
+        batch = " ".join(str(pid) for pid in pids[at:at + 20])
+        line = f"kill {batch} > /dev/null; echo killed-$(({at} + 1))\r"
+        for piece in range(0, len(line), 8):
+            guest.send(line[piece:piece + 8])
+            time.sleep(0.05)
+        guest.expect(f"killed-{at + 1}", 120)
+    time.sleep(1)
+    left = [pid for pid, _, name in ps_rows(guest) if name == "spin"]
+    if left:
+        fail(guest, f"{len(left)} spin tasks outlived their kill")
+    guest.send("ktest user-memory\r")
+    after = int(guest.capture(r"frames-free=(\d+) "))
+    if after != before:
+        fail(guest, f"frames leaked by {count} tasks: {before} -> {after}")
+    lister = "ps and taskmgr" if taskmgr else "ps"
+    print(f"{label}: spawn {count} spin, all listed by {lister} and killed, frames back: {before} -> {after}", flush=True)
+
+
 def smp_test(arch, kernel):
     """Tasks run on every CPU, and a failure on one stops the others."""
     for smp in (4, 1):
@@ -740,6 +912,23 @@ def smp_test(arch, kernel):
         guest.expect(f"[ktest] cpus: online={smp} ran-on={smp} ticking={smp}")
         guest.send("ktest fp\r")
         guest.expect("failures=0", 120)
+        # Address spaces across CPUs: a page another CPU has cached is flushed there
+        # before its frame goes, ASIDs survive running out, a user futex word is never a
+        # kernel one, whatever its frame, and a thread's end clears its word before it
+        # unmaps it. Every space's frames come back.
+        guest.send("ktest user-memory\r")
+        before = guest.capture(r"frames-free=(\d+) ")
+        for test in ("tlb", "asid-rollover", "futex-namespace", "thread-exit-clear"):
+            guest.send(f"ktest {test}\r")
+            report = guest.capture(rf"\[ktest\] ({test}:[^\r\n]*)[\r\n]", 300)
+            print(f"smp {arch} -smp {smp}: {report}", flush=True)
+            if "ok=true" not in report:
+                fail(guest, report)
+        guest.send("ktest user-memory\r")
+        after = guest.capture(r"frames-free=(\d+) ")
+        if before != after:
+            fail(guest, f"frames leaked by the space tests: {before} -> {after}")
+        many_tasks(guest, arch, f"smp {arch} -smp {smp}")
         guest.send("spawn tick 1000 10000\r")
         pid = guest.capture(r"started pid (\d+): tick")
         guest.run(f"kill {pid}", f"killed pid {pid}")
@@ -1340,11 +1529,15 @@ def user_command(arch, kernel, cpu=None, smp=4):
 
 def run_malicious(guest, arch, label):
     """Every probe has to report being blocked, each by name, and the machine stays up."""
-    guest.send("/bin/malicious; echo malicious-status-$?\r")
+    guest.send("/bin/malicious; echo malicious-status-$((0))-$?\r")
     guest.mark = len(guest.log)
-    guest.expect("malicious-status-0", 300)
+    status = guest.capture(r"malicious-status-0-(\d+)", 600)
     text = guest.log[guest.mark - 2000000 if guest.mark > 2000000 else 0:guest.mark].decode(errors="replace")
     start = text.rfind("/bin/malicious; echo")
+    if status != "0":
+        # Name what got through, and what its probe said, not just the status.
+        said = re.findall(r"^[^\r\n]*(?:NOT BLOCKED|uid-process-bomb:|pipe-exhaustion:|FAILED)[^\r\n]*", text[start:], re.M)
+        fail(guest, f"malicious exited {status}: " + " | ".join(said))
     probes = re.findall(r"probe ([a-z0-9-]+): (blocked|NOT BLOCKED)", text[start:])
     summary = re.search(r"malicious: (\d+) of (\d+) probes blocked", text[start:])
     if not summary or summary.group(1) != summary.group(2):
@@ -1405,12 +1598,13 @@ def user_test(arch, kernel):
     guest.run("x=$(/bin/hello captured); echo \"[${x##*=}]\"", "[captured]")
     print(f"user {arch}: argv, status, pipes and redirection work", flush=True)
 
-    # Anything else in a file is refused, not run.
-    guest.run("printf 'hello' > /tmp/not-elf; /tmp/not-elf 2>&1 | tr a-z A-Z; echo done-$?", "done-0")
-    guest.run("printf '\\177ELFjunk' > /tmp/bad; /tmp/bad 2>&1 | tr a-z A-Z", "TRUNCATED")
+    # Anything else in a file is refused, not run. `/tmp` keeps modes (stage 1c.3), so
+    # each is made executable first: what refuses it is then what's in it.
+    guest.run("printf 'hello' > /tmp/not-elf; chmod 755 /tmp/not-elf; /tmp/not-elf 2>&1 | tr a-z A-Z; echo done-$?", "done-0")
+    guest.run("printf '\\177ELFjunk' > /tmp/bad; chmod 755 /tmp/bad; /tmp/bad 2>&1 | tr a-z A-Z", "TRUNCATED")
     guest.run("/tmp/bad 2>/dev/null; echo bad-$?", "bad-126")
-    guest.run("head -c 200 /bin/hello > /tmp/cut; /tmp/cut 2>/dev/null; echo cut-$?", "cut-126")
-    guest.run("head -c 4097 /bin/hello > /tmp/cut2; /tmp/cut2 2>/dev/null; echo cut2-$?", "cut2-126")
+    guest.run("head -c 200 /bin/hello > /tmp/cut; chmod 755 /tmp/cut; /tmp/cut 2>/dev/null; echo cut-$?", "cut-126")
+    guest.run("head -c 4097 /bin/hello > /tmp/cut2; chmod 755 /tmp/cut2; /tmp/cut2 2>/dev/null; echo cut2-$?", "cut2-126")
     guest.run("/no/such/program; echo gone-$?", "gone-127")
     print(f"user {arch}: bad files are refused", flush=True)
 
@@ -1439,6 +1633,13 @@ def user_test(arch, kernel):
     # A program that tries everything.
     run_malicious(guest, arch, "smp=4")
     guest.run("echo survived-$((6 * 7))", "survived-42")
+
+    # More programs alive at once than 8-bit ASIDs, forced to 8 bits, all running.
+    guest.send("ktest asid-load\r")
+    report = guest.capture(r"\[ktest\] (asid-load:[^\r\n]*)[\r\n]", 600)
+    print(f"user {arch}: {report}", flush=True)
+    if "ok=true" not in report:
+        fail(guest, report)
 
     # A kernel-linked command at the same time, and user programs on every CPU, with
     # their floating point registers checked through preemption and migration.
@@ -1534,6 +1735,360 @@ def user_test(arch, kernel):
     guest.expect("vmcheck: separate", 60)
     guest.send("poweroff\r")
     guest.wait_exit()
+
+
+def mmap_test(arch, kernel):
+    """The memory calls. `mtest` runs by itself, then under `ktest drive`, which answers
+    its questions about free frames (no call says until SYSINFO), so the checks that are
+    about frames run too: a reservation that costs nothing, a populated mapping that costs
+    its pages at once. `malicious` runs driven the same way, so its VMA exhaustion and
+    table sweeps are seen to give every frame back. On four CPUs and on one."""
+    for smp in (4, 1):
+        guest = Guest(user_command(arch, kernel, smp=smp))
+        guest.boot_to_shell()
+        guest.send("ktest user-memory\r")
+        before = int(guest.capture(r"frames-free=(\d+) "))
+
+        guest.send("/bin/mtest; echo mtest-status-$?\r")
+        guest.expect("mtest: all ok", 300)
+        guest.expect("mtest-status-0")
+
+        start = len(guest.log)
+        guest.send("ktest drive /bin/mtest\r")
+        guest.expect("mtest: frame counts checked", 300)
+        guest.expect("mtest: all ok")
+        guest.expect("drive: /bin/mtest ended with status 0", 60)
+        text = guest.log[start:].decode(errors="replace")
+        if "FAILED" in text or "skipped" in text:
+            fail(guest, "mtest failed, or wasn't given frame counts")
+        checks = re.findall(r"mtest ([a-z0-9-]+): ok", text)
+        print(f"mmap {arch} smp={smp}: mtest {len(checks)} checks ok, with frame counts: " + " ".join(checks), flush=True)
+        for name in ("mmap2-noreserve-sparse", "prot-none-is-free", "mmap2-populate", "program-text-shared",
+                     "mmap-above-64g", "mmap2-noreserve-64g", "stack-8m", "stack-below-args", "stack-overflow-faults"):
+            line = re.search(r"mtest " + name + r": ok \(([^\r\n]*)\)", text)
+            print(f"mmap {arch} smp={smp}: {name}: {line.group(1) if line else '?'}", flush=True)
+
+        start = len(guest.log)
+        guest.send("ktest drive /bin/malicious\r")
+        guest.mark = start
+        status = guest.capture(r"drive: /bin/malicious ended with status (\d+),", 900)
+        guest.pump(0.5)
+        text = guest.log[start:].decode(errors="replace")
+        summary = re.search(r"malicious: (\d+) of (\d+) probes blocked", text)
+        if not summary or summary.group(1) != summary.group(2) or "NOT BLOCKED" in text or "got through" in text:
+            fail(guest, f"malicious, driven: {summary.group(0) if summary else 'no summary'}")
+        if status != "0":
+            fail(guest, f"malicious, driven, ended with status {status}")
+        for name in ("vma-exhaustion", "table-sweep"):
+            frames = re.search(r"probe " + name + r": frames (\d+)->(\d+)", text)
+            if not frames:
+                fail(guest, f"malicious, driven: no frame counts for {name}")
+            print(f"mmap {arch} smp={smp}: {name}: frames {frames.group(1)}->{frames.group(2)}", flush=True)
+        exhausted = re.search(r"probe vma-exhaustion: (made=[^\r\n]*)", text)
+        print(f"mmap {arch} smp={smp}: {summary.group(0)}; vma-exhaustion {exhausted.group(1) if exhausted else '?'}", flush=True)
+
+        # Files on the root too, and inode numbers across renames.
+        guest.run("mkdir -p /mt; /bin/mtest --dir /mt 2>&1 | tail -1", "mtest: all ok")
+        rename_keeps_ino(guest, arch, "/tmp", f"mmap smp={smp}")
+        rename_keeps_ino(guest, arch, "", f"mmap smp={smp}")
+
+        # Shared writable mappings: killed mid-storm, written back whole; and written,
+        # synced, read by a kernel command from the filesystem itself.
+        dirty_storm(guest, arch, "/tmp/ktest-dirty-storm", 12, f"mmap smp={smp}")
+        guest.run("/bin/mtest --persist /tmp/mapped.txt mapped-tmp-$((6 * 7)) 2>&1 | tail -1", "mtest persist: ok")
+        guest.run("cat /tmp/mapped.txt; rm /tmp/mapped.txt", "mapped-tmp-42")
+
+        # Everything every program took is back, and the machine is as it was.
+        time.sleep(1)
+        guest.send("ktest user-memory\r")
+        after = int(guest.capture(r"frames-free=(\d+) "))
+        if after != before:
+            fail(guest, f"frames leaked over the mmap phase: {before} -> {after}")
+        guest.run("echo survived-$((6 * 7))", "survived-42")
+        guest.run("ps | grep shell | wc -l | tr 1 Y", "\nY")
+        print(f"mmap {arch} smp={smp}: frames back: {before} -> {after}", flush=True)
+        guest.send("poweroff\r")
+        guest.wait_exit()
+
+
+TTEST_CHECKS = (
+    "thread-runs", "thread-arg", "gettid-differs", "getpid-same", "tls-per-thread", "tls-survives-migration",
+    "clear-word-wakes", "clear-word-inside-stack", "thread-exit-unmaps-stack", "joiner-reuses-stack-range",
+    "exit-ends-all-threads", "leader-exits-first", "last-thread-exit-status-0", "fp-per-thread",
+    "shared-memory-visible", "futex-between-threads", "munmap-while-other-thread-reads",
+    "fault-again-after-other-threads-discard", "user-mode-controls", "16-threads", "64-threads", "500-threads",
+)
+
+
+def threads_test(arch, kernel):
+    """Threads (stage 1b.2): `ttest` through every check, its thread pointers checked while
+    `taskset` moves them about, a thread bomb that the shell can still `ps` and `kill`, and
+    a fault injected into one thread's call ending its whole process. Every frame comes
+    back. On four CPUs and on one."""
+    arch_check = "tls-msr-direct" if arch == "arm" else "fs-selector-reload"
+    for smp in (4, 1):
+        label = f"threads {arch} smp={smp}"
+        # A native filesystem beside the RAM root, for `ktest kstack` to drive its journal.
+        native = blank_disk(kernel, "disk-kstack.img", 64 * 1024 * 1024)
+        subprocess.run([sys.executable, "scripts/mkfs-feos.py", native], check=True)
+        guest = Guest(qemu_command(arch, kernel, disk_device(arch, native), smp=str(smp)))
+        guest.expect("native filesystem mounted at /native0", BOOT_TIMEOUT)
+        guest.boot_to_shell()
+        guest.send("ktest user-memory\r")
+        before = int(guest.capture(r"frames-free=(\d+) "))
+
+        start = len(guest.log)
+        guest.send("/bin/ttest 2>&1; echo ttest-status-$?\r")
+        guest.expect("ttest: all ok", 300)
+        guest.expect("ttest-status-0")
+        text = guest.log[start:].decode(errors="replace")
+        if "FAILED" in text:
+            fail(guest, "ttest failed")
+        checks = dict(re.findall(r"ttest ([a-z0-9-]+): ok \(([^\r\n]*)\)", text))
+        missing = [name for name in TTEST_CHECKS + (arch_check,) if name not in checks]
+        if missing:
+            fail(guest, f"ttest didn't run {missing}")
+        print(f"{label}: ttest {len(checks)} checks ok: " + " ".join(checks), flush=True)
+        for name in ("tls-survives-migration", arch_check, "leader-exits-first", "user-mode-controls", "16-threads",
+                     "64-threads", "500-threads"):
+            print(f"{label}: {name}: {checks[name]}", flush=True)
+
+        # Thread pointers while something else moves the threads from CPU to CPU.
+        guest.send("/bin/ttest --migrate 3000 &\r")
+        pid = guest.capture(r"\[\d+\] (\d+)")
+        for step in range(12):
+            guest.send(f"taskset {1 << (step % smp):#x} {pid} > /dev/null\r")
+            time.sleep(0.2)
+        report = guest.capture(r"ttest (migrate: wrong=\d+ cpus=0x[0-9a-f]+)", 60)
+        guest.run(f"wait {pid}; echo migrate-$?", "migrate-0")
+        if not report.startswith("migrate: wrong=0 "):
+            fail(guest, report)
+        print(f"{label}: taskset every 200ms: {report}", flush=True)
+
+        # A thread bomb, held: the shell still lists it and kills it, and every slot comes
+        # back (the bomb run again makes as many).
+        made = []
+        for _ in range(2):
+            guest.send("/bin/malicious --thread-bomb --hold &\r")
+            bomb = guest.capture(r"\[\d+\] (\d+)")
+            made.append(guest.capture(r"thread-bomb: made=(\d+) then=-11", 60))
+            # `$!` is the shell's job, which runs the program as a child: its row is the
+            # one named for the program itself.
+            rows = ps_rows(guest)
+            threads = max((count for _, count, name in rows if name == "malicious"), default=0)
+            if threads != int(made[-1]) + 1:
+                fail(guest, f"ps shows {threads} threads for the bomb, which made {made[-1]}")
+            # The bomb stops where user programs have to: 960 tasks in all, 64 slots kept
+            # for the kernel. `ps` may be one more of those, and the shell's job another.
+            total = sum(count for _, count, _ in rows)
+            if not 960 <= total <= 962:
+                fail(guest, f"the bomb stopped at {total} tasks machine-wide, not 960")
+            guest.run(f"kill {bomb}; wait {bomb}; echo bomb-$?", "bomb-137")
+        if made[0] != made[1]:
+            fail(guest, f"thread bombs made {made}: slots didn't come back")
+        print(f"{label}: thread bomb made {made[0]} threads, at 960 tasks machine-wide, listed by ps and killed, twice", flush=True)
+
+        # User threads' 64 KiB kernel stacks: the deepest calls leave half unused.
+        guest.send("ktest kstack /native0\r")
+        report = guest.capture(r"\[ktest\] (kstack: user-peak[^\r\n]*)", 900)
+        print(f"{label}: {report}", flush=True)
+        if "ok=true" not in report:
+            fail(guest, report)
+
+        # Kernel apps killed while they take stacks and read others': nothing is left
+        # trimming, read or reserved.
+        guest.send("ktest kstack-kill\r")
+        report = guest.capture(r"\[ktest\] (kstack-kill: killed[^\r\n]*)", 300)
+        print(f"{label}: {report}", flush=True)
+        if "ok=true" not in report:
+            fail(guest, report)
+
+        # A fault in one thread's call: the whole process ends with 139, and nothing's left.
+        guest.send("ktest thread-fault\r")
+        report = guest.capture(r"\[ktest\] (thread-fault: threads[^\r\n]*)", 120)
+        print(f"{label}: {report}", flush=True)
+        if "ok=true" not in report:
+            fail(guest, report)
+
+        time.sleep(1)
+        guest.send("ktest user-memory\r")
+        after = int(guest.capture(r"frames-free=(\d+) "))
+        if after != before:
+            fail(guest, f"frames leaked over the threads phase: {before} -> {after}")
+        guest.run("echo survived-$((6 * 7))", "survived-42")
+        guest.run("ps | grep shell | wc -l | tr 1 Y", "\nY")
+        print(f"{label}: frames back: {before} -> {after}", flush=True)
+        guest.send("poweroff\r")
+        guest.wait_exit()
+        os.remove(native)
+
+
+RTEST_CHECKS = (
+    "realtime-near-rtc", "monotonic-never-backwards", "getres-positive", "nanosleep-relative", "nanosleep-absolute",
+    "futex-deadline-times-out", "futex-deadline-in-past", "futex-wake-before-deadline", "process-cputime-grows",
+    "thread-cputime-per-thread",
+)
+
+
+def time_test(arch, kernel):
+    """Clocks and deadlines (stage 1b.3): `rtest` through every check, told the host's UTC
+    time as the command is typed so the guest's wall clock (QEMU starts the RTC at the
+    host's) can be checked against it. Every frame comes back. On four CPUs and on one."""
+    for smp in (4, 1):
+        label = f"time {arch} smp={smp}"
+        guest = Guest(user_command(arch, kernel, smp=smp))
+        guest.expect("[time] wall clock from the RTC: ", BOOT_TIMEOUT)
+        guest.boot_to_shell()
+        guest.send("ktest user-memory\r")
+        before = int(guest.capture(r"frames-free=(\d+) "))
+
+        start = len(guest.log)
+        guest.send(f"/bin/rtest --now {int(time.time())} 2>&1; echo rtest-status-$?\r")
+        guest.expect("rtest: all ok", 300)
+        guest.expect("rtest-status-0")
+        text = guest.log[start:].decode(errors="replace")
+        if "FAILED" in text:
+            fail(guest, "rtest failed")
+        checks = dict(re.findall(r"rtest ([a-z0-9-]+): ok \(([^\r\n]*)\)", text))
+        missing = [name for name in RTEST_CHECKS if name not in checks]
+        if missing:
+            fail(guest, f"rtest didn't run {missing}")
+        for name in RTEST_CHECKS:
+            print(f"{label}: {name}: {checks[name]}", flush=True)
+
+        time.sleep(1)
+        guest.send("ktest user-memory\r")
+        after = int(guest.capture(r"frames-free=(\d+) "))
+        if after != before:
+            fail(guest, f"frames leaked over the time phase: {before} -> {after}")
+        guest.run("echo survived-$((6 * 7))", "survived-42")
+        print(f"{label}: frames back: {before} -> {after}", flush=True)
+        guest.send("poweroff\r")
+        guest.wait_exit()
+
+
+FTEST_CHECKS = (
+    "dup3-shares-offset", "dup3-cloexec", "fcntl-dupfd-lowest", "fcntl-getfl-setfl",
+    "pipe2-nonblock-eagain", "pipe2-cloexec", "pipe-eof-after-last-writer", "pipe-epipe",
+    "pipe-large-write-completes", "file-write-4mib-one-call", "write-past-eof-zero-fills",
+    "read-dir-eisdir", "close-range", "close-range-cloexec", "fd-1000", "path-4000",
+    "path-relative-4096", "append-two-processes",
+    # Stage 1c.2: opening, looking and directories.
+    "openat-relative-to-dirfd", "openat-excl", "openat-directory-enotdir", "openat-nofollow-eloop",
+    "openat-trailing-slash-enotdir", "mkdirat-trailing-slash", "dotdot-after-symlink-is-physical",
+    "o-path-fstat", "fstatat-nofollow", "fstatat-empty-path-pipe", "getdents-lists-all",
+    "getdents-seek-cookie", "getdents-seek-cur", "getdents-orphans-hidden", "mkdirat-umask",
+    "unlinkat-removedir-enotempty", "unlink-open-file-still-reads", "unlink-mapped-file-still-reads",
+    "unlink-running-program", "ftruncate-grow-shrink", "pread-pwrite-keep-offset",
+    "pwrite-append-at-offset", "fsync-writes-back-mapping", "fchdir-getcwd", "getcwd-no-nul",
+    "getcwd-erange", "fd-path-canonical", "current-exe",
+    # Stage 1c.3: `/dev`, `/proc/self` and the image layout.
+    "dev-null-read-eof", "dev-null-write-discards", "dev-zero-reads-zero", "dev-zero-mmap-is-anon",
+    "dev-full-enospc", "dev-fd-dups", "dev-stdout-link", "dev-shm-map-shared", "proc-self-exe-exists",
+    "proc-self-exe-matches-current-exe", "proc-self-fd-lists-open", "proc-other-pid-enoent", "tmp-sticky",
+    "etc-files-present", "image-layout",
+    # Stage 1c.4: changing the tree, and times.
+    "rename-over-existing", "rename-noreplace-eexist", "rename-exdev", "rename-dir-into-itself-einval",
+    "rename-over-open-file-still-reads", "rename-over-running-program", "linkat-follow",
+    "symlinkat-readlinkat", "readlink-truncates", "fchmodat-empty-path", "fchownat-root-only",
+    "fchownat-keep-both-widths", "utimensat-now-omit", "utimensat-nanoseconds",
+    "mtime-advances-within-second", "ctime-on-chmod", "dir-mtime-on-create", "faccessat-modes",
+    "fstatvfs-counts", "sync-ok",
+    # Stage 1c.5: locks.
+    "flock-exclusive-blocks", "flock-nb-eagain", "flock-shared-shares", "flock-released-at-exit",
+    "fcntl-setlk-conflict", "fcntl-getlk-reports-pid", "fcntl-locks-dropped-on-close",
+    "flock-struct-padding-ignored", "sqlite-style",
+)
+
+
+def run_ftest(guest, label, directory, keeps=""):
+    """`ftest` with its files in `directory`: every check, every frame back after, and no
+    orphan left waiting (stage 1c.2: what was unlinked while in use goes once let go, as
+    is what a rename replaced, from 1c.4). The symbolic links the 1c.2 checks use are made
+    here, with the shell's `ln -s`. `keeps` says what the filesystem keeps: `--coarse`
+    for FAT's two-second times and no modes, `--hard-links` for the native format's."""
+    guest.send("ktest user-memory\r")
+    before = int(guest.capture(r"frames-free=(\d+) "))
+    start = len(guest.log)
+    links = (f"mkdir -p {directory}/ftest-real/sub; ln -s {directory}/ftest-real/sub {directory}/ftest-hop; "
+             f"ln -s {directory}/ftest-real/file {directory}/ftest-flink")
+    guest.send(f"{links}; /bin/ftest --dir {directory} {keeps} 2>&1; echo ftest-status-$?\r")
+    status = guest.capture(r"ftest-status-(\d+)", 600)
+    text = guest.log[start:guest.mark].decode(errors="replace")
+    failed = re.findall(r"ftest ([a-z0-9-]+): FAILED \(([^\r\n]*)\)", text)
+    if failed or "ftest: all ok" not in text or status != "0":
+        fail(guest, f"{label}: ftest failed: {failed}")
+    checks = dict(re.findall(r"ftest ([a-z0-9-]+): ok \(([^\r\n]*)\)", text))
+    missing = [name for name in FTEST_CHECKS if name not in checks]
+    if missing:
+        fail(guest, f"{label}: ftest didn't run {missing}")
+    for name in FTEST_CHECKS:
+        print(f"{label}: {name}: {checks[name]}", flush=True)
+    guest.run(f"rm {directory}/ftest-hop {directory}/ftest-flink; echo unlinked-$?", "unlinked-0")
+    time.sleep(1)
+    guest.send("ktest user-memory\r")
+    after = int(guest.capture(r"frames-free=(\d+) "))
+    orphans = int(guest.capture(r"orphans=(\d+)"))
+    locks = int(guest.capture(r"locks=(\d+)"))
+    if after != before:
+        fail(guest, f"{label}: frames leaked over ftest: {before} -> {after}")
+    if orphans != 0:
+        fail(guest, f"{label}: {orphans} orphans still waiting after ftest")
+    # Stage 1c.5: every lock its processes took went with them.
+    if locks != 0:
+        fail(guest, f"{label}: {locks} locks still held after ftest")
+    print(f"{label}: frames back: {before} -> {after}, no orphans or locks left", flush=True)
+
+
+def posix_fs_test(arch, kernel):
+    """Descriptors and transfers (stage 1c.1), and opening, looking and directories (1c.2):
+    `ftest` on the RAM root, then on a FAT root and a native mount beside it, and
+    `malicious`'s descriptor and path probes with the rest."""
+    guest = Guest(user_command(arch, kernel))
+    guest.boot_to_shell()
+    if b"root is in RAM" not in guest.log:
+        fail(guest, "with no disk, the root wasn't in RAM")
+    run_ftest(guest, f"posix-fs {arch} ram", "/tmp/ftest")
+    # The path probes among them hide an orphan the run makes, v1's calls as v2's.
+    run_malicious(guest, arch, "posix-fs ram")
+    # Stage 1c.5: a program killed in `F_SETLKW` leaves the lock table as it was, which
+    # only the kernel can check (and kill: programs can't until 1c.8). Then nothing that
+    # malicious's probes locked is left.
+    guest.send("ktest setlkw-killed\r")
+    if guest.capture(r"\[ktest\] setlkw-killed: (ok|FAILED)", 120) != "ok":
+        fail(guest, "posix-fs ram: setlkw-killed failed")
+    guest.send("ktest user-memory\r")
+    if int(guest.capture(r"locks=(\d+)")) != 0:
+        fail(guest, "posix-fs ram: locks left after malicious")
+    # The RAM root keeps no owners, where `/tmp` (stage 1c.3) does.
+    guest.run("mkdir /open; /bin/permtest --permissionless /open; echo open-status-$?", "open-status-0")
+    # What a shell sees of `/dev` and `/proc` too: the same mounts, no process of its own.
+    guest.run("ls /dev | tr '\\n' ' '", "console fd full null shm stderr stdin stdout tty zero")
+    guest.run("ls /proc | wc -l | tr 0 E", "\nE")
+    guest.run("mount | grep -cE ' on /(proc|dev|dev/shm|tmp) type' | tr 4 F", "\nF")
+    guest.run("echo survived-$((6 * 7))", "survived-42")
+    guest.send("poweroff\r")
+    guest.wait_exit()
+
+    root = blank_disk(kernel, "disk-posix-root.img", 64 * 1024 * 1024)
+    native = blank_disk(kernel, "disk-posix-native.img", 128 * 1024 * 1024)
+    subprocess.run([sys.executable, "scripts/mkfs-feos.py", native], check=True)
+    device = "virtio-blk-device" if arch == "arm" else "virtio-blk-pci"
+    args = []
+    for path, label in ((native, "n0"), (root, "r0")):
+        args += ["-drive", f"if=none,id={label},format=raw,file={path}", "-device", f"{device},drive={label}"]
+    guest = Guest(qemu_command(arch, kernel, args))
+    guest.expect("native filesystem mounted at /native0", BOOT_TIMEOUT)
+    guest.boot_to_shell()
+    run_ftest(guest, f"posix-fs {arch} fat", "/ftest", "--coarse")
+    run_ftest(guest, f"posix-fs {arch} native", "/native0/ftest", "--hard-links")
+    guest.run("fsck /native0", "/native0: clean")
+    guest.run("sync; echo synced-$?", "synced-0")
+    guest.send("poweroff\r")
+    guest.wait_exit()
+    fsck(root)
+    os.remove(native)
+    os.remove(root)
 
 
 def screen_has(guest, kernel, color, least):
@@ -1811,9 +2366,21 @@ def terminal_test(arch, kernel):
     guest.send("\x1c")
     guest.expect("entering the serial shell")
     guest.run("cat /tmp/pasted", "got-SELECT-ME-42")
+    print(f"terminal {arch}: a drag copied and pasted back through the clipboard", flush=True)
+    # A running program's file can't be written over, by a kernel app either.
+    guest.send("/bin/spin 2 0 &\r")
+    guest.capture(r"\[\d+\] (\d+)")
+    time.sleep(1)
+    guest.run("cp /bin/hello /bin/spin 2>&1 | tr A-Z a-z", "text file busy")
+    guest.run("cmp /bin/spin /bin/hello >/dev/null; echo differ-$?", "differ-1")
+    guest.run("kill $!; wait $!; echo stopped-$?", "stopped-137")
+    guest.run("cp /bin/spin /tmp/spin-copy; cp /tmp/spin-copy /bin/spin; echo copied-$?", "copied-0")
+    print(f"terminal {arch}: cp over a running program: text file busy", flush=True)
+    # Stage 1b.5: what lists processes does so from a heap snapshot, so five hundred of
+    # them are all there, in `ps` and in the task manager's list.
+    many_tasks(guest, arch, f"terminal {arch}", count=500, taskmgr=True)
     guest.send("poweroff\r")
     guest.wait_exit()
-    print(f"terminal {arch}: a drag copied and pasted back through the clipboard", flush=True)
 
 
 def search_test(arch, kernel):
@@ -2129,7 +2696,8 @@ def native_test(arch, kernel):
     checks = guest.capture(r"permtest: native: (\d+ checks, \d+ failed)")
     guest.expect("perm-status-0")
     print(f"native {arch}: as user 1000 at EL0/ring 3: {checks}", flush=True)
-    guest.run("mkdir /tmp/open; /bin/permtest --permissionless /tmp/open; echo open-status-$?", "open-status-0")
+    # `/tmp` keeps owners and modes since stage 1c.3 (it's sticky), so the RAM case of a
+    # filesystem with none is the RAM root's, which `posix-fs` boots with.
     guest.run("mkdir /loose; /bin/permtest --permissionless /loose; echo fat-status-$?", "fat-status-0")
     # A kernel-linked command runs as root, and isn't checked. A program is.
     guest.run("cat /native0/perm/secret; id | tr a-z A-Z", "UID=0(ROOT)")
@@ -2138,6 +2706,11 @@ def native_test(arch, kernel):
     guest.send("/bin/runas 0 0 /bin/cat /native0/perm/secret; echo allowed-$?\r")
     guest.expect("top secret")
     guest.expect("allowed-0")
+    # The page cache over the native filesystem: mappings, coherence, ETXTBSY, renames.
+    guest.run("mkdir /native0/mt; /bin/mtest --dir /native0/mt 2>&1 | tail -1", "mtest: all ok")
+    rename_keeps_ino(guest, arch, "/native0", "native")
+    guest = mapped_write_survives(guest, arch, kernel, args, "/native0/mapped.txt", "mapped-native-$((3 * 7))",
+                                  "native filesystem mounted at /native0", "native")
     guest.run("fsck /native0; sync", "/native0: clean")
     guest.send("poweroff\r")
     guest.wait_exit()
@@ -2458,8 +3031,8 @@ def main():
         sys.exit(__doc__)
     arch, kernel = sys.argv[1:]
     only = os.environ.get("FEOS_BOOT_TEST_ONLY")
-    if only in ("milestone", "partition", "format", "install", "persistence", "gpu", "transport", "smp", "irq", "ram", "fault", "sched", "gicv3", "net", "usb", "efi", "el", "input", "user", "hosted", "jobs", "names", "settings", "terminal", "search", "resolution", "fonts", "native"):
-        globals()[only + "_test"](arch, kernel)
+    if only in ("milestone", "partition", "format", "install", "persistence", "gpu", "transport", "smp", "irq", "ram", "fault", "sched", "gicv3", "net", "usb", "efi", "el", "input", "user", "mmap", "threads", "time", "hosted", "jobs", "names", "settings", "terminal", "search", "resolution", "fonts", "native", "posix-fs"):
+        globals()[only.replace("-", "_") + "_test"](arch, kernel)
         print(f"{only} boot test passed: {arch}")
         return
     persistence_test(arch, kernel)
@@ -2481,6 +3054,10 @@ def main():
     el_test(arch, kernel)
     input_test(arch, kernel)
     user_test(arch, kernel)
+    mmap_test(arch, kernel)
+    threads_test(arch, kernel)
+    time_test(arch, kernel)
+    posix_fs_test(arch, kernel)
     hosted_test(arch, kernel)
     jobs_test(arch, kernel)
     names_test(arch, kernel)

@@ -1298,6 +1298,9 @@ impl Shell<'_> {
     ) -> i32 {
         let absolute = self.fs.resolve(path);
         let cwd = self.fs.cwd().to_string();
+        // A program's environment is what the shell exports, the command's own
+        // assignments (`FOO=bar prog`) among them, as for any command.
+        let env = self.env.entries();
         let result = {
             let view = RefCell::new(StreamView {
                 fds: &mut self.fds,
@@ -1321,7 +1324,7 @@ impl Shell<'_> {
                 view: &view,
                 fd: 2,
             };
-            host.run_program(&absolute, args, &cwd, &mut stdin, &mut stdout, &mut stderr, background)
+            host.run_program(&absolute, args, &env, &cwd, &mut stdin, &mut stdout, &mut stderr, background)
         };
         let Some(status) = result else {
             self.error(io, &format!("{path}: cannot execute binary file"));

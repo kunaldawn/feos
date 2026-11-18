@@ -106,19 +106,38 @@ pub fn midr_el1() -> u64 {
 
 const MSR_EFER: u32 = 0xc000_0080;
 const EFER_NXE: u32 = 1 << 11;
+/// `CR4.TSD`: `rdtsc` only at ring 0. Kept clear: programs may read the counter.
+const CR4_TSD: u64 = 1 << 2;
+/// `CR4.PCE`: `rdpmc` at ring 3. Kept clear.
+const CR4_PCE: u64 = 1 << 8;
 const CR4_UMIP: u64 = 1 << 11;
+/// `CR4.FSGSBASE`: `wrfsbase` and friends at ring 3. Kept clear, or a program could set
+/// the GS base `swapgs` relies on.
+const CR4_FSGSBASE: u64 = 1 << 16;
+/// `CR4.OSXSAVE`: `xsave` and `XCR0`, which AVX needs. Kept clear: the trap frame holds
+/// what `fxsave` saves, the x87 and SSE state, and nothing wider, so with this clear an
+/// AVX instruction is `#UD` rather than state another thread could see, and `cpuid` says
+/// so (its OSXSAVE bit follows this one).
+const CR4_OSXSAVE: u64 = 1 << 18;
+const MSR_FS_BASE: u32 = 0xc000_0100;
 const CR4_SMEP: u64 = 1 << 20;
 const CR4_SMAP: u64 = 1 << 21;
 
 static HAS_NX: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static HAS_SMEP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static HAS_SMAP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static HAS_UMIP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Turns on what this CPU has for keeping the kernel and programs apart. Call once on
 /// each, before anything runs from ring 3.
 ///
 /// SMAP is safe to leave on all the time: the kernel never touches a user page at
 /// its user address, as `feos-vm` explains, so it never needs to lift it.
+///
+/// What ring 3 may do is `docs/feos-abi-v2.md` section 1's: `rdtsc`, `rdtscp`, `cpuid`,
+/// `rdrand`, the fences and `pause`, and no more. `sgdt`, `sidt`, `sldt`, `smsw` and `str`
+/// fault where the CPU has UMIP; `rdpmc`, `wrfsbase` and AVX (see [`CR4_OSXSAVE`]) fault
+/// everywhere.
 pub fn protect() {
     let extended = core::arch::x86_64::__cpuid(0x8000_0001);
     let nx = extended.edx & (1 << 20) != 0;
@@ -157,8 +176,10 @@ pub fn protect() {
         if umip {
             cr4 |= CR4_UMIP;
         }
+        cr4 &= !(CR4_TSD | CR4_PCE | CR4_FSGSBASE | CR4_OSXSAVE);
         asm!("mov cr4, {}", in(reg) cr4, options(nostack));
     }
+    HAS_UMIP.store(umip, Ordering::Relaxed);
     HAS_NX.store(nx, Ordering::Relaxed);
     HAS_SMEP.store(smep, Ordering::Relaxed);
     HAS_SMAP.store(smap, Ordering::Relaxed);
@@ -172,4 +193,32 @@ pub fn has_nx() -> bool {
 /// Whether SMEP and SMAP are on.
 pub fn has_smep_smap() -> (bool, bool) {
     (HAS_SMEP.load(Ordering::Relaxed), HAS_SMAP.load(Ordering::Relaxed))
+}
+
+/// Whether `sgdt` and the rest fault at ring 3.
+pub fn has_umip() -> bool {
+    HAS_UMIP.load(Ordering::Relaxed)
+}
+
+/// Sets the user thread pointer, the FS base. `value` must be canonical: the caller
+/// keeps it in the user window.
+pub fn set_user_tls(value: usize) {
+    // SAFETY: the kernel never uses FS, and a canonical value can't fault.
+    unsafe {
+        asm!(
+            "wrmsr",
+            in("ecx") MSR_FS_BASE,
+            in("eax") value as u32,
+            in("edx") (value >> 32) as u32,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+/// The FS base as the CPU has it.
+pub fn user_tls() -> usize {
+    let (low, high): (u32, u32);
+    // SAFETY: reading an MSR that always exists in long mode.
+    unsafe { asm!("rdmsr", in("ecx") MSR_FS_BASE, out("eax") low, out("edx") high, options(nomem, nostack, preserves_flags)) };
+    (u64::from(high) << 32 | u64::from(low)) as usize
 }

@@ -1,0 +1,12 @@
+[package]
+name = "feos-locks"
+description = "Advisory file locks: POSIX record locks and flock, their ranges, conflicts and caps"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]

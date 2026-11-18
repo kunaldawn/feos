@@ -18,8 +18,8 @@ use core::sync::atomic::{AtomicPtr, Ordering};
 
 use feos_app::pipe::{self, PipeReader, PipeWriter, Transfer};
 use feos_app::{
-    shell, App, ArgBlock, Context, Platform, ProcessInfo, Processes, SpawnError, SpawnIo, WaitStatus,
-    MAX_ARGC, MAX_PROCESSES, PROCESS_ARGS_MAX,
+    shell, App, ArgBlock, Context, Platform, ProcessSnapshot, Processes, SpawnError, SpawnIo, WaitStatus,
+    MAX_ARGC, PROCESS_ARGS_MAX,
 };
 use feos_coreutils::{Available, Input, MemoryInfo, Output, System};
 use feos_gfx::Canvas;
@@ -350,12 +350,12 @@ impl<'d> ProcessHost<'d> {
     /// Calls `change` on a process and everything it started, as job control
     /// must: a job's shell waits on the commands that are doing the work.
     fn for_tree(&self, pid: u32, mut change: impl FnMut(u32)) {
-        let mut infos = [ProcessInfo::EMPTY; MAX_PROCESSES];
-        let count = self.platform.processes.snapshot(&mut infos);
-        let mut tree = [0u32; MAX_PROCESSES];
-        let found = feos_app::process_tree(&infos[..count], pid, &mut tree);
-        for member in &tree[..found] {
-            change(*member);
+        // With no heap for the table, the job's own process is still told: the rest of
+        // its tree is what's left out.
+        let tree = ProcessSnapshot::take(self.platform.processes).and_then(|snapshot| snapshot.tree(pid));
+        match tree {
+            Some(tree) => tree.into_iter().for_each(&mut change),
+            None => change(pid),
         }
     }
 
@@ -409,17 +409,19 @@ impl<'d> ProcessHost<'d> {
     }
 
     /// Starts a user program and looks after its streams until it ends.
+    #[allow(clippy::too_many_arguments)]
     fn run_user(
         &mut self,
         path: &str,
         argv: &[&str],
+        env: &[&str],
         cwd: &str,
         stdin: &mut dyn Input,
         stdout: &mut dyn Output,
         stderr: &mut dyn Output,
     ) -> Result<i32, SpawnError> {
         let processes = self.platform.processes;
-        self.start_foreground(stdin, stdout, stderr, |io| processes.spawn_user(path, argv, cwd, io))
+        self.start_foreground(stdin, stdout, stderr, |io| processes.spawn_user(path, argv, env, cwd, io))
     }
 
     fn start_foreground(
@@ -706,6 +708,7 @@ impl Host for ProcessHost<'_> {
         &mut self,
         path: &str,
         args: &[String],
+        env: &[String],
         cwd: &str,
         stdin: &mut dyn Input,
         stdout: &mut dyn Output,
@@ -713,12 +716,13 @@ impl Host for ProcessHost<'_> {
         background: bool,
     ) -> Option<i32> {
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        let env: Vec<&str> = env.iter().map(String::as_str).collect();
         if background {
             let io = SpawnIo {
                 background: true,
                 ..SpawnIo::default()
             };
-            return Some(match self.platform.processes.spawn_user(path, &argv, cwd, io) {
+            return Some(match self.platform.processes.spawn_user(path, &argv, &env, cwd, io) {
                 Ok(pid) => {
                     let mut message = String::new();
                     let _ = writeln!(message, "[shell] {path} started as PID {pid}");
@@ -728,7 +732,7 @@ impl Host for ProcessHost<'_> {
                 Err(error) => report_spawn(path, error, stderr),
             });
         }
-        Some(match self.run_user(path, &argv, cwd, stdin, stdout, stderr) {
+        Some(match self.run_user(path, &argv, &env, cwd, stdin, stdout, stderr) {
             Ok(status) => status,
             Err(error) => report_spawn(path, error, stderr),
         })
@@ -900,6 +904,7 @@ fn report_spawn(name: &str, error: SpawnError, stderr: &mut dyn Output) -> i32 {
         SpawnError::NoFreeSlot => "no free process slot",
         SpawnError::ArgsTooLong => "arguments too long",
         SpawnError::Unsupported => "this kernel can't start processes",
+        SpawnError::NoMemory => "out of memory",
     };
     let mut message = String::new();
     let _ = writeln!(message, "{name}: {detail}");
@@ -932,7 +937,7 @@ mod tests {
             0
         }
 
-        fn snapshot(&self, _out: &mut [ProcessInfo]) -> usize {
+        fn snapshot(&self, _out: &mut [feos_app::ProcessInfo]) -> usize {
             0
         }
 

@@ -143,6 +143,126 @@ pub unsafe fn unmap_range(
     true
 }
 
+/// A page of a kernel window: ordinary write-back memory (MAIR 1), inner shareable, the
+/// access flag set, read-write at EL1 and nothing at EL0, never executable, global.
+const KERNEL_PAGE: u64 = TYPE_PAGE | (1 << 2) | (3 << 8) | (1 << 10) | (3 << 53);
+
+/// Zeroes a page given over to being a table.
+///
+/// # Safety
+/// `table` must be a page nothing else uses.
+unsafe fn clear_table(table: usize) {
+    for index in 0..ENTRIES {
+        // SAFETY: as promised by the caller.
+        unsafe { (table as *mut u64).add(index).write_volatile(0) };
+    }
+}
+
+/// See `Arch::reserve_kernel_window`. The window's top-level entry gets a level 2
+/// table, and that a level 3 table for each 2 MiB, all from the start, so pages come
+/// and go later without a table changing under another CPU.
+///
+/// # Safety
+/// As for `Arch::reserve_kernel_window`.
+pub unsafe fn reserve_kernel_window(
+    base: usize,
+    size: usize,
+    alloc_table: &mut dyn FnMut() -> Option<usize>,
+) -> bool {
+    if !base.is_multiple_of(L1_BLOCK) || size == 0 || size > L1_BLOCK || !size.is_multiple_of(L2_BLOCK) || base + size > MAPPED {
+        return false;
+    }
+    // SAFETY: the index is inside the static table, as `base` was checked.
+    let l1 = unsafe { addr_of_mut!(page_table).cast::<u64>().add(base / L1_BLOCK) };
+    // SAFETY: as above.
+    if unsafe { read_volatile(l1) } & 1 != 0 {
+        return false;
+    }
+    let Some(l2) = alloc_table() else {
+        return false;
+    };
+    // SAFETY: `alloc_table` gave this page to be a table.
+    unsafe { clear_table(l2) };
+    for index in 0..size / L2_BLOCK {
+        let Some(l3) = alloc_table() else {
+            return false;
+        };
+        // SAFETY: as above, for both tables.
+        unsafe {
+            clear_table(l3);
+            (l2 as *mut u64).add(index).write_volatile(l3 as u64 | TYPE_TABLE);
+        }
+    }
+    // An entry going from invalid to valid needs no break-before-make: nothing can have
+    // cached what wasn't there.
+    // SAFETY: the tables are written, and the barrier makes them visible first.
+    unsafe {
+        asm!("dsb ishst", options(nostack, preserves_flags));
+        l1.write_volatile(l2 as u64 | TYPE_TABLE);
+        asm!("dsb ishst", "isb", options(nostack, preserves_flags));
+    }
+    true
+}
+
+/// The level 3 entry for `address` in a kernel window, or `None` if it isn't in one.
+fn window_entry(address: usize) -> Option<*mut u64> {
+    if address >= MAPPED {
+        return None;
+    }
+    // SAFETY: the index is inside the static table; the tables below it are the
+    // window's, which never change once made.
+    unsafe {
+        let l1 = read_volatile(addr_of!(page_table).cast::<u64>().add(address / L1_BLOCK));
+        if l1 & TYPE_MASK != TYPE_TABLE {
+            return None;
+        }
+        let l2 = read_volatile(((l1 & ADDRESS) as *const u64).add(address / L2_BLOCK % ENTRIES));
+        if l2 & TYPE_MASK != TYPE_TABLE {
+            return None;
+        }
+        Some(((l2 & ADDRESS) as *mut u64).add(address / PAGE_SIZE % ENTRIES))
+    }
+}
+
+/// See `Arch::map_kernel_page`.
+///
+/// # Safety
+/// As for `Arch::map_kernel_page`.
+pub unsafe fn map_kernel_page(address: usize, frame: usize) {
+    let Some(entry) = window_entry(address) else {
+        return;
+    };
+    // SAFETY: the entry is the window's, and the caller's to change. Invalid to valid
+    // needs no invalidation; the barriers make it visible to this CPU's next walk.
+    unsafe {
+        entry.write_volatile(frame as u64 & ADDRESS | KERNEL_PAGE);
+        asm!("dsb ishst", "isb", options(nostack, preserves_flags));
+    }
+}
+
+/// See `Arch::unmap_kernel_page`. The entry is global, so the invalidation is for every
+/// ASID, and broadcast.
+///
+/// # Safety
+/// As for `Arch::unmap_kernel_page`.
+pub unsafe fn unmap_kernel_page(address: usize) {
+    let Some(entry) = window_entry(address) else {
+        return;
+    };
+    // SAFETY: as above; invalidating the TLB has no other effect.
+    unsafe {
+        entry.write_volatile(0);
+        asm!(
+            "dsb ishst",
+            "tlbi vaae1is, {}",
+            "dsb ish",
+            "isb",
+            in(reg) (address as u64) >> 12,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
 /// A user page: access flag, inner shareable, write-back, not global, so that it only
 /// counts for its ASID. The kernel may never run it, and a program can reach it.
 const USER_PAGE: u64 = TYPE_PAGE | (1 << 2) | (3 << 8) | (1 << 10) | (1 << 11) | (1 << 6) | (1 << 53);
@@ -178,6 +298,16 @@ pub unsafe fn prepare_user_tables(tables: usize) -> usize {
     tables
 }
 
+/// One past the highest address the kernel's top table maps anything at: what every
+/// process's top table holds of the kernel's.
+pub fn kernel_map_end() -> usize {
+    (0..ENTRIES)
+        .rev()
+        // SAFETY: a table of `ENTRIES`, which only boot changes, before the others start.
+        .find(|&index| unsafe { addr_of!(page_table).cast::<u64>().add(index).read_volatile() } & 1 != 0)
+        .map_or(0, |index| (index + 1) * L1_BLOCK)
+}
+
 /// Loads a process's tables, or the kernel's with `root` zero.
 pub fn activate(root: usize, asid: u16) {
     let value = if root == 0 {
@@ -186,14 +316,14 @@ pub fn activate(root: usize, asid: u16) {
         root as u64 | (u64::from(asid) << 48)
     };
     // SAFETY: every set of tables maps the kernel the same way, so what's running stays
-    // where it is. A program can leave anything in TPIDR_EL0, so it's cleared on the way
-    // past, or it would carry a message to the next one.
+    // where it is. TPIDR_EL0 is a thread's, not a space's: the scheduler saves it as a
+    // thread leaves the CPU and sets the next one's as it comes, so nothing a program
+    // leaves there reaches another.
     unsafe {
         asm!(
             "dsb ishst",
             "msr ttbr0_el1, {}",
             "isb",
-            "msr tpidr_el0, xzr",
             in(reg) value,
             options(nostack, preserves_flags)
         );
@@ -229,6 +359,51 @@ pub fn flush_page(address: usize, asid: u16) {
             options(nostack, preserves_flags)
         );
     }
+}
+
+/// Forgets every user translation on this CPU.
+pub fn flush_local() {
+    // SAFETY: invalidating the TLB has no other effect.
+    unsafe { asm!("dsb nshst", "tlbi vmalle1", "dsb nsh", "isb", options(nostack, preserves_flags)) };
+}
+
+/// Forgets every translation of every ASID on every CPU, for a new ASID generation.
+/// The kernel's own come back from its tables as they're used.
+pub fn flush_all() {
+    // SAFETY: invalidating the TLB has no other effect.
+    unsafe { asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb", options(nostack, preserves_flags)) };
+}
+
+/// How wide the ASIDs are: 16 bits where the CPU has them, which `boot.S` turns on
+/// with `TCR_EL1.AS`, and 8 otherwise. Stops the machine if the two disagree, since
+/// then a TTBR's ASID wouldn't mean what the kernel thinks.
+pub fn asid_bits() -> u32 {
+    let (features, control): (u64, u64);
+    // SAFETY: reading ID and control registers has no side effects.
+    unsafe {
+        asm!("mrs {}, id_aa64mmfr0_el1", out(reg) features, options(nomem, nostack, preserves_flags));
+        asm!("mrs {}, tcr_el1", out(reg) control, options(nomem, nostack, preserves_flags));
+    }
+    let supported = (features >> 4) & 0xf == 0b0010;
+    let enabled = control & (1 << 36) != 0;
+    assert_eq!(supported, enabled, "TCR_EL1.AS doesn't match the CPU's ASID size");
+    if enabled {
+        16
+    } else {
+        8
+    }
+}
+
+/// Reads a word of the loaded user tables as EL0 would, with `ldtr`, which PAN
+/// doesn't stop.
+///
+/// # Safety
+/// `address` is mapped readable at EL0 and aligned in the loaded tables.
+pub unsafe fn read_user_word(address: usize) -> u64 {
+    let value: u64;
+    // SAFETY: as the caller promises.
+    unsafe { asm!("ldtr {value}, [{address}]", value = out(reg) value, address = in(reg) address, options(nostack, readonly, preserves_flags)) };
+    value
 }
 
 /// Makes table writes visible to the walker.

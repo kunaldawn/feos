@@ -7,6 +7,9 @@
 //!     utest --long-write PATH MIB        writes MIB MiB to PATH, a MiB per call, or
 //!                                        forever with 0, over its first 4 MiB, and
 //!                                        says how much it wrote
+//!     utest --asid-check ROUNDS          waits for standard input to end, then reads
+//!                                        back its own pages ROUNDS times, giving up
+//!                                        the CPU between, for `ktest asid-load`
 
 #![no_std]
 #![no_main]
@@ -130,8 +133,8 @@ fn test_lazy_memory(report: &mut Report) {
             good &= got == -errno::EFAULT;
             close(fd as usize);
         }
-        // Not past the end, and not over a hole.
-        good &= mprotect(page as usize, 64 * abi::PAGE_SIZE, prot::READ) == -errno::EINVAL;
+        // Not over a hole: past the end of the mapping, nothing changes.
+        good &= mprotect(page as usize, 64 * abi::PAGE_SIZE, prot::READ) == -errno::ENOMEM;
         good &= munmap(page as usize, 2 * abi::PAGE_SIZE) == 0;
     }
     report.check("mprotect", good);
@@ -168,7 +171,14 @@ fn test_files(report: &mut Report) {
     report.check("write-to-read-only-fd", write(fd as usize, b"x") == -errno::EBADF);
     close(fd as usize);
     report.check("open-missing", open("/no/such/file", flags::READ) == -errno::ENOENT);
-    report.check("open-directory", open("/etc", flags::READ) == -errno::EISDIR);
+    // A directory opens to be read (with `GETDENTS`, from 1c.2), never to be written,
+    // and a `READ` of it says what it is.
+    report.check("open-directory-for-writing", open("/etc", flags::READ | flags::WRITE) == -errno::EISDIR);
+    let directory = open("/etc", flags::READ);
+    report.check("open-directory", directory >= 0 && read(directory as usize, &mut buffer) == -errno::EISDIR);
+    if directory >= 0 {
+        close(directory as usize);
+    }
     report.check("open-no-mode", open(path, 0) == -errno::EINVAL);
 }
 
@@ -389,6 +399,49 @@ fn block_read() -> i32 {
     0
 }
 
+/// One of many address spaces alive at once, for `ktest asid-load`: once its standard
+/// input ends, which it does for all of them together, it reads back a word of its own
+/// in each of a few pages, and one on its stack, `rounds` times, letting the CPU go to
+/// the others in between, so the tables loaded change all the time. With more spaces
+/// than ASIDs, a stale TLB entry would show it another's word. Zero if it never did.
+fn asid_check(rounds: usize) -> i32 {
+    const PAGES: usize = 4;
+    block_read();
+    let pid = getpid() as u64;
+    let base = mmap(PAGES * abi::PAGE_SIZE, prot::READ | prot::WRITE);
+    if base < 0 {
+        return 2;
+    }
+    let word = |page: usize| (base as usize + page * abi::PAGE_SIZE) as *mut u64;
+    let mark = |page: usize| pid << 32 | page as u64;
+    for page in 0..PAGES {
+        // SAFETY: just mapped, writable, and aligned.
+        unsafe { core::ptr::write_volatile(word(page), mark(page)) };
+    }
+    let mut on_stack = core::hint::black_box(pid ^ 0x5eed);
+    let mut wrong = 0;
+    for round in 0..rounds {
+        if round % 8 == 0 {
+            sleep_ms(1);
+        } else {
+            feos_user::yield_now();
+        }
+        for page in 0..PAGES {
+            // SAFETY: as above.
+            wrong += usize::from(unsafe { core::ptr::read_volatile(word(page)) } != mark(page));
+        }
+        // SAFETY: a local, read through a pointer so it's read from memory each time.
+        wrong += usize::from(unsafe { core::ptr::read_volatile(&on_stack) } != pid ^ 0x5eed);
+        on_stack = core::hint::black_box(on_stack);
+    }
+    if wrong != 0 {
+        println!("utest asid-check pid {pid}: {wrong} reads FAILED");
+        return 1;
+    }
+    println!("asid-ok");
+    0
+}
+
 /// Writes a MiB a call to `path`, `mib` times, or forever with zero, over and over the
 /// same few MiB, so that the file stays small however long it goes on.
 fn long_write(path: &str, mib: usize) -> i32 {
@@ -431,6 +484,9 @@ fn main(args: Args) -> i32 {
     }
     if args.has("--ticker") {
         return ticker();
+    }
+    if let Some(rounds) = args.value_of("--asid-check").and_then(parse_number) {
+        return asid_check(rounds);
     }
     if let Some(path) = args.value_of("--long-write") {
         let mib = args.get(3).and_then(parse_number).unwrap_or(0);

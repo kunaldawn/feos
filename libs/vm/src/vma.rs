@@ -7,11 +7,10 @@
 //! maps and unmaps in the usual way keeps it short. It's capped at
 //! [`MAX_VMAS`](feos_abi::MAX_VMAS), so its heap is bounded by what a program can ask for.
 
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::shared::SharedAnon;
-use crate::PAGE_SIZE;
+use crate::shared::ObjectRef;
+use crate::{FileRef, PAGE_SIZE};
 
 /// What a range may be used for. Write without read is read and write: no port can
 /// map a page writable and not readable.
@@ -40,10 +39,16 @@ pub enum Backing {
     /// Frames of this process's own, the zero frame until a page is written.
     Private,
     /// A shared-anonymous object, from its page `first` on.
-    Shared { object: Arc<SharedAnon>, first: usize },
+    Shared { object: ObjectRef, first: usize },
     /// Frames the kernel owns and lent, such as the window surface: mapped when the
     /// range was, never changed by a program and never freed here.
     Lent,
+    /// A file's pages from the page cache, from its page `first` on. A private range's
+    /// pages are the cache's until written, then copies of the space's own; a shared
+    /// one's are always the cache's, written in place once it's writable. `may_write`:
+    /// the file was open for writing when it was mapped, which a shared range needs to
+    /// be made writable.
+    File { file: FileRef, first: u64, shared: bool, may_write: bool },
 }
 
 /// One mapped range.
@@ -69,6 +74,17 @@ impl Vma {
         (self.end - self.start) / PAGE_SIZE
     }
 
+    /// Whether this is a shared mapping of a file.
+    pub const fn shared_file(&self) -> bool {
+        matches!(self.backing, Backing::File { shared: true, .. })
+    }
+
+    /// Whether this is a shared mapping of a file that's writable now: its pages are
+    /// written in place, and count as a writable open of the file.
+    pub const fn shared_file_writable(&self) -> bool {
+        self.shared_file() && self.prot.write
+    }
+
     /// Whether `next` can be joined onto the end of this.
     fn joins(&self, next: &Vma) -> bool {
         if self.end != next.start
@@ -83,7 +99,16 @@ impl Vma {
         match (&self.backing, &next.backing) {
             (Backing::Private, Backing::Private) => true,
             (Backing::Shared { object, first }, Backing::Shared { object: other, first: next_first }) => {
-                Arc::ptr_eq(object, other) && first + self.pages() == *next_first
+                ObjectRef::ptr_eq(object, other) && first + self.pages() == *next_first
+            }
+            (
+                Backing::File { file, first, shared, may_write },
+                Backing::File { file: other, first: next_first, shared: next_shared, may_write: next_may_write },
+            ) => {
+                FileRef::ptr_eq(file, other)
+                    && shared == next_shared
+                    && may_write == next_may_write
+                    && first + self.pages() as u64 == *next_first
             }
             _ => false,
         }
@@ -93,8 +118,10 @@ impl Vma {
     fn split_off(&mut self, at: usize) -> Vma {
         let mut high = self.clone();
         high.start = at;
-        if let Backing::Shared { first, .. } = &mut high.backing {
-            *first += (at - self.start) / PAGE_SIZE;
+        match &mut high.backing {
+            Backing::Shared { first, .. } => *first += (at - self.start) / PAGE_SIZE,
+            Backing::File { first, .. } => *first += ((at - self.start) / PAGE_SIZE) as u64,
+            Backing::Private | Backing::Lent => {}
         }
         self.end = at;
         high
@@ -155,6 +182,11 @@ impl VmaList {
         let first = self.list.partition_point(|vma| vma.end <= start);
         let last = first + self.list[first..].partition_point(|vma| vma.start < end);
         first..last
+    }
+
+    /// The VMAs overlapping `[start, end)`.
+    pub fn in_range(&self, start: usize, end: usize) -> &[Vma] {
+        &self.list[self.overlapping(start, end)]
     }
 
     /// Whether nothing is mapped in `[start, end)`.

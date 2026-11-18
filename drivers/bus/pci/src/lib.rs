@@ -11,7 +11,8 @@
 //! Two transports are supported:
 //!
 //! * [`PciEcam`] — memory-mapped config space, used by QEMU's AArch64 `virt`
-//!   machine (the high ECAM window starts at `0x40_1000_0000`).
+//!   machine (the high ECAM window is at `0x40_1000_0000`, which the board maps
+//!   lower and passes as the base).
 //! * [`PciPort`] — the legacy `0xcf8`/`0xcfc` I/O port pair, used on x86 and
 //!   available on both i440fx and q35 without firmware tables.
 //!

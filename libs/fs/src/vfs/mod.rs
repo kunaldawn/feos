@@ -26,9 +26,13 @@
 //! [`sync`]: VfsTree::sync
 
 mod boot;
+pub mod devfs;
+mod listing;
+pub mod path;
 mod ramfs;
 
 pub use boot::{assemble, BootLog, Embedded};
+pub use listing::{Listed, Snapshot};
 pub use ramfs::{DeviceKind, RamFs, DEFAULT_QUOTA};
 
 use alloc::boxed::Box;
@@ -45,18 +49,26 @@ use crate::{
     WritableFileSystem,
 };
 
-/// Symbolic links followed in one resolution.
-const MAX_SYMLINK_HOPS: usize = 8;
+/// Symbolic links followed in one resolution: more is `ELOOP`, as on Linux (section 3.3
+/// of the ABI design).
+pub const MAX_SYMLINK_HOPS: usize = 40;
+/// The directory at a mount's root where a file unlinked while it's in use keeps its
+/// bytes until it's let go, named `<dev>-<ino>` ([`VfsTree::orphan`]). A listing of the
+/// mount's root never shows it, and whatever is left in it goes when the mount is next
+/// made.
+pub const ORPHANS: &str = ".feos-orphans";
 /// A symbolic link is a file with the system attribute that starts with this.
 /// FAT has nothing better, and this way a link is just a small odd file to any
 /// other OS, and survives a copy to one and back.
 const SYMLINK_MAGIC: &[u8] = b"XSym\n";
-/// Longest link target.
-const MAX_LINK_TARGET: usize = 1024;
+/// Longest link target: `PATH_MAX`, since `/proc/<pid>/fd/<n>` and `/proc/<pid>/exe`
+/// lead to whatever path a program opened or ran.
+const MAX_LINK_TARGET: usize = 4096;
 /// Open files at once.
 const MAX_HANDLES: usize = 256;
-/// Longest path this tree accepts.
-const MAX_PATH_BYTES: usize = 4096;
+/// Longest path this tree accepts: a program's relative path of up to `PATH_MAX` (4096)
+/// joined to a working directory of up to as much, and the slash between.
+const MAX_PATH_BYTES: usize = 2 * 4096 + 1;
 /// Most mounts at once.
 const MAX_MOUNTS: usize = 16;
 /// How deep a copy across filesystems recurses.
@@ -100,13 +112,62 @@ pub struct Stat {
     pub gid: u32,
     /// Names this has.
     pub nlink: u32,
-    /// A number for this file, unique on its filesystem.
+    /// A number for this file, unique on its filesystem, kept across renames and not
+    /// given to another file while anything [holds](VfsTree::hold) it.
     pub ino: u64,
+    /// The mount's number, the same for every file on it and for as long as it's
+    /// mounted. With `ino`, the file's [`FileId`].
+    pub dev: u64,
     /// The filesystem keeps the owner and mode, and they're enforced. FAT, exFAT and RAM
     /// mounts don't, and everyone may do anything there that the mount allows.
     pub posix: bool,
+    /// What device it is, for a device node: `kind` says a file, but its bytes aren't
+    /// stored anywhere, so it can't be mapped as one.
+    pub device: Option<DeviceKind>,
 }
 
+/// A file's identity: its mount's number and its inode number, as [`Stat`] reports them.
+/// It outlives renames, so the page cache and the kernel's lock table key files by it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct FileId {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+/// How a file's bytes changed, told to the [`FileHook`] after it allowed the change.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Change<'a> {
+    /// `data` was written at `offset`; the file is `size` bytes now.
+    Written { offset: u64, data: &'a [u8], size: u64 },
+    /// The file was cut or grown to `size` bytes.
+    Resized { size: u64 },
+    /// A change of `[offset, offset + length)` failed part way, so what's there now isn't
+    /// known; the file is `size` bytes.
+    Failed { offset: u64, length: u64, size: u64 },
+    /// Nothing changed after all.
+    Nothing,
+}
+
+/// What the tree tells about changes to files' bytes, for a cache of them kept outside
+/// it, such as the kernel's page cache. Called with the tree's lock held, so it mustn't
+/// call the tree back. Every [`may_change`](Self::may_change) that says yes is followed
+/// by one [`changed`](Self::changed).
+pub trait FileHook: Sync {
+    /// A write or truncation of `file` is about to start: `Err` (as [`FsError::TextBusy`]
+    /// for a file mapped to run) refuses it, and nothing changes.
+    fn may_change(&self, file: FileId) -> Result<(), FsError>;
+    /// What `may_change` allowed is over.
+    fn changed(&self, file: FileId, change: Change<'_>);
+    /// The file's last name is gone, and its bytes with it.
+    fn removed(&self, file: FileId);
+    /// The mount `dev` is to be unmounted: whatever holds its files only to cache them
+    /// should let them go now.
+    fn unmounting(&self, dev: u64);
+}
+
+/// The sticky bit of a directory's mode: only an entry's owner, the directory's or root
+/// may take an entry away ([`VfsTree::check_remove`]).
+pub const STICKY: u16 = 0o1000;
 /// Asking for read access, to [`VfsTree::check_access`].
 pub const ACCESS_READ: u8 = 4;
 /// Asking for write access.
@@ -130,6 +191,23 @@ pub fn permits(mode: u16, is_directory: bool, owner: u32, group: u32, uid: u32, 
     (bits as u8 & 7) & want == want
 }
 
+/// Who a program's call is for, for the calls that check their permission under the
+/// tree's lock, against what the tree walked to: a check made beforehand, on a path, can
+/// be about a different file by the time the path is walked again, if a directory on the
+/// way has been swapped for a link meanwhile. Such a call never reaches [`ORPHANS`]
+/// either (`NotFound`), whatever leads there.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Caller {
+    /// Their user id.
+    pub uid: u32,
+    /// Their group id.
+    pub gid: u32,
+}
+
+/// What a by-identity change asks before it's made, under the tree's lock, of the facts
+/// of the file it's about to change: `Err` refuses it, and nothing changes.
+pub type Allow<'a> = &'a dyn Fn(&Stat) -> Result<(), FsError>;
+
 /// One entry of a directory listing.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TreeEntry {
@@ -137,6 +215,18 @@ pub struct TreeEntry {
     pub name: String,
     /// Its facts, not following a link.
     pub stat: Stat,
+}
+
+/// What a path resolves to, as [`VfsTree::resolve_path`] finds it in one look.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Resolved {
+    /// The canonical path to it: absolute, every link on the way resolved (the last too,
+    /// if it was followed), no `.` or `..`.
+    pub canonical: String,
+    /// Its facts; a link's own if the last component is a link that wasn't followed.
+    pub stat: Stat,
+    /// Its identity.
+    pub id: FileId,
 }
 
 /// How to open a file.
@@ -332,6 +422,65 @@ pub trait VfsTree: Sync {
     /// Creates a device node. Only a RAM mount can hold one.
     fn make_device(&self, path: &str, kind: DeviceKind) -> Result<(), FsError>;
 
+    /// The identity of the file `path` names, following links, with its facts.
+    fn identify(&self, path: &str) -> Result<(FileId, Stat), FsError>;
+
+    /// Reads from the file `file` is, wherever it is now: `NotFound` once its last
+    /// name is gone.
+    fn read_file(&self, file: FileId, offset: u64, out: &mut [u8]) -> Result<usize, FsError>;
+
+    /// Facts about the file `file` is.
+    fn stat_file(&self, file: FileId) -> Result<Stat, FsError>;
+
+    /// Writes a cache's own copy of part of `file` back to it, wherever it is now, without
+    /// telling the [`FileHook`]: the bytes are the hook's already. `fill` puts them in
+    /// `buffer` and says how many, under the tree's lock, so no write through the tree can
+    /// come between taking them and writing them. Never past the file's end: the file
+    /// doesn't grow.
+    fn write_back(&self, file: FileId, offset: u64, buffer: &mut [u8], fill: &mut dyn FnMut(&mut [u8]) -> usize) -> Result<(), FsError>;
+
+    /// Keeps `file`'s inode number from going to another file, even once it's removed,
+    /// until as many [`release`](Self::release)s. Its mount can't be unmounted meanwhile.
+    fn hold(&self, file: FileId) -> Result<(), FsError>;
+
+    /// Lets go of a [`hold`](Self::hold). Never takes the tree's lock, so a
+    /// [`FileHook`] may call it.
+    fn release(&self, file: FileId);
+
+    /// Installs what's told of every change to a file's bytes.
+    fn set_file_hook(&self, hook: &'static dyn FileHook);
+
+    /// Resolves `path`, following a final link if `follow_last`: where it ends up, by
+    /// its canonical path, what it is and its identity, all from one look.
+    fn resolve_path(&self, _path: &str, _follow_last: bool) -> Result<Resolved, FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    /// Writes `data` at `offset` of the file `file` is, by identity, so a name it has
+    /// lost since doesn't matter; grows it if needed. As [`write_at`](Self::write_at).
+    fn write_file_at(&self, _file: FileId, _offset: u64, _data: &[u8]) -> Result<usize, FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    /// Cuts or grows the file `file` is to `size` bytes, by identity.
+    fn truncate_file(&self, _file: FileId, _size: u64) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    /// Takes the last name of a regular file something still uses away without taking
+    /// its bytes: `path` (not followed) moves into [`ORPHANS`] at its mount's root, made
+    /// if there's none, as `<dev>-<ino>`. Returns the name it has there, which the caller
+    /// removes once nothing uses the file.
+    fn orphan(&self, _path: &str) -> Result<String, FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    /// Removes whatever [`orphan`](Self::orphan) left in the mount at `mount_point`: done
+    /// as a mount is made, when nothing can be using them. Says how many went.
+    fn clean_orphans(&self, _mount_point: &str) -> Result<usize, FsError> {
+        Ok(0)
+    }
+
     /// Sets permission bits. `Unsupported` on a filesystem that doesn't keep them.
     fn chmod(&self, _path: &str, _mode: u16) -> Result<(), FsError> {
         Err(FsError::Unsupported)
@@ -342,8 +491,29 @@ pub trait VfsTree: Sync {
         Err(FsError::Unsupported)
     }
 
+    /// Sets whichever of the owner and group are `Some`, of `path` itself: a link's own,
+    /// not what it leads to.
+    fn lchown(&self, _path: &str, _uid: Option<u32>, _gid: Option<u32>) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+
     /// Gives the file at `existing` another name, `path`, on the same filesystem.
     fn link(&self, _existing: &str, _path: &str) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    /// A program's [`link`](Self::link): `existing` (not followed) must still be `source`
+    /// (`NotFound` otherwise), the file the caller was found able to reach, and `caller`
+    /// must be able to write and search the directory `path` is in, judged under the
+    /// tree's lock.
+    fn link_as(&self, _existing: &str, _path: &str, _source: FileId, _caller: Caller) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    /// A program's [`symlink`](Self::symlink): `caller` must be able to write and search
+    /// the directory `path` is in, judged under the tree's lock, and the link is theirs,
+    /// owned as it's made, where the filesystem keeps owners.
+    fn symlink_as(&self, _target: &str, _path: &str, _caller: Caller) -> Result<(), FsError> {
         Err(FsError::Unsupported)
     }
 
@@ -354,10 +524,74 @@ pub trait VfsTree: Sync {
         Ok(())
     }
 
+    /// Whether a user may take away the name `path` (a canonical path, not followed):
+    /// write and search permission on the directory it's in, and, where that directory has
+    /// the sticky bit (`/tmp`'s `0o1777`), owning the entry or the directory, or being
+    /// root (`NotPermitted`, `EPERM`, otherwise). For the system call boundary, as
+    /// [`check_access`](Self::check_access) is.
+    fn check_remove(&self, path: &str, uid: u32, gid: u32) -> Result<(), FsError> {
+        self.check_access(parent_of(path.trim_end_matches('/')), uid, gid, ACCESS_WRITE | ACCESS_EXECUTE)
+    }
+
     /// Checks the filesystem holding `path` through and through, if it has a checker.
     fn fsck(&self, _path: &str, _repair: bool) -> Result<crate::native::FsckReport, FsError> {
         Err(FsError::Unsupported)
     }
+
+    /// A program's rename (`RENAMEAT`, section 3.3 of the ABI design): `from` (not
+    /// followed) to `to` (its last name not followed either), on one mount
+    /// (`CrossDevice` otherwise), never under itself (`InvalidMove`), never a mount point
+    /// (`Busy`). What `to` names is replaced in one step, so anyone looking finds the old
+    /// file there or the new one, and so does the next mount after a crash: a file by a
+    /// file (`IsDirectory` for a directory), a directory by a directory only if that's
+    /// empty (`NotDirectory`, `NotEmpty`). With `no_replace`, anything there is
+    /// `NameExists`. Two names of one file leave both as they are.
+    ///
+    /// The replaced file goes as [`remove_file`](Self::remove_file) takes it, unless it's
+    /// a regular file's last name and `in_use` says something still holds it: then, in
+    /// the same step, it becomes an orphan as [`orphan`](Self::orphan) makes one, and its
+    /// identity and where it is are returned. `in_use` is asked with the tree's lock held.
+    ///
+    /// With a `caller`, theirs is a program's call: [`ORPHANS`] is `NotFound` on either
+    /// side, and the old name must be theirs to take away and the new theirs to make or
+    /// take, as [`check_remove`](Self::check_remove) and
+    /// [`check_access`](Self::check_access) say, judged under the lock.
+    fn rename_replacing(
+        &self,
+        _from: &str,
+        _to: &str,
+        _no_replace: bool,
+        _caller: Option<Caller>,
+        _in_use: &dyn Fn(FileId) -> bool,
+    ) -> Result<Option<(FileId, String)>, FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    /// Sets the permission bits of the file `file` is, by identity, wherever it is now,
+    /// if `allow` says so of its facts: a directory or a link too.
+    fn chmod_file(&self, _file: FileId, _mode: u16, _allow: Allow<'_>) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    /// Sets whichever of the owner and group of `file` are `Some`, by identity.
+    fn chown_file(&self, _file: FileId, _uid: Option<u32>, _gid: Option<u32>) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    /// Sets whichever timestamps of `file` are `Some`, by identity, if `allow` says so.
+    fn set_times_file(&self, _file: FileId, _times: NodeTimes, _allow: Allow<'_>) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    /// Size and free space of the mount `file` is on, by identity: as
+    /// [`statfs`](Self::statfs), for a file whose name may have gone.
+    fn statfs_file(&self, _file: FileId) -> Result<VolumeStats, FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    /// Sets the clock used for timestamps, on every mount present and to come: the
+    /// kernel's, to the nanosecond, once it has one.
+    fn set_time_source(&self, _now: TimeSource) {}
 }
 
 /// An open file that closes itself.
@@ -483,6 +717,8 @@ fn is_within(path: &str, prefix: &str) -> bool {
 
 struct Mount {
     path: String,
+    /// Its number, [`Stat::dev`]: never reused for another mount.
+    dev: u64,
     fs: Box<dyn WritableFileSystem>,
     read_only: bool,
     source: String,
@@ -506,6 +742,8 @@ struct State {
     mounts: Vec<Mount>,
     handles: Vec<Option<OpenFile>>,
     next_serial: u32,
+    /// The number the next mount gets.
+    next_dev: u64,
     now: Option<TimeSource>,
 }
 
@@ -517,6 +755,16 @@ struct PosixFields {
     nlink: u32,
     ino: u64,
     posix: bool,
+}
+
+/// A file something [holds](VfsTree::hold): its inode number isn't given to another file
+/// until it's let go.
+struct Held {
+    file: FileId,
+    count: u32,
+    /// Where it was last found, to save a search on filesystems with inode numbers of
+    /// their own.
+    node: NodeId,
 }
 
 impl PosixFields {
@@ -533,7 +781,9 @@ impl PosixFields {
             gid: self.gid,
             nlink: self.nlink,
             ino: self.ino,
+            dev: 0,
             posix: self.posix,
+            device: None,
         }
     }
 }
@@ -578,6 +828,9 @@ impl State {
     /// Reads the target out of a link, or `None` when `node` isn't one.
     fn link_target(&self, mount: usize, node: NodeId) -> Result<Option<String>, FsError> {
         let fs = &self.mounts[mount].fs;
+        if let Some(answer) = fs.synthesised_link(node) {
+            return answer;
+        }
         if fs.attributes(node) & attr::SYSTEM == 0 || fs.kind(node) != Some(EntryKind::File) {
             return Ok(None);
         }
@@ -721,6 +974,8 @@ impl State {
             read_only: mount.read_only
                 || fs.is_read_only()
                 || attributes & attr::READ_ONLY != 0,
+            dev: mount.dev,
+            device: if is_link { None } else { fs.device(location.node) },
             ..match fs.posix(location.node) {
                 Some(meta) => PosixFields {
                     mode: meta.mode,
@@ -734,6 +989,34 @@ impl State {
                 None => synthesised(file_kind, attributes, location.node).into_stat(),
             }
         })
+    }
+
+    /// The identity of what's at `location`.
+    fn file_id(&self, location: Location) -> FileId {
+        let mount = &self.mounts[location.mount];
+        let ino = match mount.fs.posix(location.node) {
+            Some(meta) => meta.ino,
+            None => u64::from(location.node.0) + 1,
+        };
+        FileId { dev: mount.dev, ino }
+    }
+
+    /// Where the file `file` is now, if it still has a name. `hint` is where it was.
+    fn find(&self, file: FileId, hint: Option<NodeId>) -> Result<Location, FsError> {
+        let mount = self.mounts.iter().position(|mount| mount.dev == file.dev).ok_or(FsError::NotFound)?;
+        let fs = &self.mounts[mount].fs;
+        let is_it = |node: NodeId| fs.kind(node).is_some() && self.file_id(Location { mount, node }) == file;
+        let node = match hint.filter(|&node| is_it(node)) {
+            Some(node) => node,
+            None => {
+                let guess = u32::try_from(file.ino.wrapping_sub(1)).ok().map(NodeId);
+                guess
+                    .filter(|&node| is_it(node))
+                    .or_else(|| fs.node_with_ino(file.ino).filter(|&node| is_it(node)))
+                    .ok_or(FsError::NotFound)?
+            }
+        };
+        Ok(Location { mount, node })
     }
 
     fn check_writable_mount(&self, mount: usize) -> Result<(), FsError> {
@@ -810,6 +1093,79 @@ impl State {
         Ok(())
     }
 
+    /// [`VfsTree::check_access`], under the lock already held.
+    fn check_access(&self, path: &str, caller: Caller, want: u8) -> Result<(), FsError> {
+        let Caller { uid, gid } = caller;
+        // A step at a time, each directory judged before anything past it is looked at.
+        // Otherwise whether a name exists in a closed directory would show in the answer.
+        // A link is judged by what it leads to.
+        let mut here = self.walk("/", true)?.0;
+        let mut prefix = String::new();
+        for part in path.split('/').filter(|part| !part.is_empty() && *part != ".") {
+            let fs = &self.mounts[here.mount].fs;
+            if let Some(meta) = fs.posix(here.node) {
+                if !permits(meta.mode, true, meta.uid, meta.gid, uid, gid, ACCESS_EXECUTE) {
+                    return Err(FsError::PermissionDenied);
+                }
+            }
+            prefix.push('/');
+            prefix.push_str(part);
+            here = self.walk(&prefix, true)?.0;
+        }
+        let fs = &self.mounts[here.mount].fs;
+        if let Some(meta) = fs.posix(here.node) {
+            let is_directory = fs.kind(here.node) == Some(EntryKind::Directory);
+            if !permits(meta.mode, is_directory, meta.uid, meta.gid, uid, gid, want) {
+                return Err(FsError::PermissionDenied);
+            }
+        }
+        Ok(())
+    }
+
+    /// [`VfsTree::check_remove`], under the lock already held.
+    fn check_remove(&self, path: &str, caller: Caller) -> Result<(), FsError> {
+        let trimmed = path.trim_end_matches('/');
+        let parent = parent_of(trimmed);
+        self.check_access(parent, caller, ACCESS_WRITE | ACCESS_EXECUTE)?;
+        if caller.uid == 0 {
+            return Ok(());
+        }
+        let (directory, _) = self.walk(parent, true)?;
+        let Some(meta) = self.mounts[directory.mount].fs.posix(directory.node) else {
+            return Ok(());
+        };
+        if meta.mode & STICKY == 0 || meta.uid == caller.uid {
+            return Ok(());
+        }
+        let (entry, _) = self.walk(trimmed, false)?;
+        match self.mounts[entry.mount].fs.posix(entry.node) {
+            Some(own) if own.uid == caller.uid => Ok(()),
+            _ => Err(FsError::NotPermitted),
+        }
+    }
+
+    /// May `caller` add a name to the directory `parent` (a path to it), or take one away
+    /// where there's no sticky bit: write and search permission on it.
+    fn check_parent(&self, parent: &str, caller: Caller) -> Result<(), FsError> {
+        self.check_access(parent, caller, ACCESS_WRITE | ACCESS_EXECUTE)
+    }
+
+    /// The [`ORPHANS`] directory at the root of `mount`, made if there's none.
+    fn orphan_directory(&mut self, mount: usize) -> Result<NodeId, FsError> {
+        let fs = &mut self.mounts[mount].fs;
+        let root = fs.root();
+        match fs.lookup(root, ORPHANS) {
+            Some(node) if fs.kind(node) == Some(EntryKind::Directory) => Ok(node),
+            Some(_) => Err(FsError::NameExists),
+            None => {
+                let node = fs.create_dir(root, ORPHANS)?;
+                // Root's alone, where the filesystem keeps modes at all.
+                let _ = fs.set_mode(node, 0o700);
+                Ok(node)
+            }
+        }
+    }
+
     /// Creates a file under the resolved parent.
     fn create_at(&mut self, parent: Location, name: &str) -> Result<Location, FsError> {
         self.check_writable_mount(parent.mount)?;
@@ -872,6 +1228,12 @@ pub struct Vfs {
     dirty: AtomicBool,
     change_hook: SpinLock<Option<fn()>>,
     interner: Mutex<Interner>,
+    file_hook: SpinLock<Option<&'static dyn FileHook>>,
+    /// Files held, and how many times.
+    held: SpinLock<Vec<Held>>,
+    /// Files whose last hold went, to let their filesystems reuse their numbers the next
+    /// time the tree's lock is taken: [`VfsTree::release`] may be called with it held.
+    let_go: SpinLock<Vec<(FileId, NodeId)>>,
 }
 
 impl Vfs {
@@ -883,6 +1245,7 @@ impl Vfs {
             state: Mutex::new(State {
                 mounts: alloc::vec![Mount {
                     path: String::from("/"),
+                    dev: 1,
                     fs: root,
                     read_only,
                     source: source.to_string(),
@@ -890,12 +1253,16 @@ impl Vfs {
                 }],
                 handles: Vec::new(),
                 next_serial: 1,
+                next_dev: 2,
                 now: None,
             }),
             generation: AtomicU64::new(1),
             dirty: AtomicBool::new(false),
             change_hook: SpinLock::new(None),
             interner: Mutex::new(interner),
+            file_hook: SpinLock::new(None),
+            held: SpinLock::new(Vec::new()),
+            let_go: SpinLock::new(Vec::new()),
         }
     }
 
@@ -904,13 +1271,71 @@ impl Vfs {
         Self::new(Box::new(RamFs::new(quota)), false, "ram")
     }
 
-    /// Sets the clock used for timestamps, on every mount present and to come.
-    pub fn set_time_source(&self, now: TimeSource) {
+    /// Takes the tree's lock, and lets filesystems reuse the numbers of files whose
+    /// last hold went since.
+    fn lock(&self) -> feos_sync::MutexGuard<'_, State> {
         let mut state = self.state.lock();
-        state.now = Some(now);
-        for mount in state.mounts.iter_mut() {
-            mount.fs.set_time_source(now);
+        loop {
+            let next = self.let_go.lock().pop();
+            let Some((file, node)) = next else {
+                break;
+            };
+            // Held again since: the new hold keeps it.
+            if self.held.lock().iter().any(|held| held.file == file) {
+                continue;
+            }
+            if let Some(mount) = state.mounts.iter_mut().find(|mount| mount.dev == file.dev) {
+                let _ = mount.fs.keep_id(node, file.ino, false);
+            }
         }
+        state
+    }
+
+    fn hook(&self) -> Option<&'static dyn FileHook> {
+        *self.file_hook.lock()
+    }
+
+    /// Asks the hook whether `location`'s bytes may change, and says which file it is.
+    fn may_change(&self, state: &State, location: Location) -> Result<FileId, FsError> {
+        let file = state.file_id(location);
+        if let Some(hook) = self.hook() {
+            hook.may_change(file)?;
+        }
+        Ok(file)
+    }
+
+    /// Tells the hook how the change it allowed went.
+    fn changed_file(&self, file: FileId, change: Change<'_>) {
+        if let Some(hook) = self.hook() {
+            hook.changed(file, change);
+        }
+    }
+
+    /// Writes `data` at `offset` under the hook: allowed first, told after, whether it
+    /// worked or not.
+    fn write_hooked(&self, state: &mut State, location: Location, offset: usize, data: &[u8]) -> Result<(), FsError> {
+        let file = self.may_change(state, location)?;
+        let result = state.write_all(location, offset, data);
+        let size = state.mounts[location.mount].fs.size(location.node) as u64;
+        let change = match result {
+            Ok(()) => Change::Written { offset: offset as u64, data, size },
+            Err(_) => Change::Failed { offset: offset as u64, length: data.len() as u64, size },
+        };
+        self.changed_file(file, change);
+        result
+    }
+
+    /// Sets `location`'s length under the hook.
+    fn resize_hooked(&self, state: &mut State, location: Location, size: usize) -> Result<(), FsError> {
+        let file = self.may_change(state, location)?;
+        let result = state.mounts[location.mount].fs.set_len(location.node, size);
+        let now = state.mounts[location.mount].fs.size(location.node) as u64;
+        let change = match result {
+            Ok(()) => Change::Resized { size: now },
+            Err(_) => Change::Failed { offset: 0, length: u64::MAX, size: now },
+        };
+        self.changed_file(file, change);
+        result
     }
 
     fn changed(&self) {
@@ -974,6 +1399,95 @@ impl Vfs {
         Ok(())
     }
 
+    /// [`VfsTree::symlink`], and with a `caller`, [`VfsTree::symlink_as`].
+    fn make_symlink(&self, target: &str, path: &str, caller: Option<Caller>) -> Result<(), FsError> {
+        if target.is_empty() || target.len() > MAX_LINK_TARGET {
+            return Err(FsError::InvalidName);
+        }
+        let mut state = self.lock();
+        let (parent, canonical, name) = state.walk_parent(path)?;
+        if let Some(caller) = caller {
+            if path::is_hidden(&join_path(&canonical, name)) {
+                return Err(FsError::NotFound);
+            }
+            state.check_parent(&canonical, caller)?;
+        }
+        let location = state.create_at(parent, name)?;
+        let mut contents = Vec::new();
+        contents
+            .try_reserve_exact(SYMLINK_MAGIC.len() + target.len())
+            .map_err(|_| FsError::OutOfMemory)?;
+        contents.extend_from_slice(SYMLINK_MAGIC);
+        contents.extend_from_slice(target.as_bytes());
+        let written = state
+            .write_all(location, 0, &contents)
+            .and_then(|()| {
+                state.mounts[location.mount]
+                    .fs
+                    .set_attributes(location.node, attr::SYSTEM | attr::ARCHIVE)
+            });
+        if let Err(error) = written {
+            // No half-made link: without the attribute it's just a stray file.
+            let _ = state.mounts[location.mount].fs.remove(location.node);
+            return Err(error);
+        }
+        // Theirs from the start: given later, by its path, it could go to whatever that
+        // path names by then.
+        if let Some(Caller { uid, gid }) = caller.filter(|caller| caller.uid != 0 || caller.gid != 0) {
+            let _ = state.mounts[location.mount].fs.set_owner(location.node, Some(uid), Some(gid));
+        }
+        drop(state);
+        self.changed();
+        Ok(())
+    }
+
+    /// [`VfsTree::link`], and for a program, [`VfsTree::link_as`].
+    fn hard_link(&self, existing: &str, path: &str, program: Option<(FileId, Caller)>) -> Result<(), FsError> {
+        let mut state = self.lock();
+        let (from, canonical_from) = state.walk(existing, false)?;
+        let (parent, canonical, name) = state.walk_parent(path)?;
+        if let Some((source, caller)) = program {
+            if path::is_hidden(&canonical_from) || path::is_hidden(&join_path(&canonical, name)) || state.file_id(from) != source {
+                return Err(FsError::NotFound);
+            }
+            state.check_parent(&canonical, caller)?;
+        }
+        if from.mount != parent.mount {
+            return Err(FsError::Unsupported);
+        }
+        let mount = &mut state.mounts[from.mount];
+        if mount.read_only {
+            return Err(FsError::ReadOnly);
+        }
+        mount.fs.hard_link(from.node, parent.node, name)?;
+        mount.dirty = true;
+        drop(state);
+        self.changed();
+        Ok(())
+    }
+
+    /// Changes something about the file `file` is, by identity, on a writable mount, if
+    /// `allow` says so of its facts as they are under the lock, so of the very file
+    /// changed.
+    fn change_file(
+        &self,
+        file: FileId,
+        allow: Allow<'_>,
+        change: &mut dyn FnMut(&mut dyn WritableFileSystem, NodeId) -> Result<(), FsError>,
+    ) -> Result<(), FsError> {
+        let mut state = self.lock();
+        let hint = self.held.lock().iter().find(|held| held.file == file).map(|held| held.node);
+        let location = state.find(file, hint)?;
+        let is_link = state.link_target(location.mount, location.node)?.is_some();
+        allow(&state.stat_location(location, is_link)?)?;
+        state.check_writable_mount(location.mount)?;
+        change(&mut *state.mounts[location.mount].fs, location.node)?;
+        state.touched(location.mount);
+        drop(state);
+        self.changed();
+        Ok(())
+    }
+
     fn remove_tree(&self, path: &str, depth: usize) -> Result<(), FsError> {
         if depth > MAX_COPY_DEPTH {
             return Err(FsError::TooDeep);
@@ -999,13 +1513,13 @@ fn ignore_unsupported(error: FsError) -> Result<(), FsError> {
 
 impl VfsTree for Vfs {
     fn stat(&self, path: &str) -> Result<Stat, FsError> {
-        let state = self.state.lock();
+        let state = self.lock();
         let (location, _) = state.walk(path, true)?;
         state.stat_location(location, false)
     }
 
     fn lstat(&self, path: &str) -> Result<Stat, FsError> {
-        let state = self.state.lock();
+        let state = self.lock();
         let (location, canonical) = state.walk(path, false)?;
         let is_link = canonical != "/"
             && !state.is_mount_point(&canonical)
@@ -1014,7 +1528,7 @@ impl VfsTree for Vfs {
     }
 
     fn statfs(&self, path: &str) -> Result<VolumeStats, FsError> {
-        let state = self.state.lock();
+        let state = self.lock();
         let (location, _) = state.walk(path, true)?;
         let mount = &state.mounts[location.mount];
         let mut stats = mount.fs.stats();
@@ -1023,7 +1537,7 @@ impl VfsTree for Vfs {
     }
 
     fn read_dir(&self, path: &str) -> Result<Vec<TreeEntry>, FsError> {
-        let state = self.state.lock();
+        let state = self.lock();
         let (location, canonical) = state.walk(path, true)?;
         let fs = &state.mounts[location.mount].fs;
         if fs.kind(location.node) != Some(EntryKind::Directory) {
@@ -1034,22 +1548,29 @@ impl VfsTree for Vfs {
             let Some(child) = fs.child_at(location.node, index) else {
                 continue;
             };
-            let Some(name) = fs.name(child) else {
+            let Some(name) = fs.name(child).map(ToString::to_string).or_else(|| fs.dynamic_name(child)) else {
                 continue;
             };
-            let is_link = state.link_target(location.mount, child)?.is_some();
-            let stat = state.stat_location(
+            // A made-up node can go between being counted and being looked at (a
+            // descriptor another thread closed): it's left out, as Linux's would be.
+            let is_link = match state.link_target(location.mount, child) {
+                Ok(target) => target.is_some(),
+                Err(FsError::NotFound) => continue,
+                Err(error) => return Err(error),
+            };
+            let stat = match state.stat_location(
                 Location {
                     mount: location.mount,
                     node: child,
                 },
                 is_link,
-            )?;
+            ) {
+                Ok(stat) => stat,
+                Err(FsError::NotFound) => continue,
+                Err(error) => return Err(error),
+            };
             entries.try_reserve(1).map_err(|_| FsError::OutOfMemory)?;
-            entries.push(TreeEntry {
-                name: name.to_string(),
-                stat,
-            });
+            entries.push(TreeEntry { name, stat });
         }
         // Mount points replace whatever their parent has under that name.
         for (index, mount) in state.mounts.iter().enumerate() {
@@ -1071,32 +1592,36 @@ impl VfsTree for Vfs {
                 stat,
             });
         }
+        // Files unlinked while in use are no one's to see.
+        if state.is_mount_point(&canonical) {
+            entries.retain(|entry| entry.name != ORPHANS);
+        }
         entries.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(entries)
     }
 
     fn read_at(&self, path: &str, offset: u64, out: &mut [u8]) -> Result<usize, FsError> {
-        let state = self.state.lock();
+        let state = self.lock();
         let (location, _) = state.walk(path, true)?;
         state.require_file(location)?;
         self.file_data(&state, location, offset, out)
     }
 
     fn write_at(&self, path: &str, offset: u64, data: &[u8]) -> Result<usize, FsError> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         let (location, _) = state.walk(path, true)?;
         state.require_file(location)?;
         state.check_writable_file(location)?;
         let offset = usize::try_from(offset).map_err(|_| FsError::NoSpace)?;
-        state.write_all(location, offset, data)?;
+        let result = self.write_hooked(&mut state, location, offset, data);
         state.touched(location.mount);
         drop(state);
         self.changed();
-        Ok(data.len())
+        result.map(|()| data.len())
     }
 
     fn write_file(&self, path: &str, data: &[u8], append: bool) -> Result<(), FsError> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         let location = match state.walk(path, true) {
             Ok((location, _)) => {
                 state.require_file(location)?;
@@ -1112,14 +1637,14 @@ impl VfsTree for Vfs {
         let offset = if append {
             state.mounts[location.mount].fs.size(location.node)
         } else {
-            state.mounts[location.mount].fs.set_len(location.node, 0)?;
+            self.resize_hooked(&mut state, location, 0)?;
             0
         };
-        state.write_all(location, offset, data)?;
+        let result = self.write_hooked(&mut state, location, offset, data);
         state.touched(location.mount);
         drop(state);
         self.changed();
-        Ok(())
+        result
     }
 
     fn write_file_atomic(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
@@ -1136,16 +1661,14 @@ impl VfsTree for Vfs {
         self.write_file(&temporary, data, false)?;
         // The new bytes must be on the disk before any name refers to them.
         self.sync()?;
-        match self.remove_file(&normal) {
-            Ok(()) | Err(FsError::NotFound) => {}
-            Err(error) => return Err(error),
-        }
-        self.rename(&temporary, &normal)?;
+        // In one step, so the name is never missing, crash or no crash. A kernel app's
+        // removals never orphan.
+        self.rename_replacing(&temporary, &normal, false, None, &|_| false)?;
         self.sync()
     }
 
     fn create_file(&self, path: &str) -> Result<(), FsError> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         let (parent, canonical, name) = state.walk_parent(path)?;
         if state.is_mount_point(&join_path(&canonical, name)) {
             return Err(FsError::NameExists);
@@ -1157,7 +1680,7 @@ impl VfsTree for Vfs {
     }
 
     fn create_dir(&self, path: &str) -> Result<(), FsError> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         let (parent, canonical, name) = state.walk_parent(path)?;
         if state.is_mount_point(&join_path(&canonical, name)) {
             return Err(FsError::NameExists);
@@ -1171,23 +1694,31 @@ impl VfsTree for Vfs {
     }
 
     fn remove_file(&self, path: &str) -> Result<(), FsError> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         let (location, canonical) = state.walk(path, false)?;
         if state.is_mount_point(&canonical) {
             return Err(FsError::Busy);
         }
         state.require_file(location)?;
         state.check_writable_file(location)?;
+        let file = state.file_id(location);
+        let links = state.mounts[location.mount].fs.posix(location.node).map_or(1, |meta| meta.nlink);
         state.mounts[location.mount].fs.remove(location.node)?;
         state.kill_handles(location.mount, location.node);
         state.touched(location.mount);
+        // Its bytes go with its last name; another name keeps them.
+        if links <= 1 {
+            if let Some(hook) = self.hook() {
+                hook.removed(file);
+            }
+        }
         drop(state);
         self.changed();
         Ok(())
     }
 
     fn remove_dir(&self, path: &str) -> Result<(), FsError> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         let (location, canonical) = state.walk(path, false)?;
         if canonical == "/" || state.is_mount_point(&canonical) {
             return Err(FsError::Busy);
@@ -1213,7 +1744,7 @@ impl VfsTree for Vfs {
 
     fn rename(&self, from: &str, to: &str) -> Result<(), FsError> {
         let same_mount = {
-            let mut state = self.state.lock();
+            let mut state = self.lock();
             let (source, canonical_from) = state.walk(from, false)?;
             if canonical_from == "/" || state.is_mount_point(&canonical_from) {
                 return Err(FsError::Busy);
@@ -1267,20 +1798,21 @@ impl VfsTree for Vfs {
     }
 
     fn truncate(&self, path: &str, size: u64) -> Result<(), FsError> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         let (location, _) = state.walk(path, true)?;
         state.require_file(location)?;
         state.check_writable_file(location)?;
         let size = usize::try_from(size).map_err(|_| FsError::NoSpace)?;
-        state.mounts[location.mount].fs.set_len(location.node, size)?;
+        let result = self.resize_hooked(&mut state, location, size);
         state.touched(location.mount);
+        result?;
         drop(state);
         self.changed();
         Ok(())
     }
 
     fn set_attributes(&self, path: &str, attributes: u8) -> Result<(), FsError> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         let (location, _) = state.walk(path, false)?;
         state.check_writable_mount(location.mount)?;
         // A link's system bit is what makes it a link, whatever the caller asks.
@@ -1296,7 +1828,7 @@ impl VfsTree for Vfs {
     }
 
     fn set_times(&self, path: &str, times: NodeTimes) -> Result<(), FsError> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         let (location, _) = state.walk(path, false)?;
         state.check_writable_mount(location.mount)?;
         state.mounts[location.mount].fs.set_times(location.node, times)?;
@@ -1307,37 +1839,15 @@ impl VfsTree for Vfs {
     }
 
     fn symlink(&self, target: &str, path: &str) -> Result<(), FsError> {
-        if target.is_empty() || target.len() > MAX_LINK_TARGET {
-            return Err(FsError::InvalidName);
-        }
-        let mut state = self.state.lock();
-        let (parent, _, name) = state.walk_parent(path)?;
-        let location = state.create_at(parent, name)?;
-        let mut contents = Vec::new();
-        contents
-            .try_reserve_exact(SYMLINK_MAGIC.len() + target.len())
-            .map_err(|_| FsError::OutOfMemory)?;
-        contents.extend_from_slice(SYMLINK_MAGIC);
-        contents.extend_from_slice(target.as_bytes());
-        let written = state
-            .write_all(location, 0, &contents)
-            .and_then(|()| {
-                state.mounts[location.mount]
-                    .fs
-                    .set_attributes(location.node, attr::SYSTEM | attr::ARCHIVE)
-            });
-        if let Err(error) = written {
-            // No half-made link: without the attribute it's just a stray file.
-            let _ = state.mounts[location.mount].fs.remove(location.node);
-            return Err(error);
-        }
-        drop(state);
-        self.changed();
-        Ok(())
+        self.make_symlink(target, path, None)
+    }
+
+    fn symlink_as(&self, target: &str, path: &str, caller: Caller) -> Result<(), FsError> {
+        self.make_symlink(target, path, Some(caller))
     }
 
     fn chmod(&self, path: &str, mode: u16) -> Result<(), FsError> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         let (location, _) = state.walk(path, true)?;
         let mount = &mut state.mounts[location.mount];
         if mount.read_only {
@@ -1351,7 +1861,7 @@ impl VfsTree for Vfs {
     }
 
     fn chown(&self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<(), FsError> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         let (location, _) = state.walk(path, true)?;
         let mount = &mut state.mounts[location.mount];
         if mount.read_only {
@@ -1364,60 +1874,44 @@ impl VfsTree for Vfs {
         Ok(())
     }
 
-    fn link(&self, existing: &str, path: &str) -> Result<(), FsError> {
-        let mut state = self.state.lock();
-        let (from, _) = state.walk(existing, false)?;
-        let (parent, _, name) = state.walk_parent(path)?;
-        if from.mount != parent.mount {
-            return Err(FsError::Unsupported);
-        }
-        let mount = &mut state.mounts[from.mount];
+    fn lchown(&self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<(), FsError> {
+        let mut state = self.lock();
+        let (location, _) = state.walk(path, false)?;
+        let mount = &mut state.mounts[location.mount];
         if mount.read_only {
             return Err(FsError::ReadOnly);
         }
-        mount.fs.hard_link(from.node, parent.node, name)?;
+        mount.fs.set_owner(location.node, uid, gid)?;
         mount.dirty = true;
         drop(state);
         self.changed();
         Ok(())
     }
 
+    fn link(&self, existing: &str, path: &str) -> Result<(), FsError> {
+        self.hard_link(existing, path, None)
+    }
+
+    fn link_as(&self, existing: &str, path: &str, source: FileId, caller: Caller) -> Result<(), FsError> {
+        self.hard_link(existing, path, Some((source, caller)))
+    }
+
     fn check_access(&self, path: &str, uid: u32, gid: u32, want: u8) -> Result<(), FsError> {
-        let state = self.state.lock();
-        // A step at a time, each directory judged before anything past it is looked at.
-        // Otherwise whether a name exists in a closed directory would show in the answer.
-        // A link is judged by what it leads to.
-        let mut here = state.walk("/", true)?.0;
-        let mut prefix = String::new();
-        for part in path.split('/').filter(|part| !part.is_empty() && *part != ".") {
-            let fs = &state.mounts[here.mount].fs;
-            if let Some(meta) = fs.posix(here.node) {
-                if !permits(meta.mode, true, meta.uid, meta.gid, uid, gid, ACCESS_EXECUTE) {
-                    return Err(FsError::PermissionDenied);
-                }
-            }
-            prefix.push('/');
-            prefix.push_str(part);
-            here = state.walk(&prefix, true)?.0;
-        }
-        let fs = &state.mounts[here.mount].fs;
-        if let Some(meta) = fs.posix(here.node) {
-            let is_directory = fs.kind(here.node) == Some(EntryKind::Directory);
-            if !permits(meta.mode, is_directory, meta.uid, meta.gid, uid, gid, want) {
-                return Err(FsError::PermissionDenied);
-            }
-        }
-        Ok(())
+        self.lock().check_access(path, Caller { uid, gid }, want)
+    }
+
+    fn check_remove(&self, path: &str, uid: u32, gid: u32) -> Result<(), FsError> {
+        self.lock().check_remove(path, Caller { uid, gid })
     }
 
     fn fsck(&self, path: &str, repair: bool) -> Result<crate::native::FsckReport, FsError> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         let (location, _) = state.walk(path, true)?;
         state.mounts[location.mount].fs.fsck(repair)
     }
 
     fn read_link(&self, path: &str) -> Result<String, FsError> {
-        let state = self.state.lock();
+        let state = self.lock();
         let (location, _) = state.walk(path, false)?;
         state
             .link_target(location.mount, location.node)?
@@ -1425,7 +1919,7 @@ impl VfsTree for Vfs {
     }
 
     fn open(&self, path: &str, options: OpenOptions) -> Result<Handle, FsError> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         let mut created = false;
         let location = match state.walk(path, true) {
             Ok(_) if options.create && options.exclusive => return Err(FsError::NameExists),
@@ -1444,8 +1938,9 @@ impl VfsTree for Vfs {
             state.check_writable_file(location)?;
         }
         if options.truncate {
-            state.mounts[location.mount].fs.set_len(location.node, 0)?;
+            let result = self.resize_hooked(&mut state, location, 0);
             state.touched(location.mount);
+            result?;
         }
         let slot = match state.handles.iter().position(Option::is_none) {
             Some(slot) => slot,
@@ -1484,7 +1979,7 @@ impl VfsTree for Vfs {
     }
 
     fn read_handle(&self, handle: Handle, out: &mut [u8]) -> Result<usize, FsError> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         let open = state.handle_mut(handle)?;
         if !open.readable {
             return Err(FsError::Unsupported);
@@ -1500,7 +1995,7 @@ impl VfsTree for Vfs {
     }
 
     fn write_handle(&self, handle: Handle, data: &[u8]) -> Result<usize, FsError> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         let open = state.handle_mut(handle)?;
         if !open.writable {
             return Err(FsError::ReadOnly);
@@ -1517,8 +2012,9 @@ impl VfsTree for Vfs {
             position
         };
         let start = usize::try_from(offset).map_err(|_| FsError::NoSpace)?;
-        state.write_all(location, start, data)?;
+        let result = self.write_hooked(&mut state, location, start, data);
         state.touched(location.mount);
+        result?;
         state.handle_mut(handle)?.position = offset + data.len() as u64;
         drop(state);
         self.changed();
@@ -1526,7 +2022,7 @@ impl VfsTree for Vfs {
     }
 
     fn seek_handle(&self, handle: Handle, to: Seek) -> Result<u64, FsError> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         let open = state.handle_mut(handle)?;
         let (mount, node, position) = (open.mount as usize, open.node, open.position);
         let size = state.mounts[mount].fs.size(node) as u64;
@@ -1541,7 +2037,7 @@ impl VfsTree for Vfs {
     }
 
     fn stat_handle(&self, handle: Handle) -> Result<Stat, FsError> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         let open = state.handle_mut(handle)?;
         let location = Location {
             mount: open.mount as usize,
@@ -1551,7 +2047,7 @@ impl VfsTree for Vfs {
     }
 
     fn close(&self, handle: Handle) -> Result<(), FsError> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         let slot = state
             .handles
             .get_mut(handle.slot as usize)
@@ -1566,7 +2062,7 @@ impl VfsTree for Vfs {
     }
 
     fn sync(&self) -> Result<(), FsError> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         // Cleared first: a change arriving during the flush must not be lost.
         self.dirty.store(false, Ordering::Release);
         let mut result = Ok(());
@@ -1610,7 +2106,7 @@ impl VfsTree for Vfs {
         if path == "/" {
             return Err(FsError::Busy);
         }
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         if state.mounts.len() >= MAX_MOUNTS {
             return Err(FsError::Busy);
         }
@@ -1622,8 +2118,11 @@ impl VfsTree for Vfs {
         if let Some(now) = state.now {
             fs.set_time_source(now);
         }
+        let dev = state.next_dev;
+        state.next_dev += 1;
         state.mounts.push(Mount {
-            path,
+            path: path.clone(),
+            dev,
             fs,
             read_only,
             source: source.to_string(),
@@ -1631,12 +2130,16 @@ impl VfsTree for Vfs {
         });
         drop(state);
         self.generation.fetch_add(1, Ordering::Release);
+        // What a crash left orphaned: nothing can be using it now.
+        if !read_only {
+            let _ = self.clean_orphans(&path);
+        }
         Ok(())
     }
 
     fn unmount(&self, path: &str) -> Result<(), FsError> {
         let path = normalize_path(path)?;
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         if path == "/" {
             return Err(FsError::Busy);
         }
@@ -1651,6 +2154,14 @@ impl VfsTree for Vfs {
             .flatten()
             .any(|open| open.mount == index as u32 && !open.dead)
         {
+            return Err(FsError::Busy);
+        }
+        // A file something holds, as the page cache does, keeps its mount.
+        let dev = state.mounts[index].dev;
+        if let Some(hook) = self.hook() {
+            hook.unmounting(dev);
+        }
+        if self.held.lock().iter().any(|held| held.file.dev == dev) {
             return Err(FsError::Busy);
         }
         state.mounts[index].fs.flush()?;
@@ -1669,7 +2180,7 @@ impl VfsTree for Vfs {
     }
 
     fn mounts(&self) -> Vec<MountInfo> {
-        let state = self.state.lock();
+        let state = self.lock();
         state
             .mounts
             .iter()
@@ -1683,7 +2194,7 @@ impl VfsTree for Vfs {
     }
 
     fn make_device(&self, path: &str, kind: DeviceKind) -> Result<(), FsError> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         let (parent, _, name) = state.walk_parent(path)?;
         // A device is a file whose content the mount generates, so only a mount
         // that can do that may hold one. Nothing is left behind if it can't.
@@ -1696,6 +2207,320 @@ impl VfsTree for Vfs {
         drop(state);
         self.changed();
         Ok(())
+    }
+
+    fn identify(&self, path: &str) -> Result<(FileId, Stat), FsError> {
+        let state = self.lock();
+        let (location, _) = state.walk(path, true)?;
+        Ok((state.file_id(location), state.stat_location(location, false)?))
+    }
+
+    fn read_file(&self, file: FileId, offset: u64, out: &mut [u8]) -> Result<usize, FsError> {
+        let state = self.lock();
+        let hint = self.held.lock().iter().find(|held| held.file == file).map(|held| held.node);
+        let location = state.find(file, hint)?;
+        state.require_file(location)?;
+        self.file_data(&state, location, offset, out)
+    }
+
+    fn stat_file(&self, file: FileId) -> Result<Stat, FsError> {
+        let state = self.lock();
+        let hint = self.held.lock().iter().find(|held| held.file == file).map(|held| held.node);
+        let location = state.find(file, hint)?;
+        state.stat_location(location, false)
+    }
+
+    fn write_back(&self, file: FileId, offset: u64, buffer: &mut [u8], fill: &mut dyn FnMut(&mut [u8]) -> usize) -> Result<(), FsError> {
+        let mut state = self.lock();
+        let hint = self.held.lock().iter().find(|held| held.file == file).map(|held| held.node);
+        let location = state.find(file, hint)?;
+        state.require_file(location)?;
+        state.check_writable_file(location)?;
+        let length = fill(buffer).min(buffer.len());
+        if length == 0 {
+            return Ok(());
+        }
+        let size = state.mounts[location.mount].fs.size(location.node) as u64;
+        let length = length.min(size.saturating_sub(offset) as usize);
+        if length == 0 {
+            return Ok(());
+        }
+        let offset = usize::try_from(offset).map_err(|_| FsError::OutOfBounds)?;
+        let result = state.write_all(location, offset, &buffer[..length]);
+        state.touched(location.mount);
+        drop(state);
+        self.changed();
+        result
+    }
+
+    fn hold(&self, file: FileId) -> Result<(), FsError> {
+        let mut state = self.lock();
+        let mut held = self.held.lock();
+        if let Some(entry) = held.iter_mut().find(|entry| entry.file == file) {
+            entry.count = entry.count.checked_add(1).ok_or(FsError::Busy)?;
+            return Ok(());
+        }
+        held.try_reserve(1).map_err(|_| FsError::OutOfMemory)?;
+        drop(held);
+        let location = state.find(file, None)?;
+        state.mounts[location.mount].fs.keep_id(location.node, file.ino, true)?;
+        let mut held = self.held.lock();
+        // Nothing else can have added it: holds are made under the tree's lock.
+        if held.try_reserve(1).is_err() {
+            drop(held);
+            let _ = state.mounts[location.mount].fs.keep_id(location.node, file.ino, false);
+            return Err(FsError::OutOfMemory);
+        }
+        held.push(Held { file, count: 1, node: location.node });
+        Ok(())
+    }
+
+    fn release(&self, file: FileId) {
+        let mut held = self.held.lock();
+        let Some(at) = held.iter().position(|entry| entry.file == file) else {
+            return;
+        };
+        held[at].count -= 1;
+        if held[at].count > 0 {
+            return;
+        }
+        let node = held.swap_remove(at).node;
+        drop(held);
+        // If there's no room to say so, the number is just never reused.
+        let mut let_go = self.let_go.lock();
+        if let_go.try_reserve(1).is_ok() {
+            let_go.push((file, node));
+        }
+    }
+
+    fn set_file_hook(&self, hook: &'static dyn FileHook) {
+        *self.file_hook.lock() = Some(hook);
+    }
+
+    fn resolve_path(&self, path: &str, follow_last: bool) -> Result<Resolved, FsError> {
+        let state = self.lock();
+        let (location, canonical) = state.walk(path, follow_last)?;
+        let is_link = !follow_last
+            && canonical != "/"
+            && !state.is_mount_point(&canonical)
+            && state.link_target(location.mount, location.node)?.is_some();
+        let stat = state.stat_location(location, is_link)?;
+        Ok(Resolved { id: state.file_id(location), stat, canonical })
+    }
+
+    fn write_file_at(&self, file: FileId, offset: u64, data: &[u8]) -> Result<usize, FsError> {
+        let mut state = self.lock();
+        let hint = self.held.lock().iter().find(|held| held.file == file).map(|held| held.node);
+        let location = state.find(file, hint)?;
+        state.require_file(location)?;
+        state.check_writable_file(location)?;
+        let offset = usize::try_from(offset).map_err(|_| FsError::NoSpace)?;
+        let result = self.write_hooked(&mut state, location, offset, data);
+        state.touched(location.mount);
+        drop(state);
+        self.changed();
+        result.map(|()| data.len())
+    }
+
+    fn truncate_file(&self, file: FileId, size: u64) -> Result<(), FsError> {
+        let mut state = self.lock();
+        let hint = self.held.lock().iter().find(|held| held.file == file).map(|held| held.node);
+        let location = state.find(file, hint)?;
+        state.require_file(location)?;
+        state.check_writable_file(location)?;
+        let size = usize::try_from(size).map_err(|_| FsError::NoSpace)?;
+        let result = self.resize_hooked(&mut state, location, size);
+        state.touched(location.mount);
+        result?;
+        drop(state);
+        self.changed();
+        Ok(())
+    }
+
+    fn orphan(&self, path: &str) -> Result<String, FsError> {
+        let mut state = self.lock();
+        let (location, canonical) = state.walk(path, false)?;
+        if canonical == "/" || state.is_mount_point(&canonical) {
+            return Err(FsError::Busy);
+        }
+        state.require_file(location)?;
+        state.check_writable_file(location)?;
+        let file = state.file_id(location);
+        let name = format!("{}-{}", file.dev, file.ino);
+        let directory = state.orphan_directory(location.mount)?;
+        let fs = &mut state.mounts[location.mount].fs;
+        if fs.lookup(directory, &name).is_some() {
+            return Err(FsError::NameExists);
+        }
+        fs.rename(location.node, directory, &name)?;
+        state.touched(location.mount);
+        let at = join_path(&join_path(&state.mounts[location.mount].path, ORPHANS), &name);
+        drop(state);
+        self.changed();
+        Ok(at)
+    }
+
+    fn rename_replacing(
+        &self,
+        from: &str,
+        to: &str,
+        no_replace: bool,
+        caller: Option<Caller>,
+        in_use: &dyn Fn(FileId) -> bool,
+    ) -> Result<Option<(FileId, String)>, FsError> {
+        let mut state = self.lock();
+        let (source, canonical_from) = state.walk(from, false)?;
+        // Where the walk got to is what's judged, not what the caller saw before: a
+        // directory on the way may have been swapped for a link since.
+        if caller.is_some() && path::is_hidden(&canonical_from) {
+            return Err(FsError::NotFound);
+        }
+        if canonical_from == "/" || state.is_mount_point(&canonical_from) {
+            return Err(FsError::Busy);
+        }
+        let (parent, canonical_parent, name) = state.walk_parent(to)?;
+        let target = join_path(&canonical_parent, name);
+        if caller.is_some() && path::is_hidden(&target) {
+            return Err(FsError::NotFound);
+        }
+        let existing = state.mounts[parent.mount].fs.lookup(parent.node, name);
+        // Anything there, itself included, as Linux's `renameat2` has it.
+        if no_replace && (existing.is_some() || state.is_mount_point(&target)) {
+            return Err(FsError::NameExists);
+        }
+        if target == canonical_from {
+            return Ok(None);
+        }
+        if let Some(caller) = caller {
+            state.check_remove(&canonical_from, caller)?;
+            if existing.is_some() {
+                state.check_remove(&target, caller)?;
+            } else {
+                state.check_parent(&canonical_parent, caller)?;
+            }
+        }
+        if state.is_mount_point(&target) {
+            return Err(FsError::Busy);
+        }
+        if parent.mount != source.mount {
+            return Err(FsError::CrossDevice);
+        }
+        if is_within(&target, &canonical_from) {
+            return Err(FsError::InvalidMove);
+        }
+        // A mount inside what's moving would lose its path, as would one in what goes.
+        let prefix = join_path(&canonical_from, "");
+        let below = join_path(&target, "");
+        if state.mounts.iter().any(|mount| mount.path.starts_with(&prefix) || mount.path.starts_with(&below)) {
+            return Err(FsError::Busy);
+        }
+        state.check_writable_mount(source.mount)?;
+        let mount = source.mount;
+        let fs = &state.mounts[mount].fs;
+        let moving_directory = fs.kind(source.node) == Some(EntryKind::Directory);
+        let victim = match existing {
+            // Only a change of case lands on itself.
+            None => None,
+            Some(existing) if existing == source.node => None,
+            Some(existing) => Some(existing),
+        };
+        let Some(victim) = victim else {
+            state.mounts[mount].fs.rename(source.node, parent.node, name)?;
+            state.touched(mount);
+            drop(state);
+            self.changed();
+            return Ok(None);
+        };
+        let victim_location = Location { mount, node: victim };
+        let victim_id = state.file_id(victim_location);
+        // Two names of one file: POSIX has nothing happen.
+        if victim_id == state.file_id(source) {
+            return Ok(None);
+        }
+        let victim_directory = fs.kind(victim) == Some(EntryKind::Directory);
+        match (moving_directory, victim_directory) {
+            (true, false) => return Err(FsError::NotDirectory),
+            (false, true) => return Err(FsError::IsDirectory),
+            (true, true) if fs.child_count(victim) > 0 => return Err(FsError::NotEmpty),
+            _ => {}
+        }
+        if !victim_directory {
+            state.check_writable_file(victim_location)?;
+        }
+        let is_link = state.link_target(mount, victim)?.is_some();
+        let fs = &state.mounts[mount].fs;
+        let last_link = fs.posix(victim).map_or(1, |meta| meta.nlink) <= 1;
+        let regular = !victim_directory && !is_link && fs.device(victim).is_none();
+        let keep = regular && last_link && in_use(victim_id);
+        let orphan_name = format!("{}-{}", victim_id.dev, victim_id.ino);
+        let orphans = if keep { Some(state.orphan_directory(mount)?) } else { None };
+        let fs = &mut state.mounts[mount].fs;
+        if let Some(directory) = orphans {
+            if fs.lookup(directory, &orphan_name).is_some() {
+                return Err(FsError::NameExists);
+            }
+        }
+        fs.rename_over(source.node, parent.node, name, victim, orphans.map(|directory| (directory, orphan_name.as_str())))?;
+        state.touched(mount);
+        let kept = if keep {
+            Some((victim_id, join_path(&join_path(&state.mounts[mount].path, ORPHANS), &orphan_name)))
+        } else {
+            state.kill_handles(mount, victim);
+            // Its bytes go with its last name; another name keeps them.
+            if !victim_directory && last_link {
+                if let Some(hook) = self.hook() {
+                    hook.removed(victim_id);
+                }
+            }
+            None
+        };
+        drop(state);
+        self.changed();
+        Ok(kept)
+    }
+
+    fn chmod_file(&self, file: FileId, mode: u16, allow: Allow<'_>) -> Result<(), FsError> {
+        self.change_file(file, allow, &mut |fs, node| fs.set_mode(node, mode))
+    }
+
+    fn chown_file(&self, file: FileId, uid: Option<u32>, gid: Option<u32>) -> Result<(), FsError> {
+        self.change_file(file, &|_| Ok(()), &mut |fs, node| fs.set_owner(node, uid, gid))
+    }
+
+    fn set_times_file(&self, file: FileId, times: NodeTimes, allow: Allow<'_>) -> Result<(), FsError> {
+        self.change_file(file, allow, &mut |fs, node| fs.set_times(node, times))
+    }
+
+    fn statfs_file(&self, file: FileId) -> Result<VolumeStats, FsError> {
+        let state = self.lock();
+        let mount = state.mounts.iter().find(|mount| mount.dev == file.dev).ok_or(FsError::NotFound)?;
+        let mut stats = mount.fs.stats();
+        stats.read_only |= mount.read_only;
+        Ok(stats)
+    }
+
+    fn set_time_source(&self, now: TimeSource) {
+        let mut state = self.lock();
+        state.now = Some(now);
+        for mount in state.mounts.iter_mut() {
+            mount.fs.set_time_source(now);
+        }
+    }
+
+    fn clean_orphans(&self, mount_point: &str) -> Result<usize, FsError> {
+        let directory = join_path(&normalize_path(mount_point)?, ORPHANS);
+        let entries = match self.read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(FsError::NotFound) => return Ok(0),
+            Err(error) => return Err(error),
+        };
+        let mut removed = 0;
+        for entry in entries.iter().filter(|entry| entry.stat.kind != FileKind::Directory) {
+            if self.remove_file(&join_path(&directory, &entry.name)).is_ok() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 }
 
@@ -1810,7 +2635,7 @@ impl FileSystem for Vfs {
     }
 
     fn is_damaged(&self) -> bool {
-        self.state.lock().mounts.iter().any(|mount| mount.fs.is_damaged())
+        self.lock().mounts.iter().any(|mount| mount.fs.is_damaged())
     }
 
     fn tree(&self) -> Option<&dyn VfsTree> {

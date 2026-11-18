@@ -1,6 +1,6 @@
 //! `ps`: list processes.
 
-use feos_app::{App, Context, ProcessInfo, ProcessState, MAX_PROCESSES};
+use feos_app::{App, Context, ProcessSnapshot, ProcessState};
 use feos_console::println;
 
 /// Prints the process table.
@@ -24,12 +24,15 @@ impl App for Ps {
     }
 
     fn run(&self, context: &mut Context<'_>) -> i32 {
-        let mut processes = [ProcessInfo::EMPTY; MAX_PROCESSES];
-        let count = context.platform.processes.snapshot(&mut processes);
+        // On the heap: a full table is 72 KiB, too much for a task's stack.
+        let Some(processes) = ProcessSnapshot::take(context.platform.processes) else {
+            println!("ps: out of memory");
+            return 1;
+        };
         let current = context.platform.processes.current();
 
-        println!("  PID  PPID  STATE     STACK KiB  HEAP KiB  NAME");
-        for process in &processes[..count] {
+        println!("  PID  PPID  STATE     THR  STACK KiB  HEAP KiB  NAME");
+        for process in processes.iter() {
             let marker = if process.pid == current { '*' } else { ' ' };
             let detail = context.platform.processes.detail(process.pid);
             let state = match detail {
@@ -40,10 +43,11 @@ impl App for Ps {
             };
             let detail = detail.unwrap_or_default();
             println!(
-                "{marker} {:>4}  {:>4}  {:<8}  {:>4}/{:<4}  {:>8}  {}",
+                "{marker} {:>4}  {:>4}  {:<8}  {:>3}  {:>4}/{:<4}  {:>8}  {}",
                 process.pid,
                 process.parent,
                 state,
+                process.threads,
                 detail.stack_used / 1024,
                 detail.stack_size / 1024,
                 detail.heap_bytes / 1024,

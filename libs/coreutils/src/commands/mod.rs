@@ -828,6 +828,26 @@ mod tests {
     }
 
     #[test]
+    fn rm_removes_a_link_not_what_it_names() {
+        let tree: &'static feos_fs::Vfs = Box::leak(Box::new(feos_fs::Vfs::in_memory(1024 * 1024)));
+        let mut h = Harness {
+            fs: OverlayFs::new(Some(tree)),
+            env: Env::feos(),
+            stdin: BytesInput::empty(),
+        };
+        assert_eq!(h.run("mkdir", &["-p", "/real/sub"]).0, 0);
+        assert_eq!(h.run("ln", &["-s", "/real/sub", "/hop"]).0, 0);
+        assert_eq!(h.run("ln", &["-s", "/real/gone", "/dangling"]).0, 0);
+        // `-r` through a link to a directory takes the link and leaves the directory.
+        assert_eq!(h.run("rm", &["-r", "/hop"]).0, 0);
+        assert!(h.fs.is_dir("/real/sub"));
+        // A link to nothing still goes: `rm` doesn't follow the name it removes.
+        assert_eq!(h.run("rm", &["/dangling"]).0, 0);
+        assert!(h.fs.stat_full("/dangling").is_none());
+        assert!(h.fs.stat_full("/hop").is_none());
+    }
+
+    #[test]
     fn creates_lists_and_removes_files() {
         let mut h = Harness::new();
         assert_eq!(h.run("mkdir", &["-p", "a/b"]).0, 0);

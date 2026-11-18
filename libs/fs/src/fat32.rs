@@ -38,8 +38,8 @@ use crate::block::{BlockDevice, WritableBlockDevice, WriteClass};
 use crate::tree::{path_component, try_push, try_zeroed, ClusterSet, EntryLocation, NodeTable};
 use crate::volume::Volume;
 use crate::{
-    attr, CheckReport, EntryKind, FileSystem, FsError, NodeId, NodeTimes, TimeSource, VolumeStats,
-    WritableFileSystem, MAX_PATH_DEPTH,
+    attr, CheckReport, EntryKind, FileSystem, FsError, NodeId, NodeTimes, TimeSource, Timestamp,
+    VolumeStats, WritableFileSystem, MAX_PATH_DEPTH,
 };
 
 const FAT_MASK: u32 = 0x0fff_ffff;
@@ -59,6 +59,11 @@ const BOOT_FLAG_DIRTY: u8 = 0x01;
 const NODE_ATTRIBUTES: u8 = attr::SETTABLE;
 /// FAT dates start here.
 const FAT_EPOCH_YEAR: u32 = 1980;
+/// A bit of a short entry's `NTRes` byte (12) that says the entry is on its way out: the
+/// old name of a file a rename is moving over another. Should a crash leave it and the
+/// name it moves to both naming the file's clusters, the check drops this one. No other
+/// system sets it (Windows and Linux use bits 3 and 4 alone), and it's never left set.
+const LEAVING: u8 = 0x80;
 /// Bytes of the FAT handled at a time by the mount-time check.
 const CHECK_CHUNK: usize = 64 * 1024;
 
@@ -84,6 +89,8 @@ pub struct Fat32<D: BlockDevice> {
     /// Directories that share a start with another, seen while the volume was
     /// dirty: the two names of an interrupted rename.
     suspects: Vec<u32>,
+    /// Files marked [`LEAVING`], seen while the volume was dirty.
+    leaving: Vec<u32>,
     now: Option<TimeSource>,
 }
 
@@ -122,13 +129,28 @@ fn entry_u16(entry: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([entry[at], entry[at + 1]])
 }
 
-/// Reads the timestamps out of a short entry.
+/// Reads the timestamps out of a short entry. FAT keeps no status change time.
 pub(crate) fn entry_times(entry: &[u8]) -> NodeTimes {
+    let at = |day: u16, time: u16| fat_time_to_unix(day, time).map(Timestamp::from_secs);
     NodeTimes {
-        created: fat_time_to_unix(entry_u16(entry, 16), entry_u16(entry, 14)),
-        modified: fat_time_to_unix(entry_u16(entry, 24), entry_u16(entry, 22)),
-        accessed: fat_time_to_unix(entry_u16(entry, 18), 0),
+        created: at(entry_u16(entry, 16), entry_u16(entry, 14)),
+        modified: at(entry_u16(entry, 24), entry_u16(entry, 22)),
+        accessed: at(entry_u16(entry, 18), 0),
+        changed: None,
     }
+}
+
+/// What a FAT entry keeps of `seconds`: two-second steps, from 1980. `None` outside
+/// what it can hold.
+pub(crate) fn fat_kept(seconds: u64) -> Option<Timestamp> {
+    let (day, time) = fat_timestamp(seconds)?;
+    fat_time_to_unix(day, time).map(Timestamp::from_secs)
+}
+
+/// What a FAT entry keeps of `seconds` as an access time: the day alone.
+fn fat_kept_day(seconds: u64) -> Option<Timestamp> {
+    let (day, _) = fat_timestamp(seconds)?;
+    fat_time_to_unix(day, 0).map(Timestamp::from_secs)
 }
 
 impl<D: BlockDevice> Fat32<D> {
@@ -303,6 +325,7 @@ impl<D: BlockDevice> Fat32<D> {
             damage_reason: None,
             dirty,
             suspects: Vec::new(),
+            leaving: Vec::new(),
             now: None,
         };
 
@@ -501,6 +524,9 @@ impl<D: BlockDevice> Fat32<D> {
                     added.attributes = attributes & NODE_ATTRIBUTES;
                     added.times = entry_times(entry);
                 }
+                if kind == EntryKind::File && entry[12] & LEAVING != 0 && self.dirty {
+                    try_push(&mut self.leaving, node)?;
+                }
 
                 if kind == EntryKind::Directory {
                     let depth = task.depth + 1;
@@ -650,8 +676,9 @@ impl<D: WritableBlockDevice> Fat32<D> {
         Ok(())
     }
 
+    /// The time, in the whole seconds FAT works in.
     fn now(&self) -> Option<u64> {
-        self.now.and_then(|now| now())
+        self.now.and_then(|now| now()).map(Timestamp::secs)
     }
 
     fn read_fat_entry(&self, cluster: u32) -> Result<u32, FsError> {
@@ -960,7 +987,6 @@ impl<D: WritableBlockDevice> Fat32<D> {
         if let Some((day, time)) = stamp {
             self.volume.write_u16_le(location.primary + 22, time)?;
             self.volume.write_u16_le(location.primary + 24, day)?;
-            self.volume.write_u16_le(location.primary + 18, day)?;
         }
         // Whatever backs up this volume should know it changed.
         let flags = self.volume.read_array::<1>(location.primary + 11)?[0];
@@ -974,9 +1000,9 @@ impl<D: WritableBlockDevice> Fat32<D> {
             entry.valid_size = size;
             entry.data_length = size;
             entry.attributes |= attr::ARCHIVE;
-            if stamp.is_some() {
-                entry.times.modified = now;
-                entry.times.accessed = now;
+            if let Some(now) = now.filter(|_| stamp.is_some()) {
+                // Never the access day: that's `noatime`, only ever set when asked.
+                entry.times.modified = fat_kept(now);
             }
             entry.chain_changed();
         }
@@ -1332,13 +1358,14 @@ impl<D: WritableBlockDevice> Fat32<D> {
 
     /// Fills in a node's facts to match the entry just written.
     fn stamp_new_node(&mut self, node: NodeId, attributes: u8) {
-        let now = self.now().filter(|&now| fat_timestamp(now).is_some());
+        let now = self.now();
         if let Some(entry) = self.nodes.get_mut(node) {
             entry.attributes = attributes;
             entry.times = NodeTimes {
-                created: now,
-                modified: now,
-                accessed: now,
+                created: now.and_then(fat_kept),
+                modified: now.and_then(fat_kept),
+                accessed: now.and_then(fat_kept_day),
+                changed: None,
             };
         }
     }
@@ -1527,27 +1554,166 @@ impl<D: WritableBlockDevice> Fat32<D> {
         self.nodes
             .reparent(node, new_parent, String::from(new_name), new_location)
     }
+
+    /// An entry was made, taken or renamed in `directory`, so its own entry's modification
+    /// time is now. The root has no entry, and no time. Only a timestamp: the change it
+    /// follows has happened whether or not this lands.
+    fn touch_directory(&mut self, directory: NodeId) {
+        let Some(now) = self.now() else {
+            return;
+        };
+        let (Some((day, time)), Some(location)) = (fat_timestamp(now), self.nodes.get(directory).and_then(|entry| entry.entry)) else {
+            return;
+        };
+        self.volume.class = WriteClass::Dir;
+        if self.volume.write_u16_le(location.primary + 22, time).is_ok() && self.volume.write_u16_le(location.primary + 24, day).is_ok() {
+            if let Some(entry) = self.nodes.get_mut(directory) {
+                entry.times.modified = fat_kept(now);
+            }
+        }
+    }
+
+    /// A file moved over another, in steps a crash can come between and the check can
+    /// still make whole: the moving entry is marked [`LEAVING`], then the replaced entry
+    /// takes everything but its name from it (one 32-byte write, which a sector holds
+    /// whole), then the moving entry goes, then the replaced file's clusters. Each lands
+    /// before the next is written. At every point the name holds the old file or the new
+    /// one; a crash after the second leaves two names for the new one, and the check
+    /// drops the marked one. A directory moved over an empty one is the two steps of
+    /// removing it and renaming, which a crash can come between.
+    fn rename_over_node(&mut self, node: NodeId, new_parent: NodeId, replaced: NodeId) -> Result<(), FsError> {
+        if node == NodeId::ROOT || replaced == NodeId::ROOT || node == replaced {
+            return Err(FsError::Unsupported);
+        }
+        let (kind, old_parent, old_location) = {
+            let entry = self.nodes.get(node).ok_or(FsError::NotFound)?;
+            (entry.kind, entry.parent.ok_or(FsError::Unsupported)?, entry.entry.ok_or(FsError::Corrupt)?)
+        };
+        let (victim_kind, victim_start, victim_parent, victim_location, victim_name) = {
+            let entry = self.nodes.get(replaced).ok_or(FsError::NotFound)?;
+            (
+                entry.kind,
+                entry.start_cluster,
+                entry.parent.ok_or(FsError::Unsupported)?,
+                entry.entry.ok_or(FsError::Corrupt)?,
+                entry.name.clone(),
+            )
+        };
+        if victim_parent != new_parent.0 {
+            return Err(FsError::NotFound);
+        }
+        if kind == EntryKind::Directory || victim_kind == EntryKind::Directory {
+            if kind != victim_kind {
+                return Err(if kind == EntryKind::Directory { FsError::NotDirectory } else { FsError::IsDirectory });
+            }
+            if self.nodes.is_ancestor(node, new_parent) {
+                return Err(FsError::Unsupported);
+            }
+            self.remove_node(replaced)?;
+            return self.rename_node(node, new_parent, &victim_name);
+        }
+
+        self.volume.class = WriteClass::Dir;
+        let moving = self.volume.read_array::<32>(old_location.primary)?;
+        self.volume.write_bytes(old_location.primary + 12, &[moving[12] | LEAVING])?;
+        self.volume.commit()?;
+        let mut entry = self.volume.read_array::<32>(victim_location.primary)?;
+        // Its name stays, with the case flags that go with it; the rest is the file's.
+        entry[11] = moving[11];
+        entry[12] &= !LEAVING;
+        entry[13..].copy_from_slice(&moving[13..]);
+        self.volume.write_bytes(victim_location.primary, &entry)?;
+        self.volume.commit()?;
+        self.delete_entry_set(NodeId(old_parent), old_location)?;
+        self.nodes.remove(replaced)?;
+        self.nodes.reparent(node, new_parent, victim_name, victim_location)?;
+        if victim_start >= 2 {
+            // Durably named by nothing before its clusters can be anything else's.
+            self.volume.commit()?;
+            self.free_chain(victim_start)?;
+        }
+        Ok(())
+    }
 }
 
 impl<D: WritableBlockDevice> WritableFileSystem for Fat32<D> {
     fn create_file(&mut self, parent: NodeId, name: &str) -> Result<NodeId, FsError> {
         self.ensure_writable()?;
-        self.create_file_node(parent, name)
+        let node = self.create_file_node(parent, name)?;
+        self.touch_directory(parent);
+        Ok(node)
     }
 
     fn create_dir(&mut self, parent: NodeId, name: &str) -> Result<NodeId, FsError> {
         self.ensure_writable()?;
-        self.create_dir_node(parent, name)
+        let node = self.create_dir_node(parent, name)?;
+        self.touch_directory(parent);
+        Ok(node)
     }
 
     fn remove(&mut self, node: NodeId) -> Result<(), FsError> {
         self.ensure_writable()?;
-        self.remove_node(node)
+        let parent = self.nodes.parent(node);
+        self.remove_node(node)?;
+        if let Some(parent) = parent {
+            self.touch_directory(parent);
+        }
+        Ok(())
     }
 
     fn rename(&mut self, node: NodeId, new_parent: NodeId, new_name: &str) -> Result<(), FsError> {
         self.ensure_writable()?;
-        self.rename_node(node, new_parent, new_name)
+        let old_parent = self.nodes.parent(node);
+        self.rename_node(node, new_parent, new_name)?;
+        if let Some(old_parent) = old_parent.filter(|&old_parent| old_parent != new_parent) {
+            self.touch_directory(old_parent);
+        }
+        self.touch_directory(new_parent);
+        Ok(())
+    }
+
+    fn rename_over(
+        &mut self,
+        node: NodeId,
+        new_parent: NodeId,
+        new_name: &str,
+        replaced: NodeId,
+        keep: Option<(NodeId, &str)>,
+    ) -> Result<(), FsError> {
+        self.ensure_writable()?;
+        if self.nodes.lookup(new_parent, new_name) != Some(replaced) {
+            return Err(FsError::NotFound);
+        }
+        match keep {
+            // A file still in use keeps its own entry, so the name's has to go elsewhere
+            // first; an orphan doesn't outlive a crash anyway.
+            Some((directory, name)) => {
+                let old_parent = self.nodes.parent(node);
+                let spelled = self.name(replaced).map(String::from).ok_or(FsError::NotFound)?;
+                self.rename_node(replaced, directory, name)?;
+                if let Err(error) = self.rename_node(node, new_parent, new_name) {
+                    // The name mustn't be left naming nothing, nor the file an orphan no one
+                    // knows of: back where it was, in the slot just freed, which needs no
+                    // new room.
+                    let _ = self.rename_node(replaced, new_parent, &spelled);
+                    return Err(error);
+                }
+                if let Some(old_parent) = old_parent.filter(|&old_parent| old_parent != new_parent) {
+                    self.touch_directory(old_parent);
+                }
+                self.touch_directory(new_parent);
+                Ok(())
+            }
+            None => {
+                let old_parent = self.nodes.parent(node);
+                self.rename_over_node(node, new_parent, replaced)?;
+                if let Some(old_parent) = old_parent.filter(|&old_parent| old_parent != new_parent) {
+                    self.touch_directory(old_parent);
+                }
+                self.touch_directory(new_parent);
+                Ok(())
+            }
+        }
     }
 
     fn write(&mut self, node: NodeId, offset: usize, data: &[u8]) -> Result<usize, FsError> {
@@ -1558,6 +1724,10 @@ impl<D: WritableBlockDevice> WritableFileSystem for Fat32<D> {
     fn set_len(&mut self, node: NodeId, size: usize) -> Result<(), FsError> {
         self.ensure_writable()?;
         self.set_file_len(node, size)
+    }
+
+    fn keep_id(&mut self, node: NodeId, _ino: u64, keep: bool) -> Result<(), FsError> {
+        self.nodes.keep(node, keep)
     }
 
     fn flush(&mut self) -> Result<(), FsError> {
@@ -1608,19 +1778,26 @@ impl<D: WritableBlockDevice> WritableFileSystem for Fat32<D> {
             .ok_or(FsError::Corrupt)?;
         self.volume.class = WriteClass::Dir;
         let mut stored = self.nodes.get(node).ok_or(FsError::NotFound)?.times;
-        if let Some((day, time)) = times.created.and_then(fat_timestamp) {
-            self.volume.write_u16_le(location.primary + 14, time)?;
-            self.volume.write_u16_le(location.primary + 16, day)?;
-            stored.created = times.created;
+        let seconds = |time: Option<Timestamp>| time.map(Timestamp::secs);
+        if let Some(created) = seconds(times.created) {
+            if let Some((day, time)) = fat_timestamp(created) {
+                self.volume.write_u16_le(location.primary + 14, time)?;
+                self.volume.write_u16_le(location.primary + 16, day)?;
+                stored.created = fat_kept(created);
+            }
         }
-        if let Some((day, time)) = times.modified.and_then(fat_timestamp) {
-            self.volume.write_u16_le(location.primary + 22, time)?;
-            self.volume.write_u16_le(location.primary + 24, day)?;
-            stored.modified = times.modified;
+        if let Some(modified) = seconds(times.modified) {
+            if let Some((day, time)) = fat_timestamp(modified) {
+                self.volume.write_u16_le(location.primary + 22, time)?;
+                self.volume.write_u16_le(location.primary + 24, day)?;
+                stored.modified = fat_kept(modified);
+            }
         }
-        if let Some((day, _)) = times.accessed.and_then(fat_timestamp) {
-            self.volume.write_u16_le(location.primary + 18, day)?;
-            stored.accessed = times.accessed;
+        if let Some(accessed) = seconds(times.accessed) {
+            if let Some((day, _)) = fat_timestamp(accessed) {
+                self.volume.write_u16_le(location.primary + 18, day)?;
+                stored.accessed = fat_kept_day(accessed);
+            }
         }
         if let Some(entry) = self.nodes.get_mut(node) {
             entry.times = stored;
@@ -1656,6 +1833,29 @@ impl<D: WritableBlockDevice> Fat32<D> {
         self.copy_primary_fat()?;
         for node in core::mem::take(&mut self.suspects) {
             self.drop_entry(NodeId(node), &mut report)?;
+        }
+        // A rename over a file that stopped part way: the old name goes if the new one
+        // has its clusters, and otherwise the rename never happened, and loses its mark.
+        for node in core::mem::take(&mut self.leaving) {
+            let node = NodeId(node);
+            let Some(entry) = self.nodes.get(node) else {
+                continue;
+            };
+            let (start, location) = (entry.start_cluster, entry.entry.ok_or(FsError::Corrupt)?);
+            let limit = self.nodes.id_limit() as u32;
+            let shared = start >= 2
+                && (0..limit).map(NodeId).any(|other| {
+                    other != node
+                        && self.nodes.kind(other) == Some(EntryKind::File)
+                        && self.nodes.get(other).is_some_and(|entry| entry.start_cluster == start)
+                });
+            if shared {
+                self.drop_entry(node, &mut report)?;
+            } else {
+                self.volume.class = WriteClass::Dir;
+                let flags = self.volume.read_array::<1>(location.primary + 12)?[0];
+                self.volume.write_bytes(location.primary + 12, &[flags & !LEAVING])?;
+            }
         }
 
         let mut used = ClusterSet::new(self.cluster_count)?;

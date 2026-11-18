@@ -10,3 +10,6 @@ path = "src/lib.rs"
 
 [dependencies]
 feos-hal = { workspace = true }
+feos-abi = { workspace = true }
+feos-sync = { workspace = true }
+feos-pagecache = { workspace = true }

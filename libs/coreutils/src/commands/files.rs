@@ -496,6 +496,11 @@ fn remove_any(
     if depth > MAX_WALK_DEPTH {
         return Err(FsError::TooDeep);
     }
+    // A symbolic link goes as itself, dangling or not, and `-r` never follows one into
+    // what it names: `meta` follows the final link, so ask about the link first.
+    if ctx.fs.stat_full(absolute).is_some_and(|stat| stat.kind == feos_fs::vfs::FileKind::Symlink) {
+        return ctx.fs.remove_file(absolute);
+    }
     let meta = ctx.fs.meta(absolute)?;
     match meta.kind {
         Kind::File => ctx.fs.remove_file(absolute),
@@ -739,11 +744,11 @@ pub(super) fn touch(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
     let mut status = 0;
     for file in files {
         if ctx.fs.exists(&file) {
-            if let Some(now) = ctx.system.unix_time() {
+            if let Some(now) = ctx.system.unix_time().map(feos_fs::Timestamp::from_secs) {
                 let times = feos_fs::NodeTimes {
                     modified: Some(now),
                     accessed: Some(now),
-                    created: None,
+                    ..feos_fs::NodeTimes::NONE
                 };
                 // A filesystem with no timestamps has nothing to update.
                 match ctx.fs.set_times(&file, times) {
@@ -811,7 +816,7 @@ pub(super) fn stat(args: &[String], ctx: &mut Ctx<'_>) -> i32 {
             write_line(ctx.stdout, format_args!("  Link: {target}"));
         }
         if let Some(modified) = ctx.fs.times(path).and_then(|times| times.modified) {
-            let date = feos_hal::time::DateTime::from_unix(modified);
+            let date = feos_hal::time::DateTime::from_unix(modified.secs());
             write_line(
                 ctx.stdout,
                 format_args!(

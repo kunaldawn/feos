@@ -83,6 +83,10 @@ pub const IPI_STOP: u32 = 0;
 /// SGI that asks a CPU to reschedule.
 pub const IPI_RESCHEDULE: u32 = 1;
 
+/// SGI that asks a CPU to flush its user TLB entries. Never sent: AArch64's
+/// invalidations are broadcast to every CPU in the inner shareable domain.
+pub const IPI_TLB: u32 = 2;
+
 /// CPUs the board can bring up.
 ///
 /// QEMU's GICv2 `virt` machine supports up to eight CPUs, and the kernel keeps to
@@ -93,10 +97,17 @@ pub const MAX_CPUS: usize = 8;
 /// fw_cfg MMIO window on the `virt` machine.
 pub const FW_CFG_BASE: usize = 0x0902_0000;
 
-/// PCIe ECAM (configuration space) window on the `virt` machine.
+/// PCIe ECAM (configuration space) window on the `virt` machine, as the kernel sees it.
 ///
-/// QEMU places the high ECAM region at 256 GiB + 16 MiB.
-pub const PCIE_ECAM_BASE: usize = 0x40_1000_0000;
+/// QEMU places the high ECAM region at 256 GiB + 256 MiB (`PCIE_ECAM_PHYS`). That's
+/// inside the user window, which the kernel's mappings must stay below, so `boot.S` maps
+/// the gigabyte holding it at the last gigabyte below the window, 63 GiB, and this is
+/// where the region is there. Nothing hands the address to a device, so nothing else
+/// needs the physical one.
+pub const PCIE_ECAM_BASE: usize = 0x0f_c000_0000 + (PCIE_ECAM_PHYS & 0x3fff_ffff);
+
+/// Where the ECAM region really is.
+pub const PCIE_ECAM_PHYS: usize = 0x40_1000_0000;
 
 /// First virtio MMIO slot on the `virt` machine.
 pub const VIRTIO_MMIO_BASE: usize = 0x0a00_0000;
@@ -384,6 +395,7 @@ fn enable_cpu_lines() {
     INTERRUPT_CONTROLLER.enable(TIMER_IRQ);
     INTERRUPT_CONTROLLER.enable(IPI_STOP);
     INTERRUPT_CONTROLLER.enable(IPI_RESCHEDULE);
+    INTERRUPT_CONTROLLER.enable(IPI_TLB);
 }
 
 /// Initializes the calling CPU's GIC interface and timer PPI.
@@ -667,6 +679,7 @@ impl Board for QemuVirt {
     const TIMER_IRQ: u32 = TIMER_IRQ;
     const IPI_STOP: u32 = IPI_STOP;
     const IPI_RESCHEDULE: u32 = IPI_RESCHEDULE;
+    const IPI_TLB: u32 = IPI_TLB;
     const MAX_CPUS: usize = MAX_CPUS;
     /// The boot page tables map RAM as Normal memory up to here.
     const RAM_LIMIT: u64 = 0x1_0000_0000;

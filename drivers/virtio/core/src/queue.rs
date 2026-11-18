@@ -155,9 +155,9 @@ impl<const N: usize> Queue<N> {
     /// Physical `(descriptors, available ring, used ring)` addresses.
     pub fn addresses(&self) -> (u64, u64, u64) {
         (
-            core::ptr::addr_of!(self.driver.desc) as u64,
-            core::ptr::addr_of!(self.driver.avail_flags) as u64,
-            core::ptr::addr_of!(self.device.used_flags) as u64,
+            feos_hal::dma::bus_address(core::ptr::addr_of!(self.driver.desc) as usize),
+            feos_hal::dma::bus_address(core::ptr::addr_of!(self.driver.avail_flags) as usize),
+            feos_hal::dma::bus_address(core::ptr::addr_of!(self.device.used_flags) as usize),
         )
     }
 

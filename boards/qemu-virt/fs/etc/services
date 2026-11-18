@@ -1,0 +1,23 @@
+# Network services, as getservbyname and friends look them up.
+ftp-data	20/tcp
+ftp		21/tcp
+ssh		22/tcp
+telnet		23/tcp
+smtp		25/tcp		mail
+domain		53/tcp
+domain		53/udp
+bootps		67/udp
+bootpc		68/udp
+tftp		69/udp
+http		80/tcp		www
+pop3		110/tcp
+ntp		123/udp
+imap		143/tcp
+snmp		161/udp
+https		443/tcp
+https		443/udp
+submissions	465/tcp		ssmtp smtps
+submission	587/tcp
+imaps		993/tcp
+pop3s		995/tcp
+git		9418/tcp

@@ -27,9 +27,7 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
-use feos_app::{
-    App, AppRegistry, ProcessInfo, ProcessState, Processes, SpawnError, WaitStatus, MAX_PROCESSES,
-};
+use feos_app::{App, AppRegistry, ProcessSnapshot, Processes, SpawnError, WaitStatus};
 use feos_text::Text;
 use feos_yaml::{NodeId, YamlDocument, YamlError, YamlNode};
 
@@ -839,8 +837,11 @@ impl<const N: usize> Init<N> {
             return 0;
         }
 
-        let mut live = [ProcessInfo::EMPTY; MAX_PROCESSES];
-        let count = processes.snapshot(&mut live);
+        // With no heap for the table, nothing can be told about any service: the next
+        // tick looks again, rather than taking every one for gone.
+        let Some(live) = ProcessSnapshot::take(processes) else {
+            return 0;
+        };
         let mut changed = 0;
 
         for index in 0..self.len {
@@ -852,7 +853,7 @@ impl<const N: usize> Init<N> {
                 if healthy {
                     service.restarts = 0;
                 }
-                if process_is_live(&live[..count], pid) {
+                if live.is_live(pid) {
                     if service.stopping {
                         processes.kill(pid);
                     }
@@ -988,22 +989,16 @@ fn backoff_ms(restarts: u8) -> u64 {
     }
 }
 
+/// Whether `pid` is running. Taken to be, with no heap to look: a service is only
+/// started again, or forgotten, once it's known to have gone.
 fn pid_is_live(processes: &dyn Processes, pid: u32) -> bool {
-    let mut live = [ProcessInfo::EMPTY; MAX_PROCESSES];
-    let count = processes.snapshot(&mut live);
-    process_is_live(&live[..count], pid)
-}
-
-fn process_is_live(processes: &[ProcessInfo], pid: u32) -> bool {
-    processes
-        .iter()
-        .any(|process| process.pid == pid && process.state != ProcessState::Exited)
+    ProcessSnapshot::take(processes).is_none_or(|live| live.is_live(pid))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use feos_app::Context;
+    use feos_app::{Context, ProcessInfo, ProcessState, MAX_PROCESSES};
     use feos_sync::SpinLock;
 
     struct Dummy;
@@ -1066,6 +1061,8 @@ mod tests {
         /// What the last process to exit left behind.
         exits: [(u32, i32); 8],
         exits_len: usize,
+        /// Other processes the table reports, ahead of the ones spawned here.
+        crowd: usize,
     }
 
     struct FakeProcesses {
@@ -1083,6 +1080,7 @@ mod tests {
                     spawn_error: None,
                     exits: [(0, 0); 8],
                     exits_len: 0,
+                    crowd: 0,
                 }),
             }
         }
@@ -1161,13 +1159,16 @@ mod tests {
 
         fn snapshot(&self, out: &mut [ProcessInfo]) -> usize {
             let state = self.state.lock();
-            let count = state.live_len.min(out.len());
-            for (index, &pid) in state.live[..count].iter().enumerate() {
-                out[index] = ProcessInfo {
+            let crowd = (0..state.crowd as u32).map(|index| 100_000 + index);
+            let pids = crowd.chain(state.live[..state.live_len].iter().copied());
+            let mut count = 0;
+            for (info, pid) in out.iter_mut().zip(pids) {
+                *info = ProcessInfo {
                     pid,
                     state: ProcessState::Running,
                     ..ProcessInfo::EMPTY
                 };
+                count += 1;
             }
             count
         }
@@ -1189,6 +1190,27 @@ mod tests {
         assert_eq!(config.max_restarts, 5);
         assert_eq!(config.autostart_len, 2);
         assert_eq!(config.autostart()[1].as_str(), "files");
+    }
+
+    #[test]
+    fn a_service_at_the_end_of_a_full_table_is_seen() {
+        // The table full: a thousand others, and this service's process the very last
+        // entry, which a snapshot short of the whole table would have missed.
+        let processes = FakeProcesses::new();
+        processes.state.lock().crowd = MAX_PROCESSES - 1;
+        let mut init = Init::<4>::new(RestartPolicy::Always, 3);
+        assert!(init.register("dummy", &DUMMY, ""));
+        let pid = init.start("dummy", &processes).unwrap();
+        for _ in 0..3 {
+            assert_eq!(init.tick(&processes), 0);
+        }
+        assert_eq!(init.status_of("dummy").unwrap().pid, Some(pid));
+        assert_eq!(processes.spawned(), 1, "never started twice");
+        assert_eq!(init.start("dummy", &processes), Err(InitError::AlreadyRunning));
+        // Gone, it's noticed and started again.
+        processes.exit_with(pid, 1);
+        init.tick(&processes);
+        assert_eq!(processes.spawned(), 2);
     }
 
     #[test]

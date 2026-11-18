@@ -17,18 +17,22 @@
 //! Properties, About, Help, End Process), update-speed control, status bar,
 //! sortable headers, scrolling, mouse and serial-keyboard support are all
 //! implemented here. Like the rest of the GUI, it is allocation-free apart from
-//! the off-screen frame buffer.
+//! the off-screen frame buffer and the process list, which is as long as the
+//! kernel's table.
 
 use core::cmp::Ordering;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering as AtomicOrdering};
 
 use alloc::vec;
+use alloc::vec::Vec;
 
 use feos_app::{
-    shell, App, Context, KillResult, Platform, ProcessInfo, ProcessState, SystemInfo, WindowContext, WindowFrame,
-    MAX_CPUS, MAX_PROCESSES,
+    shell, App, Context, KillResult, Platform, ProcessSnapshot, ProcessState, SystemInfo, WindowContext, WindowFrame,
+    MAX_CPUS,
 };
+#[cfg(test)]
+use feos_app::ProcessInfo;
 use feos_console::println;
 use feos_gfx::{Canvas, Color, Point, Rect};
 use feos_gui::{
@@ -41,8 +45,6 @@ use feos_sync::SpinLock;
 use feos_text::Text;
 
 /// Number of history samples kept for the performance graphs.
-/// Rows in the process list: every process and every window the desktop draws.
-const MAX_ROWS: usize = MAX_PROCESSES + shell::MAX_WINDOWS;
 const HISTORY: usize = 120;
 /// Height of one process list row.
 const ROW_HEIGHT: i32 = 20;
@@ -137,11 +139,11 @@ impl App for TaskManager {
     }
 
     fn usage(&self) -> &'static str {
-        "taskmgr"
+        "taskmgr [--list]"
     }
 
     fn description(&self) -> &'static str {
-        "inspect applications, processes, CPU and memory"
+        "inspect applications, processes, CPU and memory; --list prints the process list"
     }
 
     fn foreground(&self) -> bool {
@@ -617,7 +619,10 @@ struct State {
     dialog: Dialog,
     dialog_scroll: usize,
 
-    rows: [Row; MAX_ROWS],
+    /// Every process the kernel reported and every window the desktop draws, on the
+    /// heap: a full table is far too many rows for a task's stack. The first
+    /// `row_count` are the list.
+    rows: Vec<Row>,
     row_count: usize,
     sort: SortKey,
     sort_desc: bool,
@@ -627,7 +632,7 @@ struct State {
     app_scroll: usize,
     user_scroll: usize,
 
-    previous: [Previous; MAX_ROWS],
+    previous: Vec<Previous>,
     previous_count: usize,
     last_total_ticks: u64,
     last_idle_ticks: u64,
@@ -699,7 +704,7 @@ impl State {
             context: None,
             dialog: Dialog::None,
             dialog_scroll: 0,
-            rows: [Row::EMPTY; MAX_ROWS],
+            rows: Vec::new(),
             row_count: 0,
             sort: SortKey::Name,
             sort_desc: false,
@@ -708,7 +713,7 @@ impl State {
             process_scroll: 0,
             app_scroll: 0,
             user_scroll: 0,
-            previous: [Previous::EMPTY; MAX_ROWS],
+            previous: Vec::new(),
             previous_count: 0,
             last_total_ticks: 0,
             last_idle_ticks: 0,
@@ -986,8 +991,22 @@ impl State {
     /// `details` asks the kernel for each process's stack and wait state, which
     /// walks its stack. A minimized window does not need them.
     fn sample_with(&mut self, platform: &Platform, now: u64, pushes: usize, details: bool) {
-        let mut infos = [ProcessInfo::EMPTY; MAX_PROCESSES];
-        let count = platform.processes.snapshot(&mut infos);
+        // With no heap for the table or the rows, the list stays as it was until the
+        // next sample.
+        let Some(infos) = ProcessSnapshot::take(platform.processes) else {
+            return;
+        };
+        let mut windows = [shell::WindowInfo::empty(); shell::MAX_WINDOWS];
+        let window_count = shell::windows(&mut windows);
+        let windows = &windows[..window_count];
+        let most = infos.len() + windows.len();
+        let mut rows = Vec::new();
+        let mut previous = Vec::new();
+        if rows.try_reserve_exact(most).is_err() || previous.try_reserve_exact(most).is_err() {
+            return;
+        }
+        rows.resize(most, Row::EMPTY);
+        previous.resize(most, Previous::EMPTY);
         let system = platform.processes.system();
 
         let total_delta = system.total_ticks.saturating_sub(self.last_total_ticks);
@@ -996,17 +1015,12 @@ impl State {
         self.cpu_percent = percentage(busy_delta, total_delta);
 
         let hz = system.ticks_per_second.max(1);
-        let mut rows = [Row::EMPTY; MAX_ROWS];
-        let mut previous = [Previous::EMPTY; MAX_ROWS];
         let mut row_count = 0;
         let mut previous_count = 0;
         let mut reserved_memory = 0usize;
 
         // The desktop draws hosted windows on its own thread, so their time is
         // inside the desktop's. Show it where it belongs.
-        let mut windows = [shell::WindowInfo::empty(); shell::MAX_WINDOWS];
-        let window_count = shell::windows(&mut windows);
-        let windows = &windows[..window_count];
         let hosted_ticks = |window: &shell::WindowInfo| {
             (window.cpu_us as u128 * hz as u128 / 1_000_000) as u64
         };
@@ -1016,7 +1030,7 @@ impl State {
             .map(hosted_ticks)
             .sum();
 
-        for info in infos.iter().take(count.min(MAX_PROCESSES)) {
+        for info in infos.iter() {
             // PID 1 is the desktop's thread.
             let cpu_ticks = if info.pid == 1 {
                 info.cpu_ticks.saturating_sub(hosted_total)
@@ -1179,7 +1193,7 @@ impl State {
 
     fn sort_rows(&mut self) {
         let count = self.row_count;
-        let mut data = self.rows;
+        let mut data = core::mem::take(&mut self.rows);
         let mut index = 1;
         while index < count {
             let value = data[index];
@@ -1337,13 +1351,14 @@ impl State {
 
     /// Ends `pid` and everything it started, children first.
     fn confirm_end_tree(&mut self, platform: &Platform, pid: u32, now: u64) {
-        let mut infos = [ProcessInfo::EMPTY; MAX_PROCESSES];
-        let count = platform.processes.snapshot(&mut infos);
-        let mut tree = [0u32; MAX_PROCESSES];
-        let found = feos_app::process_tree(&infos[..count], pid, &mut tree);
+        // Every process, to find all of the tree.
+        let Some(tree) = ProcessSnapshot::take(platform.processes).and_then(|snapshot| snapshot.tree(pid)) else {
+            self.set_notice(now, "Not enough memory to list the process tree.");
+            return;
+        };
         let current = platform.processes.current();
         let mut ended = 0;
-        for &member in tree[..found].iter().rev() {
+        for &member in tree.iter().rev() {
             if member != current && platform.processes.try_kill(member).accepted() {
                 ended += 1;
             }
@@ -1409,6 +1424,9 @@ impl State {
             }
             Err(feos_app::SpawnError::Unsupported) => {
                 self.set_notice(now, "This kernel can't start that.");
+            }
+            Err(feos_app::SpawnError::NoMemory) => {
+                self.set_notice(now, "There isn't the memory to start that.");
             }
             Err(feos_app::SpawnError::ArgsTooLong) => {
                 self.set_notice(now, "The command line is too long.");
@@ -1827,8 +1845,24 @@ fn tick_task_manager(platform: &Platform, now: u64) {
     }
 }
 
+/// Prints the Processes tab's list, built and sorted as the window builds it, for a
+/// serial console or a script.
+fn print_list(platform: &Platform) {
+    let mut state = State::new(Rect::new(0, 0, 800, 600));
+    state.sample(platform, platform.clock.uptime_ms());
+    println!("  PID  THR  NAME");
+    for row in &state.rows[..state.row_count] {
+        println!("{:>5}  {:>3}  {}", row.pid, row.threads, row.name.as_str());
+    }
+    println!("[taskmgr] {} listed", state.row_count);
+}
+
 fn run(context: &mut Context<'_>) {
     let platform = context.platform;
+    if context.argv.contains(&"--list") {
+        print_list(platform);
+        return;
+    }
     let suspend = context.suspend;
     let suspend_area = context.suspend_area;
     let Some(display) = context.display.as_mut() else {
@@ -5180,6 +5214,7 @@ mod render_tests {
     pub(super) fn test_state(screen: Rect) -> State {
         let mut state = State::new(screen);
         state.row_count = 2;
+        state.rows.resize(2, Row::EMPTY);
         state.rows[0] = Row {
             pid: 1,
             name: Text::from_str("shell"),
@@ -5434,6 +5469,7 @@ mod preview_tests {
         let names = ["shell", "tick", "player", "files", "tone", "desktop"];
         let percents = [34u8, 18, 12, 7, 4, 2];
         state.row_count = names.len();
+        state.rows.resize(names.len(), Row::EMPTY);
         for index in 0..names.len() {
             let pid = index as u32 + 1;
             state.rows[index] = Row {
@@ -5761,19 +5797,6 @@ mod cursor_tests {
 mod behavior_tests {
     use super::render_tests::{platform, test_state};
     use super::*;
-
-    #[test]
-    fn the_process_tree_lists_parents_before_their_children() {
-        let info = |pid, parent| ProcessInfo {
-            pid,
-            parent,
-            ..ProcessInfo::EMPTY
-        };
-        let infos = [info(1, 0), info(2, 1), info(3, 2), info(4, 3), info(5, 1), info(6, 2)];
-        let mut tree = [0u32; MAX_PROCESSES];
-        let count = feos_app::process_tree(&infos, 2, &mut tree);
-        assert_eq!(&tree[..count], [2, 3, 6, 4]);
-    }
 
     #[test]
     fn a_hosted_window_lists_under_a_stand_in_id() {
