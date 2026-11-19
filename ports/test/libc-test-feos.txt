@@ -1,0 +1,216 @@
+# The libc-test subset feos runs (ports/src/libc-test), for ports/test/build-libc-test.sh.
+#
+#   include PATTERN...       tests to build and run (shell patterns over DIR/NAME)
+#   NAME[@ARCH] STAGE WHY    an included test feos doesn't run yet (@aarch64 or @x86_64:
+#                            on that architecture only): STAGE is the kernel
+#                            stage it waits on (docs/selfhost-todo.md), `skip` for one
+#                            that waits on something else, `upstream` for a relibc
+#                            limitation feos can't fix (said in WHY; docs/toolchain.md)
+#
+# An included test that isn't listed is built, put in the image and run, and must pass.
+
+include functional/* regression/* math/*
+
+functional/dlopen              1f.1  dlopen
+functional/tls_align_dlopen    1f.1  dlopen
+functional/tls_init_dlopen     1f.1  dlopen
+regression/tls_get_new-dtv     1f.1  dlopen, $ORIGIN rpath
+
+# Don't build against relibc: what they test isn't in relibc (upstream limitations,
+# docs/toolchain.md has the list).
+functional/env                 upstream  relibc has no clearenv
+functional/iconv_open          upstream  relibc has no iconv.h
+functional/ipc_msg             upstream  relibc has no System V message queues (sys/msg.h)
+functional/ipc_sem             upstream  relibc has no System V semaphores (sys/sem.h)
+functional/memstream           upstream  relibc has no open_memstream
+functional/mntent              upstream  relibc has no mntent.h
+functional/search_hsearch      upstream  relibc has no search.h
+functional/search_insque       upstream  relibc has no search.h
+functional/search_lsearch      upstream  relibc has no search.h
+functional/search_tsearch      upstream  relibc has no search.h
+functional/sem_open            upstream  relibc has no named semaphores (sem_open)
+functional/vfork               upstream  relibc has no vfork (and feos has no FORK before 1d.1)
+functional/wordexp             upstream  relibc has no wordexp.h
+regression/dn_expand-empty     upstream  relibc has no resolv.h
+regression/dn_expand-ptr-0     upstream  relibc has no resolv.h
+regression/fgets-eof           upstream  relibc has no fmemopen
+regression/flockfile-list      upstream  interposes malloc, which relibc's static libc.a can't have replaced (aligned_alloc defined twice)
+regression/iconv-roundtrips    upstream  relibc has no iconv.h
+regression/sem_close-unmap     upstream  relibc has no named semaphores (sem_open)
+regression/strverscmp          upstream  relibc has no strverscmp
+regression/syscall-sign-extend skip      calls Linux system call numbers through syscall(2)
+math/drem                      upstream  openlibm has no drem
+math/exp10                     upstream  openlibm has no exp10
+math/exp10f                    upstream  openlibm has no exp10f
+math/exp10l                    upstream  openlibm has no exp10l
+math/pow10                     upstream  openlibm has no pow10
+math/pow10f                    upstream  openlibm has no pow10f
+math/pow10l                    upstream  openlibm has no pow10l
+math/scalb                     upstream  openlibm has no scalb
+math/scalbf                    upstream  openlibm has no scalbf
+math/nearbyintl                upstream  openlibm declares nearbyintl but doesn't build it
+math/dremf                     upstream  openlibm declares dremf but doesn't build it
+
+# Fail the same with relibc's own Linux platform (ports/test/libc-suite-linux.sh, the
+# reference run): relibc bugs and openlibm's results and exception flags, with the
+# reference's first message.
+functional/clocale_mbfuncs           upstream  fails on relibc's Linux too: MB_CUR_MAX = 4, expected 1
+functional/crypt                     upstream  fails on relibc's Linux too: crypt("", "$2a$08$01234567890123456789") failed: got "$2a$8$s5SCFHAdETNa1a5mwtrhd8JKLg8...
+functional/fnmatch                   upstream  fails on relibc's Linux too: fnmatch("a\*.c", "a*.c", FNM_NOESCAPE) failed, got 0 want 1
+functional/fscanf                    upstream  fails on relibc's Linux too: fgetc(f) failed ('l' != 'r') (Success))
+functional/fwscanf                   upstream  fails on relibc's Linux too: fwscanf(f, L" %n%*d%n", &x, &y) failed (-1 != 0)
+functional/inet_pton                 upstream  fails on relibc's Linux too: inet_pton(AF_INET, "1.2.03.4", addr) returned 1, want 0
+functional/ipc_shm                   upstream  fails on relibc's Linux too: shmget(IPC_CREAT|IPC_EXCL) should have failed with EEXIST, got Success
+functional/mbc                       upstream  fails on relibc's Linux too: mbrtowc(&wc, "\x80", 1, &st2) failed (failed to resume) got -1 want 1
+functional/pthread_cancel-points     upstream  fails on relibc's Linux too: seqno == 1 failed (blocking sem_wait, seqno)
+functional/pthread_cancel            upstream  fails on relibc's Linux too: hangs
+functional/pthread_mutex             upstream  fails on relibc's Linux too: hangs
+functional/pthread_mutex_pi          upstream  fails on relibc's Linux too: sem_timedwait failed with unexpected error: Try again
+functional/pthread_robust            upstream  fails on relibc's Linux too: hangs
+functional/snprintf                  upstream  fails on relibc's Linux too: bad integer conversion: got " 12  ", want "+12  "
+functional/spawn                     upstream  fails on relibc's Linux too: posix_spawnp(&pid, "echo", &fa, 0, (char *[]){"echo","hello",0}, 0) failed, got 38 want 0
+functional/sscanf                    upstream  fails on relibc's Linux too: sscanf("hello, world\n", "%8c%8c", a, b) failed (2 fields, expected 1)
+functional/strftime                  upstream  fails on relibc's Linux too: "%c": expected "Sun Jan  3 13:23:45 2016", got nothing
+functional/string_strstr             upstream  fails on relibc's Linux too: strstr("","") returned 0, wanted str+0
+functional/strptime                  upstream  fails on relibc's Linux too: "%R:%S": failed to parse "20:57:8"
+functional/strtod                    upstream  fails on relibc's Linux too
+functional/strtod_long               upstream  fails on relibc's Linux too
+functional/strtod_simple             upstream  fails on relibc's Linux too
+functional/strtof                    upstream  fails on relibc's Linux too
+functional/strtol                    upstream  fails on relibc's Linux too: strtol(s="0xz", &c, 16) failed (wrong final position 0 != 1)
+functional/strtold                   upstream  fails on relibc's Linux too
+functional/swprintf                  upstream  fails on relibc's Linux too: swprintf(b, 2, L"%lc", 0xc0) failed (-1 != 1)
+functional/ungetc                    upstream  fails on relibc's Linux too: fscanf(f, "%[h]", a) failed (got 1 fields, expected 0)
+functional/wcstol                    upstream  fails on relibc's Linux too: wcstol(s=L"9223372036854775808", &c, 0) failed (uncaught overflow -1 != 922337203685477...
+regression/fpclassify-invalid-ld80   upstream  fails on relibc's Linux too: fpclassify(zero with msb set) failed: got FP_ZERO want FP_NORMAL
+regression/ftello-unflushed-append   upstream  fails on relibc's Linux too: ftello is broken before flush: got 3, want 7
+regression/inet_ntop-v4mapped        upstream  fails on relibc's Linux too: inet_ntop failed
+regression/inet_pton-empty-last-field upstream  fails on relibc's Linux too: inet_pton(1:2:3:4:5:6:7::) returned 30b0, wanted 0001
+regression/malloc-brk-fail           upstream  fails on relibc's Linux too: malloc(10000) succeeded after memory is filled
+regression/printf-1e9-oob            upstream  fails on relibc's Linux too: snprintf("%g",999999999.000000) want 1e+09 got 10e+08
+regression/printf-fmt-g-round        upstream  fails on relibc's Linux too: snprintf("%.12g", 100000000002500.000000) want 1.00000000002e+14 got 1.00000000003e+14
+regression/pthread-robust-detach     upstream  fails on relibc's Linux too: pthread_mutex_timedlock(&mtx, &ts) failed: (pshared==0) got 110 "Owner died" want 130 "...
+regression/pthread_cancel-sem_wait   upstream  fails on relibc's Linux too: seqno == 1 failed (uncontended sem_wait)
+regression/pthread_cond_wait-cancel_ignored upstream  fails on relibc's Linux too: pthread_cond_wait did not act on cancellation
+regression/pthread_condattr_setclock upstream  fails on relibc's Linux too: pthread_condattr_setclock CLOCK_PROCESS_CPUTIME_ID should fail with EINVAL, got Success
+regression/pthread_exit-dtor         upstream  fails on relibc's Linux too: atexit handler was not run after last thread exited (exited=1, signal=0, status=0, want...
+regression/regex-backref-0           upstream  fails on relibc's Linux too: regexec(/a\0/ ~ "a0") returned 1 (No match), wanted 0
+regression/regex-ere-backref         upstream  fails on relibc's Linux too: regexec(/(a)\1/ ~ "aa") returned 0 (No error), wanted REG_NOMATCH
+regression/regex-escaped-high-byte   upstream  fails on relibc's Linux too: regcomp(\\\xfc) returned 0 (No error) wanted REG_BADPAT
+regression/regexec-backref           upstream  fails on relibc's Linux too: regexec(&re, "aababa", 2, rm, 0) == 0 failed
+regression/scanf-bytes-consumed      upstream  fails on relibc's Linux too: sscanf consumed 2 bytes but reported -2052325435
+regression/setenv-oom                upstream  fails on relibc's Linux too
+regression/setvbuf-unget             upstream  fails on relibc's Linux too: hangs
+regression/sigprocmask-internal      upstream  fails on relibc's Linux too: sigaddset(&s, 32) set implementation internal rt signal
+regression/sscanf-eof                upstream  fails on relibc's Linux too: sscanf("0", "%f%c",..) returned 2, wanted 1
+math/asin                            upstream  fails on relibc's Linux too: got INEXACT
+math/asinf                           upstream  fails on relibc's Linux too: got INEXACT
+math/atan                            upstream  fails on relibc's Linux too: got INEXACT
+math/atan2                           upstream  fails on relibc's Linux too: got INEXACT
+math/atan2f                          upstream  fails on relibc's Linux too: got INEXACT
+math/atan2l                          upstream  fails on relibc's Linux too: got INEXACT
+math/atanf                           upstream  fails on relibc's Linux too: got INEXACT
+math/atanh                           upstream  fails on relibc's Linux too: got INEXACT
+math/atanhf                          upstream  fails on relibc's Linux too: got INEXACT
+math/atanhl                          upstream  fails on relibc's Linux too: got INEXACT
+math/exp                             upstream  fails on relibc's Linux too: got INEXACT
+math/exp2                            upstream  fails on relibc's Linux too: got INEXACT
+math/exp2l                           upstream  fails on relibc's Linux too: got INEXACT
+math/expf                            upstream  fails on relibc's Linux too: got INEXACT
+math/expl                            upstream  fails on relibc's Linux too: got 0
+math/expm1                           upstream  fails on relibc's Linux too: got INEXACT
+math/expm1l                          upstream  fails on relibc's Linux too: got INEXACT|OVERFLOW
+math/fenv                            upstream  fails on relibc's Linux too: fetestexcept(-1) should return 0 when all exceptions are cleared, got 32640
+math/fma                             upstream  fails on relibc's Linux too: got INEXACT
+math/fmaf                            upstream  fails on relibc's Linux too: got INEXACT
+math/fmal                            upstream  fails on relibc's Linux too: got INEXACT
+math/fpclassify                      upstream  fails on relibc's Linux too
+math/ilogb                           upstream  fails on relibc's Linux too: got 0
+math/ilogbf                          upstream  fails on relibc's Linux too: got 0
+math/ilogbl                          upstream  fails on relibc's Linux too: got 0
+math/j1                              upstream  fails on relibc's Linux too
+math/j1f                             upstream  fails on relibc's Linux too
+math/jn                              upstream  fails on relibc's Linux too
+math/jnf                             upstream  fails on relibc's Linux too
+math/log1p                           upstream  fails on relibc's Linux too: got INEXACT
+math/log1pf                          upstream  fails on relibc's Linux too: got INEXACT
+math/log1pl                          upstream  fails on relibc's Linux too: got 0
+math/log2l                           upstream  fails on relibc's Linux too: got 0
+math/logl                            upstream  fails on relibc's Linux too: got 0
+math/nextafterl                      upstream  fails on relibc's Linux too: got 0
+math/nexttoward                      upstream  fails on relibc's Linux too
+math/nexttowardl                     upstream  fails on relibc's Linux too: got 0
+math/pow                             upstream  fails on relibc's Linux too: got 0
+math/powf                            upstream  fails on relibc's Linux too: got 0
+math/powl                            upstream  fails on relibc's Linux too: got INEXACT
+math/round                           upstream  fails on relibc's Linux too: got INVALID
+math/sin                             upstream  fails on relibc's Linux too: got INEXACT
+math/sinf                            upstream  fails on relibc's Linux too: got INEXACT
+math/sinh                            upstream  fails on relibc's Linux too: got INEXACT
+math/sinhf                           upstream  fails on relibc's Linux too: got INEXACT
+math/tan                             upstream  fails on relibc's Linux too: got INEXACT
+math/tanf                            upstream  fails on relibc's Linux too: got INEXACT
+math/tanh                            upstream  fails on relibc's Linux too: got INEXACT
+math/tanhf                           upstream  fails on relibc's Linux too: got INEXACT
+math/tgamma                          upstream  fails on relibc's Linux too: got DIVBYZERO
+math/yn                              upstream  fails on relibc's Linux too
+math/ynf                             upstream  fails on relibc's Linux too
+
+# Kernel stages not in the base yet.
+functional/fcntl               1d.1  fork (and the test reads an unset status when fork fails, so it may pass by chance)
+functional/popen               1c.12 /bin/sh
+functional/setjmp              1c.10 sigprocmask (siglongjmp restores the mask)
+functional/socket              1e.3  sockets
+regression/daemon-failure      1d.1  fork
+regression/execle-env          1c.7  exec
+regression/fflush-exit         1d.1  fork
+regression/raise-race          1c.10 raise (THREAD_KILL); hangs until then
+regression/sigaltstack         1c.10 sigaltstack
+regression/sigreturn           1c.9  signal handlers
+
+# feos as designed (docs/feos-abi-v2.md), in docs/toolchain.md.
+regression/rlimit-open-files   skip  setrlimit is accepted with no effect (section 9: no limit is enforced yet)
+regression/statvfs             skip  the RAM root counts no files: FSTATVFS's files, ffree, favail are 0, as Linux says for FAT
+
+# AArch64 only: fail the same on relibc's Linux AArch64 (the reference under qemu-user):
+# openlibm's 128-bit long double and its AArch64 results and exception flags.
+math/acoshl@aarch64            upstream  fails the same on relibc's Linux AArch64
+math/acosl@aarch64             upstream  fails the same on relibc's Linux AArch64
+math/asinhl@aarch64            upstream  fails the same on relibc's Linux AArch64
+math/asinl@aarch64             upstream  fails the same on relibc's Linux AArch64
+math/atanl@aarch64             upstream  fails the same on relibc's Linux AArch64
+math/cbrtl@aarch64             upstream  fails the same on relibc's Linux AArch64
+math/coshl@aarch64             upstream  fails the same on relibc's Linux AArch64
+math/cosl@aarch64              upstream  fails the same on relibc's Linux AArch64
+math/erfcl@aarch64             upstream  fails the same on relibc's Linux AArch64
+math/erfl@aarch64              upstream  fails the same on relibc's Linux AArch64
+math/fdiml@aarch64             upstream  fails the same on relibc's Linux AArch64
+math/fmodl@aarch64             upstream  fails the same on relibc's Linux AArch64
+math/hypotl@aarch64            upstream  fails the same on relibc's Linux AArch64
+math/isless@aarch64            upstream  fails the same on relibc's Linux AArch64
+math/ldexpl@aarch64            upstream  fails the same on relibc's Linux AArch64
+math/lgammal@aarch64           upstream  fails the same on relibc's Linux AArch64
+math/lgammal_r@aarch64         upstream  fails the same on relibc's Linux AArch64
+math/llrintl@aarch64           upstream  fails the same on relibc's Linux AArch64
+math/llroundl@aarch64          upstream  fails the same on relibc's Linux AArch64
+math/log10l@aarch64            upstream  fails the same on relibc's Linux AArch64
+math/logbl@aarch64             upstream  fails the same on relibc's Linux AArch64
+math/lrintl@aarch64            upstream  fails the same on relibc's Linux AArch64
+math/lroundl@aarch64           upstream  fails the same on relibc's Linux AArch64
+math/modfl@aarch64             upstream  fails the same on relibc's Linux AArch64
+math/remainder@aarch64         upstream  fails the same on relibc's Linux AArch64
+math/remainderf@aarch64        upstream  fails the same on relibc's Linux AArch64
+math/remainderl@aarch64        upstream  fails the same on relibc's Linux AArch64
+math/remquol@aarch64           upstream  fails the same on relibc's Linux AArch64
+math/rintl@aarch64             upstream  fails the same on relibc's Linux AArch64
+math/scalblnl@aarch64          upstream  fails the same on relibc's Linux AArch64
+math/scalbnl@aarch64           upstream  fails the same on relibc's Linux AArch64
+math/sincosl@aarch64           upstream  fails the same on relibc's Linux AArch64
+math/sinhl@aarch64             upstream  fails the same on relibc's Linux AArch64
+math/sinl@aarch64              upstream  fails the same on relibc's Linux AArch64
+math/sqrt@aarch64              upstream  fails the same on relibc's Linux AArch64
+math/sqrtf@aarch64             upstream  fails the same on relibc's Linux AArch64
+math/sqrtl@aarch64             upstream  fails the same on relibc's Linux AArch64
+math/tanhl@aarch64             upstream  fails the same on relibc's Linux AArch64
+math/tanl@aarch64              upstream  fails the same on relibc's Linux AArch64
+math/tgammal@aarch64           upstream  fails the same on relibc's Linux AArch64

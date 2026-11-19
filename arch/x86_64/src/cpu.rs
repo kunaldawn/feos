@@ -222,3 +222,24 @@ pub fn user_tls() -> usize {
     unsafe { asm!("rdmsr", in("ecx") MSR_FS_BASE, out("eax") low, out("edx") high, options(nomem, nostack, preserves_flags)) };
     (u64::from(high) << 32 | u64::from(low)) as usize
 }
+
+/// The CPU's `MXCSR_MASK`, from an `FXSAVE` image: the `MXCSR` bits `fxrstor` takes, which
+/// a signal context's `MXCSR` must stay within (a reserved bit would fault `fxrstor` in
+/// the kernel's return path). An image's zero means the original mask, `0xffbf`.
+pub fn mxcsr_mask() -> u32 {
+    static MASK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let known = MASK.load(core::sync::atomic::Ordering::Relaxed);
+    if known != 0 {
+        return known;
+    }
+    #[repr(C, align(16))]
+    struct Image([u8; 512]);
+    let mut image = Image([0; 512]);
+    // SAFETY: `fxsave` writes 512 bytes to a 16-byte aligned buffer of that size, and
+    // nothing else.
+    unsafe { core::arch::asm!("fxsave64 [{}]", in(reg) image.0.as_mut_ptr(), options(nostack, preserves_flags)) };
+    let reported = u32::from_le_bytes([image.0[28], image.0[29], image.0[30], image.0[31]]);
+    let mask = if reported == 0 { 0xffbf } else { reported };
+    MASK.store(mask, core::sync::atomic::Ordering::Relaxed);
+    mask
+}

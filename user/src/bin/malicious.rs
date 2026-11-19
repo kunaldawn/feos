@@ -493,6 +493,45 @@ fn probe(name: &str) -> i32 {
             core::hint::black_box(recurse(0));
         }
         "sp-in-kernel" => sp_in_kernel(),
+        "sigreturn-kernel-pc" => sigreturn_edited(EDIT_KERNEL_PC),
+        "sigreturn-kernel-stack" => sigreturn_edited(EDIT_KERNEL_SP),
+        "sigreturn-unknown-flags" => sigreturn_edited(EDIT_FLAGS),
+        #[cfg(target_arch = "x86_64")]
+        "sigreturn-bad-mxcsr" => sigreturn_edited(EDIT_MXCSR),
+        #[cfg(target_arch = "x86_64")]
+        "sigreturn-iopl" => {
+            // Back at ring 3 with IOPL 0 whatever the context said: `cli` faults.
+            sigreturn_edited(EDIT_IOPL);
+            // SAFETY: not at all, and that's the point.
+            unsafe { core::arch::asm!("cli") };
+        }
+        #[cfg(target_arch = "x86_64")]
+        "sigreturn-ring0-cs" => {
+            // The kernel's code selector in the context: still ring 3, so `cli` faults.
+            sigreturn_edited(EDIT_RING0);
+            let cs: u16;
+            // SAFETY: reading a segment register.
+            unsafe { core::arch::asm!("mov {:x}, cs", out(reg) cs) };
+            println!("probe sigreturn-ring0-cs: cs={cs:#x}");
+            // SAFETY: not at all, and that's the point.
+            unsafe { core::arch::asm!("cli") };
+        }
+        #[cfg(target_arch = "aarch64")]
+        "sigreturn-el1" => {
+            // EL1h and every mask in the context: still EL0t, so a system register traps.
+            sigreturn_edited(EDIT_EL1);
+            // SAFETY: not at all, and that's the point.
+            unsafe { core::arch::asm!("mrs {}, sctlr_el1", out(reg) _) };
+        }
+        "sigreturn-unmapped" => {
+            let page = mmap2(0, PAGE_SIZE, prot::READ | prot::WRITE, map::PRIVATE) as usize;
+            feos_user::munmap(page, PAGE_SIZE);
+            feos_user::signal::sigreturn(page);
+        }
+        "handler-that-faults" => {
+            feos_user::signal::handle(feos_user::abi::sig::SEGV, faulting_handler, 0);
+            write_at(core::hint::black_box(0));
+        }
         other => {
             if !privileged(other) {
                 println!("malicious: no probe called {other}");
@@ -502,6 +541,389 @@ fn probe(name: &str) -> i32 {
     }
     println!("probe {name}: got through");
     ESCAPED
+}
+
+// Stage 1c.9: what a handler's context can be rewritten to, for `SIGRETURN` to check.
+const EDIT_KERNEL_PC: usize = 1;
+const EDIT_KERNEL_SP: usize = 2;
+const EDIT_FLAGS: usize = 3;
+#[cfg(target_arch = "x86_64")]
+const EDIT_MXCSR: usize = 4;
+#[cfg(target_arch = "x86_64")]
+const EDIT_IOPL: usize = 5;
+#[cfg(target_arch = "x86_64")]
+const EDIT_RING0: usize = 6;
+#[cfg(target_arch = "aarch64")]
+const EDIT_EL1: usize = 7;
+
+static EDIT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+extern "C" fn edit_context(_: i32, _: *mut feos_user::abi::SigInfo, context: *mut feos_user::abi::UContext) {
+    use feos_user::signal::{set_pc, set_sp};
+    // SAFETY: the kernel's context, on this handler's stack, rewritten as the probe says.
+    unsafe {
+        match EDIT.load(core::sync::atomic::Ordering::SeqCst) {
+            EDIT_KERNEL_PC => set_pc(context, KERNEL as u64),
+            EDIT_KERNEL_SP => set_sp(context, KERNEL as u64),
+            EDIT_FLAGS => (*context).flags = 2,
+            #[cfg(target_arch = "x86_64")]
+            EDIT_MXCSR => (&mut (*context).fxsave)[24..28].copy_from_slice(&0x0001_1f80u32.to_le_bytes()),
+            #[cfg(target_arch = "x86_64")]
+            EDIT_IOPL => (*context).gregs[feos_user::abi::ucontext::greg::EFL] |= 3 << 12 | 1 << 8,
+            #[cfg(target_arch = "x86_64")]
+            EDIT_RING0 => (*context).gregs[feos_user::abi::ucontext::greg::CSGSFS] = 0x08,
+            #[cfg(target_arch = "aarch64")]
+            EDIT_EL1 => (*context).pstate = 0x3c5,
+            _ => {}
+        }
+    }
+}
+
+/// Raises a signal whose handler rewrites its context as `edit` says, and returns if the
+/// kernel let the program go on after its `SIGRETURN`.
+fn sigreturn_edited(edit: usize) {
+    EDIT.store(edit, core::sync::atomic::Ordering::SeqCst);
+    feos_user::signal::handle(feos_user::abi::sig::USR1, edit_context, 0);
+    feos_user::kill(getpid(), feos_user::abi::sig::USR1);
+}
+
+/// A `SIGSEGV` handler that faults itself: the signal is blocked while it runs, so the
+/// second fault ends the process.
+extern "C" fn faulting_handler(_: i32, _: *mut feos_user::abi::SigInfo, _: *mut feos_user::abi::UContext) {
+    write_at(core::hint::black_box(0));
+}
+
+/// Signal handlers' probes (stage 1c.9): dispositions that can't be set, contexts a
+/// handler rewrote, and contexts and actions another thread rewrites while the kernel
+/// reads them.
+fn signal_probes(tally: &mut Tally, program: &str) {
+    use feos_user::abi::{sa, sig, SigAction};
+    use feos_user::signal::{action, restorer, sigaction};
+    extern "C" fn nothing(_: i32, _: *mut feos_user::abi::SigInfo, _: *mut feos_user::abi::UContext) {}
+    let good = action(nothing, 0, 0);
+    tally.report("sigaction-kill", sigaction(sig::KILL, Some(&good), None) == -errno::EINVAL, sigaction(sig::KILL, Some(&good), None));
+    let stop = sigaction(sig::STOP, Some(&SigAction { handler: sa::IGN, ..SigAction::default() }), None);
+    tally.report("sigaction-ignore-stop", stop == -errno::EINVAL, stop);
+    let unrestored = SigAction { flags: 0, ..good };
+    let result = sigaction(sig::USR2, Some(&unrestored), None);
+    tally.report("sigaction-no-restorer", result == -errno::EINVAL, result);
+    let result = sigaction(sig::USR2, Some(&SigAction { handler: KERNEL as u64, ..good }), None);
+    tally.report("sigaction-kernel-handler", result == -errno::EFAULT, result);
+    let result = sigaction(sig::USR2, Some(&SigAction { restorer: KERNEL as u64, ..good }), None);
+    tally.report("sigaction-kernel-restorer", result == -errno::EFAULT, result);
+    let result = sigaction(sig::USR2, Some(&SigAction { flags: good.flags | 8, ..good }), None);
+    tally.report("sigaction-unknown-flag", result == -errno::EINVAL, result);
+    let result = sigaction(65, Some(&good), None);
+    tally.report("sigaction-bad-signal", result == -errno::EINVAL, result);
+    let result = feos_user::syscall(feos_user::abi::nr::SIGACTION, [sig::USR2 as usize, KERNEL, 0, 0, 0, 0]);
+    tally.report("sigaction-kernel-pointer", result == -errno::EFAULT, result);
+    let _ = restorer();
+
+    // Contexts the handler rewrote: each ends the program (139), or, for what's forced
+    // back to user mode, has it fault at user mode.
+    let mut edits: alloc_free::Names = alloc_free::Names::new();
+    edits.push("sigreturn-kernel-pc");
+    edits.push("sigreturn-kernel-stack");
+    edits.push("sigreturn-unknown-flags");
+    edits.push("sigreturn-unmapped");
+    edits.push("handler-that-faults");
+    #[cfg(target_arch = "x86_64")]
+    {
+        edits.push("sigreturn-bad-mxcsr");
+        edits.push("sigreturn-iopl");
+        edits.push("sigreturn-ring0-cs");
+    }
+    #[cfg(target_arch = "aarch64")]
+    edits.push("sigreturn-el1");
+    for name in edits.iter() {
+        let child = spawn(program, &[program, "--probe", name]);
+        let status = if child > 0 { wait(child as usize) } else { child };
+        // The edits the kernel refuses end the program with `SIGSEGV`; those it rebuilds
+        // around leave it at user mode, where the instruction after faults.
+        let wanted = match *name {
+            "sigreturn-el1" => status == 132,
+            _ => status == FAULTED,
+        };
+        tally.report(name, wanted, status);
+    }
+
+    let child = spawn(program, &[program, "--toctou-sigreturn"]);
+    let status = if child > 0 { wait(child as usize) } else { child };
+    tally.report("toctou-sigreturn", status == 0 || status == FAULTED, status);
+    toctou_sigaction(tally);
+}
+
+/// Masks, alternate stacks, `THREAD_KILL` and `SETITIMER` (stage 1c.10): arguments out of
+/// range, stacks in the kernel or too small, a thread of another process, the timers that
+/// aren't offered, a storm of signals at a busy program, and a timer setting rewritten
+/// while the kernel reads it.
+fn mask_probes(tally: &mut Tally, program: &str) {
+    use feos_user::abi::{itimer, ITimerVal, SigStack, Timeval};
+    let set = 0u64;
+    let at = |value: &u64| value as *const u64 as usize;
+    tally.call("sigprocmask-bad-how", nr::SIGPROCMASK, [3, at(&set), 0, 0, 0, 0], errno::EINVAL);
+    tally.call("sigprocmask-how-upper-bits", nr::SIGPROCMASK, [1 << 32, at(&set), 0, 0, 0, 0], errno::EINVAL);
+    tally.call("sigprocmask-kernel-set", nr::SIGPROCMASK, [0, KERNEL, 0, 0, 0, 0], errno::EFAULT);
+    tally.call("sigpending-kernel", nr::SIGPENDING, [KERNEL, 0, 0, 0, 0, 0], errno::EFAULT);
+    tally.call("sigsuspend-kernel-mask", nr::SIGSUSPEND, [KERNEL, 0, 0, 0, 0, 0], errno::EFAULT);
+
+    let stack = |sp: u64, flags: i32, size: u64| SigStack { sp, flags, reserved: 0, size };
+    let in_kernel = stack(KERNEL as u64, 0, 8192);
+    tally.call("altstack-in-kernel", nr::SIGALTSTACK, [&in_kernel as *const SigStack as usize, 0, 0, 0, 0, 0], errno::EFAULT);
+    let mut room = [0u8; 4096];
+    let small = stack(room.as_mut_ptr() as u64, 0, 1024);
+    tally.call("altstack-too-small", nr::SIGALTSTACK, [&small as *const SigStack as usize, 0, 0, 0, 0, 0], errno::ENOMEM);
+    let flagged = stack(room.as_mut_ptr() as u64, 4, 4096);
+    tally.call("altstack-unknown-flag", nr::SIGALTSTACK, [&flagged as *const SigStack as usize, 0, 0, 0, 0, 0], errno::EINVAL);
+    let wrapping = stack(u64::MAX - 100, 0, 8192);
+    tally.call("altstack-wraps", nr::SIGALTSTACK, [&wrapping as *const SigStack as usize, 0, 0, 0, 0, 0], errno::EFAULT);
+    tally.call("altstack-kernel-old", nr::SIGALTSTACK, [0, KERNEL, 0, 0, 0, 0], errno::EFAULT);
+
+    // The shell's thread, and a child's: not this process's.
+    tally.call("thread-kill-other-process", nr::THREAD_KILL, [1, 0, 0, 0, 0, 0], errno::ESRCH);
+    let child = spawn(program, &[program, "--storm-target", "1"]);
+    let result = syscall(nr::THREAD_KILL, [child as usize, 10, 0, 0, 0, 0]);
+    let status = if child > 0 { wait(child as usize) } else { child };
+    tally.report("thread-kill-child", result == -errno::ESRCH && status == 0, result);
+    tally.call("thread-kill-bad-signal", nr::THREAD_KILL, [getpid() as usize, 65, 0, 0, 0, 0], errno::EINVAL);
+
+    let timer = |sec: i64, usec: i64| ITimerVal { interval: Timeval::default(), value: Timeval { sec, usec } };
+    let good = timer(100, 0);
+    let at_timer = |value: &ITimerVal| value as *const ITimerVal as usize;
+    tally.call("setitimer-virtual", nr::SETITIMER, [itimer::VIRTUAL as usize, at_timer(&good), 0, 0, 0, 0], errno::EINVAL);
+    tally.call("setitimer-prof", nr::SETITIMER, [itimer::PROF as usize, at_timer(&good), 0, 0, 0, 0], errno::EINVAL);
+    tally.call("setitimer-bad-usec", nr::SETITIMER, [0, at_timer(&timer(0, 1_000_000)), 0, 0, 0, 0], errno::EINVAL);
+    tally.call("setitimer-negative-usec", nr::SETITIMER, [0, at_timer(&timer(1, -1)), 0, 0, 0, 0], errno::EINVAL);
+    tally.call("setitimer-negative-sec", nr::SETITIMER, [0, at_timer(&timer(-1, 0)), 0, 0, 0, 0], errno::EINVAL);
+    tally.call("setitimer-kernel-old", nr::SETITIMER, [0, 0, KERNEL, 0, 0, 0], errno::EFAULT);
+
+    // A thousand signals a second, for a second, at a child busy computing and making
+    // calls: it still ends normally, with its sums right.
+    let child = spawn(program, &[program, "--storm-target", "1500"]);
+    let mut sent = 0isize;
+    let start = feos_user::now_ns(feos_user::abi::clock::MONOTONIC);
+    if child > 0 {
+        feos_user::sleep_ms(50);
+        while feos_user::now_ns(feos_user::abi::clock::MONOTONIC) - start < 1_000_000_000 {
+            if feos_user::kill(child, 10) == 0 {
+                sent += 1;
+            }
+            let pause = feos_user::abi::Timespec { sec: 0, nsec: 1_000_000 };
+            feos_user::nanosleep(feos_user::abi::clock::MONOTONIC, 0, &pause, None);
+        }
+    }
+    let status = if child > 0 { wait(child as usize) } else { child };
+    println!("probe signal-storm: {sent} signals sent");
+    tally.report("signal-storm", status == 0 && sent > 100, status);
+
+    toctou_setitimer(tally);
+}
+
+/// A child's, for `signal-storm`: for `ms`, sums numbers and moves them through a pipe of
+/// its own, with a handler for `SIGUSR1` (number 10) that does nothing much, its calls
+/// made again by `SA_RESTART`. 0 if every sum came out right.
+fn storm_target() -> i32 {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static HANDLED: AtomicU32 = AtomicU32::new(0);
+    extern "C" fn tick(_: i32, _: *mut feos_user::abi::SigInfo, _: *mut feos_user::abi::UContext) {
+        HANDLED.fetch_add(1, Ordering::Relaxed);
+    }
+    let ms = feos_user::c_arg(2).and_then(|arg| core::str::from_utf8(arg).ok()).and_then(feos_user::parse_number).unwrap_or(1) as u64;
+    feos_user::signal::handle(10, tick, feos_user::abi::sa::RESTART);
+    let Ok((reader, writer)) = feos_user::pipe() else {
+        return 2;
+    };
+    let start = feos_user::now_ns(feos_user::abi::clock::MONOTONIC);
+    let mut rounds = 0u64;
+    while feos_user::now_ns(feos_user::abi::clock::MONOTONIC) - start < ms * 1_000_000 {
+        let mut sum = 0u64;
+        for value in 0..1000u64 {
+            sum = sum.wrapping_add(core::hint::black_box(value * value));
+        }
+        if sum != 332_833_500 {
+            return 3;
+        }
+        let bytes = sum.to_ne_bytes();
+        if feos_user::write(writer, &bytes) != 8 {
+            return 4;
+        }
+        let mut back = [0u8; 8];
+        if feos_user::read(reader, &mut back) != 8 || back != bytes {
+            return 5;
+        }
+        rounds += 1;
+    }
+    println!("probe signal-storm: target {rounds} rounds, {} signals handled", HANDLED.load(Ordering::Relaxed));
+    0
+}
+
+/// A thread flips a timer setting's microseconds between a good value and one past the
+/// limit while the other sets it, over and over: each `SETITIMER` takes one copy, so it
+/// sets the good one or is `EINVAL`, and what's in place after is never the bad one.
+fn toctou_setitimer(tally: &mut Tally) {
+    use core::sync::atomic::{AtomicI64, Ordering};
+    use feos_user::abi::{ITimerVal, Timeval};
+    // `interval.sec`, `interval.usec`, `value.sec`, `value.usec`: a long way off, so it
+    // never goes off.
+    static TIMER: [AtomicI64; 4] = [AtomicI64::new(0), AtomicI64::new(1), AtomicI64::new(100), AtomicI64::new(0)];
+    fn flipper(_: usize) -> usize {
+        let mut rounds = 0;
+        while SIGNAL_FLIPPING.load(Ordering::Acquire) {
+            TIMER[1].store(if rounds % 2 == 0 { 1_000_000 } else { 1 }, Ordering::Relaxed);
+            rounds += 1;
+        }
+        rounds
+    }
+    SIGNAL_FLIPPING.store(true, Ordering::Release);
+    let flipping = thread::spawn(flipper, 0);
+    let mut counts = [0usize; 3];
+    for _ in 0..2000 {
+        let result = syscall(nr::SETITIMER, [0, TIMER.as_ptr() as usize, 0, 0, 0, 0]);
+        let mut now = ITimerVal::default();
+        syscall(nr::SETITIMER, [0, 0, &mut now as *mut ITimerVal as usize, 0, 0, 0]);
+        match result {
+            0 if now.interval == (Timeval { sec: 0, usec: 1 }) => counts[0] += 1,
+            error if error == -errno::EINVAL && now.interval.usec < 1_000_000 => counts[1] += 1,
+            _ => counts[2] += 1,
+        }
+    }
+    SIGNAL_FLIPPING.store(false, Ordering::Release);
+    let rounds = flipping.map(thread::Thread::join).unwrap_or(0);
+    let off = ITimerVal::default();
+    syscall(nr::SETITIMER, [0, &off as *const ITimerVal as usize, 0, 0, 0, 0]);
+    println!("probe toctou-setitimer: set {} EINVAL {} other {} ({rounds} flips)", counts[0], counts[1], counts[2]);
+    tally.report("toctou-setitimer", counts[2] == 0 && rounds > 0, counts[2] as isize);
+}
+
+/// A tiny fixed list of names, so the probe list needs no allocation.
+mod alloc_free {
+    pub struct Names {
+        names: [&'static str; 16],
+        count: usize,
+    }
+
+    impl Names {
+        pub const fn new() -> Self {
+            Self { names: [""; 16], count: 0 }
+        }
+
+        pub fn push(&mut self, name: &'static str) {
+            self.names[self.count] = name;
+            self.count += 1;
+        }
+
+        pub fn iter(&self) -> impl Iterator<Item = &&'static str> {
+            self.names[..self.count].iter()
+        }
+    }
+}
+
+static CONTEXT_PC: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static GOOD_PC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SIGNAL_FLIPPING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn publish_context(_: i32, _: *mut feos_user::abi::SigInfo, context: *mut feos_user::abi::UContext) {
+    use core::sync::atomic::Ordering;
+    // A process signal may be taken by the flipping thread itself, which mustn't be left
+    // rewriting its own stack: only the first thread's context is flipped.
+    if feos_user::gettid() != getpid() {
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: the kernel's context: only an address taken.
+    let pc = unsafe { core::ptr::addr_of_mut!((*context).pc) } as usize;
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: as above.
+    let pc = unsafe { core::ptr::addr_of_mut!((*context).gregs[feos_user::abi::ucontext::greg::RIP]) } as usize;
+    // SAFETY: as above.
+    GOOD_PC.store(unsafe { feos_user::signal::pc(context) }, Ordering::SeqCst);
+    CONTEXT_PC.store(pc, Ordering::SeqCst);
+    for _ in 0..200 {
+        core::hint::spin_loop();
+    }
+}
+
+/// Flips the published context's program counter between where it was and the kernel,
+/// as an atomic exchange on what it held, so nothing else on the stack is ever written.
+fn flip_context(_: usize) -> usize {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    let mut flips = 0;
+    while SIGNAL_FLIPPING.load(Ordering::Acquire) {
+        let at = CONTEXT_PC.load(Ordering::Acquire);
+        let good = GOOD_PC.load(Ordering::Acquire);
+        if at == 0 || good == 0 {
+            core::hint::spin_loop();
+            continue;
+        }
+        // SAFETY: the word is the context's program counter while a handler runs, and is
+        // only changed if it still holds one of the two values a context's would.
+        let word = unsafe { &*(at as *const AtomicU64) };
+        if word.compare_exchange(good, KERNEL as u64, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+            || word.compare_exchange(KERNEL as u64, good, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+        {
+            flips += 1;
+        }
+    }
+    flips
+}
+
+/// A child's: a thread rewrites a handler's context while the handler returns through
+/// `SIGRETURN`, over and over. Each return takes one consistent copy: the program goes
+/// on (0 in the end) or ends with `SIGSEGV`, and the kernel never faults.
+fn toctou_sigreturn() -> i32 {
+    use core::sync::atomic::Ordering;
+    SIGNAL_FLIPPING.store(true, Ordering::Release);
+    let Ok(flipper) = thread::spawn(flip_context, 0) else {
+        return 2;
+    };
+    feos_user::signal::handle(feos_user::abi::sig::USR1, publish_context, 0);
+    for _ in 0..500 {
+        feos_user::kill(getpid(), feos_user::abi::sig::USR1);
+    }
+    SIGNAL_FLIPPING.store(false, Ordering::Release);
+    let flips = flipper.join();
+    println!("probe toctou-sigreturn: 500 returns, {flips} flips");
+    0
+}
+
+/// A thread flips a `SigAction`'s handler between a function and the kernel while the
+/// other sets it, over and over: each `SIGACTION` sets the function or is `EFAULT`, and
+/// what's in place after is never the kernel's address.
+fn toctou_sigaction(tally: &mut Tally) {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use feos_user::abi::{sig, SigAction};
+    static ACTION: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    extern "C" fn nothing(_: i32, _: *mut feos_user::abi::SigInfo, _: *mut feos_user::abi::UContext) {}
+    let good = feos_user::signal::action(nothing, 0, 0);
+    ACTION[0].store(good.handler, Ordering::Relaxed);
+    ACTION[1].store(u64::from(good.flags), Ordering::Relaxed);
+    ACTION[2].store(good.restorer, Ordering::Relaxed);
+    fn flipper(handler: usize) -> usize {
+        let mut rounds = 0;
+        while SIGNAL_FLIPPING.load(Ordering::Acquire) {
+            ACTION[0].store(if rounds % 2 == 0 { KERNEL as u64 } else { handler as u64 }, Ordering::Relaxed);
+            rounds += 1;
+        }
+        rounds
+    }
+    SIGNAL_FLIPPING.store(true, Ordering::Release);
+    let flipping = thread::spawn(flipper, good.handler as usize);
+    let mut counts = [0usize; 3];
+    for _ in 0..2000 {
+        let result = feos_user::syscall(feos_user::abi::nr::SIGACTION, [sig::USR2 as usize, ACTION.as_ptr() as usize, 0, 0, 0, 0]);
+        let mut now = SigAction::default();
+        feos_user::signal::sigaction(sig::USR2, None, Some(&mut now));
+        match result {
+            0 if now.handler == good.handler => counts[0] += 1,
+            error if error == -errno::EFAULT && now.handler != KERNEL as u64 => counts[1] += 1,
+            _ => counts[2] += 1,
+        }
+    }
+    SIGNAL_FLIPPING.store(false, Ordering::Release);
+    let rounds = flipping.map(thread::Thread::join).unwrap_or(0);
+    feos_user::signal::set_disposition(sig::USR2, feos_user::abi::sa::DFL);
+    println!("probe toctou-sigaction: set {} EFAULT {} other {} ({rounds} flips)", counts[0], counts[1], counts[2]);
+    tally.report("toctou-sigaction", counts[2] == 0 && rounds > 0, counts[2] as isize);
 }
 
 /// Makes `path` `pages` pages long, of `byte`.
@@ -1147,6 +1569,9 @@ const SWAP_MINE: &str = "/tmp/.malicious-swap/mine";
 const SWAP_VICTIM: &str = "/tmp/.malicious-swap/d/victim";
 const SWAP_PLANTED: &str = "/tmp/.malicious-swap/d/planted";
 static SWAP_STOP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Asks the swapper to stop with its directory in place, and says it has.
+static SWAP_PAUSE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static SWAP_PAUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Swaps `SWAP_DIR` for a link to root's directory and back, again and again: what a
 /// thread does to have a call checked on its own directory and carried out in root's.
@@ -1155,6 +1580,14 @@ fn run_swapper(_: usize) -> usize {
     use feos_user::abi::at;
     let mut swaps = 0;
     while SWAP_STOP.load(Ordering::Relaxed) == 0 {
+        if SWAP_PAUSE.load(Ordering::Acquire) != 0 {
+            SWAP_PAUSED.store(1, Ordering::Release);
+            while SWAP_PAUSE.load(Ordering::Acquire) != 0 && SWAP_STOP.load(Ordering::Relaxed) == 0 {
+                feos_user::yield_now();
+            }
+            SWAP_PAUSED.store(0, Ordering::Release);
+            continue;
+        }
         if feos_user::renameat(at::FDCWD, SWAP_DIR, at::FDCWD, SWAP_AWAY, 0) == 0 {
             feos_user::symlinkat(SWAP_ROOT, at::FDCWD, SWAP_DIR);
             feos_user::unlinkat(at::FDCWD, SWAP_DIR, 0);
@@ -1233,6 +1666,142 @@ fn tree_swap_probe(tally: &mut Tally, program: &str) {
     feos_user::unlinkat(at::FDCWD, victim, 0);
     feos_user::unlinkat(at::FDCWD, planted, 0);
     feos_user::unlinkat(at::FDCWD, SWAP_ROOT, at::REMOVEDIR);
+}
+
+/// Names `--tree-swap-create` makes in its own directory, which root's has too.
+const SWAP_MADE_FILE: &str = "/tmp/.malicious-swap/d/made-file";
+const SWAP_MADE_V1: &str = "/tmp/.malicious-swap/d/made-v1";
+const SWAP_MADE_DIR: &str = "/tmp/.malicious-swap/d/made-dir";
+const SWAP_MADE_V1_DIR: &str = "/tmp/.malicious-swap/d/made-v1-dir";
+
+/// `--tree-swap-create`: as user 1000, `OPENAT`'s `O_CREAT`, v1's `OPEN` with `CREATE`,
+/// `MKDIRAT` and v1's `MKDIR` in its own directory, again and again, while another thread
+/// keeps swapping that for a link to root's, where files and directories of the same names
+/// are root's. Each creation is judged, made and given its owner and mode in one step, so
+/// none lands in root's directory and none of root's becomes this user's.
+fn tree_swap_create() -> i32 {
+    use core::sync::atomic::Ordering;
+    use feos_user::abi::{at, o};
+    if feos_user::setuid(1000, 100) != 0 {
+        return 2;
+    }
+    if feos_user::mkdirat(at::FDCWD, SWAP_HOME, 0o755) != 0 || feos_user::mkdirat(at::FDCWD, SWAP_DIR, 0o755) != 0 {
+        return 3;
+    }
+    SWAP_STOP.store(0, Ordering::Relaxed);
+    let swapper = thread::spawn(run_swapper, 0);
+    for _ in 0..1_000 {
+        let made = feos_user::openat(at::FDCWD, SWAP_MADE_FILE, o::WRONLY | o::CREAT, 0o666);
+        if made >= 0 {
+            close(made as usize);
+        }
+        let made = feos_user::open(SWAP_MADE_V1, flags::WRITE | flags::CREATE);
+        if made >= 0 {
+            close(made as usize);
+        }
+        feos_user::mkdirat(at::FDCWD, SWAP_MADE_DIR, 0o777);
+        feos_user::mkdir(SWAP_MADE_V1_DIR);
+        // What was made goes again with the directory in place: a removal is judged on
+        // its path before it's made, so one while the swapper runs could take root's.
+        SWAP_PAUSE.store(1, Ordering::Release);
+        while SWAP_PAUSED.load(Ordering::Acquire) == 0 {
+            feos_user::yield_now();
+        }
+        for path in [SWAP_MADE_FILE, SWAP_MADE_V1] {
+            feos_user::unlinkat(at::FDCWD, path, 0);
+        }
+        for path in [SWAP_MADE_DIR, SWAP_MADE_V1_DIR] {
+            feos_user::unlinkat(at::FDCWD, path, at::REMOVEDIR);
+        }
+        SWAP_PAUSE.store(0, Ordering::Release);
+        while SWAP_PAUSED.load(Ordering::Acquire) != 0 {
+            feos_user::yield_now();
+        }
+    }
+    SWAP_STOP.store(1, Ordering::Relaxed);
+    let swaps = swapper.map(thread::Thread::join);
+    println!("probe tree-swap-create: swaps={swaps:?}");
+    if swaps.is_ok() { 0 } else { 4 }
+}
+
+/// `tree-swap-create`: root's directory has only root's own after the child's race, each
+/// with the owner and mode it had.
+fn tree_swap_create_probe(tally: &mut Tally, program: &str) {
+    use feos_user::abi::{at, o};
+    let names = ["made-file", "made-v1", "made-dir", "made-v1-dir"];
+    fn in_root<'a>(name: &str, path: &'a mut [u8; 64]) -> &'a str {
+        let root = SWAP_ROOT.as_bytes();
+        path[..root.len()].copy_from_slice(root);
+        path[root.len()] = b'/';
+        path[root.len() + 1..root.len() + 1 + name.len()].copy_from_slice(name.as_bytes());
+        core::str::from_utf8(&path[..root.len() + 1 + name.len()]).unwrap_or("")
+    }
+    let mut path = [0u8; 64];
+    let mut made = feos_user::mkdirat(at::FDCWD, SWAP_ROOT, 0o755);
+    for name in names {
+        let path = in_root(name, &mut path);
+        if name.ends_with("dir") {
+            made |= feos_user::mkdirat(at::FDCWD, path, 0o700);
+        } else {
+            let fd = feos_user::openat(at::FDCWD, path, o::WRONLY | o::CREAT | o::TRUNC | o::CLOEXEC, 0o600);
+            made |= fd.min(0);
+            if fd >= 0 {
+                close(fd as usize);
+            }
+        }
+    }
+    if made != 0 {
+        tally.report("tree-swap-create", false, made);
+        return;
+    }
+    let child = spawn(program, &[program, "--tree-swap-create"]);
+    let status = if child > 0 { wait(child as usize) } else { child };
+    let mut intact = true;
+    for name in names {
+        let wanted = if name.ends_with("dir") { 0o700 } else { 0o600 };
+        let stat = feos_user::fstatat(at::FDCWD, in_root(name, &mut path), at::SYMLINK_NOFOLLOW);
+        intact &= stat.is_ok_and(|stat| stat.uid == 0 && stat.mode & 0o7777 == wanted);
+    }
+    // Nothing else in root's directory but those four.
+    let listed = match feos_user::openat(at::FDCWD, SWAP_ROOT, o::RDONLY | o::DIRECTORY | o::CLOEXEC, 0) {
+        fd if fd >= 0 => {
+            let mut buffer = [0u8; 1024];
+            let got = feos_user::getdents(fd as usize, &mut buffer);
+            close(fd as usize);
+            count_dirents(&buffer[..got.max(0) as usize])
+        }
+        _ => 0,
+    };
+    println!("probe tree-swap-create: status={status} intact={intact} entries={listed}");
+    tally.report("tree-swap-create", status == 0 && intact && listed == names.len(), status);
+    for path in [SWAP_MADE_FILE, SWAP_MADE_V1, "/tmp/.malicious-swap/away/made-file", "/tmp/.malicious-swap/away/made-v1", SWAP_DIR] {
+        feos_user::unlinkat(at::FDCWD, path, 0);
+    }
+    for path in [SWAP_MADE_DIR, SWAP_MADE_V1_DIR, "/tmp/.malicious-swap/away/made-dir", "/tmp/.malicious-swap/away/made-v1-dir", SWAP_DIR, SWAP_AWAY, SWAP_HOME] {
+        feos_user::unlinkat(at::FDCWD, path, at::REMOVEDIR);
+    }
+    for name in names {
+        let path = in_root(name, &mut path);
+        feos_user::unlinkat(at::FDCWD, path, if name.ends_with("dir") { at::REMOVEDIR } else { 0 });
+    }
+    feos_user::unlinkat(at::FDCWD, SWAP_ROOT, at::REMOVEDIR);
+}
+
+/// The entries in a `GETDENTS` buffer, but `.` and `..`.
+fn count_dirents(mut bytes: &[u8]) -> usize {
+    let header = feos_user::abi::Dirent::HEADER;
+    let mut count = 0;
+    while bytes.len() >= header {
+        let length = u16::from_ne_bytes([bytes[16], bytes[17]]) as usize;
+        if length < header || length > bytes.len() {
+            break;
+        }
+        let name = &bytes[header..length];
+        let name = &name[..name.iter().position(|&byte| byte == 0).unwrap_or(name.len())];
+        count += usize::from(name != b"." && name != b"..");
+        bytes = &bytes[length..];
+    }
+    count
 }
 
 /// Changing the tree (stage 1c.4): `PathAt`s in the kernel or with reserved bits, flags
@@ -1549,6 +2118,7 @@ fn tree_probes(tally: &mut Tally, program: &str) {
     println!("probe toctou-renameat: renamed={renamed} refused={refused} flips={flips:?}");
     tally.report("toctou-renameat", other == 0 && renamed + refused == 2_000 && made >= 0 && flips.is_ok(), other);
     tree_swap_probe(tally, program);
+    tree_swap_create_probe(tally, program);
 }
 
 /// A few bytes of text, made on the stack.
@@ -1986,21 +2556,276 @@ fn spawn2_probes(tally: &mut Tally, program: &str) {
     let status = if child > 0 { wait(child as usize) } else { child };
     tally.report("children-cap", status == 0, status);
 
+    // The storm runs twice in its child, the second as far as the first; then the child
+    // ends, and every frame its programs had is back.
     let before = free_frames();
-    let mut made = [0isize; 2];
-    for count in made.iter_mut() {
-        let child = spawn(program, &[program, "--spawn-storm"]);
-        *count = if child > 0 { wait(child as usize) } else { child };
-    }
+    let child = spawn(program, &[program, "--spawn-storm"]);
+    let status = if child > 0 { wait(child as usize) } else { child };
     let after = free_frames();
     let back = before.zip(after).is_none_or(|(before, after)| after >= before);
-    tally.report("spawn-storm", made == [0, 0] && back, made[0].min(made[1]));
+    tally.report("spawn-storm", status == 0 && back, status);
     if let (Some(before), Some(after)) = (before, after) {
         println!("probe spawn-storm: frames {before}->{after}");
     }
     if area != KERNEL {
         feos_user::munmap(area, spawn::STRING_MAX + PAGE_SIZE);
     }
+}
+
+/// `WAIT4` and `KILL` (stage 1c.8): the shell and another user's programs out of reach,
+/// arguments with garbage above their 32 bits, options that don't exist, and a parent
+/// that leaves as many children unreaped as it may have, then ends.
+fn wait_kill_probes(tally: &mut Tally, program: &str) {
+    use feos_user::abi::sig;
+    tally.call("kill-shell", nr::KILL, [1, sig::TERM as usize, 0, 0, 0, 0], errno::EPERM);
+    let me = feos_user::getpid() as usize;
+    let upper_pid = syscall(nr::KILL, [me | 1 << 32, 0, 0, 0, 0, 0]);
+    let upper_signal = syscall(nr::KILL, [me, 1 << 32 | sig::TERM as usize, 0, 0, 0, 0]);
+    let past = syscall(nr::KILL, [me, 65, 0, 0, 0, 0]);
+    tally.report(
+        "kill-pid-upper-bits",
+        upper_pid == -errno::EINVAL && upper_signal == -errno::EINVAL && past == -errno::EINVAL,
+        upper_pid.max(upper_signal).max(past),
+    );
+    let unknown = syscall(nr::WAIT4, [usize::MAX, 0, 0x100, 0, 0, 0]);
+    let wexited = syscall(nr::WAIT4, [usize::MAX, 0, 4 | feos_user::abi::wait::NOHANG, 0, 0, 0]);
+    let upper = syscall(nr::WAIT4, [1 << 32 | 1, 0, 0, 0, 0, 0]);
+    tally.report(
+        "wait4-bad-options",
+        unknown == -errno::EINVAL && wexited == -errno::EINVAL && upper == -errno::EINVAL,
+        unknown.max(wexited).max(upper),
+    );
+    tally.call("wait4-status-in-kernel", nr::WAIT4, [usize::MAX, KERNEL, 0, 0, 0, 0], errno::EFAULT);
+
+    // Root's program, which a program of user 1000 asks to end.
+    let (target, release) = match pipe() {
+        Ok((read_end, write_end)) => {
+            let pid = spawn_io(program, &[program, "--pipe-wait"], read_end, INHERIT);
+            close(read_end);
+            (pid, write_end)
+        }
+        Err(error) => (error, usize::MAX),
+    };
+    let mut digits = [0u8; 24];
+    let target_text = decimal(target.max(0) as usize, &mut digits);
+    let asker = spawn("/bin/runas", &["/bin/runas", "1000", "1000", program, "--kill-other", target_text]);
+    let refused = if asker > 0 { wait(asker as usize) } else { asker };
+    let alive = feos_user::kill(target, 0) == 0 && feos_user::wait4(target, feos_user::abi::wait::NOHANG) == Ok((0, -1));
+    if release != usize::MAX {
+        close(release);
+    }
+    let ended = if target > 0 { wait(target as usize) } else { target };
+    tally.report("kill-other-user", target > 0 && refused == 0 && alive && ended == 0, refused);
+
+    let before = free_frames();
+    let child = spawn(program, &[program, "--zombie-flood"]);
+    let status = if child > 0 { wait(child as usize) } else { child };
+    feos_user::sleep_ms(200);
+    let after = free_frames();
+    let back = before.zip(after).is_none_or(|(before, after)| after >= before);
+    // Every record went with it: there's room for children again.
+    let again = spawn(program, &[program, "--quiet-exit"]);
+    let again = if again > 0 { wait(again as usize) } else { again };
+    tally.report("zombie-flood", status == 0 && back && again == 0, status);
+    if let (Some(before), Some(after)) = (before, after) {
+        println!("probe zombie-flood: frames {before}->{after}");
+    }
+}
+
+/// This program's own path, for its children.
+fn program_name() -> &'static str {
+    "/bin/malicious"
+}
+
+/// As another user (`runas` made it one), tries to end `target`, root's: zero if `KILL`
+/// refused with `EPERM` for every signal tried, and for signal 0 too.
+fn kill_other(target: &str) -> i32 {
+    use feos_user::abi::sig;
+    let Some(pid) = feos_user::parse_number(target) else {
+        return 2;
+    };
+    let results = [sig::TERM, sig::KILL, sig::STOP, 0].map(|signal| feos_user::kill(pid as isize, signal));
+    if results.iter().all(|&result| result == -errno::EPERM) {
+        0
+    } else {
+        println!("kill-other-user: {results:?}");
+        ESCAPED
+    }
+}
+
+/// As many children as may be left unreaped, every one ended and none reaped, and then
+/// one more: `EAGAIN`. Then this ends with them all unreaped, and their records go with
+/// it. Zero if so.
+fn zombie_flood(program: &str) -> i32 {
+    use feos_user::abi::MAX_CHILDREN;
+    let mut argv = [UserStr::default(); 4];
+    let request = feos_user::spawn_request(program, feos_user::user_strs(&[program, "--quiet-exit"], &mut argv), &[], &[]);
+    let mut made = 0;
+    while made < MAX_CHILDREN {
+        match feos_user::spawn2(&request) {
+            pid if pid > 0 => made += 1,
+            // Out of slots for a moment, while children end.
+            error if error == -errno::EAGAIN => feos_user::sleep_ms(10),
+            error => {
+                println!("zombie-flood: child {made} refused: {error}");
+                return ESCAPED;
+            }
+        }
+    }
+    feos_user::sleep_ms(200);
+    let over = feos_user::spawn2(&request);
+    println!("zombie-flood: {made} unreaped, then {over}");
+    if over == -errno::EAGAIN {
+        0
+    } else {
+        ESCAPED
+    }
+}
+
+/// `EXEC` (stage 1c.7): a request the kernel would have to read from itself, `#!` lines
+/// that loop or run on, a program that faults once it's been run, two threads running
+/// programs at once, and a request's lengths changed while the kernel reads them. Every
+/// one that may succeed does so in a child, which it then replaces.
+fn exec_probes(tally: &mut Tally, program: &str) {
+    use feos_user::abi::{at, o};
+    tally.call("exec-kernel-request", nr::EXEC, [KERNEL, 0, 0, 0, 0, 0], errno::EFAULT);
+    let script = |path: &str, text: &[u8]| {
+        let fd = feos_user::openat(at::FDCWD, path, o::WRONLY | o::CREAT | o::TRUNC | o::CLOEXEC, 0o755);
+        if fd >= 0 {
+            feos_user::write(fd as usize, text);
+            close(fd as usize);
+        }
+        fd >= 0 && feos_user::fchmodat(at::FDCWD, path, 0o755, 0) == 0
+    };
+    const LOOP: &str = "/tmp/.malicious-loop";
+    let made = script(LOOP, b"#!/tmp/.malicious-loop\n");
+    let looped = feos_user::exec_args(LOOP, &[LOOP]);
+    tally.report("exec-shebang-loop", made && looped == -errno::ELOOP, looped);
+    const LONG: &str = "/tmp/.malicious-long";
+    let mut line = [b'a'; 2 + 300 + 1];
+    line[..3].copy_from_slice(b"#!/");
+    line[2 + 300] = b'\n';
+    let made = script(LONG, &line);
+    let long = feos_user::exec_args(LONG, &[LONG]);
+    tally.report("exec-shebang-long", made && long == -errno::ENOEXEC, long);
+    for path in [LOOP, LONG] {
+        feos_user::unlinkat(at::FDCWD, path, 0);
+    }
+
+    // A program run by `EXEC` that faults ends as any that faults: 139, to v1's `WAIT`.
+    let child = spawn(program, &[program, "--exec-fault"]);
+    let status = if child > 0 { wait(child as usize) } else { child };
+    tally.report("exec-then-fault", status == 139, status);
+
+    let child = spawn(program, &[program, "--exec-race"]);
+    let status = if child > 0 { wait(child as usize) } else { child };
+    tally.report("exec-two-threads-at-once", status == 0, status);
+
+    let child = spawn(program, &[program, "--toctou-exec"]);
+    let status = if child > 0 { wait(child as usize) } else { child };
+    tally.report("toctou-exec-lengths", status == 0, status);
+}
+
+/// `--exec-fault`: runs this program again, to fault.
+fn exec_fault(program: &str) -> i32 {
+    let error = feos_user::exec_args(program, &[program, "--probe", "null-read"]);
+    println!("exec: {error}");
+    2
+}
+
+/// Set when `--exec-race`'s threads may go.
+static EXEC_RACE_GO: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static EXEC_RACE_READY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// One of `--exec-race`'s threads: runs this program, at the same moment as the other.
+fn exec_racer(tag: usize) -> usize {
+    use core::sync::atomic::Ordering;
+    EXEC_RACE_READY.fetch_add(1, Ordering::AcqRel);
+    while EXEC_RACE_GO.load(Ordering::Acquire) == 0 {
+        core::hint::spin_loop();
+    }
+    let mut text = [0u8; 24];
+    let pid = decimal(getpid() as usize, &mut text);
+    let error = feos_user::exec_args("/bin/malicious", &["/bin/malicious", "--exec-race-won", pid, if tag == 0 { "a" } else { "b" }]);
+    println!("exec from racer {tag}: {error}");
+    feos_user::exit(6)
+}
+
+/// `--exec-race`: two threads run another program at once. One wins; the other, and this
+/// first thread, are gone in the winner's program, which checks it's whole.
+fn exec_race() -> i32 {
+    use core::sync::atomic::Ordering;
+    for tag in 0..2 {
+        if thread::spawn(exec_racer, tag).is_err() {
+            return 3;
+        }
+    }
+    while EXEC_RACE_READY.load(Ordering::Acquire) < 2 {
+        feos_user::yield_now();
+    }
+    EXEC_RACE_GO.store(1, Ordering::Release);
+    feos_user::sleep_ms(10_000);
+    5
+}
+
+/// What the winner of `--exec-race` runs: the same process, alone and working.
+fn exec_race_won(args: &Args) -> i32 {
+    let pid = args.get(2).and_then(feos_user::parse_number);
+    let same = pid == Some(getpid() as usize);
+    // Its threads are its own: one starts and is joined.
+    let joined = thread::spawn(|value| value + 1, 41).map(thread::Thread::join);
+    let mut exe = [0u8; 64];
+    let length = feos_user::current_exe(&mut exe);
+    let exe_ok = &exe[..length.max(0) as usize] == b"/bin/malicious";
+    println!("probe exec-two-threads-at-once: {} won, same pid {same}, thread {joined:?}, exe {exe_ok}", args.get(3).unwrap_or("?"));
+    i32::from(!(same && joined == Ok(42) && exe_ok))
+}
+
+/// `--toctou-exec`: `EXEC` over and over with an argument another thread keeps changing.
+/// Each is refused with `E2BIG` or `EFAULT`, or runs `--quiet-exit` in place of this, which
+/// ends well; anything else is a failure.
+fn toctou_exec(program: &str) -> i32 {
+    use core::sync::atomic::Ordering;
+    let quiet = "--quiet-exit";
+    let text = "abcd";
+    let words = [program.as_ptr() as usize, program.len(), quiet.as_ptr() as usize, quiet.len(), text.as_ptr() as usize, 4];
+    for (word, value) in FLIPPED.iter().zip(words) {
+        word.store(value, Ordering::Relaxed);
+    }
+    SPAWN_FLIPPING.store(true, Ordering::Release);
+    if thread::spawn(flip, text.as_ptr() as usize).is_err() {
+        return 3;
+    }
+    let request = feos_user::abi::ExecRequest {
+        argv: FLIPPED.as_ptr() as u64,
+        argc: 3,
+        ..feos_user::exec_request(program, &[], &[])
+    };
+    for _ in 0..300 {
+        match feos_user::exec(&request) {
+            error if error == -errno::E2BIG || error == -errno::EFAULT => {}
+            error => {
+                println!("probe toctou-exec-lengths: {error}");
+                return 4;
+            }
+        }
+    }
+    0
+}
+
+/// `value` in decimal, in `buffer`.
+fn decimal(value: usize, buffer: &mut [u8; 24]) -> &str {
+    let mut at = buffer.len();
+    let mut rest = value;
+    loop {
+        at -= 1;
+        buffer[at] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    core::str::from_utf8(&buffer[at..]).unwrap_or("0")
 }
 
 /// A `SPAWN2` that may start a child: its result, the child waited for.
@@ -2137,6 +2962,41 @@ fn concurrent_1mib() -> i32 {
 /// Children started and never reaped, up to the cap: one more is `EAGAIN` (`EBUSY` to
 /// v1's `SPAWN`), and once one is reaped there's room again. Zero if so.
 fn children_cap(program: &str) -> i32 {
+    // Meanwhile another thread waits for pids no child has, 0 and one that's 0 cut to 32
+    // bits: neither may take the record of a child being made, which is 0 until it is,
+    // or the cap would never be met.
+    HAMMERING.store(true, core::sync::atomic::Ordering::Release);
+    let hammer = thread::spawn(wait_nobody, 0).ok();
+    let status = children_up_to_cap(program);
+    HAMMERING.store(false, core::sync::atomic::Ordering::Release);
+    let waited = hammer.map_or(0, |thread| thread.join());
+    if waited != 0 {
+        println!("children-cap: wait for no child gave {}", waited as isize);
+        return ESCAPED;
+    }
+    status
+}
+
+/// While a probe runs beside it.
+static HAMMERING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// v1's `WAIT` for pid 0 and for 1 << 32, over and over while [`HAMMERING`]: 0 if each was
+/// `ECHILD`, else what one gave.
+fn wait_nobody(_: usize) -> usize {
+    while HAMMERING.load(core::sync::atomic::Ordering::Acquire) {
+        for pid in [0, 1 << 32] {
+            let result = wait(pid);
+            if result != -errno::ECHILD {
+                return result as usize;
+            }
+        }
+        feos_user::yield_now();
+    }
+    0
+}
+
+/// [`children_cap`]'s children, up to the cap and past it.
+fn children_up_to_cap(program: &str) -> i32 {
     use feos_user::abi::MAX_CHILDREN;
     let mut argv = [UserStr::default(); 4];
     let request = feos_user::spawn_request(program, feos_user::user_strs(&[program, "--quiet-exit"], &mut argv), &[], &[]);
@@ -2178,12 +3038,32 @@ fn children_cap(program: &str) -> i32 {
 }
 
 /// Programs until there's no slot (or memory) for another, each waiting on a pipe this
-/// then closes, so they all end; twice, the second as far as the first. Zero if so.
+/// then closes, so they all end; twice, the second as far as the first, so every slot the
+/// first took came back. Zero if so.
 fn spawn_storm(program: &str) -> i32 {
+    let first = match storm_once(program) {
+        Ok(made) => made,
+        Err(status) => return status,
+    };
+    let second = match storm_once(program) {
+        Ok(made) => made,
+        Err(status) => return status,
+    };
+    println!("spawn-storm: again made={second}, first {first}");
+    if second >= first {
+        0
+    } else {
+        ESCAPED
+    }
+}
+
+/// One storm: how many programs it made before the first refusal, each of them ended
+/// well; or the status to end with if anything else happened.
+fn storm_once(program: &str) -> Result<usize, i32> {
     use feos_user::abi::{spawn_action, SpawnAction};
     static PIDS: [core::sync::atomic::AtomicUsize; 1024] = [const { core::sync::atomic::AtomicUsize::new(0) }; 1024];
     let Ok((read_end, write_end)) = feos_user::pipe2(feos_user::abi::o::CLOEXEC) else {
-        return 2;
+        return Err(2);
     };
     let actions = [SpawnAction { kind: spawn_action::DUP2, fd: read_end as i32, to: 0, ..SpawnAction::default() }];
     let mut argv = [UserStr::default(); 4];
@@ -2205,9 +3085,9 @@ fn spawn_storm(program: &str) -> i32 {
     let failed = PIDS[..made].iter().filter(|pid| !ended_well(pid.load(core::sync::atomic::Ordering::Relaxed) as isize)).count();
     println!("spawn-storm: made={made} then={error} failed={failed}");
     if (error == -errno::EAGAIN || error == -errno::ENOMEM) && made > 0 && failed == 0 {
-        0
+        Ok(made)
     } else {
-        ESCAPED
+        Err(ESCAPED)
     }
 }
 
@@ -2218,7 +3098,15 @@ fn run_child(tally: &mut Tally, program: &str, name: &str) {
         return;
     }
     let status = wait(child as usize);
-    tally.report(name, status == FAULTED, status);
+    tally.report(name, ended_by_fault(status), status);
+}
+
+/// Whether a v1 status is the end a fault's signal gives a program with no handler for
+/// it (stage 1c.9): `SIGSEGV` (139) for a bad address or a protection fault, `SIGILL`
+/// (132) for an instruction EL0 may not run, `SIGBUS` (135) for an alignment fault,
+/// `SIGTRAP` (133) and `SIGFPE` (136).
+fn ended_by_fault(status: isize) -> bool {
+    matches!(status, 132 | 133 | 135 | 136) || status == FAULTED
 }
 
 /// Spawns, writes and reads for as long as it lives: whenever a kill lands, it's
@@ -2456,12 +3344,10 @@ const UID_PROCESSES: usize = 256;
 /// `libs/app/src/pipe.rs`).
 const PIPES_PER_PROCESS: usize = 64;
 
-/// Whether a child ended with status 0. v1 keeps only the last 64 exits' statuses, so
-/// one of many children ending together may have gone with none left (`ECHILD`): it has
-/// ended, and nothing says it failed. Exit records for every child are 1c.8's.
+/// Whether a child ended with status 0. Every child's exit is kept in its record until
+/// it's reaped (stage 1c.8), however many end together.
 fn ended_well(child: isize) -> bool {
-    let status = wait(child as usize);
-    status == 0 || status == -errno::ECHILD
+    wait(child as usize) == 0
 }
 
 /// A child holding pipe ends for its parent: reads its standard input until it ends.
@@ -2693,6 +3579,33 @@ fn main(args: Args) -> i32 {
     if let Some(name) = args.value_of("--probe") {
         return probe(name);
     }
+    if args.has("--zombie-flood") {
+        return zombie_flood(program_name());
+    }
+    if let Some(target) = args.value_of("--kill-other") {
+        return kill_other(target);
+    }
+    if args.has("--exec-fault") {
+        return exec_fault("/bin/malicious");
+    }
+    if args.has("--toctou-sigreturn") {
+        return toctou_sigreturn();
+    }
+    if args.has("--storm-target") {
+        return storm_target();
+    }
+    if args.has("--exec-race") {
+        return exec_race();
+    }
+    if args.has("--exec-race-won") {
+        return exec_race_won(&args);
+    }
+    if args.has("--toctou-exec") {
+        return toctou_exec("/bin/malicious");
+    }
+    if args.has("--tree-swap-create") {
+        return tree_swap_create();
+    }
     if args.has("--thread-bomb") {
         return thread_bomb(args.has("--hold"));
     }
@@ -2793,6 +3706,8 @@ fn main(args: Args) -> i32 {
         println!("probe umip-sgdt: skipped (this CPU has no UMIP)");
     }
     thread_probes(&mut tally, program);
+    signal_probes(&mut tally, program);
+    mask_probes(&mut tally, program);
 
     // The kernel takes no notice of where a program's stack pointer was.
     let child = spawn(program, &[program, "--sp-syscall"]);
@@ -2909,6 +3824,8 @@ fn main(args: Args) -> i32 {
     tree_probes(&mut tally, program);
     lock_probes(&mut tally, program);
     spawn2_probes(&mut tally, program);
+    exec_probes(&mut tally, program);
+    wait_kill_probes(&mut tally, program);
     tally.call("no-such-call", 0xdead, [0; 6], errno::ENOSYS);
     tally.call("call-number-huge", usize::MAX, [0; 6], errno::ENOSYS);
     if file >= 0 {

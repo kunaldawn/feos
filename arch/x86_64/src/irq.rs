@@ -195,6 +195,102 @@ impl TrapFrame {
     }
 }
 
+/// A user frame as a signal sees it (stage 1c.9): the frame builder and checker of
+/// `feos-signal`, over the registers this frame holds. A frame `SIGRETURN` rebuilds keeps
+/// the selectors of the frame the call came from, which is a user frame.
+impl feos_signal::frame::UserFrame for TrapFrame {
+    const FRAME_SIZE: usize = feos_signal::frame::x86_64::FRAME_SIZE;
+    const CONTEXT_SIZE: usize = feos_signal::frame::x86_64::CONTEXT_SIZE;
+
+    fn enter_handler(&self, entry: &feos_signal::frame::Entry, out: &mut [u8]) -> Option<(u64, Self)> {
+        use feos_signal::frame::x86_64;
+        let out: &mut [u8; x86_64::FRAME_SIZE] = (&mut out[..x86_64::FRAME_SIZE]).try_into().ok()?;
+        let (address, regs) = x86_64::build(&self.signal_regs(), entry, out)?;
+        Some((address, Self::from_signal_regs(&regs)))
+    }
+
+    fn sigreturn(
+        &self,
+        context: &[u8],
+        window: feos_signal::frame::Window,
+    ) -> Result<(Self, u64), feos_signal::frame::Refused> {
+        use feos_signal::frame::{x86_64, Refused};
+        let context: &[u8; x86_64::CONTEXT_SIZE] =
+            context.get(..x86_64::CONTEXT_SIZE).and_then(|bytes| bytes.try_into().ok()).ok_or(Refused::Flags)?;
+        let (regs, mask) = x86_64::restore(&self.signal_regs(), context, window, cpu::mxcsr_mask())?;
+        let mut frame = Self::from_signal_regs(&regs);
+        // Belt and braces: whatever the frame it came from said, the program goes back to
+        // ring 3.
+        frame.cs = gdt::USER_CODE;
+        frame.ss = gdt::USER_DATA;
+        Ok((frame, mask))
+    }
+
+    fn rewind_syscall(&mut self, number: u64, _first: u64) {
+        let mut regs = self.signal_regs();
+        feos_signal::frame::x86_64::rewind(&mut regs, number);
+        *self = Self::from_signal_regs(&regs);
+    }
+}
+
+impl TrapFrame {
+    fn signal_regs(&self) -> feos_signal::frame::x86_64::Regs {
+        feos_signal::frame::x86_64::Regs {
+            r8: self.r8,
+            r9: self.r9,
+            r10: self.r10,
+            r11: self.r11,
+            r12: self.r12,
+            r13: self.r13,
+            r14: self.r14,
+            r15: self.r15,
+            rdi: self.rdi,
+            rsi: self.rsi,
+            rbp: self.rbp,
+            rbx: self.rbx,
+            rdx: self.rdx,
+            rax: self.rax,
+            rcx: self.rcx,
+            rsp: self.rsp,
+            rip: self.rip,
+            rflags: self.rflags,
+            cs: self.cs,
+            ss: self.ss,
+            vector: self.vector,
+            error: self.error,
+            fx: self.fx,
+        }
+    }
+
+    fn from_signal_regs(regs: &feos_signal::frame::x86_64::Regs) -> Self {
+        Self {
+            fx: regs.fx,
+            r15: regs.r15,
+            r14: regs.r14,
+            r13: regs.r13,
+            r12: regs.r12,
+            r11: regs.r11,
+            r10: regs.r10,
+            r9: regs.r9,
+            r8: regs.r8,
+            rbp: regs.rbp,
+            rdi: regs.rdi,
+            rsi: regs.rsi,
+            rdx: regs.rdx,
+            rcx: regs.rcx,
+            rbx: regs.rbx,
+            rax: regs.rax,
+            vector: regs.vector,
+            error: regs.error,
+            rip: regs.rip,
+            cs: regs.cs,
+            rflags: regs.rflags,
+            rsp: regs.rsp,
+            ss: regs.ss,
+        }
+    }
+}
+
 /// Callback invoked with the frame of the interrupted process.
 ///
 /// The stub restores that frame when this returns, unless the handler asks for

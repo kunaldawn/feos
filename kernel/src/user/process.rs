@@ -22,6 +22,8 @@ use feos_app::MAX_PROCESSES;
 use feos_sync::{Mutex, MutexGuard, TryArc};
 use feos_vm::{Ctx, FaultError, Mm, PinError, Pinned, WordKey, PAGE_SIZE};
 
+use super::children::{ChildRecord, Usage};
+use super::signal::Signals;
 use super::memory_calls::{self, KernelFrames, PROMISES};
 use super::tlb::{Gather, GatherFrames, Tlb};
 use super::files::Files;
@@ -169,6 +171,11 @@ impl UserMm {
     /// Takes the space's lock.
     pub fn lock(&self) -> MutexGuard<'_, MmState> {
         self.state.lock()
+    }
+
+    /// The user window, `[base, end)`.
+    pub const fn window(&self) -> (usize, usize) {
+        self.window
     }
 
     /// Whether `[address, address + length)` is in the user window, without the lock.
@@ -432,24 +439,61 @@ impl Drop for UserMm {
 /// A program: its space and its files, and its pid, which is its thread group's.
 pub struct Process {
     pid: u32,
-    mm: Arc<UserMm>,
+    /// The space, which only `EXEC` changes: see [`replace_image`](Self::replace_image).
+    mm: UnsafeCell<Arc<UserMm>>,
     files: Mutex<Files>,
-    /// Held to start a thread, so the count of threads is only checked and changed by
-    /// one at a time: `FORK` and `EXEC` will take it too, so neither ever sees half a
-    /// thread.
+    /// Held to start a thread, and by `EXEC` from before it ends the others until it's
+    /// alone, so the count of threads is only checked and changed by one at a time and
+    /// neither ever sees half a thread. `FORK` will take it too. Taken through
+    /// [`creating`](Self::creating), which a kill ends.
     creation: Mutex<()>,
+    /// Moved on whenever the creation lock is let go, for those waiting for it.
+    creation_turns: AtomicU32,
     /// Scheduler ticks of CPU time its threads used that have ended, for
     /// `CLOCK_PROCESS_CPUTIME_ID`. Added to and read under the scheduler's lock, with the
     /// live threads' own counts, so the sum never counts a thread twice or goes back.
     ended_ticks: AtomicU64,
     /// What of the kernel heap its calls hold for it, against [`PROCESS_HEAP_LIMIT`].
     heap: TryArc<HeapBudget>,
-    /// The canonical path of the program it runs, for `CURRENT_EXE`.
-    exe: String,
-    /// The pids of the children it has started and not reaped, running or ended, each
-    /// taken before its child is made: at most [`MAX_CHILDREN`]. A child's exit record
-    /// (stage 1c.8 fills them in) is its entry here; 0 is one being made.
-    children: Mutex<Vec<u32>>,
+    /// The canonical path of the program it runs, for `CURRENT_EXE`. Changed only by
+    /// `EXEC`, as `mm` is.
+    exe: UnsafeCell<String>,
+    /// The exit records of the children it has started and not reaped, running or
+    /// ended, each taken before its child is made: at most [`MAX_CHILDREN`]. One whose
+    /// pid is 0 is being made. See [`super::children`].
+    children: Mutex<Vec<TryArc<ChildRecord>>>,
+    /// Its own record in its parent's list, if a program started it: what it used is
+    /// added there as it goes.
+    record: Option<TryArc<ChildRecord>>,
+    /// What its reaped children used, and theirs, for `RUSAGE_CHILDREN`: ticks, the most
+    /// pages any had, and faults.
+    reaped_ticks: AtomicU64,
+    reaped_peak: AtomicU64,
+    reaped_faults: AtomicU64,
+    /// Its dispositions and pending signals, which every slot of it points at for the
+    /// scheduler (see [`super::signal`]).
+    signals: Signals,
+}
+
+// SAFETY: everything in it is `Sync` but the space and the program path, which only the
+// process's own threads read, and which `replace_image` changes only when there's one
+// thread and it holds no reference to either (see there).
+unsafe impl Sync for Process {}
+// SAFETY: as above; nothing in it belongs to one CPU or task.
+unsafe impl Send for Process {}
+
+/// The creation lock, held. Let go, it wakes whoever's waiting.
+pub struct Creating<'a> {
+    guard: Option<MutexGuard<'a, ()>>,
+    turns: &'a AtomicU32,
+}
+
+impl Drop for Creating<'_> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        self.turns.fetch_add(1, Ordering::Release);
+        feos_sync::futex_wake(self.turns, usize::MAX);
+    }
 }
 
 impl Process {
@@ -457,9 +501,39 @@ impl Process {
         self.pid
     }
 
-    /// Takes the creation lock.
-    pub fn creating(&self) -> MutexGuard<'_, ()> {
-        self.creation.lock()
+    /// Its signal state.
+    pub fn signals(&self) -> &Signals {
+        &self.signals
+    }
+
+    /// Takes the creation lock, or gives up with `None` if the calling thread is being
+    /// killed: an `EXEC` holds the lock while it waits for every other thread to end,
+    /// one waiting here among them, which a plain lock would keep waiting for ever.
+    pub fn creating(&self) -> Option<Creating<'_>> {
+        loop {
+            let seen = self.creation_turns.load(Ordering::Acquire);
+            if let Some(guard) = self.creation.try_lock() {
+                return Some(Creating { guard: Some(guard), turns: &self.creation_turns });
+            }
+            if crate::sched::kill_requested() {
+                return None;
+            }
+            // A thread being killed never blocks, so its next look comes soon enough.
+            feos_sync::futex_wait(&self.creation_turns, seen);
+        }
+    }
+
+    /// Puts a new image's space and program path in place of the old, for `EXEC`, and
+    /// hands back the old ones, to drop once the thread's tables are the new space's.
+    ///
+    /// # Safety
+    ///
+    /// The caller is the process's only thread and holds its creation lock (so no other
+    /// can start), and nothing on its stack still uses a reference that [`mm`](Self::mm)
+    /// or [`exe`](Self::exe) gave out: nobody else reads either.
+    pub unsafe fn replace_image(&self, mm: Arc<UserMm>, exe: String) -> (Arc<UserMm>, String) {
+        // SAFETY: see above: nothing else is looking.
+        unsafe { (core::mem::replace(&mut *self.mm.get(), mm), core::mem::replace(&mut *self.exe.get(), exe)) }
     }
 
     /// CPU time, in scheduler ticks, of the threads that have ended. Under the
@@ -475,12 +549,14 @@ impl Process {
     }
 
     pub fn mm(&self) -> &UserMm {
-        &self.mm
+        // SAFETY: see `replace_image`, the only change.
+        unsafe { &*self.mm.get() }
     }
 
     /// The canonical path of the program it runs.
     pub fn exe(&self) -> &str {
-        &self.exe
+        // SAFETY: as for `mm`.
+        unsafe { &*self.exe.get() }
     }
 
     /// Takes the file table's lock. Nothing is closed with it held: what comes out of
@@ -489,40 +565,65 @@ impl Process {
         self.files.lock()
     }
 
-    /// Takes a record for a child about to be made: `EAGAIN` with [`MAX_CHILDREN`]
-    /// unreaped already. [`child_made`](Self::child_made) or
-    /// [`child_failed`](Self::child_failed) follows.
-    pub fn reserve_child(&self) -> Result<(), isize> {
+    /// Takes a record for a child about to be made, in the list already: `EAGAIN` with
+    /// [`MAX_CHILDREN`] unreaped already. The scheduler fills its pid in as the child's
+    /// task is made, or [`child_failed`](Self::child_failed) takes it out again.
+    pub fn reserve_child(&self) -> Result<TryArc<ChildRecord>, isize> {
+        let mut gone = Vec::new();
         let mut children = self.children.lock();
+        // At the cap, the children nobody waits for that have ended and settled make room:
+        // a parent ignoring `SIGCHLD` may never look at its list.
+        if children.len() >= MAX_CHILDREN && gone.try_reserve(children.len()).is_ok() {
+            let mut index = 0;
+            while index < children.len() {
+                let record = &children[index];
+                if record.detached() && record.end().is_some() && crate::sched::settled(record.pid()) {
+                    gone.push(children.swap_remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+        }
         if children.len() >= MAX_CHILDREN {
+            drop(children);
+            drop(gone);
             return Err(-errno::EAGAIN);
         }
         children.try_reserve(1).map_err(|_| -errno::ENOMEM)?;
-        children.push(0);
-        Ok(())
+        let record = ChildRecord::new().ok_or(-errno::ENOMEM)?;
+        children.push(record.clone());
+        Ok(record)
     }
 
-    /// The child a record was taken for is `pid`.
-    pub fn child_made(&self, pid: u32) {
-        let mut children = self.children.lock();
-        if let Some(record) = children.iter_mut().find(|record| **record == 0) {
-            *record = pid;
-        }
+    /// The child `record` was taken for wasn't made after all.
+    pub fn child_failed(&self, record: &TryArc<ChildRecord>) {
+        let gone = {
+            let mut children = self.children.lock();
+            children.iter().position(|other| TryArc::ptr_eq(other, record)).map(|at| children.swap_remove(at))
+        };
+        drop(gone);
     }
 
-    /// The child a record was taken for wasn't made after all.
-    pub fn child_failed(&self) {
-        let mut children = self.children.lock();
-        if let Some(at) = children.iter().position(|&record| record == 0) {
-            children.swap_remove(at);
-        }
+    /// The records of its unreaped children. Nothing is dropped with the guard held: what
+    /// comes out of the list goes once it's let go.
+    pub fn children(&self) -> MutexGuard<'_, Vec<TryArc<ChildRecord>>> {
+        self.children.lock()
     }
 
-    /// The child `pid` has been reaped, or its status is gone: its record goes.
-    pub fn child_reaped(&self, pid: u32) {
-        let mut children = self.children.lock();
-        if let Some(at) = children.iter().position(|&record| record == pid) {
-            children.swap_remove(at);
+    /// Adds what a child it has just reaped used, with that child's own, to what
+    /// `RUSAGE_CHILDREN` reports.
+    pub fn add_reaped(&self, usage: Usage) {
+        self.reaped_ticks.fetch_add(usage.ticks, Ordering::AcqRel);
+        self.reaped_peak.fetch_max(usage.peak, Ordering::AcqRel);
+        self.reaped_faults.fetch_add(usage.faults, Ordering::AcqRel);
+    }
+
+    /// What its reaped children used, and theirs.
+    pub fn reaped(&self) -> Usage {
+        Usage {
+            ticks: self.reaped_ticks.load(Ordering::Acquire),
+            peak: self.reaped_peak.load(Ordering::Acquire),
+            faults: self.reaped_faults.load(Ordering::Acquire),
         }
     }
 
@@ -531,6 +632,31 @@ impl Process {
     /// with every process's charges together, past [`USER_HEAP_SHARE`] of the heap.
     pub fn charge_heap(&self, bytes: usize) -> Result<HeapCharge, isize> {
         HeapBudget::charge(&self.heap, bytes)
+    }
+
+    /// Counts `pages` frames a call takes for the process outside its space against its
+    /// page limit, as its own pages are, until the [`PageCharge`] goes: `ENOMEM` past it.
+    pub fn charge_pages(&self, pages: usize) -> Result<PageCharge, isize> {
+        // SAFETY: as for `mm`.
+        let mm = unsafe { &*self.mm.get() };
+        if !mm.lock().mm.hold(pages) {
+            return Err(-errno::ENOMEM);
+        }
+        Ok(PageCharge { mm: mm.clone(), pages })
+    }
+}
+
+/// Frames held for a process outside its space, counted against its limit until this
+/// goes. It keeps the space, so it's let go in the call that made it, never left to
+/// outlive the process.
+pub struct PageCharge {
+    mm: Arc<UserMm>,
+    pages: usize,
+}
+
+impl Drop for PageCharge {
+    fn drop(&mut self) {
+        self.mm.lock().mm.unhold(self.pages);
     }
 }
 
@@ -600,16 +726,25 @@ pub fn create(slot: usize, pid: u32, cwd: &str, umask: u32, exe: &str, files: Op
     path.push_str(exe);
     let process = Arc::new(Process {
         pid,
-        mm,
+        mm: UnsafeCell::new(mm),
         files: Mutex::new(files),
         creation: Mutex::new(()),
+        creation_turns: AtomicU32::new(0),
         ended_ticks: AtomicU64::new(0),
         heap,
-        exe: path,
+        exe: UnsafeCell::new(path),
         children: Mutex::new(Vec::new()),
+        record: crate::sched::own_record(slot),
+        reaped_ticks: AtomicU64::new(0),
+        reaped_peak: AtomicU64::new(0),
+        reaped_faults: AtomicU64::new(0),
+        signals: Signals::new(crate::sched::inherited_ignored(slot)),
     });
+    let signals = process.signals() as *const Signals;
     // SAFETY: see `ProcessCell`: the slot's own task, before anything else can look.
     unsafe { *PROCESSES[slot].0.get() = Some(process) };
+    // The scheduler may look from here: the slot holds the process until it's taken.
+    crate::sched::publish_signals(slot, signals);
     current(slot)
 }
 
@@ -619,6 +754,14 @@ impl Drop for Process {
     /// go. Its descriptors'
     /// open file descriptions go with the file table just after, the same way.
     fn drop(&mut self) {
+        // What it used goes into its parent's record of it, before the parent can reap
+        // it: the record isn't reaped while any of its threads' teardowns is still under
+        // way, and this is one. CPU time the scheduler adds itself, thread by thread.
+        if let Some(record) = &self.record {
+            let (faults, peak) = self.mm().usage();
+            let reaped = self.reaped();
+            record.add_usage(Usage { ticks: reaped.ticks, peak: reaped.peak.max(peak as u64), faults: reaped.faults + faults });
+        }
         feos_app::pipe::release_pid(self.pid);
         // Its record locks, every one: its descriptors' descriptions may outlive it, and
         // their `flock` locks with them, but these are the process's.
@@ -629,8 +772,10 @@ impl Drop for Process {
 /// Gives the slot of a new thread its reference to `process`. The slot is reserved, so
 /// its task hasn't started.
 pub fn adopt(slot: usize, process: Arc<Process>) {
+    let signals = process.signals() as *const Signals;
     // SAFETY: see `ProcessCell`: a reserved slot, before anything can look.
     unsafe { *PROCESSES[slot].0.get() = Some(process) };
+    crate::sched::publish_signals(slot, signals);
 }
 
 /// Another reference to the calling task's process, which is in `slot`, for a thread
@@ -640,7 +785,10 @@ pub fn share(slot: usize) -> Option<Arc<Process>> {
     unsafe { (*PROCESSES[slot].0.get()).clone() }
 }
 
-/// Takes the process of a task that has gone, or is going and has left its tables.
+/// Takes the process of a task that has gone, or is going and has left its tables. The
+/// caller drops it only once the slot's pointer at its signals is gone, which is cleared
+/// under the scheduler's lock (`sched::publish_signals`), so nothing under that lock is
+/// left looking at a process that's being dropped.
 pub fn take(slot: usize) -> Option<Arc<Process>> {
     // SAFETY: see `ProcessCell`.
     unsafe { (*PROCESSES[slot].0.get()).take() }

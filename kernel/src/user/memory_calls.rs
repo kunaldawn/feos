@@ -133,6 +133,7 @@ pub fn promised() -> usize {
 }
 
 /// How a fault from a program went.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FaultOutcome {
     /// The page is there now: the program tries again.
     Retry,
@@ -162,6 +163,17 @@ pub fn forget_fault(slot: usize) {
 /// Answers a memory fault from the program in `slot`: gives the page what its mapping
 /// says, or says why not. Called from `sched::fault_entry`, the fault's kernel thread,
 /// with interrupts on, so it can wait for a lock.
+/// The code of a `SIGSEGV` at `address` in the process of the thread in `slot`: no access
+/// to what's mapped there, or nothing mapped.
+pub fn segv_code(slot: usize, address: u64) -> i32 {
+    let mapped = super::process(slot).is_some_and(|process| process.mm().lock().mm.covers(address as usize, 1));
+    if mapped {
+        feos_abi::si::SEGV_ACCERR
+    } else {
+        feos_abi::si::SEGV_MAPERR
+    }
+}
+
 pub fn resolve_fault(slot: usize, fault: MemoryFault) -> FaultOutcome {
     let Some(process) = super::process(slot) else {
         return FaultOutcome::Segv;

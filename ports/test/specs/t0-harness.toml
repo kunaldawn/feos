@@ -1,0 +1,41 @@
+# Stage T0: the harness itself. stage-t0.sh injects a copy of the base's own
+# /bin/hello as /bin/ports-hello on each port, and a text file per port at
+# /usr/share/ports-test/marker.txt through the overlay.
+
+[[case]]
+name = "injected-program-runs"
+run = "/bin/ports-hello one 'two words'"
+expect = ["hello from user mode", "argc 3", "argv[1]=one", "argv[2]=two words"]
+status = 0
+
+[[case]]
+name = "injected-program-exit-status"
+run = "/bin/ports-hello --quiet --exit 7"
+status = 7
+
+[[case]]
+name = "injected-program-is-the-copy"
+run = "cmp /bin/ports-hello /bin/hello && echo same-bytes"
+expect = ["same-bytes"]
+status = 0
+
+[[case]]
+name = "overlay-file-arm"
+arch = "arm"
+run = "cat /usr/share/ports-test/marker.txt"
+expect = ["ports-overlay-aarch64"]
+reject = ["x86_64"]
+status = 0
+
+[[case]]
+name = "overlay-file-x64"
+arch = "x64"
+run = "cat /usr/share/ports-test/marker.txt"
+expect = ["ports-overlay-x86_64"]
+reject = ["aarch64"]
+status = 0
+
+[[case]]
+name = "failing-status-is-seen"
+run = "/no/such/program"
+status = 127

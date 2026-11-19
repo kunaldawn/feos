@@ -239,7 +239,10 @@ fn test_processes(report: &mut Report) {
 
     if let Ok((reader, writer)) = pipe() {
         close(reader);
+        // `SIGPIPE` would end the program (stage 1c.9): ignored, the write says `EPIPE`.
+        feos_user::signal::set_disposition(feos_user::abi::sig::PIPE, feos_user::abi::sa::IGN);
         report.check("write-with-no-reader", write(writer, b"x") == -errno::EPIPE);
+        feos_user::signal::set_disposition(feos_user::abi::sig::PIPE, feos_user::abi::sa::DFL);
         close(writer);
     }
 }
@@ -381,6 +384,8 @@ fn read_stamp(fd: usize) -> Option<isize> {
 /// Sleeps two milliseconds at a time, sending the time after each, until nobody reads
 /// them or ten seconds have passed.
 fn ticker() -> i32 {
+    // It ends when its reader has gone, by the write's `EPIPE`, not by `SIGPIPE`.
+    feos_user::signal::set_disposition(feos_user::abi::sig::PIPE, feos_user::abi::sa::IGN);
     let start = uptime_ms();
     while uptime_ms() - start < 10_000 {
         sleep_ms(2);

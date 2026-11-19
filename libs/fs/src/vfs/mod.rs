@@ -517,6 +517,21 @@ pub trait VfsTree: Sync {
         Err(FsError::Unsupported)
     }
 
+    /// A program's [`create_file`](Self::create_file): `caller` must be able to write and
+    /// search the directory `path` is in, as the tree's walk finds it, under its lock; the
+    /// new file is theirs and has `mode` (where the filesystem keeps owners and modes) from
+    /// that same step, and what was made is returned, for the caller to open by: never
+    /// looked up again by its path, which could lead somewhere else by then.
+    fn create_file_as(&self, _path: &str, _mode: u16, _caller: Caller) -> Result<Resolved, FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    /// A program's [`create_dir`](Self::create_dir), judged and owned in one step as
+    /// [`create_file_as`](Self::create_file_as) is; `mode` `None` keeps the filesystem's.
+    fn create_dir_as(&self, _path: &str, _mode: Option<u16>, _caller: Caller) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+
     /// Whether a user may do `want` (`ACCESS_*`) to `path`, having to be able to go through
     /// every directory on the way. Only filesystems with owners say no. It's for the system
     /// call boundary: kernel-linked apps run as root and aren't checked at all.
@@ -1399,6 +1414,46 @@ impl Vfs {
         Ok(())
     }
 
+    /// [`VfsTree::create_file_as`] and [`VfsTree::create_dir_as`]: the new name's directory
+    /// judged, the entry made, and its owner and mode set, all under the one lock, on what
+    /// the walk reached. Done by its path in separate steps, a directory on the way swapped
+    /// for a link between them could have the check made in one place, the file made in
+    /// another, and the owner and mode given to whatever the path named by then (a file of
+    /// root's, say).
+    fn create_as(&self, path: &str, directory: bool, mode: Option<u16>, caller: Caller) -> Result<Resolved, FsError> {
+        let mut state = self.lock();
+        let (parent, canonical, name) = state.walk_parent(path)?;
+        let made = join_path(&canonical, name);
+        if path::is_hidden(&made) {
+            return Err(FsError::NotFound);
+        }
+        if state.is_mount_point(&made) {
+            return Err(FsError::NameExists);
+        }
+        state.check_parent(&canonical, caller)?;
+        let location = if directory {
+            state.check_writable_mount(parent.mount)?;
+            let node = state.mounts[parent.mount].fs.create_dir(parent.node, name)?;
+            state.touched(parent.mount);
+            Location { mount: parent.mount, node }
+        } else {
+            state.create_at(parent, name)?
+        };
+        let fs = &mut state.mounts[location.mount].fs;
+        // A filesystem with no owners or modes has nothing to keep, and says so.
+        if caller.uid != 0 || caller.gid != 0 {
+            let _ = fs.set_owner(location.node, Some(caller.uid), Some(caller.gid));
+        }
+        if let Some(mode) = mode {
+            let _ = fs.set_mode(location.node, mode);
+        }
+        let stat = state.stat_location(location, false)?;
+        let id = state.file_id(location);
+        drop(state);
+        self.changed();
+        Ok(Resolved { canonical: made, stat, id })
+    }
+
     /// [`VfsTree::symlink`], and with a `caller`, [`VfsTree::symlink_as`].
     fn make_symlink(&self, target: &str, path: &str, caller: Option<Caller>) -> Result<(), FsError> {
         if target.is_empty() || target.len() > MAX_LINK_TARGET {
@@ -1677,6 +1732,14 @@ impl VfsTree for Vfs {
         drop(state);
         self.changed();
         Ok(())
+    }
+
+    fn create_file_as(&self, path: &str, mode: u16, caller: Caller) -> Result<Resolved, FsError> {
+        self.create_as(path, false, Some(mode), caller)
+    }
+
+    fn create_dir_as(&self, path: &str, mode: Option<u16>, caller: Caller) -> Result<(), FsError> {
+        self.create_as(path, true, mode, caller).map(|_| ())
     }
 
     fn create_dir(&self, path: &str) -> Result<(), FsError> {

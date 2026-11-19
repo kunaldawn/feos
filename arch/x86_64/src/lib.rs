@@ -176,6 +176,10 @@ impl FaultDetails for exceptions::FaultInfo {
         self.elr
     }
 
+    fn user_signal(&self) -> (u32, i32) {
+        exceptions::FaultInfo::user_signal(self)
+    }
+
     fn write_report(&self, out: &mut dyn fmt::Write) -> fmt::Result {
         write!(
             out,

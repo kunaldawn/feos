@@ -1,0 +1,47 @@
+# The libc suite (ports/test/libc-suite.sh): the sysroot installed in the image, relibc's
+# own tests and the libc-test subset, run on feos by /bin/testrun from their lists
+# (ports/test/relibc-feos.txt and libc-test-feos.txt say what's left out, and why).
+# testrun prints a line per test and "testrun: LIST: P passed, F failed, ..." last.
+
+[[case]]
+name = "sysroot"
+run = "/bin/sysroot-check"
+expect = ["files ok"]
+status = 0
+
+[[case]]
+name = "testrun-self"
+run = "/bin/testrun -t 4 /usr/share/libc-suite/selftest/self.list"
+expect = ["PASS pass", "FAIL fail: exit status 1", "FAIL differs: stdout differs", "PEND later (stage 9z.9)", "SKIP never", "TIMEOUT slow: still running after 4 s", "testrun: /usr/share/libc-suite/selftest/self.list: 1 passed, 3 failed, 1 pending, 1 skipped", "testrun: 1 tests left running"]
+status = 1
+
+[[case]]
+name = "relibc-tests"
+run = "/bin/testrun -t 30 /usr/share/libc-suite/relibc/relibc.list"
+expect = [" 0 failed,"]
+reject = ["TIMEOUT"]
+status = 0
+timeout = 2400
+
+[[case]]
+name = "libc-test"
+run = "/bin/testrun -t 60 /usr/share/libc-suite/libc-test/libc-test.list"
+expect = [" 0 failed,"]
+reject = ["TIMEOUT"]
+status = 0
+timeout = 2400
+
+# For the record, not judged: every test that was built, the pending and skipped ones
+# too, so ports/test/suite-report.py can put each one's result on feos beside the Linux
+# reference's (docs/toolchain.md). A test left running here is just reported.
+[[case]]
+name = "relibc-all-record"
+run = "/bin/testrun -t 20 /usr/share/libc-suite/relibc/relibc-all.list"
+expect = ["testrun: /usr/share/libc-suite/relibc/relibc-all.list:"]
+timeout = 3000
+
+[[case]]
+name = "libc-test-all-record"
+run = "/bin/testrun -t 20 /usr/share/libc-suite/libc-test/libc-test-all.list"
+expect = ["testrun: /usr/share/libc-suite/libc-test/libc-test-all.list:"]
+timeout = 3000

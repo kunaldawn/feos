@@ -442,6 +442,38 @@ pub fn spawn_request(path: &str, argv: &[UserStr], envp: &[UserStr], actions: &[
     }
 }
 
+/// `exec`, with the request as given: only returns, with the error, if it fails.
+pub fn exec(request: &abi::ExecRequest) -> isize {
+    syscall(nr::EXEC, [request as *const abi::ExecRequest as usize, 0, 0, 0, 0, 0])
+}
+
+/// An `EXEC` request for the program at `path` (relative to the working directory), with
+/// `argv` and `envp`.
+pub fn exec_request(path: &str, argv: &[UserStr], envp: &[UserStr]) -> abi::ExecRequest {
+    abi::ExecRequest {
+        path: path_at(abi::at::FDCWD, path),
+        argv: argv.as_ptr() as u64,
+        argc: argv.len() as u64,
+        envp: envp.as_ptr() as u64,
+        envc: envp.len() as u64,
+        ..abi::ExecRequest::default()
+    }
+}
+
+/// Runs the program at `path` in place of this one, with the arguments `args` (its own
+/// name first) and this one's environment, up to 64 strings of it: the error, if it can't.
+pub fn exec_args(path: &str, args: &[&str]) -> isize {
+    let mut argv = [UserStr::default(); 16];
+    let argv = user_strs(args, &mut argv);
+    let mut envp = [UserStr::default(); 64];
+    let mut count = 0;
+    for (slot, entry) in envp.iter_mut().zip(environment()) {
+        *slot = UserStr { pointer: entry.as_ptr() as usize, length: entry.len() };
+        count += 1;
+    }
+    exec(&exec_request(path, argv, &envp[..count]))
+}
+
 pub fn getppid() -> isize {
     syscall(nr::GETPPID, [0; 6])
 }
@@ -480,6 +512,244 @@ pub fn sysinfo() -> Result<abi::SysInfo, isize> {
 
 pub fn wait(pid: usize) -> isize {
     syscall(nr::WAIT, [pid, 0, 0, 0, 0, 0])
+}
+
+/// `wait4(pid, ...)`: the pid reported (0 with `WNOHANG` and nothing to report) and its
+/// POSIX status, or the error.
+pub fn wait4(pid: isize, options: usize) -> Result<(isize, i32), isize> {
+    let mut status = -1i32;
+    match syscall(nr::WAIT4, [pid as usize, &mut status as *mut i32 as usize, options, 0, 0, 0]) {
+        error if error < 0 => Err(error),
+        pid => Ok((pid, status)),
+    }
+}
+
+/// `wait4` with the child's resource use too.
+pub fn wait4_rusage(pid: isize, options: usize) -> Result<(isize, i32, abi::Rusage), isize> {
+    let mut status = -1i32;
+    let mut usage = abi::Rusage::default();
+    let args = [pid as usize, &mut status as *mut i32 as usize, options, &mut usage as *mut abi::Rusage as usize, 0, 0];
+    match syscall(nr::WAIT4, args) {
+        error if error < 0 => Err(error),
+        pid => Ok((pid, status, usage)),
+    }
+}
+
+/// `kill(pid, signal)`: 0 or the error.
+pub fn kill(pid: isize, signal: u32) -> isize {
+    syscall(nr::KILL, [pid as usize, signal as usize, 0, 0, 0, 0])
+}
+
+/// Signals: `SIGACTION` and the restorer every handler here returns to, masks, the
+/// alternate stack, `THREAD_KILL` and `ITIMER_REAL`.
+pub mod signal {
+    use super::abi::{nr, sa, SigAction, SigInfo, UContext};
+    use super::syscall;
+
+    /// A handler as the kernel calls it: always with three arguments.
+    pub type Handler = extern "C" fn(i32, *mut SigInfo, *mut UContext);
+
+    // What a handler returns to: `SIGRETURN` with the stack pointer it then has, which is
+    // the context's address (section 8.4 of the ABI design).
+    #[cfg(target_arch = "aarch64")]
+    core::arch::global_asm!(
+        ".section .text.feos_restore_rt, \"ax\"",
+        ".global feos_restore_rt",
+        "feos_restore_rt:",
+        "    mov x0, sp",
+        "    mov x8, 89",
+        "    svc #0",
+        "    brk #0",
+    );
+    #[cfg(target_arch = "x86_64")]
+    core::arch::global_asm!(
+        ".section .text.feos_restore_rt, \"ax\"",
+        ".global feos_restore_rt",
+        "feos_restore_rt:",
+        "    mov rdi, rsp",
+        "    mov eax, 89",
+        "    int 0xf0",
+        "    ud2",
+    );
+
+    extern "C" {
+        fn feos_restore_rt();
+    }
+
+    /// The restorer's address.
+    pub fn restorer() -> u64 {
+        feos_restore_rt as *const () as usize as u64
+    }
+
+    /// `sigaction(signal, new, old)`: 0 or the error.
+    pub fn sigaction(signal: u32, new: Option<&SigAction>, old: Option<&mut SigAction>) -> isize {
+        let new = new.map_or(0, |action| action as *const SigAction as usize);
+        let old = old.map_or(0, |action| action as *mut SigAction as usize);
+        syscall(nr::SIGACTION, [signal as usize, new, old, 0, 0, 0])
+    }
+
+    /// The disposition that runs `handler` with `flags` (and `SA_RESTORER`), blocking
+    /// `mask` besides the signal itself.
+    pub fn action(handler: Handler, flags: u32, mask: u64) -> SigAction {
+        SigAction { handler: handler as usize as u64, flags: flags | sa::RESTORER, reserved: 0, restorer: restorer(), mask }
+    }
+
+    /// Runs `handler` for `signal` from now on.
+    pub fn handle(signal: u32, handler: Handler, flags: u32) -> isize {
+        sigaction(signal, Some(&action(handler, flags, 0)), None)
+    }
+
+    /// `SIG_DFL` or `SIG_IGN` for `signal`.
+    pub fn set_disposition(signal: u32, disposition: u64) -> isize {
+        sigaction(signal, Some(&SigAction { handler: disposition, ..SigAction::default() }), None)
+    }
+
+    /// What `signal`'s disposition is.
+    pub fn disposition(signal: u32) -> Result<SigAction, isize> {
+        let mut old = SigAction::default();
+        match sigaction(signal, None, Some(&mut old)) {
+            0 => Ok(old),
+            error => Err(error),
+        }
+    }
+
+    /// `sigprocmask(how, set, old)`: 0 or the error.
+    pub fn sigprocmask(how: i32, set: Option<u64>, old: Option<&mut u64>) -> isize {
+        let set_ptr = set.as_ref().map_or(0, |set| set as *const u64 as usize);
+        let old = old.map_or(0, |old| old as *mut u64 as usize);
+        syscall(nr::SIGPROCMASK, [how as isize as usize, set_ptr, old, 0, 0, 0])
+    }
+
+    /// The calling thread's mask.
+    pub fn mask() -> u64 {
+        let mut old = 0;
+        sigprocmask(super::abi::how::BLOCK, None, Some(&mut old));
+        old
+    }
+
+    /// Blocks `set` in the calling thread.
+    pub fn block(set: u64) -> isize {
+        sigprocmask(super::abi::how::BLOCK, Some(set), None)
+    }
+
+    /// Unblocks `set` in the calling thread.
+    pub fn unblock(set: u64) -> isize {
+        sigprocmask(super::abi::how::UNBLOCK, Some(set), None)
+    }
+
+    /// `sigpending`: the blocked signals pending for the thread or its process.
+    pub fn sigpending() -> Result<u64, isize> {
+        let mut out = 0u64;
+        match syscall(nr::SIGPENDING, [&mut out as *mut u64 as usize, 0, 0, 0, 0, 0]) {
+            0 => Ok(out),
+            error => Err(error),
+        }
+    }
+
+    /// `sigsuspend(mask)`: always `EINTR`.
+    pub fn sigsuspend(mask: u64) -> isize {
+        syscall(nr::SIGSUSPEND, [&mask as *const u64 as usize, 0, 0, 0, 0, 0])
+    }
+
+    /// `sigaltstack(new, old)`: 0 or the error.
+    pub fn sigaltstack(new: Option<&super::abi::SigStack>, old: Option<&mut super::abi::SigStack>) -> isize {
+        let new = new.map_or(0, |stack| stack as *const super::abi::SigStack as usize);
+        let old = old.map_or(0, |stack| stack as *mut super::abi::SigStack as usize);
+        syscall(nr::SIGALTSTACK, [new, old, 0, 0, 0, 0])
+    }
+
+    /// `thread_kill(tid, signal)`: 0 or the error.
+    pub fn thread_kill(tid: usize, signal: u32) -> isize {
+        syscall(nr::THREAD_KILL, [tid, signal as usize, 0, 0, 0, 0])
+    }
+
+    /// `setitimer(ITIMER_REAL, new, old)`: 0 or the error.
+    pub fn setitimer(new: Option<&super::abi::ITimerVal>, old: Option<&mut super::abi::ITimerVal>) -> isize {
+        let new = new.map_or(0, |timer| timer as *const super::abi::ITimerVal as usize);
+        let old = old.map_or(0, |timer| timer as *mut super::abi::ITimerVal as usize);
+        syscall(nr::SETITIMER, [super::abi::itimer::REAL as usize, new, old, 0, 0, 0])
+    }
+
+    /// `ITIMER_REAL` as it stands.
+    pub fn getitimer() -> Result<super::abi::ITimerVal, isize> {
+        let mut out = super::abi::ITimerVal::default();
+        match setitimer(None, Some(&mut out)) {
+            0 => Ok(out),
+            error => Err(error),
+        }
+    }
+
+    /// An `ITIMER_REAL` setting: `value_us` from now, then every `interval_us`.
+    pub fn timer_us(value_us: u64, interval_us: u64) -> super::abi::ITimerVal {
+        let tv = |us: u64| super::abi::Timeval { sec: (us / 1_000_000) as i64, usec: (us % 1_000_000) as i64 };
+        super::abi::ITimerVal { interval: tv(interval_us), value: tv(value_us) }
+    }
+
+    /// `sigreturn(context)`, with any context at all: only returns if the kernel let the
+    /// call return, which it never should.
+    pub fn sigreturn(context: usize) -> isize {
+        syscall(nr::SIGRETURN, [context, 0, 0, 0, 0, 0])
+    }
+
+    /// The program counter in a handler's context.
+    ///
+    /// # Safety
+    /// `context` is the one the kernel passed the handler.
+    pub unsafe fn pc(context: *mut UContext) -> u64 {
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: as the caller promises.
+        return unsafe { (*context).pc };
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: as the caller promises.
+        return unsafe { (*context).gregs[super::abi::ucontext::greg::RIP] };
+    }
+
+    /// Sets the program counter a handler returns to.
+    ///
+    /// # Safety
+    /// As for [`pc`].
+    pub unsafe fn set_pc(context: *mut UContext, pc: u64) {
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: as the caller promises.
+        unsafe {
+            (*context).pc = pc
+        };
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: as the caller promises.
+        unsafe {
+            (*context).gregs[super::abi::ucontext::greg::RIP] = pc
+        };
+    }
+
+    /// The stack pointer in a handler's context.
+    ///
+    /// # Safety
+    /// As for [`pc`].
+    pub unsafe fn sp(context: *mut UContext) -> u64 {
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: as the caller promises.
+        return unsafe { (*context).sp };
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: as the caller promises.
+        return unsafe { (*context).gregs[super::abi::ucontext::greg::RSP] };
+    }
+
+    /// Sets the stack pointer a handler returns to.
+    ///
+    /// # Safety
+    /// As for [`pc`].
+    pub unsafe fn set_sp(context: *mut UContext, sp: u64) {
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: as the caller promises.
+        unsafe {
+            (*context).sp = sp
+        };
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: as the caller promises.
+        unsafe {
+            (*context).gregs[super::abi::ucontext::greg::RSP] = sp
+        };
+    }
 }
 
 pub fn pipe() -> Result<(usize, usize), isize> {

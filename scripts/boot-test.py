@@ -851,6 +851,15 @@ def ps_rows(guest):
     return [(int(pid), int(threads), name) for pid, threads, name in rows]
 
 
+def program_pid(guest, name):
+    """The pid of the user program `name` running, as `ps` shows it: not the shell task a
+    `&` job runs it under, which is named after its path."""
+    for pid, _, text in ps_rows(guest):
+        if text == name or text.startswith(name + " "):
+            return pid
+    fail(guest, f"no {name} in ps")
+
+
 def taskmgr_rows(guest):
     """`taskmgr --list`, the task manager's own process list, as (pid, name) rows."""
     start = len(guest.log)
@@ -1668,6 +1677,12 @@ def user_test(arch, kernel):
     guest.capture(r"\[\d+\] (\d+)")
     time.sleep(1)
     guest.run("kill $!; wait $!; echo killed-$?", "killed-137")
+    guest.send("/bin/spin 2 0 &\r")
+    guest.capture(r"\[\d+\] (\d+)")
+    time.sleep(1)
+    spin = program_pid(guest, "spin")
+    guest.run(f"kill -TERM {spin}; wait $!; echo termed-$?", "termed-143")
+    # Ctrl-C is the shell's `SIGINT` to the program, whose status says so.
     guest.send("/bin/spin 2 0\r")
     time.sleep(1)
     guest.send("\x03")
@@ -2091,6 +2106,180 @@ def posix_fs_test(arch, kernel):
     os.remove(root)
 
 
+PTEST_CHECKS = (
+    "spawn2-argv-envp", "spawn2-env-from-shell", "spawn2-dup2-action", "spawn2-close-action",
+    "spawn2-close-not-open-ignored", "spawn2-closefrom", "spawn2-open-action", "spawn2-open-dev-null",
+    "spawn2-chdir-action", "spawn2-cloexec-closed", "spawn2-inherits-fds", "spawn2-setpgroup", "spawn2-setsid",
+    "spawn2-flags-combined", "spawn2-enoent-synchronous", "spawn2-eacces-synchronous",
+    "spawn2-enoexec-synchronous", "spawn2-1mib-args", "v1-spawn-errors-unchanged", "auxv-present",
+    "auxv-feos-exe", "spawn2-empty-path-identity", "sysinfo-cpus", "sysinfo-features", "getrusage-self",
+    "getppid",
+    # Stage 1c.7: `EXEC` and `#!` scripts.
+    "exec-replaces", "exec-closes-cloexec", "exec-keeps-fds", "exec-from-second-thread",
+    "exec-while-sibling-blocked", "exec-error-returns", "exec-script", "exec-script-arg", "spawn2-script",
+    "exec-drops-locks-of-cloexec-fds", "exec-keeps-locks-of-kept-fds", "setpgid-after-exec-eacces",
+    # Stage 1c.8: `WAIT4`, exit records, `KILL` with default actions, stops.
+    "wait4-status-exit", "wait4-wnohang", "kill-term", "wait4-status-signal", "wait4-rusage", "wait4-any",
+    "wait4-pgroup", "wait4-echild", "wait4-wuntraced", "wait4-wcontinued", "kill-stop-cont",
+    "kill-zero-checks", "kill-pgroup", "kill-unreaped-child-ok", "kill-tid-esrch", "stop-mid-call-no-lockup",
+    "pid-not-reused-while-unreaped", "orphan-runs-on", "getrusage-children",
+)
+
+
+def posix_proc_test(arch, kernel):
+    """Starting programs (stages 1c.6 to 1c.8): `ptest` through every check, `EXEC` and
+    `#!` scripts, `WAIT4`, `KILL` and stops among them, run from the shell with a variable
+    of its own, so its environment is the shell's; a script with another interpreter run
+    from the shell; the shell's `kill` sending signals to a program; then a spawn storm,
+    until there's no slot for another program. Every frame comes back. On four CPUs and
+    on one."""
+    for smp in (4, 1):
+        label = f"posix-proc {arch} smp={smp}"
+        guest = Guest(user_command(arch, kernel, smp=smp))
+        guest.boot_to_shell()
+        guest.send("ktest user-memory\r")
+        before = int(guest.capture(r"frames-free=(\d+) "))
+
+        start = len(guest.log)
+        guest.send("FOO=bar /bin/ptest 2>&1; echo ptest-status-$?\r")
+        status = guest.capture(r"ptest-status-(\d+)", 600)
+        text = guest.log[start:guest.mark].decode(errors="replace")
+        failed = re.findall(r"ptest ([a-z0-9-]+): FAILED \(([^\r\n]*)\)", text)
+        if failed or "ptest: all ok" not in text or status != "0":
+            fail(guest, f"{label}: ptest failed: {failed}")
+        checks = dict(re.findall(r"ptest ([a-z0-9-]+): ok \(([^\r\n]*)\)", text))
+        missing = [name for name in PTEST_CHECKS if name not in checks]
+        if missing:
+            fail(guest, f"{label}: ptest didn't run {missing}")
+        for name in PTEST_CHECKS:
+            print(f"{label}: {name}: {checks[name]}", flush=True)
+        # What the shell exports, and the command's own assignment, reach a program.
+        guest.run("FOO=bar /bin/ptest --env | tr a-z A-Z", "\nBAR")
+        guest.run("export FOO=exported; /bin/ptest --env | tr a-z A-Z", "\nEXPORTED")
+        guest.run("unset FOO; /bin/ptest --env", "(unset)")
+        # A NUL in an exported value (`read` keeps it) ends the value there, as a C
+        # string would, and leaves the environment and the aux vector after it whole.
+        guest.send("printf 'x\\0y\\n' | { read FOO; export FOO; /bin/ptest --env-whole; }; unset FOO\r")
+        guest.capture(r"env-whole FOO=(xy?) plain=0 exe=ok")
+        # A script for an interpreter that isn't the shell: the shell hands it to the
+        # kernel, which runs `#!`'s program with the script's path after its argument.
+        guest.run("printf '#!/bin/ptest --script\\n' > /tmp/sh-script; chmod 755 /tmp/sh-script; "
+                  "/tmp/sh-script from-shell | tr a-z A-Z",
+                  "SCRIPT ARGV=/BIN/PTEST|--SCRIPT|/TMP/SH-SCRIPT|FROM-SHELL| EXE=/TMP/SH-SCRIPT")
+        guest.run("rm /tmp/sh-script; echo removed-$((2 + 3))", "removed-5")
+
+        # The shell's `kill` sends a program signals, which take their default actions:
+        # `SIGTERM` ends it as 128 + 15, and a stop and continue hold it and let it go. `$!`
+        # is the shell task the job runs the program under, which ends with its status. A
+        # job, as `%1` or `$!`, is the program the job runs, and a pid is that pid.
+        guest.send("/bin/spin 3 0 &\r")
+        job = guest.capture(r"\[(\d+)\] \d+")
+        time.sleep(1)
+        spin = program_pid(guest, "spin")
+        guest.run(f"kill -STOP %{job}; sleep 300; ps | grep spin | grep -c stopped | tr 1 S", "\nS")
+        guest.run("kill -CONT $!; sleep 300; ps | grep spin | grep -c stopped | tr 0 C", "\nC")
+        guest.run(f"kill -STOP {spin}; sleep 300; ps | grep spin | grep -c stopped | tr 1 S", "\nS")
+        guest.run(f"kill -CONT {spin}; sleep 300; ps | grep spin | grep -c stopped | tr 0 C", "\nC")
+        guest.run(f"kill -TERM {spin}; wait $!; echo termed-$?", "termed-143")
+        guest.send("/bin/spin 4 0 &\r")
+        guest.capture(r"\[\d+\] (\d+)")
+        time.sleep(1)
+        guest.run("kill -USR1 $!; wait $!; echo usr1-$?", "usr1-138")
+        guest.send("/bin/spin 4 0 &\r")
+        job = guest.capture(r"\[(\d+)\] \d+")
+        time.sleep(1)
+        guest.run(f"kill -TERM %{job}; wait $!; echo job-termed-$?", "job-termed-143")
+        print(f"{label}: the shell's kill: SIGSTOP, SIGCONT, SIGTERM (143) and SIGUSR1 (138), by pid, %N and $!", flush=True)
+
+        # What a refused thread leaves in its slot, and what holds a pid once the counter
+        # has wrapped (an unreaped child, a group with members but no leader).
+        guest.send("ktest records\r")
+        report = guest.capture(r"\[ktest\] (records: ok=\w+)", 120)
+        text = guest.log[start:guest.mark].decode(errors="replace")
+        for line in re.findall(r"\[ktest\] records [^\r\n]*", text):
+            print(f"{label}: {line}", flush=True)
+        if "ok=true" not in report:
+            fail(guest, f"{label}: {report}")
+
+        # Programs until there's no slot for another, twice over, each ended after.
+        guest.send("/bin/malicious --spawn-storm; echo storm-$?\r")
+        storm = guest.capture(r"spawn-storm: (made=\d+ then=-?\d+ failed=\d+)", 600)
+        guest.expect("storm-0", 120)
+        print(f"{label}: spawn storm {storm}", flush=True)
+        guest.run("echo survived-$((6 * 7))", "survived-42")
+
+        time.sleep(1)
+        guest.send("ktest user-memory\r")
+        after = int(guest.capture(r"frames-free=(\d+) "))
+        if after != before:
+            fail(guest, f"{label}: frames leaked: {before} -> {after}")
+        print(f"{label}: frames back: {before} -> {after}", flush=True)
+        guest.send("poweroff\r")
+        guest.wait_exit()
+
+
+SIGTEST_CHECKS = (
+    "handler-runs", "siginfo-pid-uid", "ucontext-has-registers", "sigreturn-restores-registers",
+    "sa-resethand", "sa-nodefer", "segv-handler-skips-instruction", "sigill", "sigtrap",
+    "sigpipe-default-kills", "sigpipe-ignored-epipe", "sigchld-handler-finds-record",
+    "sigchld-stop-reported", "sigchld-ign-autoreaps", "sigchld-default-keeps-records",
+    "sigchld-ign-inherited-autoreaps", "sigchld-ign-kept-across-exec", "signal-on-call-return",
+    # Stage 1c.10: masks, alternate stacks, interruption and restart, `THREAD_KILL`,
+    # which thread takes a process signal, `SPAWN2`'s signal flags and `SETITIMER`.
+    "mask-blocks-then-delivers", "sigprocmask-unblock-delivers-before-return", "sigpending", "sigsuspend",
+    "altstack-used", "stack-overflow-handler", "eintr-read", "eintr-partial-write", "sa-restart-read",
+    "sa-restart-wait4", "thread-kill-targets-thread", "process-signal-unblocked-thread", "process-signal-once",
+    "ipi-prompt-delivery", "spawn2-sigmask", "spawn2-setsigdef", "alarm-interrupts-read", "setitimer-interval",
+    "getitimer-reads",
+)
+SIGTEST_ARCH_CHECKS = {"x64": ("sigfpe",), "arm": ("divide-by-zero-no-signal",)}
+
+
+def signals_test(arch, kernel):
+    """Signal handlers (stages 1c.9 and 1c.10): `sigtest` through every check (handlers
+    entered and left with every register kept, `SA_RESETHAND` and `SA_NODEFER`, faults as
+    signals a handler can skip, `SIGPIPE`, `SIGCHLD`, delivery as a call returns; masks,
+    `SIGSUSPEND`, alternate stacks and a stack overflow caught on one, calls cut short or
+    made again, `THREAD_KILL`, a process signal taken once by one thread, the IPI that
+    reaches a thread on another CPU, `SPAWN2`'s signal flags, `SETITIMER`), and a fault
+    with no handler still 139. Every frame comes back. On four CPUs and on one."""
+    wanted = SIGTEST_CHECKS + SIGTEST_ARCH_CHECKS[arch]
+    for smp in (4, 1):
+        label = f"signals {arch} smp={smp}"
+        guest = Guest(user_command(arch, kernel, smp=smp))
+        guest.boot_to_shell()
+        guest.send("ktest user-memory\r")
+        before = int(guest.capture(r"frames-free=(\d+) "))
+
+        start = len(guest.log)
+        guest.send("/bin/sigtest 2>&1; echo sigtest-status-$?\r")
+        status = guest.capture(r"sigtest-status-(\d+)", 600)
+        text = guest.log[start:guest.mark].decode(errors="replace")
+        failed = re.findall(r"sigtest ([a-z0-9-]+): FAILED \(([^\r\n]*)\)", text)
+        if failed or "sigtest: all ok" not in text or status != "0":
+            fail(guest, f"{label}: sigtest failed: {failed}")
+        checks = dict(re.findall(r"sigtest ([a-z0-9-]+): ok \(([^\r\n]*)\)", text))
+        missing = [name for name in wanted if name not in checks]
+        if missing:
+            fail(guest, f"{label}: sigtest didn't run {missing}")
+        for name in wanted:
+            print(f"{label}: {name}: {checks[name]}", flush=True)
+
+        # A fault with no handler ends the program as it always did, and the machine
+        # carries on.
+        guest.run("/bin/malicious --probe null-write; echo unhandled-$?", "unhandled-139")
+        guest.run("echo survived-$((6 * 7))", "survived-42")
+
+        time.sleep(1)
+        guest.send("ktest user-memory\r")
+        after = int(guest.capture(r"frames-free=(\d+) "))
+        if after != before:
+            fail(guest, f"{label}: frames leaked: {before} -> {after}")
+        print(f"{label}: frames back: {before} -> {after}", flush=True)
+        guest.send("poweroff\r")
+        guest.wait_exit()
+
+
 def screen_has(guest, kernel, color, least):
     """Whether the screen holds at least this many pixels of an exact colour."""
     shot = work_path(kernel, "user-screen.ppm")
@@ -2363,9 +2552,19 @@ def terminal_test(arch, kernel):
     time.sleep(1)
     guest.send(" > /tmp/pasted\r")
     time.sleep(2)
+    # Ctrl-C in the window ends a user program, through the shell's `SIGINT`.
+    guest.send("/bin/spin 6 0\r")
+    time.sleep(2)
+    guest.send("\x03")
+    time.sleep(2)
+    guest.send("echo \"uc-$?\" > /tmp/ctrl-c; ps > /tmp/ctrl-c-ps\r")
+    time.sleep(2)
     guest.send("\x1c")
     guest.expect("entering the serial shell")
     guest.run("cat /tmp/pasted", "got-SELECT-ME-42")
+    guest.run("cat /tmp/ctrl-c", "uc-130")
+    guest.run("grep -c spin /tmp/ctrl-c-ps | tr 0 Z", "\nZ")
+    print(f"terminal {arch}: Ctrl-C ended a user program", flush=True)
     print(f"terminal {arch}: a drag copied and pasted back through the clipboard", flush=True)
     # A running program's file can't be written over, by a kernel app either.
     guest.send("/bin/spin 2 0 &\r")
@@ -2759,6 +2958,20 @@ def jobs_test(arch, kernel):
     time.sleep(2)
     guest.send("echo \"fg-$?\" > /tmp/w-fg\r")
     time.sleep(1)
+    # A user program too: Ctrl-Z stops it as `SIGTSTP` would, at its way back to the
+    # program, and `fg` continues it until Ctrl-C's `SIGINT` ends it.
+    guest.send("/bin/spin 5 0\r")
+    time.sleep(2)
+    guest.send("\x1a")
+    time.sleep(2)
+    guest.send("echo \"uz-$?\" > /tmp/w-uz; ps > /tmp/w-ups\r")
+    time.sleep(2)
+    guest.send("fg\r")
+    time.sleep(2)
+    guest.send("\x03")
+    time.sleep(2)
+    guest.send("echo \"ufg-$?\" > /tmp/w-ufg\r")
+    time.sleep(1)
     # Closing the window hangs up on its shell.
     guest.send("trap 'echo bye > /tmp/w-exit' EXIT; trap 'echo hup-$((20+1)) > /tmp/w-hup' HUP\r")
     time.sleep(1)
@@ -2775,6 +2988,9 @@ def jobs_test(arch, kernel):
     guest.run("cat /tmp/w-jobs", "Stopped")
     guest.run("grep -c stopped /tmp/w-ps", "\n1")
     guest.run("cat /tmp/w-fg", "fg-130")
+    guest.run("cat /tmp/w-uz", "uz-148")
+    guest.run("grep spin /tmp/w-ups | grep -c stopped | tr 1 U", "\nU")
+    guest.run("cat /tmp/w-ufg", "ufg-130")
     guest.run("cat /tmp/w-term", "term-31")
     guest.run("cat /tmp/w-hup", "hup-21")
     guest.run("cat /tmp/w-exit", "bye")
@@ -2811,10 +3027,14 @@ def jobs_test(arch, kernel):
     guest.expect("got-quit-3")
     guest.run("echo quit-$?", "quit-131")
     guest.run("trap - HUP QUIT TERM; echo cleared-$((4+4))", "cleared-8")
-    # With no trap a process is killed by TERM, the shell excepted.
+    # With no trap a process is killed by TERM, the shell excepted. A job's pid is its
+    # task, a forked shell, so the signal goes to the `sleep` it runs (or to the task, if
+    # it hasn't started it yet), and the job ends with what that ended with.
     guest.send("sleep 100000 &\r")
     job = guest.capture(r"\[\d+\] (\d+)")
-    guest.run(f"kill -TERM {job}", f"killed pid {job}")
+    guest.send(f"kill -TERM {job}\r")
+    guest.capture(r"killed pid (\d+)")
+    guest.run(f"wait {job}; echo termed-$?", "termed-137")
 
     # Ctrl-Z on a kernel-linked app and a user program; `fg`, `bg` and `kill`.
     guest.send("sleep 100000\r")
@@ -3031,7 +3251,7 @@ def main():
         sys.exit(__doc__)
     arch, kernel = sys.argv[1:]
     only = os.environ.get("FEOS_BOOT_TEST_ONLY")
-    if only in ("milestone", "partition", "format", "install", "persistence", "gpu", "transport", "smp", "irq", "ram", "fault", "sched", "gicv3", "net", "usb", "efi", "el", "input", "user", "mmap", "threads", "time", "hosted", "jobs", "names", "settings", "terminal", "search", "resolution", "fonts", "native", "posix-fs"):
+    if only in ("milestone", "partition", "format", "install", "persistence", "gpu", "transport", "smp", "irq", "ram", "fault", "sched", "gicv3", "net", "usb", "efi", "el", "input", "user", "mmap", "threads", "time", "hosted", "jobs", "names", "settings", "terminal", "search", "resolution", "fonts", "native", "posix-fs", "posix-proc", "signals"):
         globals()[only.replace("-", "_") + "_test"](arch, kernel)
         print(f"{only} boot test passed: {arch}")
         return
@@ -3058,6 +3278,8 @@ def main():
     threads_test(arch, kernel)
     time_test(arch, kernel)
     posix_fs_test(arch, kernel)
+    posix_proc_test(arch, kernel)
+    signals_test(arch, kernel)
     hosted_test(arch, kernel)
     jobs_test(arch, kernel)
     names_test(arch, kernel)
@@ -3120,7 +3342,9 @@ def main():
     guest.run("jobs | tr a-z A-Z", "RUNNING")
     guest.run("kill -STOP %1; jobs | tr a-z A-Z", "STOPPED")
     guest.run("bg; jobs | tr a-z A-Z", "RUNNING")
-    guest.run("kill %1", f"killed pid {job}")
+    # `%1` signals what the job's task runs, its `sleep`, so the pid reported is that.
+    guest.send("kill %1\r")
+    guest.capture(r"killed pid (\d+)")
     guest.run("wait $!; echo waited-$?", "waited-137")
     guest.run("(sleep 10; exit 5) & wait $!; echo status-$?", "status-5")
     guest.run("sleep 20 & fg; echo fg-$?", "fg-0")

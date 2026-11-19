@@ -322,12 +322,70 @@ impl UserLimits {
     }
 }
 
+/// How many pids [`Table::take_pid`] looks at, once the counter has wrapped, before it
+/// gives up. A kernel whose [`PidHolds::maybe`] can only ever hold fewer buckets of pids
+/// than this, less what it and the table hold exactly, always finds one when any is free.
+pub const PID_TRIES: usize = 1 << 17;
+
+/// How many pids [`PidWindow`] covers: what's held is gathered once for each run of this
+/// many, so the work for one pid is a lookup, not a scan.
+pub const PID_WINDOW: usize = 4096;
+
+/// A run of [`PID_WINDOW`] pids from `start`, with the ones something holds marked.
+pub struct PidWindow {
+    start: u32,
+    bits: [u64; PID_WINDOW / 64],
+}
+
+impl PidWindow {
+    const fn new(start: u32) -> Self {
+        Self { start, bits: [0; PID_WINDOW / 64] }
+    }
+
+    /// Where `pid` is in the window, if it's in it.
+    fn offset(&self, pid: u32) -> Option<usize> {
+        let offset = pid.wrapping_sub(self.start) as usize;
+        (offset < PID_WINDOW).then_some(offset)
+    }
+
+    /// Marks `pid` as held, if it's in the window.
+    pub fn mark(&mut self, pid: u32) {
+        if let Some(offset) = self.offset(pid) {
+            self.bits[offset / 64] |= 1 << (offset % 64);
+        }
+    }
+
+    fn marked(&self, offset: usize) -> bool {
+        self.bits[offset / 64] & (1 << (offset % 64)) != 0
+    }
+}
+
+/// The pids the kernel holds besides live tasks' own: exits nobody has reaped,
+/// teardowns not yet done, and groups and sessions that still have members. Both run
+/// under whatever lock the table is behind, so they must neither wait nor allocate, and
+/// both are asked only once the pid counter has wrapped: before that, no pid is ever
+/// given twice.
+#[derive(Clone, Copy)]
+pub struct PidHolds {
+    /// Whether `pid` may be held, by a lookup: it can say so of a pid nobody holds, which
+    /// is then only skipped. Asked for each pid tried.
+    pub maybe: fn(u32) -> bool,
+    /// Marks, in the window, whatever the kernel holds that it has to scan for, with the
+    /// table's tasks to tell which slots are live. Asked once for each window.
+    pub mark: fn(&mut PidWindow, &[Task]),
+}
+
 /// The process table and accounting.
 pub struct Table<const TASKS: usize, const CPUS: usize> {
     tasks: [Task; TASKS],
     /// Slot running on each CPU plus one, or zero while that CPU is idle.
     current: [u16; CPUS],
     next_pid: u32,
+    /// The pid counter has come round past `u32::MAX` once: from then on a pid it gives
+    /// may still be in use, and is looked for before it's given.
+    wrapped: bool,
+    /// Pids the kernel holds besides live tasks': `None` holds none.
+    holds: Option<PidHolds>,
     online: usize,
     /// Timer ticks accounted since boot, summed over all CPUs.
     pub total_ticks: u64,
@@ -396,6 +454,8 @@ impl<const TASKS: usize, const CPUS: usize> Table<TASKS, CPUS> {
             tasks: [TASK; TASKS],
             current: [0; CPUS],
             next_pid: 0,
+            wrapped: false,
+            holds: None,
             online: 0,
             total_ticks: 0,
             idle_ticks: 0,
@@ -524,6 +584,74 @@ impl<const TASKS: usize, const CPUS: usize> Table<TASKS, CPUS> {
         self.current[0] = 1;
         self.next_pid = 2;
         self.online = 1;
+    }
+
+    /// Says which pids the kernel holds besides live tasks' own, so that none is given to
+    /// a new task until it's let go: a child's pid stays its own until its parent has
+    /// reaped it (or no longer can), and a group's until it has no members.
+    pub fn set_pid_holds(&mut self, holds: PidHolds) {
+        self.holds = Some(holds);
+    }
+
+    /// Where the pid counter goes on from, for tests that wrap it without four billion
+    /// spawns first. Below 2 it's 2: pid 1 is the boot task's.
+    pub fn set_next_pid(&mut self, pid: u32) {
+        self.next_pid = pid.max(2);
+    }
+
+    /// Where the pid counter is, and whether it has wrapped.
+    pub const fn pid_counter(&self) -> (u32, bool) {
+        (self.next_pid, self.wrapped)
+    }
+
+    /// Puts the pid counter at `pid`, wrapped or not: for a self-test of the kernel's
+    /// holds, which are only asked once it has. Back where [`pid_counter`] had it, unwrapped,
+    /// it can't give a pid twice: none it gave meanwhile is above that.
+    ///
+    /// [`pid_counter`]: Self::pid_counter
+    pub fn set_pid_counter(&mut self, pid: u32, wrapped: bool) {
+        self.next_pid = pid.max(2);
+        self.wrapped = wrapped;
+    }
+
+    /// The counter's value, moving it on past the top to 2.
+    fn advance(&mut self) -> u32 {
+        let pid = self.next_pid;
+        let next = pid.wrapping_add(1);
+        if next < 2 {
+            self.wrapped = true;
+        }
+        self.next_pid = next.max(2);
+        pid
+    }
+
+    /// The next pid nobody has, from the counter: before it has wrapped, simply its
+    /// value; after, the first value from there on that no live task is, or is the
+    /// process of, and the kernel doesn't hold. `None` if [`PID_TRIES`] pids are all
+    /// held. This runs under the scheduler's lock, so its work is bounded: what's held is
+    /// gathered by one scan for each [`PID_WINDOW`] pids, and each pid is then a lookup.
+    fn take_pid(&mut self) -> Option<u32> {
+        if !self.wrapped {
+            return Some(self.advance());
+        }
+        for _ in 0..PID_TRIES / PID_WINDOW {
+            let mut window = PidWindow::new(self.next_pid);
+            for task in self.tasks.iter().filter(|task| task.state != State::Free) {
+                window.mark(task.pid);
+                window.mark(task.tgid);
+            }
+            if let Some(holds) = self.holds {
+                (holds.mark)(&mut window, &self.tasks);
+            }
+            // Past the top, 0 and 1 are skipped, so a window may end a little short.
+            while let Some(offset) = window.offset(self.next_pid) {
+                let pid = self.advance();
+                if !window.marked(offset) && !self.holds.is_some_and(|holds| (holds.maybe)(pid)) {
+                    return Some(pid);
+                }
+            }
+        }
+        None
     }
 
     /// Records one more CPU joining the scheduler.
@@ -727,13 +855,12 @@ impl<const TASKS: usize, const CPUS: usize> Table<TASKS, CPUS> {
             return None;
         }
         let slot = (1..TASKS).find(|&slot| self.tasks[slot].state == State::Free)?;
+        let pid = self.take_pid()?;
         // A slot that left and wasn't forgotten stops being its old process's.
         if self.left.contains(slot) {
             self.leave_group(slot);
         }
-        let pid = self.next_pid;
         let home = self.least_loaded();
-        self.next_pid = self.next_pid.wrapping_add(1).max(2);
         self.tasks[slot] = Task {
             state: State::Spawning,
             pid,
@@ -1064,6 +1191,16 @@ impl<const TASKS: usize, const CPUS: usize> Table<TASKS, CPUS> {
             }
         }
         woken
+    }
+
+    /// Wakes the one task in `slot` if it's blocked, whatever for, as a signal does a
+    /// thread it has to interrupt: waits may always wake spuriously. Whether it was.
+    pub fn wake_slot(&mut self, slot: usize) -> bool {
+        if slot >= TASKS || self.tasks[slot].state != State::Blocked {
+            return false;
+        }
+        self.make_ready(slot);
+        true
     }
 
     /// Wakes up to `count` tasks blocked on `key` and returns how many woke. Never a
@@ -1452,6 +1589,117 @@ mod tests {
         assert_eq!(table.reserve(), None);
     }
 
+    /// The pids [`pid_not_reused_while_held`] holds, as a kernel's exit records would.
+    static HELD: [core::sync::atomic::AtomicU32; 2] = [const { core::sync::atomic::AtomicU32::new(0) }; 2];
+
+    fn held(pid: u32) -> bool {
+        HELD.iter().any(|held| held.load(core::sync::atomic::Ordering::Relaxed) == pid)
+    }
+
+    const HOLDS: PidHolds = PidHolds { maybe: held, mark: |_, _| {} };
+
+    #[test]
+    fn pid_not_reused_while_held() {
+        use core::sync::atomic::Ordering;
+        let mut wrapping = table();
+        wrapping.set_pid_holds(HOLDS);
+        let facts = Facts::default();
+        // A child that has ended and isn't reaped: its pid is held, though its slot is free.
+        let (zombie_slot, zombie) = spawn(&mut wrapping);
+        HELD[0].store(zombie, Ordering::Relaxed);
+        wrapping.tasks[zombie_slot].kill_pending = true;
+        wrapping.reap(zombie_slot, &facts);
+        wrapping.forget_left(zombie_slot);
+        // A task still running, whose pid is taken anyway.
+        let (_, running) = spawn(&mut wrapping);
+        // Round the counter goes, past `u32::MAX` and back to the bottom.
+        wrapping.set_next_pid(u32::MAX - 1);
+        let mut given = Vec::new();
+        for _ in 0..2 {
+            let (slot, pid) = wrapping.reserve().expect("a slot");
+            given.push(pid);
+            wrapping.cancel(slot);
+        }
+        assert_eq!(given, [u32::MAX - 1, u32::MAX]);
+        // Past the top it starts from 2 again, and skips what's held or live.
+        let mut after = Vec::new();
+        for _ in 0..4 {
+            let (slot, pid) = wrapping.reserve().expect("a slot");
+            after.push(pid);
+            wrapping.cancel(slot);
+        }
+        assert!(!after.contains(&zombie) && !after.contains(&running), "{after:?}");
+        assert!(!after.contains(&0) && !after.contains(&1), "{after:?}");
+        assert_eq!(after, [4, 5, 6, 7], "2 and 3 are held");
+        // Once reaped, its pid can come round again.
+        HELD[0].store(0, Ordering::Relaxed);
+        wrapping.set_next_pid(2);
+        let (slot, pid) = wrapping.reserve().expect("a slot");
+        assert_eq!(pid, zombie);
+        wrapping.cancel(slot);
+        // Before the counter wraps nothing is looked for: a pid is never given twice then.
+        let mut fresh = self::table();
+        fresh.set_pid_holds(PidHolds {
+            maybe: |_| panic!("asked before the counter wrapped"),
+            mark: |_, _| panic!("asked before the counter wrapped"),
+        });
+        assert!(fresh.reserve().is_some());
+    }
+
+    /// A group the kernel holds by scanning, as a live group whose leader has gone.
+    static GROUP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+    #[test]
+    fn pid_not_reused_while_marked() {
+        use core::sync::atomic::Ordering;
+        let mut wrapping = table();
+        // The whole first window is held by lookup, and the first pid of the second by a
+        // scan, which has to be made again for that window to see it.
+        wrapping.set_pid_holds(PidHolds {
+            maybe: |pid| pid < 2 + PID_WINDOW as u32,
+            mark: |window, tasks| {
+                assert!(tasks.iter().any(|task| task.state != State::Free), "the table's tasks");
+                window.mark(GROUP.load(Ordering::Relaxed));
+            },
+        });
+        wrapping.set_next_pid(u32::MAX);
+        let (slot, pid) = wrapping.reserve().expect("a slot");
+        assert_eq!(pid, u32::MAX);
+        wrapping.cancel(slot);
+        GROUP.store(2 + PID_WINDOW as u32, Ordering::Relaxed);
+        let (slot, pid) = wrapping.reserve().expect("a slot");
+        assert_eq!(pid, 3 + PID_WINDOW as u32);
+        wrapping.cancel(slot);
+        // Let go, it can be given.
+        GROUP.store(0, Ordering::Relaxed);
+        wrapping.set_next_pid(2 + PID_WINDOW as u32);
+        assert_eq!(wrapping.reserve().map(|(_, pid)| pid), Some(2 + PID_WINDOW as u32));
+    }
+
+    #[test]
+    fn pid_search_is_bounded() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        static ASKED: AtomicUsize = AtomicUsize::new(0);
+        static MARKED: AtomicUsize = AtomicUsize::new(0);
+        let mut wrapping = table();
+        wrapping.set_pid_holds(PidHolds {
+            maybe: |_| {
+                ASKED.fetch_add(1, Ordering::Relaxed);
+                true
+            },
+            mark: |_, _| {
+                MARKED.fetch_add(1, Ordering::Relaxed);
+            },
+        });
+        wrapping.set_next_pid(u32::MAX);
+        let (slot, _) = wrapping.reserve().expect("a slot");
+        wrapping.cancel(slot);
+        // Every pid held: the search gives up after its tries, scanning once per window.
+        assert_eq!(wrapping.reserve(), None);
+        assert!(ASKED.load(Ordering::Relaxed) <= PID_TRIES, "{}", ASKED.load(Ordering::Relaxed));
+        assert_eq!(MARKED.load(Ordering::Relaxed), PID_TRIES / PID_WINDOW);
+    }
+
     #[test]
     fn a_reserved_slot_is_not_runnable_until_committed() {
         let mut table = table();
@@ -1713,6 +1961,27 @@ mod tests {
         assert_eq!(table.wake_key(0xc, 1), 0);
         assert_eq!(table.wake_key(0xb, 1), 1);
         assert_eq!(state(&table, first), State::Blocked);
+        assert_eq!(state(&table, second), State::Ready);
+    }
+
+    #[test]
+    fn a_slot_wake_reaches_any_wait_of_that_slot_only() {
+        let mut table = table();
+        let facts = Facts::default();
+        let (first, _) = spawn(&mut table);
+        let (second, _) = spawn(&mut table);
+        let key = UserKey { space: 0x2000, offset: 0x40 };
+        block_with(&mut table, &facts, first, Request::WaitUser(key), 0);
+        block_with(&mut table, &facts, second, Request::Sleep(1000), 0);
+        assert_eq!(state(&table, first), State::Blocked);
+        assert_eq!(state(&table, second), State::Blocked);
+        assert!(table.wake_slot(first));
+        assert_eq!(state(&table, first), State::Ready);
+        assert_eq!(state(&table, second), State::Blocked);
+        // Not blocked any more, or never a task: nothing to do.
+        assert!(!table.wake_slot(first));
+        assert!(!table.wake_slot(usize::MAX));
+        assert!(table.wake_slot(second));
         assert_eq!(state(&table, second), State::Ready);
     }
 

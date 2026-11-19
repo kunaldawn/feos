@@ -260,9 +260,12 @@ fn test_pipes(report: &mut Report, program: &str) {
     match pipe() {
         Ok((reader, writer)) => {
             close(reader);
+            // `SIGPIPE` would end the program (stage 1c.9): ignored, the write says `EPIPE`.
+            feos_user::signal::set_disposition(feos_user::abi::sig::PIPE, feos_user::abi::sa::IGN);
             let small = write(writer, b"lost");
             let large = [0u8; 8192];
             let big = write(writer, &large);
+            feos_user::signal::set_disposition(feos_user::abi::sig::PIPE, feos_user::abi::sa::DFL);
             report.check("pipe-epipe", small == -errno::EPIPE && big == -errno::EPIPE, format_args!("{small} {big}"));
             close(writer);
         }

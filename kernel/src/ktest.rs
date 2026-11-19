@@ -948,6 +948,133 @@ fn test_thread_fault() -> i32 {
     i32::from(!good)
 }
 
+/// A line a program wrote to `reader`, waiting up to `ms` for it.
+fn read_line<'a>(reader: &feos_app::pipe::PipeReader, line: &'a mut [u8; 64], ms: u64) -> &'a str {
+    let mut length = 0;
+    let mut byte = [0u8; 1];
+    for _ in 0..ms {
+        loop {
+            match reader.try_read(&mut byte) {
+                feos_app::pipe::Transfer::Moved(_) if byte[0] == b'\n' => {
+                    return core::str::from_utf8(&line[..length]).unwrap_or("");
+                }
+                feos_app::pipe::Transfer::Moved(_) => {
+                    if length < line.len() {
+                        line[length] = byte[0];
+                        length += 1;
+                    }
+                }
+                feos_app::pipe::Transfer::Closed => return core::str::from_utf8(&line[..length]).unwrap_or(""),
+                feos_app::pipe::Transfer::WouldBlock => break,
+            }
+        }
+        sched::sleep_ms(1);
+    }
+    core::str::from_utf8(&line[..length]).unwrap_or("")
+}
+
+/// Exit records (stage 1c.8). A thread refused its kernel stack leaves its process's
+/// record in no slot, for the next task there to take as its own. And once the pid
+/// counter has wrapped, which `ptest` can't wait for, an unreaped child's pid and the
+/// pid of a group whose leader has gone but which still has a member are given to
+/// nothing new until they're let go.
+fn test_records() -> i32 {
+    let processes = &sched::PROCESSES;
+    let mut failed = 0;
+    let mut verdict = |name: &str, good: bool, detail: core::fmt::Arguments<'_>| {
+        println!("[ktest] records {name}: {} ({detail})", if good { "ok" } else { "FAILED" });
+        failed += usize::from(!good);
+    };
+
+    // The refused thread's process is a user program's child, so it has a record; the
+    // programs after it are the kernel's, with none, in whatever slots are free.
+    let before = baseline();
+    sched::fail_next_thread_stack(true);
+    let status = spawn_program(&["/bin/ptest", "--refused-thread-parent"], None).and_then(|pid| processes.wait(pid));
+    let armed = sched::fail_next_thread_stack(false);
+    let stray = sched::stray_records();
+    let mut others = 0;
+    for _ in 0..8 {
+        let pid = spawn_program(&["/bin/hello", "--quiet"], None);
+        others += usize::from(pid.and_then(|pid| processes.wait(pid)) == Some(0));
+    }
+    let stray_after = sched::stray_records();
+    let whole = back_to(before, "records");
+    verdict(
+        "refused-thread",
+        status == Some(0) && !armed && stray == 0 && stray_after == 0 && others == 8 && whole,
+        format_args!("status {status:?}, still armed {armed}, stray records {stray} then {stray_after}, others {others}/8"),
+    );
+
+    // An unreaped child and a group with a member but no leader, from a program that
+    // says their pids and reaps the child when told.
+    let (Some((in_reader, in_writer)), Some((out_reader, out_writer))) = (feos_app::pipe::create(), feos_app::pipe::create()) else {
+        println!("[ktest] records: no pipe");
+        return 1;
+    };
+    let mut block = feos_app::ArgBlock::new();
+    let _ = block.push_all(&["/bin/ptest", "--hold-pids"]);
+    let io = SpawnIo { stdin: Some(&in_reader), stdout: Some(&out_writer), ..SpawnIo::default() };
+    let holder = sched::spawn_user("/bin/ptest", block, "/", io, sched::RawStreams::default()).ok();
+    drop(in_reader);
+    drop(out_writer);
+    let mut line = [0u8; 64];
+    let said = read_line(&out_reader, &mut line, 5000);
+    let mut words = said.strip_prefix("hold ").unwrap_or("").split(' ').map(|word| word.parse::<u32>().ok());
+    let (Some(Some(zombie)), Some(Some(leader))) = (words.next(), words.next()) else {
+        println!("[ktest] records: --hold-pids said {said:?}");
+        drop(in_writer);
+        let _ = holder.map(|pid| processes.wait(pid));
+        return 1;
+    };
+    // What a program is given with the counter at `at`, wrapped: the first pid from there
+    // that nothing holds.
+    let given = |at: u32| {
+        sched::swap_pid_counter(at, true);
+        let pid = spawn_program(&["/bin/hello", "--quiet"], None)?;
+        processes.wait(pid);
+        Some(pid)
+    };
+    // What may take a moment to be let go (a record drops as its last reference does, a
+    // member ends as it reads its input's end) is asked for again until it is.
+    let given_soon = |at: u32| {
+        let mut pid = None;
+        for _ in 0..200 {
+            pid = given(at);
+            if pid == Some(at) {
+                break;
+            }
+            sched::sleep_ms(10);
+        }
+        pid
+    };
+    let saved = sched::swap_pid_counter(zombie, true);
+    let past_zombie = given(zombie);
+    let past_leader = given(leader);
+    let _ = in_writer.write(b"x");
+    let reaped = read_line(&out_reader, &mut line, 5000) == "reaped true";
+    let zombie_again = given_soon(zombie);
+    drop(in_writer);
+    let holder_status = holder.and_then(|pid| processes.wait(pid));
+    let leader_again = given_soon(leader);
+    // Back where it was, unwrapped: every pid given meanwhile is below it.
+    sched::swap_pid_counter(saved.0, saved.1);
+    verdict(
+        "pid-held-after-wrap",
+        past_zombie.is_some_and(|pid| pid != zombie && pid != leader)
+            && past_leader.is_some_and(|pid| pid != zombie && pid != leader)
+            && reaped
+            && zombie_again == Some(zombie)
+            && holder_status == Some(0)
+            && leader_again == Some(leader),
+        format_args!(
+            "zombie {zombie}: past it {past_zombie:?}, reaped {reaped}, then {zombie_again:?}; group {leader}: past it {past_leader:?}, then {leader_again:?}; holder {holder_status:?}"
+        ),
+    );
+    println!("[ktest] records: ok={}", failed == 0);
+    i32::from(failed != 0)
+}
+
 /// Spawns a program blocking on a pipe over and over, while a kernel task tries to
 /// kill each one by the PID it's about to get. Says how many ended killed, how many of
 /// the kills landed before the spawn had returned, and how many went otherwise.
@@ -1815,6 +1942,7 @@ impl App for KernelTest {
             "ukill" => test_ukill(),
             "setlkw-killed" => test_setlkw_killed(),
             "thread-fault" => test_thread_fault(),
+            "records" => test_records(),
             "teardown" => test_teardown(),
             "kstack-kill" => test_kstack_kill(),
             kstack if kstack.starts_with("kstack") => {

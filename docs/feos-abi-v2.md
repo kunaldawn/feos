@@ -4221,7 +4221,8 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
     `set_times_file`, whose `allow` closure checks the owner on the file's facts under the
     lock (a directory or a link too). The kernel's own checks beforehand stay, for the
     order of POSIX's errors. Not yet so: `MKDIRAT`, `OPENAT`'s `O_CREAT` and the v1 calls,
-    which still give a new file to its maker, and set its mode, by its path afterwards.
+    which still give a new file to its maker, and set its mode, by its path afterwards
+    (closed in 1c.7: see there).
   - `RENAME_NOREPLACE` is `EEXIST` for a name onto itself too, as Linux checks it before
     its same-name shortcut. On FAT and exFAT, if the new file can't take a kept orphan's
     name (only an I/O error can do that, the name's entries being the same size), the
@@ -4355,9 +4356,101 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
   (`E2BIG`/`EFAULT`, never a kernel fault), `spawn2-concurrent-1mib` (64 threads spawning
   with 1 MiB of arguments at once: success or `ENOMEM`, the kernel heap untouched),
   `children-cap` (1025 unreaped children: `EAGAIN`), `spawn-storm` (spawn until `EAGAIN`;
-  every slot and frame comes back).
+  every slot and frame comes back: the storm runs twice in one child, the second as far
+  as the first, then the frames are counted).
 - **Boot:** new phase `posix-proc` (both ports, smp=1 and 4), `user`, `jobs` (the shell's
   job control still works).
+- **As built (deviations):**
+  - Staging is `load::Staged` (`kernel/src/user/load.rs`): frames from the allocator,
+    promised first and given back as each is had, holding the strings end to end with
+    their NULs. `SPAWN2` first copies the `UserStr` arrays whole into staging frames of
+    their own and checks every length from that copy, then copies each string by it, so
+    nothing is read twice. The staging frames are *copied* into the child's argument area
+    as it builds its stack, and freed then, not mapped as the argument area: the area is
+    an ordinary `MAP_NORESERVE` mapping as before. While the caller's call holds them they
+    count against its page limit (`USER_MEMORY_LIMIT`, as `feos_vm::Mm::hold`, a count
+    beside its charged, owned and table pages), so its threads spawning at once can't hold
+    more than it could map; the charge ends as the call returns, since it keeps the
+    caller's space, and from then until the child has copied them they're the child's,
+    which every task slot bounds. The only heap a spawn takes is the frames' list (8 bytes
+    a frame) and the action array, charged to the caller's heap budget for as long as the
+    call keeps them. A kernel app's spawn stages the same way, with kills held off from
+    the first frame until its task has them (frames aren't counted as a kernel app's, so
+    a reap in between would lose them); too much is `ArgsTooLong` there (the `ARG_MAX`
+    rule), and a string with a NUL in it is cut there, as `ArgBlock` cuts arguments.
+  - The program is resolved in the call against the child's table and working directory
+    after the actions (a `path.dirfd` is looked up in the child's table, as are the
+    actions' `dirfd`s), and held by its cache entry (`load::Image`) before it's checked;
+    the child reads it again by identity, not by path. A file the cache can't hold isn't
+    run (`ENOMEM`, or `EACCES` for one its filesystem won't keep), from `SPAWN2` or when a
+    v1 or kernel-app child resolves its own (126). `SPAWN_EMPTY_PATH` takes a regular
+    file's descriptor (`EBADF` if it isn't open in the child's table, `EACCES` if it isn't
+    a file) and runs the file it holds, by identity: execute permission is that file's
+    own, with no search of the path, as `fexecve`, and the description's path is only
+    what `AT_FEOS_EXE` and `CURRENT_EXE` say, so a rename over it or an unlink since it
+    was opened changes nothing (ptest's `spawn2-empty-path-identity`). A `#!`
+    file is `ENOEXEC` until 1c.7. `SPAWN_SETPGROUP` with `SPAWN_SETSID` is `EINVAL` (a new
+    session's leader can't then join a group, which is how glibc's child would fail).
+    `pgroup` outside `0..=i32::MAX` is `EINVAL`. An `OPEN` action of `/proc/self/fd/N`
+    that leads to a pipe reaches the caller's descriptor `N`, not the child's. Closing
+    descriptors in the child's table (the actions and the close-on-exec sweep) drops none
+    of the caller's record locks.
+  - v1's `SPAWN` keeps its own path: the arguments copied as before (32, UTF-8, `ENAMETOOLONG`),
+    the child's table its standard streams, and the program resolved by the child, so a
+    missing one ends with 127. It shares the staging, the exit record (`EBUSY` at the
+    children cap, as for a full table) and the System V stack. A program is started by
+    `sched::spawn_program`, with the group and signal mask in `RawStreams`; kernel apps
+    use `spawn_user_env`, and `Processes::spawn_user` gained the `env` argument, which
+    feos-sh fills from its exported variables (`Host::run_program` gained it too).
+  - Process groups and sessions are per-slot atomics in `sched` (`SLOT_PGID`, `SLOT_SID`),
+    copied to new threads and changed for every thread of a process at once, under the
+    scheduler's lock. A task started by a kernel app has its own group in session 1, the
+    shell's (pid 1, group 1); only programs' groups count as existing groups for
+    `SETPGID` and `SETPGROUP`. `SETPGID`'s `EACCES` after an `EXEC` is 1c.7's. A child in
+    another session is `EPERM`, as on Linux; one that isn't the caller's child `ESRCH`.
+    `GETPGID`/`GETSID` of a negative pid is `ESRCH`.
+  - `SETSIGMASK` is kept per thread (`sched::SIGNAL_MASK`, inherited by threads and
+    spawned programs), with `SIGKILL` and `SIGSTOP` taken out; `SETSIGDEF` is accepted and
+    has nothing to reset, since there are no dispositions before 1c.9.
+  - Exit records, until 1c.8 fills them, are each child's pid in its parent's `Process`
+    (`children`, taken before the child is made, so at most `MAX_CHILDREN` (1024, in
+    `feos-abi`) unreaped). One goes when v1's `WAIT` returns for that pid, with a status
+    or with `ECHILD` because v1's 64-entry ring no longer has it, and all of them with the
+    parent. v1's `WAIT` of pid 0, or of one past 32 bits, is `ECHILD` with no record
+    touched: 0 is a record still being made (`children-cap` checks the cap with another
+    thread waiting for both throughout). Pids come from a 32-bit counter and aren't reused until it wraps; `GETPPID`
+    says 1 once no task has the parent's pid.
+  - The aux vector has no `AT_BASE` (static programs only). `AT_PHDR` is from `PT_PHDR`
+    or the `PT_LOAD` covering `e_phoff` (`feos_elf::Program::headers`), and 0 when no
+    segment loads the headers rather than `ENOEXEC`, which waits for 1f.1, when programs
+    that need it arrive; `user/link.ld` now loads the ELF and program headers at the
+    start of the read-only segment, with a `PT_PHDR`. `AT_MINSIGSTKSZ` is 2048 until 1c.9
+    builds frames. `AT_RANDOM`'s bytes are mixed from the clock and the pid, and
+    `AT_FEOS_FLAGS` bit 0 is clear, until 1e.1. `AT_HWCAP`/`AT_HWCAP2` come from a new
+    `Arch::user_hwcaps` on both ports. `user/`'s `_start` passes the first stack pointer
+    on as a third argument, for `environment()`, `getenv`, `c_arg` and `auxv()`.
+  - `GETRUSAGE`: all CPU time is `utime` and `stime` is 0, since the scheduler accounts a
+    task's ticks without telling its program's from its calls'; `minflt` counts the faults
+    a space resolved, `majflt`, `nvcsw` and `nivcsw` are 0, and `maxrss` is the most pages
+    the space has had frames for, as seen at each fault and each call. `RUSAGE_THREAD`
+    takes the thread's time and the process's memory. `SYSINFO`'s `cpus_configured` is the
+    CPUs online, `release` the workspace version, and only `SYSINFO_NO_RTC` is ever set.
+  - The feature mask is `feos_abi::FEATURES`, bits 0 to 16. New errnos `ESRCH` 3 and
+    `E2BIG` 7; `IMPLEMENTED_LATER` lists the eight calls past `FIRST_UNIMPLEMENTED` (70).
+  - `spawn2-env-from-shell` is `ptest` finding `FOO=bar` in its own environment: the boot
+    test always runs it as `FOO=bar /bin/ptest`, and runs `/bin/ptest --env` with a
+    command assignment, an export and an `unset` besides. `ptest`'s children are itself in
+    a mode (`--echo`, `--fd-state`, `--ids`, `--exe` and the rest). `spawn2-setpgroup` also
+    joins a second child to the first's group and moves a third with `SETPGID`;
+    `spawn2-1mib-args` also checks one byte more is `E2BIG`; `auxv-present` checks
+    `AT_PHDR` against `__ehdr_start`. The malicious probes `children-cap`, `spawn-storm`
+    and `spawn2-concurrent-1mib` run in children (`--children-cap`, which also checks v1's
+    `EBUSY` at the cap and room again after a reap; `--spawn-storm`, twice; and
+    `--concurrent-1mib`), with frames checked when driven; `posix-proc` runs the storm once
+    more with the frames checked. "The kernel heap untouched" holds by construction.
+  - `make test-sh`'s `exported_variables_reach_the_spawn_request`; `make test-abi` adds the
+    layouts, the glibc values and the feature mask; `make test-fdtable` adds `put` and
+    `try_clone`; `make test-elf` adds `headers_are_found_where_they_load`.
 
 ### 1c.7 `EXEC` and scripts
 
@@ -4380,6 +4473,85 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
   `exec-two-threads-at-once` (one exec wins; the process is consistent),
   `toctou-exec-lengths`.
 - **Boot:** `posix-proc`, `user`.
+- **As built (deviations):**
+  - `EXEC` is in `kernel/src/user/proc.rs`, beside `SPAWN2`, whose checks it shares: the
+    request copied once, the strings staged once (`load::Staged`, charged to the caller as
+    a spawn's are), and the program resolved against the caller's own table and working
+    directory and held by identity (`SPAWN_EMPTY_PATH` as for `SPAWN2`). It then builds the
+    whole new image, segments, argument area and the System V stack, in a fresh space that
+    isn't the process's yet (`load::build_image`, which a new program's task uses too),
+    *before* its point of no return, so `ENOMEM`, `ETXTBSY`, `ENOEXEC` and `EIO` are all
+    the call's errors and nothing past that point can fail: the "ends by `SIGSEGV`" case
+    never arises. Past it: the creation lock, every other thread killed through the
+    cooperative path and waited for until it has left the table (`sched::end_other_threads`,
+    on the teardown sequence), the thread's tables switched to the new space
+    (`sched::switch_space`), and the space and program path put in place of the old in the
+    same `Process` (`Process::replace_image`). A new `Process` would have been wrong: its
+    pid's record locks and standard-stream pipes are the `Process`'s, and its drop gives
+    them up. Then close-on-exec descriptors close one at a time, each with the process's
+    record locks on its file (`lock_calls::descriptor_closed`), so nothing is allocated
+    past the point of no return; the old space goes (its surface with it) in the call, in
+    task context; and the thread goes to the new program from the call through
+    `sched::enter_user`. The caller is killed meanwhile only when its whole process is,
+    and then it unwinds as any killed call does.
+  - The creation lock is taken through `Process::creating`, which gives up when the
+    caller is being killed: a sibling waiting for it in `THREAD_CREATE` or another `EXEC`
+    would otherwise keep the exec waiting for that sibling for ever. Of two threads
+    calling `EXEC` at once, the first to have the lock wins and the other is killed.
+  - Dispositions and the alternate stack don't exist before 1c.9, so there's nothing to
+    reset. The thread pointer is zeroed and the floating point state is a new program's
+    (`Frame::new_user`). The thread's clear word is forgotten without being written, as
+    Linux's `exec` only writes it when another thread still shares the space. `ps` shows
+    the new program's name and arguments. `SETPGID` of a child that has run `EXEC` is
+    `EACCES` (`Task::execed` in `sched`, the same in each thread of a process).
+  - Scripts: `feos_elf::shebang` reads the first line. Spaces and tabs after `#!` and at
+    the line's end are dropped; the interpreter runs to the first space or tab, and the
+    rest of the line, inner blanks and all, is the one argument (Linux's rule). A carriage
+    return is kept, as Linux keeps it. A NUL in the line, an interpreter that isn't UTF-8
+    or isn't absolute, or no newline within 255 bytes is `ENOEXEC`, except that a file
+    shorter than that with no newline ends its line at its end, as on Linux. The path put
+    after the argument is the absolute path the program was asked by (joined to the
+    working directory or `dirfd`, not made canonical; for `SPAWN_EMPTY_PATH` the
+    description's path), and for an interpreter that is itself a script, that
+    interpreter's path. Each interpreter is resolved by its path, with execute permission
+    (`EACCES`), and missing is `ENOENT`. Four scripts deep is the most (`MAX_SCRIPT_DEPTH`):
+    a fifth `#!` is `ELOOP`. `CURRENT_EXE`, `AT_FEOS_EXE` and the task's name are the
+    script's, `AT_EXECFN` the path as given. Scripts run from `SPAWN2`, `EXEC`, v1's
+    `SPAWN` and kernel apps alike (the strings in front of the rest by
+    `Staged::with_heads`, within `ARG_MAX`: `E2BIG`); `feos-sh` now hands a `#!` file whose
+    interpreter isn't a shell to the kernel to run, where it said "bad interpreter".
+  - The race 1c.4 left (`MKDIRAT`, `OPENAT`'s `O_CREAT` and v1's `MKDIR` and `OPEN` with
+    `CREATE` giving a new file its owner and mode by its path afterwards) is closed by
+    `VfsTree::create_file_as` and `create_dir_as`, which take a `feos_fs::vfs::Caller`:
+    the new name's directory is judged (write and search, `.feos-orphans` refused), the
+    entry made, and its owner and mode set in one step under the tree's lock, on what the
+    walk reached; `create_file_as` returns what it made, and `OPENAT` opens that by
+    identity rather than looking the path up again (which a swap could also have led to
+    another file). v1's `MKDIR` keeps the filesystem's mode. `SPAWN2`'s `OPEN` action goes
+    the same way. `make test-fs` adds `creations_are_judged_and_owned_in_one_step`; the
+    malicious probe `tree-swap-create` has a user-1000 child create files and directories
+    by all four calls in its own directory while a thread swaps it for a link to root's,
+    where root has entries of the same names, and finds root's directory holding only
+    those, each still root's with its mode. Still open, found by that probe: `UNLINKAT`
+    and v1's `UNLINK` judge a removal (`check_remove`) on the canonical path and then
+    remove by that path again, so a directory on it swapped for a link in between can
+    have one of root's names taken away. The probe removes what it made only with the
+    swapper paused; a removal judged under the tree's lock (a `remove_as` taking the
+    `Caller` and the orphaning question, as `rename_replacing` does) is left for a later
+    stage.
+  - Tests as listed, plus: `ptest`'s `spawn2-script` (a script started by `SPAWN2`) and
+    `setpgid-after-exec-eacces`, and `posix-proc` runs a `#!/bin/ptest --script` file from
+    the shell. `exec-replaces` runs a copy of `ptest` at `/tmp/ptest-exec`, so the paths
+    change; `exec-script-arg` runs a script whose interpreter is a script and whose
+    argument has a space in it; `exec-error-returns` covers `ENOENT`, `ENOEXEC`, `EACCES`
+    (a directory, and a mode 0644 file in `/tmp`, which root can't run either) and `argc` 0. The probes that may
+    succeed run in children, which the exec replaces: `exec-then-fault`,
+    `exec-two-threads-at-once` (the winner checks its pid, a thread of its own and its
+    path), and `toctou-exec-lengths` (a thread flipping an argument's `UserStr` between
+    fine, too long and in the kernel: every refusal `E2BIG` or `EFAULT`, until one runs).
+    `make test-elf` has `shebang_*` and `shebang_fuzz_random_first_lines`, `make test-sh`
+    `scripts_for_other_interpreters_are_programs`, `make test-abi` the `ExecRequest` layout.
+    `FEATURES` gains bit 17; `IMPLEMENTED_LATER` gains `EXEC`. No new errno.
 
 ### 1c.8 `WAIT4`, exit records, `KILL` with default actions, stops
 
@@ -4396,20 +4568,155 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
   `user/src/bin/ptest.rs`.
 - **Host tests:** `make test-signal`: `default_action_table`, `status_encoding_roundtrip`
   (exit, signal, stop, continue), `v1_status_is_128_plus`; `make test-sched`:
-  `pid_not_reused_while_held`.
+  `pid_not_reused_while_held`, `pid_not_reused_while_marked`, `pid_search_is_bounded`;
+  `make test-sh`: `kill_sends_a_jobs_signal_to_what_it_runs`.
 - **User checks:** `wait4-any`, `wait4-wnohang`, `wait4-pgroup`, `wait4-status-exit`,
   `wait4-status-signal`, `wait4-rusage`, `wait4-echild`, `wait4-wuntraced` (`0x137f` for
   `SIGSTOP`), `wait4-wcontinued` (`0xffff`), `getrusage-children`, `kill-term`,
   `kill-zero-checks`, `kill-pgroup`, `kill-stop-cont`, `kill-unreaped-child-ok`,
   `kill-tid-esrch`, `stop-mid-call-no-lockup` (a child stopped during a 64 MiB file write;
   another process writes the same mount meanwhile), `pid-not-reused-while-unreaped`
-  (2000 children spawned and reaped while one stays a zombie: its pid never comes back),
-  `orphan-runs-on`.
+  (2000 children spawned and reaped while one stays a zombie: its pid never comes back;
+  before the counter wraps none could, so this only guards against pids going round early,
+  and `ktest records` checks the holds themselves), `orphan-runs-on`.
 - **Malicious:** `kill-shell` (`EPERM`), `kill-other-user` (`EPERM`, via `runas`),
   `kill-pid-upper-bits` (`EINVAL`), `wait4-bad-options` (`EINVAL`), `zombie-flood` (1024
   unreaped children, then `EAGAIN`; when the parent exits everything is freed).
 - **Boot:** `posix-proc`, `user`, `jobs`, `terminal` (Ctrl-C ends a user program, through
   the shell's `SIGINT`).
+- **As built (deviations):**
+  - Exit records are `ChildRecord`s (`kernel/src/user/children.rs`), each a `TryArc` taken in
+    the parent before the child exists (`Process::reserve_child`, at most `MAX_CHILDREN`,
+    and listed there at once with pid 0 until the scheduler commits the child's task and
+    fills the pid in). Three references hold one: the parent's list until it reaps the record
+    or ends; the child's `Process`, which adds its memory use and its own reaped children's
+    as it goes; and one for the child's thread group in the scheduler, which every thread's
+    slot points at without counting (`sched::RECORD`). Each thread's CPU ticks are added as
+    it's collected, and the last thread's exit fills the status in (`record_exit`, under the
+    scheduler's lock, allocating nothing) and gives the group's reference up onto a lock-free
+    list the reaper drops in task context, since nothing may be freed under that lock
+    (`TryArc` gained `into_raw`, `from_raw` and `clone_raw` for this). A record is reaped only
+    once no teardown of its process is under way (`sched::settled`), so a `WAIT4` that
+    returns means its frames and pipes are free, as v1's `WAIT` always did. v1's ring of 64
+    recent exits stays, for kernel apps' waits (the shell's) and `Processes::wait`.
+  - "Pids held until reaped": the pid counter is 32 bits and never gives a pid twice before
+    it wraps; from then on `feos-sched`'s table skips any pid a live task has (as tid or
+    tgid) or the kernel holds (`Table::set_pid_holds`, a `PidHolds`), as 3.2 has it. By
+    lookup: a pid in one of 65536 buckets that some live record's pid, or its group's, falls
+    in (`children::held`, a count per bucket kept by the records themselves, so it's
+    lock-free and exact enough: a false hold only skips a pid; a zombie is still in its
+    group, so its record holds the group's pid too). By a scan made once for each window of
+    4096 pids (`PidWindow`), not for each pid tried: live tasks' tids and tgids, a teardown
+    still under way, and the group and session of every live task, so a group or session
+    whose leader has gone and been reaped keeps its pid while it has members. The search
+    runs under the scheduler's lock, so it's bounded: 2^17 pids (`PID_TRIES`), which is more
+    than the buckets plus every exact hold there can be, so a pid is found whenever a bucket
+    is free, at a cost of 32 scans and a lookup per pid; with none it fails the reservation
+    (`EAGAIN`), rather than reuse one. `make test-sched` has `pid_not_reused_while_held`,
+    `pid_not_reused_while_marked` and `pid_search_is_bounded`, with `Table::set_next_pid` to
+    wrap the counter; `ktest records` (in `posix-proc`) wraps the guest's counter
+    (`sched::swap_pid_counter`) to just below an unreaped child's pid and a leaderless
+    group's, checks a new program skips both, and gets each once it's let go, then puts the
+    counter back unwrapped.
+  - A slot points at its process's record only from its task's commit (or, for a thread,
+    its reservation, so a stop that comes before the commit finds it) until its exit is
+    collected. A thread refused its kernel stack gives the pointer back as its reservation
+    is cancelled, and every spawn clears it at reservation, so no later task in the slot
+    can take another process's record as its own (it would free a record its parent still
+    has, and mark a live child ended). `ktest records` refuses a thread of a user program's
+    child (`sched::fail_next_thread_stack`) and checks no free slot points at a record
+    (`sched::stray_records`), before and after kernel spawns reuse the slots.
+  - Statuses are `feos_signal::Status` (`Exited`, `Signaled`, `Stopped`, `Continued`; a
+    primitive `repr(u8)` so the scheduler's table stays all-zero in `.bss`) in the scheduler
+    and the records, encoded per caller: `wait_status` for `WAIT4`, `v1` (the code, or 128
+    plus the signal) for v1's `WAIT`, the ring and kernel apps. A kill is `SIGKILL` (137), a
+    fault `SIGSEGV` (139), a mapped page with no frame `SIGBUS` (135), as before in v1 terms;
+    `WAIT4` sees the signals themselves.
+  - `WAIT4` validates `pid` (32-bit) and `options` (only `WNOHANG`, `WUNTRACED`,
+    `WCONTINUED`), then faults in the status and resource-use pointers before anything is
+    reaped (`EFAULT` first; one another thread unmaps after that loses the report, as on
+    Linux). `pid` `i32::MIN` names no group (`ECHILD`). A record still being made (pid 0)
+    matches nothing. A record that has ended but whose teardown isn't done counts as
+    running (`0` with `WNOHANG`). Resource use: `utime` from the ticks, `maxrss` the most
+    any had, `minflt` summed; the rest zero, as for `RUSAGE_SELF`. v1's `WAIT` is `WAIT4`
+    of one positive pid up to `i32::MAX` with no options; anything else `ECHILD`, as before.
+    A child it has reaped already is answered again from the ring of recent exits while the
+    ring has it (`sched::recent_exit`), as v1 always answered a second `WAIT` (utest's
+    `wait-again-is-the-same`); `WAIT4` gives `ECHILD` then.
+  - `KILL` validates both arguments as 32-bit and the signal as `0..=64` (`EINVAL`), then
+    finds its targets under the scheduler's lock (`sched::kill_from`): one process by pid
+    (a thread id that isn't one is `ESRCH`; the shell and kernel apps `EPERM`; one being
+    spawned, whose pid nobody has been given yet, `ESRCH`), or every program in a group, or
+    every program but the caller's own; `EPERM` if all it found were out of reach, `ESRCH`
+    if nothing. Permission is root or the target's uid; `SIGCONT` gets no exception for the
+    same session. An ended, unreaped child is found in the caller's own records only: a
+    zombie of another program's is `ESRCH` (no global zombie table; nothing here needs it).
+    `pid` `i32::MIN` is `ESRCH`.
+  - Default actions (`feos_signal::default_action`, host-tested): terminate ends the process
+    through the kill path with the signal as its status (`sched::end_process`, unless a
+    status was decided already), a stopped one at once, where Linux keeps a fatal signal other
+    than `SIGKILL` pending until the process is continued; stop and continue are
+    `sched::stop_process` and `continue_process`; `SIGCHLD`, `SIGURG` and `SIGWINCH` do
+    nothing. There are no handlers or masks yet (1c.9, 1c.10), so a signal acts as it's sent
+    and nothing is pending: a mask `SPAWN2` set is still only kept. `SIGCHLD` isn't raised
+    on the parent yet either: its default disposition ignores it, and there's nothing that
+    could see it before 1c.9.
+  - A stop sets the table's `stopped` flag for every thread (held at its next way back to
+    its program, as 1a.2 has it) and the stop signal in `sched::STOP_STATE`, and asks the
+    CPUs running a thread of it to reschedule. It's recorded for the parent once every
+    thread has parked (`check_parked`, run as the stop is asked for and wherever a thread of
+    a stopping process leaves its CPU): none running, and each either blocked or at its
+    program. A thread blocked in a call counts as parked, since it can't go on without a
+    wake and finishes the call before it parks; without that, a thread blocked in a pipe
+    read would keep its process's stop from ever being reported. A thread started as its
+    process stops is stopped too. `SIGCONT` clears the flags and records a continue, which
+    replaces a stop nobody has reported, as on Linux; each is reported once and reaps
+    nothing. The shell's job control (`Processes::set_stopped`, Ctrl-Z and `fg`) stops a
+    program as `SIGTSTP` and continues it as `SIGCONT` through the same path, so a program
+    parent sees those too.
+  - The shell's side is in `apps/commands`, where the shell's process host and its `kill`
+    command are (`apps/shell` is only the adapter): `feos_app::Processes` gained
+    `send_signal`, a signal's default action from a kernel app (on a kernel app, anything
+    that would end it kills it, and stop and continue hold and release it). `kill` takes
+    every signal by name or number and sends it that way, its default staying `SIGKILL`
+    (`kill -TERM` sends `SIGTERM`, status 143; a trap in a kernel-app shell still catches
+    `HUP`, `INT`, `QUIT` and `TERM` first). A background job runs in a forked shell task
+    (a kernel app), so the shell's `kill` builtin sends a signal for `%N`, or for a pid that
+    is a job's task (`$!`), to what that task runs (`TaskHost::job_members`: the task's
+    process tree but itself), so `prog & kill -TERM %1` ends `prog` with 143 and the job's
+    task with it, and `-STOP`/`-CONT` hold and release `prog`. A job running nothing of the
+    kind (a loop of builtins) gets the signal on its task, as before. A job whose task loops
+    over programs (`while :; do prog; done &`) has only the program it's running signalled,
+    so a `SIGTERM` ends that program and the loop starts the next, where Bash's would end
+    the subshell too; and a job signalled before its task has started its program is the
+    task alone. The process host sends `SIGINT` on Ctrl-C and
+    `SIGQUIT` on Ctrl-\\ to a foreground program, which then ends with that signal; the
+    shell's status for it is 130 or 131, as for a kernel app.
+  - `RUSAGE_CHILDREN` is what `WAIT4` (or v1's `WAIT`) has reaped, each record carrying its
+    child's own reaped children in; `GETRUSAGE`'s `rusage-self` check no longer expects it
+    zero. `FEATURES` gains bit 18; `IMPLEMENTED_LATER` gains `WAIT4` and `KILL`; `libs/abi`
+    gains the `sig` and `wait` modules (Linux's numbers and glibc's `W*` macros, asserted in
+    `make test-abi`). No new errno.
+  - Tests as listed. `ptest` adds `kill-term` and `wait4-status-signal` (a `SIGTERM`, and a
+    fault's `SIGSEGV`, which v1 still sees as 139); `wait4-any`, `wait4-pgroup` and
+    `wait4-echild` run in children of their own, where no other child can be reaped;
+    `wait4-wuntraced`, `wait4-wcontinued` and `kill-stop-cont` stop a child writing a pipe
+    every 2 ms and see nothing arrive while it's stopped; `stop-mid-call-no-lockup` stops a
+    child part way through 64 calls of 1 MiB to a file, each reported on a pipe, and has
+    another program write 4 MiB to the same mount meanwhile, with no MiB finished while the
+    child is stopped. The 64 MiB go over the file's first 4 MiB (`PWRITE` at 0 to 3 MiB in
+    turn): `/tmp` is the RAM copy of the image in the boot test, where a 64 MiB file stopped
+    growing at about 12 MiB; `pid-not-reused-while-unreaped` uses `/bin/hello` for the
+    2000; `getrusage-children` has a child burn and reap a grandchild that burns too. The
+    malicious probes add `wait4-status-in-kernel` (`EFAULT`); `kill-other-user` has a
+    user-1000 program (`runas`) try `SIGTERM`, `SIGKILL`, `SIGSTOP` and 0 on root's program,
+    which stays alive; `kill-pid-upper-bits` checks the signal's upper bits and 65 too;
+    `zombie-flood` runs in a child, and a spawn after it ends shows the records gone. The
+    boot phases: `posix-proc` sends a background program `kill -STOP`, `-CONT`, `-TERM`
+    and `-USR1` from the shell, by its pid, by `%N` and by `$!`, and runs `ktest records`; `user` checks `kill -TERM` (143) besides Ctrl-C (130);
+    `jobs` stops a user program with Ctrl-Z in a Terminal window and ends it with Ctrl-C
+    after `fg`; `terminal` ends one with Ctrl-C in its window. `malicious`'s `ended_well` no
+    longer accepts `ECHILD`: every child's status is kept now.
 
 ### 1c.9 Signal handlers: `SIGACTION`, frames, `SIGRETURN`, faults as signals
 
@@ -4437,6 +4744,7 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
   `sigpipe-ignored-epipe`, `sigill`, `sigtrap`, `sigfpe` (x86_64), `divide-by-zero-no-signal`
   (AArch64: integer division by zero gives 0 and raises nothing), `sigchld-handler-finds-record`
   (the handler's `WAIT4(WNOHANG)` always reaps), `sigchld-ign-autoreaps`,
+  `sigchld-ign-inherited-autoreaps`, `sigchld-ign-kept-across-exec`,
   `sigchld-default-keeps-records`, `sigchld-stop-reported` (`CLD_STOPPED`, and none with
   `SA_NOCLDSTOP`), `signal-on-call-return` (a signal sent while the target is in a call
   runs its handler as the call returns, well within a tick).
@@ -4450,6 +4758,96 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
   `handler-that-faults` (ends 139), `toctou-sigreturn` (a thread rewriting the context
   during `SIGRETURN`: one consistent copy or 139, never a kernel fault), `toctou-sigaction`.
 - **Boot:** new phase `signals`, `user`, `fault`.
+- **As built (deviations):**
+  - The builder and checker are `feos_signal::frame` (`x86_64` and `aarch64`, each over a
+    plain `Regs`, both host-tested on any host), and the port's half is a trait there,
+    `UserFrame`, which each arch crate's `TrapFrame` implements in `irq.rs` (the arch crates
+    gained `feos-signal` and `feos-abi`), rather than methods on `feos_hal::TrapContext`:
+    `feos-hal` stays free of the ABI. `FaultDetails` gained `user_signal`, the port's signal
+    and code for a fault. x86_64's `MXCSR_MASK` is read once with `fxsave`
+    (`cpu::mxcsr_mask`, `0xffbf` when the image says 0).
+  - AArch64's `SPSR` after `SIGRETURN` (and at a handler's entry) is `NZCV` from the context
+    and the port's own EL0t value, `SPSR_USER`, rather than every other bit clear: that keeps
+    `D`, `A` and `F` masked as in every user frame here (`I` is clear, so interrupts are
+    taken), and nothing else of the context reaches it. x86_64's rebuilt frame also has its
+    selectors set to the user ones after the checker has kept the calling frame's.
+  - State: the dispositions are `Signals` in the `Process` (`kernel/src/user/signal.rs`), its
+    lock the process's signal lock, beside atomics for the process-pending set, the caught
+    and ignored sets and `SIGCHLD`'s flags. Each slot points at them (`sched::SIGNALS`), set
+    as the slot gets its process and cleared under the scheduler's lock before the slot lets
+    the process go, which is how the scheduler reads them lock-free. A thread's pending word
+    is `sched::THREAD_PENDING`; its mask `SIGNAL_MASK`, as before.
+  - Generation decides where a signal is sent, under the scheduler's lock: `SIG_IGN` drops
+    it, a handler makes it pending (and asks every other CPU running a thread of it to
+    reschedule, the IPI of 8.3, already here), anything else is the default
+    action as in 1c.8. `SIGCONT` continues the process whatever its disposition. A signal
+    whose disposition went back to `SIG_DFL` while pending takes the default action as it's
+    taken. Each process signal keeps its last sender (pid, uid, code; for `SIGCHLD` the
+    status and the child's CPU ticks so far as `utime`, `stime` 0): signals don't queue.
+    Thread signals (only `SIGPIPE` in this stage) carry `SI_KERNEL`. `KILL`'s sender is the
+    caller's pid and uid with `SI_USER`; a kernel app's (the shell's `kill`, Ctrl-C) is
+    `SI_USER` with its pid and uid 0.
+  - Delivery: `signal::deliver` at the end of every call and fault, and at a program's start,
+    before the `ToUser` switch, which checks again and diverts into a kernel thread
+    (`sched::signal_entry`) if something came after; a reschedule that resumes a thread at
+    its program with a signal due diverts the same way. Each handler's frame goes on top of
+    the last. A signal sent to a thread blocked in a call doesn't interrupt the call yet
+    (1c.10): it runs as the call returns, which `signal-on-call-return` checks.
+  - Faults: x86_64 `#DE` is `SIGFPE`/`FPE_INTDIV`, `#MF` and `#XM` `SIGFPE` code 0, `#DB` and
+    `#BP` `SIGTRAP`/`TRAP_BRKPT`, `#UD` `SIGILL`/`ILL_ILLOPC`, `#SS` `SIGBUS`/`BUS_ADRERR`,
+    `#AC` `SIGBUS`/`BUS_ADRALN`, `#PF` `SIGSEGV`, and everything else (`#GP`, which every
+    privileged instruction raises) `SIGSEGV` with `SI_KERNEL`, as Linux. AArch64: aborts
+    `SIGSEGV` (alignment faults `SIGBUS`/`BUS_ADRALN`), PC and SP alignment `SIGBUS`, `brk`
+    and debug exceptions `SIGTRAP`, trapped FP exceptions `SIGFPE`, anything else from EL0
+    `SIGILL`. A page fault the tables can't answer is `SEGV_ACCERR` inside a mapping and
+    `SEGV_MAPERR` outside one; a mapped page with no frame `SIGBUS`/`BUS_ADRERR`. `si_addr` is
+    the fault address, or the instruction's for a fault that isn't about memory. With no
+    handler (or blocked, or the frame unwritable) the process ends with the signal, so an
+    AArch64 privileged instruction now ends a program with 132, not 139: `malicious` counts
+    any fault signal's end (132, 133, 135, 136, 139) as blocked.
+  - `SIGCHLD` is raised as the child's record is filled in (its last thread collected) or its
+    stop or continue noted; not IPI'd, so a parent on another CPU takes it at its next switch
+    or call. A record whose child ends while the parent ignores `SIGCHLD` or has
+    `SA_NOCLDWAIT` is marked detached and dropped, once settled, the next time the parent's
+    list is looked at (any `WAIT4`, or a spawn at `MAX_CHILDREN`): a wait for it is `ECHILD`.
+    A child that ended before the parent set `SIG_IGN` stays for `WAIT4`, as on Linux.
+    `WAIT4(WNOHANG)` waits (briefly, for the teardown) for a child that has ended but isn't
+    settled, rather than returning 0, so a handler's `WAIT4` always reaps what it was told of.
+  - `EXEC` resets every handler to `SIG_DFL`, keeping what's ignored, the mask and anything
+    pending. A spawned program (by `SPAWN2` or v1's `SPAWN`) starts ignoring what its spawner
+    ignores, less `SPAWN2`'s `SETSIGDEF`, which so takes effect here rather than in 1c.10.
+  - A frame's `stack` reports `SS_DISABLE` until `SIGALTSTACK` (1c.10).
+  - `AT_MINSIGSTKSZ` is now the port's frame (`UserFrame::FRAME_SIZE`) with x86_64's red
+    zone and 16 bytes of alignment, rounded up to 16: 1104 on x86_64, 1024 on AArch64,
+    checked at build time to fit in `MINSIGSTKSZ`.
+  - `SIGCHLD`'s reaping flags are worked out from the dispositions wherever they're set up:
+    by `SIGACTION`, for a spawned program that inherits an ignored `SIGCHLD`, and after
+    `EXEC` (which, as Linux's, also clears every kept `SIG_IGN`'s flags and mask), so an
+    inherited or kept `SIG_IGN` reaps as one set by the program does. A signal sent to a
+    new program before its process exists (its image still loading) goes by the ignored
+    set it inherits. A handled signal asks every CPU running a thread of the process to
+    reschedule, not only those at their program: a thread on its way out of a call could
+    otherwise miss both the signal and the request.
+  - x86_64's breakpoint gate (vector 3) is now open to ring 3, as on Linux, so a program's
+    `int3` is its `SIGTRAP` rather than a protection fault's `SIGSEGV`.
+  - With `SIGPIPE` ending a writer by default, the existing checks that wanted a write's
+    `EPIPE` (`utest`'s `write-with-no-reader` and its ticker child, `ftest`'s `pipe-epipe`,
+    `ptest`'s `--write-until-epipe` child) set `SIG_IGN` for it first.
+  - Tests as listed. `sigtest`'s `sigreturn-restores-registers` sets every general register a
+    program can name (on AArch64 `x1`..`x7`, `x9`..`x17`, `x20`..`x28`; on x86_64 all sixteen
+    but `rax`, `rsp`), all FP/SIMD registers, `FPCR`/`MXCSR` and the flags around a `KILL` of
+    itself whose handler clobbers them; `sa-nodefer` checks both ways (deferred to after the
+    first handler returns, and nested with the flag). The malicious probes add
+    `sigaction-ignore-stop`, `sigaction-bad-signal` and `sigaction-kernel-pointer`;
+    `sigreturn-iopl` and `sigreturn-ring0-cs` run `cli` after the return (a fault, 139, at
+    ring 3) and `sigreturn-el1` `mrs sctlr_el1` (`SIGILL`, 132, at EL0); `toctou-sigreturn`
+    is a child whose thread exchanges the handler's saved program counter between its own
+    and a kernel address while the handler returns, 500 times, and ends 0 or 139. `FEATURES`
+    gains bit 19; `IMPLEMENTED_LATER` gains `SIGACTION` and `SIGRETURN`; `libs/abi` gains
+    `sa`, `si`, `ss`, `SigAction`, `SigStack`, `SigInfo` and `ucontext` (`make test-abi` has
+    `signal_structs_are_linuxs` and `ucontext_layouts_on_any_host`). `make test-signal` adds
+    `sigreturn_roundtrips_both` and `sigreturn_mask_drops_kill_and_stop`. The boot phase
+    `signals` runs `sigtest` on four CPUs and one, with every frame back after.
 
 ### 1c.10 Masks, `THREAD_KILL`, alternate stacks, interruption and restart, `SETITIMER`
 

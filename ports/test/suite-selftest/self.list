@@ -1,0 +1,8 @@
+# testrun's own test (specs/libc-suite.toml, testrun-self): one of each verdict.
+# expected.txt is made by libc-suite.sh from the sysroot's manifest.
+expect pass /bin/sysroot-check expected.txt -
+status fail /bin/sysroot-check /nonexistent
+expect differs /bin/sysroot-check expected-not.txt -
+pending later 9z.9 never runs
+skip never not for feos
+status slow /bin/testrun --sleep 10

@@ -597,7 +597,10 @@ impl Shell<'_> {
         status
     }
 
-    /// `kill %1` is a job's process; everything else goes to the `kill` command.
+    /// `kill %1`, or `kill $!`, is a job: its task runs the job in a fork of this shell,
+    /// so the signal goes to what that task is running for it (see
+    /// [`crate::TaskHost::job_members`]), as Bash's would go to the job's process. Everything
+    /// else goes to the `kill` command as it is.
     pub(crate) fn builtin_kill(
         &mut self,
         args: &[String],
@@ -609,14 +612,21 @@ impl Shell<'_> {
         }
         let mut mapped = Vec::new();
         for arg in args {
-            if arg.starts_with('%') {
+            let job = if arg.starts_with('%') {
                 let Some(index) = self.find_job(Some(arg)) else {
                     self.error(io, &format!("kill: {arg}: no such job"));
                     return Some(1);
                 };
-                mapped.push(self.jobs[index].pid.to_string());
+                Some(self.jobs[index].pid)
             } else {
-                mapped.push(arg.clone());
+                arg.parse::<u32>().ok().filter(|&pid| self.jobs.iter().any(|job| job.pid == pid))
+            };
+            match job {
+                Some(pid) => match host.tasks() {
+                    Some(tasks) => mapped.extend(tasks.job_members(pid).iter().map(u32::to_string)),
+                    None => mapped.push(pid.to_string()),
+                },
+                None => mapped.push(arg.clone()),
             }
         }
         Some(self.run_external("kill", &mapped, io, host, false))
@@ -891,19 +901,27 @@ mod tests {
         tasks: Arc<Mutex<BTreeMap<u32, JoinHandle<i32>>>>,
         done: Arc<Mutex<BTreeMap<u32, i32>>>,
         cancel: CancelToken,
+        /// With a `kill` command, the arguments of each run of it.
+        kills: Option<Arc<Mutex<Vec<Vec<String>>>>>,
     }
 
     impl Host for ThreadHost {
         fn run_external(
             &mut self,
-            _name: &str,
-            _args: &[String],
+            name: &str,
+            args: &[String],
             _stdin: &mut dyn Input,
             _stdout: &mut dyn Output,
             _stderr: &mut dyn Output,
             _background: bool,
         ) -> Option<i32> {
-            None
+            let kills = self.kills.as_ref().filter(|_| name == "kill")?;
+            kills.lock().unwrap().push(args.to_vec());
+            Some(0)
+        }
+
+        fn has_command(&self, name: &str) -> bool {
+            self.kills.is_some() && name == "kill"
         }
 
         fn poll_cancel(&mut self) -> bool {
@@ -977,6 +995,11 @@ mod tests {
         fn kill(&mut self, _pid: u32) {}
 
         fn set_stopped(&mut self, _pid: u32, _stopped: bool) {}
+
+        /// Every job is running two programs, at its pid plus 1000 and plus 2000.
+        fn job_members(&mut self, pid: u32) -> Vec<u32> {
+            std::vec![pid + 1000, pid + 2000]
+        }
 
         fn pause(&mut self) {
             std::thread::yield_now();
@@ -1067,6 +1090,32 @@ mod tests {
         assert_eq!(status, 7, "{stdout}");
         assert_eq!(run_lines(&["fg"]).0, 1);
         assert_eq!(run_lines(&["bg %4"]).0, 1);
+    }
+
+    #[test]
+    fn kill_sends_a_jobs_signal_to_what_it_runs() {
+        let mut shell = Shell::new(None, &SYSTEM);
+        let kills = Arc::new(Mutex::new(Vec::new()));
+        let mut host = ThreadHost { kills: Some(kills.clone()), ..ThreadHost::default() };
+        let mut stdin = feos_coreutils::BytesInput::empty();
+        let mut out = BytesOutput::new();
+        let mut err = BytesOutput::new();
+        let mut io = Io {
+            stdin: &mut stdin,
+            stdout: &mut out,
+            stderr: &mut err,
+        };
+        shell.execute_line("while :; do :; done &", &mut io, &mut host);
+        let job = 101;
+        // A job by number, and by its task's pid as `$!` has it, is what the job runs; any
+        // other pid goes as it is, and the signal with it.
+        assert_eq!(shell.execute_line("kill -TERM %1; kill -STOP $!; kill -CONT 7 $!", &mut io, &mut host), 0);
+        let ran = kills.lock().unwrap().clone();
+        let members = [std::format!("{}", job + 1000), std::format!("{}", job + 2000)];
+        assert_eq!(ran[0], ["-TERM", members[0].as_str(), members[1].as_str()]);
+        assert_eq!(ran[1], ["-STOP", members[0].as_str(), members[1].as_str()]);
+        assert_eq!(ran[2], ["-CONT", "7", members[0].as_str(), members[1].as_str()]);
+        assert_eq!(shell.execute_line("kill %9", &mut io, &mut host), 1);
     }
 
     #[test]

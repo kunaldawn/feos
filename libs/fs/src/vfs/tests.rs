@@ -1482,6 +1482,34 @@ fn program_calls_judge_what_the_walk_finds() {
 }
 
 #[test]
+fn creations_are_judged_and_owned_in_one_step() {
+    let tree = swapped_tree();
+    let user = Caller { uid: 1000, gid: 100 };
+    let root = Caller { uid: 0, gid: 0 };
+    // Into root's directory through the link: no, and nothing made there.
+    assert_eq!(tree.create_file_as("/home/a/d/new", 0o644, user).map(|_| ()), Err(FsError::PermissionDenied));
+    assert_eq!(tree.create_dir_as("/home/a/d/newdir", Some(0o755), user), Err(FsError::PermissionDenied));
+    assert_eq!(tree.lstat("/bin/new").map(|_| ()), Err(FsError::NotFound));
+    assert_eq!(tree.lstat("/bin/newdir").map(|_| ()), Err(FsError::NotFound));
+    // The orphans, even for root.
+    assert_eq!(tree.create_file_as("/home/a/o/new", 0o644, root).map(|_| ()), Err(FsError::NotFound));
+    assert_eq!(tree.create_dir_as("/home/a/o/newdir", None, root), Err(FsError::NotFound));
+    // A user's own: theirs, with its mode, from the start, and what was made is said.
+    let made = tree.create_file_as("/home/a/new", 0o640, user).unwrap();
+    let stat = tree.lstat("/home/a/new").unwrap();
+    assert_eq!((stat.kind, stat.uid, stat.gid, stat.mode & 0o7777), (FileKind::File, 1000, 100, 0o640));
+    assert_eq!((made.canonical.as_str(), made.id), ("/home/a/new", tree.resolve_path("/home/a/new", false).unwrap().id));
+    assert_eq!(tree.create_file_as("/home/a/new", 0o640, user).map(|_| ()), Err(FsError::NameExists));
+    tree.create_dir_as("/home/a/sub", Some(0o700), user).unwrap();
+    let stat = tree.lstat("/home/a/sub").unwrap();
+    assert_eq!((stat.kind, stat.uid, stat.gid, stat.mode & 0o7777), (FileKind::Directory, 1000, 100, 0o700));
+    // Root's are root's, and a mode of `None` leaves the filesystem's.
+    tree.create_dir_as("/bin/rootdir", None, root).unwrap();
+    let stat = tree.lstat("/bin/rootdir").unwrap();
+    assert_eq!((stat.uid, stat.mode & 0o7777), (0, tree.lstat("/home").unwrap().mode & 0o7777));
+}
+
+#[test]
 fn changes_by_identity_ask_of_the_file_changed() {
     let tree = swapped_tree();
     let sh = tree.resolve_path("/bin/sh", false).unwrap().id;

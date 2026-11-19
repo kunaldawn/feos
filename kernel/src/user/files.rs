@@ -40,7 +40,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use feos_abi::{close_range, errno, f, int_arg, o, open as open_flags, seek as seek_whence, IO_CHUNK, MAX_FDS, PIPE_BUF};
 use feos_app::pipe::{self, PipeId, Transfer};
 use feos_fdtable::{FdError, FdTable};
-use feos_fs::vfs::{path, DeviceKind, FileId, Snapshot, VfsTree, ACCESS_READ, ACCESS_WRITE};
+use feos_fs::vfs::{path, Caller, DeviceKind, FileId, Snapshot, VfsTree, ACCESS_READ, ACCESS_WRITE};
 use feos_fs::{FileKind, FsError};
 use feos_sync::{Mutex, TryArc};
 use feos_vm::{FileRef, PAGE_SIZE};
@@ -48,7 +48,7 @@ use feos_vm::{FileRef, PAGE_SIZE};
 use super::fs_calls::{self, Fail};
 use super::memory_calls::MapFd;
 use super::process::{HeapCharge, Process};
-use super::{check_parent, check_reach_link, fs_errno, give_to, lock_calls, tree, user_path, with_user_buffer, KILLED};
+use super::{check_parent, check_reach_link, fs_errno, lock_calls, tree, user_path, with_user_buffer, KILLED};
 use crate::{pagecache, sched};
 
 /// What an open file description refers to.
@@ -300,7 +300,8 @@ fn pipe_read(process: &Process, id: PipeId, address: usize, length: usize, nonbl
         let count = (length - done).min(PAGE_SIZE);
         let now_only = nonblocking || done > 0;
         let moved = match pipe::read_some(id, &mut bounce[..count], now_only) {
-            Err(pipe::Killed) => return KILLED,
+            // A kill, or a signal: only the first piece waits, so nothing has moved.
+            Err(pipe::Killed) => return sched::interrupted_result(),
             Ok(Transfer::Moved(moved)) => moved,
             Ok(Transfer::WouldBlock) if done == 0 => return -errno::EAGAIN,
             Ok(_) => break,
@@ -344,7 +345,10 @@ fn pipe_write(process: &Process, id: PipeId, address: usize, length: usize, nonb
             return if done == 0 { error } else { done as isize };
         }
         match pipe::write_some(id, &bounce[..count], atomic, nonblocking) {
-            Err(pipe::Killed) => return KILLED,
+            // A kill, or a signal: what had gone in is the result, as `write`'s partial
+            // count.
+            Err(pipe::Killed) if done == 0 => return sched::interrupted_result(),
+            Err(pipe::Killed) => break,
             Ok(Transfer::Moved(moved)) => {
                 done += moved;
                 if moved < count {
@@ -747,11 +751,11 @@ pub fn open_description(slot: usize, process: &Process, joined: &str, request: &
         Some(found) => found,
         None => {
             check_parent(tree, &remembered, uid, gid).map_err(Fail::Errno)?;
-            tree.create_file(&remembered).map_err(Fail::Fs)?;
-            give_to(tree, &remembered, uid, gid);
-            // Where the filesystem keeps modes; elsewhere there's nothing to set.
-            let _ = tree.chmod(&remembered, (request.mode & 0o7777 & !umask) as u16);
-            path::lookup(tree, &remembered, false).map_err(Fail::Fs)?
+            // Judged, made, owned and given its mode in one step, and opened as what was
+            // made: by its path again, a parent swapped for a link in between would have
+            // the owner, the mode and the open land on another file.
+            let mode = (request.mode & 0o7777 & !umask) as u16;
+            tree.create_file_as(&remembered, mode, Caller { uid, gid }).map_err(Fail::Fs)?
         }
     };
     let object = match found.stat.kind {

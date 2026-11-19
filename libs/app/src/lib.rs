@@ -430,9 +430,29 @@ pub trait Processes: Sync {
     }
 
     /// Holds a process off the CPU (`stopped`) or lets it run again. Returns
-    /// `false` when there's no such process, or it may not be stopped.
+    /// `false` when there's no such process, or it may not be stopped. A user program
+    /// stops as for `SIGTSTP` and continues as for `SIGCONT`, which its parent sees.
     fn set_stopped(&self, _pid: u32, _stopped: bool) -> bool {
         false
+    }
+
+    /// Sends signal `number` (1 to 64) to the process `pid`, to take its default action
+    /// there: a user program ends with it as its status (128 plus the number, as a shell
+    /// shows it), stops, continues, or ignores it, as POSIX has the signal do. A
+    /// kernel-linked app has no signals but `SIGKILL`: whatever would end it kills it,
+    /// and a stop or continue holds or releases it, as [`set_stopped`](Self::set_stopped)
+    /// does. `Killed` once it's done (or under way, for a stop), as for a kill.
+    ///
+    /// The default treats everything that ends a process as a kill, for test doubles.
+    fn send_signal(&self, pid: u32, number: u32) -> KillResult {
+        match number {
+            17 | 23 | 28 => KillResult::Killed,
+            18..=22 => match self.set_stopped(pid, number != 18) {
+                true => KillResult::Killed,
+                false => KillResult::NotFound,
+            },
+            _ => self.try_kill(pid),
+        }
     }
 
     /// The calling process's standard input, when it was given one.

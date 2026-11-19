@@ -1,5 +1,6 @@
-//! The process calls of stage 1c.6: `SPAWN2` (and v1's `SPAWN` beside it), process
-//! groups and sessions, `GETRUSAGE` and `SYSINFO`.
+//! The process calls of stages 1c.6 to 1c.8: `SPAWN2` (and v1's `SPAWN` beside it),
+//! `EXEC`, `WAIT4` (and v1's `WAIT` on top of it), `KILL`, process groups and sessions,
+//! `GETRUSAGE` and `SYSINFO`.
 //!
 //! `SPAWN2` does in the call everything that can fail, before the child exists, so every
 //! failure is the call's result and none a child's exit status (section 3.4 of the ABI
@@ -7,22 +8,34 @@
 //! see [`load::Staged`]), the child's descriptor table is built from a copy of the
 //! caller's by the actions, its program is resolved and held, and its exit record taken
 //! in the caller. Then the task is made, and builds its address space itself.
-
+//!
+//! `EXEC` does the same checks, and builds the new image too, in a space of its own, before
+//! its point of no return: every way it can fail is the call's error. Past that it can't
+//! fail. Holding the creation lock, it has every other thread end and waits until each
+//! has, then puts the new space and program in place of the old ones, closes the
+//! close-on-exec descriptors, and goes to the new program in the same thread.
+//!
+//! `WAIT4` looks through the caller's exit records ([`super::children`]), which its
+//! children's ends, stops and continues fill in under the scheduler's lock, and waits for
+//! the counter every one of those moves on. `KILL` carries out a signal's default action
+//! (stage 1c.8 has no handlers): the scheduler ends, stops or continues the target.
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use feos_abi::{at, errno, int_arg, o, rusage, spawn, spawn_action as kind, sysinfo, Rusage, SpawnAction, SpawnRequest, SysInfo, Timeval, UserStr, MAX_FDS, PAGE_SIZE};
+use feos_abi::{at, errno, int_arg, o, rusage, spawn, spawn_action as kind, sysinfo, wait, ExecRequest, Rusage, SpawnAction, SpawnRequest, SysInfo, Timeval, UserStr, MAX_FDS, PAGE_SIZE};
+use feos_signal::Status;
 use feos_app::{ArgBlock, SpawnError, PROCESS_ARGS_MAX};
 use feos_fs::vfs::{path, ACCESS_EXECUTE};
 use feos_fs::FileKind;
 use feos_vm::FrameSource;
 
+use super::children::Usage;
 use super::files::{self, Files, Object, OfdRef, Request};
 use super::fs_calls::{self, errno_of};
 use super::load::{self, Staged, UserStart};
 use super::memory_calls::{KernelFrames, PROMISES};
-use super::process::Process;
-use super::tree;
+use super::process::{HeapCharge, Process, UserMm};
+use super::{tree, KILLED};
 use crate::sched::{self, RawStreams, SpawnFail, SpawnGroup};
 use crate::{memory, time};
 
@@ -83,13 +96,13 @@ fn check_request(request: &SpawnRequest) -> Result<(), isize> {
 /// The argument and environment strings, copied once: first their `UserStr` arrays,
 /// whole, then each string by the lengths in that copy, so a length another thread
 /// changes meanwhile is either the one checked or never seen.
-fn stage_strings(process: &Process, request: &SpawnRequest) -> Result<Staged, isize> {
+fn stage_strings(process: &Process, (argv, argc): (u64, u64), (envp, envc): (u64, u64)) -> Result<Staged, isize> {
     let user = process.mm();
-    let (argc, envc) = (request.argc as usize, request.envc as usize);
+    let (argc, envc) = (argc as usize, envc as usize);
     let size = core::mem::size_of::<UserStr>();
     let mut table = Staged::new((argc + envc) * size, Some(process))?;
-    table.append_user(user, request.argv as usize, argc * size)?;
-    table.append_user(user, request.envp as usize, envc * size)?;
+    table.append_user(user, argv as usize, argc * size)?;
+    table.append_user(user, envp as usize, envc * size)?;
     // Strings and their pointers together, within `ARG_MAX`, each within `STRING_MAX`.
     let mut total = (argc + envc) * 8;
     for index in 0..argc + envc {
@@ -111,15 +124,22 @@ fn stage_strings(process: &Process, request: &SpawnRequest) -> Result<Staged, is
     Ok(strings)
 }
 
+/// A spawn's actions, and the heap they take charged to its caller for as long as
+/// they're kept.
+struct Actions {
+    list: Vec<SpawnAction>,
+    _charge: Option<HeapCharge>,
+}
+
 /// The actions, copied once, each checked: a kind there is, and nothing in the fields it
 /// doesn't use.
-fn copy_actions(process: &Process, request: &SpawnRequest) -> Result<Vec<SpawnAction>, isize> {
+fn copy_actions(process: &Process, request: &SpawnRequest) -> Result<Actions, isize> {
     let count = request.action_count as usize;
     let mut actions = Vec::new();
     if count == 0 {
-        return Ok(actions);
+        return Ok(Actions { list: actions, _charge: None });
     }
-    let _charge = process.charge_heap(count * (SpawnAction::SIZE + core::mem::size_of::<SpawnAction>()))?;
+    let charge = process.charge_heap(count * (SpawnAction::SIZE + core::mem::size_of::<SpawnAction>()))?;
     let mut raw = Vec::new();
     raw.try_reserve_exact(count * SpawnAction::SIZE).map_err(|_| -errno::ENOMEM)?;
     raw.resize(count * SpawnAction::SIZE, 0);
@@ -144,7 +164,7 @@ fn copy_actions(process: &Process, request: &SpawnRequest) -> Result<Vec<SpawnAc
         }
         actions.push(action);
     }
-    Ok(actions)
+    Ok(Actions { list: actions, _charge: Some(charge) })
 }
 
 /// A descriptor of an action: `EBADF` outside `0..MAX_FDS`.
@@ -288,33 +308,34 @@ fn spawn2(slot: usize, process: &Process, address: usize) -> Result<u32, isize> 
     check_request(&request)?;
     let empty_path = request.flags & spawn::EMPTY_PATH != 0;
     let given = if empty_path { None } else { Some(fs_calls::user_path(process, request.path.pointer as usize, request.path.length as usize)?) };
-    let strings = stage_strings(process, &request)?;
+    let mut strings = stage_strings(process, (request.argv, request.argc), (request.envp, request.envc))?;
+    // The staged frames count against this process's limit until the call returns, by
+    // when the child has them.
+    let _pages = strings.take_pages();
     let actions = copy_actions(process, &request)?;
 
     // The child's table: the caller's, then the actions in order, then whatever is to
     // close on exec closed. What closes is let go here, with no table held.
     let mut files = process.files().try_clone()?;
     let mut closed = Vec::new();
-    for action in &actions {
+    for action in &actions.list {
         run_action(slot, process, &mut files, action, &mut closed)?;
     }
     drop(closed);
     drop(files.table.cloexec_sweep());
 
-    // The program, against the child's table and working directory.
-    let program = match &given {
-        Some(given) => join_child(&files, request.path.dirfd, given)?,
-        None => {
-            let ofd = usize::try_from(request.path.dirfd).ok().and_then(|fd| files.table.get(fd)).ok_or(-errno::EBADF)?;
-            match &ofd.object {
-                Object::File { path, .. } => load::copy(path).ok_or(-errno::ENOMEM)?,
-                _ => return Err(-errno::EACCES),
-            }
+    // The program, against the child's table and working directory: by its path, or
+    // the file a descriptor there holds, by identity, whatever its path names now.
+    let (uid, gid) = sched::credentials(slot);
+    let (program, mut image) = resolve_target(&target(&files, request.path.dirfd, given.as_deref())?, uid, gid)?;
+    // A script's interpreter runs with its strings in front of the rest.
+    let _script_pages = match image.heads.is_empty() {
+        true => None,
+        false => {
+            strings = strings.with_heads(&core::mem::take(&mut image.heads), Some(process))?;
+            strings.take_pages()
         }
     };
-    let tree = tree().ok_or(-errno::EIO)?;
-    let (uid, gid) = sched::credentials(slot);
-    let image = load::resolve(tree, &program, uid, gid).map_err(|refused| refused.errno)?;
     let name = load::copy(name_of(&image.canonical)).ok_or(-errno::ENOMEM)?;
 
     let group = if request.flags & spawn::SETSID != 0 {
@@ -327,30 +348,167 @@ fn spawn2(slot: usize, process: &Process, address: usize) -> Result<u32, isize> 
     } else {
         SpawnGroup::Inherit
     };
-    // Handlers aren't kept by a new image, and none exist yet to reset (stage 1c.9), so
-    // `SETSIGDEF` has nothing more to do.
+    // Handlers aren't kept by a new image; what's ignored is, but for what `SETSIGDEF`
+    // names, which starts at its default.
     let sigmask = (request.flags & spawn::SETSIGMASK != 0).then_some(request.sigmask & !UNBLOCKABLE);
-    let raw = RawStreams { stdin: 0, stdout: 0, umask: Some(files.umask), group, sigmask };
+    let sigdefault = if request.flags & spawn::SETSIGDEF != 0 { request.sigdefault } else { 0 };
+    let raw = RawStreams { stdin: 0, stdout: 0, umask: Some(files.umask), group, sigmask, sigdefault };
     let shown = strings.shown();
     let given = given.unwrap_or_default();
     let cwd = load::copy(files.cwd()).ok_or(-errno::ENOMEM)?;
     let umask = files.umask;
 
-    process.reserve_child()?;
+    let record = process.reserve_child()?;
     let Some(start) = UserStart::make(&program, Some(image), if given.is_empty() { &program } else { &given }, &cwd, umask, strings, Some(files)) else {
-        process.child_failed();
+        process.child_failed(&record);
         return Err(-errno::ENOMEM);
     };
-    match sched::spawn_program(&name, start, shown, raw) {
-        Ok(pid) => {
-            process.child_made(pid);
-            Ok(pid)
-        }
+    match sched::spawn_program(&name, start, shown, raw, record.clone()) {
+        Ok(pid) => Ok(pid),
         Err(fail) => {
-            process.child_failed();
+            process.child_failed(&record);
             Err(spawn_errno(fail))
         }
     }
+}
+
+/// What a spawn or exec is asked to run, found in a descriptor table: the absolute path
+/// asked for, or with `SPAWN_EMPTY_PATH` the description whose file it is.
+enum Target {
+    Path(String),
+    Held(OfdRef),
+}
+
+/// The program a spawn or exec runs, against `files` (the child's table, or the caller's
+/// own for `EXEC`): `given` joined to `dirfd` or the working directory there, or with
+/// `SPAWN_EMPTY_PATH` (`given` `None`) the description of the descriptor `dirfd`.
+fn target(files: &Files, dirfd: i32, given: Option<&str>) -> Result<Target, isize> {
+    match given {
+        Some(given) => Ok(Target::Path(join_child(files, dirfd, given)?)),
+        None => {
+            let ofd = usize::try_from(dirfd).ok().and_then(|fd| files.table.get(fd)).ok_or(-errno::EBADF)?;
+            Ok(Target::Held(ofd.clone()))
+        }
+    }
+}
+
+/// The program `target` names, resolved, checked and held, and the absolute path it was
+/// asked by: for a held one, the file it holds by identity, whatever its path names now.
+fn resolve_target(target: &Target, uid: u32, gid: u32) -> Result<(String, load::Image), isize> {
+    let tree = tree().ok_or(-errno::EIO)?;
+    match target {
+        Target::Path(program) => {
+            let image = load::resolve(tree, program, uid, gid).map_err(|refused| refused.errno)?;
+            Ok((load::copy(program).ok_or(-errno::ENOMEM)?, image))
+        }
+        Target::Held(ofd) => {
+            let Object::File { path, id, entry: Some(entry), .. } = &ofd.object else {
+                return Err(-errno::EACCES);
+            };
+            let image = load::resolve_held(tree, path, *id, entry, uid, gid).map_err(|refused| refused.errno)?;
+            Ok((load::copy(path).ok_or(-errno::ENOMEM)?, image))
+        }
+    }
+}
+
+/// `exec`: only returns with an error, from before its point of no return.
+pub fn sys_exec(slot: usize, process: &Process, address: usize) -> isize {
+    match exec(slot, process, address) {
+        Err(error) => error,
+        Ok(never) => match never {},
+    }
+}
+
+fn exec(slot: usize, process: &Process, address: usize) -> Result<core::convert::Infallible, isize> {
+    let mut bytes = [0u8; ExecRequest::SIZE];
+    process.mm().copy_in(address, &mut bytes)?;
+    let request = ExecRequest::from_bytes(&bytes);
+    let flags = request.flags;
+    if request.reserved != [0; 2]
+        || request.path.reserved != 0
+        || flags & !spawn::EMPTY_PATH != 0
+        || (flags & spawn::EMPTY_PATH != 0 && request.path.length != 0)
+        || request.argc == 0
+    {
+        return Err(-errno::EINVAL);
+    }
+    if request.argc.checked_add(request.envc).is_none_or(|count| count > spawn::MAX_STRINGS as u64) {
+        return Err(-errno::E2BIG);
+    }
+    let given = match flags & spawn::EMPTY_PATH {
+        0 => Some(fs_calls::user_path(process, request.path.pointer as usize, request.path.length as usize)?),
+        _ => None,
+    };
+    let mut strings = stage_strings(process, (request.argv, request.argc), (request.envp, request.envc))?;
+    let pages = strings.take_pages();
+
+    // The program, against this process's own table and working directory, as `SPAWN2`
+    // resolves its child's. The table isn't held while it's looked for.
+    let (uid, gid) = sched::credentials(slot);
+    let target = target(&process.files(), request.path.dirfd, given.as_deref())?;
+    let (program, mut image) = resolve_target(&target, uid, gid)?;
+    drop(target);
+    let script_pages = match image.heads.is_empty() {
+        true => None,
+        false => {
+            strings = strings.with_heads(&core::mem::take(&mut image.heads), Some(process))?;
+            strings.take_pages()
+        }
+    };
+    let shown = strings.shown();
+    let name = load::copy(name_of(&image.canonical)).ok_or(-errno::ENOMEM)?;
+    let exe = load::copy(&image.canonical).ok_or(-errno::ENOMEM)?;
+
+    // The new image, whole, in a space nobody runs on yet: everything that can fail
+    // fails here, with the process as it was.
+    let tree = tree().ok_or(-errno::EIO)?;
+    let space = UserMm::new(true).ok_or(-errno::ENOMEM)?;
+    let shown_as = given.as_deref().unwrap_or(&program);
+    let frame = load::build_image(slot, process.pid(), &space, tree, &image, &strings, shown_as).map_err(|refused| refused.errno)?;
+    drop((strings, image, pages, script_pages, given, program));
+
+    // The point of no return. Alone, under the creation lock, so no thread can start.
+    let Some(creating) = process.creating() else {
+        return Err(KILLED);
+    };
+    if !sched::end_other_threads(slot) {
+        return Err(KILLED);
+    }
+    sched::switch_space(slot, space.root(), space.tlb());
+    let (root, tlb) = (space.root(), core::ptr::from_ref(space.tlb()));
+    // SAFETY: the only thread, holding the creation lock; nothing above holds a reference
+    // from `mm()` or `exe()` past here (`dispatch`'s own is never used again: this call
+    // doesn't return).
+    let (old, old_exe) = unsafe { process.replace_image(space, exe) };
+    sched::exec_done(slot, &name, shown);
+    // Handlers belong to the old image's code.
+    process.signals().exec_reset();
+    drop(creating);
+    // What was open close-on-exec closes now, each with the record locks the process held
+    // on its file, one at a time, so nothing is allocated past the point of no return.
+    let mut fd = 0;
+    while fd < MAX_FDS {
+        let closed = {
+            let mut files = process.files();
+            match files.table.cloexec(fd) {
+                Some(true) => files.table.remove(fd).ok(),
+                _ => None,
+            }
+        };
+        if let Some(ofd) = closed {
+            super::lock_calls::descriptor_closed(process, &ofd);
+            drop(ofd);
+        }
+        fd += 1;
+    }
+    // The old space, in task context, its surface with it; and anything it, or a closed
+    // descriptor, held last that was unlinked while in use.
+    drop(old);
+    drop(old_exe);
+    super::memory_calls::forget_fault(slot);
+    fs_calls::sweep_orphans();
+    // SAFETY: the space is the process's now, and lives as long as it does.
+    sched::enter_user(slot, root, unsafe { &*tlb }, frame)
 }
 
 /// v1's `spawn`: copies everything from the program before anything happens, and keeps
@@ -423,16 +581,13 @@ pub fn sys_spawn(process: &Process, args: [usize; 6]) -> isize {
     // The program's stream of its own, if it inherits, is the scheduler's business.
     let raw = RawStreams { stdin, stdout, umask: Some(umask), ..RawStreams::default() };
     // A parent with as many children as it may have is as full as a table with no slot.
-    if process.reserve_child().is_err() {
+    let Ok(record) = process.reserve_child() else {
         return -errno::EBUSY;
-    }
-    match sched::spawn_program(name_of(&path), start, block, raw) {
-        Ok(pid) => {
-            process.child_made(pid);
-            pid as isize
-        }
+    };
+    match sched::spawn_program(name_of(&path), start, block, raw, record.clone()) {
+        Ok(pid) => pid as isize,
         Err(fail) => {
-            process.child_failed();
+            process.child_failed(&record);
             match fail {
                 SpawnFail::Spawn(SpawnError::NoFreeSlot) => -errno::EBUSY,
                 SpawnFail::Spawn(SpawnError::ArgsTooLong) => -errno::ENAMETOOLONG,
@@ -443,16 +598,233 @@ pub fn sys_spawn(process: &Process, args: [usize; 6]) -> isize {
     }
 }
 
-/// v1's `wait`: the child's status, and its record gone with it.
-pub fn sys_wait(process: &Process, pid: usize) -> isize {
-    let pid = pid as u32;
-    let status = sched::wait_child(pid, process.pid());
-    // Reaped, or its status is gone: either way, nothing is left to wait for.
-    process.child_reaped(pid);
-    match status {
-        Some(status) => status as isize,
-        None => -errno::ECHILD,
+/// v1's `wait`: `wait4(pid, ..., 0, 0)` for one child, returning v1's status, the exit
+/// code or 128 plus the signal. Only a pid a child can have: 0 is a record still being
+/// made, and a pid with its upper bits set would be cut to one that may be another
+/// child's. A child reaped already is answered again from the ring of recent exits, as
+/// v1 always was, while the ring still has it.
+pub fn sys_wait(slot: usize, process: &Process, pid: usize) -> isize {
+    let Some(pid) = u32::try_from(pid).ok().filter(|&pid| pid != 0 && pid <= i32::MAX as u32) else {
+        return -errno::ECHILD;
+    };
+    match wait_child(slot, process, Wanted::Pid(pid), 0) {
+        Ok(Some(found)) => found.status.v1() as isize,
+        Ok(None) => -errno::ECHILD,
+        Err(error) if error == -errno::ECHILD => sched::recent_exit(pid, process.pid()).map_or(error, |status| status as isize),
+        Err(error) => error,
     }
+}
+
+/// Which children a wait is for.
+#[derive(Clone, Copy)]
+enum Wanted {
+    Pid(u32),
+    Group(u32),
+    Any,
+}
+
+/// A child a wait found: its pid and what it's reported with, and, if it was reaped,
+/// what it used.
+struct Found {
+    pid: u32,
+    status: Status,
+    usage: Option<Usage>,
+}
+
+/// What a look through the records came to.
+enum Look {
+    /// No record matches: `ECHILD`.
+    None,
+    /// Some do, and nothing has happened to any that's wanted, or (`true`) one has ended
+    /// and is still giving back what it held, which takes no longer than that: even
+    /// `WNOHANG` waits for it, so a `SIGCHLD` handler's `WAIT4` always reaps what it was
+    /// told of.
+    Waiting(bool),
+    Found(Found),
+}
+
+/// Looks once through `process`'s records for a child `wanted` names whose end (or, as
+/// `options` ask, stop or continue) is there to report: an end reaps the record.
+fn look(process: &Process, wanted: Wanted, options: usize) -> Look {
+    let mut matched = false;
+    let mut settling = false;
+    let mut detached = Vec::new();
+    let reaped = {
+        let mut children = process.children();
+        // Children nobody waits for (`SIGCHLD` ignored, or `SA_NOCLDWAIT`, as they ended)
+        // go once they've settled, matching nothing: a wait for them is `ECHILD`. Taken
+        // out under the lock and dropped after, a few at a time, as nothing is allocated
+        // for more.
+        let mut index = 0;
+        while index < children.len() {
+            let record = &children[index];
+            if record.detached() && record.end().is_some() && sched::settled(record.pid()) && detached.try_reserve(1).is_ok() {
+                detached.push(children.swap_remove(index));
+            } else {
+                index += 1;
+            }
+        }
+        let mut found = None;
+        for (index, record) in children.iter().enumerate() {
+            let pid = record.pid();
+            let named = match wanted {
+                Wanted::Pid(wanted) => pid == wanted,
+                Wanted::Group(pgid) => record.pgid() == pgid,
+                Wanted::Any => true,
+            };
+            // A record with no pid yet is a child some thread is still making.
+            if pid == 0 || !named {
+                continue;
+            }
+            matched = true;
+            if let Some(status) = record.end() {
+                // Reaped only once every thread of it has given back what it held.
+                if sched::settled(pid) {
+                    found = Some((index, Found { pid, status, usage: Some(record.usage()) }));
+                    break;
+                }
+                settling = true;
+                continue;
+            }
+            let taken = record.take_change(|status| match status {
+                Status::Stopped(_) => options & wait::UNTRACED != 0,
+                Status::Continued => options & wait::CONTINUED != 0,
+                _ => false,
+            });
+            if let Some(status) = taken {
+                return Look::Found(Found { pid, status, usage: None });
+            }
+        }
+        // The record goes once the list's lock has: its pid may be given again then.
+        found.map(|(index, found)| (children.swap_remove(index), found))
+    };
+    match reaped {
+        Some((record, found)) => {
+            drop(record);
+            if let Some(usage) = found.usage {
+                process.add_reaped(usage);
+            }
+            Look::Found(found)
+        }
+        None if matched => Look::Waiting(settling),
+        None => Look::None,
+    }
+}
+
+/// Waits for a child `wanted` names to end (or, as `options` ask, to stop or continue),
+/// as `WAIT4` does. `None` if nothing matches, or, with `WNOHANG`, nothing has happened.
+fn wait_child(slot: usize, process: &Process, wanted: Wanted, options: usize) -> Result<Option<Found>, isize> {
+    // The caller's own group is looked up each time round: it may change meanwhile.
+    loop {
+        let seen = sched::exit_sequence();
+        let wanted = match wanted {
+            Wanted::Group(0) => Wanted::Group(sched::group_of(slot, 0)?.0),
+            other => other,
+        };
+        let settling = match look(process, wanted, options) {
+            Look::Found(found) => return Ok(Some(found)),
+            Look::None => return Err(-errno::ECHILD),
+            Look::Waiting(false) if options & wait::NOHANG != 0 => return Ok(None),
+            Look::Waiting(settling) => settling,
+        };
+        // A kill gives up the wait, and the call unwinds; so does a signal to take, but
+        // not the brief wait of a `WNOHANG` for a child's teardown, which isn't a wait
+        // for the child at all.
+        let by_signal = !(settling && options & wait::NOHANG != 0);
+        if !sched::wait_for_exits(seen, by_signal) {
+            return Err(if sched::kill_requested() { KILLED } else { sched::interrupted_result() });
+        }
+    }
+}
+
+/// `wait4`. The status and resource-use pointers are checked before anything is reaped;
+/// one another thread unmaps after that loses the report (`EFAULT`), as on Linux.
+pub fn sys_wait4(slot: usize, process: &Process, args: [usize; 6]) -> isize {
+    let [pid, status_out, options, rusage_out, ..] = args;
+    let Some(pid) = int_arg(pid) else {
+        return -errno::EINVAL;
+    };
+    if options & !wait::ALL != 0 {
+        return -errno::EINVAL;
+    }
+    let wanted = match pid {
+        -1 => Wanted::Any,
+        0 => Wanted::Group(0),
+        pid if pid > 0 => Wanted::Pid(pid as u32),
+        // No group has the pid `i32::MIN` would name.
+        pid => match pid.checked_neg() {
+            Some(pgid) => Wanted::Group(pgid as u32),
+            None => return -errno::ECHILD,
+        },
+    };
+    for (pointer, length) in [(status_out, 4), (rusage_out, Rusage::SIZE)] {
+        if pointer != 0 {
+            if let Err(error) = process.mm().fault_in(pointer, length, true) {
+                return error;
+            }
+        }
+    }
+    let found = match wait_child(slot, process, wanted, options) {
+        Ok(Some(found)) => found,
+        Ok(None) => return 0,
+        Err(error) => return error,
+    };
+    if status_out != 0 {
+        if let Err(error) = process.mm().copy_out(status_out, &found.status.wait_status().to_ne_bytes()) {
+            return error;
+        }
+    }
+    if rusage_out != 0 {
+        let usage = found.usage.map_or(Rusage::default(), rusage_of);
+        if let Err(error) = process.mm().copy_out(rusage_out, &usage.to_bytes()) {
+            return error;
+        }
+    }
+    found.pid as isize
+}
+
+/// A [`Rusage`] of what reaped children used.
+fn rusage_of(usage: Usage) -> Rusage {
+    Rusage {
+        utime: Timeval::from_nanos(sched::ticks_ns(usage.ticks)),
+        maxrss: (usage.peak as usize * PAGE_SIZE / 1024) as i64,
+        minflt: usage.faults as i64,
+        ..Rusage::default()
+    }
+}
+
+/// `kill`.
+pub fn sys_kill(slot: usize, process: &Process, pid: usize, signal: usize) -> isize {
+    let (Some(pid), Some(signal)) = (int_arg(pid), int_arg(signal)) else {
+        return -errno::EINVAL;
+    };
+    let Some(signal) = u32::try_from(signal).ok().filter(|&signal| signal == 0 || feos_signal::is_signal(signal)) else {
+        return -errno::EINVAL;
+    };
+    let target = match pid {
+        -1 => sched::KillTarget::All,
+        0 => match sched::group_of(slot, 0) {
+            Ok((pgid, _)) => sched::KillTarget::Group(pgid),
+            Err(error) => return error,
+        },
+        pid if pid > 0 => sched::KillTarget::Process(pid as u32),
+        pid => match pid.checked_neg() {
+            Some(pgid) => sched::KillTarget::Group(pgid as u32),
+            None => return -errno::ESRCH,
+        },
+    };
+    match sched::kill_from(slot, target, signal) {
+        Ok(()) => 0,
+        // A child that has ended and isn't reaped yet still exists, and a signal to it
+        // does nothing, as for a POSIX zombie.
+        Err(error) if error == -errno::ESRCH && is_unreaped_child(process, pid) => 0,
+        Err(error) => error,
+    }
+}
+
+/// Whether `pid` is one of `process`'s children, ended or not, that it hasn't reaped.
+fn is_unreaped_child(process: &Process, pid: i32) -> bool {
+    pid > 0 && process.children().iter().any(|record| record.pid() == pid as u32)
 }
 
 /// A pid argument, 32-bit: 0 or positive, or `None`.
@@ -499,9 +871,9 @@ pub fn sys_getrusage(slot: usize, process: &Process, who: usize, out: usize) -> 
     let ns = match int_arg(who) {
         Some(rusage::SELF) => sched::process_cpu_ns(process),
         Some(rusage::THREAD) => sched::thread_cpu_ns(slot),
-        // Reaped children's use is stage 1c.8's, which has exit records to keep it.
+        // Reaped children's, and theirs, from their records.
         Some(rusage::CHILDREN) => {
-            return match process.mm().copy_out(out, &Rusage::default().to_bytes()) {
+            return match process.mm().copy_out(out, &rusage_of(process.reaped()).to_bytes()) {
                 Ok(()) => 0,
                 Err(error) => error,
             };

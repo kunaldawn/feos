@@ -22,14 +22,14 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use feos_abi::{at, dt, errno, int_arg, o, s_if, stat_flags, Dirent, Stat2, Timespec, CONSOLE_RDEV, FSYNC_DATA, PATH_MAX};
-use feos_fs::vfs::{path, DeviceKind, FileId, Resolved, Stat, VfsTree, ACCESS_EXECUTE, ACCESS_WRITE};
+use feos_fs::vfs::{path, Caller, DeviceKind, FileId, Resolved, Stat, VfsTree, ACCESS_EXECUTE, ACCESS_WRITE};
 use feos_fs::{FileKind, FsError, Timestamp};
 use feos_sync::Mutex;
 
 use super::devfs;
 use super::files::{self, Listing, Object, Request};
 use super::process::Process;
-use super::{check_reach_link, give_to, tree};
+use super::{check_reach_link, tree};
 use crate::{pagecache, sched};
 
 /// Why an open failed: a filesystem error, mapped by the caller's version of the ABI, or
@@ -433,13 +433,15 @@ pub fn sys_mkdirat(slot: usize, process: &Process, args: [usize; 6]) -> isize {
     if let Err(error) = check_parent(tree, &made, uid, gid) {
         return error;
     }
-    if let Err(error) = tree.create_dir(&made) {
-        return errno_of(error);
-    }
-    give_to(tree, &made, uid, gid);
+    // Judged, made, and given its owner and mode in one step under the tree's lock, on the
+    // directory its walk reaches: done by the path afterwards, a parent swapped for a link
+    // meanwhile would have them land on whatever the path named by then.
     let umask = process.files().umask;
-    let _ = tree.chmod(&made, (mode as u32 & 0o7777 & !umask) as u16);
-    0
+    let mode = (mode as u32 & 0o7777 & !umask) as u16;
+    match tree.create_dir_as(&made, Some(mode), Caller { uid, gid }) {
+        Ok(()) => 0,
+        Err(error) => errno_of(error),
+    }
 }
 
 /// `unlinkat`.

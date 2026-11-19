@@ -118,6 +118,11 @@ pub trait FaultDetails {
     fn syndrome_name(&self) -> &'static str;
     /// The address of the instruction that faulted.
     fn instruction(&self) -> u64;
+    /// The signal a user program's fault raises and its `si_code`, as section 8.2 of the
+    /// ABI design has them: `SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE` or `SIGTRAP`. A
+    /// memory fault the tables couldn't answer is `SIGSEGV` with `SEGV_MAPERR`, which the
+    /// kernel refines; anything a port can't name is `SIGILL`.
+    fn user_signal(&self) -> (u32, i32);
     /// Writes everything known, for a report that stops the machine.
     fn write_report(&self, out: &mut dyn fmt::Write) -> fmt::Result;
 }

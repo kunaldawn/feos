@@ -1,0 +1,20 @@
+# Host test: relibc's feos platform constants and structures (one file,
+# ports/src/relibc/src/platform/feos/abi.rs) against the kernel's feos-abi crate and
+# the design's call table. Run by ports/test/abi-check.sh, which points FEOS_ABI_ROOT
+# at a feos tree (a base snapshot by default) and runs:
+#   cargo test --manifest-path ports/test/abi-check/Cargo.toml
+[package]
+name = "feos-ports-abi-check"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+# The base's libs/abi (target/ports-base, from ports/test/base.sh): a committed state,
+# used read-only.
+feos-abi = { path = "../../../target/ports-base/libs/abi" }
+
+[workspace]

@@ -33,6 +33,7 @@ feos-heap = { workspace = true }
 feos-irq = { workspace = true }
 feos-net = { workspace = true }
 feos-sched = { workspace = true }
+feos-signal = { workspace = true }
 feos-shell = { workspace = true }
 feos-sync = { workspace = true }
 

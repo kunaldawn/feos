@@ -1,0 +1,4447 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 400489e..0ab359b 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -53,7 +53,8 @@ mismatched_lifetime_syntaxes = "deny"
+ non_camel_case_types = "allow" # needed for most POSIX type names
+ non_snake_case = "deny"
+ non_upper_case_globals = "allow" # TODO review occurences
+-unexpected_cfgs = "deny"
++# target_os = "feos" until rustc knows the target (feos's track T4).
++unexpected_cfgs = { level = "deny", check-cfg = ['cfg(target_os, values("feos"))'] }
+ unpredictable_function_pointer_comparisons = "deny"
+ unreachable_code = "allow" # TODO review occuurences
+ unsafe_op_in_unsafe_fn = "deny"
+@@ -90,7 +91,6 @@ rand_jitter = "0.6"
+ memchr = { version = "2.2.0", default-features = false }
+ plain.workspace = true
+ unicode-width = "0.1"
+-__libc_only_for_layout_checks = { package = "libc", version = "0.2.149", optional = true }
+ md5-crypto = { package = "md-5", version = "0.10.6", default-features = false }
+ sha-crypt = { version = "0.5", default-features = false }
+ base64ct = { version = "1.6", default-features = false, features = ["alloc"] }
+@@ -127,6 +127,10 @@ features = ["elf", "read_core"]
+ [target.'cfg(target_os = "linux")'.dependencies]
+ sc = "0.2.7"
+ 
++# Layout checks against the libc crate, which has no feos module yet.
++[target.'cfg(not(target_os = "feos"))'.dependencies]
++__libc_only_for_layout_checks = { package = "libc", version = "0.2.149", optional = true }
++
+ [target.'cfg(target_os = "redox")'.dependencies]
+ redox_syscall.workspace = true
+ redox-rt = { path = "redox-rt" }
+diff --git a/cbindgen.globdefs.toml b/cbindgen.globdefs.toml
+index 3f8cd4d..cef5768 100644
+--- a/cbindgen.globdefs.toml
++++ b/cbindgen.globdefs.toml
+@@ -3,6 +3,7 @@
+ [defines]
+ "target_os=redox" = "__redox__"
+ "target_os=linux" = "__linux__"
++"target_os=feos" = "__feos__"
+ "target_pointer_width=64" = "__LP64__"
+ "target_pointer_width=32" = "__ILP32__"
+ "target_arch=x86" = "__i386__"
+diff --git a/include/math.h b/include/math.h
+index 4d1d1ea..fa93c86 100644
+--- a/include/math.h
++++ b/include/math.h
+@@ -1,4 +1,22 @@
++#include <features.h>
++// openlibm declares its BSD and X/Open functions (j0, y0, lgamma_r, sincos, signgam,
++// ...) under FreeBSD's visibility macros, which nothing defines here: map the feature
++// test macros onto them, as FreeBSD's <sys/cdefs.h> does.
++#if !defined(__BSD_VISIBLE) && (defined(_BSD_SOURCE) || defined(_GNU_SOURCE) || defined(_DEFAULT_SOURCE))
++#define __BSD_VISIBLE 1
++#endif
++#if !defined(__XSI_VISIBLE) && (defined(_XOPEN_SOURCE) || defined(_GNU_SOURCE) || defined(_BSD_SOURCE))
++#define __XSI_VISIBLE 700
++#endif
+ #include <openlibm_math.h>
++// openlibm defines these as INT_MAX without including <limits.h>: the compiler's own
++// constant, so they work whatever was included first.
++#ifdef FP_ILOGB0
++#undef FP_ILOGB0
++#undef FP_ILOGBNAN
++#define FP_ILOGB0 (-__INT_MAX__)
++#define FP_ILOGBNAN __INT_MAX__
++#endif
+ 
+ // Missing typedefs
+ #ifndef _RELIBC_FLOAT_T
+diff --git a/include/stdatomic.h b/include/stdatomic.h
+index bfcfdf6..ad4c676 100644
+--- a/include/stdatomic.h
++++ b/include/stdatomic.h
+@@ -23,7 +23,16 @@ see the files COPYING3 and COPYING.RUNTIME respectively.  If not, see
+ 
+ /* ISO C11 Standard:  7.17  Atomics <stdatomic.h>.  */
+ 
+-#ifndef _STDATOMIC_H
++/* Clang can't use GCC's header (its __atomic builtins take no _Atomic operands): under
++   clang, the compiler's own stdatomic.h, as the rest of the C library expects. */
++#if defined(__clang__) && defined(__has_include_next)
++#if __has_include_next(<stdatomic.h>)
++#define _RELIBC_CLANG_STDATOMIC 1
++#include_next <stdatomic.h>
++#endif
++#endif
++
++#if !defined(_STDATOMIC_H) && !defined(_RELIBC_CLANG_STDATOMIC)
+ #define _STDATOMIC_H
+ 
+ typedef enum
+diff --git a/src/header/_paths/mod.rs b/src/header/_paths/mod.rs
+index 7c391b4..e813e0c 100644
+--- a/src/header/_paths/mod.rs
++++ b/src/header/_paths/mod.rs
+@@ -1,6 +1,6 @@
+ //! Implementation specific, non-standard path aliases
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ #[path = "linux.rs"]
+ mod sys;
+ 
+diff --git a/src/header/bits_mode-t/mod.rs b/src/header/bits_mode-t/mod.rs
+index 3870f55..5daec36 100644
+--- a/src/header/bits_mode-t/mod.rs
++++ b/src/header/bits_mode-t/mod.rs
+@@ -1,12 +1,12 @@
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ use crate::platform::types::c_uint;
+ 
+-#[cfg(not(target_os = "linux"))]
++#[cfg(not(any(target_os = "linux", target_os = "feos")))]
+ use crate::platform::types::c_int;
+ 
+ /// Used for some file attributes.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ pub type mode_t = c_uint;
+ /// Used for some file attributes.
+-#[cfg(not(target_os = "linux"))]
++#[cfg(not(any(target_os = "linux", target_os = "feos")))]
+ pub type mode_t = c_int;
+diff --git a/src/header/bits_open-flags/mod.rs b/src/header/bits_open-flags/mod.rs
+index a1459bc..9b5f18f 100644
+--- a/src/header/bits_open-flags/mod.rs
++++ b/src/header/bits_open-flags/mod.rs
+@@ -1,6 +1,6 @@
+ pub use self::sys::*;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ #[path = "linux.rs"]
+ pub mod sys;
+ 
+diff --git a/src/header/bits_suseconds-t/mod.rs b/src/header/bits_suseconds-t/mod.rs
+index 19b9a73..564062e 100644
+--- a/src/header/bits_suseconds-t/mod.rs
++++ b/src/header/bits_suseconds-t/mod.rs
+@@ -1,12 +1,12 @@
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ use crate::platform::types::c_long;
+ 
+-#[cfg(not(target_os = "linux"))]
++#[cfg(not(any(target_os = "linux", target_os = "feos")))]
+ use crate::platform::types::c_int;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ /// Used for time in microseconds.
+ pub type suseconds_t = c_long;
+-#[cfg(not(target_os = "linux"))]
++#[cfg(not(any(target_os = "linux", target_os = "feos")))]
+ /// Used for time in microseconds.
+ pub type suseconds_t = c_int;
+diff --git a/src/header/fcntl/linux.rs b/src/header/fcntl/linux.rs
+index 4dff8e2..9077272 100644
+--- a/src/header/fcntl/linux.rs
++++ b/src/header/fcntl/linux.rs
+@@ -2,7 +2,7 @@ use crate::platform::types::c_int;
+ 
+ /// Close the file descriptor upon execution of an `exec` family function and
+ /// in the new process image created by `posix_spawn()` or `posix_spawnp()`.
+-pub const FD_CLOEXEC: c_int = 0x8_0000;
++pub const FD_CLOEXEC: c_int = 1;
+ 
+ // Flags for capability based "at" functions {
+ /// Use the current working directory to determine the target of relative file
+diff --git a/src/header/fcntl/mod.rs b/src/header/fcntl/mod.rs
+index 4abdb6b..1fef993 100644
+--- a/src/header/fcntl/mod.rs
++++ b/src/header/fcntl/mod.rs
+@@ -18,7 +18,7 @@ pub use crate::header::bits_open_flags::*;
+ 
+ use super::errno::EINVAL;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ #[path = "linux.rs"]
+ pub mod sys;
+ 
+diff --git a/src/header/grp/mod.rs b/src/header/grp/mod.rs
+index ed474c0..38ec64a 100644
+--- a/src/header/grp/mod.rs
++++ b/src/header/grp/mod.rs
+@@ -31,7 +31,7 @@ use super::{
+ };
+ 
+ /// cbindgen:ignore
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ const SEPARATOR: char = ':';
+ 
+ /// cbindgen:ignore
+diff --git a/src/header/limits/mod.rs b/src/header/limits/mod.rs
+index 19df8d4..bd351b6 100644
+--- a/src/header/limits/mod.rs
++++ b/src/header/limits/mod.rs
+@@ -71,7 +71,7 @@ pub const MB_LEN_MAX: c_int = 4;
+ 
+ // TODO: 4096 for most architectures as determined by a quick grep of musl's source; need a better
+ // way to determine it for other archs or to hard code a value.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ pub const PAGE_SIZE: usize = 4096;
+ 
+ // These POSIX symbols must have these values regardless of OS
+diff --git a/src/header/netdb/mod.rs b/src/header/netdb/mod.rs
+index 1a44bf2..05ff268 100644
+--- a/src/header/netdb/mod.rs
++++ b/src/header/netdb/mod.rs
+@@ -34,7 +34,7 @@ use crate::{
+     raw_cell::RawCell,
+ };
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ #[path = "linux.rs"]
+ pub mod sys;
+ 
+diff --git a/src/header/pwd/mod.rs b/src/header/pwd/mod.rs
+index a4e7091..3131d8d 100644
+--- a/src/header/pwd/mod.rs
++++ b/src/header/pwd/mod.rs
+@@ -20,18 +20,18 @@ use crate::{
+     raw_cell::RawCell,
+ };
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ mod linux;
+ #[cfg(target_os = "redox")]
+ mod redox;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ use self::linux as sys;
+ #[cfg(target_os = "redox")]
+ use self::redox as sys;
+ 
+ /// cbindgen:ignore
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ const SEPARATOR: u8 = b':';
+ 
+ /// cbindgen:ignore
+diff --git a/src/header/shadow/mod.rs b/src/header/shadow/mod.rs
+index d281d04..1362054 100644
+--- a/src/header/shadow/mod.rs
++++ b/src/header/shadow/mod.rs
+@@ -24,7 +24,7 @@ use crate::{
+ use super::errno::{ENOENT, ERANGE};
+ 
+ /// cbindgen:ignore
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ const SEPARATOR: char = ':';
+ 
+ /// cbindgen:ignore
+diff --git a/src/header/signal/cbindgen.toml b/src/header/signal/cbindgen.toml
+index 76fe71b..5adfc40 100644
+--- a/src/header/signal/cbindgen.toml
++++ b/src/header/signal/cbindgen.toml
+@@ -53,7 +53,7 @@ style = "Tag"
+ no_includes = true
+ cpp_compat = true
+ trailer = """
+-#if defined(__linux__)
++#if defined(__linux__) || defined(__feos__)
+ #define si_pid _sifields.__si_common.si_pid
+ #define si_uid _sifields.__si_common.si_uid
+ #define si_value _sifields.__si_common.si_value
+diff --git a/src/header/signal/feos.rs b/src/header/signal/feos.rs
+new file mode 100644
+index 0000000..e114363
+--- /dev/null
++++ b/src/header/signal/feos.rs
+@@ -0,0 +1,175 @@
++//! feos's part of `signal.h`: the signal numbers and `SA_*` flags are Linux's
++//! (section 5.4 of feos's `docs/feos-abi-v2.md`), the contexts feos's own (section 8.4).
++
++use super::{sigset_t, stack_t};
++use crate::platform::types::{c_ulong, c_ulonglong};
++#[cfg(target_arch = "x86_64")]
++use crate::platform::types::{c_longlong, c_uchar, c_uint, c_ushort};
++#[cfg(target_arch = "aarch64")]
++use crate::platform::types::c_uint;
++use core::arch::global_asm;
++
++// The restorer a handler returns to: `SIGRETURN` (89) with the `UContext`'s address,
++// which is the stack pointer once the handler has returned (section 8.4).
++#[cfg(target_arch = "x86_64")]
++global_asm!(
++    "
++    .global __restore_rt
++    __restore_rt:
++        mov rdi, rsp
++        mov eax, 89
++        int 0xf0
++        ud2
++"
++);
++#[cfg(target_arch = "aarch64")]
++global_asm!(
++    "
++    .global __restore_rt
++    __restore_rt:
++        mov x0, sp
++        mov x8, #89
++        svc #0
++        brk #0
++"
++);
++
++/// Non-POSIX: a synonym for `SIGABRT`.
++pub const SIGIOT: usize = super::constants::SIGABRT;
++/// Obsolete in issue 7, removed in issue 8. Pollable event.
++pub const SIGPOLL: usize = super::constants::SIGIO;
++/// Non-POSIX: synonymous with `SIGSYS`.
++pub const SIGUNUSED: usize = super::constants::SIGSYS;
++
++/// Do not generate `SIGCHLD` when children stop or stopped children continue.
++pub const SA_NOCLDSTOP: usize = 1;
++/// Causes extra information to be passed to signal handlers.
++pub const SA_SIGINFO: usize = 4;
++/// Process is executing on an alternate signal stack.
++pub const SA_ONSTACK: usize = 0x0800_0000;
++/// Causes certain functions to become restartable.
++pub const SA_RESTART: usize = 0x1000_0000;
++/// Causes signal not to be automatically blocked on entry to signal handler.
++pub const SA_NODEFER: usize = 0x4000_0000;
++/// Causes signal dispositions to be set to `SIG_DFL` on entry to signal handlers.
++pub const SA_RESETHAND: usize = 0x8000_0000;
++/// Not for applications: `sa_restorer` holds the signal trampoline.
++pub const SA_RESTORER: usize = 0x0400_0000;
++
++pub(crate) type ucontext_t = ucontext;
++/// A machine-specific representation of the saved context.
++pub(crate) type mcontext_t = mcontext;
++
++/// The context a handler gets (section 8.4 of feos's ABI): 816 bytes on x86_64.
++#[cfg(target_arch = "x86_64")]
++#[repr(C)]
++pub struct ucontext {
++    /// `UC_FEOS_FXSAVE` (1): the FP area is an `FXSAVE64` image.
++    pub uc_flags: c_ulong,
++    /// Pointer to the context that is resumed when this context returns (always null).
++    pub uc_link: *mut ucontext_t,
++    /// The alternate stack as it was.
++    pub uc_stack: stack_t,
++    /// The set of signals that are blocked when this context is active.
++    pub uc_sigmask: sigset_t,
++    /// The registers.
++    pub uc_mcontext: mcontext_t,
++    /// The `FXSAVE64` image `uc_mcontext.fpregs` points at.
++    pub __fpregs_mem: [c_uchar; 512],
++}
++
++/// x86_64: the general registers in Linux's order (`r8`..`r15`, `rdi`, `rsi`, `rbp`,
++/// `rbx`, `rdx`, `rax`, `rcx`, `rsp`, `rip`, `rflags`, `cs_gs_fs`, `err`, `trapno`,
++/// `oldmask`, `cr2`), then a pointer to the FP state.
++#[cfg(target_arch = "x86_64")]
++#[repr(C)]
++pub struct mcontext {
++    pub gregs: [c_longlong; 23],
++    pub fpregs: *mut _libc_fpstate,
++    __reserved: [c_ulonglong; 8],
++}
++
++/// x86_64: the `FXSAVE64` image.
++#[cfg(target_arch = "x86_64")]
++#[repr(C)]
++pub struct _libc_fpstate {
++    pub cwd: c_ushort,
++    pub swd: c_ushort,
++    pub ftw: c_ushort,
++    pub fop: c_ushort,
++    pub rip: c_ulonglong,
++    pub rdp: c_ulonglong,
++    pub mxcsr: c_uint,
++    pub mxcr_mask: c_uint,
++    pub _st: [_libc_fpxreg; 8],
++    pub _xmm: [_libc_xmmreg; 16],
++    __private: [c_ulonglong; 12],
++}
++
++#[cfg(target_arch = "x86_64")]
++#[repr(C)]
++pub struct _libc_fpxreg {
++    pub significand: [c_ushort; 4],
++    pub exponent: c_ushort,
++    __private: [c_ushort; 3],
++}
++
++#[cfg(target_arch = "x86_64")]
++#[repr(C)]
++pub struct _libc_xmmreg {
++    pub element: [c_uint; 4],
++}
++
++/// The context a handler gets (section 8.4 of feos's ABI): 880 bytes on AArch64.
++#[cfg(target_arch = "aarch64")]
++#[repr(C)]
++pub struct ucontext {
++    /// 0.
++    pub uc_flags: c_ulong,
++    /// Always null.
++    pub uc_link: *mut ucontext_t,
++    /// The alternate stack as it was.
++    pub uc_stack: stack_t,
++    /// The set of signals that are blocked when this context is active.
++    pub uc_sigmask: sigset_t,
++    /// The registers.
++    pub uc_mcontext: mcontext_t,
++}
++
++/// AArch64: the fault address, `x0`..`x30`, `sp`, `pc`, `pstate`, `fpsr`, `fpcr`, then
++/// `q0`..`q31` as pairs of 64-bit halves (low first).
++#[cfg(target_arch = "aarch64")]
++#[repr(C)]
++pub struct mcontext {
++    pub fault_address: c_ulonglong,
++    pub regs: [c_ulonglong; 31],
++    pub sp: c_ulonglong,
++    pub pc: c_ulonglong,
++    pub pstate: c_ulonglong,
++    pub fpsr: c_uint,
++    pub fpcr: c_uint,
++    pub vregs: [c_ulonglong; 64],
++    __reserved: [c_ulonglong; 4],
++}
++
++#[cfg(target_arch = "x86_64")]
++const _: () = {
++    assert!(core::mem::size_of::<ucontext>() == 816);
++    assert!(core::mem::offset_of!(ucontext, uc_sigmask) == 40);
++    assert!(core::mem::offset_of!(ucontext, uc_mcontext) == 48);
++    assert!(core::mem::offset_of!(ucontext, __fpregs_mem) == 304);
++    assert!(core::mem::size_of::<_libc_fpstate>() == 512);
++};
++
++#[cfg(target_arch = "aarch64")]
++const _: () = {
++    assert!(core::mem::size_of::<ucontext>() == 880);
++    assert!(core::mem::offset_of!(ucontext, uc_sigmask) == 40);
++    assert!(core::mem::offset_of!(ucontext, uc_mcontext) == 48);
++    assert!(core::mem::offset_of!(mcontext, regs) == 8);
++    assert!(core::mem::offset_of!(mcontext, sp) == 256);
++    assert!(core::mem::offset_of!(mcontext, pc) == 264);
++    assert!(core::mem::offset_of!(mcontext, pstate) == 272);
++    assert!(core::mem::offset_of!(mcontext, fpsr) == 280);
++    assert!(core::mem::offset_of!(mcontext, vregs) == 288);
++};
+diff --git a/src/header/signal/mod.rs b/src/header/signal/mod.rs
+index aa3e639..a48bc45 100644
+--- a/src/header/signal/mod.rs
++++ b/src/header/signal/mod.rs
+@@ -6,7 +6,7 @@ use core::{mem, ptr};
+ 
+ use cbitset::BitSet;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ use crate::platform::types::c_short;
+ #[cfg(target_os = "redox")]
+ use crate::platform::types::pthread_attr_t;
+@@ -32,6 +32,10 @@ use super::{
+ #[path = "linux.rs"]
+ pub mod sys;
+ 
++#[cfg(target_os = "feos")]
++#[path = "feos.rs"]
++pub mod sys;
++
+ #[cfg(target_os = "redox")]
+ #[path = "redox.rs"]
+ pub mod sys;
+@@ -110,7 +114,7 @@ pub struct sigaltstack {
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/signal.h.html>.
+ #[repr(C)]
+ #[derive(Clone)]
+-#[cfg(not(target_os = "linux"))]
++#[cfg(not(any(target_os = "linux", target_os = "feos")))]
+ pub struct sigevent {
+     /// Signal value.
+     pub sigev_value: sigval,
+@@ -131,7 +135,7 @@ pub struct sigevent {
+ /// See <https://docs.rs/libc/0.2.186/src/libc/unix/linux_like/mod.rs.html#300-322>.
+ #[repr(C)]
+ #[derive(Clone)]
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ pub struct sigevent {
+     /// Signal value.
+     pub sigev_value: sigval,
+@@ -150,7 +154,7 @@ pub struct sigevent {
+ 
+ #[repr(C)]
+ #[derive(Clone, Copy)]
+-#[cfg(not(target_os = "linux"))]
++#[cfg(not(any(target_os = "linux", target_os = "feos")))]
+ pub struct siginfo {
+     /// Signal number.
+     pub si_signo: c_int,
+@@ -170,7 +174,7 @@ pub struct siginfo {
+     pub si_value: sigval,
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ #[repr(C)]
+ #[derive(Clone, Copy)]
+ pub struct siginfo {
+@@ -188,7 +192,7 @@ pub struct siginfo {
+     pub _sifields: siginfo_sifields,
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ #[repr(C)]
+ #[derive(Clone, Copy)]
+ pub union siginfo_sifields {
+@@ -198,7 +202,7 @@ pub union siginfo_sifields {
+     pub _pad: [c_char; 112],
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ #[repr(C)]
+ #[derive(Clone, Copy)]
+ pub struct siginfo_common {
+@@ -207,7 +211,7 @@ pub struct siginfo_common {
+     pub si_value: sigval,
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ #[repr(C)]
+ #[derive(Clone, Copy)]
+ pub struct siginfo_sigfault {
+diff --git a/src/header/spawn/file_actions.rs b/src/header/spawn/file_actions.rs
+index eaff126..f61e90a 100644
+--- a/src/header/spawn/file_actions.rs
++++ b/src/header/spawn/file_actions.rs
+@@ -18,6 +18,14 @@ pub enum Action {
+     Chdir(CString),
+     FChdir(c_int),
+     Dup2(c_int, c_int),
++    /// glibc's `posix_spawn_file_actions_addclosefrom_np`: close every descriptor from
++    /// this one up.
++    #[cfg(target_os = "feos")]
++    CloseFrom(c_int),
++    /// glibc's `posix_spawn_file_actions_addtcsetpgrp_np`: make the child's process group
++    /// the foreground group of this terminal.
++    #[cfg(target_os = "feos")]
++    TcSetPgrp(c_int),
+ }
+ 
+ struct FileActions(Vec<Action>);
+@@ -117,7 +125,7 @@ pub unsafe extern "C" fn posix_spawn_file_actions_destroy(
+     // TODO should we be returning EINVAL when `file_actions` is invalid?
+     assert!(!file_actions.is_null(), "file_actions cannot be NULL");
+     unsafe {
+-        let _ = *(file_actions.cast::<FileActions>());
++        ptr::drop_in_place(file_actions.cast::<FileActions>());
+     }
+     0
+ }
+@@ -150,7 +158,7 @@ pub unsafe extern "C" fn posix_spawn_file_actions_addopen(
+         path: if path.is_null() {
+             CString::new("").unwrap()
+         } else {
+-            unsafe { CString::from_raw(path.cast_mut()) }
++            unsafe { core::ffi::CStr::from_ptr(path) }.into()
+         },
+         flag: oflag,
+         mode,
+@@ -206,7 +214,7 @@ pub unsafe extern "C" fn posix_spawn_file_actions_addchdir(
+         if path.is_null() {
+             CString::new("").unwrap()
+         } else {
+-            CString::from_raw(path.cast_mut())
++            core::ffi::CStr::from_ptr(path).into()
+         }
+     }));
+     0
+@@ -266,3 +274,71 @@ pub unsafe extern "C" fn posix_spawn_file_actions_adddup2(
+     file_actions.add_action(Action::Dup2(fildes, newfildes));
+     0
+ }
++
++/// glibc's `posix_spawn_file_actions_addchdir_np`, the name `addchdir` had before POSIX
++/// 2024 (Rust's std calls this one).
++///
++/// # Safety
++/// As [`posix_spawn_file_actions_addchdir`].
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn posix_spawn_file_actions_addchdir_np(
++    file_actions: *mut posix_spawn_file_actions_t,
++    path: *const c_char,
++) -> c_int {
++    unsafe { posix_spawn_file_actions_addchdir(file_actions, path) }
++}
++
++/// glibc's `posix_spawn_file_actions_addfchdir_np`, the name `addfchdir` had before
++/// POSIX 2024.
++///
++/// # Safety
++/// As [`posix_spawn_file_actions_addfchdir`].
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn posix_spawn_file_actions_addfchdir_np(
++    file_actions: *mut posix_spawn_file_actions_t,
++    fildes: c_int,
++) -> c_int {
++    unsafe { posix_spawn_file_actions_addfchdir(file_actions, fildes) }
++}
++
++/// glibc's `posix_spawn_file_actions_addclosefrom_np`: the child closes every descriptor
++/// from `from` up.
++///
++/// Returns `0`, or `EBADF` if `from` is negative.
++///
++/// # Safety
++/// `file_actions` must be initialised.
++#[cfg(target_os = "feos")]
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn posix_spawn_file_actions_addclosefrom_np(
++    file_actions: *mut posix_spawn_file_actions_t,
++    from: c_int,
++) -> c_int {
++    let file_actions = unsafe { file_actions.as_mut().expect("file_actions cannot be NULL") };
++    if from < 0 {
++        return EBADF;
++    }
++    file_actions.add_action(Action::CloseFrom(from));
++    0
++}
++
++/// glibc's `posix_spawn_file_actions_addtcsetpgrp_np`: the child's process group becomes
++/// the foreground group of the terminal `tcfd`, after the group is set.
++///
++/// Returns `0`, or `EBADF` if `tcfd` is negative.
++///
++/// # Safety
++/// `file_actions` must be initialised.
++#[cfg(target_os = "feos")]
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn posix_spawn_file_actions_addtcsetpgrp_np(
++    file_actions: *mut posix_spawn_file_actions_t,
++    tcfd: c_int,
++) -> c_int {
++    let file_actions = unsafe { file_actions.as_mut().expect("file_actions cannot be NULL") };
++    if tcfd < 0 {
++        return EBADF;
++    }
++    file_actions.add_action(Action::TcSetPgrp(tcfd));
++    0
++}
+diff --git a/src/header/spawn/mod.rs b/src/header/spawn/mod.rs
+index b559825..4b15b7e 100644
+--- a/src/header/spawn/mod.rs
++++ b/src/header/spawn/mod.rs
+@@ -13,11 +13,11 @@ use crate::{
+     casting::U8PtrToCCharPtr,
+     header::{
+         errno, stdlib,
+-        unistd::{F_OK, path::PathSearchIter},
++        unistd::path::PathSearchIter,
+     },
+     iter::NulTerminated,
+     platform::{
+-        self, Pal, Sys,
++        self, Pal,
+         types::{c_char, c_int, pid_t},
+     },
+ };
+@@ -113,16 +113,12 @@ pub unsafe extern "C" fn posix_spawnp(
+     if program.contains(b'/') {
+         return unsafe { posix_spawn(pid, file, file_actions, attrp, argv, envp) };
+     }
+-    let Some(path_env) = stdlib::getenv_cstr(c"PATH") else {
+-        return errno::ENOENT;
+-    };
++    // As glibc: /bin:/usr/bin when PATH is unset, and a candidate that can't be run
++    // (EACCES) doesn't end the search, though it's the error if nothing else is found.
++    let path_env = stdlib::getenv_cstr(c"PATH").unwrap_or(c"/bin:/usr/bin".into());
++    let mut error = errno::ENOENT;
+     for program_buf in PathSearchIter::new(program.to_bytes(), &path_env) {
+-        // SAFETY: CStr::from_ptr().to_bytes() always stop at null, no need to check again
+-        let program_c = unsafe { CStr::from_bytes_with_nul_unchecked(program_buf.as_slice()) };
+-        if Sys::access(program_c, F_OK).is_err() {
+-            continue;
+-        }
+-        return unsafe {
++        let result = unsafe {
+             posix_spawn(
+                 pid,
+                 U8PtrToCCharPtr::cast_mut(program_buf.as_ptr()),
+@@ -132,6 +128,12 @@ pub unsafe extern "C" fn posix_spawnp(
+                 envp,
+             )
+         };
++        match result {
++            errno::EACCES => error = errno::EACCES,
++            errno::ENOENT | errno::ENOTDIR => (),
++            // Success, or an error that isn't this candidate's.
++            other => return other,
++        }
+     }
+-    errno::ENOENT
++    error
+ }
+diff --git a/src/header/spawn/spawn_attr.rs b/src/header/spawn/spawn_attr.rs
+index 2c54158..10eb755 100644
+--- a/src/header/spawn/spawn_attr.rs
++++ b/src/header/spawn/spawn_attr.rs
+@@ -14,6 +14,7 @@ use crate::{
+     platform::types::pid_t,
+ };
+ 
++#[cfg(not(target_os = "feos"))]
+ bitflags::bitflags! {
+     pub struct Flags: c_short
+     {
+@@ -27,14 +28,56 @@ bitflags::bitflags! {
+     }
+ }
+ 
++#[cfg(not(target_os = "feos"))]
+ pub const POSIX_SPAWN_RESETIDS: c_short = 1;
++#[cfg(not(target_os = "feos"))]
+ pub const POSIX_SPAWN_SETPGROUP: c_short = 2;
++#[cfg(not(target_os = "feos"))]
+ pub const POSIX_SPAWN_SETSIGDEF: c_short = 3;
++#[cfg(not(target_os = "feos"))]
+ pub const POSIX_SPAWN_SETSIGMASK: c_short = 4;
++#[cfg(not(target_os = "feos"))]
+ pub const POSIX_SPAWN_SETSCHEDPARAM: c_short = 5;
++#[cfg(not(target_os = "feos"))]
+ pub const POSIX_SPAWN_SETSCHEDULER: c_short = 6;
++#[cfg(not(target_os = "feos"))]
+ pub const POSIX_SPAWN_SETSID: c_short = 7;
+ 
++// feos: glibc's and musl's bit values, which can be ORed (relibc's sequence above
++// can't: SETSIGDEF is RESETIDS | SETPGROUP there), and which the kernel's SPAWN2 takes
++// as they are. USEVFORK is accepted and does nothing.
++#[cfg(target_os = "feos")]
++bitflags::bitflags! {
++    pub struct Flags: c_short
++    {
++        const POSIX_SPAWN_RESETIDS = 0x01;
++        const POSIX_SPAWN_SETPGROUP = 0x02;
++        const POSIX_SPAWN_SETSIGDEF = 0x04;
++        const POSIX_SPAWN_SETSIGMASK = 0x08;
++        const POSIX_SPAWN_SETSCHEDPARAM = 0x10;
++        const POSIX_SPAWN_SETSCHEDULER = 0x20;
++        const POSIX_SPAWN_USEVFORK = 0x40;
++        const POSIX_SPAWN_SETSID = 0x80;
++    }
++}
++
++#[cfg(target_os = "feos")]
++pub const POSIX_SPAWN_RESETIDS: c_short = 0x01;
++#[cfg(target_os = "feos")]
++pub const POSIX_SPAWN_SETPGROUP: c_short = 0x02;
++#[cfg(target_os = "feos")]
++pub const POSIX_SPAWN_SETSIGDEF: c_short = 0x04;
++#[cfg(target_os = "feos")]
++pub const POSIX_SPAWN_SETSIGMASK: c_short = 0x08;
++#[cfg(target_os = "feos")]
++pub const POSIX_SPAWN_SETSCHEDPARAM: c_short = 0x10;
++#[cfg(target_os = "feos")]
++pub const POSIX_SPAWN_SETSCHEDULER: c_short = 0x20;
++#[cfg(target_os = "feos")]
++pub const POSIX_SPAWN_USEVFORK: c_short = 0x40;
++#[cfg(target_os = "feos")]
++pub const POSIX_SPAWN_SETSID: c_short = 0x80;
++
+ /// A spawn attributes object.
+ #[repr(C)]
+ pub struct posix_spawnattr_t {
+diff --git a/src/header/stdio/constants.rs b/src/header/stdio/constants.rs
+index 6b5e7f5..51bdf84 100644
+--- a/src/header/stdio/constants.rs
++++ b/src/header/stdio/constants.rs
+@@ -27,9 +27,9 @@ pub const _IONBF: c_int = 2;
+ /// Rename but don't replace the target if it exists.
+ pub const RENAME_NOREPLACE: c_uint = 0x01;
+ /// Atomically swap two files.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ pub const RENAME_EXCHANGE: c_uint = 0x02;
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ pub const RENAME_WHITEOUT: c_uint = 0x04;
+ 
+ // /dev/tty + nul
+diff --git a/src/header/stdlib/mod.rs b/src/header/stdlib/mod.rs
+index 08bbc00..aaec4a6 100644
+--- a/src/header/stdlib/mod.rs
++++ b/src/header/stdlib/mod.rs
+@@ -951,7 +951,7 @@ pub unsafe extern "C" fn posix_memalign(
+ pub unsafe extern "C" fn posix_openpt(flags: c_int) -> c_int {
+     #[cfg(target_os = "redox")]
+     let r = unsafe { open(c"/scheme/pty/ptmx".as_ptr(), flags) };
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "feos"))]
+     let r = unsafe { open(c"/dev/ptmx".as_ptr(), flags) };
+ 
+     if r < 0 && platform::ERRNO.get() == ENOSPC {
+@@ -1007,7 +1007,7 @@ pub unsafe extern "C" fn ptsname_r(fildes: c_int, name: *mut c_char, namesize: s
+ 
+         if unsafe { ioctl(fildes, TIOCGPTN, ptr::from_mut(&mut pty).cast::<c_void>()) } == 0 {
+             // Linux and Redox use different resource names for PTS's.
+-            #[cfg(target_os = "linux")]
++            #[cfg(any(target_os = "linux", target_os = "feos"))]
+             let inner_name = format!("/dev/pts/{}", pty);
+             #[cfg(target_os = "redox")]
+             let inner_name = format!("/scheme/pty/{}", pty);
+diff --git a/src/header/sys_auxv/mod.rs b/src/header/sys_auxv/mod.rs
+index dbd26a8..ced973e 100644
+--- a/src/header/sys_auxv/mod.rs
++++ b/src/header/sys_auxv/mod.rs
+@@ -4,10 +4,33 @@
+ 
+ use crate::platform::types::c_ulong;
+ 
+-pub use crate::platform::auxv_defs::*;
++// The AT_* names live here, where cbindgen sees them, so <sys/auxv.h> defines them;
++// the platform module re-exports them.
++#[cfg(any(target_os = "linux", target_os = "feos"))]
++#[path = "../../platform/auxv_defs.rs"]
++pub mod auxv_defs;
++#[cfg(target_os = "redox")]
++pub use redox_rt::auxv_defs;
++
++pub use auxv_defs::*;
+ 
+ /// See <https://www.man7.org/linux/man-pages/man3/getauxval.3.html>.
++#[cfg(not(target_os = "feos"))]
+ #[unsafe(no_mangle)]
+ pub extern "C" fn getauxval(_t: c_ulong) -> c_ulong {
+     0
+ }
++
++/// The value of the aux vector's `t` entry, from the vector saved at start; 0 and
++/// `ENOENT` if there's none.
++#[cfg(target_os = "feos")]
++#[unsafe(no_mangle)]
++pub extern "C" fn getauxval(t: c_ulong) -> c_ulong {
++    match crate::platform::sys::getauxval(t as usize) {
++        Some(value) => value as c_ulong,
++        None => {
++            crate::platform::ERRNO.set(crate::header::errno::ENOENT);
++            0
++        }
++    }
++}
+diff --git a/src/header/sys_epoll/mod.rs b/src/header/sys_epoll/mod.rs
+index b4180e2..a02a215 100644
+--- a/src/header/sys_epoll/mod.rs
++++ b/src/header/sys_epoll/mod.rs
+@@ -14,7 +14,7 @@ use crate::{
+ };
+ 
+ /// Set the close-on-exec (`FD_CLOEXEC`) flag on the new file descriptor.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ pub const EPOLL_CLOEXEC: c_int = 0x8_0000;
+ 
+ /// Set the close-on-exec (`FD_CLOEXEC`) flag on the new file descriptor.
+diff --git a/src/header/sys_ioctl/mod.rs b/src/header/sys_ioctl/mod.rs
+index 7f53d5f..a2c16e9 100644
+--- a/src/header/sys_ioctl/mod.rs
++++ b/src/header/sys_ioctl/mod.rs
+@@ -31,7 +31,7 @@ pub struct sgttyb {
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn ioctl(fd: c_int, request: c_ulong, out: *mut c_void) -> c_int {
+     // TODO: Somehow support varargs to syscall??
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "feos"))]
+     unsafe {
+         crate::platform::Sys::ioctl(fd, request, out).or_minus_one_errno()
+     }
+@@ -39,10 +39,10 @@ pub unsafe extern "C" fn ioctl(fd: c_int, request: c_ulong, out: *mut c_void) ->
+     unsafe { self::redox::ioctl_inner(fd, request, out) }.or_minus_one_errno()
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ pub use self::linux::*;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ pub mod linux;
+ 
+ #[cfg(target_os = "redox")]
+diff --git a/src/header/sys_mman/mod.rs b/src/header/sys_mman/mod.rs
+index e48d084..8a06695 100644
+--- a/src/header/sys_mman/mod.rs
++++ b/src/header/sys_mman/mod.rs
+@@ -14,7 +14,7 @@ use crate::{
+ 
+ pub use self::sys::*;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ #[path = "linux.rs"]
+ pub mod sys;
+ 
+@@ -175,7 +175,7 @@ pub unsafe extern "C" fn munmap(addr: *mut c_void, len: size_t) -> c_int {
+         .or_minus_one_errno()
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ static SHM_PATH: &[u8] = b"/dev/shm/";
+ 
+ #[cfg(target_os = "redox")]
+diff --git a/src/header/sys_select/mod.rs b/src/header/sys_select/mod.rs
+index 46659ef..83cbf01 100644
+--- a/src/header/sys_select/mod.rs
++++ b/src/header/sys_select/mod.rs
+@@ -186,6 +186,99 @@ pub unsafe fn select_epoll(
+     count
+ }
+ 
++/// `select` over `poll`, for platforms without epoll (feos): the sets become
++/// `pollfd`s and back. `POLLNVAL` is `EBADF`, as `select` reports a closed descriptor.
++#[cfg(target_os = "feos")]
++pub unsafe fn select_poll(
++    nfds: c_int,
++    mut readfds: Option<&mut fd_set>,
++    mut writefds: Option<&mut fd_set>,
++    mut exceptfds: Option<&mut fd_set>,
++    timeout: Option<&mut timeval>,
++    sigmask: *const sigset_t,
++) -> c_int {
++    use crate::{
++        header::poll::{POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT, POLLPRI, pollfd},
++        platform::{Pal, Sys},
++    };
++    use alloc::vec::Vec;
++
++    if nfds < 0 || nfds > i32::try_from(FD_SETSIZE).expect("constant value within i32::MAX") {
++        crate::platform::ERRNO.set(errno::EINVAL);
++        return -1;
++    }
++    let mut fds = Vec::new();
++    for fd in 0..nfds as usize {
++        let mut events = 0;
++        if readfds.as_ref().is_some_and(|s| s.fds_bits.contains(fd)) {
++            events |= POLLIN;
++        }
++        if writefds.as_ref().is_some_and(|s| s.fds_bits.contains(fd)) {
++            events |= POLLOUT;
++        }
++        if exceptfds.as_ref().is_some_and(|s| s.fds_bits.contains(fd)) {
++            events |= POLLPRI;
++        }
++        if events != 0 {
++            fds.push(pollfd {
++                fd: fd as c_int,
++                events,
++                revents: 0,
++            });
++        }
++    }
++    let timeout = timeout.map(|t| timespec {
++        tv_sec: t.tv_sec,
++        tv_nsec: t.tv_usec as crate::platform::types::c_long * 1000,
++    });
++    let sigmask = unsafe { sigmask.as_ref() };
++    if let Err(err) = Sys::ppoll(&mut fds, timeout.as_ref(), sigmask) {
++        crate::platform::ERRNO.set(err.0);
++        return -1;
++    }
++    if fds.iter().any(|p| p.revents & POLLNVAL != 0) {
++        crate::platform::ERRNO.set(errno::EBADF);
++        return -1;
++    }
++    if let Some(set) = readfds.as_mut() {
++        set.fds_bits.clear();
++    }
++    if let Some(set) = writefds.as_mut() {
++        set.fds_bits.clear();
++    }
++    if let Some(set) = exceptfds.as_mut() {
++        set.fds_bits.clear();
++    }
++    let mut count = 0;
++    for p in &fds {
++        let fd = p.fd as usize;
++        if p.revents & (POLLIN | POLLHUP | POLLERR) != 0 && p.events & POLLIN != 0
++            && let Some(set) = readfds.as_mut()
++        {
++            set.fds_bits.insert(fd);
++            count += 1;
++        }
++        if p.revents & (POLLOUT | POLLERR) != 0 && p.events & POLLOUT != 0
++            && let Some(set) = writefds.as_mut()
++        {
++            set.fds_bits.insert(fd);
++            count += 1;
++        }
++        if p.revents & POLLPRI != 0
++            && let Some(set) = exceptfds.as_mut()
++        {
++            set.fds_bits.insert(fd);
++            count += 1;
++        }
++    }
++    count
++}
++
++#[cfg(target_os = "feos")]
++use select_poll as select_impl;
++#[cfg(not(target_os = "feos"))]
++use select_epoll as select_impl;
++
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/select.html>.
+ ///
+ /// Examines the file descriptor sets whose addresses are passed in the
+@@ -209,7 +302,7 @@ pub unsafe extern "C" fn select(
+ ) -> c_int {
+     trace_expr!(
+         unsafe {
+-            select_epoll(
++            select_impl(
+                 nfds,
+                 if readfds.is_null() {
+                     None
+@@ -275,7 +368,7 @@ pub unsafe extern "C" fn pselect(
+     };
+     trace_expr!(
+         unsafe {
+-            select_epoll(
++            select_impl(
+                 nfds,
+                 if readfds.is_null() {
+                     None
+diff --git a/src/header/sys_syslog/mod.rs b/src/header/sys_syslog/mod.rs
+index daed58f..1a2b240 100644
+--- a/src/header/sys_syslog/mod.rs
++++ b/src/header/sys_syslog/mod.rs
+@@ -8,7 +8,7 @@
+ #[path = "redox.rs"]
+ pub mod sys;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ #[path = "linux.rs"]
+ pub mod sys;
+ 
+diff --git a/src/header/termios/mod.rs b/src/header/termios/mod.rs
+index 5b2b324..1bbfaf0 100644
+--- a/src/header/termios/mod.rs
++++ b/src/header/termios/mod.rs
+@@ -17,7 +17,7 @@ pub use self::sys::*;
+ pub mod constants;
+ pub use constants::*;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ #[path = "linux.rs"]
+ pub mod sys;
+ 
+@@ -56,7 +56,7 @@ pub const TCSADRAIN: c_int = 1;
+ pub const TCSAFLUSH: c_int = 2;
+ 
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/termios.h.html>.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ #[repr(C)]
+ #[derive(Default, Clone)]
+ pub struct termios {
+@@ -165,7 +165,7 @@ pub unsafe extern "C" fn tcgetsid(fildes: c_int) -> pid_t {
+ /// Infallible. Always returns a value.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn cfgetispeed(termios_p: *const termios) -> speed_t {
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "feos"))]
+     {
+         unsafe { (*termios_p).__c_ispeed }
+     }
+@@ -189,7 +189,7 @@ pub unsafe extern "C" fn cfgetispeed(termios_p: *const termios) -> speed_t {
+ /// Infallible. Always returns a value.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn cfgetospeed(termios_p: *const termios) -> speed_t {
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "feos"))]
+     {
+         unsafe { (*termios_p).__c_ospeed }
+     }
+@@ -213,7 +213,7 @@ pub unsafe extern "C" fn cfgetospeed(termios_p: *const termios) -> speed_t {
+ pub unsafe extern "C" fn cfsetispeed(termios_p: *mut termios, speed: speed_t) -> c_int {
+     match speed as usize {
+         // TODO redox impl
+-        #[cfg(target_os = "linux")]
++        #[cfg(any(target_os = "linux", target_os = "feos"))]
+         B0..=B38400 | B57600..=B4000000 => {
+             unsafe { (*termios_p).__c_ispeed = speed };
+             0
+@@ -238,7 +238,7 @@ pub unsafe extern "C" fn cfsetispeed(termios_p: *mut termios, speed: speed_t) ->
+ pub unsafe extern "C" fn cfsetospeed(termios_p: *mut termios, speed: speed_t) -> c_int {
+     match speed as usize {
+         // TODO redox impl
+-        #[cfg(target_os = "linux")]
++        #[cfg(any(target_os = "linux", target_os = "feos"))]
+         B0..=B38400 | B57600..=B4000000 => {
+             unsafe { (*termios_p).__c_ospeed = speed };
+             0
+diff --git a/src/header/time/constants.rs b/src/header/time/constants.rs
+index b44b411..2a9ce45 100644
+--- a/src/header/time/constants.rs
++++ b/src/header/time/constants.rs
+@@ -1,6 +1,6 @@
+ use crate::platform::types::{c_char, c_int, c_long, clockid_t};
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ #[path = "linux.rs"]
+ pub mod sys;
+ 
+diff --git a/src/header/unistd/mod.rs b/src/header/unistd/mod.rs
+index 6ac9123..c73946e 100644
+--- a/src/header/unistd/mod.rs
++++ b/src/header/unistd/mod.rs
+@@ -1347,9 +1347,9 @@ pub extern "C" fn ttyname_r(fildes: c_int, name: *mut c_char, namesize: size_t)
+ #[unsafe(no_mangle)]
+ pub extern "C" fn ualarm(usecs: useconds_t, interval: useconds_t) -> useconds_t {
+     // TODO setitimer is unimplemented on Redox and obsolete
+-    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
++    #[cfg(all(any(target_os = "linux", target_os = "feos"), target_pointer_width = "64"))]
+     let (val_usec, int_usec) = (suseconds_t::from(usecs), suseconds_t::from(interval));
+-    #[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
++    #[cfg(not(all(any(target_os = "linux", target_os = "feos"), target_pointer_width = "64")))]
+     let (val_usec, int_usec) = (
+         suseconds_t::try_from(usecs).unwrap_or(suseconds_t::MAX),
+         suseconds_t::try_from(interval).unwrap_or(suseconds_t::MAX),
+diff --git a/src/header/unistd/sysconf.rs b/src/header/unistd/sysconf.rs
+index 50a40fe..ae7827b 100644
+--- a/src/header/unistd/sysconf.rs
++++ b/src/header/unistd/sysconf.rs
+@@ -6,7 +6,7 @@
+ #[path = "sysconf/redox.rs"]
+ mod sys;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ #[path = "sysconf/linux.rs"]
+ mod sys;
+ 
+diff --git a/src/header/unistd/sysconf/linux.rs b/src/header/unistd/sysconf/linux.rs
+index e7ac72a..39947c9 100644
+--- a/src/header/unistd/sysconf/linux.rs
++++ b/src/header/unistd/sysconf/linux.rs
+@@ -127,6 +127,11 @@ const _POSIX_VERSION: c_long = 200809;
+ const _XOPEN_VERSION: c_long = 700;
+ 
+ pub(super) fn sysconf_impl(name: c_int) -> c_long {
++    // feos shares this table and answers what the kernel knows from SYSINFO.
++    #[cfg(target_os = "feos")]
++    if let Some(value) = crate::platform::sys::sysconf(name) {
++        return value;
++    }
+     // Values from musl which we can assume is correct.
+     match name {
+         _SC_CLK_TCK => 100,
+diff --git a/src/ld_so/mod.rs b/src/ld_so/mod.rs
+index af5b90e..526ce21 100644
+--- a/src/ld_so/mod.rs
++++ b/src/ld_so/mod.rs
+@@ -107,6 +107,10 @@ fn static_init(
+                 p_memsz
+             };
+ 
++            // The thread pointer goes this far below the block (see AARCH64_TP_GAP).
++            #[cfg(all(any(target_os = "linux", target_os = "feos"), target_arch = "aarch64"))]
++            tcb::AARCH64_TP_GAP.store(p_align.clamp(16, page_size), core::sync::atomic::Ordering::Relaxed);
++
+             unsafe {
+                 STATIC_TCB_MASTER.ptr = p_vaddr as *const u8;
+                 STATIC_TCB_MASTER.image_size = p_filesz;
+@@ -128,7 +132,7 @@ fn static_init(
+     }
+ }
+ 
+-#[cfg(any(target_os = "linux", target_os = "redox"))]
++#[cfg(any(target_os = "linux", target_os = "redox", target_os = "feos"))]
+ pub unsafe fn init(
+     sp: &'static Stack,
+     #[cfg(target_os = "redox")] thr_fd: redox_rt::proc::FdGuardUpper,
+@@ -142,6 +146,13 @@ pub unsafe fn init(
+         syscall!(ARCH_PRCTL, ARCH_GET_FS, &raw mut val);
+         tp = val;
+     }
++    // feos starts a program with its TLS register zero (section 7.1 of its ABI), and
++    // user mode can't read FS_BASE; a program loaded by an interpreter (AT_BASE set) has
++    // had its TLS set up by it.
++    #[cfg(all(target_os = "feos", target_arch = "x86_64"))]
++    {
++        tp = unsafe { crate::platform::get_auxv_raw(sp.auxv().cast(), crate::header::sys_auxv::AT_BASE) }.unwrap_or(0);
++    }
+     #[cfg(target_arch = "aarch64")]
+     unsafe {
+         core::arch::asm!(
+diff --git a/src/ld_so/tcb.rs b/src/ld_so/tcb.rs
+index fbb9927..ee4f41e 100644
+--- a/src/ld_so/tcb.rs
++++ b/src/ld_so/tcb.rs
+@@ -18,6 +18,15 @@ use crate::{
+ 
+ use super::linker::DlError;
+ 
++/// AArch64's TLS (variant I): how far the thread pointer is below the executable's TLS
++/// block. The static linker places that block at `max(16, its PT_TLS alignment)` above
++/// the thread pointer, so a block aligned to more than 16 (`__thread` data with
++/// `aligned(64)`, say) needs more than the 16 bytes the TCB itself takes, or every
++/// variable in it is read from the wrong place. Set by `static_init` from PT_TLS (at most a
++/// page, the ABI page below the block); 16 until then.
++#[cfg(all(any(target_os = "linux", target_os = "feos"), target_arch = "aarch64"))]
++pub static AARCH64_TP_GAP: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(16);
++
+ #[repr(C)]
+ #[derive(Debug, Clone)]
+ pub struct Master {
+@@ -37,7 +46,7 @@ impl Master {
+     }
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ pub type OsSpecific = ();
+ 
+ #[cfg(target_os = "redox")]
+@@ -331,7 +340,7 @@ impl Tcb {
+     ///
+     /// For x86_64, the ABI page is not used.
+     #[expect(clippy::type_complexity)]
+-    #[cfg(any(target_os = "linux", target_os = "redox"))]
++    #[cfg(any(target_os = "linux", target_os = "redox", target_os = "feos"))]
+     unsafe fn os_new(
+         size: usize,
+     ) -> Result<(&'static mut [u8], &'static mut [u8], &'static mut [u8]), DlError> {
+@@ -354,7 +363,7 @@ impl Tcb {
+     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+     unsafe fn os_arch_activate(_os: &(), tls_end: usize, tls_len: usize) {
+         // Uses ABI page
+-        let abi_ptr = tls_end - tls_len - 16;
++        let abi_ptr = tls_end - tls_len - AARCH64_TP_GAP.load(core::sync::atomic::Ordering::Relaxed);
+         unsafe {
+             core::ptr::write(abi_ptr as *mut usize, tls_end);
+             core::arch::asm!(
+@@ -364,6 +373,23 @@ impl Tcb {
+         }
+     }
+ 
++    /// OS and architecture specific code to activate TLS - feos: the `SET_TLS` call sets
++    /// `FS_BASE` (x86_64) or `TPIDR_EL0` (AArch64), with the Linux layouts above.
++    #[cfg(all(target_os = "feos", target_arch = "x86_64"))]
++    unsafe fn os_arch_activate(_os: &(), tls_end: usize, _tls_len: usize) {
++        unsafe { Sys::set_tls(tls_end) }.expect("SET_TLS failed");
++    }
++
++    #[cfg(all(target_os = "feos", target_arch = "aarch64"))]
++    unsafe fn os_arch_activate(_os: &(), tls_end: usize, tls_len: usize) {
++        // Uses ABI page
++        let abi_ptr = tls_end - tls_len - AARCH64_TP_GAP.load(core::sync::atomic::Ordering::Relaxed);
++        unsafe {
++            core::ptr::write(abi_ptr as *mut usize, tls_end);
++            Sys::set_tls(abi_ptr).expect("SET_TLS failed");
++        }
++    }
++
+     #[cfg(target_os = "redox")]
+     unsafe fn os_arch_activate(
+         os: &OsSpecific,
+diff --git a/src/macros.rs b/src/macros.rs
+index 065e332..4acd919 100644
+--- a/src/macros.rs
++++ b/src/macros.rs
+@@ -526,7 +526,9 @@ macro_rules! OutProject {
+     }
+ }
+ #[macro_export]
+-#[cfg(not(feature = "check_against_libc_crate"))]
++// The libc crate has no feos module yet (it gets one with the Rust target), so there is
++// nothing to check feos's layouts against.
++#[cfg(any(not(feature = "check_against_libc_crate"), target_os = "feos"))]
+ macro_rules! CheckVsLibcCrate {
+     derive() { $(#[$($attrs:meta),*])* $v:vis struct $name:ident {
+         $(
+@@ -567,7 +569,7 @@ impl LibcTypeEquals<crate::platform::types::c_void, crate::platform::types::c_vo
+ /// Derive macro which checks that structs here are defined the same as in the libc crate. Perhaps
+ /// not sufficiently rigorous to soundly cast between the types, but should catch most mistakes.
+ #[macro_export]
+-#[cfg(feature = "check_against_libc_crate")]
++#[cfg(all(feature = "check_against_libc_crate", not(target_os = "feos")))]
+ macro_rules! CheckVsLibcCrate {
+     // XXX: not sure we can have the name be different from libc::$name without parameters to the
+     // derive macro
+diff --git a/src/platform/auxv_defs.rs b/src/platform/auxv_defs.rs
+index face5b1..69b5cc3 100644
+--- a/src/platform/auxv_defs.rs
++++ b/src/platform/auxv_defs.rs
+@@ -26,6 +26,21 @@ pub const AT_RANDOM: usize = 25; /* Address of 16 random bytes.  */
+ pub const AT_HWCAP2: usize = 26; /* More machine-dependent hints about*/
+ pub const AT_EXECFN: usize = 31; /* Filename of executable.  */
+ 
++pub const AT_MINSIGSTKSZ: usize = 51; /* Minimal stack size for signal delivery.  */
++
++/// feos: the kernel's `ABI_VERSION`.
++#[cfg(target_os = "feos")]
++pub const AT_FEOS_ABI: usize = 0x6665_0001;
++/// feos: bit 0 set when `AT_RANDOM` came from the kernel's CSPRNG.
++#[cfg(target_os = "feos")]
++pub const AT_FEOS_FLAGS: usize = 0x6665_0002;
++/// feos: the kernel's stage feature mask.
++#[cfg(target_os = "feos")]
++pub const AT_FEOS_FEATURES: usize = 0x6665_0003;
++/// feos: the program's canonical absolute path.
++#[cfg(target_os = "feos")]
++pub const AT_FEOS_EXE: usize = 0x6665_0004;
++
+ // TODO: Downgrade aux vectors to getauxval constants on Redox, and use a regular struct for
+ // passing important runtime info between exec (or posix_spawn in the future) calls.
+ 
+diff --git a/src/platform/feos/abi.rs b/src/platform/feos/abi.rs
+new file mode 100644
+index 0000000..d249c28
+--- /dev/null
++++ b/src/platform/feos/abi.rs
+@@ -0,0 +1,714 @@
++//! The feos kernel interface as relibc uses it: call numbers, structures and the
++//! constants that aren't already relibc's (feos's error numbers and file, memory and
++//! signal constants are Linux's, the values relibc's headers already have).
++//!
++//! This is the one place the feos platform keeps them. It's written from
++//! `docs/feos-abi-v2.md` (sections 3 to 7) and has no dependencies, so a host test
++//! (`ports/test/abi-check` in the feos tree) can include it and compare it with the
++//! kernel's own `feos-abi` crate.
++
++#![allow(dead_code)]
++
++/// The `ABI_VERSION` relibc needs: 2, the v2 layout.
++pub const ABI_VERSION: u32 = 2;
++
++/// The stage feature bits relibc needs set (section 1 and 12 of the design): every
++/// stage up to and including 1c.6 (bit 16), the last whose calls relibc can't do
++/// without. Calls of later stages are made anyway and their `ENOSYS` passed on.
++pub const FEATURES_REQUIRED: u64 = (1 << 17) - 1;
++
++/// Page size on both ports.
++pub const PAGE_SIZE: usize = 4096;
++
++/// Section 6: the layout of a process's window.
++pub const USER_BASE: usize = 0x10_0000_0000;
++pub const USER_END: usize = 0x80_0000_0000;
++pub const USER_STACK_TOP: usize = USER_END - 0x1000;
++pub const USER_ARGS_SIZE: usize = 2 * 1024 * 1024;
++pub const USER_STACK_SIZE: usize = 8 * 1024 * 1024;
++pub const USER_STACK_GUARD: usize = 1024 * 1024 * 1024;
++/// Where `ET_EXEC` programs are linked (`user/link.ld`, and the target specs'
++/// `--image-base`).
++pub const USER_IMAGE_BASE: usize = USER_BASE + 0x40_0000;
++
++/// System call numbers.
++pub mod nr {
++    pub const EXIT: usize = 0;
++    pub const WRITE: usize = 1;
++    pub const READ: usize = 2;
++    pub const CLOSE: usize = 4;
++    pub const YIELD: usize = 6;
++    pub const GETPID: usize = 7;
++    pub const MUNMAP: usize = 9;
++    pub const WAIT: usize = 11;
++    pub const FUTEX_WAKE: usize = 13;
++    pub const SEEK: usize = 15;
++    pub const GETUID: usize = 21;
++    pub const GETGID: usize = 22;
++    pub const SETUID: usize = 23;
++    pub const MPROTECT: usize = 30;
++    pub const MMAP2: usize = 31;
++    pub const MADVISE: usize = 32;
++    pub const MSYNC: usize = 33;
++    pub const THREAD_CREATE: usize = 34;
++    pub const THREAD_EXIT: usize = 35;
++    pub const GETTID: usize = 36;
++    pub const SET_TLS: usize = 37;
++    pub const FUTEX_WAIT2: usize = 38;
++    pub const CLOCK_GETTIME: usize = 39;
++    pub const CLOCK_GETRES: usize = 40;
++    pub const NANOSLEEP: usize = 41;
++    pub const OPENAT: usize = 42;
++    pub const FSTATAT: usize = 43;
++    pub const GETDENTS: usize = 44;
++    pub const MKDIRAT: usize = 45;
++    pub const UNLINKAT: usize = 46;
++    pub const RENAMEAT: usize = 47;
++    pub const LINKAT: usize = 48;
++    pub const SYMLINKAT: usize = 49;
++    pub const READLINKAT: usize = 50;
++    pub const FCHMODAT: usize = 51;
++    pub const FCHOWNAT: usize = 52;
++    pub const UTIMENSAT: usize = 53;
++    pub const FACCESSAT: usize = 54;
++    pub const FTRUNCATE: usize = 55;
++    pub const FSYNC: usize = 56;
++    pub const PREAD: usize = 57;
++    pub const PWRITE: usize = 58;
++    pub const DUP3: usize = 59;
++    pub const FCNTL: usize = 60;
++    pub const PIPE2: usize = 61;
++    pub const FCHDIR: usize = 62;
++    pub const GETCWD: usize = 63;
++    pub const UMASK: usize = 64;
++    pub const FD_PATH: usize = 65;
++    pub const CURRENT_EXE: usize = 66;
++    pub const FSTATVFS: usize = 67;
++    pub const SYNC: usize = 68;
++    pub const FLOCK: usize = 69;
++    pub const IOCTL: usize = 70;
++    pub const POLL: usize = 71;
++    pub const SPAWN2: usize = 72;
++    pub const EXEC: usize = 73;
++    pub const WAIT4: usize = 74;
++    pub const GETPPID: usize = 75;
++    pub const GETPGID: usize = 76;
++    pub const SETPGID: usize = 77;
++    pub const GETSID: usize = 78;
++    pub const SETSID: usize = 79;
++    pub const GETRUSAGE: usize = 80;
++    pub const SYSINFO: usize = 81;
++    pub const KILL: usize = 82;
++    pub const THREAD_KILL: usize = 83;
++    pub const SIGACTION: usize = 84;
++    pub const SIGPROCMASK: usize = 85;
++    pub const SIGALTSTACK: usize = 86;
++    pub const SIGPENDING: usize = 87;
++    pub const SIGSUSPEND: usize = 88;
++    pub const SIGRETURN: usize = 89;
++    pub const FORK: usize = 90;
++    pub const CLOCK_SETTIME: usize = 91;
++    pub const GETRANDOM: usize = 92;
++    pub const SOCKET: usize = 93;
++    pub const SOCKETPAIR: usize = 94;
++    pub const BIND: usize = 95;
++    pub const LISTEN: usize = 96;
++    pub const ACCEPT: usize = 97;
++    pub const CONNECT: usize = 98;
++    pub const SENDTO: usize = 99;
++    pub const RECVFROM: usize = 100;
++    pub const SHUTDOWN: usize = 101;
++    pub const GETSOCKOPT: usize = 102;
++    pub const SETSOCKOPT: usize = 103;
++    pub const GETSOCKNAME: usize = 104;
++    pub const GETPEERNAME: usize = 105;
++    pub const RESOLVE: usize = 106;
++    pub const CLOSE_RANGE: usize = 107;
++    pub const SETITIMER: usize = 108;
++}
++
++/// The error numbers feos returns (Linux's numbers: section 5.1). relibc's own
++/// `errno.h` values are checked against these at build time.
++pub mod errno {
++    pub const EPERM: i32 = 1;
++    pub const ENOENT: i32 = 2;
++    pub const ESRCH: i32 = 3;
++    pub const EINTR: i32 = 4;
++    pub const EIO: i32 = 5;
++    pub const ENXIO: i32 = 6;
++    pub const E2BIG: i32 = 7;
++    pub const ENOEXEC: i32 = 8;
++    pub const EBADF: i32 = 9;
++    pub const ECHILD: i32 = 10;
++    pub const EAGAIN: i32 = 11;
++    pub const ENOMEM: i32 = 12;
++    pub const EACCES: i32 = 13;
++    pub const EFAULT: i32 = 14;
++    pub const EBUSY: i32 = 16;
++    pub const EEXIST: i32 = 17;
++    pub const EXDEV: i32 = 18;
++    pub const ENODEV: i32 = 19;
++    pub const ENOTDIR: i32 = 20;
++    pub const EISDIR: i32 = 21;
++    pub const EINVAL: i32 = 22;
++    pub const ENFILE: i32 = 23;
++    pub const EMFILE: i32 = 24;
++    pub const ENOTTY: i32 = 25;
++    pub const ETXTBSY: i32 = 26;
++    pub const EFBIG: i32 = 27;
++    pub const ENOSPC: i32 = 28;
++    pub const ESPIPE: i32 = 29;
++    pub const EROFS: i32 = 30;
++    pub const EMLINK: i32 = 31;
++    pub const EPIPE: i32 = 32;
++    pub const ERANGE: i32 = 34;
++    pub const EDEADLK: i32 = 35;
++    pub const ENAMETOOLONG: i32 = 36;
++    pub const ENOLCK: i32 = 37;
++    pub const ENOSYS: i32 = 38;
++    pub const ENOTEMPTY: i32 = 39;
++    pub const ELOOP: i32 = 40;
++    pub const EOVERFLOW: i32 = 75;
++    pub const EILSEQ: i32 = 84;
++    pub const ENOTSOCK: i32 = 88;
++    pub const EDESTADDRREQ: i32 = 89;
++    pub const EMSGSIZE: i32 = 90;
++    pub const EPROTOTYPE: i32 = 91;
++    pub const ENOPROTOOPT: i32 = 92;
++    pub const EPROTONOSUPPORT: i32 = 93;
++    pub const ESOCKTNOSUPPORT: i32 = 94;
++    pub const EOPNOTSUPP: i32 = 95;
++    pub const EAFNOSUPPORT: i32 = 97;
++    pub const EADDRINUSE: i32 = 98;
++    pub const EADDRNOTAVAIL: i32 = 99;
++    pub const ENETDOWN: i32 = 100;
++    pub const ENETUNREACH: i32 = 101;
++    pub const ECONNABORTED: i32 = 103;
++    pub const ECONNRESET: i32 = 104;
++    pub const ENOBUFS: i32 = 105;
++    pub const EISCONN: i32 = 106;
++    pub const ENOTCONN: i32 = 107;
++    pub const ETIMEDOUT: i32 = 110;
++    pub const ECONNREFUSED: i32 = 111;
++    pub const EHOSTUNREACH: i32 = 113;
++    pub const EALREADY: i32 = 114;
++    pub const EINPROGRESS: i32 = 115;
++}
++
++/// `O_*` (section 5.2), as relibc's.
++pub mod o {
++    pub const RDONLY: i32 = 0;
++    pub const WRONLY: i32 = 1;
++    pub const RDWR: i32 = 2;
++    pub const ACCMODE: i32 = 3;
++    pub const CREAT: i32 = 0o100;
++    pub const EXCL: i32 = 0o200;
++    pub const NOCTTY: i32 = 0o400;
++    pub const TRUNC: i32 = 0o1000;
++    pub const APPEND: i32 = 0o2000;
++    pub const NONBLOCK: i32 = 0o4000;
++    pub const DSYNC: i32 = 0o10000;
++    pub const ASYNC: i32 = 0o20000;
++    pub const DIRECT: i32 = 0o40000;
++    pub const LARGEFILE: i32 = 0o100000;
++    pub const DIRECTORY: i32 = 0o200000;
++    pub const NOFOLLOW: i32 = 0o400000;
++    pub const NOATIME: i32 = 0o1000000;
++    pub const CLOEXEC: i32 = 0o2000000;
++    pub const SYNC: i32 = 0o4010000;
++    pub const PATH: i32 = 0o10000000;
++    pub const TMPFILE: i32 = 0o20200000;
++}
++
++/// `AT_*`.
++pub mod at {
++    pub const FDCWD: i32 = -100;
++    pub const SYMLINK_NOFOLLOW: i32 = 0x100;
++    pub const REMOVEDIR: i32 = 0x200;
++    pub const EACCESS: i32 = 0x200;
++    pub const SYMLINK_FOLLOW: i32 = 0x400;
++    pub const NO_AUTOMOUNT: i32 = 0x800;
++    pub const EMPTY_PATH: i32 = 0x1000;
++}
++
++/// `F_*`, `FD_CLOEXEC`.
++pub mod f {
++    pub const DUPFD: i32 = 0;
++    pub const GETFD: i32 = 1;
++    pub const SETFD: i32 = 2;
++    pub const GETFL: i32 = 3;
++    pub const SETFL: i32 = 4;
++    pub const GETLK: i32 = 5;
++    pub const SETLK: i32 = 6;
++    pub const SETLKW: i32 = 7;
++    pub const DUPFD_CLOEXEC: i32 = 1030;
++    pub const FD_CLOEXEC: i32 = 1;
++}
++
++/// `S_IF*`.
++pub mod s_if {
++    pub const MASK: u32 = 0o170000;
++    pub const SOCK: u32 = 0o140000;
++    pub const LNK: u32 = 0o120000;
++    pub const REG: u32 = 0o100000;
++    pub const BLK: u32 = 0o60000;
++    pub const DIR: u32 = 0o40000;
++    pub const CHR: u32 = 0o20000;
++    pub const FIFO: u32 = 0o10000;
++}
++
++/// `PROT_*` and `MAP_*` (section 5.3).
++pub mod prot {
++    pub const NONE: i32 = 0;
++    pub const READ: i32 = 1;
++    pub const WRITE: i32 = 2;
++    pub const EXEC: i32 = 4;
++}
++
++pub mod map {
++    pub const SHARED: i32 = 0x01;
++    pub const PRIVATE: i32 = 0x02;
++    pub const SHARED_VALIDATE: i32 = 0x03;
++    pub const FIXED: i32 = 0x10;
++    pub const ANONYMOUS: i32 = 0x20;
++    pub const NORESERVE: i32 = 0x4000;
++    pub const POPULATE: i32 = 0x8000;
++    pub const STACK: i32 = 0x20000;
++    pub const FIXED_NOREPLACE: i32 = 0x10_0000;
++}
++
++/// Clocks (section 3.2).
++pub mod clock {
++    pub const REALTIME: usize = 0;
++    pub const MONOTONIC: usize = 1;
++    pub const PROCESS_CPUTIME_ID: usize = 2;
++    pub const THREAD_CPUTIME_ID: usize = 3;
++    pub const MONOTONIC_RAW: usize = 4;
++    pub const REALTIME_COARSE: usize = 5;
++    pub const MONOTONIC_COARSE: usize = 6;
++    pub const BOOTTIME: usize = 7;
++}
++
++/// `SEEK_*`.
++pub mod seek {
++    pub const SET: usize = 0;
++    pub const CURRENT: usize = 1;
++    pub const END: usize = 2;
++}
++
++/// `FSYNC`'s flag for `fdatasync`.
++pub const FSYNC_DATA: usize = 1;
++
++/// `posix_spawn`'s attribute flags: glibc's and musl's values (section 3.4), which the
++/// feos `spawn.h` uses, so they pass to `SPAWN2` unchanged.
++pub mod spawn {
++    pub const RESETIDS: u64 = 1;
++    pub const SETPGROUP: u64 = 2;
++    pub const SETSIGDEF: u64 = 4;
++    pub const SETSIGMASK: u64 = 8;
++    pub const SETSCHEDPARAM: u64 = 0x10;
++    pub const SETSCHEDULER: u64 = 0x20;
++    pub const USEVFORK: u64 = 0x40;
++    pub const SETSID: u64 = 0x80;
++    pub const EMPTY_PATH: u64 = 0x1000;
++    /// Most bytes of strings and pointers one request may carry.
++    pub const ARG_MAX: usize = 1024 * 1024;
++}
++
++/// `SpawnAction::kind`.
++pub mod spawn_action {
++    pub const CLOSE: u32 = 1;
++    pub const DUP2: u32 = 2;
++    pub const OPEN: u32 = 3;
++    pub const CHDIR: u32 = 4;
++    pub const FCHDIR: u32 = 5;
++    pub const CLOSEFROM: u32 = 6;
++    pub const TCSETPGRP: u32 = 7;
++}
++
++/// The aux vector's types (section 7.2).
++pub mod aux {
++    pub const NULL: usize = 0;
++    pub const PHDR: usize = 3;
++    pub const PHENT: usize = 4;
++    pub const PHNUM: usize = 5;
++    pub const PAGESZ: usize = 6;
++    pub const BASE: usize = 7;
++    pub const FLAGS: usize = 8;
++    pub const ENTRY: usize = 9;
++    pub const UID: usize = 11;
++    pub const EUID: usize = 12;
++    pub const GID: usize = 13;
++    pub const EGID: usize = 14;
++    pub const PLATFORM: usize = 15;
++    pub const HWCAP: usize = 16;
++    pub const CLKTCK: usize = 17;
++    pub const SECURE: usize = 23;
++    pub const RANDOM: usize = 25;
++    pub const HWCAP2: usize = 26;
++    pub const EXECFN: usize = 31;
++    pub const MINSIGSTKSZ: usize = 51;
++    pub const FEOS_ABI: usize = 0x6665_0001;
++    pub const FEOS_FLAGS: usize = 0x6665_0002;
++    pub const FEOS_FEATURES: usize = 0x6665_0003;
++    pub const FEOS_EXE: usize = 0x6665_0004;
++}
++
++/// `WAIT4`'s options.
++pub mod wait {
++    pub const NOHANG: i32 = 1;
++    pub const UNTRACED: i32 = 2;
++    pub const CONTINUED: i32 = 8;
++}
++
++/// `IOCTL` request numbers: feos's own, not Linux's (section 3.3, `IOCTL`).
++pub mod ioctl {
++    pub const TTY_GET_ATTR: usize = 1;
++    pub const TTY_SET_ATTR: usize = 2;
++    pub const TTY_SET_ATTR_DRAIN: usize = 3;
++    pub const TTY_SET_ATTR_FLUSH: usize = 4;
++    pub const TTY_GET_WINSIZE: usize = 5;
++    pub const TTY_SET_WINSIZE: usize = 6;
++    pub const TTY_GET_PGRP: usize = 7;
++    pub const TTY_SET_PGRP: usize = 8;
++    pub const FD_NREAD: usize = 9;
++    pub const TTY_DRAIN: usize = 10;
++    pub const TTY_FLUSH: usize = 11;
++    pub const TTY_FLOW: usize = 12;
++    pub const TTY_GET_SID: usize = 13;
++}
++
++/// `RUSAGE_*`.
++pub mod rusage {
++    pub const SELF: i32 = 0;
++    pub const CHILDREN: i32 = -1;
++    pub const THREAD: i32 = 1;
++}
++
++/// A string by pointer and length, not terminated.
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Default)]
++pub struct UserStr {
++    pub pointer: usize,
++    pub length: usize,
++}
++
++/// A path relative to a directory. A request struct: `reserved` is zero.
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Default)]
++pub struct PathAt {
++    pub dirfd: i32,
++    pub reserved: u32,
++    pub pointer: u64,
++    pub length: u64,
++}
++
++/// Linux's `struct timespec`.
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Default)]
++pub struct Timespec {
++    pub sec: i64,
++    pub nsec: i64,
++}
++
++/// Linux's `struct timeval`.
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Default)]
++pub struct Timeval {
++    pub sec: i64,
++    pub usec: i64,
++}
++
++/// `SETITIMER`'s `struct itimerval`.
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Default)]
++pub struct ITimerVal {
++    pub interval: Timeval,
++    pub value: Timeval,
++}
++
++/// What `FSTATAT` fills in.
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Default)]
++pub struct Stat2 {
++    pub dev: u64,
++    pub ino: u64,
++    pub mode: u32,
++    pub nlink: u32,
++    pub uid: u32,
++    pub gid: u32,
++    pub rdev: u64,
++    pub size: i64,
++    pub blksize: i64,
++    pub blocks: i64,
++    pub atime: Timespec,
++    pub mtime: Timespec,
++    pub ctime: Timespec,
++    pub btime: Timespec,
++    pub flags: u32,
++    pub reserved0: u32,
++    pub reserved1: u64,
++}
++
++/// The fixed part of a `GETDENTS` record (`linux_dirent64`); the name follows at
++/// `DIRENT_HEADER`.
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Default)]
++pub struct Dirent {
++    pub ino: u64,
++    pub off: i64,
++    pub reclen: u16,
++    pub kind: u8,
++}
++pub const DIRENT_HEADER: usize = 19;
++
++/// What `FSTATVFS` fills in: Linux's `struct statvfs` on 64-bit.
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Default)]
++pub struct StatVfs {
++    pub bsize: u64,
++    pub frsize: u64,
++    pub blocks: u64,
++    pub bfree: u64,
++    pub bavail: u64,
++    pub files: u64,
++    pub ffree: u64,
++    pub favail: u64,
++    pub fsid: u64,
++    pub flags: u64,
++    pub namemax: u64,
++}
++
++/// Linux's `struct flock` on 64-bit, for `F_GETLK`/`F_SETLK`/`F_SETLKW`.
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Default)]
++pub struct Flock {
++    pub kind: i16,
++    pub whence: i16,
++    pub reserved0: u32,
++    pub start: i64,
++    pub length: i64,
++    pub pid: i32,
++    pub reserved1: u32,
++}
++
++/// Linux's `struct pollfd`.
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Default)]
++pub struct PollFd {
++    pub fd: i32,
++    pub events: i16,
++    pub revents: i16,
++}
++
++/// Linux's `struct termios` (with `c_ispeed`/`c_ospeed`), which relibc's is.
++#[repr(C)]
++#[derive(Clone, Copy, Debug)]
++pub struct Termios {
++    pub iflag: u32,
++    pub oflag: u32,
++    pub cflag: u32,
++    pub lflag: u32,
++    pub line: u8,
++    pub cc: [u8; 32],
++    pub reserved: [u8; 3],
++    pub ispeed: u32,
++    pub ospeed: u32,
++}
++
++/// Linux's `struct winsize`.
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Default)]
++pub struct WinSize {
++    pub rows: u16,
++    pub columns: u16,
++    pub x_pixels: u16,
++    pub y_pixels: u16,
++}
++
++/// `SPAWN2`'s request.
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Default)]
++pub struct SpawnRequest {
++    pub path: PathAt,
++    pub argv: u64,
++    pub argc: u64,
++    pub envp: u64,
++    pub envc: u64,
++    pub actions: u64,
++    pub action_count: u64,
++    pub flags: u64,
++    pub pgroup: i64,
++    pub sigmask: u64,
++    pub sigdefault: u64,
++    pub reserved: [u64; 3],
++}
++
++/// One step of building a `SPAWN2` child's descriptor table.
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Default)]
++pub struct SpawnAction {
++    pub kind: u32,
++    pub fd: i32,
++    pub to: i32,
++    pub open_flags: u32,
++    pub mode: u32,
++    pub reserved: u32,
++    pub path: PathAt,
++}
++
++/// `EXEC`'s request.
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Default)]
++pub struct ExecRequest {
++    pub path: PathAt,
++    pub argv: u64,
++    pub argc: u64,
++    pub envp: u64,
++    pub envc: u64,
++    pub flags: u64,
++    pub reserved: [u64; 2],
++}
++
++/// Linux's `struct rusage` on 64-bit.
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Default)]
++pub struct Rusage {
++    pub utime: Timeval,
++    pub stime: Timeval,
++    pub maxrss: i64,
++    pub ixrss: i64,
++    pub idrss: i64,
++    pub isrss: i64,
++    pub minflt: i64,
++    pub majflt: i64,
++    pub nswap: i64,
++    pub inblock: i64,
++    pub oublock: i64,
++    pub msgsnd: i64,
++    pub msgrcv: i64,
++    pub nsignals: i64,
++    pub nvcsw: i64,
++    pub nivcsw: i64,
++}
++
++/// What `SYSINFO` fills in (as much of it as the size passed asks for).
++#[repr(C)]
++#[derive(Clone, Copy, Debug)]
++pub struct SysInfo {
++    pub abi_version: u32,
++    pub page_size: u32,
++    pub cpus_online: u32,
++    pub cpus_configured: u32,
++    pub total_pages: u64,
++    pub free_pages: u64,
++    pub uptime_ns: u64,
++    pub arg_max: u64,
++    pub fd_max: u32,
++    pub task_max: u32,
++    pub path_max: u32,
++    pub name_max: u32,
++    pub memory_limit: u64,
++    pub release: [u8; 64],
++    pub machine: [u8; 16],
++    pub flags: u64,
++    pub features: u64,
++    pub reserved: [u64; 4],
++}
++
++impl SysInfo {
++    pub const fn zeroed() -> Self {
++        Self {
++            abi_version: 0,
++            page_size: 0,
++            cpus_online: 0,
++            cpus_configured: 0,
++            total_pages: 0,
++            free_pages: 0,
++            uptime_ns: 0,
++            arg_max: 0,
++            fd_max: 0,
++            task_max: 0,
++            path_max: 0,
++            name_max: 0,
++            memory_limit: 0,
++            release: [0; 64],
++            machine: [0; 16],
++            flags: 0,
++            features: 0,
++            reserved: [0; 4],
++        }
++    }
++}
++
++/// `SIGACTION`'s struct.
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Default)]
++pub struct SigAction {
++    pub handler: u64,
++    pub flags: u32,
++    pub reserved: u32,
++    pub restorer: u64,
++    pub mask: u64,
++}
++
++/// `SIGALTSTACK`'s struct: Linux's `stack_t`.
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Default)]
++pub struct SigStack {
++    pub sp: u64,
++    pub flags: i32,
++    pub reserved: u32,
++    pub size: u64,
++}
++
++/// BSD's `sockaddr_in`.
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Default)]
++pub struct SockAddrIn {
++    pub family: u16,
++    pub port: u16,
++    pub address: [u8; 4],
++    pub zero: [u8; 8],
++}
++
++// Section 4's sizes and offsets, so a mistake fails to build.
++macro_rules! layout {
++    ($ty:ty, $size:expr $(, $field:ident = $offset:expr)*) => {
++        const _: () = assert!(core::mem::size_of::<$ty>() == $size);
++        $(const _: () = assert!(core::mem::offset_of!($ty, $field) == $offset);)*
++    };
++}
++
++layout!(PathAt, 24, dirfd = 0, reserved = 4, pointer = 8, length = 16);
++layout!(Timespec, 16, sec = 0, nsec = 8);
++layout!(Timeval, 16, sec = 0, usec = 8);
++layout!(ITimerVal, 32, interval = 0, value = 16);
++layout!(Stat2, 144, dev = 0, ino = 8, mode = 16, nlink = 20, uid = 24, gid = 28, rdev = 32,
++    size = 40, blksize = 48, blocks = 56, atime = 64, mtime = 80, ctime = 96, btime = 112,
++    flags = 128, reserved0 = 132, reserved1 = 136);
++layout!(Dirent, 24, ino = 0, off = 8, reclen = 16, kind = 18);
++layout!(StatVfs, 88, bsize = 0, frsize = 8, blocks = 16, bfree = 24, bavail = 32, files = 40,
++    ffree = 48, favail = 56, fsid = 64, flags = 72, namemax = 80);
++layout!(Flock, 32, kind = 0, whence = 2, reserved0 = 4, start = 8, length = 16, pid = 24,
++    reserved1 = 28);
++layout!(PollFd, 8, fd = 0, events = 4, revents = 6);
++layout!(Termios, 60, iflag = 0, oflag = 4, cflag = 8, lflag = 12, line = 16, cc = 17,
++    reserved = 49, ispeed = 52, ospeed = 56);
++layout!(WinSize, 8, rows = 0, columns = 2, x_pixels = 4, y_pixels = 6);
++layout!(SpawnRequest, 128, path = 0, argv = 24, argc = 32, envp = 40, envc = 48, actions = 56,
++    action_count = 64, flags = 72, pgroup = 80, sigmask = 88, sigdefault = 96, reserved = 104);
++layout!(SpawnAction, 48, kind = 0, fd = 4, to = 8, open_flags = 12, mode = 16, reserved = 20,
++    path = 24);
++layout!(ExecRequest, 80, path = 0, argv = 24, argc = 32, envp = 40, envc = 48, flags = 56,
++    reserved = 64);
++layout!(Rusage, 144, utime = 0, stime = 16, maxrss = 32, minflt = 64, majflt = 72, nvcsw = 128,
++    nivcsw = 136);
++layout!(SysInfo, 200, abi_version = 0, page_size = 4, cpus_online = 8, cpus_configured = 12,
++    total_pages = 16, free_pages = 24, uptime_ns = 32, arg_max = 40, fd_max = 48, task_max = 52,
++    path_max = 56, name_max = 60, memory_limit = 64, release = 72, machine = 136, flags = 152,
++    features = 160, reserved = 168);
++layout!(SigAction, 32, handler = 0, flags = 8, reserved = 12, restorer = 16, mask = 24);
++layout!(SigStack, 24, sp = 0, flags = 8, reserved = 12, size = 16);
++layout!(SockAddrIn, 16, family = 0, port = 2, address = 4, zero = 8);
++layout!(UserStr, 16, pointer = 0, length = 8);
+diff --git a/src/platform/feos/checks.rs b/src/platform/feos/checks.rs
+new file mode 100644
+index 0000000..b348d17
+--- /dev/null
++++ b/src/platform/feos/checks.rs
+@@ -0,0 +1,172 @@
++//! Build-time checks that relibc's own header values are the ones the feos kernel
++//! takes (section 5 of `docs/feos-abi-v2.md`): feos uses Linux's numbers, so relibc's
++//! Linux values pass through untranslated, and a mismatch here fails the build.
++
++use super::abi;
++use crate::header::{errno, fcntl, poll, sys_mman, sys_stat, sys_wait, time, unistd};
++
++macro_rules! same {
++    ($($a:expr => $b:expr),* $(,)?) => {
++        $(const _: () = assert!($a as i64 == $b as i64);)*
++    };
++}
++
++// Error numbers: feos's are Linux's, relibc's errno.h.
++same! {
++    errno::EPERM => abi::errno::EPERM,
++    errno::ENOENT => abi::errno::ENOENT,
++    errno::ESRCH => abi::errno::ESRCH,
++    errno::EINTR => abi::errno::EINTR,
++    errno::EIO => abi::errno::EIO,
++    errno::ENXIO => abi::errno::ENXIO,
++    errno::E2BIG => abi::errno::E2BIG,
++    errno::ENOEXEC => abi::errno::ENOEXEC,
++    errno::EBADF => abi::errno::EBADF,
++    errno::ECHILD => abi::errno::ECHILD,
++    errno::EAGAIN => abi::errno::EAGAIN,
++    errno::ENOMEM => abi::errno::ENOMEM,
++    errno::EACCES => abi::errno::EACCES,
++    errno::EFAULT => abi::errno::EFAULT,
++    errno::EBUSY => abi::errno::EBUSY,
++    errno::EEXIST => abi::errno::EEXIST,
++    errno::EXDEV => abi::errno::EXDEV,
++    errno::ENODEV => abi::errno::ENODEV,
++    errno::ENOTDIR => abi::errno::ENOTDIR,
++    errno::EISDIR => abi::errno::EISDIR,
++    errno::EINVAL => abi::errno::EINVAL,
++    errno::ENFILE => abi::errno::ENFILE,
++    errno::EMFILE => abi::errno::EMFILE,
++    errno::ENOTTY => abi::errno::ENOTTY,
++    errno::ETXTBSY => abi::errno::ETXTBSY,
++    errno::EFBIG => abi::errno::EFBIG,
++    errno::ENOSPC => abi::errno::ENOSPC,
++    errno::ESPIPE => abi::errno::ESPIPE,
++    errno::EROFS => abi::errno::EROFS,
++    errno::EMLINK => abi::errno::EMLINK,
++    errno::EPIPE => abi::errno::EPIPE,
++    errno::ERANGE => abi::errno::ERANGE,
++    errno::EDEADLK => abi::errno::EDEADLK,
++    errno::ENAMETOOLONG => abi::errno::ENAMETOOLONG,
++    errno::ENOLCK => abi::errno::ENOLCK,
++    errno::ENOSYS => abi::errno::ENOSYS,
++    errno::ENOTEMPTY => abi::errno::ENOTEMPTY,
++    errno::ELOOP => abi::errno::ELOOP,
++    errno::EOVERFLOW => abi::errno::EOVERFLOW,
++    errno::EILSEQ => abi::errno::EILSEQ,
++    errno::ENOTSOCK => abi::errno::ENOTSOCK,
++    errno::EDESTADDRREQ => abi::errno::EDESTADDRREQ,
++    errno::EMSGSIZE => abi::errno::EMSGSIZE,
++    errno::EPROTOTYPE => abi::errno::EPROTOTYPE,
++    errno::ENOPROTOOPT => abi::errno::ENOPROTOOPT,
++    errno::EPROTONOSUPPORT => abi::errno::EPROTONOSUPPORT,
++    errno::ESOCKTNOSUPPORT => abi::errno::ESOCKTNOSUPPORT,
++    errno::EOPNOTSUPP => abi::errno::EOPNOTSUPP,
++    errno::EAFNOSUPPORT => abi::errno::EAFNOSUPPORT,
++    errno::EADDRINUSE => abi::errno::EADDRINUSE,
++    errno::EADDRNOTAVAIL => abi::errno::EADDRNOTAVAIL,
++    errno::ENETDOWN => abi::errno::ENETDOWN,
++    errno::ENETUNREACH => abi::errno::ENETUNREACH,
++    errno::ECONNABORTED => abi::errno::ECONNABORTED,
++    errno::ECONNRESET => abi::errno::ECONNRESET,
++    errno::ENOBUFS => abi::errno::ENOBUFS,
++    errno::EISCONN => abi::errno::EISCONN,
++    errno::ENOTCONN => abi::errno::ENOTCONN,
++    errno::ETIMEDOUT => abi::errno::ETIMEDOUT,
++    errno::ECONNREFUSED => abi::errno::ECONNREFUSED,
++    errno::EHOSTUNREACH => abi::errno::EHOSTUNREACH,
++    errno::EALREADY => abi::errno::EALREADY,
++    errno::EINPROGRESS => abi::errno::EINPROGRESS,
++}
++
++// Files.
++same! {
++    fcntl::O_RDONLY => abi::o::RDONLY,
++    fcntl::O_WRONLY => abi::o::WRONLY,
++    fcntl::O_RDWR => abi::o::RDWR,
++    fcntl::O_ACCMODE => abi::o::ACCMODE,
++    fcntl::O_CREAT => abi::o::CREAT,
++    fcntl::O_EXCL => abi::o::EXCL,
++    fcntl::O_NOCTTY => abi::o::NOCTTY,
++    fcntl::O_TRUNC => abi::o::TRUNC,
++    fcntl::O_APPEND => abi::o::APPEND,
++    fcntl::O_NONBLOCK => abi::o::NONBLOCK,
++    fcntl::O_DIRECTORY => abi::o::DIRECTORY,
++    fcntl::O_NOFOLLOW => abi::o::NOFOLLOW,
++    fcntl::O_CLOEXEC => abi::o::CLOEXEC,
++    fcntl::O_PATH => abi::o::PATH,
++    fcntl::AT_FDCWD => abi::at::FDCWD,
++    fcntl::AT_SYMLINK_NOFOLLOW => abi::at::SYMLINK_NOFOLLOW,
++    fcntl::AT_REMOVEDIR => abi::at::REMOVEDIR,
++    fcntl::AT_EACCESS => abi::at::EACCESS,
++    fcntl::AT_SYMLINK_FOLLOW => abi::at::SYMLINK_FOLLOW,
++    fcntl::AT_EMPTY_PATH => abi::at::EMPTY_PATH,
++    fcntl::F_DUPFD => abi::f::DUPFD,
++    fcntl::F_GETFD => abi::f::GETFD,
++    fcntl::F_SETFD => abi::f::SETFD,
++    fcntl::F_GETFL => abi::f::GETFL,
++    fcntl::F_SETFL => abi::f::SETFL,
++    fcntl::F_GETLK => abi::f::GETLK,
++    fcntl::F_SETLK => abi::f::SETLK,
++    fcntl::F_SETLKW => abi::f::SETLKW,
++    fcntl::F_DUPFD_CLOEXEC => abi::f::DUPFD_CLOEXEC,
++    fcntl::FD_CLOEXEC => abi::f::FD_CLOEXEC,
++    sys_stat::S_IFMT => abi::s_if::MASK,
++    sys_stat::S_IFSOCK => abi::s_if::SOCK,
++    sys_stat::S_IFLNK => abi::s_if::LNK,
++    sys_stat::S_IFREG => abi::s_if::REG,
++    sys_stat::S_IFBLK => abi::s_if::BLK,
++    sys_stat::S_IFDIR => abi::s_if::DIR,
++    sys_stat::S_IFCHR => abi::s_if::CHR,
++    sys_stat::S_IFIFO => abi::s_if::FIFO,
++    unistd::SEEK_SET => abi::seek::SET,
++    unistd::SEEK_CUR => abi::seek::CURRENT,
++    unistd::SEEK_END => abi::seek::END,
++}
++
++// Memory, clocks, waiting.
++same! {
++    sys_mman::PROT_NONE => abi::prot::NONE,
++    sys_mman::PROT_READ => abi::prot::READ,
++    sys_mman::PROT_WRITE => abi::prot::WRITE,
++    sys_mman::PROT_EXEC => abi::prot::EXEC,
++    sys_mman::MAP_SHARED => abi::map::SHARED,
++    sys_mman::MAP_PRIVATE => abi::map::PRIVATE,
++    sys_mman::MAP_FIXED => abi::map::FIXED,
++    sys_mman::MAP_ANONYMOUS => abi::map::ANONYMOUS,
++    sys_mman::MAP_NORESERVE => abi::map::NORESERVE,
++    sys_mman::MAP_POPULATE => abi::map::POPULATE,
++    sys_mman::MAP_STACK => abi::map::STACK,
++    sys_mman::MAP_FIXED_NOREPLACE => abi::map::FIXED_NOREPLACE,
++    time::CLOCK_REALTIME => abi::clock::REALTIME,
++    time::CLOCK_MONOTONIC => abi::clock::MONOTONIC,
++    time::CLOCK_PROCESS_CPUTIME_ID => abi::clock::PROCESS_CPUTIME_ID,
++    time::CLOCK_THREAD_CPUTIME_ID => abi::clock::THREAD_CPUTIME_ID,
++    time::CLOCK_MONOTONIC_RAW => abi::clock::MONOTONIC_RAW,
++    time::CLOCK_REALTIME_COARSE => abi::clock::REALTIME_COARSE,
++    time::CLOCK_MONOTONIC_COARSE => abi::clock::MONOTONIC_COARSE,
++    time::CLOCK_BOOTTIME => abi::clock::BOOTTIME,
++    sys_wait::WNOHANG => abi::wait::NOHANG,
++    sys_wait::WUNTRACED => abi::wait::UNTRACED,
++    sys_wait::WCONTINUED => abi::wait::CONTINUED,
++    poll::POLLIN => 1,
++    poll::POLLOUT => 4,
++}
++
++// Structures passed through to the kernel unconverted.
++const _: () = {
++    use core::mem::{offset_of, size_of};
++    use crate::header::{bits_timespec::timespec, fcntl::flock, sys_resource::rusage, sys_statvfs::statvfs, dirent::dirent, bits_winsize::winsize, termios::termios};
++    assert!(size_of::<timespec>() == size_of::<abi::Timespec>());
++    assert!(size_of::<rusage>() == size_of::<abi::Rusage>());
++    assert!(size_of::<statvfs>() == size_of::<abi::StatVfs>());
++    assert!(size_of::<flock>() == size_of::<abi::Flock>());
++    assert!(offset_of!(flock, l_start) == offset_of!(abi::Flock, start));
++    assert!(offset_of!(flock, l_len) == offset_of!(abi::Flock, length));
++    assert!(offset_of!(flock, l_pid) == offset_of!(abi::Flock, pid));
++    assert!(offset_of!(dirent, d_off) == offset_of!(abi::Dirent, off));
++    assert!(offset_of!(dirent, d_reclen) == offset_of!(abi::Dirent, reclen));
++    assert!(offset_of!(dirent, d_type) == offset_of!(abi::Dirent, kind));
++    assert!(offset_of!(dirent, d_name) == abi::DIRENT_HEADER);
++    assert!(size_of::<winsize>() == size_of::<abi::WinSize>());
++    assert!(size_of::<termios>() == size_of::<abi::Termios>());
++};
+diff --git a/src/platform/feos/epoll.rs b/src/platform/feos/epoll.rs
+new file mode 100644
+index 0000000..ab44e5c
+--- /dev/null
++++ b/src/platform/feos/epoll.rs
+@@ -0,0 +1,28 @@
++//! No `epoll` on feos (section 9.4 of `docs/feos-abi-v2.md`): `select` is built on
++//! `POLL` instead, and nothing on the toolchain's path needs epoll.
++
++use super::Sys;
++use crate::{
++    error::{Errno, Result},
++    header::{bits_sigset_t::sigset_t, errno::ENOSYS, sys_epoll::epoll_event},
++    platform::{PalEpoll, types::c_int},
++};
++
++impl PalEpoll for Sys {
++    fn epoll_create1(_flags: c_int) -> Result<c_int> {
++        Err(Errno(ENOSYS))
++    }
++
++    fn epoll_ctl(_epfd: c_int, _op: c_int, _fd: c_int, _event: Option<&mut epoll_event>) -> Result<()> {
++        Err(Errno(ENOSYS))
++    }
++
++    fn epoll_pwait(
++        _epfd: c_int,
++        _events: &mut [epoll_event],
++        _timeout: c_int,
++        _sigmask: Option<&sigset_t>,
++    ) -> Result<usize> {
++        Err(Errno(ENOSYS))
++    }
++}
+diff --git a/src/platform/feos/mod.rs b/src/platform/feos/mod.rs
+new file mode 100644
+index 0000000..3749074
+--- /dev/null
++++ b/src/platform/feos/mod.rs
+@@ -0,0 +1,1398 @@
++//! The feos platform: relibc's [`Pal`] over the feos kernel interface, each function
++//! as section 9 of `docs/feos-abi-v2.md` maps it.
++//!
++//! Every call number, structure and feos-only constant is in [`abi`]. Calls the
++//! kernel doesn't have yet (they return `ENOSYS` until their stage lands) are made all
++//! the same, at their numbers, and their answer passed on: nothing here fakes a result.
++
++use alloc::{boxed::Box, vec::Vec};
++use core::{
++    arch::global_asm,
++    mem::{self, size_of},
++    num::NonZeroU64,
++    ptr,
++};
++
++use super::{Pal, types::*};
++use crate::{
++    c_str::CStr,
++    error::{Errno, Result},
++    header::{
++        bits_sigset_t::sigset_t,
++        dirent::dirent,
++        errno::{EINVAL, EIO, ENOMEM, ENOSYS, EPERM, ERANGE},
++        fcntl::{AT_EMPTY_PATH, AT_FDCWD, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_PATH, O_WRONLY},
++        poll::pollfd,
++        signal::sigevent,
++        sys_resource::{rlimit, rusage},
++        sys_select::timeval,
++        sys_stat::{S_IFMT, S_IFREG, stat},
++        sys_statvfs::statvfs,
++        sys_time::timezone,
++        sys_uio::iovec,
++        sys_utsname::{UTSLENGTH, utsname},
++        time::{itimerspec, timespec},
++        unistd::{SEEK_CUR, SEEK_SET},
++    },
++    iter::NulTerminated,
++    ld_so::tcb::OsSpecific,
++    out::Out,
++};
++
++pub mod abi;
++mod checks;
++mod epoll;
++mod ptrace;
++mod signal;
++mod socket;
++pub mod syscall;
++
++use self::syscall::*;
++use abi::nr;
++
++/// The largest negated error number a call returns.
++const ERRNO_MAX: usize = 4095;
++
++/// A raw result as a [`Result`]: `-4095..0` is a negated error number.
++#[inline]
++pub fn e_raw(sys: usize) -> Result<usize> {
++    if sys > ERRNO_MAX.wrapping_neg() {
++        Err(Errno(sys.wrapping_neg() as c_int))
++    } else {
++        Ok(sys)
++    }
++}
++
++/// A C string as feos takes paths: pointer and length, no NUL.
++#[inline]
++fn path(p: CStr) -> (usize, usize) {
++    (p.as_ptr() as usize, p.len())
++}
++
++/// A 32-bit C argument as a register: sign extended, as section 1 asks of a C caller's
++/// `-1`.
++#[inline]
++fn int(value: c_int) -> usize {
++    value as isize as usize
++}
++
++fn path_at(dirfd: c_int, p: CStr) -> abi::PathAt {
++    abi::PathAt {
++        dirfd,
++        reserved: 0,
++        pointer: p.as_ptr() as u64,
++        length: p.len() as u64,
++    }
++}
++
++/// A NUL-terminated array of C strings as `UserStr`s.
++unsafe fn user_strs<'a>(strings: impl Iterator<Item = &'a *mut c_char>) -> Vec<abi::UserStr> {
++    strings
++        .map(|&s| {
++            let s = unsafe { CStr::from_ptr(s) };
++            abi::UserStr {
++                pointer: s.as_ptr() as usize,
++                length: s.len(),
++            }
++        })
++        .collect()
++}
++
++/// The kernel's [`abi::SysInfo`].
++pub fn sysinfo() -> Result<abi::SysInfo> {
++    let mut info = abi::SysInfo::zeroed();
++    e_raw(unsafe {
++        syscall2(
++            nr::SYSINFO,
++            (&raw mut info) as usize,
++            size_of::<abi::SysInfo>(),
++        )
++    })?;
++    Ok(info)
++}
++
++/// The aux vector, kept at start for `getauxval` (section 7.2).
++static mut AUXV: Option<Box<[[usize; 2]]>> = None;
++
++/// Keeps the aux vector `relibc_start` collected (sorted by type).
++///
++/// Safety: only while one thread exists.
++pub unsafe fn init(auxvs: Box<[[usize; 2]]>) {
++    unsafe { *(&raw mut AUXV) = Some(auxvs) };
++}
++
++/// `getauxval(type)`: its value, or `None` if the vector has no such entry.
++pub fn getauxval(kind: usize) -> Option<usize> {
++    let auxvs = unsafe { (*(&raw const AUXV)).as_deref()? };
++    super::get_auxv(auxvs, kind)
++}
++
++/// `sysconf` values that come from the kernel ([`abi::SysInfo`]), or `None` for those
++/// relibc's Linux table answers.
++pub fn sysconf(name: c_int) -> Option<c_long> {
++    use crate::header::unistd::*;
++    let info = || sysinfo().ok();
++    Some(match name {
++        _SC_NPROCESSORS_ONLN => info()?.cpus_online as c_long,
++        _SC_NPROCESSORS_CONF => info()?.cpus_configured as c_long,
++        _SC_PHYS_PAGES => info()?.total_pages as c_long,
++        _SC_AVPHYS_PAGES => info()?.free_pages as c_long,
++        _SC_ARG_MAX => info()?.arg_max as c_long,
++        _SC_OPEN_MAX => info()?.fd_max as c_long,
++        _SC_CHILD_MAX => info()?.task_max as c_long,
++        _SC_PAGESIZE => abi::PAGE_SIZE as c_long,
++        _SC_MINSIGSTKSZ => getauxval(abi::aux::MINSIGSTKSZ).unwrap_or(2048) as c_long,
++        _SC_SIGSTKSZ => 8192,
++        _ => return None,
++    })
++}
++
++/// The C-side `ioctl` for feos: the terminal requests relibc's headers name (Linux's
++/// numbers) translated to feos's own, `FIONBIO`/`FIOCLEX`/`FIONCLEX` through `FCNTL`
++/// (section 10.1). Anything else is `EINVAL`.
++pub unsafe fn ioctl(fd: c_int, request: c_ulong, arg: *mut c_void) -> Result<c_int> {
++    use crate::header::sys_ioctl::*;
++    use abi::ioctl as r;
++    let call = |request: usize, arg: usize| -> Result<c_int> {
++        e_raw(unsafe { syscall3(nr::IOCTL, int(fd), request, arg) }).map(|v| v as c_int)
++    };
++    let a = arg as usize;
++    match request {
++        TCGETS => call(r::TTY_GET_ATTR, a),
++        TCSETS => call(r::TTY_SET_ATTR, a),
++        TCSETSW => call(r::TTY_SET_ATTR_DRAIN, a),
++        TCSETSF => call(r::TTY_SET_ATTR_FLUSH, a),
++        TIOCGWINSZ => call(r::TTY_GET_WINSIZE, a),
++        TIOCSWINSZ => call(r::TTY_SET_WINSIZE, a),
++        TIOCGPGRP => call(r::TTY_GET_PGRP, a),
++        TIOCSPGRP => call(r::TTY_SET_PGRP, a),
++        FIONREAD => call(r::FD_NREAD, a),
++        // tcdrain is TCSBRK with a non-zero argument; a zero one would send a break,
++        // which the console has no use for.
++        TCSBRK => call(r::TTY_DRAIN, 0),
++        TCFLSH => call(r::TTY_FLUSH, a),
++        TCXONC => call(r::TTY_FLOW, a),
++        TIOCGSID => call(r::TTY_GET_SID, a),
++        // No controlling-terminal acquisition: 0 on a terminal, ENOTTY otherwise.
++        TIOCSCTTY | TIOCNOTTY => {
++            let mut size = abi::WinSize::default();
++            call(r::TTY_GET_WINSIZE, (&raw mut size) as usize).map(|_| 0)
++        }
++        FIONBIO => {
++            let on = unsafe { *arg.cast::<c_int>() } != 0;
++            let flags = Sys::fcntl(fd, abi::f::GETFL, 0)?;
++            let flags = if on {
++                flags | abi::o::NONBLOCK
++            } else {
++                flags & !abi::o::NONBLOCK
++            };
++            Sys::fcntl(fd, abi::f::SETFL, flags as c_ulonglong).map(|_| 0)
++        }
++        FIOCLEX => Sys::fcntl(fd, abi::f::SETFD, abi::f::FD_CLOEXEC as c_ulonglong).map(|_| 0),
++        FIONCLEX => Sys::fcntl(fd, abi::f::SETFD, 0).map(|_| 0),
++        _ => Err(Errno(EINVAL)),
++    }
++}
++
++fn stat_from(s: &abi::Stat2) -> stat {
++    stat {
++        st_dev: s.dev as dev_t,
++        st_ino: s.ino as ino_t,
++        st_nlink: s.nlink as nlink_t,
++        st_mode: s.mode as mode_t,
++        st_uid: s.uid as uid_t,
++        st_gid: s.gid as gid_t,
++        st_rdev: s.rdev as dev_t,
++        st_size: s.size as off_t,
++        st_blksize: s.blksize as blksize_t,
++        st_blocks: s.blocks as blkcnt_t,
++        st_atim: timespec {
++            tv_sec: s.atime.sec as time_t,
++            tv_nsec: s.atime.nsec as c_long,
++        },
++        st_mtim: timespec {
++            tv_sec: s.mtime.sec as time_t,
++            tv_nsec: s.mtime.nsec as c_long,
++        },
++        st_ctim: timespec {
++            tv_sec: s.ctime.sec as time_t,
++            tv_nsec: s.ctime.nsec as c_long,
++        },
++        _pad: [0; 24],
++    }
++}
++
++// The thread trampoline `THREAD_CREATE` starts a pthread at. relibc's `create` pushes
++// its start words (entry, then its five arguments) below the top of the new stack;
++// `rlct_clone` passes their address as the thread's argument and a 16-byte aligned
++// stack top below them, so the new thread points its stack at the words, pops them
++// as the Linux backend's `clone` path does, and calls the entry. The entry never
++// returns (it ends with `exit_thread`).
++#[cfg(target_arch = "x86_64")]
++global_asm!(
++    "
++    .globl __relibc_feos_thread_start
++    .type __relibc_feos_thread_start, @function
++__relibc_feos_thread_start:
++    mov rsp, rdi
++    pop rax
++    pop rdi
++    pop rsi
++    pop rdx
++    pop rcx
++    pop r8
++    pop r9
++    call rax
++    ud2
++    .size __relibc_feos_thread_start, . - __relibc_feos_thread_start
++"
++);
++
++#[cfg(target_arch = "aarch64")]
++global_asm!(
++    "
++    .globl __relibc_feos_thread_start
++    .type __relibc_feos_thread_start, @function
++__relibc_feos_thread_start:
++    mov sp, x0
++    ldp x8, x0, [sp], #16
++    ldp x1, x2, [sp], #16
++    ldp x3, x4, [sp], #16
++    ldr x5, [sp], #16
++    blr x8
++    brk #0
++    .size __relibc_feos_thread_start, . - __relibc_feos_thread_start
++"
++);
++
++unsafe extern "C" {
++    fn __relibc_feos_thread_start();
++}
++
++/// feos implementation of [`Pal`].
++pub struct Sys;
++
++impl Sys {
++    /// The C `ioctl`'s backend: see [`ioctl`].
++    pub unsafe fn ioctl(fd: c_int, request: c_ulong, out: *mut c_void) -> Result<c_int> {
++        unsafe { ioctl(fd, request, out) }
++    }
++
++    /// `THREAD_KILL`, `raise`'s and `pthread_kill`'s call.
++    fn thread_kill(tid: usize, signal: c_int) -> Result<()> {
++        e_raw(unsafe { syscall2(nr::THREAD_KILL, tid, int(signal)) }).map(|_| ())
++    }
++
++    /// `SET_TLS`: the TLS register, `FS_BASE` or `TPIDR_EL0`.
++    pub unsafe fn set_tls(value: usize) -> Result<()> {
++        e_raw(unsafe { syscall1(nr::SET_TLS, value) }).map(|_| ())
++    }
++
++    unsafe fn exec(request: &abi::ExecRequest) -> Result<()> {
++        e_raw(unsafe { syscall1(nr::EXEC, ptr::from_ref(request) as usize) })?;
++        unreachable!("EXEC returned success")
++    }
++
++    unsafe fn exec_strings(
++        path: abi::PathAt,
++        flags: u64,
++        argv: *const *mut c_char,
++        envp: *const *mut c_char,
++    ) -> Result<()> {
++        let args = match unsafe { NulTerminated::new(argv) } {
++            Some(argv) => unsafe { user_strs(argv) },
++            None => Vec::new(),
++        };
++        let envs = match unsafe { NulTerminated::new(envp) } {
++            Some(envp) => unsafe { user_strs(envp) },
++            None => Vec::new(),
++        };
++        let request = abi::ExecRequest {
++            path,
++            argv: args.as_ptr() as u64,
++            argc: args.len() as u64,
++            envp: envs.as_ptr() as u64,
++            envc: envs.len() as u64,
++            flags,
++            reserved: [0; 2],
++        };
++        unsafe { Self::exec(&request) }
++    }
++
++    /// v1 `WAIT`'s answer for a child, as a POSIX status: the exit code it reports
++    /// (`128 + signal` for a child a signal ended, 139 for a fault) is encoded as an
++    /// exit with that code, since v1 can't tell the two apart.
++    fn wait_v1(pid: pid_t) -> Result<c_int> {
++        let status = e_raw(unsafe { syscall1(nr::WAIT, int(pid)) })?;
++        Ok(((status & 0xff) << 8) as c_int)
++    }
++}
++
++impl Pal for Sys {
++    fn faccessat(fd: c_int, p: CStr, amode: c_int, flags: c_int) -> Result<()> {
++        let (p, len) = path(p);
++        e_raw(unsafe { syscall5(nr::FACCESSAT, int(fd), p, len, int(amode), int(flags)) })
++            .map(|_| ())
++    }
++
++    unsafe fn brk(_addr: *mut c_void) -> Result<*mut c_void> {
++        // No brk on feos: everything allocates with mmap (section 9.1).
++        Err(Errno(ENOMEM))
++    }
++
++    fn chdir(p: CStr) -> Result<()> {
++        let fd = Self::openat(AT_FDCWD, p, O_PATH | O_DIRECTORY | O_CLOEXEC, 0)?;
++        let result = Self::fchdir(fd);
++        let _ = Self::close(fd);
++        result
++    }
++
++    fn fchownat(fildes: c_int, p: CStr, owner: uid_t, group: gid_t, flags: c_int) -> Result<()> {
++        let (p, len) = path(p);
++        e_raw(unsafe {
++            syscall6(
++                nr::FCHOWNAT,
++                int(fildes),
++                p,
++                len,
++                int(owner),
++                int(group),
++                int(flags),
++            )
++        })
++        .map(|_| ())
++    }
++
++    fn clock_getres(clk_id: clockid_t, res: Option<Out<timespec>>) -> Result<()> {
++        let out = res.map_or(0, |mut p| p.as_mut_ptr() as usize);
++        e_raw(unsafe { syscall2(nr::CLOCK_GETRES, int(clk_id), out) }).map(|_| ())
++    }
++
++    fn clock_gettime(clk_id: clockid_t, mut tp: Out<timespec>) -> Result<()> {
++        e_raw(unsafe { syscall2(nr::CLOCK_GETTIME, int(clk_id), tp.as_mut_ptr() as usize) })
++            .map(|_| ())
++    }
++
++    unsafe fn clock_settime(clk_id: clockid_t, tp: *const timespec) -> Result<()> {
++        e_raw(unsafe { syscall2(nr::CLOCK_SETTIME, int(clk_id), tp as usize) }).map(|_| ())
++    }
++
++    fn close(fildes: c_int) -> Result<()> {
++        e_raw(unsafe { syscall1(nr::CLOSE, int(fildes)) }).map(|_| ())
++    }
++
++    fn dup2(fildes: c_int, fildes2: c_int) -> Result<c_int> {
++        if fildes == fildes2 {
++            // DUP3 refuses equal descriptors; dup2 returns the one, if it's open.
++            Self::fcntl(fildes, abi::f::GETFD, 0)?;
++            return Ok(fildes);
++        }
++        e_raw(unsafe { syscall3(nr::DUP3, int(fildes), int(fildes2), 0) }).map(|f| f as c_int)
++    }
++
++    unsafe fn execve(p: CStr, argv: *const *mut c_char, envp: *const *mut c_char) -> Result<()> {
++        unsafe { Self::exec_strings(path_at(AT_FDCWD, p), 0, argv, envp) }
++    }
++
++    unsafe fn fexecve(
++        fildes: c_int,
++        argv: *const *mut c_char,
++        envp: *const *mut c_char,
++    ) -> Result<()> {
++        let at = abi::PathAt {
++            dirfd: fildes,
++            reserved: 0,
++            pointer: 0,
++            length: 0,
++        };
++        unsafe { Self::exec_strings(at, abi::spawn::EMPTY_PATH, argv, envp) }
++    }
++
++    fn exit(status: c_int) -> ! {
++        unsafe { syscall1(nr::EXIT, int(status)) };
++        unreachable!("EXIT returned");
++    }
++
++    unsafe fn exit_thread(stack_base: *mut (), stack_size: usize) -> ! {
++        // The kernel unmaps the stack once the thread is off it. A range it won't take
++        // is EINVAL and the call returns; then end without unmapping.
++        unsafe { syscall2(nr::THREAD_EXIT, stack_base as usize, stack_size) };
++        unsafe { syscall2(nr::THREAD_EXIT, 0, 0) };
++        unreachable!("THREAD_EXIT returned");
++    }
++
++    fn fchdir(fildes: c_int) -> Result<()> {
++        e_raw(unsafe { syscall1(nr::FCHDIR, int(fildes)) }).map(|_| ())
++    }
++
++    fn fchmodat(dirfd: c_int, p: Option<CStr>, mode: mode_t, mut flags: c_int) -> Result<()> {
++        let (p, len) = match p {
++            Some(p) => path(p),
++            None => {
++                flags |= AT_EMPTY_PATH;
++                (0, 0)
++            }
++        };
++        e_raw(unsafe {
++            syscall5(nr::FCHMODAT, int(dirfd), p, len, mode as usize, int(flags))
++        })
++        .map(|_| ())
++    }
++
++    fn fdatasync(fildes: c_int) -> Result<()> {
++        e_raw(unsafe { syscall2(nr::FSYNC, int(fildes), abi::FSYNC_DATA) }).map(|_| ())
++    }
++
++    fn flock(fd: c_int, operation: c_int) -> Result<()> {
++        e_raw(unsafe { syscall2(nr::FLOCK, int(fd), int(operation)) }).map(|_| ())
++    }
++
++    fn fstatat(fildes: c_int, p: Option<CStr>, mut buf: Out<stat>, mut flags: c_int) -> Result<()> {
++        let (p, len) = match p {
++            Some(p) => path(p),
++            None => {
++                flags |= AT_EMPTY_PATH;
++                (0, 0)
++            }
++        };
++        let mut st = abi::Stat2::default();
++        e_raw(unsafe {
++            syscall5(
++                nr::FSTATAT,
++                int(fildes),
++                p,
++                len,
++                (&raw mut st) as usize,
++                int(flags),
++            )
++        })?;
++        buf.write(stat_from(&st));
++        Ok(())
++    }
++
++    fn fstatvfs(fildes: c_int, mut buf: Out<statvfs>) -> Result<()> {
++        let mut s = abi::StatVfs::default();
++        e_raw(unsafe { syscall2(nr::FSTATVFS, int(fildes), (&raw mut s) as usize) })?;
++        buf.write(statvfs {
++            f_bsize: s.bsize as c_ulong,
++            f_frsize: s.frsize as c_ulong,
++            f_blocks: s.blocks as fsblkcnt_t,
++            f_bfree: s.bfree as fsblkcnt_t,
++            f_bavail: s.bavail as fsblkcnt_t,
++            f_files: s.files as fsfilcnt_t,
++            f_ffree: s.ffree as fsfilcnt_t,
++            f_favail: s.favail as fsfilcnt_t,
++            f_fsid: s.fsid as c_ulong,
++            f_flag: s.flags as c_ulong,
++            f_namemax: s.namemax as c_ulong,
++        });
++        Ok(())
++    }
++
++    fn fcntl(fildes: c_int, cmd: c_int, arg: c_ulonglong) -> Result<c_int> {
++        // Lock commands take a pointer to relibc's `struct flock`, which is Linux's
++        // and so `abi::Flock`; the rest a 32-bit argument.
++        let arg = match cmd {
++            abi::f::GETLK | abi::f::SETLK | abi::f::SETLKW => arg as usize,
++            _ => int(arg as c_int),
++        };
++        e_raw(unsafe { syscall3(nr::FCNTL, int(fildes), int(cmd), arg) }).map(|v| v as c_int)
++    }
++
++    unsafe fn fork() -> Result<pid_t> {
++        let pid = e_raw(unsafe { syscall0(nr::FORK) })? as pid_t;
++        if pid == 0 {
++            // The child's thread has a tid of its own; relibc's TCB still has the
++            // parent's (section 3.6).
++            if let Some(tcb) = unsafe { crate::ld_so::tcb::Tcb::current() } {
++                unsafe { tcb.pthread.os_tid.get().write(Self::current_os_tid()) };
++            }
++        }
++        Ok(pid)
++    }
++
++    fn fpath(fildes: c_int, out: &mut [u8]) -> Result<usize> {
++        e_raw(unsafe { syscall3(nr::FD_PATH, int(fildes), out.as_mut_ptr() as usize, out.len()) })
++    }
++
++    fn fsync(fildes: c_int) -> Result<()> {
++        e_raw(unsafe { syscall2(nr::FSYNC, int(fildes), 0) }).map(|_| ())
++    }
++
++    fn ftruncate(fildes: c_int, length: off_t) -> Result<()> {
++        e_raw(unsafe { syscall2(nr::FTRUNCATE, int(fildes), length as usize) }).map(|_| ())
++    }
++
++    #[inline]
++    unsafe fn futex_wait(addr: *mut u32, val: u32, deadline: Option<&timespec>) -> Result<()> {
++        // relibc passes an absolute CLOCK_MONOTONIC deadline, which FUTEX_WAIT2 takes.
++        let deadline = deadline.map_or(0, |d| ptr::from_ref(d) as usize);
++        e_raw(unsafe {
++            syscall5(
++                nr::FUTEX_WAIT2,
++                addr as usize,
++                val as usize,
++                deadline,
++                abi::clock::MONOTONIC,
++                0,
++            )
++        })
++        .map(|_| ())
++    }
++
++    #[inline]
++    unsafe fn futex_wake(addr: *mut u32, num: u32) -> Result<u32> {
++        e_raw(unsafe { syscall2(nr::FUTEX_WAKE, addr as usize, num as usize) }).map(|n| n as u32)
++    }
++
++    fn utimensat(dirfd: c_int, p: CStr, times: Option<&[timespec; 2]>, flag: c_int) -> Result<()> {
++        let (p, len) = path(p);
++        let times = times.map_or(0, |t| t.as_ptr() as usize);
++        e_raw(unsafe { syscall5(nr::UTIMENSAT, int(dirfd), p, len, times, int(flag)) })
++            .map(|_| ())
++    }
++
++    fn getcwd(mut buf: Out<[u8]>) -> Result<()> {
++        let len = buf.len();
++        if len == 0 {
++            return Err(Errno(ERANGE));
++        }
++        let start = buf.as_mut_ptr().as_mut_ptr();
++        // GETCWD writes no NUL: ask for one byte less and add it.
++        let n = e_raw(unsafe { syscall2(nr::GETCWD, start as usize, len - 1) })?;
++        unsafe { start.add(n).write(0) };
++        Ok(())
++    }
++
++    fn getdents(fd: c_int, buf: &mut [u8], _off: u64) -> Result<usize> {
++        e_raw(unsafe { syscall3(nr::GETDENTS, int(fd), buf.as_mut_ptr() as usize, buf.len()) })
++    }
++
++    fn dir_seek(fd: c_int, off: u64) -> Result<()> {
++        e_raw(unsafe { syscall3(nr::SEEK, int(fd), off as usize, abi::seek::SET) })?;
++        Ok(())
++    }
++
++    unsafe fn dent_reclen_offset(this_dent: &[u8], _offset: usize) -> Option<(u16, u64)> {
++        // GETDENTS's records are linux_dirent64, relibc's `dirent`.
++        if this_dent.len() < abi::DIRENT_HEADER {
++            return None;
++        }
++        let dent = this_dent.as_ptr().cast::<dirent>();
++        Some((
++            unsafe { ptr::addr_of!((*dent).d_reclen).read_unaligned() },
++            unsafe { ptr::addr_of!((*dent).d_off).read_unaligned() }.cast_unsigned(),
++        ))
++    }
++
++    fn getegid() -> gid_t {
++        // No set-group-ID programs: effective is real.
++        Self::getgid()
++    }
++
++    fn geteuid() -> uid_t {
++        Self::getuid()
++    }
++
++    fn getgid() -> gid_t {
++        unsafe { syscall0(nr::GETGID) as gid_t }
++    }
++
++    fn getgroups(mut list: Out<[gid_t]>) -> Result<c_int> {
++        // One group, the process's: feos has no supplementary groups.
++        if list.is_empty() {
++            return Ok(1);
++        }
++        list.index(0).write(Self::getgid());
++        Ok(1)
++    }
++
++    fn getpagesize() -> usize {
++        abi::PAGE_SIZE
++    }
++
++    fn getpgid(pid: pid_t) -> Result<pid_t> {
++        e_raw(unsafe { syscall1(nr::GETPGID, int(pid)) }).map(|p| p as pid_t)
++    }
++
++    fn getpid() -> pid_t {
++        unsafe { syscall0(nr::GETPID) as pid_t }
++    }
++
++    fn getppid() -> pid_t {
++        unsafe { syscall0(nr::GETPPID) as pid_t }
++    }
++
++    fn getpriority(_which: c_int, _who: id_t) -> Result<c_int> {
++        // Nice 0 for everyone; relibc's wrapper turns the kernel-style 20 into it.
++        Ok(20)
++    }
++
++    fn getrandom(buf: &mut [u8], flags: c_uint) -> Result<usize> {
++        e_raw(unsafe {
++            syscall3(
++                nr::GETRANDOM,
++                buf.as_mut_ptr() as usize,
++                buf.len(),
++                flags as usize,
++            )
++        })
++    }
++
++    fn getrlimit(resource: c_int, mut rlim: Out<rlimit>) -> Result<()> {
++        use crate::header::sys_resource::*;
++        let info = sysinfo()?;
++        let limit = match resource {
++            RLIMIT_NOFILE => info.fd_max as rlim_t,
++            // The main stack is 8 MiB and doesn't grow (section 6).
++            RLIMIT_STACK => abi::USER_STACK_SIZE as rlim_t,
++            RLIMIT_AS | RLIMIT_DATA => info.memory_limit as rlim_t,
++            RLIMIT_NPROC => info.task_max as rlim_t,
++            RLIMIT_CORE => 0,
++            r if (0..RLIMIT_NLIMITS).contains(&r) => RLIM_INFINITY,
++            _ => return Err(Errno(EINVAL)),
++        };
++        rlim.write(rlimit {
++            rlim_cur: limit,
++            rlim_max: limit,
++        });
++        Ok(())
++    }
++
++    fn getresgid(
++        rgid: Option<Out<gid_t>>,
++        egid: Option<Out<gid_t>>,
++        sgid: Option<Out<gid_t>>,
++    ) -> Result<()> {
++        let gid = Self::getgid();
++        for mut out in [rgid, egid, sgid].into_iter().flatten() {
++            out.write(gid);
++        }
++        Ok(())
++    }
++
++    fn getresuid(
++        ruid: Option<Out<uid_t>>,
++        euid: Option<Out<uid_t>>,
++        suid: Option<Out<uid_t>>,
++    ) -> Result<()> {
++        let uid = Self::getuid();
++        for mut out in [ruid, euid, suid].into_iter().flatten() {
++            out.write(uid);
++        }
++        Ok(())
++    }
++
++    unsafe fn setrlimit(resource: c_int, rlim: *const rlimit) -> Result<()> {
++        // Accepted at or below the hard limit, without effect; EPERM above it.
++        let mut hard = mem::MaybeUninit::<rlimit>::uninit();
++        Self::getrlimit(resource, Out::from_uninit_mut(&mut hard))?;
++        let hard = unsafe { hard.assume_init() };
++        let new = unsafe { &*rlim };
++        if new.rlim_cur > new.rlim_max {
++            return Err(Errno(EINVAL));
++        }
++        if new.rlim_max > hard.rlim_max {
++            return Err(Errno(EPERM));
++        }
++        Ok(())
++    }
++
++    fn getrusage(who: c_int, mut r_usage: Out<rusage>) -> Result<()> {
++        // relibc's rusage is Linux's, which is abi::Rusage.
++        e_raw(unsafe { syscall2(nr::GETRUSAGE, int(who), r_usage.as_mut_ptr() as usize) })?;
++        Ok(())
++    }
++
++    fn getsid(pid: pid_t) -> Result<pid_t> {
++        e_raw(unsafe { syscall1(nr::GETSID, int(pid)) }).map(|p| p as pid_t)
++    }
++
++    fn gettid() -> pid_t {
++        unsafe { syscall0(nr::GETTID) as pid_t }
++    }
++
++    fn gettimeofday(mut tp: Out<timeval>, tzp: Option<Out<timezone>>) -> Result<()> {
++        let mut now = abi::Timespec::default();
++        e_raw(unsafe {
++            syscall2(
++                nr::CLOCK_GETTIME,
++                abi::clock::REALTIME,
++                (&raw mut now) as usize,
++            )
++        })?;
++        tp.write(timeval {
++            tv_sec: now.sec as time_t,
++            tv_usec: (now.nsec / 1000) as suseconds_t,
++        });
++        if let Some(mut tz) = tzp {
++            tz.write(timezone {
++                tz_minuteswest: 0,
++                tz_dsttime: 0,
++            });
++        }
++        Ok(())
++    }
++
++    fn getuid() -> uid_t {
++        unsafe { syscall0(nr::GETUID) as uid_t }
++    }
++
++    fn linkat(fd1: c_int, path1: CStr, fd2: c_int, path2: CStr, flags: c_int) -> Result<()> {
++        let from = path_at(fd1, path1);
++        let to = path_at(fd2, path2);
++        e_raw(unsafe {
++            syscall3(
++                nr::LINKAT,
++                (&raw const from) as usize,
++                (&raw const to) as usize,
++                int(flags),
++            )
++        })
++        .map(|_| ())
++    }
++
++    fn lseek(fildes: c_int, offset: off_t, whence: c_int) -> Result<off_t> {
++        e_raw(unsafe { syscall3(nr::SEEK, int(fildes), offset as usize, int(whence)) })
++            .map(|o| o as off_t)
++    }
++
++    fn mkdirat(dir_fildes: c_int, p: CStr, mode: mode_t) -> Result<()> {
++        let (p, len) = path(p);
++        e_raw(unsafe { syscall4(nr::MKDIRAT, int(dir_fildes), p, len, mode as usize) })
++            .map(|_| ())
++    }
++
++    fn mknodat(dir_fildes: c_int, p: CStr, mode: mode_t, _dev: dev_t) -> Result<()> {
++        // A regular file is created; there are no device nodes or FIFOs to make.
++        let kind = mode & S_IFMT as mode_t;
++        if kind != 0 && kind != S_IFREG as mode_t {
++            return Err(Errno(EPERM));
++        }
++        let fd = Self::openat(
++            dir_fildes,
++            p,
++            O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC,
++            mode & 0o7777,
++        )?;
++        Self::close(fd)
++    }
++
++    fn mkfifoat(_dir_fd: c_int, _path: CStr, _mode: mode_t) -> Result<()> {
++        // No named FIFOs (section 9.1).
++        Err(Errno(ENOSYS))
++    }
++
++    unsafe fn mlock(_addr: *const c_void, _len: usize) -> Result<()> {
++        // Nothing is paged out once it has its frame.
++        Ok(())
++    }
++
++    unsafe fn mlockall(_flags: c_int) -> Result<()> {
++        Ok(())
++    }
++
++    unsafe fn mmap(
++        addr: *mut c_void,
++        len: usize,
++        prot: c_int,
++        flags: c_int,
++        fildes: c_int,
++        off: off_t,
++    ) -> Result<*mut c_void> {
++        Ok(e_raw(unsafe {
++            syscall6(
++                nr::MMAP2,
++                addr as usize,
++                len,
++                int(prot),
++                int(flags),
++                int(fildes),
++                off as usize,
++            )
++        })? as *mut c_void)
++    }
++
++    unsafe fn mremap(
++        _addr: *mut c_void,
++        _len: usize,
++        _new_len: usize,
++        _flags: c_int,
++        _args: *mut c_void,
++    ) -> Result<*mut c_void> {
++        Err(Errno(ENOSYS))
++    }
++
++    unsafe fn mprotect(addr: *mut c_void, len: usize, prot: c_int) -> Result<()> {
++        e_raw(unsafe { syscall3(nr::MPROTECT, addr as usize, len, int(prot)) }).map(|_| ())
++    }
++
++    unsafe fn msync(addr: *mut c_void, len: usize, flags: c_int) -> Result<()> {
++        e_raw(unsafe { syscall3(nr::MSYNC, addr as usize, len, int(flags)) }).map(|_| ())
++    }
++
++    unsafe fn munlock(_addr: *const c_void, _len: usize) -> Result<()> {
++        Ok(())
++    }
++
++    unsafe fn munlockall() -> Result<()> {
++        Ok(())
++    }
++
++    unsafe fn munmap(addr: *mut c_void, len: usize) -> Result<()> {
++        e_raw(unsafe { syscall2(nr::MUNMAP, addr as usize, len) }).map(|_| ())
++    }
++
++    unsafe fn madvise(addr: *mut c_void, len: usize, flags: c_int) -> Result<()> {
++        e_raw(unsafe { syscall3(nr::MADVISE, addr as usize, len, int(flags)) }).map(|_| ())
++    }
++
++    fn nanosleep(rqtp: &timespec, rmtp: Option<Out<timespec>>) -> Result<()> {
++        let remain = rmtp.map_or(0, |mut x| x.as_mut_ptr() as usize);
++        e_raw(unsafe {
++            syscall4(
++                nr::NANOSLEEP,
++                abi::clock::MONOTONIC,
++                0,
++                ptr::from_ref(rqtp) as usize,
++                remain,
++            )
++        })
++        .map(|_| ())
++    }
++
++    fn openat(dirfd: c_int, p: CStr, oflag: c_int, mode: mode_t) -> Result<c_int> {
++        let (p, len) = path(p);
++        e_raw(unsafe { syscall5(nr::OPENAT, int(dirfd), p, len, int(oflag), mode as usize) })
++            .map(|fd| fd as c_int)
++    }
++
++    fn pipe2(mut fildes: Out<[c_int; 2]>, flags: c_int) -> Result<()> {
++        e_raw(unsafe { syscall2(nr::PIPE2, fildes.as_mut_ptr() as usize, int(flags)) })
++            .map(|_| ())
++    }
++
++    fn poll(fds: &mut [pollfd], timeout: c_int) -> Result<c_int> {
++        // POLL takes nanoseconds, negative for forever.
++        let timeout_ns: i64 = if timeout < 0 {
++            -1
++        } else {
++            i64::from(timeout) * 1_000_000
++        };
++        e_raw(unsafe {
++            syscall4(
++                nr::POLL,
++                fds.as_mut_ptr() as usize,
++                fds.len(),
++                timeout_ns as usize,
++                0,
++            )
++        })
++        .map(|n| n as c_int)
++    }
++
++    fn ppoll(
++        fds: &mut [pollfd],
++        timeout: Option<&timespec>,
++        sigmask: Option<&sigset_t>,
++    ) -> Result<c_int> {
++        let timeout_ns: i64 = match timeout {
++            None => -1,
++            Some(t) => {
++                if t.tv_sec < 0 || !(0..1_000_000_000).contains(&t.tv_nsec) {
++                    return Err(Errno(EINVAL));
++                }
++                (t.tv_sec as i64)
++                    .saturating_mul(1_000_000_000)
++                    .saturating_add(t.tv_nsec as i64)
++            }
++        };
++        e_raw(unsafe {
++            syscall4(
++                nr::POLL,
++                fds.as_mut_ptr() as usize,
++                fds.len(),
++                timeout_ns as usize,
++                sigmask.map_or(0, |m| ptr::from_ref(m) as usize),
++            )
++        })
++        .map(|n| n as c_int)
++    }
++
++    fn posix_fallocate(fd: c_int, offset: u64, length: NonZeroU64) -> Result<()> {
++        // No preallocation: grow the file if the range ends past it, so ENOSPC comes
++        // at the write (section 9.1).
++        let end = offset.checked_add(length.get()).ok_or(Errno(EINVAL))?;
++        let mut st = mem::MaybeUninit::<stat>::uninit();
++        Self::fstat(fd, Out::from_uninit_mut(&mut st))?;
++        let size = unsafe { st.assume_init() }.st_size as u64;
++        if end > size {
++            Self::ftruncate(fd, end as off_t)?;
++        }
++        Ok(())
++    }
++
++    fn posix_getdents(fildes: c_int, buf: &mut [u8]) -> Result<usize> {
++        let current_offset = Self::lseek(fildes, 0, SEEK_CUR)?.cast_unsigned();
++        let bytes_read = Self::getdents(fildes, buf, current_offset)?;
++        if bytes_read == 0 {
++            return Ok(0);
++        }
++        let mut bytes_processed = 0;
++        let mut next_offset = current_offset;
++
++        while bytes_processed < bytes_read {
++            let remaining_slice = &buf[bytes_processed..];
++            let (reclen, opaque_next) =
++                unsafe { Self::dent_reclen_offset(remaining_slice, bytes_processed) }
++                    .ok_or(Errno(EIO))?;
++            if reclen == 0 {
++                return Err(Errno(EIO));
++            }
++
++            bytes_processed += reclen as usize;
++            next_offset = opaque_next;
++        }
++
++        Self::lseek(fildes, next_offset as off_t, SEEK_SET)?;
++        Ok(bytes_read)
++    }
++
++    unsafe fn rlct_clone(
++        stack: *mut usize,
++        _os_specific: &mut OsSpecific,
++    ) -> Result<crate::pthread::OsTid> {
++        // `stack` points at relibc's start words; THREAD_CREATE wants a 16-byte
++        // aligned stack top, which below the words is (they're popped first).
++        let words = stack as usize;
++        let tid = e_raw(unsafe {
++            syscall5(
++                nr::THREAD_CREATE,
++                __relibc_feos_thread_start as *const () as usize,
++                words & !15,
++                0,
++                words,
++                0,
++            )
++        })?;
++        Ok(crate::pthread::OsTid { thread_id: tid })
++    }
++
++    unsafe fn rlct_kill(os_tid: crate::pthread::OsTid, signal: usize) -> Result<()> {
++        Self::thread_kill(os_tid.thread_id, signal as c_int)
++    }
++
++    fn current_os_tid() -> crate::pthread::OsTid {
++        crate::pthread::OsTid {
++            thread_id: unsafe { syscall0(nr::GETTID) },
++        }
++    }
++
++    fn read(fildes: c_int, buf: &mut [u8]) -> Result<usize> {
++        e_raw(unsafe { syscall3(nr::READ, int(fildes), buf.as_mut_ptr() as usize, buf.len()) })
++    }
++
++    fn pread(fildes: c_int, buf: &mut [u8], off: off_t) -> Result<usize> {
++        e_raw(unsafe {
++            syscall4(
++                nr::PREAD,
++                int(fildes),
++                buf.as_mut_ptr() as usize,
++                buf.len(),
++                off as usize,
++            )
++        })
++    }
++
++    unsafe fn readv(fildes: c_int, iov: *const iovec, iovcnt: c_int) -> Result<usize> {
++        // One READ per buffer, stopping at a short read.
++        if iovcnt < 0 {
++            return Err(Errno(EINVAL));
++        }
++        let iovs = unsafe { core::slice::from_raw_parts(iov, iovcnt as usize) };
++        let mut total = 0usize;
++        for v in iovs {
++            if v.iov_len == 0 {
++                continue;
++            }
++            let buf = unsafe { core::slice::from_raw_parts_mut(v.iov_base.cast::<u8>(), v.iov_len) };
++            match Self::read(fildes, buf) {
++                Ok(n) => {
++                    total += n;
++                    if n < v.iov_len {
++                        break;
++                    }
++                }
++                Err(e) if total == 0 => return Err(e),
++                Err(_) => break,
++            }
++        }
++        Ok(total)
++    }
++
++    fn readlinkat(dirfd: c_int, pathname: CStr, out: &mut [u8]) -> Result<usize> {
++        let (p, len) = path(pathname);
++        e_raw(unsafe {
++            syscall5(
++                nr::READLINKAT,
++                int(dirfd),
++                p,
++                len,
++                out.as_mut_ptr() as usize,
++                out.len(),
++            )
++        })
++    }
++
++    fn renameat2(
++        old_dir: c_int,
++        old_path: CStr,
++        new_dir: c_int,
++        new_path: CStr,
++        flags: c_uint,
++    ) -> Result<()> {
++        let from = path_at(old_dir, old_path);
++        let to = path_at(new_dir, new_path);
++        e_raw(unsafe {
++            syscall3(
++                nr::RENAMEAT,
++                (&raw const from) as usize,
++                (&raw const to) as usize,
++                flags as usize,
++            )
++        })
++        .map(|_| ())
++    }
++
++    fn sched_yield() -> Result<()> {
++        e_raw(unsafe { syscall0(nr::YIELD) }).map(|_| ())
++    }
++
++    unsafe fn setgroups(size: size_t, list: *const gid_t) -> Result<()> {
++        // Root may set at most its one group; nothing else is possible.
++        if Self::getuid() != 0 {
++            return Err(Errno(EPERM));
++        }
++        match size {
++            0 => Ok(()),
++            1 if unsafe { *list } == Self::getgid() => Ok(()),
++            _ => Err(Errno(EPERM)),
++        }
++    }
++
++    fn setpgid(pid: pid_t, pgid: pid_t) -> Result<()> {
++        e_raw(unsafe { syscall2(nr::SETPGID, int(pid), int(pgid)) }).map(|_| ())
++    }
++
++    fn setpriority(_which: c_int, _who: id_t, _prio: c_int) -> Result<()> {
++        // Accepted, no effect yet (section 9.1).
++        Ok(())
++    }
++
++    fn setresgid(rgid: gid_t, egid: gid_t, sgid: gid_t) -> Result<()> {
++        // No saved ids: all three equal (or -1), and only root (v1's SETUID).
++        let gid = one_id([rgid, egid, sgid])?;
++        match gid {
++            None => Ok(()),
++            Some(gid) => e_raw(unsafe {
++                syscall2(nr::SETUID, Self::getuid() as usize, gid as usize)
++            })
++            .map(|_| ()),
++        }
++    }
++
++    fn setresuid(ruid: uid_t, euid: uid_t, suid: uid_t) -> Result<()> {
++        let uid = one_id([ruid, euid, suid])?;
++        match uid {
++            None => Ok(()),
++            Some(uid) => e_raw(unsafe {
++                syscall2(nr::SETUID, uid as usize, Self::getgid() as usize)
++            })
++            .map(|_| ()),
++        }
++    }
++
++    fn setsid() -> Result<c_int> {
++        e_raw(unsafe { syscall0(nr::SETSID) }).map(|s| s as c_int)
++    }
++
++    unsafe fn spawn(
++        program: CStr,
++        fac: Option<&crate::header::spawn::posix_spawn_file_actions_t>,
++        fat: Option<&crate::header::spawn::posix_spawnattr_t>,
++        argv: NulTerminated<*mut c_char>,
++        envp: Option<NulTerminated<*mut c_char>>,
++    ) -> Result<pid_t> {
++        use crate::header::spawn::Action;
++
++        let args = unsafe { user_strs(argv) };
++        let envs = match envp {
++            Some(envp) => unsafe { user_strs(envp) },
++            None => {
++                let environ: Vec<*mut c_char> = super::environ_iter().collect();
++                unsafe { user_strs(environ.iter()) }
++            }
++        };
++
++        // The file actions, in order. `paths` keeps the strings their PathAts point at.
++        let mut actions = Vec::new();
++        let mut paths: Vec<alloc::ffi::CString> = Vec::new();
++        if let Some(fac) = fac {
++            for action in fac {
++                let mut a = abi::SpawnAction::default();
++                match action {
++                    Action::Open {
++                        fd,
++                        path,
++                        flag,
++                        mode,
++                    } => {
++                        a.kind = abi::spawn_action::OPEN;
++                        a.fd = fd;
++                        a.open_flags = flag as u32;
++                        a.mode = mode as u32;
++                        a.path = path_at(AT_FDCWD, CStr::borrow(&path));
++                        paths.push(path);
++                    }
++                    Action::Close(fd) => {
++                        a.kind = abi::spawn_action::CLOSE;
++                        a.fd = fd;
++                    }
++                    Action::Chdir(path) => {
++                        a.kind = abi::spawn_action::CHDIR;
++                        a.path = path_at(AT_FDCWD, CStr::borrow(&path));
++                        paths.push(path);
++                    }
++                    Action::FChdir(fd) => {
++                        a.kind = abi::spawn_action::FCHDIR;
++                        a.fd = fd;
++                    }
++                    Action::Dup2(from, to) => {
++                        a.kind = abi::spawn_action::DUP2;
++                        a.fd = from;
++                        a.to = to;
++                    }
++                    Action::CloseFrom(fd) => {
++                        a.kind = abi::spawn_action::CLOSEFROM;
++                        a.fd = fd;
++                    }
++                    Action::TcSetPgrp(fd) => {
++                        a.kind = abi::spawn_action::TCSETPGRP;
++                        a.fd = fd;
++                    }
++                }
++                actions.push(a);
++            }
++        }
++
++        let mut request = abi::SpawnRequest {
++            path: path_at(AT_FDCWD, program),
++            argv: args.as_ptr() as u64,
++            argc: args.len() as u64,
++            envp: envs.as_ptr() as u64,
++            envc: envs.len() as u64,
++            actions: actions.as_ptr() as u64,
++            action_count: actions.len() as u64,
++            ..Default::default()
++        };
++        if let Some(attr) = fat {
++            // The feos spawn.h uses glibc's bit values, which SPAWN2 takes as they are.
++            // SPAWN2 wants the fields a flag doesn't ask for zero (EINVAL otherwise), and
++            // POSIX ignores an attribute whose flag isn't set.
++            let flags = attr.flags as u16 as u64;
++            request.flags = flags;
++            if flags & abi::spawn::SETPGROUP != 0 {
++                request.pgroup = attr.pgroup as i64;
++            }
++            if flags & abi::spawn::SETSIGMASK != 0 {
++                request.sigmask = attr.sigmask;
++            }
++            if flags & abi::spawn::SETSIGDEF != 0 {
++                request.sigdefault = attr.sigdefault;
++            }
++        }
++        let result = e_raw(unsafe {
++            syscall1(nr::SPAWN2, (&raw const request) as usize)
++        });
++        drop(paths);
++        result.map(|pid| pid as pid_t)
++    }
++
++    fn symlinkat(path1: CStr, fd: c_int, path2: CStr) -> Result<()> {
++        let (t, tlen) = path(path1);
++        let (p, len) = path(path2);
++        e_raw(unsafe { syscall5(nr::SYMLINKAT, t, tlen, int(fd), p, len) }).map(|_| ())
++    }
++
++    fn sync() -> Result<()> {
++        e_raw(unsafe { syscall0(nr::SYNC) }).map(|_| ())
++    }
++
++    fn timer_create(_clock_id: clockid_t, _evp: &sigevent) -> Result<timer_t> {
++        // No POSIX timers (section 9.1).
++        Err(Errno(ENOSYS))
++    }
++
++    fn timer_delete(_timerid: timer_t) -> Result<()> {
++        Err(Errno(ENOSYS))
++    }
++
++    fn timer_gettime(_timerid: timer_t) -> Result<itimerspec> {
++        Err(Errno(ENOSYS))
++    }
++
++    fn timer_settime(
++        _timerid: timer_t,
++        _flags: c_int,
++        _value: &itimerspec,
++        _ovalue: Option<Out<itimerspec>>,
++    ) -> Result<()> {
++        Err(Errno(ENOSYS))
++    }
++
++    fn umask(mask: mode_t) -> mode_t {
++        unsafe { syscall1(nr::UMASK, (mask & 0o777) as usize) as mode_t }
++    }
++
++    fn uname(mut utsname: Out<utsname>) -> Result<()> {
++        let info = sysinfo()?;
++        let mut u: utsname = unsafe { mem::zeroed() };
++        fn put(field: &mut [c_char; UTSLENGTH], bytes: &[u8]) {
++            let bytes = &bytes[..bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len())];
++            let n = bytes.len().min(UTSLENGTH - 1);
++            for (dst, &src) in field.iter_mut().zip(&bytes[..n]) {
++                *dst = src as c_char;
++            }
++        }
++        put(&mut u.sysname, b"feos");
++        // The node name is /etc/hostname's first line, or "feos".
++        let mut host = [0u8; UTSLENGTH];
++        let mut host_len = 0;
++        if let Ok(fd) = Self::open(c"/etc/hostname".into(), abi::o::RDONLY | O_CLOEXEC, 0) {
++            host_len = Self::read(fd, &mut host[..UTSLENGTH - 1]).unwrap_or(0);
++            let _ = Self::close(fd);
++        }
++        let host = &host[..host_len];
++        let host = &host[..host.iter().position(|&b| b == b'\n').unwrap_or(host.len())];
++        put(&mut u.nodename, if host.is_empty() { b"feos" } else { host });
++        put(&mut u.release, &info.release);
++        put(&mut u.version, &info.release);
++        put(&mut u.machine, &info.machine);
++        utsname.write(u);
++        Ok(())
++    }
++
++    fn unlinkat(fd: c_int, p: CStr, flags: c_int) -> Result<()> {
++        let (p, len) = path(p);
++        e_raw(unsafe { syscall4(nr::UNLINKAT, int(fd), p, len, int(flags)) }).map(|_| ())
++    }
++
++    fn waitpid(pid: pid_t, stat_loc: Option<Out<c_int>>, options: c_int) -> Result<pid_t> {
++        let mut status: c_int = 0;
++        match e_raw(unsafe {
++            syscall4(nr::WAIT4, int(pid), (&raw mut status) as usize, int(options), 0)
++        }) {
++            Ok(child) => {
++                if let Some(mut out) = stat_loc {
++                    out.write(status);
++                }
++                Ok(child as pid_t)
++            }
++            // Before WAIT4 (stage 1c.8), v1's WAIT is what the kernel offers: one child
++            // by pid, blocking. Nothing stops before 1c.8, so WUNTRACED and WCONTINUED
++            // change nothing; WNOHANG and the group forms can't be had from it.
++            Err(Errno(ENOSYS))
++                if pid > 0 && options & !(abi::wait::UNTRACED | abi::wait::CONTINUED) == 0 =>
++            {
++                let status = Self::wait_v1(pid)?;
++                if let Some(mut out) = stat_loc {
++                    out.write(status);
++                }
++                Ok(pid)
++            }
++            Err(e) => Err(e),
++        }
++    }
++
++    fn write(fildes: c_int, buf: &[u8]) -> Result<usize> {
++        e_raw(unsafe { syscall3(nr::WRITE, int(fildes), buf.as_ptr() as usize, buf.len()) })
++    }
++
++    fn pwrite(fildes: c_int, buf: &[u8], off: off_t) -> Result<usize> {
++        e_raw(unsafe {
++            syscall4(
++                nr::PWRITE,
++                int(fildes),
++                buf.as_ptr() as usize,
++                buf.len(),
++                off as usize,
++            )
++        })
++    }
++
++    unsafe fn writev(fildes: c_int, iov: *const iovec, iovcnt: c_int) -> Result<usize> {
++        // Gathered into one buffer of up to 64 KiB and written with one WRITE, so a
++        // writev to a pipe of up to PIPE_BUF stays atomic; larger ones buffer by buffer.
++        const GATHER_MAX: usize = 64 * 1024;
++        if iovcnt < 0 {
++            return Err(Errno(EINVAL));
++        }
++        let iovs = unsafe { core::slice::from_raw_parts(iov, iovcnt as usize) };
++        let total: usize = iovs.iter().map(|v| v.iov_len).sum();
++        if total <= GATHER_MAX {
++            let mut buf = Vec::new();
++            buf.try_reserve_exact(total).map_err(|_| Errno(ENOMEM))?;
++            for v in iovs {
++                buf.extend_from_slice(unsafe {
++                    core::slice::from_raw_parts(v.iov_base.cast::<u8>(), v.iov_len)
++                });
++            }
++            return Self::write(fildes, &buf);
++        }
++        let mut written = 0usize;
++        for v in iovs {
++            if v.iov_len == 0 {
++                continue;
++            }
++            let buf = unsafe { core::slice::from_raw_parts(v.iov_base.cast::<u8>(), v.iov_len) };
++            match Self::write(fildes, buf) {
++                Ok(n) => {
++                    written += n;
++                    if n < v.iov_len {
++                        break;
++                    }
++                }
++                Err(e) if written == 0 => return Err(e),
++                Err(_) => break,
++            }
++        }
++        Ok(written)
++    }
++
++    fn verify() -> bool {
++        // SYSINFO: an ABI v2 kernel with every stage relibc was built for (section 1).
++        match sysinfo() {
++            Ok(info) => {
++                info.abi_version >= abi::ABI_VERSION
++                    && info.features & abi::FEATURES_REQUIRED == abi::FEATURES_REQUIRED
++            }
++            Err(_) => false,
++        }
++    }
++}
++
++/// The one id `setres*id` may set: all three the same, or `-1` to leave one.
++fn one_id(ids: [c_int; 3]) -> Result<Option<c_int>> {
++    let mut chosen = None;
++    for id in ids {
++        if id == -1 {
++            continue;
++        }
++        match chosen {
++            None => chosen = Some(id),
++            Some(c) if c == id => {}
++            Some(_) => return Err(Errno(EPERM)),
++        }
++    }
++    Ok(chosen)
++}
+diff --git a/src/platform/feos/ptrace.rs b/src/platform/feos/ptrace.rs
+new file mode 100644
+index 0000000..70168f7
+--- /dev/null
++++ b/src/platform/feos/ptrace.rs
+@@ -0,0 +1,23 @@
++//! No `ptrace` on feos (section 9.4 of `docs/feos-abi-v2.md`): no debugger is on the
++//! toolchain's path yet.
++
++use super::Sys;
++use crate::{
++    error::{Errno, Result},
++    header::errno::ENOSYS,
++    platform::{
++        PalPtrace,
++        types::{c_int, c_void, pid_t},
++    },
++};
++
++impl PalPtrace for Sys {
++    unsafe fn ptrace(
++        _request: c_int,
++        _pid: pid_t,
++        _addr: *mut c_void,
++        _data: *mut c_void,
++    ) -> Result<c_int> {
++        Err(Errno(ENOSYS))
++    }
++}
+diff --git a/src/platform/feos/signal.rs b/src/platform/feos/signal.rs
+new file mode 100644
+index 0000000..7888dd7
+--- /dev/null
++++ b/src/platform/feos/signal.rs
+@@ -0,0 +1,140 @@
++//! `PalSignal` for feos (section 9.2 of `docs/feos-abi-v2.md`). The signal calls arrive
++//! with kernel stages 1c.8 to 1c.10; until then they return the kernel's `ENOSYS`.
++
++use core::ptr;
++
++use super::{
++    super::{
++        PalSignal,
++        types::{c_int, pid_t},
++    },
++    Sys, abi, e_raw, int,
++    syscall::*,
++};
++#[expect(deprecated)]
++use crate::header::sys_time::itimerval;
++use crate::{
++    error::{Errno, Result},
++    header::{
++        bits_sigset_t::sigset_t,
++        bits_timespec::timespec,
++        errno::ENOSYS,
++        signal::{SA_RESTORER, sigaction, siginfo_t, sigval, stack_t},
++    },
++};
++
++use abi::nr;
++
++impl PalSignal for Sys {
++    #[expect(deprecated)]
++    fn getitimer(which: c_int, out: &mut itimerval) -> Result<()> {
++        // relibc's itimerval is Linux's, which is abi::ITimerVal.
++        e_raw(unsafe { syscall3(nr::SETITIMER, int(which), 0, ptr::from_mut(out) as usize) })
++            .map(|_| ())
++    }
++
++    fn kill(pid: pid_t, sig: c_int) -> Result<()> {
++        e_raw(unsafe { syscall2(nr::KILL, int(pid), int(sig)) }).map(|_| ())
++    }
++
++    fn sigqueue(pid: pid_t, sig: c_int, _val: sigval) -> Result<()> {
++        // The value is dropped: KILL, with SI_USER.
++        Self::kill(pid, sig)
++    }
++
++    fn killpg(pgrp: pid_t, sig: c_int) -> Result<()> {
++        Self::kill(pgrp.wrapping_neg(), sig)
++    }
++
++    fn raise(sig: c_int) -> Result<()> {
++        Self::thread_kill(unsafe { syscall0(nr::GETTID) }, sig)
++    }
++
++    #[expect(deprecated)]
++    fn setitimer(which: c_int, new: &itimerval, old: Option<&mut itimerval>) -> Result<()> {
++        e_raw(unsafe {
++            syscall3(
++                nr::SETITIMER,
++                int(which),
++                ptr::from_ref(new) as usize,
++                old.map_or(0, |o| ptr::from_mut(o) as usize),
++            )
++        })
++        .map(|_| ())
++    }
++
++    fn sigaction(sig: c_int, act: Option<&sigaction>, oact: Option<&mut sigaction>) -> Result<()> {
++        unsafe extern "C" {
++            fn __restore_rt();
++        }
++        // A fresh SigAction: sa_flags is a c_int, so SA_RESETHAND is negative there and
++        // must not be sign-extended into the kernel's word.
++        let new = act.map(|act| abi::SigAction {
++            handler: act.sa_handler.map_or(0, |f| f as usize as u64),
++            flags: (act.sa_flags as u32) | SA_RESTORER as u32,
++            reserved: 0,
++            restorer: __restore_rt as *const () as usize as u64,
++            mask: act.sa_mask,
++        });
++        let mut old = abi::SigAction::default();
++        e_raw(unsafe {
++            syscall3(
++                nr::SIGACTION,
++                int(sig),
++                new.as_ref().map_or(0, |n| ptr::from_ref(n) as usize),
++                if oact.is_some() { (&raw mut old) as usize } else { 0 },
++            )
++        })?;
++        if let Some(oact) = oact {
++            oact.sa_handler = unsafe { core::mem::transmute::<usize, Option<extern "C" fn(c_int)>>(old.handler as usize) };
++            oact.sa_flags = old.flags as c_int;
++            oact.sa_restorer = unsafe { core::mem::transmute::<usize, Option<unsafe extern "C" fn()>>(old.restorer as usize) };
++            oact.sa_mask = old.mask;
++        }
++        Ok(())
++    }
++
++    unsafe fn sigaltstack(ss: Option<&stack_t>, old_ss: Option<&mut stack_t>) -> Result<()> {
++        // relibc's stack_t is Linux's, which is abi::SigStack.
++        e_raw(unsafe {
++            syscall2(
++                nr::SIGALTSTACK,
++                ss.map_or(0, |s| ptr::from_ref(s) as usize),
++                old_ss.map_or(0, |s| ptr::from_mut(s) as usize),
++            )
++        })
++        .map(|_| ())
++    }
++
++    fn sigpending(set: &mut sigset_t) -> Result<()> {
++        e_raw(unsafe { syscall1(nr::SIGPENDING, ptr::from_mut(set) as usize) }).map(|_| ())
++    }
++
++    fn sigprocmask(how: c_int, set: Option<&sigset_t>, oset: Option<&mut sigset_t>) -> Result<()> {
++        e_raw(unsafe {
++            syscall3(
++                nr::SIGPROCMASK,
++                int(how),
++                set.map_or(0, |s| ptr::from_ref(s) as usize),
++                oset.map_or(0, |s| ptr::from_mut(s) as usize),
++            )
++        })
++        .map(|_| ())
++    }
++
++    fn sigsuspend(mask: &sigset_t) -> Errno {
++        match e_raw(unsafe { syscall1(nr::SIGSUSPEND, ptr::from_ref(mask) as usize) }) {
++            Err(e) => e,
++            Ok(_) => unreachable!("SIGSUSPEND always fails"),
++        }
++    }
++
++    fn sigtimedwait(
++        _set: &sigset_t,
++        _sig: Option<&mut siginfo_t>,
++        _tp: Option<&timespec>,
++    ) -> Result<c_int> {
++        // No call for it (section 9.2).
++        Err(Errno(ENOSYS))
++    }
++}
+diff --git a/src/platform/feos/socket.rs b/src/platform/feos/socket.rs
+new file mode 100644
+index 0000000..3bb7914
+--- /dev/null
++++ b/src/platform/feos/socket.rs
+@@ -0,0 +1,248 @@
++//! `PalSocket` for feos (section 9.3 of `docs/feos-abi-v2.md`), at the call numbers of
++//! section 3.7. The sockets arrive with kernel stages 1e.3 and 1e.4; until then the
++//! calls return the kernel's `ENOSYS`.
++
++use alloc::vec::Vec;
++use core::ptr;
++
++use super::{Sys, abi, e_raw, int, syscall::*};
++use crate::{
++    error::{Errno, Result},
++    header::{
++        errno::{EINVAL, ENOMEM, EOPNOTSUPP},
++        sys_socket::{msghdr, socklen_t},
++    },
++    out::Out,
++    platform::{PalSocket, types::c_int},
++};
++
++use abi::nr;
++
++impl PalSocket for Sys {
++    fn accept(socket: c_int, address_dst: Option<&mut [u8]>) -> Result<(c_int, socklen_t)> {
++        let mut len = address_dst.as_ref().map_or(0, |a| a.len()) as socklen_t;
++        let address = address_dst.map_or(0, |a| a.as_mut_ptr() as usize);
++        let fd = e_raw(unsafe {
++            syscall4(
++                nr::ACCEPT,
++                int(socket),
++                address,
++                if address == 0 { 0 } else { (&raw mut len) as usize },
++                0,
++            )
++        })? as c_int;
++        Ok((fd, len))
++    }
++
++    fn bind(socket: c_int, address_raw: &[u8]) -> Result<()> {
++        e_raw(unsafe {
++            syscall3(nr::BIND, int(socket), address_raw.as_ptr() as usize, address_raw.len())
++        })
++        .map(|_| ())
++    }
++
++    fn connect(socket: c_int, address_raw: &[u8]) -> Result<c_int> {
++        e_raw(unsafe {
++            syscall3(nr::CONNECT, int(socket), address_raw.as_ptr() as usize, address_raw.len())
++        })
++        .map(|v| v as c_int)
++    }
++
++    fn getpeername(socket: c_int, address_dst: &mut [u8]) -> Result<socklen_t> {
++        let mut len = address_dst.len() as socklen_t;
++        e_raw(unsafe {
++            syscall3(
++                nr::GETPEERNAME,
++                int(socket),
++                address_dst.as_mut_ptr() as usize,
++                (&raw mut len) as usize,
++            )
++        })?;
++        Ok(len)
++    }
++
++    fn getsockname(socket: c_int, address_dst: &mut [u8]) -> Result<socklen_t> {
++        let mut len = address_dst.len() as socklen_t;
++        e_raw(unsafe {
++            syscall3(
++                nr::GETSOCKNAME,
++                int(socket),
++                address_dst.as_mut_ptr() as usize,
++                (&raw mut len) as usize,
++            )
++        })?;
++        Ok(len)
++    }
++
++    fn getsockopt(
++        socket: c_int,
++        level: c_int,
++        option_name: c_int,
++        option_value: &mut [u8],
++    ) -> Result<socklen_t> {
++        let mut len = option_value.len() as socklen_t;
++        e_raw(unsafe {
++            syscall5(
++                nr::GETSOCKOPT,
++                int(socket),
++                int(level),
++                int(option_name),
++                option_value.as_mut_ptr() as usize,
++                (&raw mut len) as usize,
++            )
++        })?;
++        Ok(len)
++    }
++
++    fn listen(socket: c_int, backlog: c_int) -> Result<()> {
++        e_raw(unsafe { syscall2(nr::LISTEN, int(socket), int(backlog)) }).map(|_| ())
++    }
++
++    fn recvfrom(
++        socket: c_int,
++        mut buf: Out<[u8]>,
++        flags: c_int,
++        address_raw: Option<&mut [u8]>,
++    ) -> Result<(usize, socklen_t)> {
++        let mut len = address_raw.as_ref().map_or(0, |a| a.len()) as socklen_t;
++        let address = address_raw.map_or(0, |a| a.as_mut_ptr() as usize);
++        let count = e_raw(unsafe {
++            syscall6(
++                nr::RECVFROM,
++                int(socket),
++                buf.as_mut_ptr().as_mut_ptr() as usize,
++                buf.len(),
++                int(flags),
++                address,
++                if address == 0 { 0 } else { (&raw mut len) as usize },
++            )
++        })?;
++        Ok((count, len))
++    }
++
++    unsafe fn recvmsg(socket: c_int, msg: *mut msghdr, flags: c_int) -> Result<usize> {
++        // RECVFROM into one buffer, scattered into the iovecs; no control data.
++        let msg = unsafe { &mut *msg };
++        let iovs = unsafe { core::slice::from_raw_parts(msg.msg_iov, msg.msg_iovlen) };
++        let total: usize = iovs.iter().map(|v| v.iov_len).sum();
++        let mut buf = Vec::new();
++        buf.try_reserve_exact(total).map_err(|_| Errno(ENOMEM))?;
++        buf.resize(total, 0u8);
++        let mut name_len = msg.msg_namelen;
++        let count = e_raw(unsafe {
++            syscall6(
++                nr::RECVFROM,
++                int(socket),
++                buf.as_mut_ptr() as usize,
++                total,
++                int(flags),
++                msg.msg_name as usize,
++                if msg.msg_name.is_null() { 0 } else { (&raw mut name_len) as usize },
++            )
++        })?;
++        let mut at = 0;
++        for v in iovs {
++            let n = v.iov_len.min(count - at);
++            unsafe { ptr::copy_nonoverlapping(buf.as_ptr().add(at), v.iov_base.cast::<u8>(), n) };
++            at += n;
++            if at == count {
++                break;
++            }
++        }
++        if !msg.msg_name.is_null() {
++            msg.msg_namelen = name_len;
++        }
++        msg.msg_controllen = 0;
++        // RECVFROM returns at most the buffer's length and drops the rest of a longer
++        // datagram (section 3.7), with no way to ask for its full length, so a
++        // truncation can't be told from a datagram that fit: MSG_TRUNC isn't reported.
++        msg.msg_flags = 0;
++        Ok(count)
++    }
++
++    unsafe fn sendmsg(socket: c_int, msg: *const msghdr, flags: c_int) -> Result<usize> {
++        // The iovecs gathered into one SENDTO; control data isn't supported.
++        let msg = unsafe { &*msg };
++        if msg.msg_controllen != 0 {
++            return Err(Errno(EOPNOTSUPP));
++        }
++        if msg.msg_iovlen > 0 && msg.msg_iov.is_null() {
++            return Err(Errno(EINVAL));
++        }
++        let iovs = unsafe { core::slice::from_raw_parts(msg.msg_iov, msg.msg_iovlen) };
++        let total: usize = iovs.iter().map(|v| v.iov_len).sum();
++        let mut buf = Vec::new();
++        buf.try_reserve_exact(total).map_err(|_| Errno(ENOMEM))?;
++        for v in iovs {
++            buf.extend_from_slice(unsafe {
++                core::slice::from_raw_parts(v.iov_base.cast::<u8>(), v.iov_len)
++            });
++        }
++        e_raw(unsafe {
++            syscall6(
++                nr::SENDTO,
++                int(socket),
++                buf.as_ptr() as usize,
++                buf.len(),
++                int(flags),
++                msg.msg_name as usize,
++                msg.msg_namelen as usize,
++            )
++        })
++    }
++
++    fn sendto(socket: c_int, buf: &[u8], flags: c_int, dest: Option<&[u8]>) -> Result<usize> {
++        e_raw(unsafe {
++            syscall6(
++                nr::SENDTO,
++                int(socket),
++                buf.as_ptr() as usize,
++                buf.len(),
++                int(flags),
++                dest.map_or(0, |d| d.as_ptr() as usize),
++                dest.map_or(0, <[u8]>::len),
++            )
++        })
++    }
++
++    fn setsockopt(
++        socket: c_int,
++        level: c_int,
++        option_name: c_int,
++        option_value: &[u8],
++    ) -> Result<()> {
++        e_raw(unsafe {
++            syscall5(
++                nr::SETSOCKOPT,
++                int(socket),
++                int(level),
++                int(option_name),
++                option_value.as_ptr() as usize,
++                option_value.len(),
++            )
++        })
++        .map(|_| ())
++    }
++
++    fn shutdown(socket: c_int, how: c_int) -> Result<()> {
++        e_raw(unsafe { syscall2(nr::SHUTDOWN, int(socket), int(how)) }).map(|_| ())
++    }
++
++    fn socket(domain: c_int, kind: c_int, protocol: c_int) -> Result<c_int> {
++        e_raw(unsafe { syscall3(nr::SOCKET, int(domain), int(kind), int(protocol)) })
++            .map(|fd| fd as c_int)
++    }
++
++    fn socketpair(domain: c_int, kind: c_int, protocol: c_int, sv: &mut [c_int; 2]) -> Result<()> {
++        e_raw(unsafe {
++            syscall4(
++                nr::SOCKETPAIR,
++                int(domain),
++                int(kind),
++                int(protocol),
++                sv.as_mut_ptr() as usize,
++            )
++        })
++        .map(|_| ())
++    }
++}
+diff --git a/src/platform/feos/syscall.rs b/src/platform/feos/syscall.rs
+new file mode 100644
+index 0000000..47a46aa
+--- /dev/null
++++ b/src/platform/feos/syscall.rs
+@@ -0,0 +1,154 @@
++//! The raw feos system call (section 1 of `docs/feos-abi-v2.md`).
++//!
++//! x86_64: `int $0xf0`, the number in `rax`, arguments in `rdi`, `rsi`, `rdx`, `r10`,
++//! `r8`, `r9`, the result in `rax`. AArch64: `svc #0`, the number in `x8`, arguments in
++//! `x0`..`x5`, the result in `x0`. Every other register survives the call, but the
++//! condition flags don't, so none of these say `preserves_flags`. A result in
++//! `-4095..0` is a negated error number.
++//!
++//! Safety, for every function here: the arguments must be what call `n` takes, and the
++//! pointers among them valid for what the call does with them.
++
++use core::arch::asm;
++
++#[cfg(target_arch = "x86_64")]
++mod imp {
++    use super::asm;
++
++    #[inline(always)]
++    pub unsafe fn syscall0(n: usize) -> usize {
++        let ret;
++        unsafe { asm!("int 0xf0", inlateout("rax") n => ret, options(nostack)) };
++        ret
++    }
++    #[inline(always)]
++    pub unsafe fn syscall1(n: usize, a: usize) -> usize {
++        let ret;
++        unsafe { asm!("int 0xf0", inlateout("rax") n => ret, in("rdi") a, options(nostack)) };
++        ret
++    }
++    #[inline(always)]
++    pub unsafe fn syscall2(n: usize, a: usize, b: usize) -> usize {
++        let ret;
++        unsafe {
++            asm!("int 0xf0", inlateout("rax") n => ret, in("rdi") a, in("rsi") b, options(nostack))
++        };
++        ret
++    }
++    #[inline(always)]
++    pub unsafe fn syscall3(n: usize, a: usize, b: usize, c: usize) -> usize {
++        let ret;
++        unsafe {
++            asm!("int 0xf0", inlateout("rax") n => ret, in("rdi") a, in("rsi") b, in("rdx") c,
++                options(nostack))
++        };
++        ret
++    }
++    #[inline(always)]
++    pub unsafe fn syscall4(n: usize, a: usize, b: usize, c: usize, d: usize) -> usize {
++        let ret;
++        unsafe {
++            asm!("int 0xf0", inlateout("rax") n => ret, in("rdi") a, in("rsi") b, in("rdx") c,
++                in("r10") d, options(nostack))
++        };
++        ret
++    }
++    #[inline(always)]
++    pub unsafe fn syscall5(n: usize, a: usize, b: usize, c: usize, d: usize, e: usize) -> usize {
++        let ret;
++        unsafe {
++            asm!("int 0xf0", inlateout("rax") n => ret, in("rdi") a, in("rsi") b, in("rdx") c,
++                in("r10") d, in("r8") e, options(nostack))
++        };
++        ret
++    }
++    #[inline(always)]
++    pub unsafe fn syscall6(
++        n: usize,
++        a: usize,
++        b: usize,
++        c: usize,
++        d: usize,
++        e: usize,
++        f: usize,
++    ) -> usize {
++        let ret;
++        unsafe {
++            asm!("int 0xf0", inlateout("rax") n => ret, in("rdi") a, in("rsi") b, in("rdx") c,
++                in("r10") d, in("r8") e, in("r9") f, options(nostack))
++        };
++        ret
++    }
++}
++
++#[cfg(target_arch = "aarch64")]
++mod imp {
++    use super::asm;
++
++    #[inline(always)]
++    pub unsafe fn syscall0(n: usize) -> usize {
++        let ret;
++        unsafe { asm!("svc #0", in("x8") n, lateout("x0") ret, options(nostack)) };
++        ret
++    }
++    #[inline(always)]
++    pub unsafe fn syscall1(n: usize, a: usize) -> usize {
++        let ret;
++        unsafe { asm!("svc #0", in("x8") n, inlateout("x0") a => ret, options(nostack)) };
++        ret
++    }
++    #[inline(always)]
++    pub unsafe fn syscall2(n: usize, a: usize, b: usize) -> usize {
++        let ret;
++        unsafe {
++            asm!("svc #0", in("x8") n, inlateout("x0") a => ret, in("x1") b, options(nostack))
++        };
++        ret
++    }
++    #[inline(always)]
++    pub unsafe fn syscall3(n: usize, a: usize, b: usize, c: usize) -> usize {
++        let ret;
++        unsafe {
++            asm!("svc #0", in("x8") n, inlateout("x0") a => ret, in("x1") b, in("x2") c,
++                options(nostack))
++        };
++        ret
++    }
++    #[inline(always)]
++    pub unsafe fn syscall4(n: usize, a: usize, b: usize, c: usize, d: usize) -> usize {
++        let ret;
++        unsafe {
++            asm!("svc #0", in("x8") n, inlateout("x0") a => ret, in("x1") b, in("x2") c,
++                in("x3") d, options(nostack))
++        };
++        ret
++    }
++    #[inline(always)]
++    pub unsafe fn syscall5(n: usize, a: usize, b: usize, c: usize, d: usize, e: usize) -> usize {
++        let ret;
++        unsafe {
++            asm!("svc #0", in("x8") n, inlateout("x0") a => ret, in("x1") b, in("x2") c,
++                in("x3") d, in("x4") e, options(nostack))
++        };
++        ret
++    }
++    #[inline(always)]
++    pub unsafe fn syscall6(
++        n: usize,
++        a: usize,
++        b: usize,
++        c: usize,
++        d: usize,
++        e: usize,
++        f: usize,
++    ) -> usize {
++        let ret;
++        unsafe {
++            asm!("svc #0", in("x8") n, inlateout("x0") a => ret, in("x1") b, in("x2") c,
++                in("x3") d, in("x4") e, in("x5") f, options(nostack))
++        };
++        ret
++    }
++}
++
++pub use imp::*;
+diff --git a/src/platform/linux/mod.rs b/src/platform/linux/mod.rs
+index 74b193f..11269b2 100644
+--- a/src/platform/linux/mod.rs
++++ b/src/platform/linux/mod.rs
+@@ -552,11 +552,22 @@ impl Pal for Sys {
+         e_raw(unsafe { syscall!(PIPE2, fildes.as_mut_ptr(), flags) }).map(|_| ())
+     }
+ 
++    #[cfg(not(target_arch = "aarch64"))]
+     fn poll(fds: &mut [pollfd], timeout: c_int) -> Result<c_int> {
+         e_raw(unsafe { syscall!(POLL, fds.as_mut_ptr(), fds.len(), timeout) })
+             .map(|count| count as c_int)
+     }
+ 
++    // AArch64 Linux has no poll(2), only ppoll(2).
++    #[cfg(target_arch = "aarch64")]
++    fn poll(fds: &mut [pollfd], timeout: c_int) -> Result<c_int> {
++        let timeout = (timeout >= 0).then(|| timespec {
++            tv_sec: (timeout / 1000).into(),
++            tv_nsec: ((timeout % 1000) * 1_000_000).into(),
++        });
++        Self::ppoll(fds, timeout.as_ref(), None)
++    }
++
+     fn ppoll(
+         fds: &mut [pollfd],
+         timeout: Option<&timespec>,
+diff --git a/src/platform/mod.rs b/src/platform/mod.rs
+index 386b971..e63e2ec 100644
+--- a/src/platform/mod.rs
++++ b/src/platform/mod.rs
+@@ -28,11 +28,15 @@ pub(crate) mod sys;
+ #[path = "redox/mod.rs"]
+ pub(crate) mod sys;
+ 
++#[cfg(target_os = "feos")]
++#[path = "feos/mod.rs"]
++pub(crate) mod sys;
++
+ pub use self::rlb::{Line, RawLineBuffer};
+ pub mod rlb;
+ 
+-#[cfg(target_os = "linux")]
+-pub mod auxv_defs;
++#[cfg(any(target_os = "linux", target_os = "feos"))]
++pub use crate::header::sys_auxv::auxv_defs;
+ 
+ #[cfg(target_os = "redox")]
+ pub use redox_rt::auxv_defs;
+@@ -413,5 +417,12 @@ pub unsafe fn init_inner(auxvs: Box<[[usize; 2]]>) {
+     }
+ }
+ #[expect(clippy::boxed_local)]
+-#[cfg(not(target_os = "redox"))]
++#[cfg(not(any(target_os = "redox", target_os = "feos")))]
+ pub unsafe fn init(_auxvs: Box<[[usize; 2]]>) {}
++
++/// Keeps the aux vector for `getauxval`.
++// SAFETY: Must only be called when only one thread exists.
++#[cfg(target_os = "feos")]
++pub unsafe fn init(auxvs: Box<[[usize; 2]]>) {
++    unsafe { self::sys::init(auxvs) }
++}
+diff --git a/src/platform/types.rs b/src/platform/types.rs
+index 649b3aa..ad7e39d 100644
+--- a/src/platform/types.rs
++++ b/src/platform/types.rs
+@@ -81,10 +81,10 @@ pub type regoff_t = size_t;
+ /// The `off_t` type provided in [`sys/types.h`](crate::header::sys_types).
+ pub type off_t = c_longlong;
+ /// The `mode_t` type provided in [`sys/types.h`](crate::header::sys_types).
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ pub type mode_t = c_uint;
+ /// The `mode_t` type provided in [`sys/types.h`](crate::header::sys_types).
+-#[cfg(not(target_os = "linux"))]
++#[cfg(not(any(target_os = "linux", target_os = "feos")))]
+ pub type mode_t = c_int;
+ /// The `time_t` type provided in [`sys/types.h`](crate::header::sys_types).
+ pub type time_t = c_longlong;
+@@ -120,12 +120,12 @@ pub type fsfilcnt_t = c_ulong;
+ #[deprecated]
+ pub type useconds_t = c_uint;
+ /// The `suseconds_t` type provided in [`sys/types.h`](crate::header::sys_types).
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "feos"))]
+ pub type suseconds_t = c_long;
+ // TODO: Should we break this to c_long as well? This also breaks timeval as well
+ //       but it will be consistent with timespec.tv_nsec (note that syscall already uses c_int)
+ /// The `suseconds_t` type provided in [`sys/types.h`](crate::header::sys_types).
+-#[cfg(not(target_os = "linux"))]
++#[cfg(not(any(target_os = "linux", target_os = "feos")))]
+ pub type suseconds_t = c_int;
+ 
+ /// The `clock_t` type provided in [`sys/types.h`](crate::header::sys_types).
+diff --git a/src/pthread/mod.rs b/src/pthread/mod.rs
+index 1a5ee23..cb46cbb 100644
+--- a/src/pthread/mod.rs
++++ b/src/pthread/mod.rs
+@@ -32,6 +32,16 @@ pub unsafe fn init() {
+     let (stack_base, stack_size) = ((STACK_TOP - STACK_SIZE) as *mut c_void, STACK_SIZE);
+     #[cfg(target_os = "linux")]
+     let (stack_base, stack_size) = (ptr::null_mut(), 0);
++    // feos: the main thread's 8 MiB stack sits right below the argument area (section 6
++    // of its ABI).
++    #[cfg(target_os = "feos")]
++    let (stack_base, stack_size) = {
++        use crate::platform::sys::abi;
++        (
++            (abi::USER_STACK_TOP - abi::USER_ARGS_SIZE - abi::USER_STACK_SIZE) as *mut c_void,
++            abi::USER_STACK_SIZE,
++        )
++    };
+ 
+     let thread = Pthread {
+         waitval: Waitval::new(),
+@@ -70,6 +80,8 @@ pub unsafe fn terminate_from_main_thread() {
+ bitflags::bitflags! {
+     pub struct PthreadFlags: usize {
+         const DETACHED = 1;
++        /// The stack is the caller's (`pthread_attr_setstack`), not relibc's to unmap.
++        const CALLER_STACK = 2;
+     }
+ }
+ 
+@@ -93,7 +105,7 @@ pub struct Pthread {
+ pub struct OsTid {
+     #[cfg(target_os = "redox")]
+     pub thread_fd: usize,
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "feos"))]
+     pub thread_id: usize,
+ }
+ 
+@@ -169,6 +181,9 @@ pub(crate) unsafe fn create(
+ 
+     let current_tcb = unsafe { Tcb::current() }.expect("no TCB!");
+     let new_tcb = unsafe { Tcb::new(current_tcb.tls_len) }.map_err(|_| Errno(ENOMEM))?;
++    if attrs.stack != 0 {
++        flags |= PthreadFlags::CALLER_STACK;
++    }
+     new_tcb.pthread.flags = flags.bits().into();
+     new_tcb.pthread.stack_base = stack_base;
+     new_tcb.pthread.stack_size = stack_size;
+@@ -310,7 +325,13 @@ pub unsafe fn exit_current_thread(retval: Retval) -> ! {
+ 
+     let this = current_thread().expect("failed to obtain current thread when exiting");
+     let stack_base = this.stack_base;
+-    let stack_size = this.stack_size;
++    // A stack the caller gave isn't relibc's to unmap at exit.
++    let stack_size = if this.flags.load(Ordering::Acquire) & PthreadFlags::CALLER_STACK.bits() != 0
++    {
++        0
++    } else {
++        this.stack_size
++    };
+ 
+     // dealloc_thread() or waitval.post() might unmaps the tcb so extract the thread_fd now
+     #[cfg(target_os = "redox")]
+diff --git a/src/sync/semaphore.rs b/src/sync/semaphore.rs
+index 37fc502..49360b5 100644
+--- a/src/sync/semaphore.rs
++++ b/src/sync/semaphore.rs
+@@ -68,10 +68,10 @@ impl Semaphore {
+                     CLOCK_REALTIME => timespec_realtime_to_monotonic(timeout)?,
+                     _ => return Err(Errno(errno::EINVAL)),
+                 };
+-                unsafe { Sys::futex_wait(self.count.ptr(), 0, Some(&relative))? };
++                retry_on_eagain(unsafe { Sys::futex_wait(self.count.ptr(), 0, Some(&relative)) })?;
+             } else {
+                 // Use futex to wait for the next change, without a timeout
+-                unsafe { Sys::futex_wait(self.count.ptr(), 0, None)? };
++                retry_on_eagain(unsafe { Sys::futex_wait(self.count.ptr(), 0, None) })?;
+             }
+         }
+     }
+@@ -79,3 +79,12 @@ impl Semaphore {
+         self.count.load(Ordering::SeqCst)
+     }
+ }
++
++/// A futex wait that found the count no longer zero (a post between `try_wait` and the
++/// wait) says `EAGAIN`: that's a reason to try again, not the waiter's error.
++fn retry_on_eagain(result: Result<()>) -> Result<()> {
++    match result {
++        Err(Errno(errno::EAGAIN)) => Ok(()),
++        other => other,
++    }
++}

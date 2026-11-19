@@ -150,6 +150,8 @@ pub fn on_exception(info: &Fault, frame: &mut Frame) -> bool {
             memory: info.memory_fault(),
             name: info.syndrome_name(),
             instruction: info.instruction(),
+            signal: info.user_signal().0,
+            code: info.user_signal().1,
         };
         if sched::on_user_fault(fault, frame) {
             return true;

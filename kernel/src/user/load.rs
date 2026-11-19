@@ -6,14 +6,20 @@
 //! in the call, so nothing the caller does afterwards can change them, and a kernel app's
 //! from its own. The frames are taken through the machine's promises, never from the
 //! kernel heap, so many programs starting at once with a megabyte of arguments each meet
-//! `ENOMEM`, not a heap that's run out. The new task copies them to the top of its
-//! argument area as the System V initial stack (section 7.1 of the ABI design) and lets
-//! them go.
+//! `ENOMEM`, not a heap that's run out; a program's are counted against its own page
+//! limit for as long as its call holds them, so its threads spawning at once can't take
+//! more than it could map. The new task copies them to the top of its argument area as
+//! the System V initial stack (section 7.1 of the ABI design) and lets them go.
 //!
 //! What it runs is resolved either in the call (`SPAWN2`: every way it can fail is the
 //! call's error, and the file is held from then on, [`Image`]) or by the new task itself
 //! (v1's `SPAWN` and kernel apps: a program that isn't there ends with 127, one that
-//! can't be run with 126, as v1 always did).
+//! can't be run with 126, as v1 always did). A `#!` script is followed to the program
+//! that runs it (section 7.4), up to [`MAX_SCRIPT_DEPTH`] scripts deep, and the strings
+//! taking the place of `argv[0]` go in front of the rest ([`Staged::with_heads`]).
+//!
+//! `EXEC` builds a new image the same way, into a space of its own that isn't the
+//! process's yet ([`build_image`]), so every way that can fail is the call's error too.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -22,15 +28,15 @@ use alloc::vec::Vec;
 use feos_abi::{aux, errno, spawn, UserStr};
 use feos_app::{ArgBlock, SpawnError};
 use feos_elf::Limits;
-use feos_fs::vfs::{path, FileId, VfsTree, ACCESS_EXECUTE};
+use feos_fs::vfs::{path, permits, FileId, VfsTree, ACCESS_EXECUTE};
 use feos_fs::{FileKind, FsError};
 use feos_hal::Arch;
 use feos_vm::{FileMap, FileRef, FrameSource, MapRequest, Place, Prot, PAGE_SIZE};
 
 use super::files::Files;
 use super::memory_calls::{KernelFrames, PROMISES};
-use super::process::{self, HeapCharge, Process, UserMm};
-use super::{say, tree, NoKill};
+use super::process::{self, HeapCharge, PageCharge, Process, UserMm};
+use super::{say, tree};
 use crate::{memory, pagecache, sched, Frame, Port};
 
 #[cfg(target_arch = "aarch64")]
@@ -44,9 +50,18 @@ pub const PLATFORM: &str = "aarch64";
 #[cfg(target_arch = "x86_64")]
 pub const PLATFORM: &str = "x86_64";
 
-/// The largest signal frame either port will build (stage 1c.9), for `AT_MINSIGSTKSZ`:
-/// within `MINSIGSTKSZ`.
-const SIGNAL_FRAME_MAX: u64 = 2048;
+/// What a handler's entry can take of the stack beyond the frame: x86_64 steps over the
+/// red zone first, and both ports align the frame down to 16 bytes.
+#[cfg(target_arch = "aarch64")]
+const SIGNAL_FRAME_SLACK: u64 = 16;
+#[cfg(target_arch = "x86_64")]
+const SIGNAL_FRAME_SLACK: u64 = feos_signal::frame::x86_64::RED_ZONE + 16;
+
+/// The largest signal frame this port builds, rounded up, for `AT_MINSIGSTKSZ`
+/// (section 7.2): within `MINSIGSTKSZ`, which `SIGALTSTACK` holds every stack to.
+const SIGNAL_FRAME_MAX: u64 =
+    (<Frame as feos_signal::frame::UserFrame>::FRAME_SIZE as u64 + SIGNAL_FRAME_SLACK).next_multiple_of(16);
+const _: () = assert!(SIGNAL_FRAME_MAX <= feos_abi::ss::MINSIGSTKSZ as u64);
 
 /// Entries of the aux vector, `AT_NULL` included.
 const AUX_ENTRIES: usize = 24;
@@ -78,28 +93,33 @@ pub struct Staged {
     envc: usize,
     /// The heap `frames` takes, charged to the process that's starting it.
     _charge: Option<HeapCharge>,
+    /// The frames, counted against that process's page limit while its call holds them.
+    pages: Option<PageCharge>,
 }
 
 impl Staged {
     /// Room for `capacity` bytes, the frames taken now. `ENOMEM` if they can't be had or
-    /// promised, or the list of them charged to `charger`.
+    /// promised, or if `charger` has no room for them within its page limit, or for the
+    /// list of them within its heap budget.
     pub fn new(capacity: usize, charger: Option<&Process>) -> Result<Self, isize> {
         let count = capacity.div_ceil(PAGE_SIZE).max(1);
         let bytes = count * core::mem::size_of::<usize>();
-        let charge = match charger {
-            Some(process) => Some(process.charge_heap(bytes)?),
-            None => None,
+        let (charge, pages) = match charger {
+            Some(process) => (Some(process.charge_heap(bytes)?), Some(process.charge_pages(count)?)),
+            None => (None, None),
         };
         let mut frames = Vec::new();
         frames.try_reserve_exact(count).map_err(|_| -errno::ENOMEM)?;
-        let mut staged = Self { frames, length: 0, argc: 0, envc: 0, _charge: charge };
+        let mut staged = Self { frames, length: 0, argc: 0, envc: 0, _charge: charge, pages };
         // Promised first, as a mapping's pages are, so these can't take frames other
         // programs were promised; given back once each is had.
         if !PROMISES.promise(count, KernelFrames.free_count()) {
             return Err(-errno::ENOMEM);
         }
+        // A kill can't come while they're taken and held: a program's thread is in its
+        // call, and a kernel app's spawn holds kills off until its task has them (see
+        // `sched::spawn_user_env`).
         for _ in 0..count {
-            let _no_kill = NoKill::new();
             match memory::alloc_frames(1, 1) {
                 // Room was reserved for every one.
                 Some(frame) => staged.frames.push(frame),
@@ -130,8 +150,18 @@ impl Staged {
         Some(unsafe { core::slice::from_raw_parts((frame + offset) as *const u8, PAGE_SIZE - offset) })
     }
 
-    /// Adds a string from the kernel and its NUL. `false` if there's no room.
+    /// The page charge, for the call that made this to keep until it returns: the frames
+    /// go on to the child, which copies them into its own memory, and the charge would
+    /// keep the caller's space alive with them.
+    pub fn take_pages(&mut self) -> Option<PageCharge> {
+        self.pages.take()
+    }
+
+    /// Adds a string from the kernel and its NUL, up to its first NUL if it has one, as
+    /// [`ArgBlock::push`] keeps it: a string is whatever its NUL ends, and one inside it
+    /// would make two of what's counted as one. `false` if there's no room.
     fn push(&mut self, text: &[u8], env: bool) -> bool {
+        let text = text.split(|&byte| byte == 0).next().unwrap_or(text);
         let mut done = 0;
         while done < text.len() {
             let at = self.length + done;
@@ -248,6 +278,61 @@ impl Staged {
         u64::from_ne_bytes(out)
     }
 
+    /// The bytes of the string at `offset`, `length` long, added as a string of its own.
+    fn push_from(&mut self, from: &Self, offset: usize, length: usize, env: bool) -> bool {
+        let mut done = 0;
+        while done < length {
+            let (Some(bytes), at) = (from.bytes_at(offset + done), self.length + done) else {
+                return false;
+            };
+            let Some(room) = self.room_at(at) else {
+                return false;
+            };
+            let count = bytes.len().min(room.len()).min(length - done);
+            room[..count].copy_from_slice(&bytes[..count]);
+            done += count;
+        }
+        self.finish_string(length, env)
+    }
+
+    /// A script's strings: `heads` in place of the first argument, then the rest of the
+    /// arguments and the environment as they are, in frames of their own charged to
+    /// `charger` as [`new`](Self::new)'s are. `E2BIG` if that's more than `ARG_MAX` or
+    /// `MAX_STRINGS` allow.
+    pub fn with_heads(&self, heads: &[Vec<u8>], charger: Option<&Process>) -> Result<Self, isize> {
+        let mut first = None;
+        let _ = self.each_string(|offset, length| {
+            first.get_or_insert((offset, length));
+            Ok(())
+        });
+        let first_length = first.map_or(0, |(_, length)| length + 1);
+        let count = heads.len() + self.argc + self.envc - usize::from(self.argc > 0);
+        let bytes = heads.iter().map(|head| head.len() + 1).sum::<usize>() + self.length - first_length;
+        if count > spawn::MAX_STRINGS || bytes + count * 8 > spawn::ARG_MAX {
+            return Err(-errno::E2BIG);
+        }
+        let mut out = Self::new(bytes, charger)?;
+        for head in heads {
+            if !out.push(head, false) {
+                return Err(-errno::E2BIG);
+            }
+        }
+        let mut index = 0;
+        let argc = self.argc;
+        let mut fits = true;
+        let _ = self.each_string(|offset, length| {
+            if index > 0 {
+                fits &= out.push_from(self, offset, length, index >= argc);
+            }
+            index += 1;
+            Ok(())
+        });
+        if !fits {
+            return Err(-errno::E2BIG);
+        }
+        Ok(out)
+    }
+
     /// As many of the arguments as fit the process table's block, for `ps` to show.
     pub fn shown(&self) -> ArgBlock {
         let mut block = ArgBlock::new();
@@ -288,14 +373,31 @@ impl Drop for Staged {
 
 /// A program resolved, checked and held: what `SPAWN2` found in the call, for its child to
 /// load. The cache entry holds the file by identity, so a rename or unlink in between
-/// changes nothing about what runs.
+/// changes nothing about what runs, and the identity can't become another file's.
 pub struct Image {
-    /// The canonical path, for `CURRENT_EXE` and `AT_FEOS_EXE`.
+    /// The canonical path of what was asked to run, for `CURRENT_EXE` and `AT_FEOS_EXE`:
+    /// for a script, the script, not its interpreter.
     pub canonical: String,
+    /// The ELF program that's loaded, its size, and its hold, taken before anything was
+    /// checked: the child loads by `id`, with no lookup or permission check of its own, so
+    /// what it loads must be what was checked.
     pub id: FileId,
     pub size: u64,
-    /// The file's hold, if the cache keeps it.
-    _hold: Option<FileRef>,
+    hold: FileRef,
+    /// For a script, what takes the place of the first argument (section 7.4): each
+    /// interpreter, its argument, and the path it was asked to run, outermost first.
+    /// Empty for a program run directly.
+    pub heads: Vec<Vec<u8>>,
+}
+
+/// Scripts one program may go through before an ELF program: a fifth is `ELOOP`.
+pub const MAX_SCRIPT_DEPTH: usize = 4;
+
+/// What a file turned out to be, from its first bytes.
+enum Kind {
+    Program,
+    /// A `#!` script: its interpreter, and the argument for it, if the line has one.
+    Script(String, Option<Vec<u8>>),
 }
 
 /// Why a program can't run: the error a call gives, and what v1 prints.
@@ -330,9 +432,36 @@ fn limits() -> Limits {
 
 /// Resolves the absolute `path` as a program for this user to run: a regular file
 /// (`EACCES` for anything else), with execute permission and search on the way there
-/// (`EACCES`), that's an ELF program for this machine (`ENOEXEC`). A `#!` script is
-/// `ENOEXEC` until stage 1c.7 runs them.
+/// (`EACCES`), that's an ELF program for this machine or a `#!` script whose interpreter
+/// is, the same way (`ENOEXEC` otherwise).
 pub fn resolve(tree: &dyn VfsTree, path: &str, uid: u32, gid: u32) -> Result<Image, Refused> {
+    let (image, kind) = resolve_file(tree, path, uid, gid)?;
+    follow_scripts(tree, image, kind, path, uid, gid)
+}
+
+/// The program a descriptor's description holds, `fexecve`-like (`SPAWN_EMPTY_PATH`):
+/// judged by the file itself, its identity `id` held by `entry`, so a rename or unlink of
+/// `canonical` since it was opened changes nothing. Execute permission is the file's own,
+/// with no search of the directories it was opened through, as `fexecve`'s. A script's
+/// interpreter is found by its path, as [`resolve`] finds it.
+pub fn resolve_held(tree: &dyn VfsTree, canonical: &str, id: FileId, entry: &FileRef, uid: u32, gid: u32) -> Result<Image, Refused> {
+    let stat = tree.stat_file(id).map_err(|_| Refused::new(errno::ENOENT, "No such file or directory"))?;
+    if stat.kind != FileKind::File || stat.device.is_some() {
+        return Err(Refused::new(errno::EACCES, "not a file"));
+    }
+    // Only filesystems that keep owners say no, as `check_access`.
+    if stat.posix && !permits(stat.mode, false, stat.uid, stat.gid, uid, gid, ACCESS_EXECUTE) {
+        return Err(Refused::new(errno::EACCES, "permission denied"));
+    }
+    let kind = classify(tree, id, stat.size)?;
+    let canonical = copy(canonical).ok_or(Refused::new(errno::ENOMEM, "out of memory"))?;
+    let image = Image { canonical, id, size: stat.size, hold: entry.clone(), heads: Vec::new() };
+    let given = copy(&image.canonical).ok_or(Refused::new(errno::ENOMEM, "out of memory"))?;
+    follow_scripts(tree, image, kind, &given, uid, gid)
+}
+
+/// One file, as [`resolve`] judges it, held, and what it is.
+fn resolve_file(tree: &dyn VfsTree, path: &str, uid: u32, gid: u32) -> Result<(Image, Kind), Refused> {
     let found = match path::lookup(tree, path, true) {
         Ok(found) => found,
         Err(FsError::PermissionDenied) => return Err(Refused::new(errno::EACCES, "permission denied")),
@@ -343,19 +472,85 @@ pub fn resolve(tree: &dyn VfsTree, path: &str, uid: u32, gid: u32) -> Result<Ima
     if let Err(FsError::PermissionDenied) = tree.check_access(&found.canonical, uid, gid, ACCESS_EXECUTE) {
         return Err(Refused::new(errno::EACCES, "permission denied"));
     }
-    if found.stat.kind != FileKind::File {
+    if found.stat.kind != FileKind::File || found.stat.device.is_some() {
         return Err(Refused::new(errno::EACCES, "not a file"));
     }
+    let hold = pagecache::file_for(found.id, found.stat.size).map_err(held_error)?;
+    let kind = classify(tree, found.id, found.stat.size)?;
+    Ok((Image { canonical: found.canonical, id: found.id, size: found.stat.size, hold, heads: Vec::new() }, kind))
+}
+
+/// `image`, which `given` named, if it's a program; if it's a script, the program that
+/// runs it, through as many as [`MAX_SCRIPT_DEPTH`] scripts, with `image`'s own path kept
+/// for `CURRENT_EXE` and the strings that go in place of `argv[0]`.
+fn follow_scripts(tree: &dyn VfsTree, image: Image, kind: Kind, given: &str, uid: u32, gid: u32) -> Result<Image, Refused> {
+    let no_memory = || Refused::new(errno::ENOMEM, "out of memory");
+    let Kind::Script(mut interpreter, mut argument) = kind else {
+        return Ok(image);
+    };
+    let exe = image.canonical;
+    let mut asked = copy(given).ok_or_else(no_memory)?;
+    let mut heads: Vec<Vec<u8>> = Vec::new();
+    for _ in 0..MAX_SCRIPT_DEPTH {
+        // `[interpreter, argument, the path it runs]` in place of the first of what's
+        // there, which for the outermost script is the caller's own `argv[0]`.
+        let mut next = Vec::new();
+        next.try_reserve_exact(3 + heads.len()).map_err(|_| no_memory())?;
+        next.push(bytes_of(interpreter.as_bytes()).ok_or_else(no_memory)?);
+        if let Some(argument) = argument.take() {
+            next.push(argument);
+        }
+        next.push(bytes_of(asked.as_bytes()).ok_or_else(no_memory)?);
+        next.extend(heads.drain(..).skip(1));
+        heads = next;
+        let (found, kind) = resolve_file(tree, &interpreter, uid, gid)?;
+        match kind {
+            Kind::Program => return Ok(Image { canonical: exe, heads, ..found }),
+            Kind::Script(inner, inner_argument) => {
+                asked = core::mem::replace(&mut interpreter, inner);
+                argument = inner_argument;
+            }
+        }
+    }
+    Err(Refused::new(errno::ELOOP, "too many #! interpreters"))
+}
+
+/// A copy of `bytes` on the heap, fallibly.
+fn bytes_of(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(bytes.len()).ok()?;
+    out.extend_from_slice(bytes);
+    Some(out)
+}
+
+/// What a hold that couldn't be had is: no memory for it, or a file that can't be kept.
+fn held_error(error: FsError) -> Refused {
+    match error {
+        FsError::OutOfMemory | FsError::Busy => Refused::new(errno::ENOMEM, "out of memory"),
+        _ => Refused::new(errno::EACCES, "can't be held"),
+    }
+}
+
+/// What the file `id` is: a program for this machine, or a script with a `#!` line that
+/// names an interpreter; `ENOEXEC` if neither.
+fn classify(tree: &dyn VfsTree, id: FileId, size: u64) -> Result<Kind, Refused> {
     let mut head = [0u8; feos_elf::HEADER_BYTES];
-    let got = tree.read_file(found.id, 0, &mut head).map_err(|_| Refused::new(errno::EIO, "can't be read"))?;
-    if head[..got].starts_with(b"#!") {
-        return Err(Refused::new(errno::ENOEXEC, "scripts can't be run yet"));
+    let got = tree.read_file(id, 0, &mut head).map_err(|_| Refused::new(errno::EIO, "can't be read"))?;
+    let head = &head[..got];
+    if let Some(line) = feos_elf::shebang(head, got as u64 == size) {
+        let line = line.map_err(|error| Refused::new(errno::ENOEXEC, error.text()))?;
+        let no_memory = || Refused::new(errno::ENOMEM, "out of memory");
+        let interpreter = copy(line.interpreter).ok_or_else(no_memory)?;
+        let argument = match line.argument {
+            Some(argument) => Some(bytes_of(argument).ok_or_else(no_memory)?),
+            None => None,
+        };
+        return Ok(Kind::Script(interpreter, argument));
     }
-    if let Err(error) = feos_elf::parse(&head[..got], found.stat.size, &limits()) {
-        return Err(Refused { errno: -errno::ENOEXEC, message: error.text() });
+    match feos_elf::parse(head, size, &limits()) {
+        Ok(_) => Ok(Kind::Program),
+        Err(error) => Err(Refused { errno: -errno::ENOEXEC, message: error.text() }),
     }
-    let hold = pagecache::file_for(found.id, found.stat.size).ok();
-    Ok(Image { canonical: found.canonical, id: found.id, size: found.stat.size, _hold: hold })
 }
 
 /// What a new program is loaded from and starts with, made before the scheduler's lock
@@ -396,11 +591,10 @@ impl UserStart {
             return Err(SpawnError::ArgsTooLong);
         }
         let mut strings = Staged::new(bytes, None).map_err(|_| SpawnError::NoMemory)?;
-        for arg in argv.iter() {
-            strings.push(arg.as_bytes(), false);
-        }
-        for entry in env {
-            strings.push(entry.as_bytes(), true);
+        // Sized for every string whole, so each fits: a string cut at a NUL only shrinks.
+        let pushed = argv.iter().all(|arg| strings.push(arg.as_bytes(), false)) && env.iter().all(|entry| strings.push(entry.as_bytes(), true));
+        if !pushed {
+            return Err(SpawnError::ArgsTooLong);
         }
         Self::make(path, None, path, cwd, umask, strings, None).ok_or(SpawnError::NoMemory)
     }
@@ -438,24 +632,20 @@ fn load(slot: usize, start: Box<UserStart>) -> Result<(&'static Process, Frame),
         return Err(feos_abi::EXIT_NOT_FOUND);
     };
     let (uid, gid) = sched::credentials(slot);
+    let refused = |refused: Refused| {
+        say(format_args!("{path}: {}", refused.message));
+        refused.status()
+    };
     let image = match image {
         Some(image) => image,
-        None => resolve(tree, &path, uid, gid).map_err(|refused| {
-            say(format_args!("{path}: {}", refused.message));
-            refused.status()
-        })?,
+        None => resolve(tree, &path, uid, gid).map_err(refused)?,
     };
-    // Read again from the file held: `SPAWN2` checked it, but the file may have been
-    // written since, and what's loaded is what's read now.
-    let mut head = [0u8; feos_elf::HEADER_BYTES];
-    let got = tree.read_file(image.id, 0, &mut head).map_err(|_| {
-        say(format_args!("{path}: can't be read"));
-        feos_abi::EXIT_NOT_EXECUTABLE
-    })?;
-    let program = feos_elf::parse(&head[..got], image.size, &limits()).map_err(|error| {
-        say(format_args!("{path}: {}", error.text()));
-        feos_abi::EXIT_NOT_EXECUTABLE
-    })?;
+    // A script found here, by a kernel app's or v1's child, has its interpreter's strings
+    // put in front now; `SPAWN2` has done that already, and left none.
+    let strings = match image.heads.is_empty() {
+        true => strings,
+        false => strings.with_heads(&image.heads, None).map_err(|error| refused(Refused { errno: error, message: "too many arguments" }))?,
+    };
 
     // The working directory is canonical: links resolved, as `GETCWD` sees it. One that
     // can't be resolved is kept as given. `SPAWN2`'s child has its own already.
@@ -468,7 +658,24 @@ fn load(slot: usize, start: Box<UserStart>) -> Result<(&'static Process, Frame),
         say(format_args!("{path}: out of memory"));
         return Err(feos_abi::EXIT_NOT_EXECUTABLE);
     };
-    load_segments(process, tree, &path, &image, &program)?;
+    let frame = build_image(slot, process.pid(), process.mm(), tree, &image, &strings, &given).map_err(refused)?;
+    // The staged strings are in the program now.
+    drop(strings);
+    drop(image);
+    Ok((process, frame))
+}
+
+/// Builds the image of the program `image` holds in `user`, a space nothing runs on yet:
+/// its segments, then its argument area and stack, with `strings` copied to the System V
+/// initial stack there, `given` as `AT_EXECFN`. The frame it starts from. `pid` is the
+/// process it's for, `slot` its thread.
+pub fn build_image(slot: usize, pid: u32, user: &UserMm, tree: &dyn VfsTree, image: &Image, strings: &Staged, given: &str) -> Result<Frame, Refused> {
+    // Read again from the file held: it was checked, but may have been written since,
+    // and what's loaded is what's read now.
+    let mut head = [0u8; feos_elf::HEADER_BYTES];
+    let got = tree.read_file(image.id, 0, &mut head).map_err(|_| Refused::new(errno::EIO, "can't be read"))?;
+    let program = feos_elf::parse(&head[..got], image.size, &limits()).map_err(|error| Refused { errno: -errno::ENOEXEC, message: error.text() })?;
+    load_segments(user, tree, image, &program)?;
 
     // The argument area at the top, and the stack directly below it: separate, so the
     // whole stack is free at `main` however long the arguments are, and a program
@@ -478,7 +685,6 @@ fn load(slot: usize, start: Box<UserStart>) -> Result<(&'static Process, Frame),
     // a 512 MiB machine could start about twenty, whatever they used. A page touched
     // when there's no frame to be had ends the program with `SIGBUS`, as any
     // `MAP_NORESERVE` page would.
-    let user = process.mm();
     let args_low = feos_abi::USER_STACK_TOP - feos_abi::USER_ARGS_SIZE;
     let stack_low = args_low - feos_abi::USER_STACK_SIZE;
     for (low, length) in [(args_low, feos_abi::USER_ARGS_SIZE), (stack_low, feos_abi::USER_STACK_SIZE)] {
@@ -488,30 +694,23 @@ fn load(slot: usize, start: Box<UserStart>) -> Result<(&'static Process, Frame),
             ..MapRequest::anonymous(length, Prot::READ_WRITE)
         };
         if user.with(|mm, ctx| mm.map(&request, ctx)).is_err() {
-            say(format_args!("{path}: out of memory"));
-            return Err(feos_abi::EXIT_NOT_EXECUTABLE);
+            return Err(Refused::new(errno::ENOMEM, "out of memory"));
         }
     }
 
-    let Ok(place) = build_stack(slot, process, &strings, &given, &image.canonical, &program) else {
-        say(format_args!("{path}: out of memory for its arguments"));
-        return Err(feos_abi::EXIT_NOT_EXECUTABLE);
-    };
-    // The staged strings are in the program now.
-    drop(strings);
-    drop(image);
+    let place = build_stack(slot, pid, user, strings, given, &image.canonical, &program)
+        .map_err(|error| Refused { errno: error, message: "out of memory for its arguments" })?;
     Port::sync_user_tables();
-    Ok((process, Frame::new_user(program.entry as usize, place.sp, place.argc, place.strings)))
+    Ok(Frame::new_user(program.entry as usize, place.sp, place.argc, place.strings))
 }
 
 /// Maps and loads the program's segments.
-fn load_segments(process: &Process, tree: &dyn VfsTree, path: &str, image: &Image, program: &feos_elf::Program) -> Result<(), i32> {
-    let user = process.mm();
+fn load_segments(user: &UserMm, tree: &dyn VfsTree, image: &Image, program: &feos_elf::Program) -> Result<(), Refused> {
     // Code and read-only data are mapped from the page cache, so every copy of a program
     // runs the same frames, and the file can't be written while it runs. That takes a
     // segment whose file offset and address agree within a page, and no zeroed tail;
     // anything else, writable data included, is copied into frames of its own.
-    let cache = pagecache::file_for(image.id, image.size).ok();
+    let crowded = || Refused::new(errno::ENOMEM, "out of memory, or overlapping segments");
     for segment in program.segments() {
         let prot = Prot {
             read: true,
@@ -521,9 +720,8 @@ fn load_segments(process: &Process, tree: &dyn VfsTree, path: &str, image: &Imag
         let start = segment.page_start() as usize;
         let length = (segment.page_end() - segment.page_start()) as usize;
         let page = PAGE_SIZE as u64;
-        let cached = cache.as_ref().filter(|_| {
-            !segment.writable && segment.offset % page == segment.address % page && segment.memory_size == segment.file_size
-        });
+        let shareable = !segment.writable && segment.offset % page == segment.address % page && segment.memory_size == segment.file_size;
+        let cached = shareable.then_some(&image.hold);
         if let Some(file) = cached {
             let request = MapRequest {
                 place: Place::Exact(start),
@@ -535,14 +733,8 @@ fn load_segments(process: &Process, tree: &dyn VfsTree, path: &str, image: &Imag
             };
             match user.with(|mm, ctx| mm.map(&request, ctx)) {
                 Ok(_) => continue,
-                Err(feos_vm::MmError::TextBusy) => {
-                    say(format_args!("{path}: text file busy"));
-                    return Err(feos_abi::EXIT_NOT_EXECUTABLE);
-                }
-                Err(_) => {
-                    say(format_args!("{path}: out of memory, or overlapping segments"));
-                    return Err(feos_abi::EXIT_NOT_EXECUTABLE);
-                }
+                Err(feos_vm::MmError::TextBusy) => return Err(Refused::new(errno::ETXTBSY, "text file busy")),
+                Err(_) => return Err(crowded()),
             }
         }
         // Each page gets a frame of its own now, read-only ones too, to load into.
@@ -552,8 +744,7 @@ fn load_segments(process: &Process, tree: &dyn VfsTree, path: &str, image: &Imag
             ..MapRequest::anonymous(length, prot)
         };
         if user.with(|mm, ctx| mm.map(&request, ctx)).is_err() {
-            say(format_args!("{path}: out of memory, or overlapping segments"));
-            return Err(feos_abi::EXIT_NOT_EXECUTABLE);
+            return Err(crowded());
         }
         // Loaded with the space's lock held: the filesystem comes after it, and
         // nothing else is using this space yet.
@@ -562,7 +753,7 @@ fn load_segments(process: &Process, tree: &dyn VfsTree, path: &str, image: &Imag
         while done < segment.file_size {
             let address = segment.address as usize + done as usize;
             let Ok(target) = state.mm.space().translate(address, false) else {
-                return Err(feos_abi::EXIT_NOT_EXECUTABLE);
+                return Err(crowded());
             };
             let count = ((PAGE_SIZE - address % PAGE_SIZE) as u64).min(segment.file_size - done) as usize;
             // SAFETY: `target` is a frame of this new space's own, which nothing can run
@@ -570,10 +761,7 @@ fn load_segments(process: &Process, tree: &dyn VfsTree, path: &str, image: &Imag
             let out = unsafe { core::slice::from_raw_parts_mut(target as *mut u8, count) };
             match tree.read_file(image.id, segment.offset + done, out) {
                 Ok(got) if got > 0 => done += got as u64,
-                _ => {
-                    say(format_args!("{path}: truncated"));
-                    return Err(feos_abi::EXIT_NOT_EXECUTABLE);
-                }
+                _ => return Err(Refused::new(errno::EIO, "truncated")),
             }
         }
         if segment.executable {
@@ -649,8 +837,7 @@ fn random_bytes(pid: u32) -> [u8; 16] {
 /// the ABI design): from the stack pointer up, `argc`, the `argv` pointers and a zero,
 /// the `envp` pointers and a zero, the aux vector, the `UserStr`s of the arguments for
 /// v1's convention, the random bytes, and the strings.
-fn build_stack(slot: usize, process: &Process, strings: &Staged, given: &str, exe: &str, program: &feos_elf::Program) -> Result<StackPlace, isize> {
-    let user = process.mm();
+fn build_stack(slot: usize, pid: u32, user: &UserMm, strings: &Staged, given: &str, exe: &str, program: &feos_elf::Program) -> Result<StackPlace, isize> {
     let top = feos_abi::USER_STACK_TOP;
     let low = top - feos_abi::USER_ARGS_SIZE;
     let text_length = strings.length + given.len() + 1 + exe.len() + 1 + PLATFORM.len() + 1;
@@ -702,7 +889,7 @@ fn build_stack(slot: usize, process: &Process, strings: &Staged, given: &str, ex
         user.copy_out(at, string.as_bytes())?;
         user.copy_out(at + string.len(), &[0])?;
     }
-    user.copy_out(random, &random_bytes(process.pid()))?;
+    user.copy_out(random, &random_bytes(pid))?;
 
     let mut out = Words::new(user, sp);
     out.push(argc as u64)?;

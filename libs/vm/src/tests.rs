@@ -322,7 +322,7 @@ impl World {
 /// machine has promised, and the limit's count is the sum of its parts.
 fn consistent(world: &World, mm: &Mm) {
     assert_eq!(mm.unbacked(), world.promises.held());
-    assert_eq!(mm.committed(), mm.charged() + mm.owned() + mm.tables());
+    assert_eq!(mm.committed(), mm.charged() + mm.owned() + mm.tables() + mm.held());
     assert!(mm.unbacked() <= mm.charged());
 }
 
@@ -586,6 +586,23 @@ fn lent_frames_count_against_the_limit() {
     assert_eq!(world.with(|ctx| mm.map_lent(lent, 4 * PAGE_SIZE, ctx)), Err(MmError::NoMemory));
     assert_eq!((mm.vmas().len(), mm.committed()), (0, 0));
     world.pool.free(lent);
+    world.done(mm);
+}
+
+#[test]
+fn held_frames_count_against_the_limit() {
+    let mut world = World::new();
+    let mut mm = world.mm_with(BITS, mm::Layout { page_limit: 8, ..layout() });
+    assert!(mm.hold(6));
+    assert_eq!(mm.committed(), 6);
+    // What's held leaves the space less room, and more than the rest is refused whole.
+    assert!(!mm.hold(3));
+    assert_eq!(world.with(|ctx| mm.map(&MapRequest::anonymous(4 * PAGE_SIZE, RW), ctx)), Err(MmError::NoMemory));
+    consistent(&world, &mm);
+    mm.unhold(6);
+    assert_eq!(mm.committed(), 0);
+    assert!(world.with(|ctx| mm.map(&MapRequest::anonymous(4 * PAGE_SIZE, RW), ctx)).is_ok());
+    consistent(&world, &mm);
     world.done(mm);
 }
 

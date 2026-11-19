@@ -1,4 +1,9 @@
-//! `kill`: stop a background process.
+//! `kill`: send a process a signal, `SIGKILL` unless another is named.
+//!
+//! A user program takes the signal's default action, as `KILL` from a program would
+//! give it: `-TERM` ends it with `SIGTERM` (status 143), `-STOP` and `-CONT` stop and
+//! continue it, which its parent sees. A kernel-linked app catches what its shell has a
+//! trap for, and is otherwise killed by anything that would end it.
 
 use feos_app::{App, Context, KillResult, Processes};
 use feos_console::{eprintln, println};
@@ -17,11 +22,11 @@ impl App for Kill {
     }
 
     fn usage(&self) -> &'static str {
-        "kill [-KILL|-TERM|-HUP|-QUIT|-INT|-STOP|-CONT] <pid>..."
+        "kill [-SIGNAL|-NUMBER] <pid>...   (SIGNAL: KILL TERM HUP INT QUIT USR1 USR2 ALRM PIPE STOP TSTP CONT ...)"
     }
 
     fn description(&self) -> &'static str {
-        "stop a background process"
+        "send a process a signal"
     }
 
     fn run(&self, context: &mut Context<'_>) -> i32 {
@@ -42,20 +47,18 @@ impl App for Kill {
                 status = 2;
                 continue;
             };
-            let done = match signal.trim_start_matches('-') {
-                "9" | "KILL" | "SIGKILL" => kill(processes, pid),
-                // A shell with a trap for one of these sees it; for anything else, they
-                // end the process, and SIGKILL's the only way the kernel has of doing that.
-                "1" | "HUP" | "SIGHUP" => catchable(processes, pid, feos_app::signal::HUP),
-                "2" | "INT" | "SIGINT" => catchable(processes, pid, feos_app::signal::INT),
-                "3" | "QUIT" | "SIGQUIT" => catchable(processes, pid, feos_app::signal::QUIT),
-                "15" | "TERM" | "SIGTERM" => catchable(processes, pid, feos_app::signal::TERM),
-                "19" | "STOP" | "SIGSTOP" => change(processes, pid, true),
-                "18" | "CONT" | "SIGCONT" => change(processes, pid, false),
-                _ => {
-                    eprintln!("kill: {signal}: unknown signal");
-                    return 2;
-                }
+            let Some(number) = signal_number(signal.trim_start_matches('-')) else {
+                eprintln!("kill: {signal}: unknown signal");
+                return 2;
+            };
+            let done = match number {
+                // A shell with a trap for one of these sees it; anything else takes the
+                // signal's default action.
+                HUP | INT | QUIT | TERM => catchable(processes, pid, number),
+                STOP | TSTP | TTIN | TTOU => change(processes, pid, number),
+                CONT => change(processes, pid, number),
+                CHLD | URG | WINCH => change(processes, pid, number),
+                _ => kill(processes, pid, number),
             };
             if !done {
                 status = 1;
@@ -65,21 +68,55 @@ impl App for Kill {
     }
 }
 
-fn catchable(processes: &dyn Processes, pid: u32, number: u32) -> bool {
-    processes.signal(pid, number) || kill(processes, pid)
+const HUP: u32 = 1;
+const INT: u32 = 2;
+const QUIT: u32 = 3;
+const TERM: u32 = 15;
+const CHLD: u32 = 17;
+const CONT: u32 = 18;
+const STOP: u32 = 19;
+const TSTP: u32 = 20;
+const TTIN: u32 = 21;
+const TTOU: u32 = 22;
+const URG: u32 = 23;
+const WINCH: u32 = 28;
+
+/// Signals by name, with or without `SIG`: Linux's numbers.
+const NAMES: [(&str, u32); 31] = [
+    ("HUP", 1), ("INT", 2), ("QUIT", 3), ("ILL", 4), ("TRAP", 5), ("ABRT", 6), ("BUS", 7), ("FPE", 8),
+    ("KILL", 9), ("USR1", 10), ("SEGV", 11), ("USR2", 12), ("PIPE", 13), ("ALRM", 14), ("TERM", 15),
+    ("STKFLT", 16), ("CHLD", 17), ("CONT", 18), ("STOP", 19), ("TSTP", 20), ("TTIN", 21), ("TTOU", 22),
+    ("URG", 23), ("XCPU", 24), ("XFSZ", 25), ("VTALRM", 26), ("PROF", 27), ("WINCH", 28), ("IO", 29),
+    ("PWR", 30), ("SYS", 31),
+];
+
+/// The signal `name` names: a number from 1 to 64, or a name from [`NAMES`].
+fn signal_number(name: &str) -> Option<u32> {
+    if let Ok(number) = name.parse::<u32>() {
+        return (1..=64).contains(&number).then_some(number);
+    }
+    let name = name.strip_prefix("SIG").unwrap_or(name);
+    NAMES.iter().find(|(known, _)| known.eq_ignore_ascii_case(name)).map(|&(_, number)| number)
 }
 
-fn change(processes: &dyn Processes, pid: u32, stopped: bool) -> bool {
-    let done = processes.set_stopped(pid, stopped);
+fn catchable(processes: &dyn Processes, pid: u32, number: u32) -> bool {
+    processes.signal(pid, number) || kill(processes, pid, number)
+}
+
+/// A signal that doesn't end what it's sent to: a stop, a continue, or one that's
+/// ignored.
+fn change(processes: &dyn Processes, pid: u32, number: u32) -> bool {
+    let done = matches!(processes.send_signal(pid, number), KillResult::Killed | KillResult::Pending | KillResult::AlreadyPending);
     if !done {
         eprintln!("cannot signal pid {pid}: no such process, or it is the shell");
     }
     done
 }
 
-fn kill(processes: &dyn Processes, pid: u32) -> bool {
+/// A signal that ends what it's sent to, `SIGKILL` or another: waits a moment for it to.
+fn kill(processes: &dyn Processes, pid: u32, number: u32) -> bool {
     let leaked_before = processes.leaked_heap_bytes();
-    match processes.try_kill(pid) {
+    match processes.send_signal(pid, number) {
         KillResult::Killed => {
             report_killed(processes, pid, leaked_before);
             true

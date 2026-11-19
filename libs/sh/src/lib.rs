@@ -261,6 +261,14 @@ pub trait TaskHost {
     /// Holds a task off the CPU, or lets it run again.
     fn set_stopped(&mut self, pid: u32, stopped: bool);
 
+    /// What a signal sent to the job whose task is `pid` goes to: the processes it's
+    /// running for the job (the programs and commands it started, and theirs), so a
+    /// program ends with the signal's status and the job's task with the program's.
+    /// Just the task when it's running nothing of the kind, a loop of builtins, say.
+    fn job_members(&mut self, pid: u32) -> Vec<u32> {
+        alloc::vec![pid]
+    }
+
     /// Gives the CPU away for a moment, between looks at a task.
     fn pause(&mut self);
 

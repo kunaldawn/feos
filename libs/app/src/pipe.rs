@@ -63,7 +63,9 @@ const COPY_CHUNK: usize = 2048;
 pub struct PipeHooks {
     /// PID of the calling task, or zero outside any task.
     pub current_pid: fn() -> u32,
-    /// True when the calling task should stop waiting because it is being killed.
+    /// True when the calling task should stop waiting: it's being killed, or, for a user
+    /// program's thread, it has a signal to take (stage 1c.10), which ends its call
+    /// with `EINTR` or what it had moved so far.
     pub interrupted: fn() -> bool,
 }
 
@@ -355,8 +357,10 @@ pub fn try_write_id(id: PipeId, bytes: &[u8]) -> Transfer {
     Transfer::Moved(count)
 }
 
-/// A wait in a pipe ended because the calling task is being killed. What was asked
-/// for may have partly happened, which nobody will look at: the task is going.
+/// A wait in a pipe ended because the calling task was interrupted: it's being killed,
+/// and nobody will look at what was asked for having partly happened, or it's a user
+/// program's thread with a signal to take, and nothing had moved (what had is the
+/// result instead: [`write_some`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Killed;
 
@@ -660,7 +664,8 @@ fn try_write_whole(id: PipeId, bytes: &[u8]) -> Transfer {
 ///
 /// [`Transfer::Moved`] says how much went: everything, unless the readers went part way
 /// or a non-blocking write filled the pipe. [`Transfer::Closed`] is a broken pipe with
-/// nothing written, and [`Killed`] a caller being killed, whatever was written.
+/// nothing written, and [`Killed`] a caller interrupted before anything was written; one
+/// interrupted after is told what was, as `write` returns a partial count.
 pub fn write_some(id: PipeId, bytes: &[u8], atomic: bool, nonblocking: bool) -> Result<Transfer, Killed> {
     if bytes.is_empty() {
         return Ok(Transfer::Moved(0));
@@ -677,6 +682,9 @@ pub fn write_some(id: PipeId, bytes: &[u8], atomic: bool, nonblocking: bool) -> 
             Transfer::WouldBlock if nonblocking => break,
             Transfer::WouldBlock => {
                 if interrupted() {
+                    if done > 0 {
+                        break;
+                    }
                     return Err(Killed);
                 }
                 futex_wait(&slot.wakes, seen);
@@ -1244,6 +1252,12 @@ mod tests {
         while writer.try_write(&data) != Transfer::WouldBlock {}
         assert_eq!(write_wait(writer.id(), b"x"), Err(Killed));
         assert!(!writer.write(b"x"));
+        // A program's write that got some of the way says how far, as `write` would.
+        assert_eq!(write_some(writer.id(), b"x", false, false), Err(Killed));
+        let mut drained = [0u8; COPY_CHUNK];
+        assert_eq!(reader.try_read(&mut drained), Transfer::Moved(COPY_CHUNK));
+        let more = [4u8; COPY_CHUNK + 100];
+        assert_eq!(write_some(writer.id(), &more, false, false), Ok(Transfer::Moved(COPY_CHUNK)));
 
         // Not being killed, a broken pipe and end of file are what they always were.
         KILLED.with(|killed| killed.set(false));

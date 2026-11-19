@@ -1428,6 +1428,24 @@ impl Host for ProgramHost {
 }
 
 #[test]
+fn scripts_for_other_interpreters_are_programs() {
+    let mut shell = Shell::new(None, &NoSystem);
+    let mut host = ProgramHost::default();
+    let mut input = BytesInput::empty();
+    let mut out = BytesOutput::new();
+    let mut err = BytesOutput::new();
+    let mut io = Io { stdin: &mut input, stdout: &mut out, stderr: &mut err };
+    let lines = ["printf '#!/bin/hello --flag\\n' > /script", "/script one", "printf '#!/bin/sh\\necho in-shell\\n' > /own", "/own"];
+    for line in lines {
+        assert_eq!(shell.execute_line(line, &mut io, &mut host), 0, "{line}");
+    }
+    // The kernel follows the `#!` line; a shell script stays the shell's.
+    assert_eq!(host.runs.len(), 1);
+    let (path, args, _) = &host.runs[0];
+    assert_eq!((path.as_str(), args.as_slice()), ("/script", ["one".to_string()].as_slice()));
+}
+
+#[test]
 fn exported_variables_reach_the_spawn_request() {
     let mut shell = Shell::new(None, &NoSystem);
     let mut host = ProgramHost::default();

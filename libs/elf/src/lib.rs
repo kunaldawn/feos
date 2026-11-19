@@ -1,4 +1,4 @@
-//! A static ELF64 program loader's parsing half.
+//! A static ELF64 program loader's parsing half, and `#!` scripts' first lines.
 //!
 //! The input is whatever someone put in a file, so nothing here trusts it: every read
 //! is checked, every sum can't overflow, and anything off is an [`Error`], never a
@@ -7,6 +7,10 @@
 //! This only says where things go. The caller owns the pages, and copies from the file.
 
 #![cfg_attr(not(test), no_std)]
+
+mod shebang;
+
+pub use shebang::{shebang, Shebang, ShebangError, SHEBANG_BYTES, SHEBANG_MAX};
 
 /// Most segments a program may load. Real static programs have about four.
 pub const MAX_SEGMENTS: usize = 16;

@@ -1,0 +1,129 @@
+#!/usr/bin/env -S python3 -I
+"""The generation-0 C compiler driver for feos: the host's clang, ld.lld and a relibc
+sysroot, until clang has a feos target of its own (track T4, plan phase 4).
+
+    x86_64-unknown-feos-cc ARGS...      (or aarch64-unknown-feos-cc: links to this)
+
+Compiles for <arch>-unknown-none-elf with -nostdinc against the sysroot's headers,
+defining __feos__, __unix__ and __ELF__ (what a feos clang will predefine). x86_64
+code is position independent (-fPIC): programs are linked at 64 GiB, out of reach of
+the small code model's 32-bit absolute addresses; AArch64's ADRP reaches it from
+static code (-fno-pic).
+
+Without -c, -S, -E or -M it also links, calling ld.lld itself (clang would link a
+target it doesn't know through the host's gcc): a static ET_EXEC in the feos user
+layout, image at 0x1000400000 and every PT_LOAD on pages of its own
+(docs/feos-abi-v2.md section 7.3), with relibc's crt0.o, crti.o and crtn.o, libc,
+libm and compiler-builtins. Sources among the inputs are compiled first.
+
+The sysroot is FEOS_SYSROOT, by default /build/relibc/<arch>-unknown-feos (what
+ports/build-relibc-feos.sh installs): include/ and lib/ in it, or usr/include and usr/lib
+when it has them (the layout ports/sysroot.sh makes, /build/sysroot/<arch>-unknown-feos,
+which is also the feos image's). FEOS_CLANG and FEOS_LD name the tools; the linker is
+Rust's rust-lld by default (what the Rust targets link with; Debian's lld 14 relaxes a
+GOTPCRELX it can't reach at 64 GiB and fails), else ld.lld.
+
+Header search: the sysroot's, then clang's own (intrinsics such as immintrin.h and
+arm_neon.h, and the stdatomic.h relibc's defers to under clang), as a clang with a feos
+target will search them, its resource directory after the libc's.
+"""
+import os
+import subprocess
+import sys
+import tempfile
+
+IMAGE_BASE = "0x1000400000"
+
+
+def rust_lld():
+    """rust-lld's ld.lld front end in the Rust toolchain's sysroot, if there is one."""
+    try:
+        root = subprocess.run(["rustc", "--print", "sysroot"], capture_output=True, text=True,
+                              check=True).stdout.strip()
+        host = [line.split(": ", 1)[1] for line in subprocess.run(
+            ["rustc", "-vV"], capture_output=True, text=True, check=True).stdout.splitlines()
+            if line.startswith("host: ")][0]
+    except (OSError, subprocess.CalledProcessError, IndexError):
+        return None
+    path = os.path.join(root, "lib", "rustlib", host, "bin", "gcc-ld", "ld.lld")
+    return path if os.access(path, os.X_OK) else None
+
+
+def main():
+    name = os.path.basename(sys.argv[0])
+    arch = name.split("-", 1)[0]
+    if arch == "x86_64":
+        extra = ["-fPIC"]
+    elif arch == "aarch64":
+        extra = ["-fno-pic", "-mno-outline-atomics"]
+    else:
+        sys.exit(f"{name}: call me as x86_64-unknown-feos-cc or aarch64-unknown-feos-cc")
+    sysroot = os.environ.get("FEOS_SYSROOT", f"/build/relibc/{arch}-unknown-feos")
+    usr = os.path.join(sysroot, "usr")
+    if os.path.isdir(os.path.join(usr, "include")):
+        sysroot = usr
+    clang = os.environ.get("FEOS_CLANG", "clang")
+    resource = subprocess.run([clang, "-print-resource-dir"], capture_output=True, text=True,
+                              check=True).stdout.strip()
+    cflags = [f"--target={arch}-unknown-none-elf", "-D__feos__", "-D__unix__", "-D__unix",
+              "-D__ELF__", "-nostdinc", "-isystem", f"{sysroot}/include",
+              "-isystem", f"{resource}/include"] + extra
+    args = sys.argv[1:]
+
+    if any(a in ("-c", "-S", "-E", "-M", "-MM") for a in args) or not args or \
+            any(a.startswith("-dump") or a in ("--version", "-v", "-###") for a in args):
+        os.execvp(clang, [clang] + cflags + args)
+
+    # Link: compile the sources, keep the compile flags for them, hand the rest to lld.
+    compile_flags, link_inputs, link_flags, sources = [], [], [], []
+    output = "a.out"
+    with_value = {"-I", "-isystem", "-include", "-D", "-U", "-x", "-MF", "-MT", "-iquote"}
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "-o":
+            output = args[i + 1]
+            i += 2
+            continue
+        if a in with_value:
+            compile_flags += [a, args[i + 1]]
+            i += 2
+            continue
+        if a.startswith("-Wl,"):
+            link_flags += a[4:].split(",")
+        elif a.startswith("-L") or a.startswith("-l"):
+            link_inputs.append(a if len(a) > 2 else a + args[i + 1])
+            if len(a) == 2:
+                i += 1
+        elif a in ("-static", "-nostdlib", "-nostartfiles", "-no-pie", "-pthread"):
+            pass
+        elif a.startswith("-"):
+            compile_flags.append(a)
+        elif a.endswith((".c", ".cc", ".cpp", ".S", ".s")):
+            sources.append(a)
+            link_inputs.append(None)
+        else:
+            link_inputs.append(a)
+        i += 1
+
+    with tempfile.TemporaryDirectory(prefix="feos-cc-") as scratch:
+        objects = []
+        for n, src in enumerate(sources):
+            obj = os.path.join(scratch, f"{n}-{os.path.basename(src)}.o")
+            subprocess.run([clang] + cflags + compile_flags + ["-c", src, "-o", obj], check=True)
+            objects.append(obj)
+        objects.reverse()
+        inputs = [objects.pop() if x is None else x for x in link_inputs]
+        lib = f"{sysroot}/lib"
+        ld = os.environ.get("FEOS_LD") or rust_lld() or "ld.lld"
+        command = [ld, "-static", f"--image-base={IMAGE_BASE}", "-z", "separate-loadable-segments",
+                   "-z", "max-page-size=4096", "-z", "noexecstack", "-z", "norelro", "-o", output,
+                   f"{lib}/crt0.o", f"{lib}/crti.o"] + link_flags + inputs + \
+                  [f"-L{lib}", "--start-group", "-lc", "-lm", "-lcompiler_builtins", "--end-group",
+                   f"{lib}/crtn.o"]
+        if arch == "aarch64":
+            command.insert(1, "--fix-cortex-a53-843419")
+        sys.exit(subprocess.run(command).returncode)
+
+
+main()

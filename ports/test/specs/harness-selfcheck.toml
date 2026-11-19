@@ -1,0 +1,24 @@
+# The harness's own check that it reports what it should: run with
+# ports/test/boot.py, this spec must give 1 pass, 1 fail, 1 skipped, 1 pending
+# and exit 1 (see stage-t0.sh).
+
+[[case]]
+name = "passes"
+run = "echo selfcheck-$((40 + 2))"
+expect = ["selfcheck-42"]
+status = 0
+
+[[case]]
+name = "must-fail"
+run = "echo selfcheck-real"
+expect = ["selfcheck-not-printed"]
+
+[[case]]
+name = "skipped-after-failure"
+run = "echo never"
+
+[[case]]
+name = "pending-example"
+run = "/bin/never-run"
+pending = "1c.7"
+why = "an example of a pending case; never run"

@@ -443,7 +443,7 @@ The window, from `feos-abi` (`ABI_VERSION` 2):
 | `USER_MMAP_BASE..USER_MMAP_END` | where `mmap` and `mmap2` place things, about 446 GiB |
 | 1 GiB (`USER_STACK_GUARD`) | unmapped, below the stack |
 | 8 MiB (`USER_STACK_SIZE`) | the main stack, reserved whole and charged as it's touched, as `MAP_NORESERVE` memory is |
-| 2 MiB (`USER_ARGS_SIZE`) up to `USER_STACK_TOP` | the argument area: the strings, their `UserStr`s, and the first stack pointer |
+| 2 MiB (`USER_ARGS_SIZE`) up to `USER_STACK_TOP` | the argument area: the System V initial stack (`argc`, `argv`, `envp`, the aux vector), the arguments' `UserStr`s, `AT_RANDOM`'s bytes and the strings |
 | the last page | unmapped |
 
 The argument area is a mapping of its own, so however long the arguments are the whole
@@ -492,6 +492,112 @@ and the space with its own last, and since a space's end writes back what its sh
 mappings dirtied, the scheduler only ever moves a dead task's reference into the teardown
 queue, and drops it in task context. A slot's `ROOT` and `TLBS` entries say what to load for
 it.
+
+**Starting a program.** `kernel/src/user/load.rs` and `proc.rs`. Whoever starts a program
+copies its argument and environment strings into frames of their own (`load::Staged`),
+promised before they're taken and never from the kernel heap (a program's counted against
+its page limit while its call holds them, a kernel app's with kills held off until its
+task has them), and hands them, with what else it starts with (`load::UserStart`), to the
+new task through its slot. `SPAWN2` does
+everything that can fail in the call: the request and its `UserStr` arrays are copied once
+and checked, the child's descriptor table is a copy of the caller's (sharing descriptions)
+changed by the actions and swept of close-on-exec descriptors, the program is resolved
+against that table and working directory (or, for `SPAWN_EMPTY_PATH`, is the file its
+descriptor holds) and held by identity before it's checked (`load::Image`), and a record
+for the child is taken in the caller's `Process` (at most `MAX_CHILDREN` unreaped, `EAGAIN`).
+v1's `SPAWN` and kernel apps (the shell passes its exported variables as the environment)
+hand over a path the task resolves itself, so a missing program still ends with 127. The new
+task maps its image, its argument area and stack, and copies the System V initial stack to
+the top of the argument area: `argc`, the `argv` and `envp` pointers, the aux vector
+(`AT_PHDR`, `AT_RANDOM`, `AT_HWCAP` from `Arch::user_hwcaps`, `AT_FEOS_EXE`,
+`AT_FEOS_FEATURES` and the rest), and above them the `UserStr`s v1's convention passes in
+the first two registers, which `user/`'s runtime still reads; its `_start` passes the stack
+pointer on for `environment()` and `auxv()`. `user/link.ld` loads the ELF and program
+headers at the start of the read-only segment, so `AT_PHDR` points at them.
+
+**Running another program.** `EXEC` (`kernel/src/user/proc.rs`) checks and stages as
+`SPAWN2` does, resolves the program against the caller's own table, and builds the whole new
+image in a fresh space nobody runs on yet (`load::build_image`, which a new task's start uses
+too), so every way it can fail is the call's error. Then, holding the process's creation lock
+(taken through `Process::creating`, which a kill ends), it has every other thread killed and
+waits until each has left the table, switches its own tables to the new space, puts the new
+space and program path in place of the old in the same `Process` (whose pid's locks and pipes
+stay), closes the close-on-exec descriptors with their record locks, drops the old space and
+goes to the new program in the same thread, which keeps its tid. A `#!` script
+(`feos_elf::shebang`) is followed to its interpreter, four deep at most, with the
+interpreter, its argument and the script's path in place of `argv[0]`
+(`load::Staged::with_heads`), for every way of starting a program.
+
+**Process groups and sessions.** Each slot's group and session are `sched`'s `SLOT_PGID` and
+`SLOT_SID`, the same in every thread of a process and changed only under the scheduler's
+lock (`SETPGID`, `SETSID`, a spawn's `SETPGROUP` or `SETSID`, which is refused there, before
+the task is committed, if the group it's to join isn't in its session). A task a kernel app
+starts gets a group of its own in session 1, the shell's; a program's child inherits its
+creator's unless it asks. Only programs' groups can be joined. `GETPPID` says 1 once no task
+has the parent's pid; pids come from a counter, so a pid that's there is the one it was.
+`SYSINFO` and `GETRUSAGE` report the machine and the process: `GETRUSAGE`'s CPU time is all
+`utime` (the scheduler doesn't split a task's ticks between its program and its calls),
+`minflt` counts the faults a space resolved and `maxrss` the most pages it has had frames for.
+
+**Exit records, waits and signals.** A program's child has an exit record in it
+(`kernel/src/user/children.rs`), allocated before the child exists and listed in the parent's
+`Process`. Every thread's slot points at it (`sched::RECORD`, one reference for the thread
+group); each thread's CPU time is added as it's collected, and the last thread's end fills it
+in under the scheduler's lock, without allocating, and gives the reference up onto a lock-free
+list the reaper drops in task context. The child's `Process` adds its memory use and its own
+reaped children's as it goes. A slot points at a record only from its task's commit (a
+thread's, from its reservation) until its exit is collected: a refused thread, and every new
+spawn, clear it. A record's pid and its group's are held (`children::held`, which the table
+asks only once its pid counter has wrapped) until the record is dropped; the table also
+skips live tasks' ids and, through a scan made once per window of 4096 pids, teardowns under
+way and live tasks' groups and sessions, and gives up (`EAGAIN`) after 2^17 pids, so the
+search under the scheduler's lock is bounded. `WAIT4` (`proc.rs`) looks
+through the records for one that's ended and whose teardowns are all done (so a wait that
+returns means the frames and pipes are free), or with a stop or continue not yet reported,
+and otherwise waits on the counter every exit, stop and continue moves on; v1's `WAIT` is it
+for one pid, reporting the v1 status. Statuses are a `feos_signal::Status` throughout, encoded
+per caller: the POSIX word for `WAIT4`, the code or 128 plus the signal for v1, kernel apps
+and the shell, whose waits still use the ring of recent exits. `KILL` (and the shell's `kill`,
+Ctrl-C and Ctrl-\\ through `Processes::send_signal`) carries out a signal's default action
+(`feos_signal::default_action`) in `sched`: a terminating signal ends the process through the
+kill path with the signal as its status; a stop (`SIGSTOP`, and job control's Ctrl-Z as
+`SIGTSTP`) holds each thread at its next way back to its program, never in a call, and is
+recorded for the parent once none is running and each is blocked or held (CPUs running a
+thread of it are asked to reschedule); `SIGCONT` lets it go and records that. A background
+job's task is a forked shell, so the shell's `kill %N` (or of `$!`) signals what that task runs,
+its process tree but itself (`TaskHost::job_members`).
+
+**Signal handlers.** A process's dispositions (`kernel/src/user/signal.rs`, set by
+`SIGACTION`) are behind its signal lock, with what the scheduler needs beside them in atomics:
+the process-pending set, which signals are caught, which ignored, and `SIGCHLD`'s
+`SA_NOCLDSTOP`/`SA_NOCLDWAIT`. Each slot points at its process's (`sched::SIGNALS`, cleared
+under the scheduler's lock before the slot lets its process go), so a signal is decided where
+it's sent, under that lock: ignored, made pending for a handler (every CPU running a thread
+of it asked to reschedule, as one leaving a call may have looked before the signal came), or
+its default action. A program whose process isn't made yet (its image still loading) goes by
+the ignored set it inherits. Each thread has a mask and
+a pending word of its own (`SIGPIPE`). Delivery is only on the way back to a program: the end
+of every call and fault delivers what's due (`signal::deliver`) before the `ToUser` switch,
+which checks again and, as does a reschedule resuming a thread at its program, diverts into a
+kernel thread on the task's kernel stack (`sched::signal_entry`) when something is due, so a
+frame is always built in task context, from `USER_FRAMES`, never from live registers. A
+process signal is claimed by one thread, by compare-and-swap (`feos_signal::claim`). The
+frame builder and the `SIGRETURN` checker are `feos_signal::frame`, byte layouts for both
+ports host-tested on any host, which the arch crates' `TrapFrame`s implement
+(`UserFrame`): a frame is built in a zeroed buffer and copied out; `SIGRETURN` copies the
+context once and rebuilds the frame from a whitelist (x86_64's selectors from the user
+frame, `RFLAGS` sanitised, `MXCSR` against the CPU's `MXCSR_MASK`; AArch64's `SPSR` from
+`NZCV` and the port's EL0t value), ending the process with `SIGSEGV` if it fails a check. A
+fault is its signal (`FaultDetails::user_signal`, refined to `SEGV_ACCERR`/`MAPERR` and
+`SIGBUS` for a page with no frame): a handler it doesn't block runs at once, and otherwise
+the process ends with the signal, a `SIGSEGV` still 139. A write to a pipe with no reader
+raises `SIGPIPE`. `SIGCHLD` is raised as a child's record is filled in or its stop or continue
+noted, and with `SIG_IGN` or `SA_NOCLDWAIT` the record is marked detached and dropped once it
+has settled; `WAIT4(WNOHANG)` waits for a child that has ended but not settled, so a handler's
+reap always finds it. `EXEC` resets handlers, and a spawned program starts ignoring what its
+spawner ignores (but for `SETSIGDEF`); either way `SIGCHLD`'s flags are worked out again from
+what's kept, so an inherited or kept `SIG_IGN` of it reaps too. Masks beyond a handler's own, alternate stacks,
+interrupted calls and restart are stage 1c.10.
 
 **Threads.** `THREAD_CREATE` checks every argument, takes the process's creation lock and
 has `sched::spawn_thread` reserve a slot (refused at the thread cap, with too few slots, or
@@ -725,8 +831,7 @@ user frees them.
 - **Side channels.** Nothing here tries, and there's no page table isolation.
 - **The x86_64 NMI window.** An NMI in the few instructions around `swapgs` would run with the wrong GS base. The only NMI is the fatal path's stop.
 
-Other limits: no `fork`,
-`exec`, signals or `dup`, and shared memory only within a process (or through a shared mapping of a file); a program reading a terminal gets the
+Other limits: no `fork`, and shared memory only within a process (or through a shared mapping of a file); a program reading a terminal gets the
 shell's cooked lines, with no way to ask for raw keys; and
 surfaces are a fixed size, with no way to hear about a resize.
 

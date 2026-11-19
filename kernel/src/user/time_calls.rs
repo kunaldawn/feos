@@ -76,9 +76,9 @@ pub(super) fn sys_clock_getres(process: &Process, id: usize, out: usize) -> isiz
     write_timespec(process.mm(), out, ns)
 }
 
-/// `nanosleep`, which is `clock_nanosleep`. Nothing interrupts it yet but a kill, which
-/// ends the thread on its way out, so it never says `EINTR` and never writes `remain`
-/// until signal handlers exist; `remain` is checked all the same.
+/// `nanosleep`, which is `clock_nanosleep`. A signal to take cuts it short with `EINTR`,
+/// and a relative sleep then says in `remain` how much was left; it's never made again
+/// (section 8.3 of the ABI design). A kill ends the thread on its way out.
 pub(super) fn sys_nanosleep(process: &Process, args: [usize; 6]) -> isize {
     let [id, flags, request, remain, _, _] = args;
     let user = process.mm();
@@ -108,8 +108,16 @@ pub(super) fn sys_nanosleep(process: &Process, args: [usize; 6]) -> isize {
         ns
     };
     // A kill ends the thread as the call unwinds, whatever this returns.
-    sched::sleep_until(time::deadline_ticks(deadline));
-    0
+    if sched::sleep_until(time::deadline_ticks(deadline)) {
+        return 0;
+    }
+    if remain != 0 && flags & timer::ABSTIME == 0 {
+        let left = deadline.saturating_sub(time::monotonic_ns());
+        if let Err(error) = user.copy_out(remain, &Timespec::from_nanos(left).to_bytes()) {
+            return error;
+        }
+    }
+    sched::interrupted_result()
 }
 
 /// The counter value a `FUTEX_WAIT2` waits until, if it has a deadline: checked, then
@@ -160,6 +168,9 @@ pub(super) fn futex_wait_until(user: &UserMm, address: usize, expected: u32, dea
         -errno::EAGAIN
     } else if sched::futex_wait_user(word, key, expected, (user.unmap_count(), unmaps), deadline) {
         -errno::ETIMEDOUT
+    } else if sched::interrupted() {
+        // Woken for a signal to take (or a kill): `EINTR`, never made again.
+        sched::interrupted_result()
     } else {
         0
     };

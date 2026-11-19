@@ -504,7 +504,14 @@ impl<'d> ProcessHost<'d> {
                 }
                 if interrupted || quit || stdout.is_broken() {
                     killed = true;
-                    let _ = processes.try_kill(job.pid);
+                    // Ctrl-C is `SIGINT` and Ctrl-\ `SIGQUIT`, as a terminal's line
+                    // discipline would send them: a program ends with that signal as its
+                    // status, a kernel app is killed. Output with nowhere to go kills it.
+                    let _ = match (interrupted, quit) {
+                        (true, _) => processes.send_signal(job.pid, feos_app::signal::INT),
+                        (_, true) => processes.send_signal(job.pid, feos_app::signal::QUIT),
+                        _ => processes.try_kill(job.pid),
+                    };
                 } else if self.console.take_suspend() && stoppable {
                     self.for_tree(job.pid, |member| {
                         processes.set_stopped(member, true);
@@ -892,6 +899,17 @@ impl TaskHost for ProcessHost<'_> {
 
     fn pause(&mut self) {
         self.platform.processes.sleep_ms(IDLE_MS);
+    }
+
+    fn job_members(&mut self, pid: u32) -> Vec<u32> {
+        // A job's task is a forked shell, waiting on the commands that do its work: those
+        // are its tree but for itself. With no heap for the table, the task is all that's
+        // known of it.
+        let tree = ProcessSnapshot::take(self.platform.processes).and_then(|snapshot| snapshot.tree(pid));
+        match tree {
+            Some(tree) if tree.len() > 1 => tree[1..].to_vec(),
+            _ => alloc::vec![pid],
+        }
     }
 
     fn system(&mut self) -> &'static dyn System {

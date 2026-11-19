@@ -147,6 +147,57 @@ impl TrapFrame {
     }
 }
 
+/// A user frame as a signal sees it (stage 1c.9): the frame builder and checker of
+/// `feos-signal`, over the registers this frame holds. A handler and a frame `SIGRETURN`
+/// rebuilds both run at EL0t with [`SPSR_USER`]'s masks, whatever the context said.
+impl feos_signal::frame::UserFrame for TrapFrame {
+    const FRAME_SIZE: usize = feos_signal::frame::aarch64::FRAME_SIZE;
+    const CONTEXT_SIZE: usize = feos_signal::frame::aarch64::CONTEXT_SIZE;
+
+    fn enter_handler(&self, entry: &feos_signal::frame::Entry, out: &mut [u8]) -> Option<(u64, Self)> {
+        use feos_signal::frame::aarch64;
+        let out: &mut [u8; aarch64::FRAME_SIZE] = (&mut out[..aarch64::FRAME_SIZE]).try_into().ok()?;
+        let (address, regs) = aarch64::build(&self.signal_regs(), entry, out, SPSR_USER)?;
+        Some((address, Self::from_signal_regs(&regs)))
+    }
+
+    fn sigreturn(
+        &self,
+        context: &[u8],
+        window: feos_signal::frame::Window,
+    ) -> Result<(Self, u64), feos_signal::frame::Refused> {
+        use feos_signal::frame::{aarch64, Refused};
+        let context: &[u8; aarch64::CONTEXT_SIZE] =
+            context.get(..aarch64::CONTEXT_SIZE).and_then(|bytes| bytes.try_into().ok()).ok_or(Refused::Flags)?;
+        let (regs, mask) = aarch64::restore(context, window, SPSR_USER)?;
+        Ok((Self::from_signal_regs(&regs), mask))
+    }
+
+    fn rewind_syscall(&mut self, _number: u64, first: u64) {
+        let mut regs = self.signal_regs();
+        feos_signal::frame::aarch64::rewind(&mut regs, first);
+        *self = Self::from_signal_regs(&regs);
+    }
+}
+
+impl TrapFrame {
+    fn signal_regs(&self) -> feos_signal::frame::aarch64::Regs {
+        feos_signal::frame::aarch64::Regs {
+            x: self.x,
+            sp: self.sp,
+            pc: self.elr,
+            pstate: self.spsr,
+            fpsr: self.fpsr,
+            fpcr: self.fpcr,
+            q: self.q,
+        }
+    }
+
+    fn from_signal_regs(regs: &feos_signal::frame::aarch64::Regs) -> Self {
+        Self { x: regs.x, fpcr: regs.fpcr, q: regs.q, sp: regs.sp, elr: regs.pc, spsr: regs.pstate, fpsr: regs.fpsr }
+    }
+}
+
 /// Callback invoked with the frame of the interrupted process.
 ///
 /// The stub restores that frame when this returns, unless the handler asks for

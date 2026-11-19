@@ -36,8 +36,9 @@ pub const ABI_VERSION: u32 = 2;
 
 /// The stage feature mask (section 1 and the table in section 12 of
 /// `docs/feos-abi-v2.md`): bit `n` is set once stage `n` is in. Bits are never reused or
-/// cleared. Up to bit 16, stage 1c.6 (`SPAWN2` and process groups).
-pub const FEATURES: u64 = (1 << 17) - 1;
+/// cleared. Up to bit 20, stage 1c.10 (masks, `THREAD_KILL`, alternate stacks,
+/// interruption and restart, `SETITIMER`).
+pub const FEATURES: u64 = (1 << 21) - 1;
 
 /// Most children a process may have that it hasn't reaped, running or ended: past this
 /// `SPAWN2` (and `FORK`) are `EAGAIN`.
@@ -169,7 +170,11 @@ pub mod nr {
     /// inherited stderr}`, keeping v1's errors (a full table `EBUSY`, too many or too long
     /// arguments `ENAMETOOLONG`).
     pub const SPAWN: usize = 10;
-    /// `wait(pid) -> status`: this process's children only.
+    /// `wait(pid) -> status`: this process's children only. The status is the exit code,
+    /// or 128 plus the signal that ended it (139 for a fault).
+    ///
+    /// Superseded by [`WAIT4`]: this is `wait4(pid, ..., 0, 0)` for one child, returning
+    /// that status rather than writing the POSIX one.
     pub const WAIT: usize = 11;
     /// `futex_wait(address, expected, timeout_ms) -> 0`, or `EAGAIN` if the word at
     /// `address` isn't `expected`, or `ETIMEDOUT`. A timeout of zero is none.
@@ -403,6 +408,21 @@ pub mod nr {
     /// that can fail (the request, the actions, the program) fails in the call, before
     /// the child exists. Supersedes [`SPAWN`].
     pub const SPAWN2: usize = 72;
+    /// `exec(request: *const ExecRequest) -> !`: replaces the calling process's image with
+    /// the program [`ExecRequest`](super::ExecRequest) names, a `#!` script's interpreter
+    /// included. It returns only with an error, from checking the request, resolving the
+    /// program or building its image; past that, every other thread has gone, close-on-exec
+    /// descriptors are closed, and the caller runs the new program with its tid, pid,
+    /// parent, group, session, working directory, umask and credentials.
+    pub const EXEC: usize = 73;
+    /// `wait4(pid, status: *mut i32, options, rusage: *mut Rusage) -> pid`: `pid` (32-bit)
+    /// positive for that child, `-1` for any, `0` for any in the caller's group, below
+    /// `-1` for any in group `-pid`. `options` are [`wait`](super::wait)'s bits (others
+    /// `EINVAL`). Writes the POSIX status ([`wait::exited`](super::wait::exited) and the
+    /// rest) and the child's resource use where the pointers aren't zero. An end reaps the
+    /// child; a stop (with `WUNTRACED`) or continue (with `WCONTINUED`) is reported once
+    /// and doesn't. `0` with `WNOHANG` if nothing has changed; `ECHILD` if no child matches.
+    pub const WAIT4: usize = 74;
     /// `getppid() -> pid`: the parent's pid, or 1 once the parent has ended.
     pub const GETPPID: usize = 75;
     /// `getpgid(pid) -> pgid`, `pid` (32-bit) 0 for the caller; `ESRCH` for no process.
@@ -421,6 +441,51 @@ pub mod nr {
     /// `sysinfo(out: *mut SysInfo, size) -> 0`: copies `min(size, size_of::<SysInfo>())`
     /// bytes of a [`SysInfo`](super::SysInfo).
     pub const SYSINFO: usize = 81;
+    /// `kill(pid, signal) -> 0`: both 32-bit. `pid` positive for a process, `0` for the
+    /// caller's group, `-1` for every process the caller may signal but itself, below `-1`
+    /// for group `-pid`; `signal` (`1..=64`, or 0 to check only) runs the target's handler
+    /// for it, or is ignored, or takes its default action ([`sig`](super::sig)). Root, or
+    /// the target's own user, may (`EPERM`); kernel tasks can't be signalled (`EPERM`). An ended child not yet reaped exists, and does
+    /// nothing; a thread id that isn't a process id is `ESRCH`, as is nothing matching.
+    pub const KILL: usize = 82;
+    /// `thread_kill(tid, signal) -> 0`: both 32-bit. `signal` (`1..=64`, or 0 to check
+    /// only) for the thread `tid` of the caller's own process, pending on that thread
+    /// alone (`ESRCH` for any other); otherwise as [`KILL`].
+    pub const THREAD_KILL: usize = 83;
+    /// `sigaction(signal, new: *const SigAction, old: *mut SigAction) -> 0`: either pointer
+    /// may be zero. `signal` (32-bit) `1..=64`; `SIGKILL` and `SIGSTOP` can't be given a
+    /// new one (`EINVAL`). A handler needs [`sa::RESTORER`](super::sa::RESTORER)
+    /// (`EINVAL`), and it and the restorer must be in the user window (`EFAULT`); unknown
+    /// flags are `EINVAL`. `SIG_IGN` (or a default that ignores) discards the signal if
+    /// it's pending.
+    pub const SIGACTION: usize = 84;
+    /// `sigprocmask(how, set: *const u64, old: *mut u64) -> 0`: the calling thread's
+    /// mask. `how` (32-bit) is one of [`how`](super::how)'s (`EINVAL`), ignored when
+    /// `set` is zero; either pointer may be zero. `SIGKILL` and `SIGSTOP` are never
+    /// blocked. A pending signal it unblocks is delivered before the call returns.
+    pub const SIGPROCMASK: usize = 85;
+    /// `sigaltstack(new: *const SigStack, old: *mut SigStack) -> 0`: the calling thread's
+    /// alternate stack. `new.flags` 0 or [`ss::DISABLE`](super::ss::DISABLE) (`EINVAL`),
+    /// `size` at least [`ss::MINSIGSTKSZ`](super::ss::MINSIGSTKSZ) (`ENOMEM`), the range
+    /// in the window (`EFAULT`); `EPERM` while on it.
+    pub const SIGALTSTACK: usize = 86;
+    /// `sigpending(out: *mut u64) -> 0`: the signals pending for the thread or its
+    /// process that the thread blocks.
+    pub const SIGPENDING: usize = 87;
+    /// `sigsuspend(mask: *const u64) -> EINTR`: waits with `*mask` as the thread's mask
+    /// until a handler has run, then puts the mask back. Always `EINTR`.
+    pub const SIGSUSPEND: usize = 88;
+    /// `sigreturn(context: *const UContext) -> !`: what a handler's restorer calls, with
+    /// the stack pointer the handler had at entry. Resumes with the context's registers
+    /// and mask, rebuilt from a whitelist; a context that fails a check ends the process
+    /// with `SIGSEGV`.
+    pub const SIGRETURN: usize = 89;
+    /// `setitimer(which, new: *const ITimerVal, old: *mut ITimerVal) -> 0`: `which`
+    /// (32-bit) [`itimer::REAL`](super::itimer::REAL) only (`EINVAL`), a per-process
+    /// deadline on the monotonic clock that raises `SIGALRM`, re-armed by `interval`. A
+    /// zero `new` only reads; a zero `value` disarms; `usec` outside `0..1_000_000` (or a
+    /// negative `sec`) is `EINVAL`. Kept across `EXEC`, not inherited by `SPAWN2`.
+    pub const SETITIMER: usize = 108;
     /// The first number of the calls `docs/feos-abi-v2.md` adds. Every number from here
     /// to [`LAST_RESERVED`] is taken, and is `ENOSYS` until the stage that brings it.
     pub const FIRST_V2: usize = 31;
@@ -430,7 +495,10 @@ pub mod nr {
     pub const FIRST_UNIMPLEMENTED: usize = 70;
     /// The calls past [`FIRST_UNIMPLEMENTED`] that have landed anyway, a stage having
     /// brought them ahead of the numbers before them.
-    pub const IMPLEMENTED_LATER: [usize; 9] = [CLOSE_RANGE, SPAWN2, GETPPID, GETPGID, SETPGID, GETSID, SETSID, GETRUSAGE, SYSINFO];
+    pub const IMPLEMENTED_LATER: [usize; 20] = [
+        CLOSE_RANGE, SPAWN2, EXEC, WAIT4, GETPPID, GETPGID, SETPGID, GETSID, SETSID, GETRUSAGE, SYSINFO, KILL, THREAD_KILL,
+        SIGACTION, SIGPROCMASK, SIGALTSTACK, SIGPENDING, SIGSUSPEND, SIGRETURN, SETITIMER,
+    ];
 
     /// Whether `number` is one the design reserves with no call behind it yet.
     pub const fn is_unimplemented(number: usize) -> bool {
@@ -1436,6 +1504,64 @@ impl SpawnRequest {
     }
 }
 
+/// What [`nr::EXEC`] runs in place of the caller's image: a [`SpawnRequest`] without
+/// actions or attributes. A request struct: `reserved` is zero.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct ExecRequest {
+    /// The program, relative to `dirfd` or the working directory.
+    pub path: PathAt,
+    /// `argc` [`UserStr`]s, at least one.
+    pub argv: u64,
+    pub argc: u64,
+    /// `envc` [`UserStr`]s, each `KEY=VALUE`.
+    pub envp: u64,
+    pub envc: u64,
+    /// [`spawn::EMPTY_PATH`] or nothing.
+    pub flags: u64,
+    pub reserved: [u64; 2],
+}
+
+const _: () = assert!(core::mem::size_of::<ExecRequest>() == 80);
+const _: () = assert!(core::mem::offset_of!(ExecRequest, path) == 0);
+const _: () = assert!(core::mem::offset_of!(ExecRequest, argv) == 24);
+const _: () = assert!(core::mem::offset_of!(ExecRequest, argc) == 32);
+const _: () = assert!(core::mem::offset_of!(ExecRequest, envp) == 40);
+const _: () = assert!(core::mem::offset_of!(ExecRequest, envc) == 48);
+const _: () = assert!(core::mem::offset_of!(ExecRequest, flags) == 56);
+const _: () = assert!(core::mem::offset_of!(ExecRequest, reserved) == 64);
+
+impl ExecRequest {
+    /// Bytes of one, in user memory.
+    pub const SIZE: usize = 80;
+
+    /// From its bytes in memory, on both ports: read once, as a [`SpawnRequest`] is.
+    pub fn from_bytes(bytes: &[u8; Self::SIZE]) -> Self {
+        let mut path = [0u8; 24];
+        path.copy_from_slice(&bytes[..24]);
+        Self {
+            path: PathAt::from_bytes(path),
+            argv: word_at(bytes, 24),
+            argc: word_at(bytes, 32),
+            envp: word_at(bytes, 40),
+            envc: word_at(bytes, 48),
+            flags: word_at(bytes, 56),
+            reserved: [word_at(bytes, 64), word_at(bytes, 72)],
+        }
+    }
+
+    /// As it is in memory.
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut out = [0u8; Self::SIZE];
+        out[..24].copy_from_slice(&self.path.to_bytes());
+        let words = [self.argv, self.argc, self.envp, self.envc, self.flags, self.reserved[0], self.reserved[1]];
+        for (index, word) in words.iter().enumerate() {
+            out[24 + index * 8..32 + index * 8].copy_from_slice(&word.to_ne_bytes());
+        }
+        out
+    }
+}
+
 /// One step of building a [`nr::SPAWN2`] child's table. A request struct: the fields its
 /// kind doesn't use, and `reserved`, are zero.
 #[repr(C)]
@@ -1514,11 +1640,518 @@ impl Timeval {
     }
 }
 
+/// Signal numbers: Linux's, the same on both ports. A set of them is a `u64` with bit
+/// `n - 1` for signal `n`.
+pub mod sig {
+    pub const HUP: u32 = 1;
+    pub const INT: u32 = 2;
+    pub const QUIT: u32 = 3;
+    pub const ILL: u32 = 4;
+    pub const TRAP: u32 = 5;
+    pub const ABRT: u32 = 6;
+    pub const BUS: u32 = 7;
+    pub const FPE: u32 = 8;
+    pub const KILL: u32 = 9;
+    pub const USR1: u32 = 10;
+    pub const SEGV: u32 = 11;
+    pub const USR2: u32 = 12;
+    pub const PIPE: u32 = 13;
+    pub const ALRM: u32 = 14;
+    pub const TERM: u32 = 15;
+    pub const STKFLT: u32 = 16;
+    pub const CHLD: u32 = 17;
+    pub const CONT: u32 = 18;
+    pub const STOP: u32 = 19;
+    pub const TSTP: u32 = 20;
+    pub const TTIN: u32 = 21;
+    pub const TTOU: u32 = 22;
+    pub const URG: u32 = 23;
+    pub const XCPU: u32 = 24;
+    pub const XFSZ: u32 = 25;
+    pub const VTALRM: u32 = 26;
+    pub const PROF: u32 = 27;
+    pub const WINCH: u32 = 28;
+    pub const IO: u32 = 29;
+    pub const PWR: u32 = 30;
+    pub const SYS: u32 = 31;
+    /// The first real-time signal.
+    pub const RTMIN: u32 = 32;
+    /// The highest signal number.
+    pub const MAX: u32 = 64;
+}
+
+/// `flags` of a [`SigAction`], and the dispositions that aren't handlers: Linux's
+/// values. `SA_SIGINFO` is accepted and always in effect: a handler always gets three
+/// arguments.
+pub mod sa {
+    /// `SIG_DFL`: the signal's default action.
+    pub const DFL: u64 = 0;
+    /// `SIG_IGN`: the signal is discarded.
+    pub const IGN: u64 = 1;
+    /// `SA_NOCLDSTOP`: no `SIGCHLD` for a child's stop or continue.
+    pub const NOCLDSTOP: u32 = 1;
+    /// `SA_NOCLDWAIT`: children are reaped as they end, never left for `WAIT4`.
+    pub const NOCLDWAIT: u32 = 2;
+    /// `SA_SIGINFO`.
+    pub const SIGINFO: u32 = 4;
+    /// `SA_RESTORER`: `restorer` is what the handler returns to. Required with a handler.
+    pub const RESTORER: u32 = 0x0400_0000;
+    /// `SA_ONSTACK`: on the alternate stack, once there is one (stage 1c.10).
+    pub const ONSTACK: u32 = 0x0800_0000;
+    /// `SA_RESTART`: an interrupted call is restarted (stage 1c.10).
+    pub const RESTART: u32 = 0x1000_0000;
+    /// `SA_NODEFER`: the signal isn't blocked while its handler runs.
+    pub const NODEFER: u32 = 0x4000_0000;
+    /// `SA_RESETHAND`: the disposition goes back to `SIG_DFL` as the handler is entered.
+    pub const RESETHAND: u32 = 0x8000_0000;
+    /// Every flag there is.
+    pub const ALL: u32 = NOCLDSTOP | NOCLDWAIT | SIGINFO | RESTORER | ONSTACK | RESTART | NODEFER | RESETHAND;
+}
+
+/// `code` of a [`SigInfo`]: Linux's values.
+pub mod si {
+    /// Sent by `KILL`.
+    pub const USER: i32 = 0;
+    /// Raised by the kernel: `SIGPIPE`, the console's `SIGINT`.
+    pub const KERNEL: i32 = 0x80;
+    /// Sent by `THREAD_KILL`.
+    pub const TKILL: i32 = -6;
+    pub const CLD_EXITED: i32 = 1;
+    pub const CLD_KILLED: i32 = 2;
+    pub const CLD_STOPPED: i32 = 5;
+    pub const CLD_CONTINUED: i32 = 6;
+    pub const SEGV_MAPERR: i32 = 1;
+    pub const SEGV_ACCERR: i32 = 2;
+    pub const BUS_ADRALN: i32 = 1;
+    pub const BUS_ADRERR: i32 = 2;
+    pub const ILL_ILLOPC: i32 = 1;
+    pub const FPE_INTDIV: i32 = 1;
+    pub const TRAP_BRKPT: i32 = 1;
+}
+
+/// `how` of [`nr::SIGPROCMASK`]: Linux's values.
+pub mod how {
+    /// Adds the set to the mask.
+    pub const BLOCK: i32 = 0;
+    /// Takes the set from the mask.
+    pub const UNBLOCK: i32 = 1;
+    /// The set is the mask.
+    pub const SETMASK: i32 = 2;
+}
+
+/// `which` of [`nr::SETITIMER`]: Linux's values. Only [`REAL`](itimer::REAL) is offered.
+pub mod itimer {
+    pub const REAL: i32 = 0;
+    pub const VIRTUAL: i32 = 1;
+    pub const PROF: i32 = 2;
+}
+
+/// An interval timer's setting, Linux's `struct itimerval`: a request struct (no
+/// reserved fields) for [`nr::SETITIMER`], and what it reports.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct ITimerVal {
+    /// What it's re-armed by each time it goes off; zero for once.
+    pub interval: Timeval,
+    /// How long until it goes off; zero for disarmed.
+    pub value: Timeval,
+}
+
+const _: () = assert!(core::mem::size_of::<ITimerVal>() == 32);
+const _: () = assert!(core::mem::offset_of!(ITimerVal, interval) == 0);
+const _: () = assert!(core::mem::offset_of!(ITimerVal, value) == 16);
+
+impl ITimerVal {
+    pub const SIZE: usize = 32;
+
+    pub fn from_bytes(bytes: [u8; Self::SIZE]) -> Self {
+        let word = |at: usize| {
+            let mut out = [0u8; 8];
+            out.copy_from_slice(&bytes[at..at + 8]);
+            i64::from_ne_bytes(out)
+        };
+        Self { interval: Timeval { sec: word(0), usec: word(8) }, value: Timeval { sec: word(16), usec: word(24) } }
+    }
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut out = [0u8; Self::SIZE];
+        for (index, word) in [self.interval.sec, self.interval.usec, self.value.sec, self.value.usec].into_iter().enumerate() {
+            out[index * 8..index * 8 + 8].copy_from_slice(&word.to_ne_bytes());
+        }
+        out
+    }
+}
+
+/// `flags` of a [`SigStack`], and the alternate stack's sizes: Linux's values.
+pub mod ss {
+    pub const ONSTACK: i32 = 1;
+    pub const DISABLE: i32 = 2;
+    pub const MINSIGSTKSZ: usize = 2048;
+    pub const SIGSTKSZ: usize = 8192;
+}
+
+/// A signal's disposition, for [`nr::SIGACTION`]: Linux's `struct sigaction` as its
+/// system call takes it. A Linux-layout struct: `reserved` is the padding after a C
+/// `sa_flags`, ignored on input and written as zero.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct SigAction {
+    /// [`sa::DFL`], [`sa::IGN`], or the handler's address.
+    pub handler: u64,
+    /// [`sa`]'s flags.
+    pub flags: u32,
+    pub reserved: u32,
+    /// What the handler returns to, which calls [`nr::SIGRETURN`].
+    pub restorer: u64,
+    /// Signals blocked while the handler runs, besides the signal itself.
+    pub mask: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<SigAction>() == 32);
+const _: () = assert!(core::mem::offset_of!(SigAction, handler) == 0);
+const _: () = assert!(core::mem::offset_of!(SigAction, flags) == 8);
+const _: () = assert!(core::mem::offset_of!(SigAction, reserved) == 12);
+const _: () = assert!(core::mem::offset_of!(SigAction, restorer) == 16);
+const _: () = assert!(core::mem::offset_of!(SigAction, mask) == 24);
+
+impl SigAction {
+    pub const SIZE: usize = 32;
+
+    /// From its bytes in memory, the padding dropped.
+    pub fn from_bytes(bytes: [u8; Self::SIZE]) -> Self {
+        let word = |at: usize| {
+            let mut out = [0u8; 8];
+            out.copy_from_slice(&bytes[at..at + 8]);
+            u64::from_ne_bytes(out)
+        };
+        let flags = u32::from_ne_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        Self { handler: word(0), flags, reserved: 0, restorer: word(16), mask: word(24) }
+    }
+
+    /// As it is in memory, the padding zero.
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut out = [0u8; Self::SIZE];
+        out[0..8].copy_from_slice(&self.handler.to_ne_bytes());
+        out[8..12].copy_from_slice(&self.flags.to_ne_bytes());
+        out[16..24].copy_from_slice(&self.restorer.to_ne_bytes());
+        out[24..32].copy_from_slice(&self.mask.to_ne_bytes());
+        out
+    }
+}
+
+/// An alternate signal stack, Linux's `stack_t`. A Linux-layout struct.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct SigStack {
+    pub sp: u64,
+    /// [`ss`]'s flags.
+    pub flags: i32,
+    pub reserved: u32,
+    pub size: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<SigStack>() == 24);
+const _: () = assert!(core::mem::offset_of!(SigStack, sp) == 0);
+const _: () = assert!(core::mem::offset_of!(SigStack, flags) == 8);
+const _: () = assert!(core::mem::offset_of!(SigStack, reserved) == 12);
+const _: () = assert!(core::mem::offset_of!(SigStack, size) == 16);
+
+impl SigStack {
+    pub const SIZE: usize = 24;
+
+    /// From its bytes in memory, the padding dropped.
+    pub fn from_bytes(bytes: [u8; Self::SIZE]) -> Self {
+        let word = |at: usize| {
+            let mut out = [0u8; 8];
+            out.copy_from_slice(&bytes[at..at + 8]);
+            u64::from_ne_bytes(out)
+        };
+        let flags = i32::from_ne_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        Self { sp: word(0), flags, reserved: 0, size: word(16) }
+    }
+
+    /// As it is in memory, the padding zero.
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut out = [0u8; Self::SIZE];
+        out[0..8].copy_from_slice(&self.sp.to_ne_bytes());
+        out[8..12].copy_from_slice(&self.flags.to_ne_bytes());
+        out[16..24].copy_from_slice(&self.size.to_ne_bytes());
+        out
+    }
+}
+
+/// What a handler is told about its signal, Linux's `siginfo_t` on 64-bit: an output.
+/// What `fields` holds depends on the signal: [`SigInfo::sender`], [`SigInfo::child`] and
+/// [`SigInfo::fault`] make each kind, and the rest is zero.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SigInfo {
+    pub signo: i32,
+    /// Always 0.
+    pub errno: i32,
+    /// [`si`]'s codes.
+    pub code: i32,
+    pub reserved: i32,
+    /// From offset 16: `pid: i32`, `uid: u32` for a sent signal; then `status: i32`, a
+    /// reserved `i32`, `utime: i64` and `stime: i64` for `SIGCHLD`; `address: u64` for a
+    /// fault.
+    pub fields: [u8; 112],
+}
+
+const _: () = assert!(core::mem::size_of::<SigInfo>() == 128);
+const _: () = assert!(core::mem::offset_of!(SigInfo, signo) == 0);
+const _: () = assert!(core::mem::offset_of!(SigInfo, errno) == 4);
+const _: () = assert!(core::mem::offset_of!(SigInfo, code) == 8);
+const _: () = assert!(core::mem::offset_of!(SigInfo, fields) == 16);
+
+impl Default for SigInfo {
+    fn default() -> Self {
+        Self { signo: 0, errno: 0, code: 0, reserved: 0, fields: [0; 112] }
+    }
+}
+
+impl SigInfo {
+    pub const SIZE: usize = 128;
+
+    fn put(&mut self, at: usize, bytes: &[u8]) {
+        self.fields[at - 16..at - 16 + bytes.len()].copy_from_slice(bytes);
+    }
+
+    fn get<const N: usize>(&self, at: usize) -> [u8; N] {
+        let mut out = [0u8; N];
+        out.copy_from_slice(&self.fields[at - 16..at - 16 + N]);
+        out
+    }
+
+    /// A signal sent by a process `pid` of user `uid`, or raised by the kernel (with
+    /// [`si::KERNEL`], `pid` and `uid` 0).
+    pub fn sender(signo: u32, code: i32, pid: u32, uid: u32) -> Self {
+        let mut info = Self { signo: signo as i32, code, ..Self::default() };
+        info.put(16, &(pid as i32).to_ne_bytes());
+        info.put(20, &uid.to_ne_bytes());
+        info
+    }
+
+    /// `SIGCHLD` for the child `pid` of user `uid`: `code` one of `si::CLD_*`, `status`
+    /// its exit code or signal, and its CPU time in clock ticks of 10 ms.
+    pub fn child(code: i32, pid: u32, uid: u32, status: i32, utime: i64, stime: i64) -> Self {
+        let mut info = Self::sender(sig::CHLD, code, pid, uid);
+        info.put(24, &status.to_ne_bytes());
+        info.put(32, &utime.to_ne_bytes());
+        info.put(40, &stime.to_ne_bytes());
+        info
+    }
+
+    /// A fault's signal, at `address`.
+    pub fn fault(signo: u32, code: i32, address: u64) -> Self {
+        let mut info = Self { signo: signo as i32, code, ..Self::default() };
+        info.put(16, &address.to_ne_bytes());
+        info
+    }
+
+    /// The sender's pid, or a child's.
+    pub fn pid(&self) -> i32 {
+        i32::from_ne_bytes(self.get(16))
+    }
+
+    /// The sender's uid, or a child's.
+    pub fn uid(&self) -> u32 {
+        u32::from_ne_bytes(self.get(20))
+    }
+
+    /// A child's status, for `SIGCHLD`.
+    pub fn status(&self) -> i32 {
+        i32::from_ne_bytes(self.get(24))
+    }
+
+    /// A fault's address.
+    pub fn address(&self) -> u64 {
+        u64::from_ne_bytes(self.get(16))
+    }
+
+    /// As it is in memory.
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut out = [0u8; Self::SIZE];
+        out[0..4].copy_from_slice(&self.signo.to_ne_bytes());
+        out[4..8].copy_from_slice(&self.errno.to_ne_bytes());
+        out[8..12].copy_from_slice(&self.code.to_ne_bytes());
+        out[12..16].copy_from_slice(&self.reserved.to_ne_bytes());
+        out[16..].copy_from_slice(&self.fields);
+        out
+    }
+
+    /// From its bytes in memory.
+    pub fn from_bytes(bytes: &[u8; Self::SIZE]) -> Self {
+        let int = |at: usize| i32::from_ne_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+        let mut fields = [0u8; 112];
+        fields.copy_from_slice(&bytes[16..]);
+        Self { signo: int(0), errno: int(4), code: int(8), reserved: int(12), fields }
+    }
+}
+
+/// The register contexts a signal handler is given, one per port (section 8.4 of
+/// `docs/feos-abi-v2.md`), both defined on every host so either's layout can be checked
+/// anywhere. [`UContext`] is this port's.
+pub mod ucontext {
+    use super::SigStack;
+
+    /// `flags` on x86_64: the FP area is a plain `FXSAVE64` image.
+    pub const UC_FEOS_FXSAVE: u64 = 1;
+
+    /// x86_64's: Linux's `gregs` order. `rsp + 8` at a handler's entry points at it.
+    #[repr(C, align(16))]
+    #[derive(Clone, Copy)]
+    pub struct X86_64 {
+        /// [`UC_FEOS_FXSAVE`].
+        pub flags: u64,
+        /// 0.
+        pub link: u64,
+        /// The alternate stack as it was.
+        pub stack: SigStack,
+        /// The mask to restore.
+        pub mask: u64,
+        /// `r8`..`r15`, `rdi`, `rsi`, `rbp`, `rbx`, `rdx`, `rax`, `rcx`, `rsp`, `rip`,
+        /// `rflags`, `cs_gs_fs` (`cs` in the low 16 bits), `err`, `trapno`, `oldmask` (0),
+        /// `cr2`: see [`greg`].
+        pub gregs: [u64; 23],
+        /// The address of `fxsave`, for the handler; ignored by `SIGRETURN`.
+        pub fpregs: u64,
+        pub reserved: [u64; 8],
+        /// The `FXSAVE64` image.
+        pub fxsave: [u8; 512],
+    }
+
+    /// Indexes of [`X86_64::gregs`]: Linux's `REG_*`.
+    pub mod greg {
+        pub const R8: usize = 0;
+        pub const R9: usize = 1;
+        pub const R10: usize = 2;
+        pub const R11: usize = 3;
+        pub const R12: usize = 4;
+        pub const R13: usize = 5;
+        pub const R14: usize = 6;
+        pub const R15: usize = 7;
+        pub const RDI: usize = 8;
+        pub const RSI: usize = 9;
+        pub const RBP: usize = 10;
+        pub const RBX: usize = 11;
+        pub const RDX: usize = 12;
+        pub const RAX: usize = 13;
+        pub const RCX: usize = 14;
+        pub const RSP: usize = 15;
+        pub const RIP: usize = 16;
+        pub const EFL: usize = 17;
+        pub const CSGSFS: usize = 18;
+        pub const ERR: usize = 19;
+        pub const TRAPNO: usize = 20;
+        pub const OLDMASK: usize = 21;
+        pub const CR2: usize = 22;
+    }
+
+    const _: () = assert!(core::mem::size_of::<X86_64>() == 816);
+    const _: () = assert!(core::mem::offset_of!(X86_64, flags) == 0);
+    const _: () = assert!(core::mem::offset_of!(X86_64, link) == 8);
+    const _: () = assert!(core::mem::offset_of!(X86_64, stack) == 16);
+    const _: () = assert!(core::mem::offset_of!(X86_64, mask) == 40);
+    const _: () = assert!(core::mem::offset_of!(X86_64, gregs) == 48);
+    const _: () = assert!(core::mem::offset_of!(X86_64, fpregs) == 232);
+    const _: () = assert!(core::mem::offset_of!(X86_64, reserved) == 240);
+    const _: () = assert!(core::mem::offset_of!(X86_64, fxsave) == 304);
+
+    /// AArch64's. `sp` at a handler's entry points at it.
+    #[repr(C, align(16))]
+    #[derive(Clone, Copy)]
+    pub struct Aarch64 {
+        /// 0.
+        pub flags: u64,
+        /// 0.
+        pub link: u64,
+        pub stack: SigStack,
+        pub mask: u64,
+        pub fault_address: u64,
+        /// `x0`..`x30`.
+        pub regs: [u64; 31],
+        pub sp: u64,
+        pub pc: u64,
+        /// Only `NZCV` (bits 31 to 28) is taken back.
+        pub pstate: u64,
+        pub fpsr: u32,
+        pub fpcr: u32,
+        /// `q0`..`q31`.
+        pub v: [u128; 32],
+        pub reserved: [u64; 4],
+    }
+
+    const _: () = assert!(core::mem::size_of::<Aarch64>() == 880);
+    const _: () = assert!(core::mem::offset_of!(Aarch64, flags) == 0);
+    const _: () = assert!(core::mem::offset_of!(Aarch64, link) == 8);
+    const _: () = assert!(core::mem::offset_of!(Aarch64, stack) == 16);
+    const _: () = assert!(core::mem::offset_of!(Aarch64, mask) == 40);
+    const _: () = assert!(core::mem::offset_of!(Aarch64, fault_address) == 48);
+    const _: () = assert!(core::mem::offset_of!(Aarch64, regs) == 56);
+    const _: () = assert!(core::mem::offset_of!(Aarch64, sp) == 304);
+    const _: () = assert!(core::mem::offset_of!(Aarch64, pc) == 312);
+    const _: () = assert!(core::mem::offset_of!(Aarch64, pstate) == 320);
+    const _: () = assert!(core::mem::offset_of!(Aarch64, fpsr) == 328);
+    const _: () = assert!(core::mem::offset_of!(Aarch64, fpcr) == 332);
+    const _: () = assert!(core::mem::offset_of!(Aarch64, v) == 336);
+    const _: () = assert!(core::mem::offset_of!(Aarch64, reserved) == 848);
+}
+
+/// This port's signal context.
+#[cfg(target_arch = "x86_64")]
+pub type UContext = ucontext::X86_64;
+/// This port's signal context.
+#[cfg(target_arch = "aarch64")]
+pub type UContext = ucontext::Aarch64;
+
+/// `options` of [`nr::WAIT4`], and the POSIX status it writes: Linux's.
+pub mod wait {
+    /// `WNOHANG`: return 0 rather than wait.
+    pub const NOHANG: usize = 1;
+    /// `WUNTRACED`: report a child that stopped too.
+    pub const UNTRACED: usize = 2;
+    /// `WCONTINUED`: report a child that continued too.
+    pub const CONTINUED: usize = 8;
+    /// Every option there is.
+    pub const ALL: usize = NOHANG | UNTRACED | CONTINUED;
+
+    /// `WIFEXITED`.
+    pub const fn exited(status: i32) -> bool {
+        status & 0x7f == 0
+    }
+    /// `WEXITSTATUS`.
+    pub const fn exit_code(status: i32) -> i32 {
+        (status >> 8) & 0xff
+    }
+    /// `WIFSIGNALED`.
+    pub const fn signaled(status: i32) -> bool {
+        let signal = status & 0x7f;
+        signal != 0 && signal != 0x7f
+    }
+    /// `WTERMSIG`.
+    pub const fn term_signal(status: i32) -> i32 {
+        status & 0x7f
+    }
+    /// `WIFSTOPPED`.
+    pub const fn stopped(status: i32) -> bool {
+        status & 0xff == 0x7f
+    }
+    /// `WSTOPSIG`.
+    pub const fn stop_signal(status: i32) -> i32 {
+        (status >> 8) & 0xff
+    }
+    /// `WIFCONTINUED`.
+    pub const fn continued(status: i32) -> bool {
+        status == 0xffff
+    }
+}
+
 /// `who` of [`nr::GETRUSAGE`]: Linux's.
 pub mod rusage {
     /// The calling process, every thread of it.
     pub const SELF: i32 = 0;
-    /// Its reaped children, and theirs: zero until stage 1c.8 has exit records.
+    /// Its reaped children, and theirs.
     pub const CHILDREN: i32 = -1;
     /// The calling thread.
     pub const THREAD: i32 = 1;
@@ -1864,12 +2497,16 @@ mod tests {
         assert!(!nr::is_unimplemented(nr::NANOSLEEP) && !nr::is_unimplemented(nr::UNLINKAT));
         assert!(nr::is_unimplemented(nr::FIRST_UNIMPLEMENTED));
         assert!(!nr::is_unimplemented(54) && !nr::is_unimplemented(67) && !nr::is_unimplemented(68));
-        assert!(!nr::is_unimplemented(69) && nr::is_unimplemented(70) && nr::is_unimplemented(106) && nr::is_unimplemented(nr::LAST_RESERVED));
+        assert!(!nr::is_unimplemented(69) && nr::is_unimplemented(70) && nr::is_unimplemented(106) && !nr::is_unimplemented(nr::LAST_RESERVED));
         assert!(!nr::is_unimplemented(58) && !nr::is_unimplemented(62) && !nr::is_unimplemented(66));
         assert_eq!((nr::SPAWN2, nr::GETPPID, nr::GETPGID, nr::SETPGID, nr::GETSID, nr::SETSID), (72, 75, 76, 77, 78, 79));
         assert_eq!((nr::GETRUSAGE, nr::SYSINFO), (80, 81));
-        // `EXEC` and `WAIT4` are stage 1c.7's and 1c.8's.
-        assert!(nr::is_unimplemented(73) && nr::is_unimplemented(74) && !nr::is_unimplemented(nr::SYSINFO));
+        assert_eq!((nr::EXEC, nr::WAIT4, nr::KILL), (73, 74, 82));
+        assert!(!nr::is_unimplemented(nr::EXEC) && !nr::is_unimplemented(nr::WAIT4) && !nr::is_unimplemented(nr::SYSINFO));
+        assert!(!nr::is_unimplemented(nr::KILL) && !nr::is_unimplemented(83) && !nr::is_unimplemented(84));
+        assert_eq!((nr::SIGACTION, nr::SIGRETURN), (84, 89));
+        assert_eq!((nr::THREAD_KILL, nr::SIGPROCMASK, nr::SIGALTSTACK, nr::SIGPENDING, nr::SIGSUSPEND, nr::SETITIMER), (83, 85, 86, 87, 88, 108));
+        assert!((83..=89).all(|number| !nr::is_unimplemented(number)) && nr::is_unimplemented(90) && !nr::is_unimplemented(108));
         for number in nr::IMPLEMENTED_LATER {
             assert!(number > nr::FIRST_UNIMPLEMENTED && !nr::is_unimplemented(number));
         }
@@ -2065,6 +2702,15 @@ mod tests {
         let bytes: [u8; SpawnAction::SIZE] = unsafe { core::mem::transmute(action) };
         assert_eq!(action.to_bytes(), bytes);
         assert_eq!(SpawnAction::from_bytes(&bytes), action);
+        assert_eq!(core::mem::size_of::<ExecRequest>(), ExecRequest::SIZE);
+        let exec = ExecRequest {
+            path: PathAt { dirfd: 7, reserved: 0, pointer: 0x55, length: 4 },
+            argv: 1, argc: 2, envp: 3, envc: 4, flags: spawn::EMPTY_PATH, reserved: [5, 6],
+        };
+        // SAFETY: as above.
+        let bytes: [u8; ExecRequest::SIZE] = unsafe { core::mem::transmute(exec) };
+        assert_eq!(exec.to_bytes(), bytes);
+        assert_eq!(ExecRequest::from_bytes(&bytes), exec);
     }
 
     #[test]
@@ -2106,9 +2752,75 @@ mod tests {
     }
 
     #[test]
+    fn signals_and_wait_statuses_are_linuxs() {
+        assert_eq!((sig::HUP, sig::INT, sig::KILL, sig::SEGV, sig::TERM, sig::CHLD), (1, 2, 9, 11, 15, 17));
+        assert_eq!((sig::CONT, sig::STOP, sig::TSTP, sig::TTIN, sig::TTOU, sig::WINCH), (18, 19, 20, 21, 22, 28));
+        assert_eq!((sig::SYS, sig::RTMIN, sig::MAX), (31, 32, 64));
+        assert_eq!((wait::NOHANG, wait::UNTRACED, wait::CONTINUED), (1, 2, 8));
+        // glibc's macros on the statuses a kernel writes.
+        assert!(wait::exited(42 << 8) && wait::exit_code(42 << 8) == 42 && !wait::signaled(42 << 8));
+        assert!(wait::signaled(15) && wait::term_signal(15) == 15 && !wait::exited(15) && !wait::stopped(15));
+        assert!(wait::stopped(0x137f) && wait::stop_signal(0x137f) == 19 && !wait::signaled(0x137f));
+        assert!(wait::continued(0xffff) && !wait::exited(0xffff) && !wait::stopped(0xffff));
+    }
+
+    #[test]
     fn features_cover_every_stage_so_far() {
-        // 1a.1 to 1c.6: bits 0 to 16, and nothing beyond.
-        assert_eq!(FEATURES.count_ones(), 17);
-        assert_eq!(FEATURES >> 17, 0);
+        // 1a.1 to 1c.10: bits 0 to 20, and nothing beyond.
+        assert_eq!(FEATURES.count_ones(), 21);
+        assert_eq!(FEATURES >> 21, 0);
+    }
+
+    #[test]
+    fn signal_structs_are_linuxs() {
+        assert_eq!((sa::NOCLDSTOP, sa::NOCLDWAIT, sa::SIGINFO, sa::RESTORER), (1, 2, 4, 0x0400_0000));
+        assert_eq!((sa::ONSTACK, sa::RESTART, sa::NODEFER, sa::RESETHAND), (0x0800_0000, 0x1000_0000, 0x4000_0000, 0x8000_0000));
+        assert_eq!((sa::DFL, sa::IGN), (0, 1));
+        assert_eq!((si::USER, si::KERNEL, si::TKILL), (0, 0x80, -6));
+        assert_eq!((si::CLD_EXITED, si::CLD_KILLED, si::CLD_STOPPED, si::CLD_CONTINUED), (1, 2, 5, 6));
+        assert_eq!((si::SEGV_MAPERR, si::SEGV_ACCERR, si::BUS_ADRALN, si::BUS_ADRERR), (1, 2, 1, 2));
+        assert_eq!((si::ILL_ILLOPC, si::FPE_INTDIV, si::TRAP_BRKPT), (1, 1, 1));
+        assert_eq!((ss::ONSTACK, ss::DISABLE, ss::MINSIGSTKSZ, ss::SIGSTKSZ), (1, 2, 2048, 8192));
+        assert_eq!((how::BLOCK, how::UNBLOCK, how::SETMASK), (0, 1, 2));
+        assert_eq!((itimer::REAL, itimer::VIRTUAL, itimer::PROF), (0, 1, 2));
+        let timer = ITimerVal { interval: Timeval { sec: 1, usec: 2 }, value: Timeval { sec: -3, usec: 999_999 } };
+        // SAFETY: a `repr(C)` struct of integers with no padding.
+        let bytes: [u8; ITimerVal::SIZE] = unsafe { core::mem::transmute(timer) };
+        assert_eq!(timer.to_bytes(), bytes);
+        assert_eq!(ITimerVal::from_bytes(bytes), timer);
+        let stack = SigStack { sp: 0x7f_0000_0000, flags: ss::ONSTACK, reserved: 0, size: 8192 };
+        let mut bytes = stack.to_bytes();
+        // SAFETY: as above; the padding is zero here.
+        assert_eq!(bytes, unsafe { core::mem::transmute::<SigStack, [u8; SigStack::SIZE]>(stack) });
+        bytes[13] = 0xee;
+        assert_eq!(SigStack::from_bytes(bytes), stack, "the padding after a C ss_flags is ignored");
+        let action = SigAction { handler: 0x10_0000_1000, flags: sa::RESTORER | sa::RESETHAND, reserved: 0, restorer: 0x10_0000_2000, mask: 1 << 9 };
+        // SAFETY: a `repr(C)` struct of integers whose padding is zero here.
+        let bytes: [u8; SigAction::SIZE] = unsafe { core::mem::transmute(action) };
+        assert_eq!(action.to_bytes(), bytes);
+        let mut dirty = bytes;
+        dirty[12] = 0xff;
+        assert_eq!(SigAction::from_bytes(dirty), action, "the padding after a C sa_flags is ignored");
+        let info = SigInfo::child(si::CLD_EXITED, 42, 1000, 3, 5, 6);
+        let bytes = info.to_bytes();
+        assert_eq!(SigInfo::from_bytes(&bytes), info);
+        assert_eq!((info.signo, info.code, info.pid(), info.uid(), info.status()), (17, 1, 42, 1000, 3));
+        assert_eq!(i64::from_ne_bytes(bytes[32..40].try_into().unwrap()), 5);
+        assert_eq!(SigInfo::fault(sig::SEGV, si::SEGV_MAPERR, 0x1234).address(), 0x1234);
+    }
+
+    #[test]
+    fn ucontext_layouts_on_any_host() {
+        // Both ports' layouts, wherever the tests run: section 8.4 of the design.
+        assert_eq!(core::mem::size_of::<ucontext::X86_64>(), 816);
+        assert_eq!(core::mem::align_of::<ucontext::X86_64>(), 16);
+        assert_eq!(core::mem::offset_of!(ucontext::X86_64, fxsave) % 16, 0);
+        assert_eq!(core::mem::size_of::<ucontext::Aarch64>(), 880);
+        assert_eq!(core::mem::align_of::<ucontext::Aarch64>(), 16);
+        assert_eq!(core::mem::offset_of!(ucontext::Aarch64, v), 336);
+        assert_eq!(ucontext::greg::CR2, 22);
+        assert_eq!((ucontext::greg::RSP, ucontext::greg::RIP, ucontext::greg::EFL), (15, 16, 17));
+        assert_eq!(ucontext::UC_FEOS_FXSAVE, 1);
+        assert_eq!(core::mem::size_of::<UContext>() % 16, 0);
     }
 }

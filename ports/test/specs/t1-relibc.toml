@@ -1,0 +1,175 @@
+# Stage T1: C programs built against relibc's feos platform (ports/test/c/t1),
+# injected as /bin/t1-*, run on feos. Each prints "<name>: ok" when every check
+# passed and exits with the number of failures.
+
+[[case]]
+name = "hello"
+run = "/bin/t1-hello one 'two words'"
+expect = ["hello from relibc on feos", "argc 3", "argv[1]=one", "argv[2]=two words", "fputs line", "raw write", "t1-hello: ok"]
+reject = ["FAILED"]
+status = 0
+
+# stderr is a stream of its own: its line may come before or after stdout's
+# neighbours on the console, so it's checked alone.
+[[case]]
+name = "stderr"
+run = "/bin/t1-hello"
+expect = ["t1-hello: to stderr"]
+status = 0
+
+[[case]]
+name = "exit-status"
+run = "/bin/t1-hello --exit 42"
+expect = ["t1-hello: ok"]
+status = 42
+
+[[case]]
+name = "atexit"
+run = "/bin/t1-hello --atexit"
+expect = ["t1-hello: ok", "atexit handler ran"]
+status = 0
+
+[[case]]
+name = "malloc-stress"
+run = "/bin/t1-malloc"
+expect = ["t1-malloc: ok"]
+reject = ["FAILED"]
+status = 0
+timeout = 180
+
+[[case]]
+name = "files"
+run = "/bin/t1-files /tmp"
+expect = ["t1-files: ok"]
+reject = ["FAILED"]
+status = 0
+
+[[case]]
+name = "time"
+run = "/bin/t1-time"
+expect = ["t1-time: slept", "t1-time: ok"]
+reject = ["FAILED"]
+status = 0
+
+[[case]]
+name = "pthreads"
+run = "/bin/t1-threads"
+expect = ["counter 160000", "condvar sum 500500", "t1-threads: ok"]
+reject = ["FAILED"]
+status = 0
+timeout = 180
+
+[[case]]
+name = "env-export"
+run = "export T1_VAR=from-shell; /bin/t1-env T1_VAR from-shell"
+expect = ["T1_VAR=from-shell", "t1-env: ok"]
+reject = ["FAILED"]
+status = 0
+
+[[case]]
+name = "env-assignment"
+run = "T1_ONE=just-this /bin/t1-env T1_ONE just-this"
+expect = ["T1_ONE=just-this", "t1-env: ok"]
+reject = ["FAILED"]
+status = 0
+
+[[case]]
+name = "env-unset"
+run = "/bin/t1-env T1_NEVER_SET -"
+expect = ["T1_NEVER_SET=(unset)", "t1-env: ok"]
+reject = ["FAILED"]
+status = 0
+
+[[case]]
+name = "posix-spawn-waitpid"
+run = "/bin/t1-spawn /bin"
+expect = ["child exited 42", "attributes ok", "t1-spawn: ok"]
+reject = ["FAILED"]
+status = 0
+timeout = 120
+
+[[case]]
+name = "platform-info"
+run = "/bin/t1-sys"
+expect = ["uname feos", "t1-sys: ok"]
+reject = ["FAILED"]
+status = 0
+
+[[case]]
+name = "later-calls-give-enosys"
+run = "/bin/t1-enosys"
+expect = ["t1-enosys: ok"]
+reject = ["FAILED"]
+status = 0
+
+[[case]]
+name = "exec"
+run = "/bin/t1-pending exec"
+expect = ["argv[1]=exec-ed", "t1-hello: ok"]
+status = 0
+pending = "1c.7"
+why = "execv needs EXEC"
+
+[[case]]
+name = "waitpid-wnohang"
+run = "/bin/t1-pending wnohang"
+expect = ["t1-pending: ok"]
+status = 0
+pending = "1c.8"
+why = "WNOHANG and waiting for any child need WAIT4; until then waitpid of one pid uses v1 WAIT"
+
+[[case]]
+name = "signals"
+run = "/bin/t1-pending raise"
+expect = ["t1-pending: ok"]
+status = 0
+pending = "1c.10"
+why = "sigaction (1c.9) and THREAD_KILL (1c.10)"
+
+[[case]]
+name = "isatty"
+run = "/bin/t1-pending isatty"
+expect = ["t1-pending: ok"]
+status = 0
+pending = "1c.11"
+why = "isatty is tcgetattr, which is IOCTL"
+
+[[case]]
+name = "fork"
+run = "/bin/t1-pending fork"
+expect = ["t1-pending: ok"]
+status = 0
+pending = "1d.1"
+why = "FORK"
+
+[[case]]
+name = "getrandom"
+run = "/bin/t1-pending getrandom"
+expect = ["t1-pending: ok"]
+status = 0
+pending = "1e.1"
+why = "GETRANDOM"
+
+[[case]]
+name = "socket"
+run = "/bin/t1-pending socket"
+expect = ["t1-pending: ok"]
+status = 0
+pending = "1e.3"
+why = "SOCKET"
+
+[[case]]
+name = "spawn-sigmask"
+run = "/bin/t1-pending spawnmask"
+expect = ["t1-pending: ok"]
+status = 0
+pending = "1c.10"
+why = "the child reads its mask with SIGPROCMASK"
+
+[[case]]
+name = "spawn-tcsetpgrp"
+run = "/bin/t1-pending tcsetpgrp"
+expect = ["t1-pending: ok"]
+status = 0
+pending = "1c.11"
+why = "SPAWN2's TCSETPGRP action needs terminals"

@@ -1224,7 +1224,7 @@ impl Shell<'_> {
             if self.is_program(name) {
                 return self.run_program(name, args, io, host, background);
             }
-            return self.run_script_path(name, args, io, host);
+            return self.run_script_path(name, args, io, host, background);
         }
         if is_command(name) {
             return self.run_coreutil(name, args, io, host);
@@ -1275,7 +1275,7 @@ impl Shell<'_> {
             if self.is_program(&path) {
                 return self.run_program(&path, args, io, host, background);
             }
-            return self.run_script_path(&path, args, io, host);
+            return self.run_script_path(&path, args, io, host, background);
         }
         self.write_err(io, &format!("sh: {name}: command not found\n"));
         127
@@ -1414,13 +1414,15 @@ impl Shell<'_> {
         None
     }
 
-    /// Runs a script file in a child-like copy of the shell.
+    /// Runs a script file in a child-like copy of the shell, or, one whose `#!` line
+    /// names another interpreter, as a program: the kernel runs that interpreter.
     pub(crate) fn run_script_path(
         &mut self,
         path: &str,
         args: &[String],
         io: &mut Io<'_>,
         host: &mut dyn Host,
+        background: bool,
     ) -> i32 {
         let data = match self.fs.read_file(path) {
             Ok(data) => data,
@@ -1448,8 +1450,7 @@ impl Shell<'_> {
             let second = interpreter.split_whitespace().nth(1).unwrap_or("");
             let wanted = if program == "env" { second } else { program };
             if !matches!(wanted, "sh" | "bash" | "dash" | "ash" | "") {
-                self.error(io, &format!("{path}: {wanted}: bad interpreter"));
-                return 126;
+                return self.run_program(path, args, io, host, background);
             }
         }
         let text = String::from_utf8_lossy(&data);

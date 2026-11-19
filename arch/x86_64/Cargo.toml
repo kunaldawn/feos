@@ -10,3 +10,5 @@ license.workspace = true
 feos-hal = { workspace = true }
 feos-port-io = { workspace = true }
 feos-sync = { workspace = true }
+feos-signal = { workspace = true }
+feos-abi = { workspace = true }

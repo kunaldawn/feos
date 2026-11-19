@@ -1,0 +1,55 @@
+{
+  "arch": "x86_64",
+  "cpu": "x86-64",
+  "crt-objects-fallback": "false",
+  "crt-static-default": true,
+  "crt-static-respected": true,
+  "data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
+  "default-uwtable": true,
+  "dynamic-linking": false,
+  "features": "+fxsr,+sse,+sse2,-avx,-avx2,-avx512f,-xsave",
+  "has-rpath": false,
+  "has-thread-local": true,
+  "late-link-args": {
+    "gnu-lld": ["-lc", "-lm", "-lcompiler_builtins"]
+  },
+  "linker": "rust-lld",
+  "linker-flavor": "gnu-lld",
+  "llvm-target": "x86_64-unknown-feos",
+  "max-atomic-width": 64,
+  "metadata": {
+    "description": "feos on x86_64, static executables (relibc)",
+    "host_tools": false,
+    "std": true,
+    "tier": 3
+  },
+  "os": "feos",
+  "panic-strategy": "unwind",
+  "plt-by-default": false,
+  "position-independent-executables": false,
+  "post-link-objects": {
+    "static-nopic-exe": ["crtn.o"]
+  },
+  "pre-link-args": {
+    "gnu-lld": [
+      "-static",
+      "--image-base=0x1000400000",
+      "-z", "separate-loadable-segments",
+      "-z", "max-page-size=4096",
+      "-z", "noexecstack"
+    ]
+  },
+  "pre-link-objects": {
+    "static-nopic-exe": ["crt0.o", "crti.o"]
+  },
+  "relocation-model": "pic",
+  "relro-level": "off",
+  "stack-probes": {
+    "kind": "inline"
+  },
+  "static-position-independent-executables": false,
+  "target-family": [
+    "unix"
+  ],
+  "target-pointer-width": 64
+}

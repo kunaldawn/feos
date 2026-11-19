@@ -100,6 +100,23 @@ impl FaultInfo {
         })
     }
 
+    /// The signal a fault from ring 3 raises, and its code (section 8.2 of the ABI
+    /// design): a protection fault, which is what every privileged instruction raises
+    /// here, is `SIGSEGV`, as on Linux.
+    pub const fn user_signal(&self) -> (u32, i32) {
+        use feos_abi::{si, sig};
+        match self.index {
+            0 => (sig::FPE, si::FPE_INTDIV),
+            16 | 19 => (sig::FPE, 0),
+            1 | 3 => (sig::TRAP, si::TRAP_BRKPT),
+            6 => (sig::ILL, si::ILL_ILLOPC),
+            12 => (sig::BUS, si::BUS_ADRERR),
+            17 => (sig::BUS, si::BUS_ADRALN),
+            14 => (sig::SEGV, si::SEGV_MAPERR),
+            _ => (sig::SEGV, si::KERNEL),
+        }
+    }
+
     /// Exception class. On x86 this is the vector itself.
     pub const fn exception_class(&self) -> u64 {
         self.index
@@ -234,9 +251,11 @@ pub fn init() {
             let stubs = addr_of!(isr_irq_stubs) as u64;
             (stubs + ((vector - EXCEPTIONS) * IRQ_STUB_SIZE) as u64, gdt::IST_IRQ)
         };
-        // Present and an interrupt gate. Only the system call's may be raised from
-        // ring 3: `int` to any other gate is a protection fault.
-        let attributes = if vector as u64 == crate::irq::SYSCALL_VECTOR { 0xee } else { 0x8e };
+        // Present and an interrupt gate. Only the system call's and the breakpoint's may
+        // be raised from ring 3, the second so a program's `int3` is its `SIGTRAP`: `int`
+        // to any other gate is a protection fault.
+        let user_gate = vector as u64 == crate::irq::SYSCALL_VECTOR || vector == 3;
+        let attributes = if user_gate { 0xee } else { 0x8e };
         *entry = IdtEntry::new(handler, 0x08, attributes, stack);
     }
 

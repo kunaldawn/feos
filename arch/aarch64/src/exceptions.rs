@@ -94,6 +94,33 @@ impl FaultInfo {
         })
     }
 
+    /// The signal a fault from EL0 raises, and its code (section 8.2 of the ABI design).
+    /// Integer division by zero raises nothing on AArch64, so there's no `SIGFPE` but a
+    /// trapped floating-point exception, which nothing enables.
+    pub const fn user_signal(&self) -> (u32, i32) {
+        use feos_abi::{si, sig};
+        match self.exception_class() {
+            CLASS_USER_INSTRUCTION_ABORT | CLASS_USER_DATA_ABORT => {
+                // Alignment faults (status 0b100001) are the bus's; anything else the
+                // tables couldn't answer is a bad address.
+                if self.esr & 0x3f == 0b10_0001 {
+                    (sig::BUS, si::BUS_ADRALN)
+                } else {
+                    (sig::SEGV, si::SEGV_MAPERR)
+                }
+            }
+            // PC and SP alignment.
+            0x22 | 0x26 => (sig::BUS, si::BUS_ADRALN),
+            // `brk`, and breakpoints, steps and watchpoints from EL0.
+            0x3c | 0x30 | 0x32 | 0x34 => (sig::TRAP, si::TRAP_BRKPT),
+            // A trapped floating-point exception.
+            0x2c => (sig::FPE, 0),
+            // Unknown and undefined instructions, trapped system register accesses, `wfi`,
+            // an illegal execution state, and whatever else.
+            _ => (sig::ILL, si::ILL_ILLOPC),
+        }
+    }
+
     /// Writes the general-purpose registers, four to a line.
     pub fn write_registers(&self, out: &mut dyn fmt::Write) -> fmt::Result {
         for (index, value) in self.regs.iter().enumerate() {

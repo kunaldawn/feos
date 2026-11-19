@@ -31,3 +31,11 @@
 	path = ports/src/cpython
 	url = https://github.com/python/cpython
 	shallow = true
+[submodule "ports/src/cbindgen"]
+	path = ports/src/cbindgen
+	url = https://github.com/mozilla/cbindgen
+	shallow = true
+[submodule "ports/src/libc-test"]
+	path = ports/src/libc-test
+	url = https://repo.or.cz/libc-test.git
+	shallow = true

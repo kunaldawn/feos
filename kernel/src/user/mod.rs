@@ -30,7 +30,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use feos_abi::{errno, nr, Event};
-use feos_fs::vfs::{path, VfsTree, ACCESS_EXECUTE, ACCESS_WRITE};
+use feos_fs::vfs::{path, Caller, VfsTree, ACCESS_EXECUTE, ACCESS_WRITE};
 use feos_fs::{FileKind, FsError};
 use feos_hal::Clock;
 use feos_vm::{FrameSource, PAGE_SIZE};
@@ -38,6 +38,7 @@ use feos_vm::{FrameSource, PAGE_SIZE};
 use crate::sched;
 use crate::{surface, Frame};
 
+mod children;
 mod devfs;
 mod files;
 mod fs_calls;
@@ -46,14 +47,16 @@ mod lock_calls;
 mod memory_calls;
 mod proc;
 pub mod process;
+pub mod signal;
 mod time_calls;
 pub mod tlb;
 mod tree_calls;
 
 use memory_calls::{KernelFrames, PROMISES};
-pub use memory_calls::{forget_fault, promised, resolve_fault, FaultOutcome, SPARE_FRAMES};
+pub use memory_calls::{forget_fault, promised, resolve_fault, segv_code, FaultOutcome, SPARE_FRAMES};
 pub use fs_calls::orphans;
 pub use lock_calls::count as locks;
+pub use children::{drain as drain_records, held as pid_held, release as release_record, ChildRecord};
 pub use process::{take as take_process, Process, TestSpace};
 
 /// Makes the zero frame and takes the port's ASIDs. Before any program runs.
@@ -257,13 +260,6 @@ fn check_visible(tree: &dyn VfsTree, path: &str, follow_last: bool) -> Result<()
     Ok(())
 }
 
-/// A new file belongs to who made it. A filesystem with no owners has nothing to say.
-fn give_to(tree: &dyn VfsTree, path: &str, uid: u32, gid: u32) {
-    if uid != 0 || gid != 0 {
-        let _ = tree.chown(path, Some(uid), Some(gid));
-    }
-}
-
 fn sys_setuid(slot: usize, uid: usize, gid: usize) -> isize {
     // Only down, and only from root: there's nothing to raise a process's rights again.
     if sched::credentials(slot).0 != 0 {
@@ -389,11 +385,8 @@ fn sys_make_or_remove(slot: usize, process: &Process, pointer: usize, length: us
         return error;
     }
     let result = if make {
-        let result = tree.create_dir(path);
-        if result.is_ok() {
-            give_to(tree, path, uid, gid);
-        }
-        result
+        // Theirs as it's made, judged on what the walk finds (see `create_dir_as`).
+        tree.create_dir_as(path, None, Caller { uid, gid })
     } else {
         // A file still in use keeps working, as `UNLINKAT` leaves it.
         match tree.resolve_path(path, false) {
@@ -540,7 +533,9 @@ fn sys_thread_create(slot: usize, process: &Process, args: [usize; 6]) -> isize 
     let Some(shared) = process::share(slot) else {
         return -errno::EAGAIN;
     };
-    let _creating = process.creating();
+    let Some(_creating) = process.creating() else {
+        return KILLED;
+    };
     // Its registers all zero but these, its floating point as a new program's.
     let frame = Frame::new_user(entry, stack_top, arg, 0);
     match sched::spawn_thread(frame, user.root(), user.tlb(), tls, clear_word, |new| process::adopt(new, shared)) {
@@ -572,12 +567,12 @@ pub fn syscall(slot: usize, number: usize, args: [usize; 6]) -> isize {
     // Ends the process, every thread of it. Before the process is borrowed: the exit
     // gives it back.
     if number == nr::EXIT {
-        sched::exit_user(args[0] as i32 & 0xff);
+        sched::exit_user(feos_signal::Status::Exited(args[0] as i32 & 0xff));
     }
     let Some(process) = process(slot) else {
         // A user task always has its process. There's no one to report this to but the
         // kernel's own log, and no way to carry on.
-        sched::exit_user(feos_abi::EXIT_FAULTED);
+        sched::exit_user(feos_signal::FAULTED);
     };
     memory_calls::forget_fault(slot);
     memory_calls::apply_zaps(process.mm());
@@ -587,6 +582,11 @@ pub fn syscall(slot: usize, number: usize, args: [usize; 6]) -> isize {
     // The call may have let go of the last hold on a file unlinked while in use: a
     // close, an unmap, a dup over a descriptor.
     fs_calls::sweep_orphans();
+    // A write with nobody to read it raises `SIGPIPE` on the writer, as the call has
+    // unwound (a kill's own `EPIPE` is never seen: the task ends on its way out).
+    if result == -errno::EPIPE && matches!(number, nr::WRITE | nr::PWRITE) && !sched::kill_requested() {
+        signal::broken_pipe(slot, process);
+    }
     result
 }
 
@@ -662,7 +662,17 @@ fn dispatch(slot: usize, process: &Process, number: usize, args: [usize; 6]) -> 
         nr::MSYNC => memory_calls::sys_msync(user, args[0], args[1], args[2]),
         nr::SPAWN => proc::sys_spawn(process, args),
         nr::SPAWN2 => proc::sys_spawn2(slot, process, args[0]),
-        nr::WAIT => proc::sys_wait(process, args[0]),
+        nr::EXEC => proc::sys_exec(slot, process, args[0]),
+        nr::WAIT => proc::sys_wait(slot, process, args[0]),
+        nr::WAIT4 => proc::sys_wait4(slot, process, args),
+        nr::KILL => proc::sys_kill(slot, process, args[0], args[1]),
+        nr::SIGACTION => signal::sys_sigaction(slot, process, args[0], args[1], args[2]),
+        nr::THREAD_KILL => signal::sys_thread_kill(slot, args[0], args[1]),
+        nr::SIGPROCMASK => signal::sys_sigprocmask(slot, process, args[0], args[1], args[2]),
+        nr::SIGALTSTACK => signal::sys_sigaltstack(slot, process, args[0], args[1]),
+        nr::SIGPENDING => signal::sys_sigpending(slot, process, args[0]),
+        nr::SIGSUSPEND => signal::sys_sigsuspend(slot, process, args[0]),
+        nr::SETITIMER => signal::sys_setitimer(process, args[0], args[1], args[2]),
         nr::GETPPID => sched::parent_pid(slot) as isize,
         nr::GETPGID => proc::sys_getpgid_getsid(slot, args[0], false),
         nr::SETPGID => proc::sys_setpgid(slot, args[0], args[1]),

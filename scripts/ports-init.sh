@@ -60,4 +60,6 @@ if git submodule status --recursive | grep '^[+U]'; then
     echo "ports-init: the submodules above are not at their pinned commits" >&2
     exit 1
 fi
+# feos's changes to those sources, kept here until they are commits in forks.
+ports/patches.sh apply
 echo "ports-init: sources ready; builds from here on need no network"

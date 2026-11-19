@@ -1,0 +1,55 @@
+{
+  "arch": "aarch64",
+  "crt-objects-fallback": "false",
+  "crt-static-default": true,
+  "crt-static-respected": true,
+  "data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32",
+  "default-uwtable": true,
+  "dynamic-linking": false,
+  "features": "+v8a,+neon,+fp-armv8",
+  "frame-pointer": "non-leaf",
+  "has-rpath": false,
+  "has-thread-local": true,
+  "late-link-args": {
+    "gnu-lld": ["-lc", "-lm", "-lcompiler_builtins"]
+  },
+  "linker": "rust-lld",
+  "linker-flavor": "gnu-lld",
+  "llvm-target": "aarch64-unknown-feos",
+  "max-atomic-width": 128,
+  "metadata": {
+    "description": "feos on AArch64, static executables (relibc)",
+    "host_tools": false,
+    "std": true,
+    "tier": 3
+  },
+  "os": "feos",
+  "panic-strategy": "unwind",
+  "position-independent-executables": false,
+  "post-link-objects": {
+    "static-nopic-exe": ["crtn.o"]
+  },
+  "pre-link-args": {
+    "gnu-lld": [
+      "-static",
+      "--image-base=0x1000400000",
+      "-z", "separate-loadable-segments",
+      "-z", "max-page-size=4096",
+      "-z", "noexecstack",
+      "--fix-cortex-a53-843419"
+    ]
+  },
+  "pre-link-objects": {
+    "static-nopic-exe": ["crt0.o", "crti.o"]
+  },
+  "relocation-model": "static",
+  "relro-level": "off",
+  "stack-probes": {
+    "kind": "inline"
+  },
+  "static-position-independent-executables": false,
+  "target-family": [
+    "unix"
+  ],
+  "target-pointer-width": 64
+}

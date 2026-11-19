@@ -51,7 +51,9 @@ dependencies = [
 name = "feos-arch-aarch64"
 version = "0.1.0"
 dependencies = [
+ "feos-abi",
  "feos-hal",
+ "feos-signal",
  "feos-sync",
 ]
 
@@ -59,8 +61,10 @@ dependencies = [
 name = "feos-arch-x86_64"
 version = "0.1.0"
 dependencies = [
+ "feos-abi",
  "feos-hal",
  "feos-port-io",
+ "feos-signal",
  "feos-sync",
 ]
 
@@ -502,6 +506,7 @@ dependencies = [
  "feos-pagecache",
  "feos-sched",
  "feos-shell",
+ "feos-signal",
  "feos-sync",
  "feos-vm",
 ]
@@ -590,6 +595,13 @@ dependencies = [
  "feos-coreutils",
  "feos-gfx",
  "feos-sh",
+]
+
+[[package]]
+name = "feos-signal"
+version = "0.1.0"
+dependencies = [
+ "feos-abi",
 ]
 
 [[package]]

@@ -4,7 +4,9 @@
 //! What a process is charged for, in pages, is three counts: `charged` (pages promised
 //! to it, with or without their frames yet), `owned` (frames it has that no promise
 //! covers: a read-only image page, a `MAP_NORESERVE` page that was written) and its page
-//! tables. Their sum is what `USER_MEMORY_LIMIT` limits. `unbacked` is the part of
+//! tables, and `held`, frames the kernel holds for the process outside its space while
+//! a call of its uses them (a spawn's staged arguments). Their sum is what
+//! `USER_MEMORY_LIMIT` limits. `unbacked` is the part of
 //! `charged` without frames, which is exactly what this space holds in [`Promises`].
 //!
 //! A private charged range's share of `unbacked` is its pages less the frames of its
@@ -222,6 +224,8 @@ pub struct Mm {
     charged: usize,
     owned: usize,
     unbacked: usize,
+    /// Frames the kernel holds for the process outside the space: see [`hold`](Self::hold).
+    held: usize,
     /// Heap the shared objects this space made hold, by [`SharedAnon::heap_cost`].
     object_heap: usize,
 }
@@ -274,6 +278,7 @@ impl Mm {
             charged: 0,
             owned: 0,
             unbacked: 0,
+            held: 0,
             object_heap: 0,
         })
     }
@@ -319,9 +324,31 @@ impl Mm {
         self.object_heap
     }
 
-    /// What counts against the limit: pages charged or owned, and tables.
+    /// Frames the kernel holds for the process outside the space.
+    pub const fn held(&self) -> usize {
+        self.held
+    }
+
+    /// What counts against the limit: pages charged or owned, tables, and frames held.
     pub const fn committed(&self) -> usize {
-        self.charged + self.owned + self.space.tables()
+        self.charged + self.owned + self.space.tables() + self.held
+    }
+
+    /// Counts `pages` frames the kernel takes for the process outside the space (a
+    /// spawn's staged arguments) against its limit, for as long as they're held: `false`,
+    /// and nothing counted, past the limit. [`unhold`](Self::unhold) gives them back.
+    pub fn hold(&mut self, pages: usize) -> bool {
+        if !self.fits(pages) {
+            return false;
+        }
+        self.held += pages;
+        true
+    }
+
+    /// Gives back what [`hold`](Self::hold) counted.
+    pub fn unhold(&mut self, pages: usize) {
+        debug_assert!(pages <= self.held);
+        self.held -= pages.min(self.held);
     }
 
     /// The mmap area.
@@ -1326,7 +1353,7 @@ impl Mm {
                 }
             }
         }
-        debug_assert_eq!((self.charged, self.owned, self.unbacked, self.object_heap), (0, 0, 0, 0));
+        debug_assert_eq!((self.charged, self.owned, self.unbacked, self.held, self.object_heap), (0, 0, 0, 0, 0));
         // Anything left would be a bug above; the machine keeps its promises either way.
         ctx.promises.release(self.unbacked);
         self.space.destroy(ctx.frames);

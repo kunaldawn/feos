@@ -14,3 +14,26 @@ offline = true
 # under ports/ are host programs unless they say otherwise.
 [build]
 target = "host-tuple"
+
+# relibc's git dependencies (gitlab.redox-os.org), vendored by ports/vendor.sh into
+# ports/vendor-git: a directory of their own, since relibc's `object 0.36.7` fork
+# has the name and version of a crates.io package in ports/vendor.
+[source."git+https://gitlab.redox-os.org/andypython/object?branch=new"]
+git = "https://gitlab.redox-os.org/andypython/object"
+branch = "new"
+replace-with = "feos-vendor-git"
+
+[source."git+https://gitlab.redox-os.org/redox-os/kernel/"]
+git = "https://gitlab.redox-os.org/redox-os/kernel/"
+replace-with = "feos-vendor-git"
+
+[source."git+https://gitlab.redox-os.org/redox-os/redox-buffer-pool.git"]
+git = "https://gitlab.redox-os.org/redox-os/redox-buffer-pool.git"
+replace-with = "feos-vendor-git"
+
+[source."git+https://gitlab.redox-os.org/redox-os/redox-rings.git"]
+git = "https://gitlab.redox-os.org/redox-os/redox-rings.git"
+replace-with = "feos-vendor-git"
+
+[source.feos-vendor-git]
+directory = "vendor-git"

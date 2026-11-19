@@ -14,6 +14,7 @@ use core::ops::Deref;
 use core::ptr::NonNull;
 use core::sync::atomic::{fence, AtomicUsize, Ordering};
 
+#[repr(C)]
 struct Inner<T> {
     count: AtomicUsize,
     value: T,
@@ -93,6 +94,42 @@ impl<T> TryArc<T> {
         this.inner().count.load(Ordering::Acquire)
     }
 
+    /// Gives the reference up as a pointer to the value, which keeps the value alive
+    /// until [`from_raw`](Self::from_raw) takes it back. Allocates nothing: for handing a
+    /// reference to something that can't hold a `TryArc`, such as an atomic.
+    pub fn into_raw(this: Self) -> *const T {
+        let value = &this.inner().value as *const T;
+        core::mem::forget(this);
+        value
+    }
+
+    /// Takes back a reference [`into_raw`](Self::into_raw) gave up.
+    ///
+    /// # Safety
+    ///
+    /// `value` came from `into_raw` for this `T`, and each such pointer is taken back once.
+    pub unsafe fn from_raw(value: *const T) -> Self {
+        let offset = core::mem::offset_of!(Inner<T>, value);
+        // SAFETY: as the caller promises, `value` is the field of an `Inner<T>` that
+        // `into_raw` left alive, `offset` bytes into it.
+        let inner = unsafe { value.byte_sub(offset) }.cast::<Inner<T>>().cast_mut();
+        // SAFETY: as above, never null.
+        Self { inner: unsafe { NonNull::new_unchecked(inner) }, owns: PhantomData }
+    }
+
+    /// Another reference to a value whose pointer [`into_raw`](Self::into_raw) gave, which
+    /// that pointer keeps: the count goes up, and allocates nothing.
+    ///
+    /// # Safety
+    ///
+    /// As for [`from_raw`](Self::from_raw), and the reference `value` stands for hasn't
+    /// been taken back.
+    pub unsafe fn clone_raw(value: *const T) -> Self {
+        // SAFETY: as the caller promises; forgetting it leaves that reference where it was.
+        let held = core::mem::ManuallyDrop::new(unsafe { Self::from_raw(value) });
+        (*held).clone()
+    }
+
     /// What one costs on the heap, before the allocator's own overhead.
     pub const fn heap_size() -> usize {
         core::mem::size_of::<Inner<T>>()
@@ -163,6 +200,23 @@ mod tests {
         drop(first);
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         drop(second);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_raw_reference_keeps_the_value_until_taken_back() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let first = TryArc::new(Counted(drops.clone())).ok().unwrap();
+        let raw = TryArc::into_raw(first.clone());
+        // SAFETY: `raw` is from `into_raw` and still stands for its reference.
+        let another = unsafe { TryArc::clone_raw(raw) };
+        assert_eq!(TryArc::count(&first), 3);
+        assert!(TryArc::ptr_eq(&first, &another));
+        drop(first);
+        drop(another);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        // SAFETY: taken back once.
+        drop(unsafe { TryArc::from_raw(raw) });
         assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 

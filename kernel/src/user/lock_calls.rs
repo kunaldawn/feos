@@ -93,10 +93,11 @@ fn take(wait: bool, mut attempt: impl FnMut(&mut LockTable) -> Result<bool, Refu
             Ok(()) => return 0,
             Err(LockError::NoLocks) => return -errno::ENOLCK,
             Err(LockError::Conflict(_)) if !wait => return -errno::EAGAIN,
-            // Signals are stage 1c.9's: until then only a kill ends the wait.
+            // A kill ends the wait, and so does a signal to take (`EINTR`, or the call
+            // made again for `SA_RESTART`).
             Err(LockError::Conflict(_)) => {
-                if sched::kill_requested() {
-                    return KILLED;
+                if sched::interrupted() {
+                    return if sched::kill_requested() { KILLED } else { sched::interrupted_result() };
                 }
                 futex_wait(&CHANGES, seen);
             }

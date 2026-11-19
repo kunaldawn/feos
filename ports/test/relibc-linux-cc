@@ -1,0 +1,21 @@
+#!/bin/sh
+# The libc suite's Linux reference compiler (libc-suite-linux.sh): the host clang against
+# relibc's own Linux platform (ports/build-relibc.sh <arch>-unknown-linux-gnu), static,
+# with the feos driver's header order (the libc's headers, then clang's) and flags
+# (-fPIC on x86_64; AArch64 without outline atomics). LINUX_ARCH is x86_64 (default) or aarch64. What fails here as
+# it fails on feos is relibc's, not feos's.
+set -eu
+arch=${LINUX_ARCH:-x86_64}
+s=${RELIBC_LINUX_SYSROOT:-/build/relibc/$arch-unknown-linux-gnu}
+r=$(clang -print-resource-dir)/include
+case "$arch" in
+    x86_64) libgcc=$(gcc -print-libgcc-file-name); extra=-fPIC ;;
+    aarch64) libgcc=$(aarch64-linux-gnu-gcc -print-libgcc-file-name); extra=-mno-outline-atomics ;;
+    *) echo "relibc-linux-cc: unknown LINUX_ARCH $arch" >&2; exit 2 ;;
+esac
+set -- --target="$arch-linux-gnu" -nostdinc -isystem "$s/include" -isystem "$r" $extra "$@"
+for a in "$@"; do
+    case "$a" in -c|-S|-E|-M|-MM) exec clang "$@" ;; esac
+done
+exec clang "$@" -static -nostdlib -fuse-ld=lld "$s/lib/crt0.o" "$s/lib/crti.o" \
+    -Wl,--start-group "$s/lib/libc.a" "$s/lib/libm.a" "$libgcc" -Wl,--end-group "$s/lib/crtn.o"

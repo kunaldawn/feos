@@ -1,0 +1,4 @@
+# relibc test-suite failures that come from where the suite runs, not from
+# relibc: one test path (as under bins_static/ or bins_dynamic/) per line, then
+# the reason. ports/test/relibc-runner.sh fails the run on any other failure.
+netdb/getaddrinfo	resolves www.redox-os.org through DNS; the tests run with --network none
