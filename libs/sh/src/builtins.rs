@@ -594,7 +594,11 @@ impl Shell<'_> {
             self.keep_redirects = true;
             return 0;
         }
+        // A host that starts processes replaces this shell with a program `exec` names
+        // (see `spawn.rs`); anything else runs, and the shell ends with its status.
+        self.exec_next = host.processes().is_some();
         let status = self.dispatch(args, io, host, false, true);
+        self.exec_next = false;
         self.flow = Flow::Exit(status);
         status
     }
@@ -1030,7 +1034,7 @@ impl Shell<'_> {
         0
     }
 
-    fn builtin_sh(&mut self, args: &[String], io: &mut Io<'_>, host: &mut dyn Host) -> i32 {
+    pub(crate) fn builtin_sh(&mut self, args: &[String], io: &mut Io<'_>, host: &mut dyn Host) -> i32 {
         let mut options: Vec<(char, bool)> = Vec::new();
         let mut long_options: Vec<(String, bool)> = Vec::new();
         let mut command: Option<bool> = None;

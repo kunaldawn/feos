@@ -82,6 +82,13 @@ pub trait FrameSource {
     fn get(&mut self, frame: usize) -> bool;
     /// Drops a reference. The frame goes when none is left, and nothing pins it.
     fn put(&mut self, frame: usize);
+    /// Drops a reference only if it isn't the last, in one step: `true` if it was
+    /// dropped. What a frame a fork shares between spaces is charged by: see [`Mm::fork`].
+    fn put_shared(&mut self, frame: usize) -> bool;
+    /// Copies in flight through a referenced frame now.
+    fn pins(&self, frame: usize) -> u32;
+    /// References to a frame now.
+    fn maps(&self, frame: usize) -> u32;
     /// Pins a referenced frame for a copy. `false` if its pin count is at the cap.
     fn pin(&mut self, frame: usize) -> bool;
     /// Drops a pin.
@@ -99,7 +106,12 @@ const SOFT_FRAME: u64 = 1 << 62;
 /// space's own, so it's never written through this entry. Ignored by the hardware on
 /// both ports (AArch64 leaves bits 55 to 58 to software; x86 ignores 52 to 58).
 const CACHED: u64 = 1 << 57;
-const SOFT_BITS: u64 = SOFT | SOFT_FRAME | CACHED;
+/// Software bit, in a valid entry or a soft one: the frame is shared copy-on-write with
+/// another space since a fork, so the entry is never writable however its range is; the
+/// first write copies, or takes the frame back if nothing else has it. Ignored by the
+/// hardware on both ports, as [`CACHED`] is.
+pub const COW: u64 = 1 << 56;
+const SOFT_BITS: u64 = SOFT | SOFT_FRAME | CACHED | COW;
 
 /// A user pointer that isn't good for the access asked of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,10 +152,10 @@ pub struct AddressSpace {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Entry {
     Empty,
-    /// Valid to the hardware.
-    Present { frame: usize, writable: bool, executable: bool, cached: bool },
+    /// Valid to the hardware. `cow`: shared copy-on-write, so never writable.
+    Present { frame: usize, writable: bool, executable: bool, cached: bool, cow: bool },
     /// Holds a frame no access is allowed to.
-    Hidden { frame: usize, cached: bool },
+    Hidden { frame: usize, cached: bool, cow: bool },
 }
 
 impl AddressSpace {
@@ -272,15 +284,17 @@ impl AddressSpace {
     fn decode(&self, entry: u64) -> Entry {
         let frame = (entry & self.bits.address) as usize;
         let cached = entry & CACHED != 0;
+        let cow = entry & COW != 0;
         if entry & self.bits.present != 0 {
             Entry::Present {
                 frame,
                 writable: self.bits.is_writable(entry),
                 executable: entry & self.bits.no_execute == 0,
                 cached,
+                cow,
             }
         } else if entry & SOFT_FRAME != 0 {
-            Entry::Hidden { frame, cached }
+            Entry::Hidden { frame, cached, cow }
         } else {
             Entry::Empty
         }
@@ -289,11 +303,15 @@ impl AddressSpace {
     fn encode(&self, entry: Entry) -> u64 {
         match entry {
             Entry::Empty => 0,
-            Entry::Present { frame, writable, executable, cached } => {
-                let cached = if cached { CACHED } else { 0 };
-                frame as u64 | self.bits.leaf(PageAccess { write: writable, execute: executable }) | cached
+            Entry::Present { frame, writable, executable, cached, cow } => {
+                let soft = if cached { CACHED } else { 0 } | if cow { COW } else { 0 };
+                // A shared frame is never written through this entry, whatever the caller
+                // asked: the bit and writability can't disagree.
+                frame as u64 | self.bits.leaf(PageAccess { write: writable && !cow, execute: executable }) | soft
             }
-            Entry::Hidden { frame, cached } => frame as u64 | SOFT | SOFT_FRAME | if cached { CACHED } else { 0 },
+            Entry::Hidden { frame, cached, cow } => {
+                frame as u64 | SOFT | SOFT_FRAME | if cached { CACHED } else { 0 } | if cow { COW } else { 0 }
+            }
         }
     }
 

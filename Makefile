@@ -68,7 +68,7 @@ DOCKER_DISPLAY ?= gtk
 # filesystem image, so these come first. RUSTFLAGS replaces the kernel's rustflags
 # from .cargo/config.toml, which are for linking a kernel.
 USER_TARGET_DIR ?= $(or $(CARGO_TARGET_DIR),$(CURDIR)/target)/user
-USER_BINS       := hello cat vmcheck spin utest wdemo malicious permtest runas mtest ttest rtest ftest ptest sigtest
+USER_BINS       := hello cat vmcheck spin utest wdemo malicious permtest runas mtest ttest rtest ftest ptest sigtest polltest sh shtest
 USER_FLAGS      := -C linker=rust-lld -C link-arg=-T$(CURDIR)/user/link.ld -C link-arg=-z -C link-arg=max-page-size=4096
 
 .PHONY: all build build-arm build-x64 build-efi check check-arm check-x64 clippy clippy-arm clippy-x64 run run-arm run-x64 clean \
@@ -76,7 +76,7 @@ USER_FLAGS      := -C linker=rust-lld -C link-arg=-T$(CURDIR)/user/link.ld -C li
         test-heap test-sched test-hal test-console test-app test-pci test-i8042 test-apic test-gicv2 test-gicv3 test-uart16550 test-intel-hda \
         test-json test-yaml test-image test-audio-codec test-compress test-archive \
         test-h264 test-source test-opus test-video test-text test-bundle test-init test-fs test-keys \
-        test-coreutils test-sh test-abi test-elf test-vm test-pagecache test-fdtable test-locks test-signal user user-arm user-x64 fuzz \
+        test-coreutils test-sh test-abi test-elf test-vm test-pagecache test-fdtable test-locks test-signal test-tty test-csprng user user-arm user-x64 fuzz \
         test-desktop test-desktop-app test-virtio-input test-virtio-core test-virtio-blk test-virtio-net test-virtio-gpu test-ramfb test-rtc test-net test-xhci test-bootinfo test-dosbox test-dosbox-app test-apps \
         boot-test boot-test-arm boot-test-x64 docker-boot-test \
         bundles games-image games-unlink games-check run-games run-games-x64 audio-demo \
@@ -186,7 +186,7 @@ docker-boot-test: docker-build
 	docker run --rm --network none --entrypoint sh $(IMAGE) \
 		-c 'echo nameserver 127.0.0.1 > /etc/resolv.conf; make boot-test'
 
-test: test-firmware test-frames test-irq test-gfx test-gui test-audio test-mixer test-math test-milkdrop test-iconset test-sync test-heap test-sched test-hal test-console test-app test-pci test-i8042 test-apic test-gicv2 test-gicv3 test-uart16550 test-intel-hda test-json test-yaml test-image test-audio-codec test-compress test-archive test-h264 test-source test-opus test-video test-text test-bundle test-init test-fs test-keys test-coreutils test-sh test-abi test-elf test-vm test-pagecache test-fdtable test-locks test-signal test-desktop test-desktop-app test-virtio-input test-dosbox test-dosbox-app test-apps test-virtio-core test-virtio-blk test-virtio-net test-virtio-gpu test-ramfb test-rtc test-net test-xhci test-bootinfo
+test: test-firmware test-frames test-irq test-gfx test-gui test-audio test-mixer test-math test-milkdrop test-iconset test-sync test-heap test-sched test-hal test-console test-app test-pci test-i8042 test-apic test-gicv2 test-gicv3 test-uart16550 test-intel-hda test-json test-yaml test-image test-audio-codec test-compress test-archive test-h264 test-source test-opus test-video test-text test-bundle test-init test-fs test-keys test-coreutils test-sh test-abi test-elf test-vm test-pagecache test-fdtable test-locks test-signal test-tty test-csprng test-desktop test-desktop-app test-virtio-input test-dosbox test-dosbox-app test-apps test-virtio-core test-virtio-blk test-virtio-net test-virtio-gpu test-ramfb test-rtc test-net test-xhci test-bootinfo
 
 # The fuzz-style tests again, under the `fuzz` profile: optimised, with overflow
 # checks and debug assertions, on a kernel-sized stack. `make test` runs the same
@@ -227,6 +227,12 @@ test-locks:
 
 test-signal:
 	cargo test -p feos-signal --target $(HOST_TARGET)
+
+test-tty:
+	cargo test -p feos-tty --target $(HOST_TARGET)
+
+test-csprng:
+	cargo test -p feos-csprng --target $(HOST_TARGET)
 
 test-irq:
 	cargo test -p feos-irq --target $(HOST_TARGET)

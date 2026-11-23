@@ -31,6 +31,17 @@ pub(crate) struct Job {
     pub(crate) pid: u32,
     pub(crate) text: String,
     pub(crate) stopped: bool,
+    /// The processes of a job a [`Processes`](feos_coreutils::Processes) host started,
+    /// its leader (`pid`) first. Empty for a job on a task of a [`TaskHost`].
+    pub(crate) members: Vec<Member>,
+}
+
+/// One process of a job of processes.
+#[derive(Clone)]
+pub(crate) struct Member {
+    pub(crate) pid: u32,
+    /// Its `$?`, once it has ended.
+    pub(crate) status: Option<i32>,
 }
 
 /// The streams a forked shell starts with.
@@ -79,7 +90,7 @@ fn describe_words(words: &[Word]) -> String {
 }
 
 /// A short form of a command for `jobs` and the process list.
-fn describe_command(command: &Command) -> String {
+pub(crate) fn describe_command(command: &Command) -> String {
     match command {
         Command::Simple(simple) => describe_words(&simple.words),
         Command::Redirected(inner, _) => describe_command(inner),
@@ -326,7 +337,10 @@ impl Shell<'_> {
         io: &mut Io<'_>,
         host: &mut dyn Host,
     ) -> i32 {
-        let _ = io;
+        if let Some(index) = self.process_job_index(pid) {
+            let foreground = self.foreground_wait;
+            return self.wait_process_job(index, io, host, foreground);
+        }
         let mut killed = false;
         loop {
             let interrupted = self.checkpoint(host);
@@ -387,6 +401,7 @@ impl Shell<'_> {
             pid,
             text: describe_list(list),
             stopped: false,
+            members: Vec::new(),
         });
         self.last_background = Some(pid);
         if self.interactive {
@@ -400,28 +415,29 @@ impl Shell<'_> {
         if self.jobs.is_empty() {
             return;
         }
-        let Some(tasks) = host.tasks() else {
-            return;
-        };
         let mut message = String::new();
-        self.jobs.retain(|job| match tasks.status(job.pid) {
-            JobStatus::Running | JobStatus::Stopped => true,
-            JobStatus::Exited(0) | JobStatus::Unknown => {
-                message.push_str(&format!("[{}]  Done  {}\n", job.id, job.text));
-                false
+        let mut index = 0;
+        while index < self.jobs.len() {
+            let finished = match self.job_status(index, host) {
+                None | Some(JobStatus::Running | JobStatus::Stopped) => None,
+                Some(JobStatus::Exited(0) | JobStatus::Unknown) => Some(String::from("Done")),
+                Some(JobStatus::Exited(code)) => Some(format!("Exit {code}")),
+            };
+            match finished {
+                Some(state) => {
+                    let job = self.jobs.remove(index);
+                    message.push_str(&format!("[{}]  {state}  {}\n", job.id, job.text));
+                }
+                None => index += 1,
             }
-            JobStatus::Exited(code) => {
-                message.push_str(&format!("[{}]  Exit {code}  {}\n", job.id, job.text));
-                false
-            }
-        });
+        }
         if !message.is_empty() {
             self.write_err(io, &message);
         }
     }
 
     /// Finds a job from `%n`, `%%`, `%+` or a PID. No text means the latest.
-    fn find_job(&self, spec: Option<&str>) -> Option<usize> {
+    pub(crate) fn find_job(&self, spec: Option<&str>) -> Option<usize> {
         match spec {
             None | Some("%%" | "%+" | "%") => self.jobs.len().checked_sub(1),
             Some(text) => {
@@ -444,32 +460,34 @@ impl Shell<'_> {
     ) -> i32 {
         let only_pids = args.first().is_some_and(|arg| arg == "-p");
         let mut text = String::new();
-        if let Some(tasks) = host.tasks() {
-            let count = self.jobs.len();
-            let mut finished = Vec::new();
-            for (index, job) in self.jobs.iter_mut().enumerate() {
-                let state = match tasks.status(job.pid) {
-                    JobStatus::Running => String::from("Running"),
-                    JobStatus::Stopped => String::from("Stopped"),
-                    JobStatus::Exited(0) | JobStatus::Unknown => {
-                        finished.push(job.id);
-                        String::from("Done")
-                    }
-                    JobStatus::Exited(code) => {
-                        finished.push(job.id);
-                        format!("Exit {code}")
-                    }
-                };
-                job.stopped = state == "Stopped";
-                if only_pids {
-                    text.push_str(&format!("{}\n", job.pid));
-                } else {
-                    let mark = if index + 1 == count { '+' } else { ' ' };
-                    text.push_str(&format!("[{}]{mark} {state:<8} {}\n", job.id, job.text));
+        let count = self.jobs.len();
+        let mut finished = Vec::new();
+        for index in 0..count {
+            let Some(status) = self.job_status(index, host) else {
+                continue;
+            };
+            let job = &mut self.jobs[index];
+            let state = match status {
+                JobStatus::Running => String::from("Running"),
+                JobStatus::Stopped => String::from("Stopped"),
+                JobStatus::Exited(0) | JobStatus::Unknown => {
+                    finished.push(job.id);
+                    String::from("Done")
                 }
+                JobStatus::Exited(code) => {
+                    finished.push(job.id);
+                    format!("Exit {code}")
+                }
+            };
+            job.stopped = state == "Stopped";
+            if only_pids {
+                text.push_str(&format!("{}\n", job.pid));
+            } else {
+                let mark = if index + 1 == count { '+' } else { ' ' };
+                text.push_str(&format!("[{}]{mark} {state:<8} {}\n", job.id, job.text));
             }
-            self.jobs.retain(|job| !finished.contains(&job.id));
         }
+        self.jobs.retain(|job| !finished.contains(&job.id));
         self.write_out(io, &text);
         0
     }
@@ -485,6 +503,10 @@ impl Shell<'_> {
             return 1;
         };
         let (pid, text) = (self.jobs[index].pid, self.jobs[index].text.clone());
+        if !self.jobs[index].members.is_empty() {
+            self.write_out(io, &format!("{text}\n"));
+            return self.wait_process_job(index, io, host, true);
+        }
         let Some(tasks) = host.tasks() else {
             return 1;
         };
@@ -548,13 +570,17 @@ impl Shell<'_> {
             self.error(io, "bg: no such job");
             return 1;
         };
-        let Some(tasks) = host.tasks() else {
-            return 1;
-        };
-        let pid = self.jobs[index].pid;
-        tasks.set_stopped(pid, false);
-        self.jobs[index].stopped = false;
-        host.continue_job(pid);
+        if !self.jobs[index].members.is_empty() {
+            self.continue_process_job(index, host);
+        } else {
+            let Some(tasks) = host.tasks() else {
+                return 1;
+            };
+            let pid = self.jobs[index].pid;
+            tasks.set_stopped(pid, false);
+            self.jobs[index].stopped = false;
+            host.continue_job(pid);
+        }
         let line = format!("[{}]+ {} &\n", self.jobs[index].id, self.jobs[index].text);
         self.write_out(io, &line);
         0
@@ -607,6 +633,9 @@ impl Shell<'_> {
         io: &mut Io<'_>,
         host: &mut dyn Host,
     ) -> Option<i32> {
+        if host.processes().is_some() {
+            return Some(self.kill_processes(args, io, host));
+        }
         if !host.has_command("kill") {
             return None;
         }
@@ -632,6 +661,24 @@ impl Shell<'_> {
         Some(self.run_external("kill", &mapped, io, host, false))
     }
 
+    /// What a job is doing now: through the host's [`TaskHost`] for a job on a task,
+    /// through its [`Processes`](feos_coreutils::Processes) for one of processes. `None`
+    /// when the host can't tell.
+    fn job_status(&mut self, index: usize, host: &mut dyn Host) -> Option<JobStatus> {
+        if let Some(status) = self.process_job_status(index, host) {
+            return Some(status);
+        }
+        let pid = self.jobs.get(index)?.pid;
+        host.tasks().map(|tasks| tasks.status(pid))
+    }
+
+    /// The job of processes `pid` leads.
+    fn process_job_index(&self, pid: u32) -> Option<usize> {
+        self.jobs
+            .iter()
+            .position(|job| job.pid == pid && !job.members.is_empty())
+    }
+
     /// Adds a command Ctrl-Z stopped to the job table, as Bash reports it.
     pub(crate) fn note_suspended(
         &mut self,
@@ -652,6 +699,7 @@ impl Shell<'_> {
             pid,
             text: text.clone(),
             stopped: true,
+            members: Vec::new(),
         });
         self.last_background = Some(pid);
         self.write_err(io, &format!("\n[{id}]+  Stopped  {text}\n"));
@@ -1170,6 +1218,46 @@ mod tests {
         shell.execute_line("trap 'echo hup' HUP; trap 'echo bye' EXIT", &mut io, &mut host);
         shell.hang_up(&mut io, &mut host);
         assert_eq!(String::from_utf8_lossy(out.bytes()), "hup\nbye\n");
+    }
+
+    #[test]
+    fn a_signal_during_the_last_command_runs_its_trap_before_the_line_ends() {
+        let mut shell = Shell::new(None, &NoSystem);
+        let mut host = RaisingHost { pending: 0 };
+        let mut out = BytesOutput::new();
+        let mut err = BytesOutput::new();
+        let mut input = NullInput;
+        let mut io = Io { stdin: &mut input, stdout: &mut out, stderr: &mut err };
+        let status = shell.execute_line("trap 'echo caught-$?' TERM; raise", &mut io, &mut host);
+        assert_eq!(status, 5);
+        assert_eq!(host.pending, 0);
+        assert_eq!(String::from_utf8_lossy(out.bytes()), "caught-5\n");
+    }
+
+    /// A host whose `raise` program has `SIGTERM` arrive while it runs, and fails with 5.
+    struct RaisingHost {
+        pending: u32,
+    }
+
+    impl Host for RaisingHost {
+        fn run_external(
+            &mut self,
+            name: &str,
+            _args: &[String],
+            _stdin: &mut dyn Input,
+            _stdout: &mut dyn Output,
+            _stderr: &mut dyn Output,
+            _background: bool,
+        ) -> Option<i32> {
+            (name == "raise").then(|| {
+                self.pending |= 1 << 15;
+                5
+            })
+        }
+
+        fn take_signals(&mut self) -> u32 {
+            core::mem::take(&mut self.pending)
+        }
     }
 
     struct SignalHost {

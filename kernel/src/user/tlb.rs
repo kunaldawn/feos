@@ -274,13 +274,13 @@ pub struct Gather<'a> {
     tlb: &'a Tlb,
     /// CPUs to ask, from the flushes so far.
     pending: UnsafeCell<u32>,
-    /// Frames held back, with whether each is a table (freed) or a page (put).
-    held: UnsafeCell<([(usize, bool); HELD], usize)>,
+    /// Frames held back, with what letting each go is.
+    held: UnsafeCell<([(usize, Held); HELD], usize)>,
 }
 
 impl<'a> Gather<'a> {
     pub fn new(tlb: &'a Tlb) -> Self {
-        Self { tlb, pending: UnsafeCell::new(0), held: UnsafeCell::new(([(0, false); HELD], 0)) }
+        Self { tlb, pending: UnsafeCell::new(0), held: UnsafeCell::new(([(0, Held::Page); HELD], 0)) }
     }
 
     /// Forgets a page whose entry has just changed.
@@ -290,18 +290,22 @@ impl<'a> Gather<'a> {
         unsafe { *self.pending.get() |= others };
     }
 
-    /// Gives a frame back now, or once the CPUs that may still reach it have flushed.
-    fn give_back(&self, frame: usize, table: bool) {
+    /// Whether some other CPU may still reach what was just flushed.
+    fn pending(&self) -> bool {
         // SAFETY: as in `flush`.
-        let pending = unsafe { *self.pending.get() };
-        if pending == 0 {
-            release(frame, table);
+        unsafe { *self.pending.get() != 0 }
+    }
+
+    /// Gives a frame back now, or once the CPUs that may still reach it have flushed.
+    fn give_back(&self, frame: usize, kind: Held) {
+        if !self.pending() {
+            release(frame, kind);
             return;
         }
         // SAFETY: as in `flush`.
         let full = unsafe {
             let held = &mut *self.held.get();
-            held.0[held.1] = (frame, table);
+            held.0[held.1] = (frame, kind);
             held.1 += 1;
             held.1 == HELD
         };
@@ -320,8 +324,8 @@ impl<'a> Gather<'a> {
         }
         // SAFETY: as in `flush`.
         let held = unsafe { &mut *self.held.get() };
-        for &(frame, table) in &held.0[..held.1] {
-            release(frame, table);
+        for &(frame, kind) in &held.0[..held.1] {
+            release(frame, kind);
         }
         held.1 = 0;
     }
@@ -332,11 +336,20 @@ impl<'a> Gather<'a> {
     }
 }
 
-fn release(frame: usize, table: bool) {
-    if table {
-        crate::memory::put_frame(frame);
-    } else {
-        crate::memory::put_frame_noting(frame);
+/// What a held frame is waiting to have done: a table freed, a page's reference put, or
+/// the pin that kept a frame whose shared reference already went from being freed.
+#[derive(Clone, Copy)]
+enum Held {
+    Table,
+    Page,
+    Pin,
+}
+
+fn release(frame: usize, kind: Held) {
+    match kind {
+        Held::Table => crate::memory::put_frame(frame),
+        Held::Page => crate::memory::put_frame_noting(frame),
+        Held::Pin => crate::memory::unpin_frame(frame),
     }
 }
 
@@ -349,7 +362,7 @@ impl FrameSource for GatherFrames<'_, '_> {
     }
 
     fn free(&mut self, frame: usize) {
-        self.0.give_back(frame, true);
+        self.0.give_back(frame, Held::Table);
     }
 
     fn get(&mut self, frame: usize) -> bool {
@@ -357,7 +370,40 @@ impl FrameSource for GatherFrames<'_, '_> {
     }
 
     fn put(&mut self, frame: usize) {
-        self.0.give_back(frame, false);
+        self.0.give_back(frame, Held::Page);
+    }
+
+    fn put_shared(&mut self, frame: usize) -> bool {
+        if !self.0.pending() {
+            return super::KernelFrames.put_shared(frame);
+        }
+        // Never the last reference, but the space sharing the frame may put that one at
+        // any moment, waiting only for its own CPUs, and this space's may still reach the
+        // frame until this change settles: freed, it could be handed to anyone. So it's
+        // pinned first, while this reference keeps it, and the pin is what's held: a
+        // pinned frame outlives its last put, and the sharer, seeing it pinned, copies
+        // rather than writes it in place. Pinned before the drop, so that stays one step.
+        if !crate::memory::pin_frame(frame) {
+            // Pins at the cap: wait for this space's CPUs now instead.
+            self.0.settle();
+            return super::KernelFrames.put_shared(frame);
+        }
+        if super::KernelFrames.put_shared(frame) {
+            self.0.give_back(frame, Held::Pin);
+            true
+        } else {
+            // The last reference after all, for a plain put, which is held as ever.
+            crate::memory::unpin_frame(frame);
+            false
+        }
+    }
+
+    fn pins(&self, frame: usize) -> u32 {
+        super::KernelFrames.pins(frame)
+    }
+
+    fn maps(&self, frame: usize) -> u32 {
+        super::KernelFrames.maps(frame)
     }
 
     fn pin(&mut self, frame: usize) -> bool {

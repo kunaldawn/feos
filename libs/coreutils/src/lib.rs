@@ -44,6 +44,7 @@ pub mod env;
 pub mod fs;
 pub mod glob;
 pub mod io;
+pub mod process;
 pub mod regex;
 pub mod sha256;
 pub mod system;
@@ -52,4 +53,5 @@ pub use commands::{command, is_command, run, CommandFn, CommandSpec, Ctx, COMMAN
 pub use env::{Env, Var, VarError};
 pub use fs::{base_name, join, normalize, parent, DirEntry, FsError, Kind, Meta, OverlayFs, Vfs};
 pub use io::{Available, BytesInput, BytesOutput, Input, NullInput, NullOutput, Output, MAX_STREAM_BYTES};
+pub use process::{Processes, WaitStatus};
 pub use system::{MemoryInfo, NoSystem, System};

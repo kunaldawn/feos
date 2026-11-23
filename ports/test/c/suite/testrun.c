@@ -2,6 +2,7 @@
  *
  *   testrun [-C DIR] [-t SECONDS] [-w WRAPPER] [-v] LIST
  *   testrun --sleep SECONDS        (sleeps, then exits 0: testrun's own test uses it)
+ *   testrun --signal-group         (sends its process group SIGTERM: the same)
  *
  * Runs every test LIST names from DIR (default: LIST's directory), each with
  * posix_spawn, stdin from /dev/null and stdout and stderr into files, and checks it.
@@ -19,16 +20,22 @@
  * FAIL, PEND or SKIP and its name, and a failure its output after it; the last line is
  * "testrun: LIST: P passed, F failed, N pending, S skipped". Exits 0 when nothing failed.
  *
- * feos has no kill(2) until kernel stage 1c.8, so a test still running after the timeout
- * (-t, default 30 s) can't be stopped: it fails as TIMEOUT and is left running, and the
- * next test starts. A test that hangs belongs in LIST as pending. Each test's output goes
- * to files of its own in /tmp (testrun-N.stdout, .stderr), removed once checked unless
- * the test was left running.
+ * A test still running after the timeout (-t, default 30 s) fails as TIMEOUT and is
+ * killed with SIGKILL; before kernel stage 1c.8 feos has no kill(2), so there it's left
+ * running instead, and the next test starts. A test that hangs belongs in LIST as
+ * pending. Each test's output goes to files of its own in /tmp (testrun-N.stdout,
+ * .stderr), removed once checked unless the test was left running.
+ *
+ * testrun ignores every signal it can but SIGCHLD, and starts each test with all of them
+ * at their defaults (POSIX_SPAWN_SETSIGDEF), so a test that signals its process group or
+ * every process (kill(0, ...), kill(-1, ...): relibc's signal tests do when fork fails)
+ * can't end the run. Stop testrun itself with SIGKILL.
  */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,7 +51,7 @@ extern char **environ;
 #define SHOW_BYTES 1200
 
 static int verbose;
-static int passed, failed, pending, skipped, timeouts;
+static int passed, failed, pending, skipped, timeouts, left_running;
 static const char *list_name;
 
 static double now(void) {
@@ -128,17 +135,25 @@ static void show(const char *label, const char *data, size_t len) {
 }
 
 /* Runs one test, its output in OUT and ERR; returns its wait status, -1 with errno when
- * it didn't start, or -2 when it was still running after TIMEOUT seconds (it's left
- * running, with its waiter thread). */
+ * it didn't start, -3 when it was still running after TIMEOUT seconds and was killed, or
+ * -2 when it couldn't be killed (it's left running, with its waiter thread). */
 static int run(char *const argv[], const char *out, const char *err, double timeout) {
+    /* The test gets every signal at its default, whatever testrun ignores. */
+    posix_spawnattr_t attr;
+    sigset_t all;
+    sigfillset(&all);
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setsigdefault(&attr, &all);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGDEF);
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
     posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
     posix_spawn_file_actions_addopen(&fa, 1, out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     posix_spawn_file_actions_addopen(&fa, 2, err, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     pid_t pid;
-    int e = posix_spawn(&pid, argv[0], &fa, NULL, argv, environ);
+    int e = posix_spawn(&pid, argv[0], &fa, &attr, argv, environ);
     posix_spawn_file_actions_destroy(&fa);
+    posix_spawnattr_destroy(&attr);
     if (e) {
         errno = e;
         return -1;
@@ -160,7 +175,19 @@ static int run(char *const argv[], const char *out, const char *err, double time
     pthread_mutex_lock(&w->lock);
     while (!w->done) {
         if (pthread_cond_timedwait(&w->done_cv, &w->lock, &deadline) == ETIMEDOUT && !w->done) {
+            /* Overran: kill it and give the waiter a few seconds to see it end. */
+            if (kill(pid, SIGKILL) == 0) {
+                deadline.tv_sec += 10;
+                while (!w->done && pthread_cond_timedwait(&w->done_cv, &w->lock, &deadline) != ETIMEDOUT)
+                    ;
+            }
+            int ended = w->done;
             pthread_mutex_unlock(&w->lock);
+            if (ended) {
+                pthread_join(thread, NULL);
+                free(w);
+                return -3;
+            }
             /* Left behind: the waiter keeps w. */
             pthread_detach(thread);
             return -2;
@@ -191,6 +218,22 @@ int main(int argc, char **argv) {
     /* For testrun's own test (ports/test/suite-selftest): a test that outlives -t. */
     if (argc == 3 && strcmp(argv[1], "--sleep") == 0) {
         sleep((unsigned)atoi(argv[2]));
+        return 0;
+    }
+    /* And a test that signals its process group: it must start with SIGTERM at its
+     * default (testrun ignores it), and testrun must outlive it. */
+    if (argc == 2 && strcmp(argv[1], "--signal-group") == 0) {
+        struct sigaction old;
+        if (sigaction(SIGTERM, NULL, &old) != 0 || old.sa_handler != SIG_DFL) {
+            printf("SIGTERM not at its default\n");
+            return 1;
+        }
+        struct sigaction ign = {.sa_handler = SIG_IGN};
+        sigemptyset(&ign.sa_mask);
+        if (sigaction(SIGTERM, &ign, NULL) != 0 || kill(0, SIGTERM) != 0) {
+            printf("signal-group: %s\n", strerror(errno));
+            return 1;
+        }
         return 0;
     }
     int opt;
@@ -237,6 +280,12 @@ int main(int argc, char **argv) {
         return 64;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
+    /* Before kernel stage 1c.9 sigaction is ENOSYS, and nothing can signal testrun. */
+    struct sigaction ignore = {.sa_handler = SIG_IGN};
+    sigemptyset(&ignore.sa_mask);
+    for (int sig = 1; sig < NSIG; sig++)
+        if (sig != SIGKILL && sig != SIGSTOP && sig != SIGCHLD)
+            sigaction(sig, &ignore, NULL);
 
     char line[4096];
     while (fgets(line, sizeof line, list)) {
@@ -281,10 +330,17 @@ int main(int argc, char **argv) {
         int status = run(targv, out_path, err_path, timeout);
         int spawn_errno = errno;
         double took = now() - started;
-        if (status == -2) {
+        if (status == -2 || status == -3) {
             failed++;
             timeouts++;
-            printf("TIMEOUT %s: still running after %.0f s, left running\n", name, timeout);
+            printf("TIMEOUT %s: still running after %.0f s, %s\n", name, timeout,
+                   status == -3 ? "killed" : "left running");
+            if (status == -2) {
+                left_running++;
+                continue;
+            }
+            unlink(out_path);
+            unlink(err_path);
             continue;
         }
 
@@ -351,6 +407,6 @@ int main(int argc, char **argv) {
     fclose(list);
     summary();
     if (timeouts)
-        printf("testrun: %d tests left running\n", timeouts);
+        printf("testrun: %d tests timed out, %d left running\n", timeouts, left_running);
     return failed ? 1 : 0;
 }

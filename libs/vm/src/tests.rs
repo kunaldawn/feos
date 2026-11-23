@@ -65,6 +65,21 @@ impl FrameSource for Pool {
             self.release(frame);
         }
     }
+    fn put_shared(&mut self, frame: usize) -> bool {
+        let counts = self.live.get_mut(&frame).expect("put of a frame that's gone");
+        assert!(counts.0 > 0, "put of {frame:#x} with no references");
+        if counts.0 == 1 {
+            return false;
+        }
+        counts.0 -= 1;
+        true
+    }
+    fn pins(&self, frame: usize) -> u32 {
+        self.live.get(&frame).map_or(0, |counts| counts.1)
+    }
+    fn maps(&self, frame: usize) -> u32 {
+        self.live.get(&frame).map_or(0, |counts| counts.0)
+    }
     fn pin(&mut self, frame: usize) -> bool {
         let counts = self.live.get_mut(&frame).expect("pin of a frame that's gone");
         assert!(counts.0 > 0);
@@ -1672,4 +1687,512 @@ fn futex_words_are_named_by_what_maps_them() {
     mm.shared_words(copy, copy + 2 * PAGE_SIZE, &mut |object, low, high| seen.push((object, low, high)));
     assert!(seen.is_empty());
     world.done(mm);
+}
+
+// Stage 1d.1: `FORK`, copy-on-write and strict charging.
+
+/// Runs a fork test with each port's way of writing entries.
+fn on_both(test: fn(PageBits)) {
+    test(BITS);
+    test(ARM_BITS);
+}
+
+/// A space for a fork test, written the `bits` way.
+fn forking(world: &mut World, bits: PageBits) -> Mm {
+    world.mm_with(bits, layout())
+}
+
+/// `parent`'s child, which reverse maps know as space 2.
+fn fork_of(world: &mut World, parent: &mut Mm) -> Mm {
+    world.with(|ctx| parent.fork(2, ctx)).expect("the fork")
+}
+
+/// Whether the entry at `address` is shared copy-on-write.
+fn is_cow(mm: &Mm, address: usize) -> bool {
+    matches!(mm.space().entry(address), Entry::Present { cow: true, .. } | Entry::Hidden { cow: true, .. })
+}
+
+/// The frame behind `address`, for reading.
+fn frame_at(mm: &Mm, address: usize) -> usize {
+    mm.space().translate(address, false).unwrap() & !(PAGE_SIZE - 1)
+}
+
+/// The extra references the pool's frames have, over all of them that `spaces` map as
+/// their own private pages: what a fork's charging says the machine owes.
+fn debt(world: &World, spaces: &[&Mm]) -> usize {
+    let mut frames = std::collections::HashSet::new();
+    for mm in spaces {
+        for vma in mm.vmas().iter() {
+            if !matches!(vma.backing, Backing::Private | Backing::File { shared: false, .. }) {
+                continue;
+            }
+            mm.space().visit(vma.start, vma.end, &mut |_, entry| match entry {
+                Entry::Present { frame, cached: false, .. } | Entry::Hidden { frame, cached: false, .. } if frame != world.zero => {
+                    frames.insert(frame);
+                }
+                _ => {}
+            });
+        }
+    }
+    frames.iter().map(|frame| world.pool.live[frame].0 as usize - 1).sum()
+}
+
+/// What the charged shared objects `spaces` map hold in promises, each object once.
+fn objects_owed(spaces: &[&Mm]) -> usize {
+    let mut seen = std::collections::HashMap::new();
+    for mm in spaces {
+        for vma in mm.vmas().iter() {
+            if let Backing::Shared { object, .. } = &vma.backing {
+                let owed = if object.charged() { object.pages() - object.frames() } else { 0 };
+                seen.insert(crate::ObjectRef::as_ptr(object) as usize, owed);
+            }
+        }
+    }
+    seen.values().sum()
+}
+
+/// The machine's promises are each space's own, its objects' and the forks' debt, exactly.
+fn owed(world: &World, spaces: &[&Mm]) {
+    let own: usize = spaces.iter().map(|mm| mm.private_unbacked()).sum();
+    let expected = own + objects_owed(spaces) + debt(world, spaces);
+    assert_eq!(world.promises.held(), expected, "promises held against what's owed");
+    assert_eq!(world.promises.underflows(), 0);
+}
+
+/// Gives back a child and its parent, and checks nothing is left.
+fn both_done(mut world: World, parent: Mm, child: Mm) {
+    child.destroy(&mut world.pool, &world.promises);
+    world.done(parent);
+}
+
+#[test]
+fn fork_shares_until_write() {
+    on_both(|bits| {
+        let mut world = World::new();
+        let mut parent = forking(&mut world, bits);
+        let at = world.anywhere(&mut parent, 4 * PAGE_SIZE, RW);
+        for page in 0..4 {
+            world.write(&mut parent, at + page * PAGE_SIZE, &[page as u8 + 1]);
+        }
+        let mut child = fork_of(&mut world, &mut parent);
+        for page in 0..4 {
+            let address = at + page * PAGE_SIZE;
+            assert_eq!(frame_at(&parent, address), frame_at(&child, address), "shared");
+            assert!(is_cow(&parent, address) && is_cow(&child, address));
+            assert_eq!(parent.space().translate(address, true), Err(BadAddress), "read-only in the parent");
+            assert_eq!(child.space().translate(address, true), Err(BadAddress), "and in the child");
+            assert_eq!(world.read(&mut child, address, 1), [page as u8 + 1]);
+        }
+        // The parent's entries that became read-only were flushed.
+        assert!(world.flushed.contains(&at));
+        // Each writes its own page; the other keeps what it had.
+        world.write(&mut child, at, &[0xc0]);
+        world.write(&mut parent, at + PAGE_SIZE, &[0xb1]);
+        assert_eq!(world.read(&mut parent, at, 1), [1]);
+        assert_eq!(world.read(&mut child, at, 1), [0xc0]);
+        assert_eq!(world.read(&mut child, at + PAGE_SIZE, 1), [2]);
+        assert_eq!(world.read(&mut parent, at + PAGE_SIZE, 1), [0xb1]);
+        assert_eq!(frame_at(&parent, at + 2 * PAGE_SIZE), frame_at(&child, at + 2 * PAGE_SIZE));
+        owed(&world, &[&parent, &child]);
+        both_done(world, parent, child);
+    });
+}
+
+#[test]
+fn cow_copy_at_count_two() {
+    on_both(|bits| {
+        let mut world = World::new();
+        let mut parent = forking(&mut world, bits);
+        let at = world.anywhere(&mut parent, PAGE_SIZE, RW);
+        world.write(&mut parent, at, &[7]);
+        let frame = frame_at(&parent, at);
+        let mut child = fork_of(&mut world, &mut parent);
+        assert_eq!(world.pool.live[&frame].0, 2);
+        // The writer copies; the frame stays the other's, at one reference again.
+        world.write(&mut parent, at, &[8]);
+        assert_ne!(frame_at(&parent, at), frame);
+        assert_eq!(frame_at(&child, at), frame);
+        assert_eq!(world.pool.live[&frame].0, 1);
+        assert!(!is_cow(&parent, at) && parent.space().translate(at, true).is_ok());
+        assert_eq!(world.read(&mut child, at, 1), [7]);
+        owed(&world, &[&parent, &child]);
+        both_done(world, parent, child);
+    });
+}
+
+#[test]
+fn cow_reuse_at_count_one_anon_only() {
+    on_both(|bits| {
+        let mut world = World::new();
+        let mut parent = forking(&mut world, bits);
+        let at = world.anywhere(&mut parent, 2 * PAGE_SIZE, RW);
+        world.write(&mut parent, at, &[3]);
+        world.write(&mut parent, at + PAGE_SIZE, &[4]);
+        let frame = frame_at(&parent, at);
+        let child = fork_of(&mut world, &mut parent);
+        child.destroy(&mut world.pool, &world.promises);
+        // Nothing else has it: the write takes the frame back in place, nothing allocated.
+        let used = world.in_use();
+        assert!(is_cow(&parent, at));
+        world.write(&mut parent, at, &[5]);
+        assert_eq!(frame_at(&parent, at), frame);
+        assert_eq!(world.in_use(), used);
+        assert!(!is_cow(&parent, at));
+        // A copy in flight through the frame keeps it from being taken back: copied.
+        let other = frame_at(&parent, at + PAGE_SIZE);
+        let child = fork_of(&mut world, &mut parent);
+        child.destroy(&mut world.pool, &world.promises);
+        let pinned = parent.pin(at + PAGE_SIZE, false, &mut world.pool).unwrap();
+        world.write(&mut parent, at + PAGE_SIZE, &[6]);
+        assert_ne!(frame_at(&parent, at + PAGE_SIZE), other);
+        // SAFETY: pinned, so still the pool's.
+        assert_eq!(unsafe { *(pinned.address as *const u8) }, 4, "the copy in flight sees what it pinned");
+        parent.unpin(pinned, &mut world.pool);
+        owed(&world, &[&parent]);
+        consistent(&world, &parent);
+        world.done(parent);
+    });
+}
+
+#[test]
+fn cow_never_reuses_cache_frame() {
+    on_both(|bits| {
+        let mut world = World::new();
+        let mut parent = forking(&mut world, bits);
+        let file = world.files.add(21, PAGE_SIZE, 0x21);
+        let at = world.map(&mut parent, file_request(&file, PAGE_SIZE, RW, false)).unwrap();
+        world.read(&mut parent, at, 1);
+        let cached = frame_at(&parent, at);
+        let child = fork_of(&mut world, &mut parent);
+        assert_eq!(frame_at(&child, at), cached, "the cache's frame, shared as it is");
+        assert!(!is_cow(&child, at), "a cache frame is never the space's to take back");
+        child.destroy(&mut world.pool, &world.promises);
+        // Even with nothing else mapping it, a write copies: it's the file's.
+        world.write(&mut parent, at, &[0xee]);
+        assert_ne!(frame_at(&parent, at), cached);
+        assert_eq!(world.read(&mut parent, at, 1), [0xee]);
+        assert_eq!(file_byte(&world, 21, 0), 0x21 ^ 0);
+        // SAFETY: the cache still has the frame.
+        assert_eq!(unsafe { *(cached as *const u8) }, file_byte(&world, 21, 0));
+        consistent(&world, &parent);
+        world.done(parent);
+    });
+}
+
+#[test]
+fn pinned_page_copied_at_fork() {
+    on_both(|bits| {
+        let mut world = World::new();
+        let mut parent = forking(&mut world, bits);
+        let at = world.anywhere(&mut parent, 2 * PAGE_SIZE, RW);
+        world.write(&mut parent, at, &[1]);
+        world.write(&mut parent, at + PAGE_SIZE, &[2]);
+        let frame = frame_at(&parent, at);
+        // A copy of the kernel's is in flight into the page as the fork comes.
+        let pinned = parent.pin(at, true, &mut world.pool).unwrap();
+        let mut child = fork_of(&mut world, &mut parent);
+        assert_ne!(frame_at(&child, at), frame, "the child has a copy of its own");
+        assert_eq!(frame_at(&parent, at), frame);
+        assert!(!is_cow(&parent, at) && parent.space().translate(at, true).is_ok(), "still the parent's, writable");
+        // What the kernel writes through the pin after the fork is the parent's alone.
+        // SAFETY: pinned for writing.
+        unsafe { *(pinned.address as *mut u8) = 0x99 };
+        parent.unpin(pinned, &mut world.pool);
+        assert_eq!(world.read(&mut parent, at, 1), [0x99]);
+        assert_eq!(world.read(&mut child, at, 1), [1]);
+        // The page without a pin is shared as usual.
+        assert!(is_cow(&child, at + PAGE_SIZE));
+        owed(&world, &[&parent, &child]);
+        both_done(world, parent, child);
+    });
+}
+
+#[test]
+fn write_pin_breaks_cow() {
+    on_both(|bits| {
+        let mut world = World::new();
+        let mut parent = forking(&mut world, bits);
+        let at = world.anywhere(&mut parent, PAGE_SIZE, RW);
+        world.write(&mut parent, at, &[0x10]);
+        let mut child = fork_of(&mut world, &mut parent);
+        let shared = frame_at(&child, at);
+        // A pin for writing is refused on the shared entry, and readying it copies first.
+        assert!(matches!(child.pin(at, true, &mut world.pool), Err(PinError::Fault)));
+        let pinned = world.with(|ctx| child.translate_and_pin(at, true, ctx)).unwrap();
+        assert_ne!(pinned.address & !(PAGE_SIZE - 1), shared, "the kernel never writes a shared frame");
+        // SAFETY: pinned for writing.
+        unsafe { *(pinned.address as *mut u8) = 0x20 };
+        child.unpin(pinned, &mut world.pool);
+        assert_eq!(world.read(&mut parent, at, 1), [0x10]);
+        assert_eq!(world.read(&mut child, at, 1), [0x20]);
+        owed(&world, &[&parent, &child]);
+        both_done(world, parent, child);
+    });
+}
+
+#[test]
+fn shared_stays_shared() {
+    on_both(|bits| {
+        let mut world = World::new();
+        let mut parent = forking(&mut world, bits);
+        let request = MapRequest { shared: true, ..MapRequest::anonymous(2 * PAGE_SIZE, RW) };
+        let at = world.map(&mut parent, request).unwrap();
+        world.write(&mut parent, at, &[1]);
+        let file = world.files.add(22, PAGE_SIZE, 0x22);
+        let mapped = world.map(&mut parent, file_request(&file, PAGE_SIZE, RO, true)).unwrap();
+        world.read(&mut parent, mapped, 1);
+        let mut child = fork_of(&mut world, &mut parent);
+        assert_eq!(frame_at(&child, at), frame_at(&parent, at));
+        assert!(!is_cow(&child, at) && child.space().translate(at, true).is_ok(), "shared, and writable");
+        world.write(&mut child, at, &[2]);
+        assert_eq!(world.read(&mut parent, at, 1), [2]);
+        world.write(&mut parent, at + 8, &[3]);
+        assert_eq!(world.read(&mut child, at + 8, 1), [3]);
+        assert_eq!(frame_at(&child, mapped), frame_at(&parent, mapped), "the file's page too");
+        // The object is promised once, however many spaces count it.
+        assert_eq!((parent.charged(), child.charged()), (2, 2));
+        owed(&world, &[&parent, &child]);
+        assert_eq!(world.promises.held(), 1, "the object's one page without a frame");
+        // The parent going first leaves the object to the child.
+        let mut world = world;
+        parent.destroy(&mut world.pool, &world.promises);
+        assert_eq!(world.read(&mut child, at, 1), [2]);
+        world.write(&mut child, at + PAGE_SIZE, &[4]);
+        assert_eq!(world.promises.held(), 0);
+        world.done(child);
+    });
+}
+
+#[test]
+fn untouched_shared_anon_shared_after_fork() {
+    on_both(|bits| {
+        let mut world = World::new();
+        let mut parent = forking(&mut world, bits);
+        let request = MapRequest { shared: true, ..MapRequest::anonymous(3 * PAGE_SIZE, RW) };
+        let at = world.map(&mut parent, request).unwrap();
+        // Neither has touched a page before the fork.
+        let mut child = fork_of(&mut world, &mut parent);
+        world.write(&mut child, at + PAGE_SIZE, &[0x5a]);
+        assert_eq!(world.read(&mut parent, at + PAGE_SIZE, 1), [0x5a]);
+        assert_eq!(frame_at(&parent, at + PAGE_SIZE), frame_at(&child, at + PAGE_SIZE));
+        // And the other way, and a read first.
+        assert_eq!(world.read(&mut child, at + 2 * PAGE_SIZE, 1), [0]);
+        world.write(&mut parent, at + 2 * PAGE_SIZE, &[0x6b]);
+        assert_eq!(world.read(&mut child, at + 2 * PAGE_SIZE, 1), [0x6b]);
+        assert_eq!(world.promises.held(), 1);
+        both_done(world, parent, child);
+    });
+}
+
+#[test]
+fn fork_debt_is_sum_of_extra_refs() {
+    on_both(|bits| {
+        let mut world = World::new();
+        let mut parent = forking(&mut world, bits);
+        let at = world.anywhere(&mut parent, 10 * PAGE_SIZE, RW);
+        for page in 0..4 {
+            world.write(&mut parent, at + page * PAGE_SIZE, &[page as u8]);
+        }
+        // Read-only pages with frames of their own are charged too: `mprotect` could make
+        // them writable without asking the fork again.
+        let image = world.map(&mut parent, image(PAGE_SIZE, RO, LOW + 512 * PAGE_SIZE)).unwrap();
+        assert_eq!(world.promises.held(), 6);
+        let first = fork_of(&mut world, &mut parent);
+        // The child's six untouched charged pages, and one per frame it shares.
+        assert_eq!(world.promises.held(), 6 + 6 + 5);
+        let second = world.with(|ctx| parent.fork(3, ctx)).unwrap();
+        assert_eq!(world.promises.held(), 6 * 3 + 5 * 2);
+        assert_eq!(world.pool.live[&frame_at(&parent, image)].0, 3);
+        owed(&world, &[&parent, &first, &second]);
+        // However they go, it comes back to the parent's own.
+        first.destroy(&mut world.pool, &world.promises);
+        owed(&world, &[&parent, &second]);
+        assert_eq!(world.promises.held(), 6 * 2 + 5);
+        both_done(world, parent, second);
+    });
+}
+
+#[test]
+fn cow_copy_consumes_promise() {
+    on_both(|bits| {
+        let mut world = World::new();
+        let mut parent = forking(&mut world, bits);
+        let at = world.anywhere(&mut parent, 8 * PAGE_SIZE, RW);
+        for page in 0..8 {
+            world.write(&mut parent, at + page * PAGE_SIZE, &[page as u8]);
+        }
+        let mut child = fork_of(&mut world, &mut parent);
+        assert_eq!(world.promises.held(), 8);
+        // No frame to spare beyond what's promised: every copy still comes, each with
+        // the promise its reference held, and nothing else can be had.
+        world.pool.limit = world.pool.live.len() + world.promises.held();
+        assert!(!world.promises.promise(1, world.pool.free_count()));
+        for page in 0..8 {
+            let space = if page % 2 == 0 { &mut child } else { &mut parent };
+            world.write(space, at + page * PAGE_SIZE, &[0xf0 | page as u8]);
+        }
+        assert_eq!((world.promises.held(), world.pool.free_count()), (0, 0));
+        owed(&world, &[&parent, &child]);
+        world.pool.limit = usize::MAX;
+        both_done(world, parent, child);
+    });
+}
+
+#[test]
+fn unmap_of_shared_page_releases_one() {
+    on_both(|bits| {
+        let mut world = World::new();
+        let mut parent = forking(&mut world, bits);
+        let at = world.anywhere(&mut parent, 3 * PAGE_SIZE, RW);
+        for page in 0..3 {
+            world.write(&mut parent, at + page * PAGE_SIZE, &[page as u8]);
+        }
+        let mut child = fork_of(&mut world, &mut parent);
+        assert_eq!(world.promises.held(), 3);
+        let frame = frame_at(&parent, at);
+        world.with(|ctx| child.unmap(at, PAGE_SIZE, ctx)).unwrap();
+        assert_eq!((world.promises.held(), world.pool.live[&frame].0), (2, 1));
+        // A discard lets go of the frame but keeps the page's own promise.
+        world.with(|ctx| child.discard(at + PAGE_SIZE, PAGE_SIZE, ctx)).unwrap();
+        assert_eq!(world.promises.held(), 2, "one debt gone, the page's promise back");
+        // The last reference gives back nothing more.
+        world.with(|ctx| parent.unmap(at, PAGE_SIZE, ctx)).unwrap();
+        assert_eq!(world.promises.held(), 2);
+        owed(&world, &[&parent, &child]);
+        both_done(world, parent, child);
+    });
+}
+
+#[test]
+fn fork_frees_all_on_exit() {
+    on_both(|bits| {
+        let mut world = World::new();
+        let mut parent = forking(&mut world, bits);
+        let at = world.anywhere(&mut parent, 16 * PAGE_SIZE, RW);
+        let shared = world.map(&mut parent, MapRequest { shared: true, ..MapRequest::anonymous(4 * PAGE_SIZE, RW) }).unwrap();
+        let file = world.files.add(23, 2 * PAGE_SIZE, 0x23);
+        let mapped = world.map(&mut parent, file_request(&file, 2 * PAGE_SIZE, RW, false)).unwrap();
+        world.read(&mut parent, mapped, 1);
+        for page in 0..8 {
+            world.write(&mut parent, at + page * PAGE_SIZE, &[1]);
+        }
+        world.write(&mut parent, shared, &[1]);
+        let (used, held, tables) = (world.in_use(), world.promises.held(), parent.tables());
+        for round in 0..100 {
+            let mut child = world.with(|ctx| parent.fork(2 + round, ctx)).unwrap();
+            // Writes in both, in an order that changes round to round.
+            let page = round as usize % 16;
+            world.write(&mut child, at + page * PAGE_SIZE, &[2]);
+            world.write(&mut parent, at + ((page + 3) % 16) * PAGE_SIZE, &[3]);
+            world.write(&mut child, mapped + PAGE_SIZE, &[4]);
+            world.write(&mut child, shared + PAGE_SIZE, &[5]);
+            owed(&world, &[&parent, &child]);
+            child.destroy(&mut world.pool, &world.promises);
+            owed(&world, &[&parent]);
+        }
+        // Counts back where they were, give or take the pages the parent wrote, which
+        // the promises it held for them paid for.
+        assert_eq!(parent.tables(), tables);
+        assert_eq!(world.in_use() + world.promises.held(), used + held + 1, "one shared page the children touched");
+        consistent(&world, &parent);
+        world.done(parent);
+    });
+}
+
+#[test]
+fn fork_refused_changes_nothing() {
+    on_both(|bits| {
+        let mut world = World::new();
+        let mut parent = forking(&mut world, bits);
+        let at = world.anywhere(&mut parent, 64 * PAGE_SIZE, RW);
+        world.write(&mut parent, at, &[1]);
+        // Not enough frames for the child's promises: refused, the parent as it was.
+        world.pool.limit = world.pool.live.len() + world.promises.held() + 10;
+        let (used, held) = (world.in_use(), world.promises.held());
+        let refused = world.with(|ctx| parent.fork(2, ctx));
+        assert_eq!(refused.err(), Some(MmError::NoMemory));
+        assert_eq!((world.in_use(), world.promises.held()), (used, held));
+        world.write(&mut parent, at, &[2]);
+        assert_eq!(world.read(&mut parent, at, 1), [2]);
+        world.pool.limit = usize::MAX;
+        consistent(&world, &parent);
+        world.done(parent);
+    });
+}
+
+#[test]
+fn cow_bit_is_56_on_both() {
+    assert_eq!(crate::COW, 1 << 56);
+    for bits in [BITS, ARM_BITS] {
+        let port = bits.present | bits.address | bits.leaf | bits.writable | bits.read_only | bits.no_execute;
+        assert_eq!(port & crate::COW, 0, "the hardware's bits never include it");
+        let mut world = World::new();
+        let mut parent = forking(&mut world, bits);
+        let at = world.anywhere(&mut parent, 2 * PAGE_SIZE, RW);
+        world.write(&mut parent, at, &[1]);
+        world.write(&mut parent, at + PAGE_SIZE, &[1]);
+        world.with(|ctx| parent.protect(at + PAGE_SIZE, PAGE_SIZE, Prot::NONE, ctx)).unwrap();
+        let child = fork_of(&mut world, &mut parent);
+        let mut raw = Vec::new();
+        parent.space().visit(at, at + 2 * PAGE_SIZE, &mut |_, entry| raw.push(entry));
+        assert!(matches!(raw[0], Entry::Present { cow: true, writable: false, .. }));
+        assert!(matches!(raw[1], Entry::Hidden { cow: true, .. }), "kept through no access");
+        // Made writable again, it stays shared and read-only.
+        world.with(|ctx| parent.protect(at + PAGE_SIZE, PAGE_SIZE, RW, ctx)).unwrap();
+        assert!(is_cow(&parent, at + PAGE_SIZE) && parent.space().translate(at + PAGE_SIZE, true).is_err());
+        both_done(world, parent, child);
+    }
+}
+
+#[test]
+fn shared_pieces_counted_per_space() {
+    on_both(|bits| {
+        let mut world = World::new();
+        let mut parent = forking(&mut world, bits);
+        let request = MapRequest { shared: true, ..MapRequest::anonymous(4 * PAGE_SIZE, RW) };
+        let at = world.map(&mut parent, request).unwrap();
+        world.write(&mut parent, at, &[1]);
+        let mut child = fork_of(&mut world, &mut parent);
+        let heap = SharedAnon::heap_cost(4);
+        assert_eq!((child.charged(), child.object_heap()), (4, heap));
+        // Cut in three in the child: the object counts there until its last piece goes.
+        world.with(|ctx| child.protect(at + PAGE_SIZE, PAGE_SIZE, RO, ctx)).unwrap();
+        assert_eq!(child.vmas().len(), 3);
+        for (piece, pages) in [(0, 1), (2, 2)] {
+            world.with(|ctx| child.unmap(at + piece * PAGE_SIZE, pages * PAGE_SIZE, ctx)).unwrap();
+            assert_eq!((child.charged(), child.object_heap()), (4, heap));
+        }
+        world.with(|ctx| child.unmap(at + PAGE_SIZE, PAGE_SIZE, ctx)).unwrap();
+        assert_eq!((child.charged(), child.object_heap()), (0, 0));
+        // The parent's count, and the object, are as they were.
+        assert_eq!((parent.charged(), parent.object_heap()), (4, heap));
+        assert_eq!(world.read(&mut parent, at, 1), [1]);
+        owed(&world, &[&parent, &child]);
+        both_done(world, parent, child);
+    });
+}
+
+#[test]
+fn many_shared_objects_stay_cheap() {
+    // Thousands of one-page objects, as `malicious --shared-flood` makes: mapped,
+    // forked, touched and unmapped without a pass over all of them for each.
+    let mut world = World::new();
+    let mut parent = world.mm();
+    let started = std::time::Instant::now();
+    let mut at = Vec::new();
+    for _ in 0..8000 {
+        let request = MapRequest { shared: true, ..MapRequest::anonymous(PAGE_SIZE, RW) };
+        at.push(world.map(&mut parent, request).unwrap());
+    }
+    let child = fork_of(&mut world, &mut parent);
+    for &address in at.iter().step_by(7) {
+        world.write(&mut parent, address, &[1]);
+    }
+    for &address in &at {
+        world.with(|ctx| parent.unmap(address, PAGE_SIZE, ctx)).unwrap();
+    }
+    assert_eq!((parent.charged(), parent.object_heap()), (0, 0));
+    child.destroy(&mut world.pool, &world.promises);
+    assert!(started.elapsed() < std::time::Duration::from_secs(20), "took {:?}", started.elapsed());
+    world.done(parent);
 }

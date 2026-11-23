@@ -47,13 +47,15 @@ mod lock_calls;
 mod memory_calls;
 mod proc;
 pub mod process;
+mod random_calls;
 pub mod signal;
 mod time_calls;
 pub mod tlb;
 mod tree_calls;
+pub mod tty;
 
 use memory_calls::{KernelFrames, PROMISES};
-pub use memory_calls::{forget_fault, promised, resolve_fault, segv_code, FaultOutcome, SPARE_FRAMES};
+pub use memory_calls::{forget_fault, promise_underflows, promised, resolve_fault, segv_code, FaultOutcome, SPARE_FRAMES};
 pub use fs_calls::orphans;
 pub use lock_calls::count as locks;
 pub use children::{drain as drain_records, held as pid_held, release as release_record, ChildRecord};
@@ -76,6 +78,7 @@ fn process(slot: usize) -> Option<&'static Process> {
 use crate::sched::NoKill;
 
 pub use load::UserStart;
+pub use proc::Forked;
 
 /// The umask of a program a kernel app starts (section 3.3 of the ABI design).
 pub const DEFAULT_UMASK: u32 = 0o022;
@@ -88,10 +91,20 @@ pub(super) fn say(message: core::fmt::Arguments<'_>) {
     feos_console::eprintln!("{}", message);
 }
 
-/// Loads the program `start` names and runs it. Only returns if it can't, with the
-/// status the process should end with.
-pub fn start(slot: usize, start: alloc::boxed::Box<UserStart>) -> i32 {
-    load::start(slot, start)
+/// What a program's new task starts with: a program to load (a kernel app's spawn,
+/// `SPAWN` or `SPAWN2`), or the copy of its parent a `FORK` made.
+pub enum Start {
+    Load(alloc::boxed::Box<UserStart>),
+    Fork(alloc::boxed::Box<Forked>),
+}
+
+/// Loads the program `start` names and runs it, or runs the forked copy. Only returns if
+/// it can't, with the status the process should end with.
+pub fn start(slot: usize, start: Start) -> i32 {
+    match start {
+        Start::Load(start) => load::start(slot, start),
+        Start::Fork(forked) => proc::start_forked(slot, forked),
+    }
 }
 
 /// What a filesystem error is called across the boundary.
@@ -627,6 +640,8 @@ fn dispatch(slot: usize, process: &Process, number: usize, args: [usize; 6]) -> 
         nr::FSTATVFS => tree_calls::sys_fstatvfs(process, args[0], args[1]),
         nr::SYNC => tree_calls::sys_sync(),
         nr::FLOCK => lock_calls::sys_flock(process, args[0], args[1]),
+        nr::IOCTL => files::sys_ioctl(slot, process, args[0], args[1], args[2]),
+        nr::POLL => files::sys_poll(slot, process, args),
         nr::SLEEP => {
             sched::sleep_ms(args[0] as u64);
             0
@@ -662,6 +677,7 @@ fn dispatch(slot: usize, process: &Process, number: usize, args: [usize; 6]) -> 
         nr::MSYNC => memory_calls::sys_msync(user, args[0], args[1], args[2]),
         nr::SPAWN => proc::sys_spawn(process, args),
         nr::SPAWN2 => proc::sys_spawn2(slot, process, args[0]),
+        nr::FORK => proc::sys_fork(slot, process),
         nr::EXEC => proc::sys_exec(slot, process, args[0]),
         nr::WAIT => proc::sys_wait(slot, process, args[0]),
         nr::WAIT4 => proc::sys_wait4(slot, process, args),
@@ -686,6 +702,8 @@ fn dispatch(slot: usize, process: &Process, number: usize, args: [usize; 6]) -> 
         nr::CLOCK_GETTIME => time_calls::sys_clock_gettime(slot, process, args[0], args[1]),
         nr::CLOCK_GETRES => time_calls::sys_clock_getres(process, args[0], args[1]),
         nr::NANOSLEEP => time_calls::sys_nanosleep(process, args),
+        nr::CLOCK_SETTIME => time_calls::sys_clock_settime(slot, process, args[0], args[1]),
+        nr::GETRANDOM => random_calls::sys_getrandom(process, args[0], args[1], args[2]),
         nr::FUTEX_WAKE => match user.futex_key(args[0]) {
             Ok(key) => sched::futex_wake_user(key, args[1]) as isize,
             Err(_) => -errno::EFAULT,

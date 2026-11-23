@@ -1545,7 +1545,7 @@ def run_malicious(guest, arch, label):
     start = text.rfind("/bin/malicious; echo")
     if status != "0":
         # Name what got through, and what its probe said, not just the status.
-        said = re.findall(r"^[^\r\n]*(?:NOT BLOCKED|uid-process-bomb:|pipe-exhaustion:|FAILED)[^\r\n]*", text[start:], re.M)
+        said = re.findall(r"^[^\r\n]*(?:NOT BLOCKED|uid-process-bomb:|pipe-exhaustion:|signal-storm:|toctou-setitimer:|setitimer-tiny-interval:|FAILED)[^\r\n]*", text[start:], re.M)
         fail(guest, f"malicious exited {status}: " + " | ".join(said))
     probes = re.findall(r"probe ([a-z0-9-]+): (blocked|NOT BLOCKED)", text[start:])
     summary = re.search(r"malicious: (\d+) of (\d+) probes blocked", text[start:])
@@ -1982,6 +1982,88 @@ def time_test(arch, kernel):
         guest.wait_exit()
 
 
+RANDOM_CHECKS = (
+    "clock-settime-root", "clock-settime-nonroot-eperm", "getrandom-fills", "getrandom-distinct",
+    "getrandom-monobit", "getrandom-nonblock-seeded", "getrandom-insecure-never-waits", "at-random-from-csprng",
+    "dev-urandom-reads", "dev-random-reads",
+)
+UNSEEDED_CHECKS = (
+    "getrandom-fills", "getrandom-distinct", "getrandom-monobit", "getrandom-nonblock-eagain",
+    "getrandom-blocks-until-signal", "getrandom-insecure-never-waits", "at-random-from-csprng", "dev-urandom-reads",
+    "dev-random-nonblock-eagain",
+)
+
+
+def random_boot(arch, kernel, cpu, seeded, sources):
+    """One boot for the `random` phase: the boot log names `sources` (and the warning
+    when there are none), then `rtest --random` (`--unseeded` without a source) passes
+    every check. Returns the sample of the generator's output rtest printed."""
+    label = f"random {arch} -cpu {cpu}"
+    guest = Guest(user_command(arch, kernel, cpu=cpu))
+    guest.boot_to_shell()
+    log = guest.log.decode(errors="replace")
+    lines = re.findall(r"\[random\] [^\r\n]*", log)
+    for line in lines:
+        print(f"{label}: {line}", flush=True)
+    for source in sources:
+        if not re.search(rf"\[random\] {re.escape(source)}: (256|512) bits", log):
+            fail(guest, f"{label}: no {source} in the boot log")
+    if seeded != ("[random] generator seeded" in log):
+        fail(guest, f"{label}: seeded should be {seeded}")
+    if seeded == ("[random] WARNING: no trusted source" in log):
+        fail(guest, f"{label}: the no-source warning should be {'absent' if seeded else 'there'}")
+    guest.send("ktest user-memory\r")
+    before = int(guest.capture(r"frames-free=(\d+) "))
+
+    start = len(guest.log)
+    flags = "--random" if seeded else "--random --unseeded"
+    guest.send(f"/bin/rtest {flags} 2>&1; echo rtest-status-$?\r")
+    status = guest.capture(r"rtest-status-(\d+)", 300)
+    text = guest.log[start:guest.mark].decode(errors="replace")
+    failed = re.findall(r"rtest ([a-z0-9-]+): FAILED \(([^\r\n]*)\)", text)
+    if failed or "rtest: all ok" not in text or status != "0":
+        fail(guest, f"{label}: rtest {flags} failed: {failed}")
+    checks = dict(re.findall(r"rtest ([a-z0-9-]+): ok \(([^\r\n]*)\)", text))
+    wanted = RANDOM_CHECKS if seeded else UNSEEDED_CHECKS
+    missing = [name for name in wanted if name not in checks]
+    if missing:
+        fail(guest, f"{label}: rtest {flags} didn't run {missing}")
+    for name in wanted:
+        print(f"{label}: {name}: {checks[name]}", flush=True)
+    sample = re.search(r"rtest random-sample: ([0-9a-f]+)", text).group(1)
+
+    time.sleep(1)
+    guest.send("ktest user-memory\r")
+    after = int(guest.capture(r"frames-free=(\d+) "))
+    if after != before:
+        fail(guest, f"{label}: frames leaked: {before} -> {after}")
+    guest.run("echo survived-$((6 * 7))", "survived-42")
+    print(f"{label}: frames back: {before} -> {after}, sample {sample}", flush=True)
+    guest.send("poweroff\r")
+    guest.wait_exit()
+    return sample
+
+
+def random_test(arch, kernel):
+    """The random number generator and `CLOCK_SETTIME` (stage 1e.1). x86_64 with `-cpu
+    max`, seeded from `RDSEED` (or `RDRAND`), and with `max,-rdrand,-rdseed` and so no
+    trusted source: the warning is logged, `GRND_NONBLOCK` says `EAGAIN`, a blocking call
+    waits until a signal, and `GRND_INSECURE` and `/dev/urandom` work. AArch64 with
+    `cortex-a53`, seeded from the device tree's `rng-seed`, and `-cpu max`, from `RNDR`
+    too. Every boot's output differs from every other's."""
+    if arch == "x64":
+        rdseed = "RDSEED"
+        boots = [("max", True, [rdseed]), ("max", True, [rdseed]), ("max,-rdrand,-rdseed", False, [])]
+    else:
+        seed = "the device tree's rng-seed"
+        boots = [("cortex-a53", True, [seed]), ("cortex-a53", True, [seed]), ("max", True, ["RNDR", seed])]
+    samples = [random_boot(arch, kernel, cpu, seeded, sources) for cpu, seeded, sources in boots]
+    if len(set(samples)) != len(samples):
+        print(f"random {arch}: boots gave the same output: {samples}", flush=True)
+        sys.exit(1)
+    print(f"random {arch}: {len(samples)} boots, all different: {' '.join(samples)}", flush=True)
+
+
 FTEST_CHECKS = (
     "dup3-shares-offset", "dup3-cloexec", "fcntl-dupfd-lowest", "fcntl-getfl-setfl",
     "pipe2-nonblock-eagain", "pipe2-cloexec", "pipe-eof-after-last-writer", "pipe-epipe",
@@ -2078,7 +2160,7 @@ def posix_fs_test(arch, kernel):
     # The RAM root keeps no owners, where `/tmp` (stage 1c.3) does.
     guest.run("mkdir /open; /bin/permtest --permissionless /open; echo open-status-$?", "open-status-0")
     # What a shell sees of `/dev` and `/proc` too: the same mounts, no process of its own.
-    guest.run("ls /dev | tr '\\n' ' '", "console fd full null shm stderr stdin stdout tty zero")
+    guest.run("ls /dev | tr '\\n' ' '", "console fd full null random shm stderr stdin stdout tty urandom zero")
     guest.run("ls /proc | wc -l | tr 0 E", "\nE")
     guest.run("mount | grep -cE ' on /(proc|dev|dev/shm|tmp) type' | tr 4 F", "\nF")
     guest.run("echo survived-$((6 * 7))", "survived-42")
@@ -2123,7 +2205,16 @@ PTEST_CHECKS = (
     "wait4-pgroup", "wait4-echild", "wait4-wuntraced", "wait4-wcontinued", "kill-stop-cont",
     "kill-zero-checks", "kill-pgroup", "kill-unreaped-child-ok", "kill-tid-esrch", "stop-mid-call-no-lockup",
     "pid-not-reused-while-unreaped", "orphan-runs-on", "getrusage-children",
+) + (
+    # Stage 1d.1: `FORK`, which `ptest --fork` runs alone too.
+    "fork-returns-twice", "fork-memory-isolated", "fork-shared-anon-shared", "fork-shared-futex",
+    "fork-file-private-cow", "fork-fds-share-offset", "fork-flock-shared", "fork-in-threaded-parent",
+    "fork-while-sibling-futex-waits", "fork-child-futex-isolated", "fork-tid-refreshed", "fork-no-clear-word",
+    "fork-tls-inherited", "fork-exec", "fork-wait", "fork-1000",
 )
+
+FORK_CHECKS = PTEST_CHECKS[PTEST_CHECKS.index("fork-returns-twice"):]
+FORK_PROBES = ("fork-bomb", "fork-munmap-race", "fork-enomem", "cow-write-from-kernel", "fork-during-disk-read")
 
 
 def posix_proc_test(arch, kernel):
@@ -2157,6 +2248,11 @@ def posix_proc_test(arch, kernel):
         guest.run("FOO=bar /bin/ptest --env | tr a-z A-Z", "\nBAR")
         guest.run("export FOO=exported; /bin/ptest --env | tr a-z A-Z", "\nEXPORTED")
         guest.run("unset FOO; /bin/ptest --env", "(unset)")
+        # The user-mode shell (stage 1c.12) gets the kernel shell's environment, and its
+        # programs get it from it.
+        guest.send("FOO=via-user-sh /bin/sh -c '/bin/ptest --env; echo $((2 + 3))-$FOO' | tr a-z A-Z\r")
+        guest.expect("\nVIA-USER-SH")
+        guest.expect("5-VIA-USER-SH")
         # A NUL in an exported value (`read` keeps it) ends the value there, as a C
         # string would, and leaves the environment and the aux vector after it whole.
         guest.send("printf 'x\\0y\\n' | { read FOO; export FOO; /bin/ptest --env-whole; }; unset FOO\r")
@@ -2218,6 +2314,75 @@ def posix_proc_test(arch, kernel):
         guest.wait_exit()
 
 
+def fork_test(arch, kernel):
+    """`FORK` (stage 1d.1): `ptest --fork` through every check (both returns, memory
+    copied on write and shared mappings shared, files and locks shared through their
+    descriptions, a fork from a threaded parent and around futex waits, the child's own
+    tid and no clear word, `EXEC` and `WAIT4` after it, a thousand in a row);
+    `vmcheck --fork`, the same address with different data in parent and child; the
+    malicious fork probes (a fork bomb, an unmap racing the child, a fork with no memory to
+    promise, the kernel writing into a shared page, a disk read in flight across the
+    fork); and `ktest fork-promises`, ten thousand forks with the machine's promises back
+    where they started. Every frame comes back. On four CPUs and on one."""
+    for smp in (4, 1):
+        label = f"fork {arch} smp={smp}"
+        guest = Guest(user_command(arch, kernel, smp=smp))
+        guest.boot_to_shell()
+        guest.send("ktest user-memory\r")
+        before = int(guest.capture(r"frames-free=(\d+) "))
+
+        start = len(guest.log)
+        guest.send("/bin/ptest --fork 2>&1; echo ptest-status-$?\r")
+        status = guest.capture(r"ptest-status-(\d+)", 600)
+        text = guest.log[start:guest.mark].decode(errors="replace")
+        failed = re.findall(r"ptest ([a-z0-9-]+): FAILED \(([^\r\n]*)\)", text)
+        if failed or "ptest: all ok" not in text or status != "0":
+            fail(guest, f"{label}: ptest --fork failed: {failed}")
+        checks = dict(re.findall(r"ptest ([a-z0-9-]+): ok \(([^\r\n]*)\)", text))
+        missing = [name for name in FORK_CHECKS if name not in checks]
+        if missing:
+            fail(guest, f"{label}: ptest --fork didn't run {missing}")
+        for name in FORK_CHECKS:
+            print(f"{label}: {name}: {checks[name]}", flush=True)
+
+        start = len(guest.log)
+        guest.send("/bin/vmcheck --fork; echo vm-$?\r")
+        guest.expect("vmcheck: separate", 60)
+        guest.expect("vm-0")
+        found = re.findall(rb"vmcheck (parent|child) pid=(\d+) static=(0x[0-9a-f]+) mmap=(0x[0-9a-f]+) value=(\d+) intact=(\w+)", guest.log[start:])
+        parent = next(item for item in found if item[0] == b"parent")
+        child = next(item for item in found if item[0] == b"child")
+        if parent[2:4] != child[2:4] or parent[1] == child[1] or parent[4] == child[4] or b"false" in (parent[5], child[5]):
+            fail(guest, f"{label}: vmcheck --fork: {parent} {child}")
+        print(f"{label}: vmcheck --fork: same address {parent[3].decode()}, values {parent[4].decode()} and {child[4].decode()}", flush=True)
+
+        for probe in FORK_PROBES:
+            start = len(guest.log)
+            guest.send(f"/bin/malicious --{probe}; echo probe-status-$?\r")
+            status = guest.capture(r"probe-status-(\d+)", 600)
+            text = guest.log[start:guest.mark].decode(errors="replace")
+            said = re.findall(r"^[^\r\n]*-?[a-z-]+: [^\r\n]*", text, re.M)
+            if status != "0":
+                fail(guest, f"{label}: {probe} exited {status}: {said}")
+            print(f"{label}: {probe}: {said[-1].strip() if said else 'ok'}", flush=True)
+        guest.run("echo survived-$((6 * 7))", "survived-42")
+
+        guest.send("ktest fork-promises\r")
+        report = guest.capture(r"\[ktest\] (fork-promises: [^\r\n]*)", 600)
+        print(f"{label}: {report}", flush=True)
+        if "ok=true" not in report:
+            fail(guest, f"{label}: {report}")
+
+        time.sleep(1)
+        guest.send("ktest user-memory\r")
+        after = int(guest.capture(r"frames-free=(\d+) "))
+        if after != before:
+            fail(guest, f"{label}: frames leaked: {before} -> {after}")
+        print(f"{label}: frames back: {before} -> {after}", flush=True)
+        guest.send("poweroff\r")
+        guest.wait_exit()
+
+
 SIGTEST_CHECKS = (
     "handler-runs", "siginfo-pid-uid", "ucontext-has-registers", "sigreturn-restores-registers",
     "sa-resethand", "sa-nodefer", "segv-handler-skips-instruction", "sigill", "sigtrap",
@@ -2228,7 +2393,7 @@ SIGTEST_CHECKS = (
     # which thread takes a process signal, `SPAWN2`'s signal flags and `SETITIMER`.
     "mask-blocks-then-delivers", "sigprocmask-unblock-delivers-before-return", "sigpending", "sigsuspend",
     "altstack-used", "stack-overflow-handler", "eintr-read", "eintr-partial-write", "sa-restart-read",
-    "sa-restart-wait4", "thread-kill-targets-thread", "process-signal-unblocked-thread", "process-signal-once",
+    "eintr-wait4", "sa-restart-wait4", "thread-kill-targets-thread", "process-signal-unblocked-thread", "process-signal-once",
     "ipi-prompt-delivery", "spawn2-sigmask", "spawn2-setsigdef", "alarm-interrupts-read", "setitimer-interval",
     "getitimer-reads",
 )
@@ -2268,6 +2433,174 @@ def signals_test(arch, kernel):
         # A fault with no handler ends the program as it always did, and the machine
         # carries on.
         guest.run("/bin/malicious --probe null-write; echo unhandled-$?", "unhandled-139")
+        guest.run("echo survived-$((6 * 7))", "survived-42")
+
+        time.sleep(1)
+        guest.send("ktest user-memory\r")
+        after = int(guest.capture(r"frames-free=(\d+) "))
+        if after != before:
+            fail(guest, f"{label}: frames leaked: {before} -> {after}")
+        print(f"{label}: frames back: {before} -> {after}", flush=True)
+        guest.send("poweroff\r")
+        guest.wait_exit()
+
+
+POLLTEST_CHECKS = (
+    "poll-pipe-in-out", "poll-hup", "poll-nval", "poll-timeout", "poll-sigmask", "poll-many",
+    "poll-unknown-events-accepted", "poll-woken-by-other-thread", "poll-dev-null", "isatty-console",
+    "isatty-pipe-false", "winsize", "fionread", "tcdrain", "tcflush", "tcgetsid",
+    "dev-tty-opens-terminal", "vmin-vtime-read", "background-read-sigttin", "spawn2-tcsetpgrp",
+)
+
+
+def poll_test(arch, kernel):
+    """`POLL`, `IOCTL` and the terminal (stage 1c.11): `polltest` through every check, on
+    the terminal the serial shell starts it on; raw mode reading one key with no Enter;
+    typed keys counted and flushed, and a write held by `TCOOFF`;
+    Ctrl-C ending a user program through the kernel's `ISIG`, not the shell; and keys
+    typed ahead of a program that never reads them still the shell's afterwards. Every
+    frame comes back. On four CPUs and on one."""
+    for smp in (4, 1):
+        label = f"poll {arch} smp={smp}"
+        guest = Guest(user_command(arch, kernel, smp=smp))
+        guest.boot_to_shell()
+        guest.send("ktest user-memory\r")
+        before = int(guest.capture(r"frames-free=(\d+) "))
+
+        start = len(guest.log)
+        guest.send("/bin/polltest; echo polltest-status-$?\r")
+        status = guest.capture(r"polltest-status-(\d+)", 300)
+        text = guest.log[start:guest.mark].decode(errors="replace")
+        failed = re.findall(r"polltest ([a-z0-9-]+): FAILED \(([^\r\n]*)\)", text)
+        if failed or "polltest: all ok" not in text or status != "0":
+            fail(guest, f"{label}: polltest failed: {failed}")
+        checks = dict(re.findall(r"polltest ([a-z0-9-]+): ok \(([^\r\n]*)\)", text))
+        missing = [name for name in POLLTEST_CHECKS if name not in checks]
+        if missing:
+            fail(guest, f"{label}: polltest didn't run {missing}")
+        for name in POLLTEST_CHECKS:
+            print(f"{label}: {name}: {checks[name]}", flush=True)
+
+        # Raw mode: one key, no Enter, is a read.
+        guest.send("/bin/polltest --raw-key; echo raw-status-$?\r")
+        guest.expect("polltest raw: ready")
+        time.sleep(0.5)
+        guest.send("x")
+        got = guest.capture(r"polltest tcsetattr-raw: (ok \([^\r\n]*\)|FAILED[^\r\n]*)")
+        guest.expect("raw-status-0")
+        if got != "ok (read 1: 120)":
+            fail(guest, f"{label}: raw mode: {got}")
+        print(f"{label}: tcsetattr-raw: {got}", flush=True)
+
+        # Keys typed into raw mode are counted by `FD_NREAD` and dropped by `TCIFLUSH`
+        # in the kernel's terminal; `TCOOFF` holds a write until `TCOON`.
+        guest.send("/bin/polltest --flush; echo flush-status-$?\r")
+        guest.expect("polltest flush: ready")
+        time.sleep(0.5)
+        guest.send("abc")
+        for name in ("tcflush-input", "tcooff-holds-write"):
+            got = guest.capture(rf"polltest {name}: (ok \([^\r\n]*\)|FAILED[^\r\n]*)")
+            if not got.startswith("ok"):
+                fail(guest, f"{label}: {name}: {got}")
+            print(f"{label}: {name}: {got}", flush=True)
+        guest.expect("flush-status-0")
+
+        # Ctrl-C reaches a program that never reads, through its terminal's `ISIG`.
+        guest.send("/bin/spin 6 0\r")
+        time.sleep(2)
+        guest.send("\x03")
+        guest.run("echo \"isig-$?\"", "isig-130")
+        print(f"{label}: Ctrl-C ended a user program through ISIG", flush=True)
+        # A line typed while a program runs that doesn't read is the shell's after.
+        guest.send("/bin/spin 7 1500\r")
+        time.sleep(0.5)
+        guest.send("echo typed-ahead-$((40 + 2))\r")
+        guest.expect("typed-ahead-42", 30)
+        print(f"{label}: keys typed ahead of a program stayed the shell's", flush=True)
+        # And a cooked line reaches a program that reads one.
+        guest.send("/bin/cat\r")
+        time.sleep(1)
+        guest.send("cooked-ab\x7fc\r")
+        guest.expect("cooked-ac", 30)
+        guest.send("\x04")
+        guest.run("echo cat-$?", "cat-0")
+        print(f"{label}: a cooked line, erase and end of file through the terminal", flush=True)
+
+        time.sleep(1)
+        guest.send("ktest user-memory\r")
+        after = int(guest.capture(r"frames-free=(\d+) "))
+        if after != before:
+            fail(guest, f"{label}: frames leaked: {before} -> {after}")
+        print(f"{label}: frames back: {before} -> {after}", flush=True)
+        guest.send("poweroff\r")
+        guest.wait_exit()
+
+
+SHTEST_CHECKS = (
+    "sh-c-echo", "sh-status", "sh-pipeline", "sh-redirections", "sh-cd-relative-program",
+    "sh-script-file", "sh-shebang-via-exec", "sh-enoexec-fallback", "sh-env-to-children",
+    "sh-exec-builtin", "sh-trap-term", "sh-background-jobs", "sh-no-fd-leak",
+    "sh-inherited-fds", "sh-ignored-on-entry",
+)
+
+
+def usersh_test(arch, kernel):
+    """`/bin/sh` as a user program (stage 1c.12): `shtest` through every check; then an
+    interactive `/bin/sh` on the serial console's terminal, started from the kernel's
+    shell: commands, a pipeline of programs, Ctrl-C ending the job in the foreground and
+    not the shell, Ctrl-Z stopping one, `bg` and `kill %1`, and `exit` back to the kernel's
+    shell; and a script recursing 10,000 functions ending cleanly. Every frame comes back.
+    On four CPUs and on one."""
+    for smp in (4, 1):
+        label = f"usersh {arch} smp={smp}"
+        guest = Guest(user_command(arch, kernel, smp=smp))
+        guest.boot_to_shell()
+        guest.send("ktest user-memory\r")
+        before = int(guest.capture(r"frames-free=(\d+) "))
+
+        start = len(guest.log)
+        guest.send("/bin/shtest 2>&1; echo shtest-status-$?\r")
+        status = guest.capture(r"shtest-status-(\d+)", 600)
+        text = guest.log[start:guest.mark].decode(errors="replace")
+        failed = re.findall(r"shtest ([a-z0-9-]+): FAILED \(([^\r\n]*)\)", text)
+        if failed or "shtest: all ok" not in text or status != "0":
+            fail(guest, f"{label}: shtest failed: {failed}")
+        checks = dict(re.findall(r"shtest ([a-z0-9-]+): ok \(([^\r\n]*)\)", text))
+        missing = [name for name in SHTEST_CHECKS if name not in checks]
+        if missing:
+            fail(guest, f"{label}: shtest didn't run {missing}")
+        for name in SHTEST_CHECKS:
+            print(f"{label}: {name}: {checks[name][:160]}", flush=True)
+
+        # An interactive /bin/sh on the console's terminal. Its prompt says it's the user
+        # program, not the kernel's shell, and `$$` is its pid.
+        guest.send("PS1='usersh> ' /bin/sh\r")
+        guest.expect("\nusersh> ", 60)
+        guest.send("echo shell-pid-$$\r")
+        pid = guest.capture(r"shell-pid-(\d+)")
+        guest.run("echo inside-$((6 * 7))", "inside-42")
+        guest.run("/bin/ptest --emit 3000 | /bin/ptest --count-stdin", "lines=3000 bytes=48000")
+        guest.expect("usersh> ")
+        # Ctrl-C reaches the job, whose group has the terminal; the shell carries on.
+        guest.send("/bin/spin 6 0\r")
+        time.sleep(2)
+        guest.send("\x03")
+        guest.run("echo after-ctrl-c-$?-$$", f"after-ctrl-c-130-{pid}")
+        print(f"{label}: sh-ctrl-c-ends-job-not-shell: ok (the job ended 130, the shell {pid} went on)", flush=True)
+        # Ctrl-Z stops the job, which stays one: `bg` lets it go on, `kill %1` ends it.
+        guest.send("/bin/spin 7 0\r")
+        time.sleep(2)
+        guest.send("\x1a")
+        guest.expect("Stopped", 30)
+        guest.run("jobs | tr a-z A-Z", "STOPPED")
+        guest.run("bg >/dev/null; kill %1; wait %1; echo bg-killed-$?", "bg-killed-143")
+        print(f"{label}: job control: Ctrl-Z stopped a job, bg and kill %1 ended it", flush=True)
+        guest.send("exit 3\r")
+        guest.run("echo back-$?", "back-3")
+        print(f"{label}: exit left the user shell for the kernel's", flush=True)
+
+        # A script recursing as deep as it likes ends with the shell's error.
+        guest.run("/bin/sh -c 'f() { f $(($1 + 1)); }; f 0' 2>&1 | tr a-z A-Z", "MAXIMUM NESTING DEPTH")
         guest.run("echo survived-$((6 * 7))", "survived-42")
 
         time.sleep(1)
@@ -2552,18 +2885,30 @@ def terminal_test(arch, kernel):
     time.sleep(1)
     guest.send(" > /tmp/pasted\r")
     time.sleep(2)
-    # Ctrl-C in the window ends a user program, through the shell's `SIGINT`.
+    # Ctrl-C in the window ends a user program, through its terminal's `ISIG` (stage
+    # 1c.11): the window passes the key on raw, and the kernel raises `SIGINT`.
     guest.send("/bin/spin 6 0\r")
     time.sleep(2)
     guest.send("\x03")
     time.sleep(2)
     guest.send("echo \"uc-$?\" > /tmp/ctrl-c; ps > /tmp/ctrl-c-ps\r")
     time.sleep(2)
+    # And in /bin/sh run in the window (stage 1c.12): Ctrl-C ends its job, not it.
+    guest.send("/bin/sh\r")
+    time.sleep(2)
+    guest.send("/bin/spin 6 0\r")
+    time.sleep(2)
+    guest.send("\x03")
+    time.sleep(2)
+    guest.send("echo \"usersh-$?-alive\" > /tmp/usersh-ctrl-c; exit\r")
+    time.sleep(2)
     guest.send("\x1c")
     guest.expect("entering the serial shell")
     guest.run("cat /tmp/pasted", "got-SELECT-ME-42")
     guest.run("cat /tmp/ctrl-c", "uc-130")
     guest.run("grep -c spin /tmp/ctrl-c-ps | tr 0 Z", "\nZ")
+    guest.run("cat /tmp/usersh-ctrl-c", "usersh-130-alive")
+    print(f"terminal {arch}: Ctrl-C ended a job of /bin/sh in the window, and not the shell", flush=True)
     print(f"terminal {arch}: Ctrl-C ended a user program", flush=True)
     print(f"terminal {arch}: a drag copied and pasted back through the clipboard", flush=True)
     # A running program's file can't be written over, by a kernel app either.
@@ -3251,7 +3596,7 @@ def main():
         sys.exit(__doc__)
     arch, kernel = sys.argv[1:]
     only = os.environ.get("FEOS_BOOT_TEST_ONLY")
-    if only in ("milestone", "partition", "format", "install", "persistence", "gpu", "transport", "smp", "irq", "ram", "fault", "sched", "gicv3", "net", "usb", "efi", "el", "input", "user", "mmap", "threads", "time", "hosted", "jobs", "names", "settings", "terminal", "search", "resolution", "fonts", "native", "posix-fs", "posix-proc", "signals"):
+    if only in ("milestone", "partition", "format", "install", "persistence", "gpu", "transport", "smp", "irq", "ram", "fault", "sched", "gicv3", "net", "usb", "efi", "el", "input", "user", "mmap", "threads", "time", "hosted", "jobs", "names", "settings", "terminal", "search", "resolution", "fonts", "native", "posix-fs", "posix-proc", "fork", "signals", "poll", "usersh", "random"):
         globals()[only.replace("-", "_") + "_test"](arch, kernel)
         print(f"{only} boot test passed: {arch}")
         return
@@ -3279,7 +3624,10 @@ def main():
     time_test(arch, kernel)
     posix_fs_test(arch, kernel)
     posix_proc_test(arch, kernel)
+    fork_test(arch, kernel)
     signals_test(arch, kernel)
+    poll_test(arch, kernel)
+    usersh_test(arch, kernel)
     hosted_test(arch, kernel)
     jobs_test(arch, kernel)
     names_test(arch, kernel)

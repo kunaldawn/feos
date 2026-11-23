@@ -401,6 +401,14 @@ impl Arch for X86_64 {
         (u64::from(core::arch::x86_64::__cpuid(1).edx), 0)
     }
 
+    fn hardware_random() -> Option<u64> {
+        cpu::hardware_random()
+    }
+
+    fn hardware_random_name() -> Option<&'static str> {
+        cpu::hardware_random_name()
+    }
+
     // `CR4.FSGSBASE` is clear: only a selector load changes the FS base from ring 3, and
     // what that leaves isn't the thread's, so the kernel's copy is written at every
     // switch in, with nothing cached per CPU.

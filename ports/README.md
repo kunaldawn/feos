@@ -37,6 +37,7 @@ committing, see `PATCHES.md`).
 | `src/ninja` | ninja-build/ninja | `v1.13.2` (`3441b633`) | latest release |
 | `src/make` | GNU make (Savannah) | `4.4.1` (`d66a65ad`) | latest release |
 | `src/cbindgen` | mozilla/cbindgen | `v0.29.4` (`b826cb89`) | latest release; relibc generates its headers with it |
+| `src/libc-test` | musl's libc-test, from its repo.or.cz mirror (`https://repo.or.cz/libc-test.git`, the one musl's site points to, which serves the smart protocol and fetches by hash) | `master` at `63e36e93` | no releases; the C library test suite track T2 runs on feos |
 
 GNU make from git has no generated `configure`, so its first build needs autoconf and
 automake on the host. Once one make exists anywhere, it builds the next.
@@ -141,7 +142,25 @@ Every build and test runs in it with `--network none`, the tree at `/src` and th
 | `test/stage-t0.sh` | a base snapshot's kernels with injected programs, booted | `ports-base-target/` |
 | `test/build-t1.sh` | stage T1's C programs (`test/c/t1`) with `toolchain/bin/<arch>-unknown-feos-cc` | `t1/<arch>/` |
 | `test/stage-t1.sh [REF]` | cbindgen and relibc for feos (no-ops when built and unchanged, so a fresh volume works), the T1 programs injected into a base (default `refs/feos-checkpoints/1c.6`), both ports booted | `ports-base-target/` |
-| `test/abi-check.sh [REF]` | host test: relibc's feos constants against a base's `feos-abi` | `abi-check-target/` |
+| `test/abi-check.sh [REF]` | host test: relibc's feos constants against a base's `feos-abi`, and its header constants (section 5's signal ones, `PTHREAD_STACK_MIN`) against the design | `abi-check-target/` |
+| `sysroot.sh x86_64\|aarch64\|all [--libc-only]` | the feos sysroot from relibc's feos build: `usr/include`, `usr/lib/{crt0.o,crt1.o,crti.o,crtn.o,libc.a,libm.a,libcompiler_builtins.a}`, empty `lib{pthread,dl,rt,crypt,util,resolv,xnet}.a`, `usr/share/feos-sysroot/MANIFEST`; with T5's runtimes built, `usr/include/c++/v1`, `usr/lib/{libc++,libc++abi,libc++experimental,libunwind}.a` and compiler-rt in `usr/lib/clang/23/lib/<triple>/` too (`--libc-only`: relibc alone, into `sysroot-libc/`) | `sysroot/<arch>-unknown-feos/` |
+| `test/build-libc-suite.sh [ARCH...]` | everything the libc suite puts in the image: relibc for feos, the sysroot, `testrun` and `sysroot-check` (`test/c/suite`), relibc's tests (`build-relibc-tests.sh`, selection `test/relibc-feos.txt`), the libc-test subset (`build-libc-test.sh`, selection `test/libc-test-feos.txt`) | `libc-suite/<arch>/` |
+| `test/libc-suite.sh [REF]` | stage T2's one entry point: the above, the sysroot installed at `/usr` in a base's image (default `HEAD`) with the payloads, both kernels, `specs/libc-suite.toml` on each port | `libc-suite/boot-{arm,x64}.log` |
+| `test/libc-suite-linux.sh [ARCH...]` | the suite's Linux reference: the same tests against relibc's Linux platform, run on the host (AArch64 under qemu-user) | `libc-suite/linux-<arch>/` |
+| `build-libunwind.sh x86_64\|aarch64\|all` | LLVM's libunwind, static, from `src/rust/src/llvm-project/libunwind` with the C driver (track T3) | `libunwind/<arch>-unknown-feos/libunwind.a` |
+| `build-std.sh x86_64\|aarch64\|all` | Rust's std for feos: relibc, the sysroot and libunwind first (no-ops when built), then `-Zbuild-std=std,panic_unwind` of the patched `src/rust/library` (libc from `src/libc`) with the host rustc 1.99.1, laid out as a rustc sysroot | `rust-sysroot/lib/rustlib/<arch>-unknown-feos/lib`; cargo's in `std-target/` |
+| `test/libc-check/libc-check.sh [ARCH...]` | host test: the libc crate's feos module against relibc's headers and `libc.a` (sizes, alignments, offsets, constants, function signatures), both architectures; differences allowed only as listed in `test/libc-check/allow.txt` | `libc-check/<arch>/` |
+| `test/rust/build.sh [ARCH...]` | stage T3's Rust programs (`test/rust/t3/*.rs`) with rustc directly against that sysroot, each checked a static `ET_EXEC` with `PT_GNU_EH_FRAME` | `t3/<arch>/` |
+| `test/stage-t3.sh [REF]` | stage T3's one entry point: std and the programs (no-ops when built), `libc-check`, the programs injected as `/bin/t3-*` into a base (default `refs/feos-checkpoints/1c.10`), `specs/t3-rust.toml` on each port with a native disk at `/native0` and 1 GiB of RAM | `ports-base-target/` |
+| `build-rust.sh [X.PY ARGS...]` | track T4's toolchain: relibc and the sysroot for both feos targets (no-ops when built), then rust's own `x.py build --stage 1 library cargo` with `rust-bootstrap.toml` (LLVM, clang and lld from `src/rust/src/llvm-project`; rustc with `x86_64-unknown-feos` and `aarch64-unknown-feos` built in; std for those and `x86_64-unknown-linux-gnu`; cargo), laid out as one toolchain directory, with the library sources copied in as rust-src (not `x.py dist rust-src`; see `docs/toolchain.md`) | `rust-build/` (bootstrap's, with LLVM's install at `rust-build/x86_64-unknown-linux-gnu/llvm`: `bin/clang`, `llvm-*`), `rust-feos/` (the toolchain: `bin/{rustc,rustdoc,cargo}`, `lib/rustlib/`) |
+| `test/rust/t4-host.sh` | host test: the built-in targets against T1's JSON specs (`--print target-spec-json`, `--print cfg`), stage T3's programs and `test/rust/t4-cargo` (vendored serde, serde_json, memchr, itoa) built with them and `rust-feos`'s cargo, offline, no `RUSTC_BOOTSTRAP` | `t4/` |
+| `test/stage-t4.sh [REF]` | stage T4's one entry point: `build-rust.sh` (`PORTS_T4_NO_BUILD=1` skips it), `t4-host.sh`, T3's programs (rebuilt) as `/bin/t3-*` and the cargo project as `/bin/t4-cargo` in a base (default `refs/feos-checkpoints/1c.11`), `specs/t3-rust.toml` and `specs/t4-rust.toml` on each port | `ports-base-target/` |
+| `build-clang.sh` | track T5's C/C++ toolchain: clang with the feos driver, rebuilt by ninja in T4's LLVM build tree (only what the driver changed), with lld and the LLVM binutils, laid out as one directory | `llvm-feos/` (`bin/clang`, `clang++`, `<arch>-unknown-feos-clang{,++}`, `ld.lld`, `llvm-*`; `lib/clang/23/`) |
+| `build-runtimes.sh x86_64\|aarch64\|all` | LLVM's runtimes for feos with that clang and `cmake/<arch>-unknown-feos.cmake` (CMake's `Feos` system, `cmake/Platform/Feos.cmake`): compiler-rt's builtins and crtbegin/crtend, libunwind, libc++abi, libc++, static, against relibc; then into the sysroot (`sysroot.sh`) and the toolchain | `runtimes/<arch>-unknown-feos/`, `sysroot/<arch>-unknown-feos/`, `llvm-feos/<arch>-unknown-feos/` (clang's default sysroot) |
+| `test/clang-lit/run.py [LIT ARGS] TEST...` | clang's lit tests (e.g. `clang/test/Driver/feos.c`) against T4's LLVM build, which was configured without tests: writes the site configuration and runs `llvm/utils/lit` | `clang-lit/` |
+| `test/t5/build.sh [ARCH...]` | stage T5's programs: C with `clang --target=<arch>-unknown-feos` alone, C++ with clang++, Rust with T4's rustc and T5's libunwind, a Rust static library in a C++ program | `t5/<arch>/` |
+| `test/stage-t5.sh [REF]` | stage T5's one entry point: the three builds above (`PORTS_T5_NO_BUILD=1` skips them), the driver's lit test, the programs as `/bin/t5-*` and the sysroot at `/usr` in a base (default `refs/feos-checkpoints/1c.12`), `specs/t5-toolchain.toml` on each port (`PORTS_T5_NO_BOOT=1` stops before booting) | `ports-base-target/` |
+| `test/suite-report.py [BUILD]` | the per-test table in `docs/toolchain.md` from the two runs | stdout |
 | `test/test-fresh.sh [A B]` | the base at two commits in turn, checking each kernel is its own commit's | `ports-base-target/` |
 
 `docs/toolchain.md` has how each piece is built, the test harness, what's tested and
@@ -151,11 +170,15 @@ and `KERNEL-ISSUES.md` the kernel problems found on the way.
 ## Targets and the C driver
 
 `targets/x86_64-unknown-feos.json` and `targets/aarch64-unknown-feos.json` are the Rust
-targets until rustc has them built in (stage T4); relibc builds against them with
-`-Zjson-target-spec`. `toolchain/bin/feos-cc`, called as `x86_64-unknown-feos-cc` or
+targets for the image's rust 1.99.1, which relibc and T3's std build against with
+`-Zjson-target-spec`. `src/rust`'s rustc has them built in (stage T4, `build-rust.sh`);
+`test/rust/t4-host.sh` checks the two agree field by field. `toolchain/bin/feos-cc`, called as `x86_64-unknown-feos-cc` or
 `aarch64-unknown-feos-cc`, is generation 0's C compiler: the host clang and ld.lld with
 the feos sysroot, the feos link layout and relibc's crt objects. `docs/toolchain.md`
-says what each sets and why.
+says what each sets and why. Since T5, `src/rust/src/llvm-project`'s clang knows the
+feos triples itself (`build-clang.sh`'s `/build/llvm-feos/bin/clang
+--target=<arch>-unknown-feos`, no other flags); the generation 0 driver still builds
+relibc and the T1 to T4 programs.
 
 ## Testing on feos
 
@@ -179,3 +202,17 @@ reuse that build, and `kernels/{arm,x64}.ref` say which commit each kernel is fr
 SPEC.toml...` boots one with the base's own `scripts/boot-test.py` machinery and runs the
 spec's shell commands, checking output and exit status. Cases that wait on a kernel stage
 are marked `pending` and reported as such, never run as passes. See `docs/toolchain.md`.
+
+The libc suite (track T2) is one command, both ports:
+
+```sh
+ports/test/container.sh libc ports/test/libc-suite.sh [REF]   # default HEAD
+timeout 570 docker wait feos-ports-libc                       # repeat until it prints the status
+```
+
+It builds the sysroot and the test payloads, installs the sysroot at `/usr` in the
+base's image (`/usr/include`, `/usr/lib`, checked on feos by `/bin/sysroot-check`
+against its `MANIFEST`), and runs relibc's own tests and the libc-test subset there with
+`/bin/testrun`. `test/relibc-feos.txt` and `test/libc-test-feos.txt` list each test
+feos doesn't run yet, with the kernel stage it waits on or why it's skipped; everything
+else must pass. `docs/toolchain.md` has the results and the per-test table.

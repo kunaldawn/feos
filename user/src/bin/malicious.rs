@@ -701,22 +701,74 @@ fn mask_probes(tally: &mut Tally, program: &str) {
     // calls: it still ends normally, with its sums right.
     let child = spawn(program, &[program, "--storm-target", "1500"]);
     let mut sent = 0isize;
+    let mut refused = 0isize;
     let start = feos_user::now_ns(feos_user::abi::clock::MONOTONIC);
     if child > 0 {
         feos_user::sleep_ms(50);
+        // Paced by absolute deadlines a millisecond apart, so a slow machine (an emulated
+        // CPU, whose sleeps overshoot) catches up rather than sending fewer.
+        let mut next = feos_user::now_ns(feos_user::abi::clock::MONOTONIC);
         while feos_user::now_ns(feos_user::abi::clock::MONOTONIC) - start < 1_000_000_000 {
             if feos_user::kill(child, 10) == 0 {
                 sent += 1;
+            } else {
+                refused += 1;
             }
-            let pause = feos_user::abi::Timespec { sec: 0, nsec: 1_000_000 };
-            feos_user::nanosleep(feos_user::abi::clock::MONOTONIC, 0, &pause, None);
+            next += 1_000_000;
+            let at = feos_user::abi::Timespec { sec: (next / 1_000_000_000) as i64, nsec: (next % 1_000_000_000) as i64 };
+            feos_user::nanosleep(feos_user::abi::clock::MONOTONIC, feos_user::abi::timer::ABSTIME, &at, None);
         }
     }
     let status = if child > 0 { wait(child as usize) } else { child };
-    println!("probe signal-storm: {sent} signals sent");
-    tally.report("signal-storm", status == 0 && sent > 100, status);
+    println!("probe signal-storm: {sent} signals sent, {refused} refused, child status {status}");
+    // Paced as it is, about a thousand go; several hundred, all of them taken, still
+    // shows a storm, while leaving room for an emulated single CPU, where the busy child
+    // can hold the CPU past a deadline or two.
+    tally.report("signal-storm", status == 0 && sent >= 500 && refused == 0, status);
 
     toctou_setitimer(tally);
+    setitimer_tiny_interval(tally);
+}
+
+/// An `ITIMER_REAL` of a microsecond, with an interval of one: the kernel re-arms no
+/// faster than its floor, a millisecond, so for half a second its `SIGALRM`, caught,
+/// comes some hundreds of times, not hundreds of thousands, and the alarm task, which
+/// runs above every program, leaves a busy loop most of the CPU it had without the timer;
+/// again with `SIGALRM` blocked, where it stays pending and the timer keeps going off.
+fn setitimer_tiny_interval(tally: &mut Tally) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use feos_user::abi::{clock, sig};
+    use feos_user::signal::{block, handle, set_disposition, setitimer, timer_us, unblock};
+    static ALARMS: AtomicU32 = AtomicU32::new(0);
+    extern "C" fn alarm(_: i32, _: *mut feos_user::abi::SigInfo, _: *mut feos_user::abi::UContext) {
+        ALARMS.fetch_add(1, Ordering::Relaxed);
+    }
+    // Percent of `ms` of wall time this thread spends running, spinning throughout.
+    fn share(ms: u64) -> u64 {
+        let wall = feos_user::now_ns(clock::MONOTONIC);
+        let cpu = feos_user::now_ns(clock::THREAD_CPUTIME_ID);
+        let mut spins = 0u64;
+        while feos_user::now_ns(clock::MONOTONIC) - wall < ms * 1_000_000 {
+            spins = core::hint::black_box(spins.wrapping_add(1));
+        }
+        let ran = feos_user::now_ns(clock::THREAD_CPUTIME_ID) - cpu;
+        ran * 100 / (feos_user::now_ns(clock::MONOTONIC) - wall).max(1)
+    }
+    let before = share(300);
+    ALARMS.store(0, Ordering::Relaxed);
+    handle(sig::ALRM, alarm, 0);
+    let armed = setitimer(Some(&timer_us(1, 1)), None);
+    let caught = share(500);
+    let alarms = ALARMS.load(Ordering::Relaxed);
+    block(1 << (sig::ALRM - 1));
+    let blocked = share(500);
+    setitimer(Some(&timer_us(0, 0)), None);
+    // What's pending goes to the handler, then the default is back.
+    unblock(1 << (sig::ALRM - 1));
+    set_disposition(sig::ALRM, feos_user::abi::sa::DFL);
+    println!("probe setitimer-tiny-interval: {alarms} SIGALRMs in 500 ms; CPU {before}% alone, {caught}% caught, {blocked}% blocked");
+    let kept = |during: u64| during * 2 >= before;
+    tally.report("setitimer-tiny-interval", armed == 0 && alarms > 0 && alarms <= 1000 && kept(caught) && kept(blocked), alarms as isize);
 }
 
 /// A child's, for `signal-storm`: for `ms`, sums numbers and moves them through a pipe of
@@ -776,6 +828,14 @@ fn toctou_setitimer(tally: &mut Tally) {
     }
     SIGNAL_FLIPPING.store(true, Ordering::Release);
     let flipping = thread::spawn(flipper, 0);
+    // On one CPU the flipper only runs once this thread gives way: wait until it has
+    // flipped, so the race is run at all.
+    for _ in 0..1000 {
+        if TIMER[1].load(Ordering::Relaxed) != 1 {
+            break;
+        }
+        feos_user::sleep_ms(1);
+    }
     let mut counts = [0usize; 3];
     for _ in 0..2000 {
         let result = syscall(nr::SETITIMER, [0, TIMER.as_ptr() as usize, 0, 0, 0, 0]);
@@ -793,6 +853,137 @@ fn toctou_setitimer(tally: &mut Tally) {
     syscall(nr::SETITIMER, [0, &off as *const ITimerVal as usize, 0, 0, 0, 0]);
     println!("probe toctou-setitimer: set {} EINVAL {} other {} ({rounds} flips)", counts[0], counts[1], counts[2]);
     tally.report("toctou-setitimer", counts[2] == 0 && rounds > 0, counts[2] as isize);
+}
+
+/// `--no-terminal`: `/dev/tty` with no terminal-marked descriptor is `ENXIO`, by
+/// `OPENAT` and by v1's `OPEN`. 0 if both were.
+fn no_terminal() -> i32 {
+    use feos_user::abi::{at, o};
+    let path = "/dev/tty";
+    let (p, l) = (path.as_ptr() as usize, path.len());
+    let v2 = syscall(nr::OPENAT, [at::FDCWD as isize as usize, p, l, o::RDWR, 0, 0]);
+    let v1 = syscall(nr::OPEN, [p, l, flags::READ | flags::WRITE, 0, 0, 0]);
+    i32::from(v2 != -errno::ENXIO) | i32::from(v1 != -errno::ENXIO) << 1
+}
+
+/// `/bin/sh` (stage 1c.12): a script recursing through 10,000 functions ends cleanly,
+/// with the shell's nesting error or `SIGSEGV`'s 139, and the machine carries on. Its
+/// output goes to `/dev/null`.
+fn shell_probes(tally: &mut Tally) {
+    use feos_user::abi::{at, o, spawn_action, SpawnAction};
+    let shell = "/bin/sh";
+    let script = "f() { if [ $1 -lt 10000 ]; then f $(($1 + 1)); fi; }; f 0; echo finished";
+    let null = "/dev/null";
+    let to_null = |fd: i32| SpawnAction {
+        kind: spawn_action::OPEN,
+        fd,
+        open_flags: o::RDWR as u32,
+        path: feos_user::path_at(at::FDCWD, null),
+        ..SpawnAction::default()
+    };
+    let actions = [to_null(0), to_null(1), to_null(2)];
+    let mut argv = [UserStr::default(); 3];
+    let request = feos_user::spawn_request(shell, feos_user::user_strs(&[shell, "-c", script], &mut argv), &[], &actions);
+    let child = feos_user::spawn2(&request);
+    let status = if child > 0 { wait(child as usize) } else { child };
+    tally.report("sh-deep-recursion", status == 2 || status == FAULTED, status);
+}
+
+/// `POLL` and `IOCTL` (stage 1c.11): too many entries, an array in the kernel, requests
+/// that don't exist or aren't a terminal's to answer, pointers into the kernel, a flush
+/// of a queue there isn't, and an array another thread rewrites while the kernel polls.
+fn terminal_probes(tally: &mut Tally) {
+    use feos_user::abi::{ioctl, poll, tc, PollFd, MAX_FDS};
+    let mut entries = [PollFd { fd: 0, events: poll::IN, revents: 0 }; 4];
+    let array = entries.as_mut_ptr() as usize;
+    tally.call("poll-count-too-big", nr::POLL, [array, MAX_FDS + 1, 0, 0, 0, 0], errno::EINVAL);
+    tally.call("poll-kernel-array", nr::POLL, [KERNEL, 1, 0, 0, 0, 0], errno::EFAULT);
+    tally.call("poll-kernel-sigmask", nr::POLL, [array, 1, 0, KERNEL, 0, 0], errno::EFAULT);
+    tally.call("ioctl-unknown", nr::IOCTL, [1, 99, 0, 0, 0, 0], errno::EINVAL);
+    tally.call("ioctl-unknown-huge", nr::IOCTL, [1, 1 << 40 | ioctl::TTY_GET_ATTR, 0, 0, 0, 0], errno::EINVAL);
+    tally.call("ioctl-bad-fd", nr::IOCTL, [900, ioctl::TTY_GET_ATTR, 0, 0, 0, 0], errno::EBADF);
+    let file = open("/bin/hello", flags::READ);
+    let mut termios = [0u8; 60];
+    let out = termios.as_mut_ptr() as usize;
+    if file >= 0 {
+        tally.call("ioctl-tty-on-file", nr::IOCTL, [file as usize, ioctl::TTY_GET_ATTR, out, 0, 0, 0], errno::ENOTTY);
+        tally.call("ioctl-pgrp-on-file", nr::IOCTL, [file as usize, ioctl::TTY_SET_PGRP, out, 0, 0, 0], errno::ENOTTY);
+        close(file as usize);
+    } else {
+        tally.report("ioctl-tty-on-file", false, file);
+    }
+    if let Ok((reader, writer)) = pipe() {
+        tally.call("ioctl-kernel-pointer", nr::IOCTL, [reader, ioctl::FD_NREAD, KERNEL, 0, 0, 0], errno::EFAULT);
+        tally.call("ioctl-tty-on-pipe", nr::IOCTL, [writer, ioctl::TTY_DRAIN, 0, 0, 0, 0], errno::ENOTTY);
+        close(reader);
+        close(writer);
+    }
+    // On the terminal this runs on, if it does: a queue there isn't, and pointers into
+    // the kernel. With none, every one of them is `ENOTTY` first.
+    let terminal = feos_user::isatty(0);
+    let wanted = |error: isize| if terminal { error } else { errno::ENOTTY };
+    tally.call("tty-flush-bad-queue", nr::IOCTL, [0, ioctl::TTY_FLUSH, 7, 0, 0, 0], wanted(errno::EINVAL));
+    tally.call("tty-flow-bad-action", nr::IOCTL, [0, ioctl::TTY_FLOW, tc::ION + 1, 0, 0, 0], wanted(errno::EINVAL));
+    tally.call("tty-get-attr-kernel", nr::IOCTL, [0, ioctl::TTY_GET_ATTR, KERNEL, 0, 0, 0], wanted(errno::EFAULT));
+    tally.call("tty-set-attr-kernel", nr::IOCTL, [0, ioctl::TTY_SET_ATTR, KERNEL, 0, 0, 0], wanted(errno::EFAULT));
+    tally.call("tty-set-pgrp-negative", nr::IOCTL, [0, ioctl::TTY_SET_PGRP, (&-5i32) as *const i32 as usize, 0, 0, 0], wanted(errno::EINVAL));
+    tally.call("tty-set-pgrp-nobody", nr::IOCTL, [0, ioctl::TTY_SET_PGRP, (&0x7fff_0000i32) as *const i32 as usize, 0, 0, 0], wanted(errno::EPERM));
+    toctou_poll_array(tally);
+}
+
+/// A thread rewrites a `POLL` array's descriptors and events between a pipe's read end,
+/// one that isn't open, a negative one and garbage, while the other polls it over and
+/// over: each call reads the array once, so it answers between none and all of the
+/// entries, and never faults.
+fn toctou_poll_array(tally: &mut Tally) {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use feos_user::abi::poll;
+    // Each word is a `PollFd`: `fd` in the low half, `events` and `revents` above.
+    static ARRAY: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    static FLIP_FD: AtomicU64 = AtomicU64::new(0);
+    fn flipper(_: usize) -> usize {
+        let fds = [FLIP_FD.load(Ordering::Relaxed) as u32, 900, u32::MAX, 0x8000_0000, 1];
+        let mut rounds = 0usize;
+        while SIGNAL_FLIPPING.load(Ordering::Acquire) {
+            for (index, word) in ARRAY.iter().enumerate() {
+                let fd = fds[(rounds + index) % fds.len()];
+                let events = if rounds.is_multiple_of(3) { 0xffffu64 } else { poll::IN as u16 as u64 };
+                word.store(u64::from(fd) | events << 32 | 0xbeef << 48, Ordering::Relaxed);
+            }
+            rounds += 1;
+        }
+        rounds
+    }
+    let Ok((reader, writer)) = pipe() else {
+        tally.report("toctou-poll-array", false, -1);
+        return;
+    };
+    feos_user::write(writer, b"x");
+    FLIP_FD.store(reader as u64, Ordering::Relaxed);
+    SIGNAL_FLIPPING.store(true, Ordering::Release);
+    let flipping = thread::spawn(flipper, 0);
+    for _ in 0..1000 {
+        if ARRAY[0].load(Ordering::Relaxed) != 0 {
+            break;
+        }
+        feos_user::sleep_ms(1);
+    }
+    let mut odd = 0usize;
+    let mut answered = 0usize;
+    for _ in 0..2000 {
+        let result = syscall(nr::POLL, [ARRAY.as_ptr() as usize, ARRAY.len(), 0, 0, 0, 0]);
+        if (0..=ARRAY.len() as isize).contains(&result) {
+            answered += 1;
+        } else {
+            odd += 1;
+        }
+    }
+    SIGNAL_FLIPPING.store(false, Ordering::Release);
+    let rounds = flipping.map(thread::Thread::join).unwrap_or(0);
+    close(reader);
+    close(writer);
+    println!("probe toctou-poll-array: {answered} answered, {odd} odd ({rounds} flips)");
+    tally.report("toctou-poll-array", odd == 0 && rounds > 0, odd as isize);
 }
 
 /// A tiny fixed list of names, so the probe list needs no allocation.
@@ -1298,7 +1489,7 @@ fn run_path_flipper(_: usize) -> usize {
 /// not, `/dev/shm` aside; another process's descriptors aren't there to find; and with no
 /// terminal, `/dev/tty` is `ENXIO`.
 fn dev_probes(tally: &mut Tally) {
-    use feos_user::abi::{at, o};
+    use feos_user::abi::{at, o, SpawnAction};
     let cwd = at::FDCWD as isize as usize;
     let named = |path: &'static str| (path.as_ptr() as usize, path.len());
     let mut stat = feos_user::abi::Stat2::default();
@@ -1333,9 +1524,23 @@ fn dev_probes(tally: &mut Tally) {
     tally.call("proc-fd-closed", nr::OPENAT, [cwd, p, l, o::RDONLY, 0, 0], errno::ENOENT);
     let (p, l) = named("/proc/self/maps");
     tally.call("proc-maps-missing", nr::OPENAT, [cwd, p, l, o::RDONLY, 0, 0], errno::ENOENT);
-    let (p, l) = named("/dev/tty");
-    tally.call("dev-tty-without-terminal", nr::OPENAT, [cwd, p, l, o::RDWR, 0, 0], errno::ENXIO);
-    tally.call("dev-tty-v1", nr::OPEN, [p, l, flags::READ | flags::WRITE, 0, 0, 0], errno::ENXIO);
+    // A process with no descriptor on a terminal has none: a child whose standard
+    // streams are all `/dev/null`, by `OPENAT` and by v1's `OPEN`.
+    let null = "/dev/null";
+    let open_null = |fd: i32| SpawnAction {
+        kind: feos_user::abi::spawn_action::OPEN,
+        fd,
+        open_flags: o::RDWR as u32,
+        path: feos_user::path_at(at::FDCWD, null),
+        ..SpawnAction::default()
+    };
+    let actions = [open_null(0), open_null(1), open_null(2)];
+    let mut argv = [UserStr::default(); 2];
+    let argv = feos_user::user_strs(&["/bin/malicious", "--no-terminal"], &mut argv);
+    let request = feos_user::spawn_request("/bin/malicious", argv, &[], &actions);
+    let child = feos_user::spawn2(&request);
+    let status = if child > 0 { wait(child as usize) } else { child };
+    tally.report("dev-tty-without-terminal", status == 0, status);
     let (p, l) = named("/dev/urandom");
     tally.call("dev-urandom-not-yet", nr::OPENAT, [cwd, p, l, o::RDONLY, 0, 0], errno::ENOENT);
     // `/dev/full` can't be mapped: no device but `/dev/zero` is memory.
@@ -2445,6 +2650,97 @@ fn time_probes(tally: &mut Tally) {
     let flips = flipper.map(thread::Thread::join);
     println!("probe toctou-nanosleep: slept={slept} refused={refused} flips={flips:?}");
     tally.report("toctou-nanosleep", other == 0 && slept + refused == 2_000 && flips.is_ok(), other);
+}
+
+/// The `Timespec` `toctou-clock-settime` rewrites: `sec` stays put, `nsec` flips between
+/// good and out of range.
+static SETTIME_FLIPPING: [core::sync::atomic::AtomicI64; 2] = [const { core::sync::atomic::AtomicI64::new(0) }; 2];
+static SETTIME_FLIP_STOP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn run_settime_flipper(_: usize) -> usize {
+    use core::sync::atomic::Ordering;
+    let mut flips = 0;
+    while SETTIME_FLIP_STOP.load(Ordering::Relaxed) == 0 {
+        SETTIME_FLIPPING[1].store(if flips % 2 == 1 { 2_000_000_000 } else { 0 }, Ordering::Relaxed);
+        flips += 1;
+    }
+    flips
+}
+
+/// `GETRANDOM` and `CLOCK_SETTIME` (stage 1e.1): buffers a program can't give, flags that
+/// don't exist or don't go together, a request longer than any call answers, clocks
+/// that can't be set, and a time rewritten while the kernel reads it. This runs as root,
+/// so every `CLOCK_SETTIME` here but the race's is one the kernel must refuse; the race
+/// puts the clock back after.
+fn random_probes(tally: &mut Tally) {
+    use core::sync::atomic::Ordering;
+    use feos_user::abi::{clock, grnd, Timespec, IO_CHUNK};
+    use feos_user::now_ns;
+    let gr = nr::GETRANDOM;
+    let mut scratch = [0u8; 16];
+    let good = scratch.as_mut_ptr() as usize;
+    tally.call("getrandom-kernel-buffer", gr, [KERNEL, 16, 0, 0, 0, 0], errno::EFAULT);
+    tally.call("getrandom-kernel-buffer-insecure", gr, [KERNEL, 16, grnd::INSECURE, 0, 0, 0], errno::EFAULT);
+    tally.call("getrandom-into-own-code", gr, [victim(), 16, grnd::INSECURE, 0, 0, 0], errno::EFAULT);
+    tally.call("getrandom-address-wraps", gr, [usize::MAX - 8, 64, grnd::INSECURE, 0, 0, 0], errno::EFAULT);
+    tally.call("getrandom-flags", gr, [good, 16, 8, 0, 0, 0], errno::EINVAL);
+    tally.call("getrandom-flags-upper-bits", gr, [good, 16, 1 << 32 | grnd::INSECURE, 0, 0, 0], errno::EINVAL);
+    tally.call("getrandom-insecure-and-random", gr, [good, 16, grnd::INSECURE | grnd::RANDOM, 0, 0, 0], errno::EINVAL);
+    // Longer than any call answers: as much as one does, and no error.
+    let big = mmap2(0, IO_CHUNK, prot::READ | prot::WRITE, map::PRIVATE);
+    let huge = if big > 0 { syscall(gr, [big as usize, usize::MAX, grnd::INSECURE, 0, 0, 0]) } else { big };
+    if big > 0 {
+        feos_user::munmap(big as usize, IO_CHUNK);
+    }
+    tally.report("getrandom-huge", huge == IO_CHUNK as isize, huge);
+
+    let st = nr::CLOCK_SETTIME;
+    let now = Timespec::from_nanos(now_ns(clock::REALTIME));
+    let at = |time: &Timespec| time as *const Timespec as usize;
+    let overflow = Timespec { sec: now.sec, nsec: 1_000_000_000 };
+    let negative = Timespec { sec: -1, nsec: 0 };
+    let far = Timespec { sec: i64::MAX, nsec: 0 };
+    tally.call("clock-settime-monotonic", st, [clock::MONOTONIC, at(&now), 0, 0, 0, 0], errno::EINVAL);
+    tally.call("clock-settime-boottime", st, [clock::BOOTTIME, at(&now), 0, 0, 0, 0], errno::EINVAL);
+    tally.call("clock-settime-coarse", st, [clock::REALTIME_COARSE, at(&now), 0, 0, 0, 0], errno::EINVAL);
+    tally.call("clock-settime-cputime", st, [clock::PROCESS_CPUTIME_ID, at(&now), 0, 0, 0, 0], errno::EINVAL);
+    tally.call("clock-settime-clock-upper-bits", st, [1 << 32, at(&now), 0, 0, 0, 0], errno::EINVAL);
+    tally.call("clock-settime-kernel-time", st, [clock::REALTIME, KERNEL, 0, 0, 0, 0], errno::EFAULT);
+    tally.call("clock-settime-null-time", st, [clock::REALTIME, 0, 0, 0, 0, 0], errno::EFAULT);
+    tally.call("clock-settime-nsec-overflow", st, [clock::REALTIME, at(&overflow), 0, 0, 0, 0], errno::EINVAL);
+    tally.call("clock-settime-negative", st, [clock::REALTIME, at(&negative), 0, 0, 0, 0], errno::EINVAL);
+    tally.call("clock-settime-too-far", st, [clock::REALTIME, at(&far), 0, 0, 0, 0], errno::EINVAL);
+
+    // The time rewritten as the kernel reads it: each call sees one version, so it sets
+    // the clock to `sec` exactly or says `EINVAL`, and never anything else.
+    let wall = now_ns(clock::REALTIME);
+    let started = now_ns(clock::MONOTONIC);
+    let sec = (wall / 1_000_000_000) as i64;
+    SETTIME_FLIPPING[0].store(sec, Ordering::Relaxed);
+    SETTIME_FLIPPING[1].store(0, Ordering::Relaxed);
+    SETTIME_FLIP_STOP.store(0, Ordering::Relaxed);
+    let flipper = thread::spawn(run_settime_flipper, 0);
+    let request = SETTIME_FLIPPING.as_ptr() as usize;
+    let (mut set, mut refused, mut other) = (0isize, 0isize, 0isize);
+    for _ in 0..2_000 {
+        match syscall(st, [clock::REALTIME, request, 0, 0, 0, 0]) {
+            0 => set += 1,
+            result if result == -errno::EINVAL => refused += 1,
+            result => other = result,
+        }
+    }
+    SETTIME_FLIP_STOP.store(1, Ordering::Relaxed);
+    let flips = flipper.map(thread::Thread::join);
+    // The clock is where the last good set put it, counted on since: never anything a
+    // mix of the two versions would make (2 s ahead).
+    let reading = now_ns(clock::REALTIME);
+    let since = now_ns(clock::MONOTONIC) - started;
+    let sane = set == 0 || (reading >= sec as u64 * 1_000_000_000 && reading <= sec as u64 * 1_000_000_000 + since + 100_000_000);
+    // Back where it was, counted on.
+    let back = Timespec::from_nanos(wall + (now_ns(clock::MONOTONIC) - started));
+    let restored = syscall(st, [clock::REALTIME, at(&back), 0, 0, 0, 0]);
+    println!("probe toctou-clock-settime: set={set} refused={refused} flips={flips:?} restored={restored}");
+    tally.report("toctou-clock-settime", other == 0 && set + refused == 2_000 && flips.is_ok() && sane && restored == 0, other);
 }
 
 struct Tally {
@@ -3563,6 +3859,299 @@ fn uid_thread_bomb() -> i32 {
 
 
 
+// Stage 1d.1: `FORK`.
+
+/// Runs `child` in a forked child, which ends with what it returns: the status it ended
+/// with, its exit code or 128 plus a signal, or the fork's error.
+fn in_fork(child: impl FnOnce() -> i32) -> isize {
+    let pid = feos_user::fork();
+    if pid == 0 {
+        feos_user::exit(child());
+    }
+    if pid < 0 {
+        return pid;
+    }
+    feos_user::wait_status(pid)
+}
+
+/// Forks until it can't: `EAGAIN` with no task left to programs (or `ENOMEM`), the
+/// machine up. Each child waits for a pipe's end; once they've all gone another fork
+/// works again. Zero if so.
+fn fork_bomb() -> i32 {
+    let Ok((read_end, write_end)) = pipe() else {
+        return 2;
+    };
+    let mut made = 0usize;
+    let error = loop {
+        let pid = feos_user::fork();
+        if pid == 0 {
+            close(write_end);
+            let mut byte = [0u8; 1];
+            while read(read_end, &mut byte) > 0 {}
+            feos_user::exit(0);
+        }
+        if pid < 0 {
+            break pid;
+        }
+        made += 1;
+        if made > 4096 {
+            break 0;
+        }
+    };
+    close(write_end);
+    close(read_end);
+    let mut reaped = 0;
+    let mut failed = 0;
+    while let Ok((_, status)) = feos_user::wait4(-1, 0) {
+        reaped += 1;
+        failed += usize::from(status != 0);
+    }
+    // The table and the memory came back: a fork works again.
+    let again = in_fork(|| 0);
+    println!("fork-bomb: made={made} then={error} reaped={reaped} failed={failed} again={again}");
+    if (error == -errno::EAGAIN || error == -errno::ENOMEM) && made > 0 && reaped == made && failed == 0 && again == 0 {
+        0
+    } else {
+        ESCAPED
+    }
+}
+
+/// The parent unmaps a region the moment it has forked, and maps something else there,
+/// while the child reads its copy over and over: the child's is never touched. Zero if
+/// every child saw only what was there at its fork.
+fn fork_munmap_race() -> i32 {
+    const PAGES: usize = 16;
+    for round in 0..20u64 {
+        let area = mmap2(0, PAGES * PAGE_SIZE, prot::READ | prot::WRITE, map::PRIVATE | map::ANONYMOUS);
+        if area < 0 {
+            return 2;
+        }
+        let area = area as usize;
+        for page in 0..PAGES {
+            // SAFETY: just mapped, writable.
+            unsafe { core::ptr::write_volatile((area + page * PAGE_SIZE) as *mut u64, round << 8 | page as u64) };
+        }
+        let pid = feos_user::fork();
+        if pid == 0 {
+            for _ in 0..200 {
+                for page in 0..PAGES {
+                    // SAFETY: the child's copy, which only it can unmap.
+                    let value = unsafe { core::ptr::read_volatile((area + page * PAGE_SIZE) as *const u64) };
+                    if value != round << 8 | page as u64 {
+                        feos_user::exit(ESCAPED);
+                    }
+                }
+            }
+            feos_user::exit(0);
+        }
+        feos_user::munmap(area, PAGES * PAGE_SIZE);
+        let again = mmap2(area, PAGES * PAGE_SIZE, prot::READ | prot::WRITE, map::PRIVATE | map::ANONYMOUS | map::FIXED);
+        if again == area as isize {
+            // SAFETY: just mapped there, writable.
+            unsafe { core::ptr::write_bytes(area as *mut u8, 0xee, PAGES * PAGE_SIZE) };
+            feos_user::munmap(area, PAGES * PAGE_SIZE);
+        }
+        let status = if pid > 0 { feos_user::wait_status(pid) } else { pid };
+        if status != 0 {
+            println!("fork-then-munmap-race: round {round}, child {status}");
+            return ESCAPED;
+        }
+    }
+    0
+}
+
+/// A writable private mapping of most of what the machine has free, all of it charged:
+/// a fork would need as much again promised, which isn't there. `ENOMEM`, and the parent
+/// carries on, its mapping as it was. Zero if so.
+fn fork_enomem() -> i32 {
+    let Ok(info) = feos_user::sysinfo() else {
+        return 2;
+    };
+    let pages = (info.free_pages as usize) * 3 / 4;
+    let area = mmap2(0, pages * PAGE_SIZE, prot::READ | prot::WRITE, map::PRIVATE | map::ANONYMOUS);
+    if area < 0 {
+        println!("fork-enomem: no mapping of {pages} pages: {area}");
+        return 2;
+    }
+    let area = area as usize;
+    // Some of it touched, so the fork would share frames too.
+    for page in (0..pages).step_by(pages / 16 + 1) {
+        // SAFETY: just mapped, writable.
+        unsafe { core::ptr::write_volatile((area + page * PAGE_SIZE) as *mut u64, page as u64) };
+    }
+    let refused = feos_user::fork();
+    if refused == 0 {
+        feos_user::exit(ESCAPED);
+    }
+    if refused > 0 {
+        feos_user::wait_status(refused);
+    }
+    // The parent's pages are its own still, and writable.
+    let mut intact = true;
+    for page in (0..pages).step_by(pages / 16 + 1) {
+        // SAFETY: as above.
+        unsafe {
+            intact &= core::ptr::read_volatile((area + page * PAGE_SIZE) as *const u64) == page as u64;
+            core::ptr::write_volatile((area + page * PAGE_SIZE) as *mut u64, 1);
+        }
+    }
+    feos_user::munmap(area, pages * PAGE_SIZE);
+    // With the memory back, a fork works.
+    let again = in_fork(|| 0);
+    println!("fork-enomem: {pages} pages, fork {refused}, intact {intact}, then {again}");
+    if refused == -errno::ENOMEM && intact && again == 0 {
+        0
+    } else {
+        ESCAPED
+    }
+}
+
+/// The child has the kernel write into a page it shares with its parent: a `read` of a
+/// file and of a pipe. The kernel copies it first; the parent's page is unchanged. Zero if
+/// so.
+fn cow_write_from_kernel() -> i32 {
+    let area = mmap2(0, 2 * PAGE_SIZE, prot::READ | prot::WRITE, map::PRIVATE | map::ANONYMOUS);
+    if area < 0 {
+        return 2;
+    }
+    let area = area as usize;
+    // SAFETY: just mapped, writable.
+    unsafe { core::ptr::write_bytes(area as *mut u8, b'P', 2 * PAGE_SIZE) };
+    let Ok((read_end, write_end)) = pipe() else {
+        return 2;
+    };
+    let status = in_fork(|| {
+        let file = open("/etc/motd", flags::READ);
+        // SAFETY: the child's copy of the mapping, writable, two pages long.
+        let buffer = unsafe { core::slice::from_raw_parts_mut(area as *mut u8, PAGE_SIZE) };
+        let got = if file >= 0 { read(file as usize, buffer) } else { file };
+        feos_user::write(write_end, b"from the pipe");
+        // SAFETY: as above.
+        let second = unsafe { core::slice::from_raw_parts_mut((area + PAGE_SIZE) as *mut u8, 64) };
+        let piped = read(read_end, second);
+        i32::from(!(got > 0 && buffer[0] != b'P' && piped == 13 && &second[..13] == b"from the pipe"))
+    });
+    close(read_end);
+    close(write_end);
+    // SAFETY: the parent's mapping.
+    let mine = unsafe { core::slice::from_raw_parts(area as *const u8, 2 * PAGE_SIZE) };
+    let intact = mine.iter().all(|&byte| byte == b'P');
+    feos_user::munmap(area, 2 * PAGE_SIZE);
+    println!("cow-write-from-kernel: child {status}, parent's pages intact {intact}");
+    if status == 0 && intact {
+        0
+    } else {
+        ESCAPED
+    }
+}
+
+const DISK_A: &str = "/tmp/malicious-disk-a";
+const DISK_B: &str = "/tmp/malicious-disk-b";
+const DISK_BYTES: usize = 256 * 1024;
+static DISK_BUFFER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static DISK_STOP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Reads the two files into the buffer in turn, whole, until told to stop.
+fn disk_reader(_: usize) -> usize {
+    use core::sync::atomic::Ordering;
+    let buffer = DISK_BUFFER.load(Ordering::Acquire);
+    let mut turn = 0;
+    while !DISK_STOP.load(Ordering::Acquire) {
+        let path = if turn % 2 == 0 { DISK_A } else { DISK_B };
+        let fd = open(path, flags::READ);
+        if fd < 0 {
+            return 1;
+        }
+        // SAFETY: the buffer the probe mapped, this long, and nothing else writes it.
+        let out = unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, DISK_BYTES) };
+        read(fd as usize, out);
+        close(fd as usize);
+        turn += 1;
+    }
+    0
+}
+
+/// A file of `bytes` bytes of `byte`.
+fn disk_file(path: &str, byte: u8) -> bool {
+    let fd = open(path, flags::WRITE | flags::CREATE | flags::TRUNCATE);
+    if fd < 0 {
+        return false;
+    }
+    let chunk = [byte; 4096];
+    let mut good = true;
+    for _ in 0..DISK_BYTES / chunk.len() {
+        good &= feos_user::write(fd as usize, &chunk) == chunk.len() as isize;
+    }
+    close(fd as usize);
+    good
+}
+
+/// A parent thread's `READ` of a file into a buffer is in flight while another forks:
+/// whatever the child's copy of the buffer holds, it holds still, as nothing in the child
+/// writes it. A kernel write through a pin taken before the fork landing in the child's
+/// copy would show as a change. Zero if no child saw one.
+fn fork_during_disk_read() -> i32 {
+    use core::sync::atomic::Ordering;
+    if !disk_file(DISK_A, b'A') || !disk_file(DISK_B, b'B') {
+        return 2;
+    }
+    let buffer = mmap2(0, DISK_BYTES, prot::READ | prot::WRITE, map::PRIVATE | map::ANONYMOUS);
+    if buffer < 0 {
+        return 2;
+    }
+    let buffer = buffer as usize;
+    DISK_BUFFER.store(buffer, Ordering::Release);
+    DISK_STOP.store(false, Ordering::Release);
+    let reader = thread::spawn(disk_reader, 0);
+    let mut changed = 0;
+    for _ in 0..20 {
+        feos_user::sleep_ms(3);
+        changed += usize::from(in_fork(|| {
+            let sum = |buffer: usize| {
+                // SAFETY: the child's copy of the buffer.
+                let bytes = unsafe { core::slice::from_raw_parts(buffer as *const u8, DISK_BYTES) };
+                bytes.iter().fold(0u64, |sum, &byte| sum.wrapping_mul(31).wrapping_add(u64::from(byte)))
+            };
+            let first = sum(buffer);
+            feos_user::sleep_ms(20);
+            i32::from(sum(buffer) != first)
+        }) != 0);
+    }
+    DISK_STOP.store(true, Ordering::Release);
+    let joined = reader.map(|thread| thread.join()).unwrap_or(9);
+    feos_user::munmap(buffer, DISK_BYTES);
+    for path in [DISK_A, DISK_B] {
+        feos_user::unlink(path);
+    }
+    println!("fork-during-disk-read: children that saw their copy change {changed}, reader {joined}");
+    if changed == 0 && joined == 0 {
+        0
+    } else {
+        ESCAPED
+    }
+}
+
+/// The `FORK` probes, each in a child of its own: its children are its business.
+fn fork_probes(tally: &mut Tally, program: &str) {
+    for (name, mode) in [
+        ("fork-bomb", "--fork-bomb"),
+        ("fork-then-munmap-race", "--fork-munmap-race"),
+        ("fork-enomem", "--fork-enomem"),
+        ("cow-write-from-kernel", "--cow-write-from-kernel"),
+        ("fork-during-disk-read", "--fork-during-disk-read"),
+    ] {
+        let before = free_frames();
+        let child = spawn(program, &[program, mode]);
+        let status = if child > 0 { wait(child as usize) } else { child };
+        let after = free_frames();
+        let back = before.zip(after).is_none_or(|(before, after)| after >= before);
+        tally.report(name, status == 0 && back, status);
+        if let (Some(before), Some(after)) = (before, after) {
+            println!("probe {name}: frames {before}->{after}");
+        }
+    }
+}
+
 fn main(args: Args) -> i32 {
     if args.has("--quiet-exit") {
         return 0;
@@ -3593,6 +4182,9 @@ fn main(args: Args) -> i32 {
     }
     if args.has("--storm-target") {
         return storm_target();
+    }
+    if args.has("--no-terminal") {
+        return no_terminal();
     }
     if args.has("--exec-race") {
         return exec_race();
@@ -3677,6 +4269,21 @@ fn main(args: Args) -> i32 {
     if args.has("--fault-loop") {
         return fault_loop();
     }
+    if args.has("--fork-bomb") {
+        return fork_bomb();
+    }
+    if args.has("--fork-munmap-race") {
+        return fork_munmap_race();
+    }
+    if args.has("--fork-enomem") {
+        return fork_enomem();
+    }
+    if args.has("--cow-write-from-kernel") {
+        return cow_write_from_kernel();
+    }
+    if args.has("--fork-during-disk-read") {
+        return fork_during_disk_read();
+    }
     if args.has("--sp-syscall") {
         return syscall_on_kernel_sp();
     }
@@ -3708,6 +4315,7 @@ fn main(args: Args) -> i32 {
     thread_probes(&mut tally, program);
     signal_probes(&mut tally, program);
     mask_probes(&mut tally, program);
+    shell_probes(&mut tally);
 
     // The kernel takes no notice of where a program's stack pointer was.
     let child = spawn(program, &[program, "--sp-syscall"]);
@@ -3808,6 +4416,7 @@ fn main(args: Args) -> i32 {
     tally.call("futex-unaligned", nr::FUTEX_WAIT, [good + 1, 0, 1, 0, 0, 0], errno::EFAULT);
     futex_probes(&mut tally);
     time_probes(&mut tally);
+    random_probes(&mut tally);
     tally.call("pipe-into-kernel", nr::PIPE, [KERNEL, 0, 0, 0, 0, 0], errno::EFAULT);
     tally.call("pipe-into-own-code", nr::PIPE, [probe as *const () as usize, 0, 0, 0, 0, 0], errno::EFAULT);
     tally.call("surface-too-big", nr::SURFACE_CREATE, [1 << 20, 1 << 20, 0, 0, 0, 0], errno::EINVAL);
@@ -3821,11 +4430,13 @@ fn main(args: Args) -> i32 {
     fd_probes(&mut tally, program);
     path_probes(&mut tally);
     dev_probes(&mut tally);
+    terminal_probes(&mut tally);
     tree_probes(&mut tally, program);
     lock_probes(&mut tally, program);
     spawn2_probes(&mut tally, program);
     exec_probes(&mut tally, program);
     wait_kill_probes(&mut tally, program);
+    fork_probes(&mut tally, program);
     tally.call("no-such-call", 0xdead, [0; 6], errno::ENOSYS);
     tally.call("call-number-huge", usize::MAX, [0; 6], errno::ENOSYS);
     if file >= 0 {

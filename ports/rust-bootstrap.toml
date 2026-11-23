@@ -1,0 +1,78 @@
+# rust's bootstrap configuration for the feos toolchain (track T4): rustc 1.99.1 with
+# the feos targets built in, LLVM, clang and lld built from ports/src/rust's own
+# src/llvm-project, std for x86_64 Linux and both feos targets, and cargo.
+#
+# ports/build-rust.sh passes this to x.py (--config), in localhost/feos-toolchain with
+# --network none: every path here is the container's (the tree at /src, the
+# feos-ports-target volume at /build). Nothing is downloaded: the stage 0 compiler is
+# the image's rust 1.99.1 (the same version, so this is a "local rebuild"), LLVM is
+# built here, and crates come from ports/vendor through ports/.cargo/config.toml, which
+# cargo finds because bootstrap runs it in ports/src/rust.
+change-id = "ignore"
+
+[llvm]
+download-ci-llvm = false
+targets = "X86;AArch64"
+experimental-targets = ""
+# clang in the same build (its install is the LLVM install's bin/clang), for the
+# feos C compiler (track T5); lld is rust.lld below, built from the same tree.
+clang = true
+ninja = true
+assertions = false
+# One link at a time: clang and the LLVM tools are large static links.
+link-jobs = 1
+use-linker = "lld"
+
+[gcc]
+download-ci-gcc = false
+
+[build]
+build = "x86_64-unknown-linux-gnu"
+host = ["x86_64-unknown-linux-gnu"]
+target = ["x86_64-unknown-linux-gnu", "x86_64-unknown-feos", "aarch64-unknown-feos"]
+build-dir = "/build/rust-build"
+rustc = "/usr/local/rustup/toolchains/1.99.1-x86_64-unknown-linux-gnu/bin/rustc"
+cargo = "/usr/local/rustup/toolchains/1.99.1-x86_64-unknown-linux-gnu/bin/cargo"
+# The submodules are checked out by scripts/ports-init.sh; bootstrap must not touch git.
+submodules = false
+locked-deps = true
+# Crates come from ports/vendor by source replacement (ports/.cargo/config.toml), not
+# from a vendor/ directory in the rust tree.
+vendor = false
+extended = true
+# (rust-src is laid out by build-rust.sh: see there.)
+tools = ["cargo"]
+# cargo's `all-static`: OpenSSL, curl, libgit2 and libssh2 from their vendored sources
+# (openssl-src and the -sys crates' bundled copies), since the image has no OpenSSL
+# headers; a cargo with no system library dependencies is also what feos will run.
+cargo-native-static = true
+docs = false
+compiler-docs = false
+# compiler-builtins' Rust implementations only, as std for feos builds them (T3).
+optimized-compiler-builtins = false
+jobs = 6
+python = "python3"
+
+[rust]
+channel = "nightly"
+download-rustc = false
+lld = true
+debuginfo-level = 0
+deny-warnings = false
+codegen-backends = ["llvm"]
+
+[target.x86_64-unknown-linux-gnu]
+cc = "cc"
+cxx = "c++"
+
+[target.x86_64-unknown-feos]
+cc = "/src/ports/toolchain/bin/x86_64-unknown-feos-cc"
+cxx = "/src/ports/toolchain/bin/x86_64-unknown-feos-cc"
+ar = "llvm-ar"
+ranlib = "llvm-ranlib"
+
+[target.aarch64-unknown-feos]
+cc = "/src/ports/toolchain/bin/aarch64-unknown-feos-cc"
+cxx = "/src/ports/toolchain/bin/aarch64-unknown-feos-cc"
+ar = "llvm-ar"
+ranlib = "llvm-ranlib"

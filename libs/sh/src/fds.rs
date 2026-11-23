@@ -39,6 +39,10 @@ pub(crate) enum OpenFile {
     Capture { data: Vec<u8>, overflow: bool },
     /// A live stream from another task.
     Stream(Box<dyn Input + Send>),
+    /// One of the shell process's own descriptors: a pipe end between two programs of a
+    /// pipeline, with a [`Processes`](feos_coreutils::Processes) host. Only a program
+    /// started with it uses it; the pipeline closes it.
+    Descriptor(i32),
 }
 
 struct Entry {
@@ -69,6 +73,16 @@ impl FdTable {
             table.slots[usize::from(fd)] = Some(index);
         }
         table
+    }
+
+    /// Enters `fd`, a descriptor below [`MAX_FDS`] the shell inherited open without
+    /// close-on-exec, as itself: the programs it starts get it as POSIX has them, and a
+    /// redirection can still close or replace it for one of them.
+    pub(crate) fn inherit(&mut self, fd: usize) {
+        if fd < MAX_FDS && self.slots[fd].is_none() {
+            let index = self.open(OpenFile::Descriptor(fd as i32));
+            self.slots[fd] = Some(index);
+        }
     }
 
     /// Adds an open file with one reference, not yet bound to a descriptor.
@@ -198,6 +212,33 @@ impl FdTable {
         self.slots[3..].iter().any(Option::is_some)
     }
 
+    /// The open file `fd` refers to, by its index.
+    pub(crate) fn slot(&self, fd: usize) -> Option<u16> {
+        self.slots.get(fd).copied().flatten()
+    }
+
+    /// The open file at `index`.
+    pub(crate) fn file(&mut self, index: u16) -> Option<&mut OpenFile> {
+        self.files
+            .get_mut(usize::from(index))?
+            .as_mut()
+            .map(|entry| &mut entry.file)
+    }
+
+    /// Adds what a program wrote to a capture, as its descriptor's writes would.
+    pub(crate) fn append_capture(&mut self, index: u16, bytes: &[u8]) {
+        if let Some(OpenFile::Capture { data, overflow }) = self.file(index) {
+            if *overflow
+                || data.len().saturating_add(bytes.len()) > MAX_STREAM_BYTES
+                || data.try_reserve(bytes.len()).is_err()
+            {
+                *overflow = true;
+                return;
+            }
+            data.extend_from_slice(bytes);
+        }
+    }
+
     pub(crate) fn resolve(&mut self, fd: usize) -> Option<&mut OpenFile> {
         let index = self.slots.get(fd).copied().flatten()?;
         self.files
@@ -305,6 +346,15 @@ impl StreamView<'_, '_> {
         match fds.resolve(fd) {
             Some(OpenFile::Base(0)) => io.stdin.read_pending(out),
             _ => self.read(fd, out),
+        }
+    }
+
+    /// Raw keys already here, if this descriptor is the terminal.
+    pub(crate) fn try_read_raw(&mut self, fd: usize, out: &mut [u8]) -> feos_coreutils::Available {
+        let Self { fds, io, .. } = self;
+        match fds.resolve(fd) {
+            Some(OpenFile::Base(0)) => io.stdin.try_read_raw(out),
+            _ => feos_coreutils::Available::Pending,
         }
     }
 
@@ -420,6 +470,10 @@ impl Input for FdInput<'_, '_, '_> {
 
     fn set_raw(&mut self, raw: bool) {
         self.view.borrow_mut().set_raw(raw);
+    }
+
+    fn try_read_raw(&mut self, out: &mut [u8]) -> feos_coreutils::Available {
+        self.view.borrow_mut().try_read_raw(self.fd, out)
     }
 
     fn unread(&mut self, bytes: &[u8]) {

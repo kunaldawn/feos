@@ -660,6 +660,12 @@ extern "C" fn stamp(_: i32, _: *mut SigInfo, _: *mut UContext) {
     HANDLED_AT.store(now_ns(clock::MONOTONIC), Ordering::SeqCst);
 }
 
+/// [`record`], noting when in [`HANDLED_AT`].
+extern "C" fn record_stamped(signo: i32, info: *mut SigInfo, context: *mut UContext) {
+    HANDLED_AT.store(now_ns(clock::MONOTONIC), Ordering::SeqCst);
+    record(signo, info, context);
+}
+
 /// A child's: a call that waits 300 ms, which the parent signals part way, 50 ms in. The
 /// signal cuts the wait short (stage 1c.10: `EINTR`, with what was left in `remain`), and
 /// the handler runs as the call returns: well before the 300 ms, and well within a tick
@@ -1000,17 +1006,44 @@ fn test_interrupted_calls(report: &mut Report) {
         format_args!("read={got} byte={:#x} hits={}", byte[0], HITS.load(Ordering::SeqCst)),
     );
 
-    // And a `WAIT4`, for a child that ends after the signal.
+    // A `WAIT4` for a child that ends 100 ms in, which the signal 30 ms in cuts short
+    // without `SA_RESTART`: `EINTR` well before the child is done, and it's still there
+    // to wait for after.
     reset();
+    handle(sig::USR1, record_stamped, 0);
     let child = spawn(PROGRAM, &[PROGRAM, "--child", "sleep-exit"]);
     let started = sender(send_then_write, usize::MAX);
     let waited = wait4(child, 0);
     let _ = started.map(thread::Thread::join);
+    let after = wait4(child, 0);
+    report.check(
+        "eintr-wait4",
+        waited == Err(-errno::EINTR)
+            && matches!(after, Ok((pid, status)) if pid == child && wait::exit_code(status) == 7)
+            && HITS.load(Ordering::SeqCst) == 1,
+        format_args!("pid={child} wait4={waited:?} then {after:?} hits={}", HITS.load(Ordering::SeqCst)),
+    );
+
+    // With `SA_RESTART` it's made again and gets the child; the handler ran while it was
+    // still waiting, well before the child ended, so it was cut short and made again,
+    // not merely followed by the signal as it returned.
+    reset();
+    HANDLED_AT.store(0, Ordering::SeqCst);
+    handle(sig::USR1, record_stamped, sa::RESTART);
+    let child = spawn(PROGRAM, &[PROGRAM, "--child", "sleep-exit"]);
+    let started = sender(send_then_write, usize::MAX);
+    let waited = wait4(child, 0);
+    let returned = now_ns(clock::MONOTONIC);
+    let _ = started.map(thread::Thread::join);
     set_disposition(sig::USR1, sa::DFL);
+    let handled = HANDLED_AT.load(Ordering::SeqCst);
+    let early_us = if handled == 0 { 0 } else { returned.saturating_sub(handled) / 1000 };
     report.check(
         "sa-restart-wait4",
-        matches!(waited, Ok((pid, status)) if pid == child && wait::exit_code(status) == 7) && HITS.load(Ordering::SeqCst) == 1,
-        format_args!("pid={child} wait4={waited:?} hits={}", HITS.load(Ordering::SeqCst)),
+        matches!(waited, Ok((pid, status)) if pid == child && wait::exit_code(status) == 7)
+            && HITS.load(Ordering::SeqCst) == 1
+            && early_us >= 20_000,
+        format_args!("pid={child} wait4={waited:?} hits={} handled {early_us}us before it returned", HITS.load(Ordering::SeqCst)),
     );
     close(reader);
     close(writer);

@@ -1913,6 +1913,102 @@ fn test_futex_namespace() -> i32 {
     i32::from(!ok)
 }
 
+/// Stage 1d.1's strict charging, kept up through ten thousand forks: spaces forked from
+/// one with pages written and pages promised but untouched, then written and dropped in
+/// orders that change round to round, each write read back and every space's words its
+/// own. The machine's promises never drop below what was owed before (no release is
+/// ever clamped) and are back where they started once every space has gone.
+fn test_fork_promises() -> i32 {
+    use crate::user::TestSpace;
+    use feos_abi::PAGE_SIZE;
+    const PAGES: usize = 16;
+    const CHILDREN: usize = 4;
+    let baseline = crate::user::promised();
+    let underflows = crate::user::promise_underflows();
+    let Some(parent) = TestSpace::new() else {
+        return 1;
+    };
+    // Half written, half promised and never touched until a round writes it.
+    let mut made = (0..PAGES / 2).all(|page| parent.map_word(TEST_PAGE + page * PAGE_SIZE, page as u64).is_some());
+    made &= parent.map_pages(TEST_PAGE + PAGES / 2 * PAGE_SIZE, PAGES / 2);
+    if !made {
+        println!("[ktest] fork-promises: no space to fork");
+        return 1;
+    }
+    // What each space should read, word by word: the parent's at 0, the children's after.
+    let mut expected = [[0u64; PAGES]; CHILDREN + 1];
+    for (page, value) in expected[0].iter_mut().enumerate().take(PAGES / 2) {
+        *value = page as u64;
+    }
+    let mut children: [Option<TestSpace>; CHILDREN] = [const { None }; CHILDREN];
+    let (mut forks, mut exits, mut writes, mut wrong, mut refused) = (0, 0, 0, 0, 0);
+    let mut peak = baseline;
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    // Ten thousand forks, with the exits and writes among them.
+    let mut round = 0u64;
+    while forks < 10_000 && round < 200_000 {
+        round += 1;
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let which = (seed % CHILDREN as u64) as usize;
+        let page = ((seed >> 8) % PAGES as u64) as usize;
+        let address = TEST_PAGE + page * PAGE_SIZE;
+        match (seed >> 16) % 4 {
+            // A fork into an empty place, or that child's exit.
+            0 => match children[which].take() {
+                Some(child) => {
+                    drop(child);
+                    exits += 1;
+                }
+                None => match parent.fork() {
+                    Some(child) => {
+                        children[which] = Some(child);
+                        expected[which + 1] = expected[0];
+                        forks += 1;
+                    }
+                    None => refused += 1,
+                },
+            },
+            // A write in the parent.
+            1 => {
+                writes += 1;
+                expected[0][page] = round;
+                wrong += usize::from(!parent.write(address, round) || parent.read(address) != Some(round));
+            }
+            // A write in a child, if there is one.
+            _ => {
+                if let Some(child) = &children[which] {
+                    writes += 1;
+                    expected[which + 1][page] = round;
+                    wrong += usize::from(!child.write(address, round) || child.read(address) != Some(round));
+                }
+            }
+        }
+        peak = peak.max(crate::user::promised());
+        // Now and then, every space read whole: each holds its own words only.
+        if round % 1000 == 999 {
+            for (index, space) in core::iter::once(Some(&parent)).chain(children.iter().map(Option::as_ref)).enumerate() {
+                if let Some(space) = space {
+                    for (page, &value) in expected[index].iter().enumerate() {
+                        wrong += usize::from(space.read(TEST_PAGE + page * PAGE_SIZE) != Some(value));
+                    }
+                }
+            }
+        }
+    }
+    drop(children);
+    drop(parent);
+    let after = crate::user::promised();
+    let clamped = crate::user::promise_underflows() - underflows;
+    let ok = forks >= 10_000 && wrong == 0 && refused == 0 && after == baseline && clamped == 0;
+    println!(
+        "[ktest] fork-promises: forks={forks} exits={exits} writes={writes} wrong={wrong} refused={refused} \
+         promised={baseline}->{peak}->{after} clamped={clamped} ok={ok}"
+    );
+    i32::from(!ok)
+}
+
 struct KernelTest;
 
 impl App for KernelTest {
@@ -1921,7 +2017,7 @@ impl App for KernelTest {
     }
 
     fn usage(&self) -> &'static str {
-        "ktest <uspawn [n]|ukill|setlkw-killed|teardown|kstack [DIR]|kstack-kill|thread-fault|tlb|asid-rollover|asid-load [n]|futex-namespace|thread-exit-clear|drive PROGRAM [ARGS]|dirty-storm PATH MIB|user-memory|cpus|fp|irqs|mem|priority|affinity|timer|panic|overflow|overflow-locked|null|task-panic>"
+        "ktest <uspawn [n]|ukill|fork-promises|setlkw-killed|teardown|kstack [DIR]|kstack-kill|thread-fault|tlb|asid-rollover|asid-load [n]|futex-namespace|thread-exit-clear|drive PROGRAM [ARGS]|dirty-storm PATH MIB|user-memory|cpus|fp|irqs|mem|priority|affinity|timer|panic|overflow|overflow-locked|null|task-panic>"
     }
 
     fn description(&self) -> &'static str {
@@ -1931,6 +2027,7 @@ impl App for KernelTest {
     fn run(&self, context: &mut Context<'_>) -> i32 {
         match context.args.trim() {
             "user-memory" => test_user_memory(),
+            "fork-promises" => test_fork_promises(),
             "tlb" => test_tlb(),
             "asid-rollover" => test_asid_rollover(),
             load if load.starts_with("asid-load") => {

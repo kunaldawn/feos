@@ -409,6 +409,14 @@ impl Arch for Aarch64 {
         cpu::user_hwcaps()
     }
 
+    fn hardware_random() -> Option<u64> {
+        cpu::hardware_random()
+    }
+
+    fn hardware_random_name() -> Option<&'static str> {
+        cpu::hardware_random_name()
+    }
+
     // `msr tpidr_el0` is an EL0 instruction.
     const USER_TLS_WRITABLE: bool = true;
 

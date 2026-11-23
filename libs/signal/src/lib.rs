@@ -138,14 +138,22 @@ pub mod itimer {
         Timeval { sec: (micros / 1_000_000) as i64, usec: (micros % 1_000_000) as i64 }
     }
 
+    /// The shortest period a timer is re-armed by. Each time one goes off the kernel's
+    /// alarm task takes the scheduler's lock, so an interval of a microsecond, which any
+    /// program may ask for, would have that task, which runs above every program, do so
+    /// a million times a second, whether or not the program ever takes its `SIGALRM`s.
+    /// A shorter interval still reads back as set, as on Linux.
+    pub const MIN_PERIOD_NS: u64 = 1_000_000;
+
     /// The deadline after `at`, which has passed (`now >= at`), for a timer re-armed by
-    /// `every`: the first `at + k * every` past `now`, so a timer whose process wasn't
-    /// run for a while goes off once and then keeps its phase, not once per period
-    /// missed. 0, disarmed, without an interval.
+    /// `every` (at least [`MIN_PERIOD_NS`]): the first `at + k * every` past `now`, so a
+    /// timer whose process wasn't run for a while goes off once and then keeps its
+    /// phase, not once per period missed. 0, disarmed, without an interval.
     pub const fn next(at: u64, every: u64, now: u64) -> u64 {
         if every == 0 {
             return 0;
         }
+        let every = if every < MIN_PERIOD_NS { MIN_PERIOD_NS } else { every };
         let missed = now.saturating_sub(at) / every;
         at.saturating_add(every.saturating_mul(missed + 1))
     }
@@ -355,6 +363,9 @@ mod tests {
         }
         // No overflow at the far end.
         assert_eq!(itimer::next(u64::MAX - 5, u64::MAX, u64::MAX), u64::MAX);
+        // An interval under the floor re-arms by the floor, on its grid, however late.
+        assert_eq!(itimer::next(100 * MS, 1000, 100 * MS), 100 * MS + itimer::MIN_PERIOD_NS);
+        assert_eq!(itimer::next(100 * MS, 1, 100 * MS + 2_500_000), 100 * MS + 3 * itimer::MIN_PERIOD_NS);
         // Values: checked, and read back.
         assert_eq!(itimer::to_nanos(Timeval { sec: 1, usec: 500_000 }), Some(1_500_000_000));
         assert_eq!(itimer::to_nanos(Timeval { sec: 0, usec: 999_999 }), Some(999_999_000));

@@ -1,0 +1,13 @@
+# The empty crate ports/build-std.sh builds with -Zbuild-std=std,panic_unwind: cargo
+# then builds std and its dependencies for a feos target, which build-std.sh lays out
+# as a sysroot. Nothing uses this crate itself.
+[package]
+name = "feos-std-build"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[workspace]

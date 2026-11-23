@@ -262,6 +262,15 @@ fn device_tree(address: usize) -> Option<Fdt<'static>> {
     device_tree_within(address, KERNEL_LOAD_ADDR)
 }
 
+/// Most of `/chosen/rng-seed` kept: QEMU gives 32 bytes, and twice that is more than
+/// the generator needs.
+const SEED_MAX: usize = 64;
+
+/// The device tree's `/chosen/rng-seed`, copied at boot for the kernel's random number
+/// generator to take once, and its length. Copied rather than read later, since nothing
+/// promises the tree stays where it is once the kernel has its RAM.
+static FIRMWARE_SEED: SpinLock<([u8; SEED_MAX], usize)> = SpinLock::new(([0; SEED_MAX], 0));
+
 /// How the device tree says to reach PSCI.
 static CONDUIT: AtomicU8 = AtomicU8::new(FirmwareConduit::Unknown as u8);
 
@@ -311,6 +320,12 @@ pub fn init_boot_info(boot_info: usize) {
             INTERRUPT_CONTROLLER.v3.store(true, Ordering::Relaxed);
         }
         _ => {}
+    }
+    if let Some(seed) = tree.rng_seed() {
+        let mut kept = FIRMWARE_SEED.lock();
+        let length = seed.len().min(SEED_MAX);
+        kept.0[..length].copy_from_slice(&seed[..length]);
+        kept.1 = length;
     }
     let conduit = match tree.psci_method() {
         Some(PsciMethod::Hvc) => FirmwareConduit::Hvc,
@@ -807,6 +822,23 @@ impl Board for QemuVirt {
 
     fn unix_time() -> Option<u64> {
         unix_time()
+    }
+
+    fn take_firmware_seed(out: &mut [u8]) -> usize {
+        let mut kept = FIRMWARE_SEED.lock();
+        let length = kept.1.min(out.len());
+        out[..length].copy_from_slice(&kept.0[..length]);
+        // Given once: the generator has it now, and nobody else should.
+        for byte in kept.0.iter_mut() {
+            // SAFETY: a valid reference to a byte; volatile so the wipe isn't left out.
+            unsafe { core::ptr::write_volatile(byte, 0) };
+        }
+        kept.1 = 0;
+        length
+    }
+
+    fn firmware_seed_name() -> &'static str {
+        "the device tree's rng-seed"
     }
 
     fn kernel_range() -> (usize, usize) {

@@ -1,0 +1,27 @@
+# Stage T4: a cargo project with vendored crates.io dependencies (ports/test/rust/t4-cargo:
+# serde with its derive, serde_json, memchr, itoa), built by the feos toolchain's cargo
+# with --target <arch>-unknown-feos (rustc's built-in targets, no JSON spec), injected
+# as /bin/t4-cargo. stage-t4.sh runs this after specs/t3-rust.toml, whose programs are
+# T3's rebuilt by the same toolchain.
+
+[[case]]
+name = "cargo-vendored"
+run = "/bin/t4-cargo one 'two three'"
+expect = ["json: {\"cargo\":true,\"vendored\":true}", "serde: ok", "memchr: ok", "itoa: ok",
+          "args: [\"one\", \"two three\"]", "os: feos", "t4-cargo: ok"]
+reject = ["panicked"]
+status = 0
+
+[[case]]
+name = "cargo-arch-x64"
+arch = "x64"
+run = "/bin/t4-cargo"
+expect = ["os: feos x86_64", "t4-cargo: ok"]
+status = 0
+
+[[case]]
+name = "cargo-arch-arm"
+arch = "arm"
+run = "/bin/t4-cargo"
+expect = ["os: feos aarch64", "t4-cargo: ok"]
+status = 0

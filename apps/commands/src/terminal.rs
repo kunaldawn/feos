@@ -143,6 +143,9 @@ struct Link {
     quit: AtomicBool,
     /// The shell asked to exit, and with what, offset by one: 0 means it hasn't.
     exit: AtomicI32,
+    /// The window's size in cells, rows in the high half: what a program's terminal is
+    /// told.
+    size: AtomicU32,
 }
 
 impl Link {
@@ -156,7 +159,13 @@ impl Link {
             suspend: AtomicBool::new(false),
             quit: AtomicBool::new(false),
             exit: AtomicI32::new(0),
+            size: AtomicU32::new((INITIAL_ROWS as u32) << 16 | INITIAL_COLUMNS as u32),
         }
+    }
+
+    fn set_size(&self, columns: usize, rows: usize) {
+        let clamp = |cells: usize| cells.min(u16::MAX as usize) as u32;
+        self.size.store(clamp(rows) << 16 | clamp(columns), Ordering::Release);
     }
 
     fn poke(&self) {
@@ -383,6 +392,17 @@ impl Input for KeyInput {
         true
     }
 
+    fn try_read_raw(&mut self, out: &mut [u8]) -> Available {
+        if !self.returned.is_empty() {
+            return Available::Bytes(self.take_returned(out));
+        }
+        match self.reader.try_read(out) {
+            Transfer::Moved(count) => Available::Bytes(count),
+            Transfer::Closed => Available::End,
+            Transfer::WouldBlock => Available::Pending,
+        }
+    }
+
     fn set_raw(&mut self, raw: bool) {
         self.link.raw.store(raw, Ordering::Release);
     }
@@ -434,6 +454,11 @@ impl ConsoleSource for WindowConsole {
 
     fn take_quit(&self) -> bool {
         self.link.quit.swap(false, Ordering::AcqRel)
+    }
+
+    fn size(&self) -> Option<(u16, u16)> {
+        let size = self.link.size.load(Ordering::Acquire);
+        Some(((size >> 16) as u16, size as u16))
     }
 }
 
@@ -946,6 +971,9 @@ impl TerminalState {
             return;
         }
         self.vt.resize(cols, rows);
+        if let Some(worker) = self.worker.as_ref() {
+            worker.link.set_size(cols, rows);
+        }
         if self.running {
             self.size_changed = true;
         } else {
@@ -1106,10 +1134,14 @@ fn key_bytes(key: KeyPress) -> Option<feos_text::Text<8>> {
     let mut text = feos_text::Text::<8>::new();
     let sequence = match key.code {
         KeyCode::Char(ch) if key.ctrl => {
-            let code = (ch.to_ascii_lowercase() as u32).wrapping_sub('a' as u32 - 1);
-            if !(1..=26).contains(&code) {
-                return None;
-            }
+            // Ctrl-[, Ctrl-\ and Ctrl-] too: Escape, a terminal's `VQUIT`, and 0x1d.
+            let code = match ch {
+                '[' => 0x1b,
+                '\\' => 0x1c,
+                ']' => 0x1d,
+                ch if ch.is_ascii_alphabetic() => ch.to_ascii_lowercase() as u32 - ('a' as u32 - 1),
+                _ => return None,
+            };
             let _ = text.write_char(code as u8 as char);
             return Some(text);
         }

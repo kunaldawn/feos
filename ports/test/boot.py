@@ -18,6 +18,13 @@ they do there. A spec is TOML:
     pending = "1c.7"                 # not run: waits on this kernel stage
     why = "needs EXEC"               # said with `pending`
 
+A spec may also ask for a native-format disk beside the RAM root, mounted at /native0
+(for what the RAM root lacks, such as hard links):
+
+    [boot]
+    native_disk = 64                 # MiB; made blank by the base's scripts/mkfs-feos.py
+    memory = "1G"                    # the guest's RAM (else FEOS_BOOT_TEST_MEM, or 512M)
+
 A pending case is reported as PENDING, never as a pass. Each port's cases run in
 one boot, in order; after a failure the rest of that boot is skipped, since the
 guest may be in any state (PORTS_KEEP_GOING=1 runs them anyway, for debugging, as
@@ -46,6 +53,24 @@ def load_boot_test():
             spec.loader.exec_module(module)
             return module
     sys.exit("boot.py: no scripts/boot-test.py found")
+
+
+def boot_options(paths):
+    """The specs' [boot] tables, merged."""
+    options = {}
+    for path in paths:
+        options.update(tomllib.loads(pathlib.Path(path).read_text()).get("boot", {}))
+    return options
+
+
+def native_disk(bt, port, kernel, mib):
+    """QEMU arguments for a blank native-format disk of MIB MiB, and its path."""
+    import subprocess
+    path = bt.blank_disk(kernel, "ports-native.img", mib * 1024 * 1024)
+    base = pathlib.Path(os.environ.get("PORTS_BASE", REPO / "target/ports-base"))
+    subprocess.run([sys.executable, str(base / "scripts/mkfs-feos.py"), path], check=True)
+    device = "virtio-blk-device" if port == "arm" else "virtio-blk-pci"
+    return ["-drive", f"if=none,id=pn0,format=raw,file={path}", "-device", f"{device},drive=pn0"], path
 
 
 def load_cases(paths, port):
@@ -114,8 +139,15 @@ def main():
     results = []
     runnable = [case for case in cases if not case.get("pending")]
     guest = None
+    disk = None
     if runnable:
-        guest = bt.Guest(bt.qemu_command(port, kernel))
+        args = []
+        options = boot_options(specs)
+        if options.get("native_disk"):
+            args, disk = native_disk(bt, port, kernel, int(options["native_disk"]))
+        guest = bt.Guest(bt.qemu_command(port, kernel, args, memory=options.get("memory")))
+        if disk:
+            guest.expect("native filesystem mounted at /native0", bt.BOOT_TIMEOUT)
         guest.boot_to_shell()
     failed = False
     for number, case in enumerate(cases, 1):
@@ -145,6 +177,8 @@ def main():
                 pass
         if guest.process.poll() is None:
             guest.process.kill()
+    if disk and os.path.exists(disk):
+        os.remove(disk)
     for verdict, name, note in results:
         print(f"{port} {verdict:7} {name}" + (f"  ({note})" if note else ""), flush=True)
     counts = {v: sum(1 for r in results if r[0] == v) for v in ("PASS", "FAIL", "SKIPPED", "PENDING")}

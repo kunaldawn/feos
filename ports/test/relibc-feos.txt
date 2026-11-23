@@ -18,18 +18,7 @@ pthread/init_cpp            skip  C++, needs libc++ (plan phase 4)
 unistd/getpass              1c.11 a terminal for getpass, and expect(1) on feos
 
 # Kernel stages not in the base yet (each fails with ENOSYS from the call it needs).
-unistd/exec                 1c.7  execv
-signals/kill0-self          1c.8  kill
-signals/kill-invalid        1c.8  kill
-signals/kill-permission     1c.8  kill
-signals/killpg-esrch        1c.8  killpg
-signals/killpg-invalid      1c.8  killpg
-signals/killpg0-self        1c.8  killpg
-signals/kill-self           1c.9  sigaction, kill
-signals/kill-group          1c.9  sigaction, kill
-signals/killpg-self         1c.9  sigaction, killpg
-signals/signal-handle_return 1c.9 signal handlers
-signals/sigsegv             1c.9  faults as signals, sigaction
+unistd/exec                 1c.12 /bin/sh as a program for execv (EXEC itself is in, 1c.7)
 sigaction                   1c.10 sigaction, raise (THREAD_KILL), sigprocmask
 sigaltstack                 1c.10 sigaltstack
 signal                      1c.10 signal, raise (THREAD_KILL)

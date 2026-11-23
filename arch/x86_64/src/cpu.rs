@@ -243,3 +243,70 @@ pub fn mxcsr_mask() -> u32 {
     MASK.store(mask, core::sync::atomic::Ordering::Relaxed);
     mask
 }
+
+/// What the CPU's random number instructions are, once asked: bit 0 known, bit 1
+/// `RDRAND` (`CPUID.1:ECX` bit 30), bit 2 `RDSEED` (`CPUID.7.0:EBX` bit 18).
+static RANDOM_FEATURES: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+fn random_features() -> u8 {
+    let known = RANDOM_FEATURES.load(Ordering::Relaxed);
+    if known != 0 {
+        return known;
+    }
+    let rdrand = core::arch::x86_64::__cpuid(1).ecx & (1 << 30) != 0;
+    let rdseed = core::arch::x86_64::__cpuid(0).eax >= 7 && core::arch::x86_64::__cpuid_count(7, 0).ebx & (1 << 18) != 0;
+    let features = 1 | u8::from(rdrand) << 1 | u8::from(rdseed) << 2;
+    RANDOM_FEATURES.store(features, Ordering::Relaxed);
+    features
+}
+
+/// Tries `RDSEED` this many times: it says "not yet" when the conditioner hasn't caught
+/// up, which a burst of reads makes common, and a short pause between lets it.
+const RDSEED_TRIES: u32 = 128;
+/// Tries `RDRAND` this many times, Intel's advice: more than that and it's broken.
+const RDRAND_TRIES: u32 = 10;
+
+fn rdseed() -> Option<u64> {
+    for _ in 0..RDSEED_TRIES {
+        let (value, ok): (u64, u8);
+        // SAFETY: only run where CPUID says the instruction exists; it only writes the
+        // registers named and the carry flag.
+        unsafe { asm!("rdseed {v}", "setc {ok}", v = out(reg) value, ok = out(reg_byte) ok, options(nomem, nostack)) };
+        if ok != 0 {
+            return Some(value);
+        }
+        core::hint::spin_loop();
+    }
+    None
+}
+
+fn rdrand() -> Option<u64> {
+    for _ in 0..RDRAND_TRIES {
+        let (value, ok): (u64, u8);
+        // SAFETY: as for `rdseed`.
+        unsafe { asm!("rdrand {v}", "setc {ok}", v = out(reg) value, ok = out(reg_byte) ok, options(nomem, nostack)) };
+        if ok != 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// A word from `RDSEED`, or `RDRAND` where there's no `RDSEED` or it kept failing.
+pub fn hardware_random() -> Option<u64> {
+    let features = random_features();
+    let seeded = if features & 4 != 0 { rdseed() } else { None };
+    seeded.or_else(|| if features & 2 != 0 { rdrand() } else { None })
+}
+
+/// Which instruction [`hardware_random`] reads, for the boot log.
+pub fn hardware_random_name() -> Option<&'static str> {
+    let features = random_features();
+    if features & 4 != 0 {
+        Some("RDSEED")
+    } else if features & 2 != 0 {
+        Some("RDRAND")
+    } else {
+        None
+    }
+}

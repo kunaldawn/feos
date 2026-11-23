@@ -80,7 +80,16 @@
 //! delivers it on the thread's way back to its program), or its default action: a
 //! terminating one ends the process through the kill path, its status the signal; a
 //! stop holds each thread at its next way back to its program, never in a call, and is
-//! recorded for the parent once every thread has parked; a continue lets them go.
+//! recorded for the parent once every thread has parked; a continue lets them go. A
+//! default that ends or stops the process waits pending instead while every thread
+//! blocks the signal, and `THREAD_KILL`'s go on the one thread.
+//!
+//! A signal made pending asks each thread that may take it to: one running on another
+//! CPU by an IPI, one blocked by a wake. A wait in a call that a signal may end looks
+//! for one with [`interrupted`], which claims a process signal for the thread that
+//! looks, so of several woken exactly one leaves its call for it; and no program's
+//! thread blocks while it has a signal due, so one that comes just before the block
+//! isn't missed. `ITIMER_REAL`s go off in the `alarms` task.
 
 extern crate alloc;
 
@@ -254,6 +263,9 @@ struct Task {
     /// task as it starts, both under the lock and so neither allocating nor freeing
     /// there: whatever was left in the slot is dropped once the lock is let go.
     user_start: Option<Box<crate::user::UserStart>>,
+    /// Or, for a forked child, the copy of its parent it starts from, the same way. Two
+    /// boxes rather than one of an enum: the table starts zeroed, which is `None` for both.
+    forked: Option<Box<crate::user::Forked>>,
     is_user: bool,
     /// Lowest and highest stack addresses, set when the task is created.
     stack: (usize, usize),
@@ -2253,7 +2265,10 @@ extern "C" fn app_entry(slot: usize) -> ! {
     let (app, entry, block, user_start) = {
         let mut scheduler = SCHEDULER.lock();
         let task = &mut scheduler.tasks[slot];
-        let user_start = if task.is_user { task.user_start.take() } else { None };
+        let user_start = match task.is_user {
+            true => task.user_start.take().map(crate::user::Start::Load).or_else(|| task.forked.take().map(crate::user::Start::Fork)),
+            false => None,
+        };
         (task.app, task.entry.take(), task.args, user_start)
     };
 
@@ -2310,6 +2325,9 @@ pub struct RawStreams {
     pub sigmask: Option<u64>,
     /// Signals its creator ignores that it starts at their defaults: `SETSIGDEF`.
     pub sigdefault: u64,
+    /// A terminal's foreground group word, to be set to the new process's group as it's
+    /// made, before it can run: `SPAWN2`'s `TCSETPGRP`.
+    pub foreground: Option<&'static AtomicU32>,
 }
 
 /// Where a new program's process goes, among process groups and sessions. A program a
@@ -2391,7 +2409,7 @@ fn spawn_entry_with(
     entry: Entry<'_>,
     io: SpawnIo<'_>,
     raw: RawStreams,
-    mut user_start: Option<Box<crate::user::UserStart>>,
+    mut user_start: Option<crate::user::Start>,
     record: Option<TryArc<crate::user::ChildRecord>>,
 ) -> Result<u32, SpawnFail> {
     // Slot 0 belongs to the shell and is never reused. A slot that's free but hasn't
@@ -2574,7 +2592,12 @@ fn spawn_entry_with(
         let task = &mut scheduler.tasks[slot];
         task.set_name(name);
         task.is_user = false;
-        let left = core::mem::replace(&mut task.user_start, user_start.take());
+        let (start, forked) = match user_start.take() {
+            Some(crate::user::Start::Load(start)) => (Some(start), None),
+            Some(crate::user::Start::Fork(forked)) => (None, Some(forked)),
+            None => (None, None),
+        };
+        let left = (core::mem::replace(&mut task.user_start, start), core::mem::replace(&mut task.forked, forked));
         match entry {
             Entry::App(app, args) => {
                 task.args = args;
@@ -2616,6 +2639,13 @@ fn spawn_entry_with(
         );
         // SAFETY: the slot is reserved, so nothing is running it or about to.
         unsafe { TASK_FRAMES.0[slot].get().write(frame) };
+        // The terminal goes to its group only now, when nothing is left that can fail the
+        // spawn, and still before it can run: set any earlier, a spawn that fails after
+        // would leave the terminal to a group that never existed, and its creator's group
+        // in the background, to be stopped by its next read.
+        if let Some(foreground) = raw.foreground {
+            foreground.store(SLOT_PGID[slot].load(Ordering::Relaxed), Ordering::Release);
+        }
         scheduler.table.commit(slot);
         (scheduler.table.idle_cpu(this_cpu()), left)
     };
@@ -2671,9 +2701,14 @@ pub fn spawn_user_env(
     // it held them, it would lose them for good. So no kill from before they're taken
     // until the new task has them, or they've gone back.
     let _no_kill = NoKill::new();
-    let start = crate::user::UserStart::new(path, &argv, env, cwd, umask)?;
+    let mut start = crate::user::UserStart::new(path, &argv, env, cwd, umask)?;
+    // Its streams on a terminal, those the kernel app says are: a reference to that
+    // terminal for the process to make its descriptors from. One closed since is none.
+    if let Some(terminal) = io.terminal {
+        start.set_terminal(crate::user::tty::from_host(terminal.terminal), terminal.streams);
+    }
     let name = path.rsplit('/').next().unwrap_or(path);
-    spawn_entry_with(name, Entry::User(argv, core::marker::PhantomData), io, raw, Some(start), None).map_err(|fail| match fail {
+    spawn_entry_with(name, Entry::User(argv, core::marker::PhantomData), io, raw, Some(crate::user::Start::Load(start)), None).map_err(|fail| match fail {
         SpawnFail::Spawn(error) => error,
         SpawnFail::Errno(_) => SpawnError::Unsupported,
     })
@@ -2690,7 +2725,43 @@ pub fn spawn_program(
     raw: RawStreams,
     record: TryArc<crate::user::ChildRecord>,
 ) -> Result<u32, SpawnFail> {
-    spawn_entry_with(name, Entry::User(shown, core::marker::PhantomData), SpawnIo::default(), raw, Some(start), Some(record))
+    spawn_entry_with(name, Entry::User(shown, core::marker::PhantomData), SpawnIo::default(), raw, Some(crate::user::Start::Load(start)), Some(record))
+}
+
+/// Starts the child a `FORK` from the calling thread made, in a new process: with the
+/// caller's name and arguments as `ps` shows them, in its group and session, with its
+/// signal mask, and `record` the exit record its parent took for it. `forked` is what
+/// the child starts from (`user::proc::start_forked`).
+pub fn spawn_fork(
+    forked: Box<crate::user::Forked>,
+    raw: RawStreams,
+    record: TryArc<crate::user::ChildRecord>,
+) -> Result<u32, SpawnFail> {
+    let Some(creator) = with_current_slot() else {
+        return Err(SpawnFail::Spawn(SpawnError::Unsupported));
+    };
+    let (name, name_len, args) = {
+        let scheduler = SCHEDULER.lock();
+        let task = &scheduler.tasks[creator];
+        (task.name, task.name_len, task.args)
+    };
+    let name = core::str::from_utf8(&name[..name_len]).unwrap_or("forked");
+    spawn_entry_with(name, Entry::User(args, core::marker::PhantomData), SpawnIo::default(), raw, Some(crate::user::Start::Fork(forked)), Some(record))
+}
+
+/// The thread pointer of the calling thread, in `slot`, as its register has it now.
+/// Where a program can write the register itself, `TLS[slot]` only catches up when the
+/// thread leaves its CPU, so it's read from the register (and the copy brought up to
+/// date), with interrupts masked so a switch can't come between.
+pub fn current_tls(slot: usize) -> usize {
+    if !Port::USER_TLS_WRITABLE {
+        return TLS[slot].load(Ordering::Relaxed);
+    }
+    let flags = Port::irq_save_and_disable();
+    let value = Port::user_tls();
+    TLS[slot].store(value, Ordering::Relaxed);
+    Port::irq_restore(flags);
+    value
 }
 
 /// The exit record of the calling program's process in its parent, which is in `slot`:
@@ -2828,7 +2899,7 @@ pub fn spawn_thread(
         task.name_len = name_len;
         task.is_user = true;
         // A thread starts at its program: nothing to load. Nothing is freed here either.
-        let left = task.user_start.take();
+        let left = (task.user_start.take(), task.forked.take());
         task.args = ArgBlock::new();
         task.app = None;
         task.entry = None;
@@ -2976,6 +3047,88 @@ pub fn set_process_group(slot: usize, pid: u32, pgid: u32) -> Result<(), isize> 
     }
     set_group_of(&scheduler, target, pgid, session);
     Ok(())
+}
+
+/// Whether a live program is in the process group `pgid` of the session `sid`: a group
+/// a terminal's foreground can be made.
+pub fn group_exists(pgid: u32, sid: u32) -> bool {
+    let scheduler = SCHEDULER.lock();
+    group_in_session(&scheduler, pgid, sid)
+}
+
+/// Whether the process group `pgid` of the session `sid` is orphaned, as POSIX has it: no
+/// member has a parent in another group of the same session, so nobody is left to
+/// continue it if a terminal stops it. The kernel app a program was started by counts as
+/// such a parent: it's in the session, in a group of its own. A group with no members
+/// isn't orphaned; it's nothing.
+pub fn group_orphaned(pgid: u32, sid: u32) -> bool {
+    let scheduler = SCHEDULER.lock();
+    let mut members = false;
+    for slot in 1..MAX_TASKS {
+        if !is_live_program(&scheduler, slot) || SLOT_PGID[slot].load(Ordering::Relaxed) != pgid {
+            continue;
+        }
+        members = true;
+        let parent = scheduler.tasks[slot].parent;
+        let held = scheduler.table.find_pid(parent).filter(|&found| scheduler.tasks[found].live || found == 0);
+        if let Some(found) = held {
+            let (group, session) = (SLOT_PGID[found].load(Ordering::Relaxed), SLOT_SID[found].load(Ordering::Relaxed));
+            if group != pgid && session == sid {
+                return false;
+            }
+        }
+    }
+    members
+}
+
+/// Raises `signal` on every program in the process group `pgid`, as a terminal does:
+/// its line discipline's `ISIG`, a background read's `SIGTTIN`, a resize's `SIGWINCH`.
+/// From the kernel, so nothing is refused. Whether any program was there.
+pub fn signal_group(pgid: u32, signal: u32) -> bool {
+    if pgid == 0 {
+        return false;
+    }
+    let info = feos_abi::SigInfo::sender(signal, feos_abi::si::KERNEL, 0, 0);
+    let (found, cpus, idle) = {
+        let mut scheduler = SCHEDULER.lock();
+        let scheduler = &mut *scheduler;
+        let mut seen = [0u64; MAX_TASKS / 64];
+        let (mut found, mut cpus) = (false, 0);
+        for other in 1..MAX_TASKS {
+            if seen[other / 64] >> (other % 64) & 1 != 0 || !is_live_program(scheduler, other) {
+                continue;
+            }
+            if SLOT_PGID[other].load(Ordering::Relaxed) != pgid {
+                continue;
+            }
+            for member in scheduler.table.group_members(other) {
+                seen[member / 64] |= 1 << (member % 64);
+            }
+            found = true;
+            cpus |= act_on(scheduler, other, signal, &info);
+        }
+        let collected = collect_exits(scheduler);
+        (found, cpus, announce(scheduler, collected).or(scheduler.table.idle_cpu(this_cpu())))
+    };
+    reschedule_cpus(cpus);
+    kick(idle);
+    found
+}
+
+/// Blocks the calling task while `word` holds `seen`, until the counter reaches
+/// `deadline` if there is one. As with any futex, a wake can be spurious, and a signal's
+/// or a kill's wake of the task ends it too: the caller looks at
+/// [`interrupted`] and the time itself.
+pub fn wait_word_until(word: &AtomicU32, seen: u32, deadline: Option<u64>) {
+    if !can_block() {
+        core::hint::spin_loop();
+        return;
+    }
+    let key = word as *const AtomicU32 as usize;
+    match deadline {
+        Some(deadline) => switch_with(PendingRequest::WaitUntil(key, seen, deadline)),
+        None => switch_with(PendingRequest::Wait(key, seen)),
+    }
 }
 
 /// `SETSID` from the program in `slot`: a new session and group, both its pid. `EPERM`
@@ -3807,6 +3960,26 @@ impl Processes for ProcessManager {
         current_stdin()
     }
 
+    fn open_terminal(&self, echo: PipeId, rows: u16, columns: u16) -> Option<u32> {
+        crate::user::tty::open(echo, rows, columns)
+    }
+
+    fn terminal_input(&self, terminal: u32, bytes: &[u8]) -> usize {
+        crate::user::tty::input(terminal, bytes)
+    }
+
+    fn resize_terminal(&self, terminal: u32, rows: u16, columns: u16) {
+        crate::user::tty::resize(terminal, rows, columns);
+    }
+
+    fn close_terminal(&self, terminal: u32) {
+        crate::user::tty::close(terminal);
+    }
+
+    fn take_terminal_input(&self, terminal: u32, out: &mut [u8]) -> usize {
+        crate::user::tty::take_input(terminal, out)
+    }
+
     fn catch_signals(&self, mask: u32) {
         if let Some(slot) = with_current_slot() {
             CAUGHT[slot].store(mask, Ordering::Release);
@@ -3834,6 +4007,11 @@ impl Processes for ProcessManager {
 
     fn set_stopped(&self, pid: u32, stopped: bool) -> bool {
         set_stopped(pid, stopped)
+    }
+
+    fn is_stopped(&self, pid: u32) -> bool {
+        let scheduler = SCHEDULER.lock();
+        scheduler.table.find_pid(pid).is_some_and(|slot| scheduler.table.tasks()[slot].stopped)
     }
 
     fn send_signal(&self, pid: u32, number: u32) -> KillResult {
@@ -3956,11 +4134,17 @@ pub fn alarms_changed() {
 
 /// The task that raises `SIGALRM` for each program whose `ITIMER_REAL` has passed, and
 /// re-arms it by its interval, then sleeps until the next one is due or a timer changes.
+/// It looks at most once per [`feos_signal::itimer::MIN_PERIOD_NS`] but when a timer is
+/// set: as well as each timer's interval having that floor, many programs' timers out of
+/// phase with each other then can't between them have it take the scheduler's lock any
+/// more often.
 fn alarms() -> i32 {
     loop {
         let seen = ALARMS.load(Ordering::Acquire);
-        match fire_alarms(crate::time::monotonic_ns()) {
+        let now = crate::time::monotonic_ns();
+        match fire_alarms(now) {
             Some(due) => {
+                let due = due.max(now.saturating_add(feos_signal::itimer::MIN_PERIOD_NS));
                 if can_block() {
                     let key = &ALARMS as *const AtomicU32 as usize;
                     switch_with(PendingRequest::WaitUntil(key, seen, crate::time::deadline_ticks(due)));
@@ -3993,7 +4177,10 @@ fn fire_alarms(now: u64) -> Option<u64> {
             let mut due = signals.alarm_at.load(Ordering::Acquire);
             if due != 0 && due <= now {
                 let again = feos_signal::itimer::next(due, signals.alarm_every.load(Ordering::Acquire), now);
-                if signals.alarm_at.compare_exchange(due, again, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                // One still pending from last time takes this one in (signals don't
+                // queue), so there's no one to tell again.
+                let pending = signals.pending.load(Ordering::Acquire) & feos_signal::bit(feos_abi::sig::ALRM) != 0;
+                if signals.alarm_at.compare_exchange(due, again, Ordering::AcqRel, Ordering::Acquire).is_ok() && !pending {
                     let info = feos_abi::SigInfo::sender(feos_abi::sig::ALRM, feos_abi::si::KERNEL, 0, 0);
                     cpus |= act_on(scheduler, slot, feos_abi::sig::ALRM, &info);
                 }

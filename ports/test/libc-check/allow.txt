@@ -1,0 +1,50 @@
+# Items of the libc crate (as it exports them for feos) that may differ from relibc's
+# feos headers, each with why. KEY as libc-check prints it ('size NAME', 'align NAME',
+# 'signed NAME', 'offset NAME.FIELD', 'const NAME', 'fn NAME'), a colon, the reason.
+# libc-check fails on any other difference, and says when an entry here passes again.
+
+# Rust-only names: the libc crate's own aliases, which no C header has.
+size Ioctl: the libc crate's name for ioctl's request type (unsigned long, as relibc's ioctl takes)
+signed Ioctl: the same
+size sighandler_t: the libc crate's integer form of a signal handler (glibc's has it only under _GNU_SOURCE); the same size as relibc's handler pointers
+signed sighandler_t: the same
+size Elf64_Sword: relibc defines it (src/header/elf) but cbindgen leaves the unused alias out of <elf.h>
+signed Elf64_Sword: the same
+
+# Signal handlers are pointers in C and integers in the libc crate (as on every unix).
+const SIG_DFL: a function pointer in C, not an integer constant expression; 0 in both
+const SIG_IGN: a function pointer in C; 1 in both
+const SIG_ERR: a function pointer in C; -1 in both
+fn signal: takes and returns sighandler_t (an integer of pointer size) where C has a pointer: the same registers
+fn sigset: the same
+const SA_RESETHAND: relibc's is an unsigned long 0x80000000, the libc crate's an int, which sa_flags (an int in both) gets: the same 32 bits
+
+# ioctl: relibc declares int ioctl(int, unsigned long, void *); the libc crate's is
+# variadic, as on Linux, so Linux callers build unchanged. Both pass the three arguments
+# in the same registers on x86_64 and AArch64 (no vector registers: %al is ignored).
+fn ioctl: variadic in the libc crate, three fixed arguments in relibc; same registers on both ports
+
+# Shared unix items (src/unix/mod.rs, for every unix target) that relibc doesn't have.
+# Values are the Linux ones; a program using them builds, and a C equivalent wouldn't.
+const USRQUOTA: no <sys/quota.h> in relibc
+const GRPQUOTA: no <sys/quota.h> in relibc
+const SIGIOT: relibc's <signal.h> has SIGABRT (6) only
+const IFNAMSIZ: relibc's <net/if.h> has IF_NAMESIZE (16) only
+const LOG_PRIMASK: relibc's <syslog.h> has no LOG_PRIMASK (LOG_PRI's mask, 7)
+const LOG_FACMASK: relibc's <syslog.h> has no LOG_FACMASK (0x3f8)
+const PRIO_MIN: relibc's <sys/resource.h> has no PRIO_MIN (-20)
+const PRIO_MAX: relibc's <sys/resource.h> has no PRIO_MAX (20)
+const ARPOP_REQUEST: no <net/if_arp.h> in relibc
+const ARPOP_REPLY: no <net/if_arp.h> in relibc
+const ATF_COM: no <net/if_arp.h> in relibc
+const ATF_PERM: no <net/if_arp.h> in relibc
+const ATF_PUBL: no <net/if_arp.h> in relibc
+const ATF_USETRAILERS: no <net/if_arp.h> in relibc
+align in6_addr: the libc crate's in6_addr is 4-aligned (Linux's has a uint32_t member), relibc's only bytes; it sits at 4-aligned offsets in sockaddr_in6 and ipv6_mreq either way, whose layouts match
+fn fmemopen: not in relibc: a program calling it doesn't link
+fn open_memstream: not in relibc: a program calling it doesn't link
+fn open_wmemstream: not in relibc: a program calling it doesn't link
+fn adjtime: not in relibc (feos has no clock slewing): a program calling it doesn't link
+fn res_init: not in relibc (no resolver state): a program calling it doesn't link
+fn readdir_r: relibc has it but neither exports nor declares it (obsolescent in POSIX 2024): a program calling it doesn't link
+fn times: relibc's sys_times module is off upstream (times() is a todo there): a program calling it doesn't link

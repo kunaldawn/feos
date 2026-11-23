@@ -57,6 +57,7 @@ fn target_of(slot: usize, ofd: &Ofd) -> Option<String> {
             None => copy("/dev/console"),
         },
         Object::Console => copy("/dev/console"),
+        Object::Terminal { .. } => copy("/dev/tty"),
         Object::File { .. } | Object::Directory { .. } | Object::Link { .. } => copy(ofd.path()?),
     }
 }

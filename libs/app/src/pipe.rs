@@ -259,6 +259,131 @@ impl PipeId {
 fn notify(slot: &Slot) {
     slot.wakes.fetch_add(1, Ordering::Release);
     futex_wake(&slot.wakes, usize::MAX);
+    advance_readiness();
+}
+
+/// The machine-wide readiness word (stage 1c.11): moves whenever anything a `POLL` can
+/// wait for may have changed, a pipe's contents or ends, the terminal's input, so a
+/// poller reads it, looks at every entry, and waits for it to move from what it read.
+/// One word for everything is simple and correct, and wakes every poller on every
+/// change: the place to give objects waiter lists of their own, if many pollers ever
+/// show up in profiles.
+static READINESS: AtomicU32 = AtomicU32::new(0);
+
+/// Pollers waiting on [`READINESS`], so a change with nobody waiting costs only the
+/// increment: no wake, which takes the scheduler's lock.
+static POLLERS: AtomicU32 = AtomicU32::new(0);
+
+/// The readiness word now, for a poller to wait on with [`wait_readiness`] once it has
+/// looked at what it polls.
+pub fn readiness() -> u32 {
+    READINESS.load(Ordering::SeqCst)
+}
+
+/// The word itself, for a kernel wait with a deadline on it.
+pub fn readiness_word() -> &'static AtomicU32 {
+    &READINESS
+}
+
+/// Something a poller may be waiting for has changed: moves the word, and wakes them.
+pub fn advance_readiness() {
+    READINESS.fetch_add(1, Ordering::SeqCst);
+    // Sequentially consistent with a poller's count and read: either it counted itself
+    // before this looked, and is woken, or it reads the word after this moved it, and
+    // doesn't wait.
+    if POLLERS.load(Ordering::SeqCst) != 0 {
+        futex_wake(&READINESS, usize::MAX);
+    }
+}
+
+/// Counts the caller as a poller until it lets go of what this returns. Taken before
+/// reading [`readiness`].
+pub fn poller() -> Poller {
+    POLLERS.fetch_add(1, Ordering::SeqCst);
+    Poller(())
+}
+
+/// A poller counted in [`POLLERS`].
+pub struct Poller(());
+
+impl Drop for Poller {
+    fn drop(&mut self) {
+        POLLERS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Blocks while the readiness word still reads `seen`, as [`futex_wait`] does: a
+/// spurious return is always possible.
+pub fn wait_readiness(seen: u32) {
+    futex_wait(&READINESS, seen);
+}
+
+/// What a `POLL` sees of a pipe, by id: bytes held, and whether either end is open. A
+/// pipe that's gone has neither.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct PipeState {
+    pub held: usize,
+    pub readers: bool,
+    pub writers: bool,
+}
+
+impl PipeState {
+    /// Room for a write of [`PIPE_BUF`] in one piece.
+    pub const fn writable(&self) -> bool {
+        PIPE_BYTES - self.held >= PIPE_BUF
+    }
+}
+
+/// The state of the pipe `id`.
+pub fn state(id: PipeId) -> PipeState {
+    let ring = id.slot().ring.lock();
+    if ring.generation != id.generation() {
+        return PipeState::default();
+    }
+    PipeState { held: ring.len, readers: ring.readers > 0, writers: ring.writers > 0 }
+}
+
+/// Notes that a reader came up empty on the pipe `id` without reading: a poller of its
+/// read end wants input, as a reader that found it empty does.
+pub fn mark_wanted(id: PipeId) {
+    let slot = id.slot();
+    let ring = slot.ring.lock();
+    if ring.generation == id.generation() && ring.len == 0 {
+        slot.wanted.store(true, Ordering::Release);
+    }
+}
+
+/// Drops whatever the pipe `id` holds: a terminal's `TCOFLUSH` of output not yet shown.
+pub fn discard(id: PipeId) {
+    let slot = id.slot();
+    let mut ring = slot.ring.lock();
+    if ring.generation != id.generation() {
+        return;
+    }
+    ring.head = 0;
+    ring.len = 0;
+    drop(ring);
+    notify(slot);
+}
+
+/// Waits until the pipe `id` is empty, its reader having taken everything (or gone):
+/// `tcdrain`. [`Killed`] if the caller is interrupted first.
+pub fn wait_empty(id: PipeId) -> Result<(), Killed> {
+    let slot = id.slot();
+    loop {
+        let seen = slot.wakes.load(Ordering::Acquire);
+        let done = {
+            let ring = slot.ring.lock();
+            ring.generation != id.generation() || ring.len == 0 || ring.readers == 0
+        };
+        if done {
+            return Ok(());
+        }
+        if interrupted() {
+            return Err(Killed);
+        }
+        futex_wait(&slot.wakes, seen);
+    }
 }
 
 fn close(id: PipeId, end: End, pid: u32) {
@@ -895,6 +1020,44 @@ mod tests {
             current_pid: || PID.with(|pid| pid.get()),
             interrupted: || KILLED.with(|killed| killed.get()),
         });
+    }
+
+    #[test]
+    fn readiness_word_moves_on_pipe_change() {
+        per_thread_hooks();
+        let (reader, writer) = create().unwrap();
+        let id = reader.id();
+        let mut seen = readiness();
+        // Every change a poller could be waiting for moves it: a write, a read, a close.
+        let mut moved = |what: &str| {
+            let now = readiness();
+            assert_ne!(now, seen, "{what} didn't move the readiness word");
+            seen = now;
+        };
+        assert_eq!(writer.try_write(b"abc"), Transfer::Moved(3));
+        moved("a write");
+        assert_eq!(state(id), PipeState { held: 3, readers: true, writers: true });
+        let mut out = [0u8; 2];
+        assert_eq!(reader.try_read(&mut out), Transfer::Moved(2));
+        moved("a read");
+        discard(id);
+        moved("a discard");
+        assert_eq!(state(id).held, 0);
+        assert!(state(id).writable());
+        assert_eq!(wait_empty(id), Ok(()));
+        drop(writer);
+        moved("the writer's close");
+        assert_eq!(state(id), PipeState { held: 0, readers: true, writers: false });
+        drop(reader);
+        moved("the reader's close");
+        // A pipe that's gone has nobody at either end.
+        assert_eq!(state(id), PipeState::default());
+        // A poller is counted while it waits, and a wait on a word that moved returns.
+        let poller = poller();
+        let before = readiness();
+        advance_readiness();
+        wait_readiness(before);
+        drop(poller);
     }
 
     #[test]

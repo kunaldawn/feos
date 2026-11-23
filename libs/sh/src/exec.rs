@@ -290,7 +290,7 @@ impl Shell<'_> {
         let mut status = match pipeline.commands.as_slice() {
             [] => 0,
             [command] => self.run_command(command, io, host, background),
-            commands => self.run_stages(commands, io, host),
+            commands => self.run_stages(commands, io, host, background),
         };
         if let Some(start) = timing {
             self.report_timing(start, pipeline.timed_posix, io);
@@ -301,12 +301,27 @@ impl Shell<'_> {
                 status = i32::from(status == 0);
             }
         }
+        // And once it's done, so one that arrived during the last command (`sh -c '...;
+        // kill -INT $$'`) still runs before the shell exits, with `$?` as it left it.
+        if !self.flow.is_active() {
+            self.last_status = status;
+            self.deliver_signals(io, host);
+        }
         status
     }
 
     /// Runs a pipeline: each stage's output is buffered and becomes the next
     /// stage's input.
-    fn run_stages(&mut self, commands: &[Command], io: &mut Io<'_>, host: &mut dyn Host) -> i32 {
+    fn run_stages(
+        &mut self,
+        commands: &[Command],
+        io: &mut Io<'_>,
+        host: &mut dyn Host,
+        background: bool,
+    ) -> i32 {
+        if let Some(status) = self.run_program_pipeline(commands, io, host, background) {
+            return status;
+        }
         if let Some(status) = self.run_streaming(commands, io, host) {
             return status;
         }
@@ -1282,7 +1297,7 @@ impl Shell<'_> {
     }
 
     /// Whether the file at `path` starts as an ELF image does.
-    fn is_program(&mut self, path: &str) -> bool {
+    pub(crate) fn is_program(&mut self, path: &str) -> bool {
         let mut magic = [0u8; 4];
         matches!(self.fs.read_at(path, 0, &mut magic), Ok(4)) && magic == *b"\x7fELF"
     }
@@ -1297,6 +1312,9 @@ impl Shell<'_> {
         background: bool,
     ) -> i32 {
         let absolute = self.fs.resolve(path);
+        if host.processes().is_some() {
+            return self.spawn_program(path, &absolute, args, io, host, background);
+        }
         let cwd = self.fs.cwd().to_string();
         // A program's environment is what the shell exports, the command's own
         // assignments (`FOO=bar prog`) among them, as for any command.

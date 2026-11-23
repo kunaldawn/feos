@@ -524,6 +524,21 @@ pub fn wait4(pid: isize, options: usize) -> Result<(isize, i32), isize> {
     }
 }
 
+/// `fork()`: the child's pid in the parent, 0 in the child, or the error.
+pub fn fork() -> isize {
+    syscall(nr::FORK, [0; 6])
+}
+
+/// The status a child ended with, waited for: its exit code, 128 plus a signal, or the
+/// error as itself.
+pub fn wait_status(pid: isize) -> isize {
+    match wait4(pid, 0) {
+        Ok((_, status)) if abi::wait::exited(status) => abi::wait::exit_code(status) as isize,
+        Ok((_, status)) => 128 + abi::wait::term_signal(status) as isize,
+        Err(error) => error,
+    }
+}
+
 /// `wait4` with the child's resource use too.
 pub fn wait4_rusage(pid: isize, options: usize) -> Result<(isize, i32, abi::Rusage), isize> {
     let mut status = -1i32;
@@ -837,6 +852,16 @@ pub fn clock_getres(clock: usize) -> Result<abi::Timespec, isize> {
     }
 }
 
+/// `clock_settime(clock, time)`.
+pub fn clock_settime(clock: usize, time: &abi::Timespec) -> isize {
+    syscall(nr::CLOCK_SETTIME, [clock, time as *const abi::Timespec as usize, 0, 0, 0, 0])
+}
+
+/// `getrandom(out, flags)`: the count, or the negated error.
+pub fn getrandom(out: &mut [u8], flags: usize) -> isize {
+    syscall(nr::GETRANDOM, [out.as_mut_ptr() as usize, out.len(), flags, 0, 0, 0])
+}
+
 /// A clock's reading in nanoseconds, or zero if it can't be read.
 pub fn now_ns(clock: usize) -> u64 {
     clock_gettime(clock).ok().and_then(|time| time.to_nanos()).unwrap_or(0)
@@ -1036,6 +1061,61 @@ pub mod thread {
 
 /// `openat(dirfd, path, flags, mode)`: `dirfd` is a descriptor or
 /// [`abi::at::FDCWD`] (passed as `i32`, sign extended, as a C caller's would be).
+/// `ioctl(fd, request, arg)`.
+pub fn ioctl(fd: usize, request: usize, arg: usize) -> isize {
+    syscall(nr::IOCTL, [fd, request, arg, 0, 0, 0])
+}
+
+/// `poll(fds, timeout_ns)`, or with `sigmask` `ppoll`: how many entries are ready, or the
+/// error.
+pub fn poll(fds: &mut [abi::PollFd], timeout_ns: i64, sigmask: Option<&u64>) -> isize {
+    let mask = sigmask.map_or(0, |mask| mask as *const u64 as usize);
+    syscall(nr::POLL, [fds.as_mut_ptr() as usize, fds.len(), timeout_ns as usize, mask, 0, 0])
+}
+
+/// The terminal's settings, if `fd` is a terminal: `tcgetattr`.
+pub fn tcgetattr(fd: usize) -> Result<abi::Termios, isize> {
+    let mut out = [0u8; abi::Termios::SIZE];
+    match ioctl(fd, abi::ioctl::TTY_GET_ATTR, out.as_mut_ptr() as usize) {
+        0 => Ok(abi::Termios::from_bytes(out)),
+        error => Err(error),
+    }
+}
+
+/// `tcsetattr`, `request` one of the `TTY_SET_ATTR*`.
+pub fn tcsetattr(fd: usize, request: usize, termios: &abi::Termios) -> isize {
+    let bytes = termios.to_bytes();
+    ioctl(fd, request, bytes.as_ptr() as usize)
+}
+
+/// Whether `fd` is a terminal.
+pub fn isatty(fd: usize) -> bool {
+    tcgetattr(fd).is_ok()
+}
+
+/// An `i32` an `ioctl` gives back through its pointer.
+pub fn ioctl_int(fd: usize, request: usize) -> Result<i32, isize> {
+    let mut out = 0i32;
+    match ioctl(fd, request, &mut out as *mut i32 as usize) {
+        0 => Ok(out),
+        error => Err(error),
+    }
+}
+
+/// The terminal's size.
+pub fn winsize(fd: usize) -> Result<abi::WinSize, isize> {
+    let mut out = [0u8; abi::WinSize::SIZE];
+    match ioctl(fd, abi::ioctl::TTY_GET_WINSIZE, out.as_mut_ptr() as usize) {
+        0 => Ok(abi::WinSize::from_bytes(out)),
+        error => Err(error),
+    }
+}
+
+/// `tcsetpgrp`.
+pub fn tcsetpgrp(fd: usize, pgid: i32) -> isize {
+    ioctl(fd, abi::ioctl::TTY_SET_PGRP, &pgid as *const i32 as usize)
+}
+
 pub fn openat(dirfd: i32, path: &str, flags: usize, mode: usize) -> isize {
     syscall(nr::OPENAT, [dirfd as isize as usize, path.as_ptr() as usize, path.len(), flags, mode, 0])
 }
@@ -1206,6 +1286,110 @@ pub fn error_name(result: isize) -> &'static str {
         Some(errno::E2BIG) => "E2BIG",
         Some(_) => "error",
         None => "ok",
+    }
+}
+
+/// `execvp`'s fallback, as a C library has it: [`exec`] `path`, and if the kernel says
+/// it isn't a format it runs (`ENOEXEC`, a file without `#!`), run it as a shell script
+/// instead: `/bin/sh path args...`. Returns only with the error.
+pub fn execvp(path: &str, args: &[&str]) -> isize {
+    let error = exec_args(path, args);
+    if abi::error_of(error) != Some(errno::ENOEXEC) {
+        return error;
+    }
+    let mut words = [""; 16];
+    words[0] = "/bin/sh";
+    words[1] = path;
+    let mut count = 2;
+    for arg in args.iter().skip(1) {
+        if count == words.len() {
+            return -errno::E2BIG;
+        }
+        words[count] = arg;
+        count += 1;
+    }
+    exec_args("/bin/sh", &words[..count])
+}
+
+/// A heap for the programs that want `alloc`, such as `/bin/sh`: `feos-heap`'s first fit
+/// over one arena reserved with `MAP_NORESERVE` on first use, so it costs frames only as
+/// it's touched. A program that wants it names it as its `#[global_allocator]`.
+pub mod heap {
+    use core::alloc::{GlobalAlloc, Layout};
+    use core::cell::UnsafeCell;
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    use super::abi::{map, prot};
+
+    pub struct UserHeap {
+        lock: AtomicBool,
+        heap: UnsafeCell<feos_heap::Heap>,
+        size: usize,
+    }
+
+    // SAFETY: the heap is only reached with `lock` held.
+    unsafe impl Sync for UserHeap {}
+
+    impl UserHeap {
+        /// A heap of up to `size` bytes.
+        pub const fn new(size: usize) -> Self {
+            Self { lock: AtomicBool::new(false), heap: UnsafeCell::new(feos_heap::Heap::empty()), size }
+        }
+
+        /// Runs `body` with the heap, its arena reserved first.
+        fn with<T>(&self, failed: T, body: impl FnOnce(&mut feos_heap::Heap) -> T) -> T {
+            while self.lock.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                core::hint::spin_loop();
+            }
+            // SAFETY: the lock is held, so nothing else has the heap.
+            let heap = unsafe { &mut *self.heap.get() };
+            let result = if heap.is_initialized() {
+                body(heap)
+            } else {
+                let base = super::mmap2(0, self.size, prot::READ | prot::WRITE, map::PRIVATE | map::NORESERVE);
+                if super::abi::error_of(base).is_some() {
+                    failed
+                } else {
+                    // SAFETY: a fresh mapping of `size` bytes nothing else uses, kept for good.
+                    unsafe { heap.init(base as *mut u8, self.size) };
+                    body(heap)
+                }
+            };
+            self.lock.store(false, Ordering::Release);
+            result
+        }
+    }
+
+    // SAFETY: `feos-heap` hands out disjoint blocks aligned as asked, from memory that
+    // stays mapped.
+    unsafe impl GlobalAlloc for UserHeap {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            self.with(core::ptr::null_mut(), |heap| heap.alloc(layout, 0))
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, _layout: Layout) {
+            self.with((), |heap| {
+                let _ = heap.free(pointer);
+            });
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            if layout.align() <= 16 && self.with(false, |heap| matches!(heap.resize(pointer, new_size), Ok(Some(_)))) {
+                return pointer;
+            }
+            // SAFETY: as `GlobalAlloc::realloc` promises of the layout.
+            let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
+            // SAFETY: as for any allocation.
+            let moved = unsafe { self.alloc(new_layout) };
+            if !moved.is_null() {
+                // SAFETY: both blocks are live and at least this long.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(pointer, moved, layout.size().min(new_size));
+                    self.dealloc(pointer, layout);
+                }
+            }
+            moved
+        }
     }
 }
 

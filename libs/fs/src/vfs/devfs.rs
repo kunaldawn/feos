@@ -111,18 +111,19 @@ enum DevNode {
     Link(&'static str),
 }
 
-/// `/dev`, sorted by name after its root. `random` and `urandom` come with `GETRANDOM`
-/// (stage 1e.1) and are missing until then.
-const DEV: [(&str, DevNode); 10] = [
+/// `/dev`, sorted by name after its root.
+const DEV: [(&str, DevNode); 12] = [
     ("/", DevNode::Root),
     ("console", DevNode::Device(DeviceKind::Console, 0o600)),
     ("fd", DevNode::Link("/proc/self/fd")),
     ("full", DevNode::Device(DeviceKind::Full, 0o666)),
     ("null", DevNode::Device(DeviceKind::Null, 0o666)),
+    ("random", DevNode::Device(DeviceKind::Random, 0o666)),
     ("stderr", DevNode::Link("/proc/self/fd/2")),
     ("stdin", DevNode::Link("/proc/self/fd/0")),
     ("stdout", DevNode::Link("/proc/self/fd/1")),
     ("tty", DevNode::Device(DeviceKind::Tty, 0o666)),
+    ("urandom", DevNode::Device(DeviceKind::Urandom, 0o666)),
     ("zero", DevNode::Device(DeviceKind::Zero, 0o666)),
 ];
 

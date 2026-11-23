@@ -1,0 +1,108 @@
+# Stage T5: C and C++ built by the feos clang (Triple::Feos, clang's feos driver) with
+# compiler-rt, LLVM's libunwind, libc++abi and libc++ for feos (ports/build-runtimes.sh),
+# and Rust linked with them (ports/test/t5). Programs injected as /bin/t5-*, the sysroot
+# with the runtimes at /usr (t5-sysroot-check is libc-suite's sysroot-check built by the
+# feos clang).
+[boot]
+memory = "1G"
+
+[[case]]
+name = "sysroot"
+run = "/bin/t5-sysroot-check"
+expect = ["files ok ("]
+reject = ["sysroot-check: /"]
+status = 0
+timeout = 120
+
+[[case]]
+name = "c-hello"
+run = "/bin/t5-c-hello one 'two three'"
+expect = ["hello from C on feos, 2 argument(s)", "argv[1]=one", "argv[2]=two three",
+          "strdup: one", "t5-c-hello: ok"]
+reject = ["FAILED"]
+status = 0
+
+[[case]]
+name = "c-hello-arch-x64"
+arch = "x64"
+run = "/bin/t5-c-hello"
+expect = ["arch: x86_64", "t5-c-hello: ok"]
+status = 0
+
+[[case]]
+name = "c-hello-arch-arm"
+arch = "arm"
+run = "/bin/t5-c-hello"
+expect = ["arch: aarch64", "t5-c-hello: ok"]
+status = 0
+
+[[case]]
+name = "cxx-hello"
+run = "/bin/t5-cxx-hello alpha beta"
+expect = ["static constructor ran", "hello from C++ on feos, 2 argument(s)", "arg: alpha",
+          "arg: beta", "map: a=3 b=2 c=1", "sorted: 1 3 5 7 9", "float: 3.142", "hex: beef",
+          "parsed: 59", "t5-cxx-hello: ok", "static destructor ran"]
+reject = ["FAILED"]
+status = 0
+
+[[case]]
+name = "cxx-hello-stderr"
+run = "/bin/t5-cxx-hello 2>&1 >/dev/null"
+expect = ["to stderr"]
+reject = ["hello from C++"]
+status = 0
+
+[[case]]
+name = "cxx-exceptions"
+run = "/bin/t5-cxx-except"
+expect = ["caught: bottom, 21 destructors", "through C: from a callback, value 42",
+          "inner: 7", "rethrown: 7", "on a thread: 1", "caught: a std::string",
+          "t5-cxx-except: ok"]
+reject = ["FAILED", "terminate"]
+status = 0
+
+[[case]]
+name = "cxx-threads"
+run = "/bin/t5-cxx-threads"
+expect = ["mutex: 80000 of 80000", "thread_local destructors: 8", "condition_variable: 42",
+          "atomic wait: 2", "sleep_for: ok", "async: 42", "hardware_concurrency: ok",
+          "t5-cxx-threads: ok"]
+reject = ["FAILED"]
+status = 0
+timeout = 120
+
+[[case]]
+name = "cxx-filesystem"
+run = "/bin/t5-cxx-fs /tmp/t5-fs"
+expect = ["directory_iterator: a/ one.txt two.txt",
+          "recursive: a a/b a/b/four.txt a/three.txt one.txt two.txt",
+          "file_size: 20", "exists: copy 1, moved 1, old 0", "copy: contents of one.txt",
+          "is_directory: 1, absolute: 1", "remove_all: 8, exists 0",
+          "filesystem_error: ENOENT", "t5-cxx-fs: ok"]
+reject = ["FAILED", "terminate"]
+status = 0
+
+[[case]]
+name = "cxx-strtod"
+run = "/bin/t5-cxx-strtod"
+expect = ["narrow: ok", "wide: ok", "c: ok", "t5-cxx-strtod: ok"]
+reject = ["FAILED", "terminate"]
+status = 0
+
+[[case]]
+name = "rust-panic"
+run = "/bin/t5-rust-panic"
+expect = ["caught: deep panic, drops 16", "thread caught: true", "join error: true",
+          "t5-rust-panic: ok"]
+reject = ["FAILED"]
+status = 0
+
+[[case]]
+name = "mixed-cxx-rust"
+run = "/bin/t5-mixed"
+expect = ["rust_sum: 15", "through Rust: C++ exception 9, rust drops 1",
+          "rust caught: rust panic 5 through C++",
+          "rust_catch: 1, C++ destructors 1, rust drops 2", "rust threads: 100",
+          "t5-mixed: ok"]
+reject = ["FAILED", "terminate"]
+status = 0

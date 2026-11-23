@@ -70,6 +70,21 @@ index 4d1d1ea..fa93c86 100644
  
  // Missing typedefs
  #ifndef _RELIBC_FLOAT_T
+diff --git a/include/setjmp.h b/include/setjmp.h
+index 8b3878d..09c364a 100644
+--- a/include/setjmp.h
++++ b/include/setjmp.h
+@@ -2,7 +2,9 @@
+ #define _SETJMP_H
+ 
+ #ifdef __aarch64__
+-typedef unsigned long long jmp_buf[22];
++/* musl's size: 22 words of registers (setjmp.s), then sigsetjmp's x30, the signal mask
++ * and its saved x19 (sigsetjmp.s, __sigsetjmp_tail), with room for a larger mask. */
++typedef unsigned long long jmp_buf[39];
+ #endif
+ 
+ #ifdef __i386__
 diff --git a/include/stdatomic.h b/include/stdatomic.h
 index bfcfdf6..ad4c676 100644
 --- a/include/stdatomic.h
@@ -92,6 +107,49 @@ index bfcfdf6..ad4c676 100644
  #define _STDATOMIC_H
  
  typedef enum
+diff --git a/include/sys/feos.h b/include/sys/feos.h
+new file mode 100644
+index 0000000..15945a3
+--- /dev/null
++++ b/include/sys/feos.h
+@@ -0,0 +1,24 @@
++#ifndef _SYS_FEOS_H
++#define _SYS_FEOS_H
++
++#include <stdint.h>
++#include <time.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#ifdef __feos__
++
++/* The futex Rust's std uses on feos (docs/feos-abi-v2.md 10.2), over FUTEX_WAIT2
++ * and FUTEX_WAKE. The deadline is an absolute CLOCK_MONOTONIC time, or NULL. */
++int __feos_futex_wait(uint32_t *addr, uint32_t expected, const struct timespec *deadline);
++int __feos_futex_wake(uint32_t *addr, int count);
++
++#endif
++
++#ifdef __cplusplus
++} // extern "C"
++#endif
++
++#endif
+diff --git a/src/c/wchar.c b/src/c/wchar.c
+new file mode 100644
+index 0000000..a458bcd
+--- /dev/null
++++ b/src/c/wchar.c
+@@ -0,0 +1,7 @@
++typedef __WCHAR_TYPE__ wchar_t;
++
++double wcstod(const wchar_t *nptr, wchar_t **endptr);
++
++long double wcstold(const wchar_t *nptr, wchar_t **endptr) {
++    return (long double)wcstod(nptr, endptr);
++}
 diff --git a/src/header/_paths/mod.rs b/src/header/_paths/mod.rs
 index 7c391b4..e813e0c 100644
 --- a/src/header/_paths/mod.rs
@@ -104,6 +162,22 @@ index 7c391b4..e813e0c 100644
  #[path = "linux.rs"]
  mod sys;
  
+diff --git a/src/header/bits_gid-t/mod.rs b/src/header/bits_gid-t/mod.rs
+index e1af88f..30f7a04 100644
+--- a/src/header/bits_gid-t/mod.rs
++++ b/src/header/bits_gid-t/mod.rs
+@@ -1,4 +1,11 @@
++#[cfg(any(target_os = "linux", target_os = "feos"))]
++use crate::platform::types::c_uint;
++#[cfg(not(any(target_os = "linux", target_os = "feos")))]
+ use crate::platform::types::c_int;
+ 
+ /// Used for group IDs.
++#[cfg(any(target_os = "linux", target_os = "feos"))]
++pub type gid_t = c_uint;
++/// Used for group IDs.
++#[cfg(not(any(target_os = "linux", target_os = "feos")))]
+ pub type gid_t = c_int;
 diff --git a/src/header/bits_mode-t/mod.rs b/src/header/bits_mode-t/mod.rs
 index 3870f55..5daec36 100644
 --- a/src/header/bits_mode-t/mod.rs
@@ -158,6 +232,50 @@ index 19b9a73..564062e 100644
 +#[cfg(not(any(target_os = "linux", target_os = "feos")))]
  /// Used for time in microseconds.
  pub type suseconds_t = c_int;
+diff --git a/src/header/bits_uid-t/mod.rs b/src/header/bits_uid-t/mod.rs
+index c0315f7..d4c657a 100644
+--- a/src/header/bits_uid-t/mod.rs
++++ b/src/header/bits_uid-t/mod.rs
+@@ -1,4 +1,11 @@
++#[cfg(any(target_os = "linux", target_os = "feos"))]
++use crate::platform::types::c_uint;
++#[cfg(not(any(target_os = "linux", target_os = "feos")))]
+ use crate::platform::types::c_int;
+ 
+ /// Used for user IDs.
++#[cfg(any(target_os = "linux", target_os = "feos"))]
++pub type uid_t = c_uint;
++/// Used for user IDs.
++#[cfg(not(any(target_os = "linux", target_os = "feos")))]
+ pub type uid_t = c_int;
+diff --git a/src/header/errno/mod.rs b/src/header/errno/mod.rs
+index aceb031..d732c78 100644
+--- a/src/header/errno/mod.rs
++++ b/src/header/errno/mod.rs
+@@ -84,7 +84,11 @@ pub const ENOLCK: c_int = 37; /* No record locks available */
+ pub const ENOSYS: c_int = 38; /* Function not implemented */
+ pub const ENOTEMPTY: c_int = 39; /* Directory not empty */
+ pub const ELOOP: c_int = 40; /* Too many symbolic links encountered */
++#[cfg(not(any(target_os = "linux", target_os = "feos")))]
+ pub const EWOULDBLOCK: c_int = 41; /* Operation would block */
++/// Linux's (and feos's) `EWOULDBLOCK` is `EAGAIN`: no call returns 41.
++#[cfg(any(target_os = "linux", target_os = "feos"))]
++pub const EWOULDBLOCK: c_int = EAGAIN; /* Operation would block */
+ pub const ENOMSG: c_int = 42; /* No message of desired type */
+ pub const EIDRM: c_int = 43; /* Identifier removed */
+ pub const ECHRNG: c_int = 44; /* Channel number out of range */
+@@ -101,7 +105,11 @@ pub const EXFULL: c_int = 54; /* Exchange full */
+ pub const ENOANO: c_int = 55; /* No anode */
+ pub const EBADRQC: c_int = 56; /* Invalid request code */
+ pub const EBADSLT: c_int = 57; /* Invalid slot */
++#[cfg(not(any(target_os = "linux", target_os = "feos")))]
+ pub const EDEADLOCK: c_int = 58; /* Resource deadlock would occur */
++/// Linux's (and feos's) `EDEADLOCK` is `EDEADLK` on x86_64 and AArch64.
++#[cfg(any(target_os = "linux", target_os = "feos"))]
++pub const EDEADLOCK: c_int = EDEADLK; /* Resource deadlock would occur */
+ pub const EBFONT: c_int = 59; /* Bad font file format */
+ pub const ENOSTR: c_int = 60; /* Device not a stream */
+ pub const ENODATA: c_int = 61; /* No data available */
 diff --git a/src/header/fcntl/linux.rs b/src/header/fcntl/linux.rs
 index 4dff8e2..9077272 100644
 --- a/src/header/fcntl/linux.rs
@@ -185,7 +303,7 @@ index 4abdb6b..1fef993 100644
  pub mod sys;
  
 diff --git a/src/header/grp/mod.rs b/src/header/grp/mod.rs
-index ed474c0..38ec64a 100644
+index ed474c0..a415762 100644
 --- a/src/header/grp/mod.rs
 +++ b/src/header/grp/mod.rs
 @@ -31,7 +31,7 @@ use super::{
@@ -197,8 +315,17 @@ index ed474c0..38ec64a 100644
  const SEPARATOR: char = ':';
  
  /// cbindgen:ignore
+@@ -536,7 +536,7 @@ pub unsafe extern "C" fn getgrouplist(
+ 
+         let _group_name = parts.next().unwrap_or("");
+         let _group_password = parts.next().unwrap_or("");
+-        let group_id = parts.next().unwrap_or("-1").parse::<c_int>().unwrap();
++        let group_id = parts.next().unwrap_or("-1").parse::<c_int>().unwrap() as gid_t;
+         let members = parts
+             .next()
+             .unwrap_or("")
 diff --git a/src/header/limits/mod.rs b/src/header/limits/mod.rs
-index 19df8d4..bd351b6 100644
+index 19df8d4..4d4a7bb 100644
 --- a/src/header/limits/mod.rs
 +++ b/src/header/limits/mod.rs
 @@ -71,7 +71,7 @@ pub const MB_LEN_MAX: c_int = 4;
@@ -210,6 +337,96 @@ index 19df8d4..bd351b6 100644
  pub const PAGE_SIZE: usize = 4096;
  
  // These POSIX symbols must have these values regardless of OS
+@@ -162,7 +162,11 @@ pub const POSIX_ALLOC_SIZE_MIN: c_long = 4096;
+ // PTHREAD_DESTRUCTOR_ITERATIONS defined in bits file
+ // TODO: What should this limit be? Both glibc and musl have it as 1024
+ pub const PTHREAD_KEYS_MAX: c_long = 4096 * 32;
++#[cfg(not(target_os = "feos"))]
+ pub const PTHREAD_STACK_MIN: c_long = 65536;
++// feos: 16 KiB, the value of feos-abi v2 section 10.2 (and glibc's on x86_64).
++#[cfg(target_os = "feos")]
++pub const PTHREAD_STACK_MIN: c_long = 16384;
+ /// Maximum number of symbolic links that can be reliably traversed in the
+ /// resolution of a pathname in the absence of a loop.
+ pub const SYMLOOP_MAX: c_long = 64;
+diff --git a/src/header/link/mod.rs b/src/header/link/mod.rs
+index a31d267..74572b4 100644
+--- a/src/header/link/mod.rs
++++ b/src/header/link/mod.rs
+@@ -25,11 +25,11 @@ pub unsafe extern "C" fn dl_iterate_phdr(
+     data: *mut c_void,
+ ) -> c_int {
+     let Some(tcb) = (unsafe { Tcb::current() }) else {
+-        return 0;
++        return unsafe { static_program(callback, data) };
+     };
+ 
+     if tcb.linker_ptr.is_null() {
+-        return 0;
++        return unsafe { static_program(callback, data) };
+     }
+ 
+     unsafe {
+@@ -37,3 +37,59 @@ pub unsafe extern "C" fn dl_iterate_phdr(
+         linker.dl_iterate_phdr(callback, data)
+     }
+ }
++
++/// A static program, which no dynamic linker loaded, reports itself, from the aux
++/// vector's `AT_PHDR` and `AT_PHNUM`, as glibc's and musl's static `dl_iterate_phdr`
++/// do: unwinders (LLVM's libunwind, through `PT_GNU_EH_FRAME`) and backtraces find
++/// the program's frames this way.
++#[cfg(target_os = "feos")]
++unsafe fn static_program(callback: dl_iterate_phdr_callback, data: *mut c_void) -> c_int {
++    use crate::header::sys_auxv::{AT_PHDR, AT_PHNUM, getauxval};
++
++    #[repr(C)]
++    struct Phdr64 {
++        p_type: u32,
++        p_flags: u32,
++        p_offset: u64,
++        p_vaddr: u64,
++        p_paddr: u64,
++        p_filesz: u64,
++        p_memsz: u64,
++        p_align: u64,
++    }
++    const PT_PHDR: u32 = 6;
++    const PT_TLS: u32 = 7;
++
++    let Some(callback) = callback else {
++        return 0;
++    };
++    let phdr = getauxval(AT_PHDR as _) as usize;
++    let phnum = getauxval(AT_PHNUM as _) as usize;
++    if phdr == 0 || phnum == 0 {
++        return 0;
++    }
++    let headers = unsafe { core::slice::from_raw_parts(phdr as *const Phdr64, phnum) };
++    // A position-dependent program loads at its own addresses; one loaded elsewhere
++    // says where through PT_PHDR.
++    let base = headers
++        .iter()
++        .find(|h| h.p_type == PT_PHDR)
++        .map_or(0, |h| phdr.wrapping_sub(h.p_vaddr as usize));
++    let tls = headers.iter().any(|h| h.p_type == PT_TLS);
++    let mut info = dl_phdr_info {
++        dlpi_addr: base,
++        dlpi_name: c"".as_ptr(),
++        dlpi_phdr: phdr as *const ProgramHeader,
++        dlpi_phnum: phnum as u16,
++        dlpi_adds: 1,
++        dlpi_subs: 0,
++        dlpi_tls_modid: usize::from(tls),
++        dlpi_tls_data: core::ptr::null_mut(),
++    };
++    unsafe { callback(&mut info, core::mem::size_of::<dl_phdr_info>(), data) }
++}
++
++#[cfg(not(target_os = "feos"))]
++unsafe fn static_program(_callback: dl_iterate_phdr_callback, _data: *mut c_void) -> c_int {
++    0
++}
 diff --git a/src/header/netdb/mod.rs b/src/header/netdb/mod.rs
 index 1a44bf2..05ff268 100644
 --- a/src/header/netdb/mod.rs
@@ -223,6 +440,23 @@ index 1a44bf2..05ff268 100644
  #[path = "linux.rs"]
  pub mod sys;
  
+diff --git a/src/header/pthread/attr.rs b/src/header/pthread/attr.rs
+index c3d64f0..b4504e3 100644
+--- a/src/header/pthread/attr.rs
++++ b/src/header/pthread/attr.rs
+@@ -498,8 +498,10 @@ pub unsafe extern "C" fn pthread_getattr_np(thread: pthread_t, attr: *mut pthrea
+         attr.detachstate =
+             c_uchar::try_from(PTHREAD_CREATE_DETACHED).expect("constant value within bounds");
+     }
+-    attr.stack = thread.stack_base as usize;
+-    attr.stacksize = thread.stack_size;
++    // The usable stack, above the guard relibc mapped under it (if any).
++    attr.stack = thread.stack_base as usize + thread.guard_size;
++    attr.stacksize = thread.stack_size - thread.guard_size;
++    attr.guardsize = thread.guard_size;
+     //TODO: more values?
+     0
+ }
 diff --git a/src/header/pwd/mod.rs b/src/header/pwd/mod.rs
 index a4e7091..3131d8d 100644
 --- a/src/header/pwd/mod.rs
@@ -275,6 +509,21 @@ index 76fe71b..5adfc40 100644
  #define si_pid _sifields.__si_common.si_pid
  #define si_uid _sifields.__si_common.si_uid
  #define si_value _sifields.__si_common.si_value
+diff --git a/src/header/signal/constants.rs b/src/header/signal/constants.rs
+index 247925b..5a57d71 100644
+--- a/src/header/signal/constants.rs
++++ b/src/header/signal/constants.rs
+@@ -137,6 +137,10 @@ pub const SS_DISABLE: usize = 2;
+ /// Minimum stack size for a signal handler.
+ pub const MINSIGSTKSZ: usize = 2048;
+ /// Default size in bytes for the alternate signal stack.
++#[cfg(any(target_os = "linux", target_os = "feos"))]
++pub const SIGSTKSZ: usize = 8192;
++/// Default size in bytes for the alternate signal stack.
++#[cfg(not(any(target_os = "linux", target_os = "feos")))]
+ pub const SIGSTKSZ: usize = 8096;
+ 
+ /// Signal sent by `sigqueue()`.
 diff --git a/src/header/signal/feos.rs b/src/header/signal/feos.rs
 new file mode 100644
 index 0000000..e114363
@@ -457,7 +706,7 @@ index 0000000..e114363
 +    assert!(core::mem::offset_of!(mcontext, vregs) == 288);
 +};
 diff --git a/src/header/signal/mod.rs b/src/header/signal/mod.rs
-index aa3e639..a48bc45 100644
+index aa3e639..ee77094 100644
 --- a/src/header/signal/mod.rs
 +++ b/src/header/signal/mod.rs
 @@ -6,7 +6,7 @@ use core::{mem, ptr};
@@ -543,6 +792,18 @@ index aa3e639..a48bc45 100644
  #[repr(C)]
  #[derive(Clone, Copy)]
  pub struct siginfo_sigfault {
+@@ -238,6 +242,11 @@ pub type stack_t = sigaltstack;
+ //     https://git.musl-libc.org/cgit/musl/commit/?id=583e55122e767b1586286a0d9c35e2a4027998ab
+ #[unsafe(no_mangle)]
+ unsafe extern "C" fn __sigsetjmp_tail(jb: *mut c_ulonglong, ret: c_int) -> c_int {
++    // The mask's word follows the registers and the return address sigsetjmp.s keeps
++    // (musl's __ss): 9 on x86_64, 23 on AArch64, whose setjmp uses words 0 to 21.
++    #[cfg(target_arch = "aarch64")]
++    let set = jb.wrapping_add(23);
++    #[cfg(not(target_arch = "aarch64"))]
+     let set = jb.wrapping_add(9);
+     if ret > 0 {
+         unsafe { sigprocmask(SIG_SETMASK, set, ptr::null_mut()) };
 diff --git a/src/header/spawn/file_actions.rs b/src/header/spawn/file_actions.rs
 index eaff126..f61e90a 100644
 --- a/src/header/spawn/file_actions.rs
@@ -801,10 +1062,30 @@ index 6b5e7f5..51bdf84 100644
  
  // /dev/tty + nul
 diff --git a/src/header/stdlib/mod.rs b/src/header/stdlib/mod.rs
-index 08bbc00..aaec4a6 100644
+index 08bbc00..0a1c5d8 100644
 --- a/src/header/stdlib/mod.rs
 +++ b/src/header/stdlib/mod.rs
-@@ -951,7 +951,7 @@ pub unsafe extern "C" fn posix_memalign(
+@@ -115,6 +115,19 @@ pub unsafe extern "C" fn a64l(s: *const c_char) -> c_long {
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/abort.html>.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn abort() -> ! {
++    // POSIX: abnormal termination by SIGABRT, unless a handler doesn't return; so
++    // raise it, then (a handler returned, or it's ignored or blocked) raise it again
++    // with the default action and unblocked. The trap below is the last resort.
++    #[cfg(target_os = "feos")]
++    {
++        use crate::header::signal::{SIG_UNBLOCK, SIGABRT, raise, signal, sigprocmask};
++        let sig = SIGABRT as c_int;
++        raise(sig);
++        signal(sig, None);
++        let set: crate::header::bits_sigset_t::sigset_t = 1 << (SIGABRT - 1);
++        unsafe { sigprocmask(SIG_UNBLOCK, &raw const set, ptr::null_mut()) };
++        raise(sig);
++    }
+     log::error!("Abort");
+     intrinsics::abort();
+ }
+@@ -951,7 +964,7 @@ pub unsafe extern "C" fn posix_memalign(
  pub unsafe extern "C" fn posix_openpt(flags: c_int) -> c_int {
      #[cfg(target_os = "redox")]
      let r = unsafe { open(c"/scheme/pty/ptmx".as_ptr(), flags) };
@@ -813,7 +1094,7 @@ index 08bbc00..aaec4a6 100644
      let r = unsafe { open(c"/dev/ptmx".as_ptr(), flags) };
  
      if r < 0 && platform::ERRNO.get() == ENOSPC {
-@@ -1007,7 +1007,7 @@ pub unsafe extern "C" fn ptsname_r(fildes: c_int, name: *mut c_char, namesize: s
+@@ -1007,7 +1020,7 @@ pub unsafe extern "C" fn ptsname_r(fildes: c_int, name: *mut c_char, namesize: s
  
          if unsafe { ioctl(fildes, TIOCGPTN, ptr::from_mut(&mut pty).cast::<c_void>()) } == 0 {
              // Linux and Redox use different resource names for PTS's.
@@ -922,6 +1203,22 @@ index e48d084..8a06695 100644
  static SHM_PATH: &[u8] = b"/dev/shm/";
  
  #[cfg(target_os = "redox")]
+diff --git a/src/header/sys_random/mod.rs b/src/header/sys_random/mod.rs
+index 8393a78..2a61d32 100644
+--- a/src/header/sys_random/mod.rs
++++ b/src/header/sys_random/mod.rs
+@@ -22,6 +22,11 @@ pub const GRND_NONBLOCK: c_uint = 1;
+ /// If this bit is set, then random bytes are drawn from the `random` source
+ /// instead of the `urandom` source.
+ pub const GRND_RANDOM: c_uint = 2;
++/// See <https://www.man7.org/linux/man-pages/man2/getrandom.2.html>.
++///
++/// Never wait for the generator to be seeded (Linux 5.6, and feos's `GETRANDOM`).
++#[cfg(any(target_os = "linux", target_os = "feos"))]
++pub const GRND_INSECURE: c_uint = 4;
+ 
+ /// See <https://www.man7.org/linux/man-pages/man2/getrandom.2.html>.
+ ///
 diff --git a/src/header/sys_select/mod.rs b/src/header/sys_select/mod.rs
 index 46659ef..83cbf01 100644
 --- a/src/header/sys_select/mod.rs
@@ -1127,10 +1424,152 @@ index b44b411..2a9ce45 100644
  #[path = "linux.rs"]
  pub mod sys;
  
+diff --git a/src/header/unistd/alarm.rs b/src/header/unistd/alarm.rs
+index 2342f52..d907dc0 100644
+--- a/src/header/unistd/alarm.rs
++++ b/src/header/unistd/alarm.rs
+@@ -1,25 +1,32 @@
+ use crate::{
++    header::bits_timespec::timespec,
++    platform::{Sys, types::c_uint},
++};
++#[cfg(target_os = "feos")]
++use crate::platform::PalSignal;
++#[cfg(not(target_os = "feos"))]
++use crate::{
++    platform::Pal,
+     header::{
+-        bits_timespec::timespec,
+         signal::{SIGALRM, SIGEV_SIGNAL, sigevent},
+         time::itimerspec,
+     },
+-    platform::{
+-        Pal, Sys,
+-        types::{c_int, c_uint, timer_t},
+-    },
++    platform::types::{c_int, timer_t},
+     sync::Mutex,
+ };
+ 
+ /// Wrapper for timer_t that implements Send (the timer_t pointer is a process-
+ /// wide mmap'd allocation that outlives any single thread).
++#[cfg(not(target_os = "feos"))]
+ struct AlarmTimer(timer_t);
+ // SAFETY: The timer_t pointer refers to an mmap'd RlctTimer that is
+ // only accessed under the ALARM_TIMER mutex lock.
++#[cfg(not(target_os = "feos"))]
+ unsafe impl Send for AlarmTimer {}
+ 
+ /// Process-global singleton timer used by alarm(). Protected by a mutex to
+ /// ensure only one alarm is active at a time (POSIX requirement).
++#[cfg(not(target_os = "feos"))]
+ static ALARM_TIMER: Mutex<Option<AlarmTimer>> = Mutex::new(None);
+ 
+ /// Internal helper that arms/disarms the process-global alarm timer.
+@@ -31,6 +38,17 @@ static ALARM_TIMER: Mutex<Option<AlarmTimer>> = Mutex::new(None);
+ /// pending alarm be preserved across exec (the timer continues counting down
+ /// in the new process image as i understand).
+ pub fn alarm_timespec(duration: timespec) -> c_uint {
++    // feos has no POSIX timers; its alarm is the process's ITIMER_REAL, which the kernel
++    // keeps across exec as POSIX wants.
++    #[cfg(target_os = "feos")]
++    return alarm_itimer(duration);
++    #[cfg(not(target_os = "feos"))]
++    return alarm_timer(duration);
++}
++
++/// `alarm_timespec` over a POSIX timer.
++#[cfg(not(target_os = "feos"))]
++fn alarm_timer(duration: timespec) -> c_uint {
+     let mut guard = ALARM_TIMER.lock();
+ 
+     // Determine remaining time on any existing alarm
+@@ -86,3 +104,31 @@ pub fn alarm_timespec(duration: timespec) -> c_uint {
+ 
+     remaining
+ }
++
++/// `alarm_timespec` over `setitimer(ITIMER_REAL)`, for platforms with no POSIX timers.
++#[cfg(target_os = "feos")]
++#[expect(deprecated)]
++fn alarm_itimer(duration: timespec) -> c_uint {
++    use crate::header::{
++        bits_timeval::timeval,
++        sys_time::{ITIMER_REAL, itimerval},
++    };
++    let new = itimerval {
++        it_interval: timeval::default(),
++        it_value: timeval {
++            tv_sec: duration.tv_sec,
++            // Round up, so a sub-microsecond request still arms the timer.
++            tv_usec: (duration.tv_nsec + 999) / 1000,
++        },
++    };
++    let mut old = itimerval::default();
++    if Sys::setitimer(ITIMER_REAL, &new, Some(&mut old)).is_err() {
++        return 0;
++    }
++    let secs = c_uint::try_from(old.it_value.tv_sec).unwrap_or(c_uint::MAX);
++    if old.it_value.tv_usec > 0 {
++        secs.saturating_add(1) // POSIX: round up
++    } else {
++        secs
++    }
++}
 diff --git a/src/header/unistd/mod.rs b/src/header/unistd/mod.rs
-index 6ac9123..c73946e 100644
+index 6ac9123..0f90bef 100644
 --- a/src/header/unistd/mod.rs
 +++ b/src/header/unistd/mod.rs
+@@ -1075,19 +1075,19 @@ pub unsafe extern "C" fn rmdir(path: *const c_char) -> c_int {
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/setegid.html>.
+ #[unsafe(no_mangle)]
+ pub extern "C" fn setegid(gid: gid_t) -> c_int {
+-    Sys::setresgid(-1, gid, -1).map(|()| 0).or_minus_one_errno()
++    Sys::setresgid(!0, gid, !0).map(|()| 0).or_minus_one_errno()
+ }
+ 
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/seteuid.html>.
+ #[unsafe(no_mangle)]
+ pub extern "C" fn seteuid(uid: uid_t) -> c_int {
+-    Sys::setresuid(-1, uid, -1).map(|()| 0).or_minus_one_errno()
++    Sys::setresuid(!0, uid, !0).map(|()| 0).or_minus_one_errno()
+ }
+ 
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/setgid.html>.
+ #[unsafe(no_mangle)]
+ pub extern "C" fn setgid(gid: gid_t) -> c_int {
+-    Sys::setresgid(gid, gid, -1)
++    Sys::setresgid(gid, gid, !0)
+         .map(|()| 0)
+         .or_minus_one_errno()
+ }
+@@ -1123,7 +1123,7 @@ pub extern "C" fn setpgrp() -> pid_t {
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/setregid.html>.
+ #[unsafe(no_mangle)]
+ pub extern "C" fn setregid(rgid: gid_t, egid: gid_t) -> c_int {
+-    Sys::setresgid(rgid, egid, -1)
++    Sys::setresgid(rgid, egid, !0)
+         .map(|()| 0)
+         .or_minus_one_errno()
+ }
+@@ -1147,7 +1147,7 @@ pub extern "C" fn setresuid(ruid: uid_t, euid: uid_t, suid: uid_t) -> c_int {
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/setreuid.html>.
+ #[unsafe(no_mangle)]
+ pub extern "C" fn setreuid(ruid: uid_t, euid: uid_t) -> c_int {
+-    Sys::setresuid(ruid, euid, -1)
++    Sys::setresuid(ruid, euid, !0)
+         .map(|()| 0)
+         .or_minus_one_errno()
+ }
+@@ -1172,7 +1172,7 @@ pub extern "C" fn setsid() -> pid_t {
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/setuid.html>.
+ #[unsafe(no_mangle)]
+ pub extern "C" fn setuid(uid: uid_t) -> c_int {
+-    Sys::setresuid(uid, uid, -1)
++    Sys::setresuid(uid, uid, !0)
+         .map(|()| 0)
+         .or_minus_one_errno()
+ }
 @@ -1347,9 +1347,9 @@ pub extern "C" fn ttyname_r(fildes: c_int, name: *mut c_char, namesize: size_t)
  #[unsafe(no_mangle)]
  pub extern "C" fn ualarm(usecs: useconds_t, interval: useconds_t) -> useconds_t {
@@ -1172,6 +1611,62 @@ index e7ac72a..39947c9 100644
      // Values from musl which we can assume is correct.
      match name {
          _SC_CLK_TCK => 100,
+diff --git a/src/header/wchar/cbindgen.toml b/src/header/wchar/cbindgen.toml
+index 9bde4dc..7aacf42 100644
+--- a/src/header/wchar/cbindgen.toml
++++ b/src/header/wchar/cbindgen.toml
+@@ -40,6 +40,23 @@ after_includes = """
+ 
+ #define WEOF (0xffffffffu)
+ """
++# long double has no Rust type: wcstold is C (src/c/wchar.c).
++trailer = """
++#ifndef _RELIBC_WCHAR_EXTRA_H
++#define _RELIBC_WCHAR_EXTRA_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++long double wcstold(const wchar_t *nptr, wchar_t **endptr);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
++"""
+ include_guard = "_RELIBC_WCHAR_H"
+ language = "C"
+ style = "Type"
+diff --git a/src/header/wchar/mod.rs b/src/header/wchar/mod.rs
+index 1f9201c..d0421de 100644
+--- a/src/header/wchar/mod.rs
++++ b/src/header/wchar/mod.rs
+@@ -21,7 +21,7 @@ use crate::{
+     platform::{
+         self, ERRNO,
+         types::{
+-            c_char, c_double, c_int, c_long, c_longlong, c_uchar, c_ulong, c_ulonglong, c_void,
++            c_char, c_double, c_float, c_int, c_long, c_longlong, c_uchar, c_ulong, c_ulonglong, c_void,
+             size_t, wchar_t, wint_t,
+         },
+     },
+@@ -818,6 +818,14 @@ pub unsafe extern "C" fn wcstod(mut ptr: *const wchar_t, end: *mut *mut wchar_t)
+     result
+ }
+ 
++/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/wcstof.html>.
++///
++/// `wcstod` rounded to `float` (`wcstold` is in `src/c/wchar.c`).
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn wcstof(ptr: *const wchar_t, end: *mut *mut wchar_t) -> c_float {
++    unsafe { wcstod(ptr, end) as c_float }
++}
++
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/wcstok.html>.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn wcstok(
 diff --git a/src/ld_so/mod.rs b/src/ld_so/mod.rs
 index af5b90e..526ce21 100644
 --- a/src/ld_so/mod.rs
@@ -1211,7 +1706,7 @@ index af5b90e..526ce21 100644
      unsafe {
          core::arch::asm!(
 diff --git a/src/ld_so/tcb.rs b/src/ld_so/tcb.rs
-index fbb9927..ee4f41e 100644
+index fbb9927..35cb55f 100644
 --- a/src/ld_so/tcb.rs
 +++ b/src/ld_so/tcb.rs
 @@ -18,6 +18,15 @@ use crate::{
@@ -1239,7 +1734,15 @@ index fbb9927..ee4f41e 100644
  pub type OsSpecific = ();
  
  #[cfg(target_os = "redox")]
-@@ -331,7 +340,7 @@ impl Tcb {
+@@ -104,6 +113,7 @@ impl Tcb {
+                     has_async_cancelation: AtomicBool::new(false),
+                     stack_base: core::ptr::null_mut(),
+                     stack_size: 0,
++                    guard_size: 0,
+                     os_tid: UnsafeCell::new(OsTid::default()),
+                     tcb_selfref: UnsafeCell::new(tcb_ptr),
+                 },
+@@ -331,7 +341,7 @@ impl Tcb {
      ///
      /// For x86_64, the ABI page is not used.
      #[expect(clippy::type_complexity)]
@@ -1248,7 +1751,7 @@ index fbb9927..ee4f41e 100644
      unsafe fn os_new(
          size: usize,
      ) -> Result<(&'static mut [u8], &'static mut [u8], &'static mut [u8]), DlError> {
-@@ -354,7 +363,7 @@ impl Tcb {
+@@ -354,7 +364,7 @@ impl Tcb {
      #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
      unsafe fn os_arch_activate(_os: &(), tls_end: usize, tls_len: usize) {
          // Uses ABI page
@@ -1257,7 +1760,7 @@ index fbb9927..ee4f41e 100644
          unsafe {
              core::ptr::write(abi_ptr as *mut usize, tls_end);
              core::arch::asm!(
-@@ -364,6 +373,23 @@ impl Tcb {
+@@ -364,6 +374,23 @@ impl Tcb {
          }
      }
  
@@ -2265,10 +2768,10 @@ index 0000000..ab44e5c
 +}
 diff --git a/src/platform/feos/mod.rs b/src/platform/feos/mod.rs
 new file mode 100644
-index 0000000..3749074
+index 0000000..376ab24
 --- /dev/null
 +++ b/src/platform/feos/mod.rs
-@@ -0,0 +1,1398 @@
+@@ -0,0 +1,1434 @@
 +//! The feos platform: relibc's [`Pal`] over the feos kernel interface, each function
 +//! as section 9 of `docs/feos-abi-v2.md` maps it.
 +//!
@@ -2413,7 +2916,8 @@ index 0000000..3749074
 +        _SC_CHILD_MAX => info()?.task_max as c_long,
 +        _SC_PAGESIZE => abi::PAGE_SIZE as c_long,
 +        _SC_MINSIGSTKSZ => getauxval(abi::aux::MINSIGSTKSZ).unwrap_or(2048) as c_long,
-+        _SC_SIGSTKSZ => 8192,
++        _SC_SIGSTKSZ => crate::header::signal::SIGSTKSZ as c_long,
++        _SC_THREAD_STACK_MIN => crate::header::limits::PTHREAD_STACK_MIN,
 +        _ => return None,
 +    })
 +}
@@ -2626,8 +3130,9 @@ index 0000000..3749074
 +                int(fildes),
 +                p,
 +                len,
-+                int(owner),
-+                int(group),
++                // -1 (no change) is (uid_t)-1: sign extended like any C int.
++                int(owner as c_int),
++                int(group as c_int),
 +                int(flags),
 +            )
 +        })
@@ -2704,6 +3209,10 @@ index 0000000..3749074
 +                (0, 0)
 +            }
 +        };
++        // Linux's chmod takes the permission bits and ignores the rest (S_IFMT
++        // included: Rust's std passes a whole st_mode to fchmod when it copies a
++        // file); FCHMODAT refuses any bit past 0o7777 with EINVAL.
++        let mode = mode & 0o7777;
 +        e_raw(unsafe {
 +            syscall5(nr::FCHMODAT, int(dirfd), p, len, mode as usize, int(flags))
 +        })
@@ -3653,10 +4162,11 @@ index 0000000..3749074
 +}
 +
 +/// The one id `setres*id` may set: all three the same, or `-1` to leave one.
-+fn one_id(ids: [c_int; 3]) -> Result<Option<c_int>> {
++fn one_id(ids: [uid_t; 3]) -> Result<Option<uid_t>> {
 +    let mut chosen = None;
 +    for id in ids {
-+        if id == -1 {
++        // (uid_t)-1: leave it as it is.
++        if id == !0 {
 +            continue;
 +        }
 +        match chosen {
@@ -3666,6 +4176,35 @@ index 0000000..3749074
 +        }
 +    }
 +    Ok(chosen)
++}
++
++/// The futex Rust's std uses on feos (`docs/feos-abi-v2.md` 10.2): waits while `*addr`
++/// is `expected`, until `deadline`, an absolute `CLOCK_MONOTONIC` time (null: no
++/// deadline), or a [`__feos_futex_wake`]. `FUTEX_WAIT2` underneath.
++///
++/// Returns 0, or -1 with `errno` `EAGAIN` (the value wasn't `expected`), `ETIMEDOUT`,
++/// `EINTR`, or `EFAULT`/`EINVAL`.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn __feos_futex_wait(
++    addr: *mut u32,
++    expected: u32,
++    deadline: *const timespec,
++) -> c_int {
++    use crate::error::ResultExt;
++    unsafe { <Sys as Pal>::futex_wait(addr, expected, deadline.as_ref()) }
++        .map(|()| 0)
++        .or_minus_one_errno()
++}
++
++/// Wakes up to `count` threads waiting on `addr` in [`__feos_futex_wait`] (`FUTEX_WAKE`).
++/// Returns how many it woke, or -1 with `errno`.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn __feos_futex_wake(addr: *mut u32, count: c_int) -> c_int {
++    use crate::error::ResultExt;
++    let count = u32::try_from(count).unwrap_or(0);
++    unsafe { <Sys as Pal>::futex_wake(addr, count) }
++        .map(|n| n as c_int)
++        .or_minus_one_errno()
 +}
 diff --git a/src/platform/feos/ptrace.rs b/src/platform/feos/ptrace.rs
 new file mode 100644
@@ -4320,7 +4859,7 @@ index 386b971..e63e2ec 100644
 +    unsafe { self::sys::init(auxvs) }
 +}
 diff --git a/src/platform/types.rs b/src/platform/types.rs
-index 649b3aa..ad7e39d 100644
+index 649b3aa..cafcc25 100644
 --- a/src/platform/types.rs
 +++ b/src/platform/types.rs
 @@ -81,10 +81,10 @@ pub type regoff_t = size_t;
@@ -4336,7 +4875,24 @@ index 649b3aa..ad7e39d 100644
  pub type mode_t = c_int;
  /// The `time_t` type provided in [`sys/types.h`](crate::header::sys_types).
  pub type time_t = c_longlong;
-@@ -120,12 +120,12 @@ pub type fsfilcnt_t = c_ulong;
+@@ -93,8 +93,16 @@ pub type pid_t = c_int;
+ /// The `id_t` type provided in [`sys/types.h`](crate::header::sys_types).
+ pub type id_t = c_uint;
+ /// The `gid_t` type provided in [`sys/types.h`](crate::header::sys_types).
++#[cfg(any(target_os = "linux", target_os = "feos"))]
++pub type gid_t = c_uint;
++/// The `gid_t` type provided in [`sys/types.h`](crate::header::sys_types).
++#[cfg(not(any(target_os = "linux", target_os = "feos")))]
+ pub type gid_t = c_int;
+ /// The `uid_t` type provided in [`sys/types.h`](crate::header::sys_types).
++#[cfg(any(target_os = "linux", target_os = "feos"))]
++pub type uid_t = c_uint;
++/// The `uid_t` type provided in [`sys/types.h`](crate::header::sys_types).
++#[cfg(not(any(target_os = "linux", target_os = "feos")))]
+ pub type uid_t = c_int;
+ /// The `dev_t` type provided in [`sys/types.h`](crate::header::sys_types).
+ pub type dev_t = c_ulonglong;
+@@ -120,12 +128,12 @@ pub type fsfilcnt_t = c_ulong;
  #[deprecated]
  pub type useconds_t = c_uint;
  /// The `suseconds_t` type provided in [`sys/types.h`](crate::header::sys_types).
@@ -4352,7 +4908,7 @@ index 649b3aa..ad7e39d 100644
  
  /// The `clock_t` type provided in [`sys/types.h`](crate::header::sys_types).
 diff --git a/src/pthread/mod.rs b/src/pthread/mod.rs
-index 1a5ee23..cb46cbb 100644
+index 1a5ee23..9a78db1 100644
 --- a/src/pthread/mod.rs
 +++ b/src/pthread/mod.rs
 @@ -32,6 +32,16 @@ pub unsafe fn init() {
@@ -4372,7 +4928,15 @@ index 1a5ee23..cb46cbb 100644
  
      let thread = Pthread {
          waitval: Waitval::new(),
-@@ -70,6 +80,8 @@ pub unsafe fn terminate_from_main_thread() {
+@@ -45,6 +55,7 @@ pub unsafe fn init() {
+         // TODO: set these values on Linux as well
+         stack_base,
+         stack_size,
++        guard_size: 0,
+ 
+         tcb_selfref: UnsafeCell::new(core::ptr::null_mut()),
+ 
+@@ -70,6 +81,8 @@ pub unsafe fn terminate_from_main_thread() {
  bitflags::bitflags! {
      pub struct PthreadFlags: usize {
          const DETACHED = 1;
@@ -4381,7 +4945,19 @@ index 1a5ee23..cb46cbb 100644
      }
  }
  
-@@ -93,7 +105,7 @@ pub struct Pthread {
+@@ -81,8 +94,11 @@ pub struct Pthread {
+     pub(crate) has_async_cancelation: AtomicBool,
+     pub(crate) flags: AtomicUsize,
+ 
++    /// The thread's stack mapping: its guard (`guard_size` bytes, `PROT_NONE`, at the
++    /// bottom) and the stack above it.
+     pub(crate) stack_base: *mut c_void,
+     pub(crate) stack_size: usize,
++    pub(crate) guard_size: usize,
+ 
+     pub(crate) tcb_selfref: UnsafeCell<*mut Tcb>,
+ 
+@@ -93,7 +109,7 @@ pub struct Pthread {
  pub struct OsTid {
      #[cfg(target_os = "redox")]
      pub thread_fd: usize,
@@ -4390,7 +4966,43 @@ index 1a5ee23..cb46cbb 100644
      pub thread_id: usize,
  }
  
-@@ -169,6 +181,9 @@ pub(crate) unsafe fn create(
+@@ -132,11 +148,21 @@ pub(crate) unsafe fn create(
+     let synchronization_mutex = unsafe { Mutex::locked(current_sigmask) };
+     let synchronization_mutex = &synchronization_mutex;
+ 
+-    let stack_size = attrs.stacksize.next_multiple_of(Sys::getpagesize());
++    let mut stack_size = attrs.stacksize.next_multiple_of(Sys::getpagesize());
++    // A stack relibc maps gets a guard below it, as glibc's and musl's do, so that an
++    // overflow faults instead of running into whatever is mapped below (Rust's std
++    // reports such a fault as a stack overflow, from pthread_getattr_np). feos only: the
++    // other platforms keep their behaviour.
++    let guard_size = if cfg!(target_os = "feos") && attrs.stack == 0 {
++        attrs.guardsize.next_multiple_of(Sys::getpagesize())
++    } else {
++        0
++    };
+ 
+     let stack_base = if attrs.stack != 0 {
+         attrs.stack as *mut c_void
+     } else {
++        stack_size += guard_size;
+         let ret = unsafe {
+             sys_mman::mmap(
+                 core::ptr::null_mut(),
+@@ -151,6 +177,12 @@ pub(crate) unsafe fn create(
+             // "Insufficient resources"
+             return Err(Errno(EAGAIN));
+         }
++        if guard_size != 0
++            && unsafe { sys_mman::mprotect(ret, guard_size, sys_mman::PROT_NONE) } != 0
++        {
++            unsafe { sys_mman::munmap(ret, stack_size) };
++            return Err(Errno(EAGAIN));
++        }
+         ret
+     };
+ 
+@@ -169,9 +201,13 @@ pub(crate) unsafe fn create(
  
      let current_tcb = unsafe { Tcb::current() }.expect("no TCB!");
      let new_tcb = unsafe { Tcb::new(current_tcb.tls_len) }.map_err(|_| Errno(ENOMEM))?;
@@ -4400,7 +5012,11 @@ index 1a5ee23..cb46cbb 100644
      new_tcb.pthread.flags = flags.bits().into();
      new_tcb.pthread.stack_base = stack_base;
      new_tcb.pthread.stack_size = stack_size;
-@@ -310,7 +325,13 @@ pub unsafe fn exit_current_thread(retval: Retval) -> ! {
++    new_tcb.pthread.guard_size = guard_size;
+ 
+     new_tcb.masters_ptr = current_tcb.masters_ptr;
+     new_tcb.masters_len = current_tcb.masters_len;
+@@ -310,7 +346,13 @@ pub unsafe fn exit_current_thread(retval: Retval) -> ! {
  
      let this = current_thread().expect("failed to obtain current thread when exiting");
      let stack_base = this.stack_base;

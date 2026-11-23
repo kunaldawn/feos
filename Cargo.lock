@@ -196,6 +196,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "feos-csprng"
+version = "0.1.0"
+
+[[package]]
 name = "feos-desktop"
 version = "0.1.0"
 dependencies = [
@@ -491,6 +495,7 @@ dependencies = [
  "feos-board-qemu-virt",
  "feos-board-qemu-x86_64",
  "feos-console",
+ "feos-csprng",
  "feos-desktop-app",
  "feos-elf",
  "feos-fdtable",
@@ -508,6 +513,7 @@ dependencies = [
  "feos-shell",
  "feos-signal",
  "feos-sync",
+ "feos-tty",
  "feos-vm",
 ]
 
@@ -615,6 +621,13 @@ version = "0.1.0"
 [[package]]
 name = "feos-text"
 version = "0.1.0"
+
+[[package]]
+name = "feos-tty"
+version = "0.1.0"
+dependencies = [
+ "feos-abi",
+]
 
 [[package]]
 name = "feos-video"

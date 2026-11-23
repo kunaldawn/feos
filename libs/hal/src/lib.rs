@@ -588,6 +588,18 @@ pub trait Board {
         None
     }
 
+    /// Copies the seed firmware left for the kernel's random number generator into
+    /// `out`, once: what's copied is forgotten here. Returns how many bytes it gave,
+    /// none where firmware left nothing. A trusted source.
+    fn take_firmware_seed(_out: &mut [u8]) -> usize {
+        0
+    }
+
+    /// What [`take_firmware_seed`](Self::take_firmware_seed) reads, for the boot log.
+    fn firmware_seed_name() -> &'static str {
+        "firmware seed"
+    }
+
     /// Address range `[start, end)` of the loaded kernel image.
     fn kernel_range() -> (usize, usize);
     /// Address range `[start, end)` of `.bss`.

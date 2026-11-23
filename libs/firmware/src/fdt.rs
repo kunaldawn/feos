@@ -237,6 +237,20 @@ impl<'a> Fdt<'a> {
         found
     }
 
+    /// The seed firmware leaves for the kernel's random number generator in
+    /// `/chosen/rng-seed` (QEMU's `virt` fills 32 bytes), if it left one.
+    pub fn rng_seed(&self) -> Option<&'a [u8]> {
+        let mut in_chosen = false;
+        let mut found = None;
+        self.walk(|event| match event {
+            Event::Begin { name, depth: 1 } => in_chosen = name == b"chosen",
+            Event::End { depth: 1 } => in_chosen = false,
+            Event::Property { name: b"rng-seed", value, depth: 1 } if in_chosen && !value.is_empty() => found = Some(value),
+            _ => {}
+        });
+        found
+    }
+
     /// The first interrupt controller found directly under the root.
     pub fn gic(&self) -> Option<Gic> {
         let root = self.root_cells();
@@ -403,6 +417,21 @@ mod tests {
     }
 
     #[test]
+    fn rng_seed_read() {
+        // QEMU's 32 bytes, different in each dump.
+        let two = Fdt::new(GICV2).unwrap().rng_seed().unwrap();
+        let three = Fdt::new(GICV3).unwrap().rng_seed().unwrap();
+        assert_eq!((two.len(), three.len()), (32, 32));
+        assert_ne!(two, three);
+        assert!(two.iter().any(|byte| *byte != 0));
+        // Found by its node, not by its name anywhere: renaming `/chosen` hides it.
+        let mut renamed = GICV2.to_vec();
+        let at = renamed.windows(7).position(|window| window == b"chosen\0").unwrap();
+        renamed[at] = b'x';
+        assert_eq!(Fdt::new(&renamed).unwrap().rng_seed(), None);
+    }
+
+    #[test]
     fn walks_a_whole_tree_and_balances() {
         let mut begins = 0;
         let mut ends = 0;
@@ -444,6 +473,7 @@ mod tests {
                 let _ = fdt.memory();
                 let _ = fdt.cpu_count();
                 let _ = fdt.gic();
+                let _ = fdt.rng_seed();
             }
         };
         for cut in (0..GICV2.len()).step_by(7) {

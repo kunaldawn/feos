@@ -80,6 +80,13 @@ pub trait Input {
         }
     }
 
+    /// Raw bytes that have already arrived, with no line discipline and no waiting:
+    /// what a terminal's keys are fed to a user program's kernel terminal with, whose
+    /// own discipline cooks them. Only a terminal has any; the default has none.
+    fn try_read_raw(&mut self, _out: &mut [u8]) -> Available {
+        Available::Pending
+    }
+
     /// Asks a terminal to deliver keys as they are, Ctrl-C included, or to go
     /// back to normal. A program that draws the whole screen brackets its run
     /// with this. Anything but a terminal ignores it.

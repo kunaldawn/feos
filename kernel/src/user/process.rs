@@ -80,6 +80,13 @@ static SPACE_NUMBERS: [AtomicBool; pagecache::SPACES] = [const { AtomicBool::new
 /// The space number of a space that maps no files.
 const UNNUMBERED: u32 = u32::MAX;
 
+/// Gives back a space number [`take_space_number`] took.
+fn give_back_number(space: u32) {
+    if let Some(used) = SPACE_NUMBERS.get(space as usize) {
+        used.store(false, Ordering::Release);
+    }
+}
+
 /// A free space number, taken.
 fn take_space_number() -> Option<u32> {
     SPACE_NUMBERS
@@ -96,23 +103,45 @@ impl UserMm {
         // run out panics there, and with no counted lock held that ends just the caller,
         // where under `NoKill` it would stop the machine. Nothing below allocates from the
         // kernel heap except `new_mm`, which fails softly.
-        let mut cell = Arc::<Self>::new_uninit();
+        let cell = Arc::<Self>::new_uninit();
         let _no_kill = NoKill::new();
         let space = if numbered { take_space_number()? } else { UNNUMBERED };
-        let give_back = |space: u32| {
-            if let Some(used) = SPACE_NUMBERS.get(space as usize) {
-                used.store(false, Ordering::Release);
-            }
-        };
         let Some(mm) = memory_calls::new_mm(space) else {
-            give_back(space);
+            give_back_number(space);
             return None;
         };
+        Self::around(cell, mm, space)
+    }
+
+    /// A child's copy of this space, for `FORK`, in `cell` (taken by the caller before any
+    /// lock, as [`new`](Self::new) takes its own): the tables copied, private pages shared
+    /// copy-on-write and charged as the module `feos_vm::mm` says, under this space's lock
+    /// and counted as a revoke, since this space's writable pages become read-only.
+    /// `ENOMEM` if anything can't be had, with nothing of the child left.
+    pub fn fork(&self, cell: Arc<core::mem::MaybeUninit<Self>>) -> Result<Arc<Self>, isize> {
+        let _no_kill = NoKill::new();
+        let space = take_space_number().ok_or(-errno::ENOMEM)?;
+        let copied = {
+            let mut state = self.lock();
+            let copied = self.revoke(&mut state, |mm, ctx| mm.fork(space, ctx));
+            self.note_resident(&state);
+            copied
+        };
+        let Ok(mm) = copied else {
+            give_back_number(space);
+            return Err(-errno::ENOMEM);
+        };
+        Self::around(cell, mm, space).ok_or(-errno::ENOMEM)
+    }
+
+    /// A space for `mm`, which file reverse maps know as `space`, its tables made ready to
+    /// load, in `cell`. Held off from a kill by the caller.
+    fn around(mut cell: Arc<core::mem::MaybeUninit<Self>>, mm: Mm, space: u32) -> Option<Arc<Self>> {
         let mut alloc = || memory::alloc_frames(1, 1);
         // SAFETY: a table just made for this, on a machine past boot.
         let Some(root) = (unsafe { Port::prepare_user_tables(mm.root(), &mut alloc) }) else {
             mm.destroy(&mut KernelFrames, &PROMISES);
-            give_back(space);
+            give_back_number(space);
             return None;
         };
         let window = mm.space().window();
@@ -148,7 +177,7 @@ impl UserMm {
 
     /// Notes the pages it has frames for now, under its lock as `state`, for its peak.
     pub fn note_resident(&self, state: &MmState) {
-        let resident = (state.mm.charged() - state.mm.unbacked()) + state.mm.owned();
+        let resident = state.mm.resident();
         self.peak_pages.fetch_max(resident, Ordering::Relaxed);
     }
 
@@ -444,7 +473,8 @@ pub struct Process {
     files: Mutex<Files>,
     /// Held to start a thread, and by `EXEC` from before it ends the others until it's
     /// alone, so the count of threads is only checked and changed by one at a time and
-    /// neither ever sees half a thread. `FORK` will take it too. Taken through
+    /// neither ever sees half a thread. `FORK` holds it while it copies the process, so no
+    /// thread is half made in the copy. Taken through
     /// [`creating`](Self::creating), which a kill ends.
     creation: Mutex<()>,
     /// Moved on whenever the creation lock is let go, for those waiting for it.
@@ -714,16 +744,49 @@ static PROCESSES: [ProcessCell; MAX_PROCESSES] = [const { ProcessCell(UnsafeCell
 /// it the slot: with `files` for its descriptors and working directory if its spawn made
 /// them, or else the standard streams, relative paths starting from `cwd`, and `umask`.
 /// `None` if there's no memory for it.
-pub fn create(slot: usize, pid: u32, cwd: &str, umask: u32, exe: &str, files: Option<Files>) -> Option<&'static Process> {
+///
+/// `terminal` is the terminal its standard streams are on, those `streams` names, for
+/// a program a kernel app or v1's `spawn` started: it's the foreground job there if it's
+/// the first.
+pub fn create(
+    slot: usize,
+    pid: u32,
+    cwd: &str,
+    umask: u32,
+    exe: &str,
+    files: Option<Files>,
+    terminal: Option<(super::tty::TerminalRef, u8)>,
+) -> Option<&'static Process> {
     let files = match files {
         Some(files) => files,
-        None => Files::new(cwd, umask)?,
+        None => {
+            let marked = terminal.as_ref().map(|(terminal, streams)| (terminal, *streams));
+            Files::new(cwd, umask, marked)?
+        }
     };
+    if let Some((terminal, _)) = &terminal {
+        if let Ok((pgid, sid)) = crate::sched::group_of(slot, 0) {
+            super::tty::adopt(terminal, pgid, sid);
+        }
+    }
+    drop(terminal);
     let mm = UserMm::new(true)?;
-    let heap = TryArc::new(HeapBudget { charged: AtomicUsize::new(0) }).ok()?;
     let mut path = String::new();
     path.try_reserve_exact(exe.len()).ok()?;
     path.push_str(exe);
+    install(slot, pid, mm, files, path, Signals::new(crate::sched::inherited_ignored(slot)))
+}
+
+/// Makes the process of a child `FORK` made, starting in `slot` with pid `pid`, from what
+/// its parent's call copied: its space, descriptor table, program path and dispositions.
+/// `None` if there's no memory for it.
+pub fn create_forked(slot: usize, pid: u32, mm: Arc<UserMm>, files: Files, exe: String, signals: Signals) -> Option<&'static Process> {
+    install(slot, pid, mm, files, exe, signals)
+}
+
+/// A process of these, given the slot.
+fn install(slot: usize, pid: u32, mm: Arc<UserMm>, files: Files, exe: String, signals: Signals) -> Option<&'static Process> {
+    let heap = TryArc::new(HeapBudget { charged: AtomicUsize::new(0) }).ok()?;
     let process = Arc::new(Process {
         pid,
         mm: UnsafeCell::new(mm),
@@ -732,13 +795,13 @@ pub fn create(slot: usize, pid: u32, cwd: &str, umask: u32, exe: &str, files: Op
         creation_turns: AtomicU32::new(0),
         ended_ticks: AtomicU64::new(0),
         heap,
-        exe: UnsafeCell::new(path),
+        exe: UnsafeCell::new(exe),
         children: Mutex::new(Vec::new()),
         record: crate::sched::own_record(slot),
         reaped_ticks: AtomicU64::new(0),
         reaped_peak: AtomicU64::new(0),
         reaped_faults: AtomicU64::new(0),
-        signals: Signals::new(crate::sched::inherited_ignored(slot)),
+        signals,
     });
     let signals = process.signals() as *const Signals;
     // SAFETY: see `ProcessCell`: the slot's own task, before anything else can look.
@@ -825,6 +888,33 @@ impl TestSpace {
         self.0.copy_out(address, &value.to_ne_bytes()).ok()?;
         let state = self.0.lock();
         state.mm.space().translate(address, false).ok()
+    }
+
+    /// Maps `pages` pages of private memory at `address`, charged and untouched.
+    pub fn map_pages(&self, address: usize, pages: usize) -> bool {
+        let request = feos_vm::MapRequest {
+            place: feos_vm::Place::Exact(address),
+            ..feos_vm::MapRequest::anonymous(pages * PAGE_SIZE, feos_vm::Prot::READ_WRITE)
+        };
+        self.0.with(|mm, ctx| mm.map(&request, ctx)).is_ok()
+    }
+
+    /// Writes `value` at `address`, as a program's store would: copied first if a fork
+    /// shares the page.
+    pub fn write(&self, address: usize, value: u64) -> bool {
+        self.0.copy_out(address, &value.to_ne_bytes()).is_ok()
+    }
+
+    /// The word at `address`.
+    pub fn read(&self, address: usize) -> Option<u64> {
+        let mut bytes = [0u8; 8];
+        self.0.copy_in(address, &mut bytes).ok()?;
+        Some(u64::from_ne_bytes(bytes))
+    }
+
+    /// A child's copy, as `FORK` makes it.
+    pub fn fork(&self) -> Option<Self> {
+        self.0.fork(Arc::new_uninit()).ok().map(Self)
     }
 
     /// Unmaps the page at `address`.

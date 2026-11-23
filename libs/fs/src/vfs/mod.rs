@@ -33,7 +33,7 @@ mod ramfs;
 
 pub use boot::{assemble, BootLog, Embedded};
 pub use listing::{Listed, Snapshot};
-pub use ramfs::{DeviceKind, RamFs, DEFAULT_QUOTA};
+pub use ramfs::{set_random_source, DeviceKind, RamFs, DEFAULT_QUOTA};
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;

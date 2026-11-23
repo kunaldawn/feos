@@ -206,6 +206,21 @@ pub fn frame_refs(address: usize) -> u32 {
     FRAMES.lock().meta(address as u64).map_or(0, |meta| meta.maps())
 }
 
+/// Drops a reference to a counted frame only if another is left: `true` if it was
+/// dropped. One step under the lock, so of two spaces letting go of a frame a fork left
+/// them sharing, exactly one is told it was the last (see `feos_vm`'s charging).
+pub fn put_frame_if_shared(address: usize) -> bool {
+    match FRAMES.lock().put_if_shared(address as u64) {
+        Ok(dropped) => dropped,
+        Err(error) => panic!("bad put of the frame at {address:#x}: {error:?}"),
+    }
+}
+
+/// Copies in flight through a counted frame now.
+pub fn frame_pins(address: usize) -> u32 {
+    FRAMES.lock().meta(address as u64).map_or(0, |meta| meta.pins())
+}
+
 /// Pins a counted frame for a copy through it. `false` at the cap.
 pub fn pin_frame(address: usize) -> bool {
     match FRAMES.lock().pin(address as u64) {

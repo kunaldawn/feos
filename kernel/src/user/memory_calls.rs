@@ -57,6 +57,18 @@ impl FrameSource for KernelFrames {
         memory::put_frame_noting(frame);
     }
 
+    fn put_shared(&mut self, frame: usize) -> bool {
+        memory::put_frame_if_shared(frame)
+    }
+
+    fn pins(&self, frame: usize) -> u32 {
+        memory::frame_pins(frame)
+    }
+
+    fn maps(&self, frame: usize) -> u32 {
+        memory::frame_refs(frame)
+    }
+
     fn pin(&mut self, frame: usize) -> bool {
         memory::pin_frame(frame)
     }
@@ -130,6 +142,12 @@ fn report_underflows() {
 /// Pages promised and not yet given frames, across the machine.
 pub fn promised() -> usize {
     PROMISES.held()
+}
+
+/// Releases of promises that were clamped, having been more than was held: always zero
+/// unless there's a bug.
+pub fn promise_underflows() -> usize {
+    PROMISES.underflows()
 }
 
 /// How a fault from a program went.

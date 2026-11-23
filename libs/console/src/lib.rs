@@ -178,12 +178,13 @@ pub fn write_bytes(bytes: &[u8]) {
     for_each_terminal_chunk(bytes, emit);
 }
 
-/// Splits `bytes` around each `\n`, inserting the `\r` a terminal needs.
+/// Splits `bytes` around each `\n`, inserting the `\r` a terminal needs. A line that
+/// has its `\r` already (a user program's terminal output, `ONLCR`) isn't given another.
 fn for_each_terminal_chunk(bytes: &[u8], mut chunk: impl FnMut(&[u8])) {
     for line in bytes.split_inclusive(|&byte| byte == b'\n') {
         match line.split_last() {
             Some((b'\n', text)) => {
-                chunk(text);
+                chunk(text.strip_suffix(b"\r").unwrap_or(text));
                 chunk(b"\r\n");
             }
             _ => chunk(line),
@@ -369,6 +370,8 @@ mod tests {
         assert_eq!(collect(b"\n\n"), b"\r\n\r\n");
         assert_eq!(collect(b"\x00\xff\r"), b"\x00\xff\r");
         assert_eq!(collect(b""), b"");
+        // A line that has its carriage return already keeps just the one.
+        assert_eq!(collect(b"a\r\nb\r\r\n"), b"a\r\nb\r\r\n");
     }
 
     #[test]

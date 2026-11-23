@@ -245,6 +245,14 @@ fn console_stat(tree: &dyn VfsTree) -> Stat2 {
     }
 }
 
+/// What a terminal's descriptor is: `/dev/tty`'s node.
+fn terminal_stat(tree: &dyn VfsTree) -> Stat2 {
+    match tree.stat("/dev/tty") {
+        Ok(stat) if stat.device == Some(DeviceKind::Tty) => stat2(&stat, None),
+        _ => Stat2 { mode: s_if::CHR | 0o666, ino: 1, rdev: 5 << 8, nlink: 1, blksize: 4096, ..Stat2::default() },
+    }
+}
+
 /// The link's own facts, its size the length of what it leads to.
 pub(super) fn link_stat(tree: &dyn VfsTree, path: &str, stat: &Stat) -> Stat2 {
     let length = tree.read_link(path).map(|target| target.len() as u64).ok();
@@ -268,6 +276,7 @@ pub(super) fn stat_of_fd(slot: usize, process: &Process, tree: &dyn VfsTree, dir
             None => Ok(console_stat(tree)),
         },
         Object::Console => Ok(console_stat(tree)),
+        Object::Terminal { .. } => Ok(terminal_stat(tree)),
     }
 }
 
@@ -677,6 +686,7 @@ pub fn sys_fd_path(slot: usize, process: &Process, fd: usize, address: usize, le
             give_path(process, address, length, "/dev/console")
         }
         (Object::Console, None) => give_path(process, address, length, "/dev/console"),
+        (Object::Terminal { .. }, None) => give_path(process, address, length, "/dev/tty"),
         _ => -errno::ENOENT,
     }
 }

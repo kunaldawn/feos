@@ -138,6 +138,24 @@ impl Signals {
         self.ignored.load(Ordering::Acquire)
     }
 
+    /// A forked child's: every disposition as this process has it, handlers and their
+    /// flags and masks included (the child runs the same code), and nothing else. Nothing
+    /// pending (a `SIGCHLD` pending here stays this process's) and no interval timer.
+    pub fn fork_copy(&self) -> Self {
+        let actions = *self.actions.lock();
+        let (caught, ignored, child_flags) = Self::derive(&actions);
+        Self {
+            actions: Mutex::new(actions),
+            pending: AtomicU64::new(0),
+            caught: AtomicU64::new(caught),
+            ignored: AtomicU64::new(ignored),
+            child_flags: AtomicU32::new(child_flags),
+            senders: [const { Sender { who: AtomicU64::new(0), code: AtomicU64::new(0), ticks: AtomicU64::new(0) } }; 64],
+            alarm_at: AtomicU64::new(0),
+            alarm_every: AtomicU64::new(0),
+        }
+    }
+
     /// For `EXEC`: handlers aren't kept by a new image, so each goes back to its default.
     /// What's ignored stays ignored, and the mask and pending signals stay as they are.
     pub fn exec_reset(&self) {
@@ -305,8 +323,7 @@ fn enter(
         alt_top,
     };
     let mut out = [0u8; FRAME_MAX];
-    // SAFETY: the thread is the caller, in the kernel, so nothing else uses its user
-    // frame: see `sched::user_frame`.
+    // SAFETY: as above.
     let built = unsafe { (*user).enter_handler(&entry, &mut out) };
     let Some((address, handler)) = built else {
         return false;
@@ -373,11 +390,13 @@ pub struct Interrupted {
 
 /// Whether the call `number` with `args` is made again after a signal interrupts it
 /// (section 8.3 of the ABI design): the reads and writes, the waits for children and
-/// locks, unless a handler without `SA_RESTART` runs; `SIGSUSPEND` unless any handler
-/// runs; the timed waits never.
+/// locks, unless a handler without `SA_RESTART` runs; the timed waits never.
+/// `SIGSUSPEND` is made again when the signal that woke it runs no handler (ignored by
+/// then, or a stop and continue), as Linux's `ERESTARTNOHAND`: it returns only once a
+/// handler has run (section 3's `SIGSUSPEND`, and 1c.10's notes).
 pub fn restart_of(number: usize, args: [usize; 6]) -> Restart {
     match number {
-        nr::READ | nr::WRITE | nr::PREAD | nr::PWRITE | nr::WAIT | nr::WAIT4 | nr::FLOCK | nr::OPENAT | nr::SPAWN2 => {
+        nr::READ | nr::WRITE | nr::PREAD | nr::PWRITE | nr::WAIT | nr::WAIT4 | nr::FLOCK | nr::OPENAT | nr::SPAWN2 | nr::IOCTL => {
             Restart::Restartable
         }
         nr::FCNTL if int_arg(args[1]).is_some_and(|command| command as usize == feos_abi::f::SETLKW) => Restart::Restartable,

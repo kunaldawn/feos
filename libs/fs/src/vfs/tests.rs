@@ -1105,6 +1105,8 @@ fn devfs_nodes_and_modes() {
         ("/dev/full", DeviceKind::Full, 0o666),
         ("/dev/tty", DeviceKind::Tty, 0o666),
         ("/dev/console", DeviceKind::Console, 0o600),
+        ("/dev/random", DeviceKind::Random, 0o666),
+        ("/dev/urandom", DeviceKind::Urandom, 0o666),
     ] {
         let stat = vfs.stat(path).unwrap();
         assert_eq!(stat.device, Some(kind), "{path}");
@@ -1113,9 +1115,7 @@ fn devfs_nodes_and_modes() {
     }
     assert_eq!(DeviceKind::Null.rdev(), 1 << 8 | 3);
     assert_eq!(DeviceKind::Console.rdev(), 5 << 8 | 1);
-    // Nothing else of a random device until `GETRANDOM`.
-    assert_eq!(vfs.stat("/dev/urandom"), Err(FsError::NotFound));
-    assert_eq!(vfs.stat("/dev/random"), Err(FsError::NotFound));
+    assert_eq!((DeviceKind::Random.rdev(), DeviceKind::Urandom.rdev()), (1 << 8 | 8, 1 << 8 | 9));
     // The links into `/proc/self/fd`.
     for (name, target) in [("stdin", "/proc/self/fd/0"), ("stdout", "/proc/self/fd/1"), ("stderr", "/proc/self/fd/2"), ("fd", "/proc/self/fd")] {
         let path = format!("/dev/{name}");
@@ -1139,12 +1139,22 @@ fn devfs_nodes_and_modes() {
     assert_eq!(vfs.read_file(full, 0, &mut out).unwrap(), 8);
     assert_eq!(out, [0; 8]);
     assert_eq!(vfs.write_file_at(full, 0, b"x"), Err(FsError::NoSpace));
+    // The random devices give what the installed source does, at any offset, and take
+    // writes; with none installed they'd read as empty.
+    crate::vfs::set_random_source(|out| out.fill(0x42));
+    for path in ["/dev/random", "/dev/urandom"] {
+        let random = vfs.identify(path).unwrap().0;
+        let mut out = [0u8; 300];
+        assert_eq!(vfs.read_file(random, 1 << 30, &mut out).unwrap(), 300, "{path}");
+        assert!(out.iter().all(|byte| *byte == 0x42), "{path}");
+        assert_eq!(vfs.write_file_at(random, 0, b"entropy?").unwrap(), 8, "{path}");
+    }
     // Emptying a device, as every `> /dev/null` does, works and changes nothing.
     vfs.truncate_file(null, 0).unwrap();
     vfs.write_file("/dev/null", b"shell", false).unwrap();
     // The listing, and the shared-memory directory on top.
     let names: Vec<String> = vfs.read_dir("/dev").unwrap().into_iter().map(|entry| entry.name).collect();
-    assert_eq!(names, ["console", "fd", "full", "null", "shm", "stderr", "stdin", "stdout", "tty", "zero"]);
+    assert_eq!(names, ["console", "fd", "full", "null", "random", "shm", "stderr", "stdin", "stdout", "tty", "urandom", "zero"]);
     let shm = vfs.stat("/dev/shm").unwrap();
     assert_eq!((shm.kind, shm.mode & 0o7777, shm.posix), (FileKind::Directory, 0o1777, true));
     let tmp = vfs.stat("/tmp").unwrap();

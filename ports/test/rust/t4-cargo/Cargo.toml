@@ -1,0 +1,23 @@
+# Stage T4's cargo project: a crate with crates.io dependencies from ports/vendor
+# (through ports/.cargo/config.toml's source replacement, offline), built by the feos
+# toolchain's cargo with `--target x86_64-unknown-feos` / `aarch64-unknown-feos` and
+# run on feos as /bin/t4-cargo (ports/test/stage-t4.sh). serde's derive is a proc
+# macro, so the build also compiles host code (proc-macro2, syn, quote and the build
+# scripts) beside the target's.
+[package]
+name = "t4-cargo"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+itoa = "1"
+memchr = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+debug = 0
+strip = "debuginfo"
+
+[workspace]

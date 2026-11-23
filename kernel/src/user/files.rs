@@ -37,7 +37,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use feos_abi::{close_range, errno, f, int_arg, o, open as open_flags, seek as seek_whence, IO_CHUNK, MAX_FDS, PIPE_BUF};
+use feos_abi::{close_range, errno, f, int_arg, ioctl, o, open as open_flags, poll, seek as seek_whence, PollFd, IO_CHUNK, MAX_FDS, PIPE_BUF};
 use feos_app::pipe::{self, PipeId, Transfer};
 use feos_fdtable::{FdError, FdTable};
 use feos_fs::vfs::{path, Caller, DeviceKind, FileId, Snapshot, VfsTree, ACCESS_READ, ACCESS_WRITE};
@@ -48,7 +48,8 @@ use feos_vm::{FileRef, PAGE_SIZE};
 use super::fs_calls::{self, Fail};
 use super::memory_calls::MapFd;
 use super::process::{HeapCharge, Process};
-use super::{check_parent, check_reach_link, fs_errno, lock_calls, tree, user_path, with_user_buffer, KILLED};
+use super::tty::{self, TerminalRef};
+use super::{check_parent, check_reach_link, fs_errno, lock_calls, random_calls, tree, user_path, with_user_buffer, KILLED};
 use crate::{pagecache, sched};
 
 /// What an open file description refers to.
@@ -63,7 +64,10 @@ pub enum Object {
     /// A regular file (or a device node), by identity, with its lock-table entry (`None`
     /// only for a device the cache won't keep), counted there as a writer if `writer`: a
     /// file mapped to run can't be opened for writing, nor mapped to run while it is.
-    File { path: Path, id: FileId, entry: Option<FileRef>, writer: bool },
+    /// `random` is `Some` for `/dev/random` (`true`: a read waits for the generator to be
+    /// seeded, as `GETRANDOM` does) and `/dev/urandom` (`false`: never waits), whose reads
+    /// the generator answers here rather than the tree, which would hold its lock.
+    File { path: Path, id: FileId, entry: Option<FileRef>, writer: bool, random: Option<bool> },
     /// A directory, read with `GETDENTS` from the snapshot it takes; `READ` says `EISDIR`.
     /// Its identity is what a lock on it is keyed by.
     Directory { path: Path, id: FileId, listing: Mutex<Option<Listing>> },
@@ -71,6 +75,11 @@ pub enum Object {
     Link { path: Path },
     /// `/dev/console` opened: the console itself, whatever the thread's streams are.
     Console,
+    /// A terminal (stage 1c.11): one of the standard streams a program was started with
+    /// on it, `stream` (its writes go to that stream's pipe, as `Stream`'s do), or
+    /// `/dev/tty` opened (`None`: its writes go where the terminal echoes). Reads go
+    /// through the terminal's line discipline, whichever it is.
+    Terminal { terminal: TerminalRef, stream: Option<usize> },
 }
 
 /// A directory's listing as `GETDENTS` took it, and the heap it's charged as.
@@ -203,7 +212,7 @@ impl Drop for Ofd {
                 // This may have been the last hold on a file unlinked while in use.
                 fs_calls::sweep_orphans();
             }
-            Object::Stream(_) | Object::Console | Object::Directory { .. } | Object::Link { .. } => {}
+            Object::Stream(_) | Object::Console | Object::Terminal { .. } | Object::Directory { .. } | Object::Link { .. } => {}
         }
     }
 }
@@ -218,15 +227,20 @@ pub struct Files {
 }
 
 impl Files {
-    /// A table with the standard streams as descriptors 0 to 2, `cwd` and `umask`. `None`
-    /// if there's no heap for it.
-    pub fn new(cwd: &str, umask: u32) -> Option<Self> {
+    /// A table with the standard streams as descriptors 0 to 2, `cwd` and `umask`: those
+    /// whose bits are in `terminal`'s set marked with that terminal. `None` if there's no
+    /// heap for it.
+    pub fn new(cwd: &str, umask: u32, terminal: Option<(&TerminalRef, u8)>) -> Option<Self> {
         let mut path = String::new();
         path.try_reserve_exact(cwd.len()).ok()?;
         path.push_str(cwd);
         let mut table = FdTable::new(MAX_FDS);
         for (stream, access) in [(0, o::RDONLY), (1, o::WRONLY), (2, o::WRONLY)] {
-            let ofd = TryArc::new(Ofd::value(Object::Stream(stream), access, 0, None)).ok()?;
+            let object = match terminal {
+                Some((terminal, streams)) if streams >> stream & 1 != 0 => Object::Terminal { terminal: terminal.clone(), stream: Some(stream) },
+                _ => Object::Stream(stream),
+            };
+            let ofd = TryArc::new(Ofd::value(object, access, 0, None)).ok()?;
             table.insert(ofd, false, 0).ok()?;
         }
         Some(Self { table, cwd: path, umask })
@@ -276,7 +290,7 @@ const fn table_errno(error: FdError) -> isize {
 
 /// Readies a user buffer the kernel is about to copy a pipe's or the console's bytes
 /// into, before anything is taken from it: a bad buffer fails with nothing lost.
-fn ready(process: &Process, address: usize, length: usize, write: bool) -> Result<(), isize> {
+pub(super) fn ready(process: &Process, address: usize, length: usize, write: bool) -> Result<(), isize> {
     let user = process.mm();
     if !user.in_window(address, length) {
         return Err(-errno::EFAULT);
@@ -365,7 +379,7 @@ fn pipe_write(process: &Process, id: PipeId, address: usize, length: usize, nonb
 }
 
 /// `write` to the console itself, a page at a time, as a kernel-linked app's print.
-fn console_write(process: &Process, address: usize, length: usize) -> isize {
+pub(super) fn console_write(process: &Process, address: usize, length: usize) -> isize {
     with_user_buffer(process, address, length, false, |piece| {
         feos_console::write_bytes(piece);
         Ok(piece.len())
@@ -426,10 +440,12 @@ pub fn sys_read(slot: usize, process: &Process, fd: usize, address: usize, lengt
             None => ready(process, address, length, true).map_or_else(|error| error, |()| 0),
         },
         Object::PipeRead(id) => pipe_read(process, *id, address, length, nonblocking),
+        Object::Terminal { terminal, .. } => tty::read(slot, process, terminal, address, length, nonblocking),
         // The console's input isn't a program's to read: at end of file, as above.
         Object::Console => ready(process, address, length, true).map_or_else(|error| error, |()| 0),
         Object::PipeWrite(_) | Object::Link { .. } => -errno::EBADF,
         Object::Directory { .. } => -errno::EISDIR,
+        Object::File { random: Some(waits), .. } => random_calls::read_device(process, address, length, *waits, nonblocking),
         Object::File { id, .. } => {
             let mut offset = ofd.offset.lock();
             let at = *offset;
@@ -525,6 +541,14 @@ pub fn sys_write(slot: usize, process: &Process, fd: usize, address: usize, leng
             None => console_write(process, address, length),
         },
         Object::PipeWrite(id) => pipe_write(process, *id, address, length, nonblocking),
+        Object::Terminal { terminal, stream } => {
+            let pipe = stream.and_then(|stream| sched::stream_pipe(slot, stream));
+            match (stream, pipe) {
+                // A marked stream with no pipe is the console itself.
+                (Some(_), None) => console_write(process, address, length),
+                _ => tty::write(process, terminal, pipe, address, length, nonblocking),
+            }
+        }
         Object::Console => console_write(process, address, length),
         Object::PipeRead(_) | Object::Directory { .. } | Object::Link { .. } => -errno::EBADF,
         Object::File { id, entry, .. } => {
@@ -568,7 +592,7 @@ pub fn sys_pread_pwrite(process: &Process, fd: usize, address: usize, length: us
             }
         }
         Object::Link { .. } => -errno::EBADF,
-        Object::Stream(_) | Object::Console | Object::PipeRead(_) | Object::PipeWrite(_) => -errno::ESPIPE,
+        Object::Stream(_) | Object::Console | Object::Terminal { .. } | Object::PipeRead(_) | Object::PipeWrite(_) => -errno::ESPIPE,
     }
 }
 
@@ -699,7 +723,10 @@ pub fn open_description(slot: usize, process: &Process, joined: &str, request: &
         // same description, as Linux's do. The caller holds that description already, so
         // the node's own bits (`0o600`, root's) aren't what decides; the description's
         // access is. `/dev/console` itself, opened by name, is judged by the node.
-        if follow && !request.path_only && found.stat.device == Some(DeviceKind::Console) {
+        // A terminal-marked descriptor's link leads to `/dev/tty`, and reaches the
+        // descriptor the same way.
+        let console_like = matches!(found.stat.device, Some(DeviceKind::Console | DeviceKind::Tty));
+        if follow && !request.path_only && console_like {
             if let Some(fd) = super::devfs::descriptor_behind(process, tree, joined) {
                 return open_descriptor(process, fd, request);
             }
@@ -720,9 +747,13 @@ pub fn open_description(slot: usize, process: &Process, joined: &str, request: &
         } else {
             tree.check_access(joined, uid, gid, want).map_err(Fail::Fs)?;
         }
-        // A process's terminal is stage 1c.11's: until then none has one.
+        // The caller's terminal: the one its marked descriptors refer to, if any do.
         if found.stat.device == Some(DeviceKind::Tty) && !request.path_only {
-            return Err(Fail::Errno(-errno::ENXIO));
+            let terminal = terminal_of(process).ok_or(Fail::Errno(-errno::ENXIO))?;
+            let charge = process.charge_heap(ofd_heap(None)).map_err(Fail::Errno)?;
+            let room = OfdRef::reserve().ok_or(Fail::Errno(-errno::ENOMEM))?;
+            let ofd = Ofd::value(Object::Terminal { terminal, stream: None }, request.access, request.status, Some(charge));
+            return Ok(room.fill(ofd));
         }
     }
     // The canonical path, which a new file's parent says.
@@ -789,7 +820,12 @@ pub fn open_description(slot: usize, process: &Process, joined: &str, request: &
                     return Err(Fail::Fs(error));
                 }
             }
-            Object::File { path: remembered, id: found.id, entry, writer: writable }
+            let random = match found.stat.device {
+                Some(DeviceKind::Random) => Some(true),
+                Some(DeviceKind::Urandom) => Some(false),
+                _ => None,
+            };
+            Object::File { path: remembered, id: found.id, entry, writer: writable, random }
         }
     };
     // `O_PATH` keeps only `O_CLOEXEC`, `O_DIRECTORY` and `O_NOFOLLOW`, as on Linux.
@@ -1128,6 +1164,252 @@ pub fn spawn_stream(process: &Process, fd: usize, read: bool) -> Option<u32> {
     match (&ofd.object, read) {
         (Object::PipeRead(id), true) | (Object::PipeWrite(id), false) => Some(id.raw()),
         (Object::Stream(0), true) | (Object::Stream(1), false) => Some(0),
+        (Object::Terminal { stream: Some(0), .. }, true) | (Object::Terminal { stream: Some(1), .. }, false) => Some(0),
         _ => None,
+    }
+}
+
+/// The terminal `fd`'s description is marked with, if it is: what v1's `spawn` marks a
+/// child's inherited stream with.
+pub fn terminal_of_fd(process: &Process, fd: usize) -> Option<TerminalRef> {
+    let files = process.files();
+    match &files.table.get(fd)?.object {
+        Object::Terminal { terminal, .. } => Some(terminal.clone()),
+        _ => None,
+    }
+}
+
+/// The caller's terminal: the one the first of its terminal-marked descriptors refers to,
+/// for `/dev/tty`. A program's terminal is the one it was started on (there's no
+/// acquiring one), so they all refer to the same one.
+pub fn terminal_of(process: &Process) -> Option<TerminalRef> {
+    let files = process.files();
+    let found = files.table.iter().find_map(|(_, ofd)| match &ofd.object {
+        Object::Terminal { terminal, .. } => Some(terminal.clone()),
+        _ => None,
+    });
+    found
+}
+
+/// What `POLL` finds of a description, as `revents` bits before they're matched against
+/// what was asked for (section 3.3's table in the ABI design). A pipe's reader that finds
+/// it empty is noted as wanting input, as a reader that read nothing would be.
+fn poll_bits(slot: usize, ofd: &Ofd) -> i16 {
+    let reading = |id: PipeId| {
+        let state = pipe::state(id);
+        let mut bits = 0;
+        if state.held > 0 || !state.writers {
+            bits |= poll::IN;
+        } else {
+            pipe::mark_wanted(id);
+        }
+        if !state.writers {
+            bits |= poll::HUP;
+        }
+        bits
+    };
+    let writing = |id: PipeId| {
+        let state = pipe::state(id);
+        if !state.readers {
+            poll::ERR
+        } else if state.writable() {
+            poll::OUT
+        } else {
+            0
+        }
+    };
+    if ofd.path_only {
+        return poll::NVAL;
+    }
+    match &ofd.object {
+        // Files and the device nodes are always ready, for what they were opened for.
+        Object::File { .. } => poll::IN | if ofd.writable() { poll::OUT } else { 0 },
+        Object::Directory { .. } => poll::IN,
+        Object::Link { .. } => poll::NVAL,
+        Object::PipeRead(id) => reading(*id),
+        Object::PipeWrite(id) => writing(*id),
+        Object::Stream(stream) => match (sched::stream_pipe(slot, *stream), *stream) {
+            (Some(id), 0) => reading(id),
+            (Some(id), _) => writing(id),
+            // The console a program isn't given: reads at end of file, writes go.
+            (None, _) => poll::IN | poll::OUT,
+        },
+        Object::Console => poll::IN | poll::OUT,
+        Object::Terminal { terminal, .. } => {
+            let (readable, hung_up) = tty::poll_state(terminal);
+            let mut bits = poll::OUT;
+            if readable || hung_up {
+                bits |= poll::IN;
+            }
+            if hung_up {
+                bits |= poll::HUP;
+            }
+            bits
+        }
+    }
+}
+
+/// `revents` for one entry: what's so of what it asked for, and `ERR`, `HUP` and `NVAL`
+/// whatever it asked; `RDNORM` and `WRNORM` as `IN` and `OUT`. A negative descriptor is
+/// skipped, and one that isn't open is `NVAL`.
+fn revents_of(slot: usize, process: &Process, entry: &PollFd) -> i16 {
+    if entry.fd < 0 {
+        return 0;
+    }
+    let Some(ofd) = process.files().table.get(entry.fd as usize).cloned() else {
+        return poll::NVAL;
+    };
+    let bits = poll_bits(slot, &ofd);
+    drop(ofd);
+    let always = poll::ERR | poll::HUP | poll::NVAL;
+    let mut revents = bits & (entry.events | always);
+    if bits & poll::IN != 0 && entry.events & poll::RDNORM != 0 {
+        revents |= poll::RDNORM;
+    }
+    if bits & poll::OUT != 0 && entry.events & poll::WRNORM != 0 {
+        revents |= poll::WRNORM;
+    }
+    revents
+}
+
+/// `poll` (and `ppoll`, with `sigmask`). The array is copied in once, looked at against
+/// every change of the readiness word until something's ready, the time is up or a
+/// signal comes, and written back whole from that copy with the `revents` filled in.
+pub fn sys_poll(slot: usize, process: &Process, args: [usize; 6]) -> isize {
+    let [fds, count, timeout, sigmask, _, _] = args;
+    if count > MAX_FDS {
+        return -errno::EINVAL;
+    }
+    let bytes = count * PollFd::SIZE;
+    if count > 0 && !process.mm().in_window(fds, bytes) {
+        return -errno::EFAULT;
+    }
+    let mask = if sigmask == 0 {
+        None
+    } else {
+        let mut raw = [0u8; 8];
+        if let Err(error) = process.mm().copy_in(sigmask, &mut raw) {
+            return error;
+        }
+        Some(u64::from_ne_bytes(raw))
+    };
+    let _charge = match process.charge_heap(bytes) {
+        Ok(charge) => charge,
+        Err(error) => return error,
+    };
+    let mut raw = Vec::new();
+    if raw.try_reserve_exact(bytes).is_err() {
+        return -errno::ENOMEM;
+    }
+    raw.resize(bytes, 0u8);
+    // No entries is a sleep, whatever the pointer.
+    if count > 0 {
+        if let Err(error) = process.mm().copy_in(fds, &mut raw) {
+            return error;
+        }
+    }
+    let mut entries = Vec::new();
+    if entries.try_reserve_exact(count).is_err() {
+        return -errno::ENOMEM;
+    }
+    entries.extend(raw.chunks_exact(PollFd::SIZE).map(|chunk| {
+        let mut one = [0u8; PollFd::SIZE];
+        one.copy_from_slice(chunk);
+        PollFd { revents: 0, ..PollFd::from_bytes(one) }
+    }));
+    let timeout = timeout as i64;
+    let deadline = (timeout > 0).then(|| crate::time::monotonic_ns().saturating_add(timeout as u64));
+    // The mask to wait with, put back as `SIGSUSPEND`'s is: at once if this returns
+    // without a signal, or by the handler's frame if one runs.
+    if let Some(mask) = mask {
+        sched::set_suspended_mask(slot, sched::signal_mask(slot));
+        sched::set_signal_mask(slot, mask & !super::signal::UNBLOCKABLE);
+    }
+    let poller = pipe::poller();
+    let result = loop {
+        let seen = pipe::readiness();
+        let mut ready = 0;
+        for entry in &mut entries {
+            entry.revents = revents_of(slot, process, entry);
+            ready += usize::from(entry.revents != 0);
+        }
+        if ready > 0 || timeout == 0 {
+            break Ok(ready);
+        }
+        if deadline.is_some_and(|deadline| crate::time::monotonic_ns() >= deadline) {
+            break Ok(0);
+        }
+        if sched::interrupted() {
+            break Err(sched::interrupted_result());
+        }
+        sched::wait_word_until(pipe::readiness_word(), seen, deadline.map(crate::time::deadline_ticks));
+    };
+    drop(poller);
+    if result.is_ok() {
+        if let Some(old) = sched::take_suspended_mask(slot) {
+            sched::set_signal_mask(slot, old);
+        }
+    }
+    match result {
+        Ok(ready) => {
+            for (entry, chunk) in entries.iter().zip(raw.chunks_exact_mut(PollFd::SIZE)) {
+                chunk.copy_from_slice(&entry.to_bytes());
+            }
+            if count == 0 {
+                return 0;
+            }
+            match process.mm().copy_out(fds, &raw) {
+                Ok(()) => ready as isize,
+                Err(error) => error,
+            }
+        }
+        Err(error) => error,
+    }
+}
+
+/// `ioctl`: [`ioctl::FD_NREAD`] on anything that has bytes to read, and the terminal's
+/// requests on a terminal (`ENOTTY` elsewhere); anything else is `EINVAL`.
+pub fn sys_ioctl(slot: usize, process: &Process, fd: usize, request: usize, arg: usize) -> isize {
+    let ofd = match lookup(process, fd) {
+        Ok(ofd) => ofd,
+        Err(error) => return error,
+    };
+    if ofd.path_only {
+        return -errno::EBADF;
+    }
+    match request {
+        ioctl::FD_NREAD => {
+            let count = match &ofd.object {
+                Object::PipeRead(id) | Object::PipeWrite(id) => pipe::state(*id).held,
+                Object::Stream(stream) => sched::stream_pipe(slot, *stream).map_or(0, |id| pipe::state(id).held),
+                Object::Terminal { terminal, .. } => tty::available(terminal),
+                Object::Console => 0,
+                Object::File { id, .. } => {
+                    let Some(tree) = tree() else {
+                        return -errno::EIO;
+                    };
+                    let size = match tree.stat_file(*id) {
+                        Ok(stat) => stat.size,
+                        Err(error) => return fs_errno(error),
+                    };
+                    let at = *ofd.offset.lock();
+                    size.saturating_sub(at).min(i32::MAX as u64) as usize
+                }
+                Object::Directory { .. } | Object::Link { .. } => return -errno::ENOTTY,
+            };
+            let count = count.min(i32::MAX as usize) as i32;
+            match process.mm().copy_out(arg, &count.to_ne_bytes()) {
+                Ok(()) => 0,
+                Err(error) => error,
+            }
+        }
+        request if ioctl::is_terminal_request(request) => match &ofd.object {
+            Object::Terminal { terminal, stream } => {
+                let pipe = stream.and_then(|stream| sched::stream_pipe(slot, stream));
+                tty::ioctl(slot, process, terminal, pipe, request, arg)
+            }
+            _ => -errno::ENOTTY,
+        },
+        _ => -errno::EINVAL,
     }
 }

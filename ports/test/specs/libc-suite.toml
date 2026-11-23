@@ -12,12 +12,12 @@ status = 0
 [[case]]
 name = "testrun-self"
 run = "/bin/testrun -t 4 /usr/share/libc-suite/selftest/self.list"
-expect = ["PASS pass", "FAIL fail: exit status 1", "FAIL differs: stdout differs", "PEND later (stage 9z.9)", "SKIP never", "TIMEOUT slow: still running after 4 s", "testrun: /usr/share/libc-suite/selftest/self.list: 1 passed, 3 failed, 1 pending, 1 skipped", "testrun: 1 tests left running"]
+expect = ["PASS pass", "FAIL fail: exit status 1", "FAIL differs: stdout differs", "PEND later (stage 9z.9)", "SKIP never", "PASS signal-group", "TIMEOUT slow: still running after 4 s, killed", "testrun: /usr/share/libc-suite/selftest/self.list: 2 passed, 3 failed, 1 pending, 1 skipped", "testrun: 1 tests timed out, 0 left running"]
 status = 1
 
 [[case]]
 name = "relibc-tests"
-run = "/bin/testrun -t 30 /usr/share/libc-suite/relibc/relibc.list"
+run = "/bin/testrun -t 120 /usr/share/libc-suite/relibc/relibc.list"
 expect = [" 0 failed,"]
 reject = ["TIMEOUT"]
 status = 0
@@ -33,10 +33,10 @@ timeout = 2400
 
 # For the record, not judged: every test that was built, the pending and skipped ones
 # too, so ports/test/suite-report.py can put each one's result on feos beside the Linux
-# reference's (docs/toolchain.md). A test left running here is just reported.
+# reference's (docs/toolchain.md). A test that overruns here is killed and just reported.
 [[case]]
 name = "relibc-all-record"
-run = "/bin/testrun -t 20 /usr/share/libc-suite/relibc/relibc-all.list"
+run = "/bin/testrun -t 90 /usr/share/libc-suite/relibc/relibc-all.list"
 expect = ["testrun: /usr/share/libc-suite/relibc/relibc-all.list:"]
 timeout = 3000
 

@@ -1432,7 +1432,10 @@ fn sigsuspend(mask: *const u64) -> EINTR
 
 `SIGPENDING`: signals pending for the thread or the process that the thread blocks.
 `SIGSUSPEND`: replaces the thread's mask with `*mask` until a handler has run, then
-restores it and returns `EINTR` (always).
+restores it and returns `EINTR` (always). A signal that wakes it but runs no handler
+(ignored by the time it's taken, or a default stop then a continue) makes the call again
+with the same mask, as Linux's `ERESTARTNOHAND`, so it never returns without a handler
+having run.
 
 #### 89 `SIGRETURN`
 
@@ -1455,7 +1458,9 @@ fn setitimer(which: usize, new: *const ITimerVal, old: *mut ITimerVal) -> 0
 
 `ITIMER_REAL` 0 only (`ITIMER_VIRTUAL` 1 and `ITIMER_PROF` 2 are `EINVAL`): a per-process
 deadline on the monotonic clock that raises `SIGALRM` on the process when it passes, then
-re-arms by `interval` if that isn't zero. `new` zero only reads the current value into
+re-arms by `interval` if that isn't zero; an interval under 1 ms re-arms every
+millisecond (it still reads back as set), so a program can't have the kernel's alarm task,
+which takes the scheduler's lock each time, go off faster. `new` zero only reads the current value into
 `old` (`getitimer`); a zero `value` disarms. `usec` outside `0..1_000_000` is `EINVAL`.
 Not inherited by `FORK` or `SPAWN2`; kept across `EXEC`, as POSIX. relibc's `alarm()` is
 this, which configure test programs, coreutils `timeout` and Python's `signal.alarm`
@@ -2236,7 +2241,8 @@ to is the call itself (the program counter set back to the trap instruction, 2 b
 argument in `x0` on AArch64, both kept by the kernel at entry). Restartable: `READ`,
 `WRITE`, `PREAD`, `PWRITE`, `WAIT4`, `ACCEPT`, `RECVFROM`, `SENDTO`, `FLOCK`, `FCNTL`
 (`F_SETLKW`), `OPENAT` (if it was waiting), `SPAWN2` and v1's `WAIT`. Never restarted:
-`POLL`, `NANOSLEEP`, `FUTEX_WAIT2`, `SIGSUSPEND`, `CONNECT` (Linux's behaviour for each).
+`POLL`, `NANOSLEEP`, `FUTEX_WAIT2`, `SIGSUSPEND`, `CONNECT` (Linux's behaviour for each);
+but `SIGSUSPEND` is made again when no handler runs at all, as on Linux (section 3).
 
 A blocked thread asked to end for a fatal signal or `SIGKILL` leaves its call at once,
 unwinds it, and ends at the user boundary: the cooperative kill of [2.1](#21-kernel-rules-the-calls-depend-on).
@@ -4865,7 +4871,7 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
 - **User checks:** `mask-blocks-then-delivers`, `sigprocmask-unblock-delivers-before-return`,
   `sigpending`, `sigsuspend`, `altstack-used`, `stack-overflow-handler` (overflow the main
   stack, catch `SIGSEGV` on the alternate stack, `si_addr` in the guard), `eintr-read`,
-  `sa-restart-read`, `sa-restart-wait4`, `thread-kill-targets-thread`,
+  `sa-restart-read`, `eintr-wait4`, `sa-restart-wait4`, `thread-kill-targets-thread`,
   `process-signal-unblocked-thread`, `process-signal-once` (with 8 threads not blocking it,
   each of 10,000 process signals is handled exactly once), `ipi-prompt-delivery` (a thread
   spinning on another CPU runs a `THREAD_KILL` handler within 1 ms), `spawn2-sigmask`,
@@ -4874,8 +4880,28 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
 - **Malicious:** `sigprocmask-bad-how` (`EINVAL`), `altstack-in-kernel` (`EFAULT`),
   `altstack-too-small` (`ENOMEM`), `thread-kill-other-process` (`ESRCH`),
   `setitimer-virtual` (`EINVAL`), `setitimer-bad-usec` (`EINVAL`), `signal-storm` (a
-  thousand signals a second at a busy child; it still exits normally), `toctou-setitimer`.
+  thousand signals a second at a busy child; it still exits normally), `toctou-setitimer`,
+  `setitimer-tiny-interval`.
 - **Boot:** `signals` (smp=1 and 4), `user`, `fault`.
+- **As built (deviations):**
+  - `SIGSUSPEND` is `Restart::NoHandler` (`signal::restart_of`): woken by a signal that
+    then runs no handler (ignored by the time it's taken, a default stop then continue),
+    it's made again rather than returning `EINTR`, as Linux's `ERESTARTNOHAND`, which is
+    what "until a handler has run" asks for. Sections 3 and 8.3 say so.
+  - `ITIMER_REAL` re-arms by at least `feos_signal::itimer::MIN_PERIOD_NS` (1 ms), and the
+    `alarms` task looks at most that often but when a timer is set; a `SIGALRM` still
+    pending when the timer goes off again isn't raised (or IPI'd) a second time. Linux
+    instead re-arms only once the last `SIGALRM` is taken, which this floor makes
+    unneeded and which would cover neither an ignored `SIGALRM` nor many processes'
+    timers. A shorter interval reads back as set. `make test-signal`'s
+    `itimer_rearms_by_interval` checks the floor; the malicious probe
+    `setitimer-tiny-interval` arms a 1 us interval and checks how often `SIGALRM` comes and
+    that a busy loop keeps its share of the CPU.
+  - `signal-storm` passes only with at least 500 of its thousand `KILL`s sent (it's paced
+    by absolute deadlines, so about a thousand go; the margin is for an emulated single
+    CPU) and none refused. `sa-restart-wait4` checks the handler ran well before `WAIT4`
+    returned, while it was still blocked, and a new check before it, `eintr-wait4`, has
+    the same `WAIT4` without `SA_RESTART` return `EINTR` with the child still to wait for.
 
 ### 1c.11 `POLL`, `IOCTL`, the terminal
 
@@ -4897,11 +4923,59 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
   thread blocked in `POLL` on a pipe wakes when another thread writes it mid-wait),
   `poll-dev-null`, `isatty-console`, `isatty-pipe-false`, `winsize`, `tcsetattr-raw`
   (driven by the boot test: raw mode reads one key), `fionread`, `tcdrain`, `tcflush`,
-  `tcgetsid`, `dev-tty-opens-terminal`, `background-read-sigttin`, `spawn2-tcsetpgrp`.
+  `tcflush-input` and `tcooff-holds-write` (driven by the boot test: three typed keys are
+  `FD_NREAD` 3, then 0 after `TCIFLUSH` with nothing to read; a write waits out
+  `TCOOFF`, `EAGAIN` if non-blocking), `tcgetsid`, `dev-tty-opens-terminal`, `background-read-sigttin`, `spawn2-tcsetpgrp`.
 - **Malicious:** `poll-count-too-big` (`EINVAL`), `poll-kernel-array` (`EFAULT`),
   `ioctl-unknown` (`EINVAL`), `ioctl-tty-on-file` (`ENOTTY`), `ioctl-kernel-pointer`
   (`EFAULT`), `tty-flush-bad-queue` (`EINVAL`), `toctou-poll-array`.
 - **Boot:** new phase `poll`, `terminal` (Ctrl-C now through the kernel's `ISIG`), `user`.
+- **As built (deviations):**
+  - A terminal is the kernel's (`kernel/src/user/tty.rs`, a static table of 16), opened by
+    the kernel app that runs a program in the foreground, not marked by feos-sh itself:
+    `apps/commands/src/host.rs` (the shell's host, shared by the serial shell and every
+    Terminal window) opens one with `Processes::open_terminal` for a user program whose
+    standard input and output or error are the console, names it and the streams that are
+    on it in `SpawnIo::terminal`, feeds it the console's raw keys (`Input::try_read_raw`,
+    the window put in raw mode meanwhile) and closes its hold when the program ends. A
+    program with its input redirected gets no terminal, so its other streams aren't marked
+    either; one whose output and error both are redirected neither. Window size comes from
+    the window (`apps/commands/src/terminal.rs`, where the Terminal app is, not
+    `libs/desktop`) through `ConsoleSource::size`, and the serial console says 24 by 80.
+  - Typed keys reach the line discipline only when they're wanted: while a reader waits or
+    a poller looks (or one found nothing since the last offer), and otherwise only up to a
+    character `ISIG` makes a signal. So keys typed ahead of a program that never reads them
+    stay the shell's, as they always were, and Ctrl-C still reaches the foreground group at
+    once. What the terminal took and nobody read goes with it.
+  - A terminal's marked descriptors and `/dev/tty` `FSTATAT` as `/dev/tty` (`5 << 8 | 0`),
+    and `FD_PATH` and `/proc/self/fd/N` say `/dev/tty`; opening such a link reaches the
+    descriptor itself, as the console's does. `/dev/tty`'s writes go where the terminal
+    echoes (the program's standard output's pipe, or its error's). `ENXIO` is for a process
+    with no terminal-marked descriptor at all: the malicious probe
+    `dev-tty-without-terminal` now runs in a child whose standard streams are `/dev/null`.
+  - `TTY_SET_PGRP` and `SPAWN2`'s `TCSETPGRP` on a terminal of another session are
+    `ENOTTY`, as Linux's on a terminal that isn't the caller's controlling one; a group not
+    in the session is `EPERM`, and `TCSETPGRP` with `SPAWN_SETSID` is `EPERM`. The
+    foreground word is set under the scheduler's lock as the child gets its group, so the
+    child is in the foreground before it runs. A background read checks for an orphaned
+    group only when it would otherwise raise `SIGTTIN`; the kernel app that started a
+    program counts as a parent in another group of the session.
+  - `ISIG` echoes `^C`, `^\` and `^Z` with a newline, as the shell's Ctrl-C always did;
+    `VERASE` also takes `0x08`, which serial terminals send. Without `ECHOE`, an erase
+    echoes itself (`^?` under `ECHOCTL`).
+  - `FD_NREAD` on a directory or a link is `ENOTTY`. `POLL` of an `O_PATH` descriptor is
+    `POLLNVAL`, as Linux's. A terminal whose host has gone reads end of file and polls
+    `POLLHUP`. `POLL` writes the whole array back from its copy, `revents` filled in.
+    `IOCTL` is restartable, for `tcdrain` and the draining `TTY_SET_ATTR`s.
+  - `poll-many` is 500 entries over 50 pipes, ten each: a process may have 64 pipes alive
+    (`PIPES_PER_PROCESS`). Beyond the stage's list, `polltest` also checks a `VMIN` 0,
+    `VTIME` 2 read (`vmin-vtime-read`), and `malicious` probes a kernel `sigmask`, a
+    request with high bits set, a bad descriptor, `ENOTTY` for `TTY_SET_PGRP` on a file and
+    `TTY_DRAIN` on a pipe, a bad flow action, kernel pointers to the terminal's `GET_ATTR`
+    and `SET_ATTR`, and a negative and an absent foreground group. `tty-flush-bad-queue`
+    and those terminal probes expect `ENOTTY` when `malicious` isn't on a terminal.
+  - The serial console no longer doubles a carriage return that's already there
+    (`libs/console`), since a program's terminal output now has its own (`ONLCR`).
 
 ### 1c.12 `/bin/sh` as a user program
 
@@ -4927,6 +5001,78 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
 - **Malicious:** `sh-deep-recursion` (a script recursing 10,000 functions ends cleanly,
   with an error or 139, machine fine).
 - **Boot:** new phase `usersh`, `posix-proc`, `terminal`.
+- **As built (deviations):**
+  - The process backend is `feos_coreutils::Processes` (`libs/coreutils/src/process.rs`:
+    spawn with actions, exec, wait, pipes, poll, signals, the terminal's foreground group),
+    which a host offers through `Host::processes`; the kernel's shell host doesn't, so the
+    console shell is unchanged. Files needed no new trait: the user runtime implements
+    feos-fs's own `VfsTree` (`UserTree`, over `OPENAT`, `FSTATAT`, `GETDENTS`, `PREAD` and
+    the rest), which the utilities' `OverlayFs` already reaches the kernel's shared tree
+    through. Open handles, mounts and file identities aren't offered there (`Unsupported`):
+    nothing the shell and utilities do uses them. The backend lives in
+    `user/src/bin/sh.rs`; `user/src/lib.rs` gained the heap (`feos_user::heap`, feos-heap
+    over one `MAP_NORESERVE` arena) and `execvp`.
+  - The shell side is `libs/sh/src/spawn.rs`. A program's descriptors 0 to 9 are made from
+    the shell's table by actions: the shell's own descriptor copied, a redirected file
+    opened by the child (`>file` is made or truncated by the shell when the redirection is
+    opened, so the child opens it to append, after the shell has written what it had for
+    it), `/dev/null` and `/dev/zero` opened, a descriptor sharing an earlier one's file
+    copied from it; a source an earlier copy would overwrite is moved above every source
+    first; then closes, and `CLOSEFROM` above the highest descriptor named. What the shell
+    holds in memory (a here-document, a file it read in full, a capture) goes through a
+    pipe it feeds or drains with `POLL` while the program runs. Only a pipeline whose every
+    stage is a plainly named program (not a function, builtin, utility or anything
+    expanded) runs as processes joined by pipes, all at once; any other pipeline is the
+    buffered one as before, its program stages fed and drained. `&` likewise backgrounds a
+    pipeline of programs; any other list still runs in the foreground, since there's no
+    fork yet. `exec` of a program that must be fed from memory runs it as a child and ends
+    the shell with its status.
+  - A program's `argv[0]` is the path the shell resolved (`/bin/ptest` for `ptest`), as the
+    kernel's shell host gives it, not the word typed.
+  - Job control is on only at a prompt on a terminal: each job is a group of its own, the
+    terminal's foreground group from `SPAWN2`'s `TCSETPGRP` (on a copy of the terminal the
+    shell keeps on descriptor 63, closed in its children) until the shell takes it back with
+    `TTY_SET_PGRP`; the shell ignores `SIGTSTP`, `SIGTTIN`, `SIGTTOU`, `SIGQUIT` and
+    `SIGTERM` there and catches `SIGINT`. `wait`, `fg`, `bg`, `jobs` and `kill` (with
+    `%n`, `$!`, pids and `-pgid`) work on jobs of processes; a job ended by `SIGINT` ends
+    the line at a prompt, and a script goes on. Without job control a background program
+    reads `/dev/null`. What the shell ignores of its own accord is reset to the default for
+    every program it starts (`SETSIGDEF`), and the mask cleared (`SETSIGMASK`). A signal
+    the shell was started with ignored (`nohup sh -c`) stays ignored for the programs it
+    starts, and in a shell without a prompt for the shell itself: `trap` on it is accepted
+    (and listed) but never fires, and `trap -` doesn't reset it, which POSIX allows ("no
+    error need be reported"). A background program of a shell without job control gets
+    `SIGINT` and `SIGQUIT` as the shell has them (their defaults, unless inherited ignored),
+    not ignored as POSIX has it: `SPAWN2` can only reset signals to their defaults, and
+    ignoring them in the shell around the call would drop one meant for the shell. That
+    comes with `FORK` (stage 1d.1), whose child can ignore them before its `EXEC`.
+  - Descriptors the shell was started with open and not close-on-exec (GNU make's
+    jobserver pipe through `sh -c`) are found at startup through `/proc/self/fd` and passed
+    on to every program, as POSIX has it: 3 to 9 are entered in the shell's table as
+    themselves, so a redirection can still close or replace one for a program, and the
+    highest one above 9 moves the final `CLOSEFROM` past it (closed table descriptors below
+    it are closed one by one, and a source copied out of the way goes above it too). The
+    shell's own descriptors (its pipes, files it reads, the terminal's copy on 63) are all
+    close-on-exec, so those between go at the program's `EXEC`. Builtins and utilities
+    can't write to an inherited descriptor (`echo >&3` writes nothing): only programs reach
+    it. Checked by `sh-inherited-fds` (`ptest --fds` sees 3 and 12, and not 3 after
+    `3>&-`, through a pipeline, a nested `sh -c` and `exec`) and the host test
+    `inherited_descriptors_reach_programs`; `sh-ignored-on-entry` checks the signals.
+  - At a prompt `/bin/sh` reads cooked lines from the terminal's line discipline, with
+    `PS2` for a line that leaves a construct open, not the kernel shell's line editor (which
+    wants raw keys): no tab completion or history editing there.
+  - The host tests are `make test-sh`'s `spawn_actions_for_redirections`,
+    `pipeline_closes_unused_ends` and `exit_status_of_signal_reaches_dollar_question`
+    (against a mock `Processes`), and `make test-coreutils`'s `exit_status_of_signal`
+    (`WAIT4`'s status words and the `$?` they give).
+  - The user checks are a new program, `user/src/bin/shtest.rs`, which starts `/bin/sh` with
+    its streams on pipes, plus `sh-background-jobs` (`&`, `$!`, `wait`, `kill $!`). `ptest`
+    gained the modes they use: `--emit` and `--count-stdin` (its `--count` already counts
+    arguments), `--both`, `--fds`, `--pid` and `--execvp`. `sh-ctrl-c-ends-job-not-shell` is
+    driven by the `usersh` boot phase on the serial console's terminal (with Ctrl-Z, `bg`
+    and `kill %1`), and again in a Terminal window in `terminal`; `posix-proc` runs
+    `/bin/sh -c` from the kernel's shell. `sh-deep-recursion` expects the shell's nesting
+    error (status 2) or 139.
 
 ### 1d.1 `FORK`
 
@@ -4958,7 +5104,8 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
   blocked in `FUTEX_WAIT2` on a heap word; another forks, then writes the word and wakes:
   the waiter wakes), `fork-child-futex-isolated` (a child's wake on the same address
   doesn't wake the parent's waiter), `fork-tid-refreshed` (in the child `GETTID ==
-  GETPID`), `fork-no-clear-word`, `fork-exec`, `fork-wait`, `fork-1000` (sequential
+  GETPID`), `fork-no-clear-word`, `fork-tls-inherited` (the thread pointer set just
+  before forking, from EL0 on AArch64, is the child's), `fork-exec`, `fork-wait`, `fork-1000` (sequential
   fork/exit, frames back to baseline), `vmcheck` over `fork`.
 - **Malicious:** `fork-bomb` (until `EAGAIN`; the machine stays up and recovers),
   `fork-then-munmap-race` (the parent unmaps while the child reads), `fork-enomem` (fork a
@@ -4970,6 +5117,61 @@ calls take a struct adds a `toctou-*` probe for it ([section 1](#1-rules-every-c
 - **Ktest:** `ktest fork-promises` (10,000 forks, exits and writes in mixed orders;
   `UNBACKED` back to its baseline and never negative).
 - **Boot:** new phase `fork`, `posix-proc`, `user`, `ram`.
+- **As built (deviations):**
+  - The copy-on-write bit is bit 56, not 57: 1a.4 gave bit 57 to the page cache's entries
+    (`CACHED`), and both stay port-independent software bits (AArch64 leaves 55 to 58 to
+    software, x86_64 ignores 52 to 58). The host test is `cow_bit_is_56_on_both`.
+  - Every frame of a space's own that a fork shares holds a promise, read-only ones
+    (image data, pages written and then made read-only, `PROT_NONE` pages that kept their
+    frames) and `MAP_NORESERVE` ones included, not only writable private present pages:
+    `mprotect` could make one writable without asking the fork again, and one rule keeps
+    the debt exactly the sum over shared frames of their map count less one. The costs are
+    the read-only pages of small programs.
+  - "A private writable page with pins" is one whose entry is writable with any pin: a
+    frame's pin count doesn't say which way a copy goes.
+  - A frame only one space maps any more but some copy has pinned is copied on its first
+    write with a promise taken then (it holds none), so that copy alone can fail
+    (`SIGBUS`); every other copy-on-write copy uses the promise its reference held.
+  - Shared-anonymous objects hold their own promise (their pages less their frames), not
+    the space that made them: after a fork either space may touch a page first or let go
+    of the object last. Each space mapping an object counts it against its own limit and
+    heap budget (its pages while it's charged, otherwise the frames that space's touches
+    made); `mprotect` charging an object does it under the object's lock, so two spaces
+    doing it at once promise it once; and the last reference is found in one atomic step
+    (`ObjectRef::release`).
+  - `feos_vm::FrameSource` gained `put_shared` (drop a reference only if it isn't the last,
+    as one step: `feos_frames::Frames::put_if_shared`), `pins` and `maps`; the deferred puts
+    of a change's gather never apply to a reference that isn't the last, so they're
+    immediate.
+  - The child's task starts in the kernel, as a spawned program's does, from
+    `user::Start::Fork` in its slot: it makes its `Process` there from what the call
+    copied and enters its program from the forking thread's frame. So `fork` returns in
+    the parent before the child has run, and a child that finds no memory for its
+    `Process` ends with status 126 rather than the parent seeing `ENOMEM`.
+  - The user checks are `ptest --fork` (and in `ptest`'s full run, so `posix-proc` runs
+    them too); `vmcheck over fork` is `vmcheck --fork`; the malicious probes run as
+    `malicious --fork-bomb`, `--fork-munmap-race`, `--fork-enomem`,
+    `--cow-write-from-kernel` and `--fork-during-disk-read`, from `malicious`'s run and one
+    by one in the `fork` phase. `ktest fork-promises` forks kernel test spaces (the same
+    `UserMm::fork`), ten thousand times, rather than processes.
+  - The intermittent x64 hang from 1c.12's verify (`seq 1 20000 | /bin/cat | wc -l | tr 2
+    Q` never printing `Q0000`) didn't come back: 600 rounds of that pipeline, with the
+    user phase's other `/bin/cat` pipelines between, on x64 at smp=4 from a fresh boot, all
+    gave `Q0000`, and so did every `user` phase run here. Nothing in the pipe, futex or
+    teardown paths it goes through was found that could lose a wake. Noted while looking:
+    a run of `malicious` on x64 once stalled in `zombie-flood` (`SPAWN2` answering `EAGAIN`
+    without end) after a first spawn storm that found only 681 slots where every other run
+    finds 954, and passed on the next runs; it was with an earlier draft of this stage
+    whose shared-object bookkeeping was quadratic, so it may have been that, but it stays
+    an open point to watch for.
+  - A space's shared objects are kept sorted, with a count of the VMAs mapping each, so
+    a fault, a split, an unmap and the space's end find one in a few steps: `malicious
+    --shared-flood`'s sixteen thousand objects in one space cost what they did before.
+    `maxrss` (`Mm::resident`) leaves out the frames of charged objects, which any sharer
+    may have made, rather than look at every object on every fault.
+  - 1c.12's note that a background program of a shell without job control gets `SIGINT`
+    and `SIGQUIT` as the shell has them stays as it is: `/bin/sh` still starts programs
+    with `SPAWN2`, and moving it onto `FORK` is its own change.
 
 ### 1e.1 Randomness and setting the clock: the CSPRNG, CPU and firmware sources, `GETRANDOM`, `CLOCK_SETTIME`
 

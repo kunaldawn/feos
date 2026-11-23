@@ -291,6 +291,22 @@ impl Input for ConsoleInput {
         0
     }
 
+    fn try_read_raw(&mut self, out: &mut [u8]) -> Available {
+        let mut count = 0;
+        while count < out.len() {
+            let Some(byte) = next_raw() else {
+                break;
+            };
+            out[count] = byte;
+            count += 1;
+        }
+        if count == 0 {
+            Available::Pending
+        } else {
+            Available::Bytes(count)
+        }
+    }
+
     fn unread(&mut self, bytes: &[u8]) {
         let mut tty = TTY.lock();
         for byte in bytes.iter().rev() {

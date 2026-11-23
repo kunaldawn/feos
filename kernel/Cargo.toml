@@ -26,6 +26,7 @@ feos-fdtable = { workspace = true }
 feos-locks = { workspace = true }
 feos-apps = { workspace = true }
 feos-console = { workspace = true }
+feos-csprng = { workspace = true }
 feos-desktop-app = { workspace = true }
 feos-hal = { workspace = true }
 feos-frames = { workspace = true }
@@ -34,6 +35,7 @@ feos-irq = { workspace = true }
 feos-net = { workspace = true }
 feos-sched = { workspace = true }
 feos-signal = { workspace = true }
+feos-tty = { workspace = true }
 feos-shell = { workspace = true }
 feos-sync = { workspace = true }
 

@@ -2,7 +2,7 @@
 //! environment and actions, its synchronous errors, process groups and sessions, the
 //! initial stack's aux vector, `SYSINFO` and `GETRUSAGE`; `EXEC` and `#!` scripts;
 //! `WAIT4` and its statuses, `KILL` with default actions, stops and continues, and how
-//! long a pid and a record last.
+//! long a pid and a record last; and `FORK` (stage 1d.1), which `--fork` runs alone.
 //! Reports each check, and exits zero if all passed.
 //!
 //! The boot test runs it as `FOO=bar /bin/ptest`, so its own environment comes from the
@@ -25,6 +25,17 @@ struct Report {
 }
 
 impl Report {
+    /// Says how it went, as the program's status.
+    fn summary(&self) -> i32 {
+        if self.failed == 0 {
+            println!("ptest: all ok");
+            0
+        } else {
+            println!("ptest: {} FAILED", self.failed);
+            1
+        }
+    }
+
     fn check(&mut self, name: &str, good: bool, detail: core::fmt::Arguments<'_>) {
         if good {
             println!("ptest {name}: ok ({detail})");
@@ -945,6 +956,108 @@ fn exec_mode(mode: &str, args: &Args) -> Option<i32> {
     })
 }
 
+/// The modes `/bin/sh`'s checks run (stage 1c.12, `shtest`): a pipeline's two ends, both
+/// output streams, the descriptors a child has, its pid, and `execvp`.
+fn shell_mode(mode: &str, args: &Args) -> Option<i32> {
+    Some(match mode {
+        // `--emit [n]`: `n` numbered lines, 2000 by default: more than a pipe holds, so a
+        // pipeline only finishes if its reader runs as it writes.
+        "--emit" => {
+            let count = args.get(2).and_then(feos_user::parse_number).unwrap_or(2000);
+            for index in 0..count {
+                let mut line = feos_user::Line::new(1);
+                use core::fmt::Write as _;
+                let _ = writeln!(line, "emit-line-{index:05}");
+                line.flush();
+            }
+            0
+        }
+        // `--count-stdin`: the lines and bytes of standard input, to its end.
+        "--count-stdin" => {
+            let (mut lines, mut bytes) = (0usize, 0usize);
+            let mut buffer = [0u8; 1024];
+            loop {
+                let got = read(0, &mut buffer);
+                if got <= 0 {
+                    break;
+                }
+                bytes += got as usize;
+                lines += buffer[..got as usize].iter().filter(|byte| **byte == b'\n').count();
+            }
+            println!("lines={lines} bytes={bytes}");
+            0
+        }
+        "--both" => {
+            let out = write(1, b"to-stdout\n") == 10;
+            let err = write(2, b"to-stderr\n") == 10;
+            i32::from(!(out && err))
+        }
+        // `--fds`: the descriptors `/proc/self/fd` lists, but for the one listing it.
+        "--fds" => {
+            let fd = feos_user::openat(feos_user::abi::at::FDCWD, "/proc/self/fd", o::RDONLY | o::DIRECTORY | o::CLOEXEC, 0);
+            if fd < 0 {
+                println!("fds=error {}", feos_user::error_name(fd));
+                return Some(1);
+            }
+            let mut buffer = [0u8; 2048];
+            let mut found = [false; 256];
+            loop {
+                let length = feos_user::getdents(fd as usize, &mut buffer);
+                if length <= 0 {
+                    break;
+                }
+                let mut at = 0;
+                while at + 19 <= length as usize {
+                    let record = usize::from(u16::from_ne_bytes([buffer[at + 16], buffer[at + 17]]));
+                    if record == 0 {
+                        break;
+                    }
+                    let name = &buffer[at + 19..at + record];
+                    let name = &name[..name.iter().position(|byte| *byte == 0).unwrap_or(name.len())];
+                    if let Some(number) = core::str::from_utf8(name).ok().and_then(feos_user::parse_number) {
+                        if number < found.len() && number != fd as usize {
+                            found[number] = true;
+                        }
+                    }
+                    at += record;
+                }
+            }
+            close(fd as usize);
+            let mut line = feos_user::Line::new(1);
+            use core::fmt::Write as _;
+            let _ = line.write_str("fds=");
+            let mut first = true;
+            for (number, open) in found.iter().enumerate() {
+                if *open {
+                    let _ = write!(line, "{}{number}", if first { "" } else { "," });
+                    first = false;
+                }
+            }
+            let _ = line.write_str("\n");
+            line.flush();
+            0
+        }
+        "--pid" => {
+            println!("pid={}", getpid());
+            0
+        }
+        // `--execvp <file> [args...]`: `execvp`'s fallback, which runs a file without `#!`
+        // through `/bin/sh`.
+        "--execvp" => {
+            let mut words = [""; 8];
+            let mut count = 0;
+            for index in 2..args.len().min(10) {
+                words[count] = args.get(index).unwrap_or("");
+                count += 1;
+            }
+            let error = feos_user::execvp(words[0], &words[..count]);
+            println!("execvp: {}", feos_user::error_name(error));
+            127
+        }
+        _ => return None,
+    })
+}
+
 /// What each child mode does.
 fn child_mode(args: &Args) -> Option<i32> {
     let mode = args.get(1)?;
@@ -952,6 +1065,9 @@ fn child_mode(args: &Args) -> Option<i32> {
         return Some(status);
     }
     if let Some(status) = wait_mode(mode, args) {
+        return Some(status);
+    }
+    if let Some(status) = shell_mode(mode, args) {
         return Some(status);
     }
     Some(match mode {
@@ -1056,6 +1172,10 @@ fn main(args: Args) -> i32 {
         return status;
     }
     let mut report = Report { failed: 0 };
+    if args.has("--fork") {
+        test_fork(&mut report);
+        return report.summary();
+    }
     test_argv_envp(&mut report);
     test_env_from_shell(&mut report);
     test_dup2(&mut report);
@@ -1080,6 +1200,7 @@ fn main(args: Args) -> i32 {
     test_kill_ids(&mut report);
     test_stop_mid_call(&mut report);
     test_lifetimes(&mut report);
+    test_fork(&mut report);
     for path in [EXEC_COPY, SCRIPT, SCRIPT2] {
         feos_user::unlinkat(feos_user::abi::at::FDCWD, path, 0);
     }
@@ -1592,4 +1713,401 @@ fn wait_mode(mode: &str, args: &Args) -> Option<i32> {
         }
         _ => return None,
     })
+}
+
+// Stage 1d.1: `FORK`.
+
+/// Runs `child` in a forked child, which ends with what it returns: its pid, and the
+/// status it ended with (its exit code, or 128 plus the signal that ended it).
+fn forked(child: impl FnOnce() -> i32) -> (isize, isize) {
+    let pid = feos_user::fork();
+    if pid == 0 {
+        feos_user::exit(child());
+    }
+    if pid < 0 {
+        return (pid, pid);
+    }
+    (pid, feos_user::wait_status(pid))
+}
+
+/// An anonymous private page, or shared with `shared`, `pages` long.
+fn anonymous(pages: usize, shared: bool) -> usize {
+    use feos_user::abi::{map, prot};
+    let kind = if shared { map::SHARED } else { map::PRIVATE };
+    let at = feos_user::mmap2(0, pages * PAGE_SIZE, prot::READ | prot::WRITE, kind | map::ANONYMOUS);
+    at.max(0) as usize
+}
+
+fn peek(address: usize) -> u64 {
+    // SAFETY: the callers' own mappings.
+    unsafe { core::ptr::read_volatile(address as *const u64) }
+}
+
+fn poke(address: usize, value: u64) {
+    // SAFETY: the callers' own writable mappings.
+    unsafe { core::ptr::write_volatile(address as *mut u64, value) };
+}
+
+static FORK_STATIC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn test_fork(report: &mut Report) {
+    use core::sync::atomic::Ordering;
+    let me = getpid();
+
+    // Once in each: the child's 0 and its own pid, its parent the caller.
+    let (pid, status) = forked(|| if getppid() == me && getpid() != me { 42 } else { 1 });
+    report.check("fork-returns-twice", pid > 0 && pid != me && status == 42, format_args!("pid {pid}, child status {status}"));
+
+    // The same page written in both: each keeps its own, a static and the heap alike.
+    let page = anonymous(1, false);
+    poke(page, 0x1111);
+    FORK_STATIC.store(0x1111, Ordering::SeqCst);
+    let (_, status) = forked(|| {
+        let before = peek(page) == 0x1111 && FORK_STATIC.load(Ordering::SeqCst) == 0x1111;
+        poke(page, 0x2222);
+        FORK_STATIC.store(0x2222, Ordering::SeqCst);
+        feos_user::sleep_ms(30);
+        i32::from(!(before && peek(page) == 0x2222 && FORK_STATIC.load(Ordering::SeqCst) == 0x2222))
+    });
+    poke(page + 8, 0x3333);
+    let mine = peek(page) == 0x1111 && peek(page + 8) == 0x3333 && FORK_STATIC.load(Ordering::SeqCst) == 0x1111;
+    report.check("fork-memory-isolated", status == 0 && mine, format_args!("child status {status}, parent's {:#x}", peek(page)));
+
+    // A shared page touched before and one not: both the same memory in both.
+    let shared = anonymous(2, true);
+    poke(shared, 5);
+    let (_, status) = forked(|| {
+        let saw = peek(shared);
+        poke(shared, 6);
+        poke(shared + PAGE_SIZE, 7);
+        i32::from(saw != 5)
+    });
+    let (first, second) = (peek(shared), peek(shared + PAGE_SIZE));
+    report.check("fork-shared-anon-shared", status == 0 && first == 6 && second == 7, format_args!("child {status}, pages {first} and {second}"));
+
+    // A futex on a shared word: the parent waits and the child wakes it, then the other
+    // way round.
+    let word_at = anonymous(1, true);
+    // SAFETY: a page just mapped, aligned, shared and writable.
+    let word = unsafe { &*(word_at as *const core::sync::atomic::AtomicU32) };
+    let child = feos_user::fork();
+    if child == 0 {
+        feos_user::sleep_ms(20);
+        word.store(1, Ordering::SeqCst);
+        feos_user::futex_wake(word, 1);
+        // Now it waits, for the parent's 2.
+        let mut waited = 0;
+        while word.load(Ordering::SeqCst) != 2 && waited < 50 {
+            feos_user::futex_wait(word, 1, 100);
+            waited += 1;
+        }
+        feos_user::exit(i32::from(word.load(Ordering::SeqCst) != 2));
+    }
+    let mut rounds = 0;
+    while word.load(Ordering::SeqCst) == 0 && rounds < 50 {
+        feos_user::futex_wait(word, 0, 100);
+        rounds += 1;
+    }
+    let woke = word.load(Ordering::SeqCst) == 1;
+    word.store(2, Ordering::SeqCst);
+    feos_user::futex_wake(word, 1);
+    let status = if child > 0 { feos_user::wait_status(child) } else { child };
+    report.check("fork-shared-futex", woke && status == 0, format_args!("parent woken {woke} after {rounds}, child {status}"));
+
+    test_fork_files(report);
+    test_fork_threads(report, me);
+
+    // In the child, the thread is the process's first: its tid is its pid.
+    let (_, status) = forked(|| i32::from(feos_user::gettid() != getpid() || getpid() == me));
+    report.check("fork-tid-refreshed", status == 0, format_args!("child {status}"));
+
+    test_fork_tls(report);
+
+    // `EXEC` from the child, and `WAIT4` for it.
+    let (_, status) = forked(|| {
+        let mut argv = [UserStr::default(); 4];
+        let request = feos_user::exec_request(PROGRAM, user_strs(&[PROGRAM, "--exit-code", "7"], &mut argv), &[]);
+        feos_user::exec(&request);
+        99
+    });
+    report.check("fork-exec", status == 7, format_args!("child {status}"));
+
+    // In a child of its own, whose only children are these: each reaped once by `-1`,
+    // with its own code, and then there are none.
+    let (_, status) = forked(|| {
+        let mut pids = [0isize; 3];
+        for (index, pid) in pids.iter_mut().enumerate() {
+            *pid = feos_user::fork();
+            if *pid == 0 {
+                feos_user::sleep_ms(20 + 10 * index);
+                feos_user::exit(10 + index as i32);
+            }
+        }
+        let early = feos_user::wait4(-1, feos_user::abi::wait::NOHANG);
+        let mut codes = 0;
+        for _ in 0..3 {
+            if let Ok((pid, status)) = feos_user::wait4(-1, 0) {
+                if let Some(index) = pids.iter().position(|&child| child == pid) {
+                    codes |= i32::from(feos_user::abi::wait::exit_code(status) == 10 + index as i32) << index;
+                }
+            }
+        }
+        let after = feos_user::wait4(-1, feos_user::abi::wait::NOHANG);
+        codes | i32::from(!matches!(early, Ok((0, _)))) << 3 | i32::from(after != Err(-errno::ECHILD)) << 4
+    });
+    report.check("fork-wait", status == 0b111, format_args!("child {status:#b}: a bit per child reaped right, then WNOHANG before, ECHILD after"));
+
+    // A thousand, one after another: every frame and promise comes back.
+    let free = || feos_user::sysinfo().map_or(0, |info| info.free_pages);
+    for _ in 0..10 {
+        forked(|| 0);
+    }
+    let before = free();
+    let mut failed = 0;
+    for round in 0..1000 {
+        let (_, status) = forked(move || {
+            // Touched in the child: a copy, given back as it ends.
+            poke(page + 16, round);
+            0
+        });
+        failed += usize::from(status != 0);
+    }
+    let after = free();
+    report.check(
+        "fork-1000",
+        failed == 0 && after + 16 >= before,
+        format_args!("failed {failed}, free pages {before} -> {after}"),
+    );
+    feos_user::munmap(page, PAGE_SIZE);
+    feos_user::munmap(shared, 2 * PAGE_SIZE);
+    feos_user::munmap(word_at, PAGE_SIZE);
+}
+
+/// A thread control block for [`test_fork_tls`]: its first word is its own address,
+/// which is how x86_64 code reads its thread pointer (`fs:0`).
+#[repr(C, align(64))]
+struct ForkTcb([core::sync::atomic::AtomicUsize; 8]);
+
+static FORK_TCB: ForkTcb = ForkTcb([const { core::sync::atomic::AtomicUsize::new(0) }; 8]);
+
+/// The thread pointer set straight before forking is the child's. On AArch64 a program
+/// writes `TPIDR_EL0` itself, with no call the kernel sees, so the kernel's copy is
+/// stale until the thread is next switched out: forking at once is what would show it
+/// taking that copy. x86_64 sets it only through `SET_TLS`.
+fn test_fork_tls(report: &mut Report) {
+    use core::sync::atomic::Ordering;
+    let address = &FORK_TCB as *const ForkTcb as usize;
+    FORK_TCB.0[0].store(address, Ordering::Relaxed);
+    #[cfg(target_arch = "aarch64")]
+    let old = {
+        let old: usize;
+        // SAFETY: the thread pointer is this thread's to set; nothing here uses TLS.
+        unsafe {
+            core::arch::asm!("mrs {}, tpidr_el0", out(reg) old, options(nomem, nostack, preserves_flags));
+            core::arch::asm!("msr tpidr_el0, {}", in(reg) address, options(nomem, nostack, preserves_flags));
+        }
+        old
+    };
+    #[cfg(target_arch = "x86_64")]
+    feos_user::set_tls(address);
+    let pid = feos_user::fork();
+    if pid == 0 {
+        feos_user::exit(i32::from(feos_user::tls() != address));
+    }
+    let status = if pid > 0 { feos_user::wait_status(pid) } else { pid };
+    let mine = feos_user::tls() == address;
+    // Put back as it was where that can be read; on x86_64 the block stays, and is valid.
+    // SAFETY: as above.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("msr tpidr_el0, {}", in(reg) old, options(nomem, nostack, preserves_flags))
+    };
+    report.check("fork-tls-inherited", status == 0 && mine, format_args!("child {status}, parent's kept {mine}"));
+}
+
+const FORK_FILE: &str = "/tmp/ptest-fork";
+
+fn test_fork_files(report: &mut Report) {
+    use feos_user::abi::{lock, map, prot};
+    let fd = feos_user::openat(feos_user::abi::at::FDCWD, FORK_FILE, o::RDWR | o::CREAT | o::TRUNC | o::CLOEXEC, 0o644);
+    if fd < 0 {
+        return report.check("fork-file-private-cow", false, format_args!("open {fd}"));
+    }
+    let fd = fd as usize;
+    let data: [u8; 64] = core::array::from_fn(|index| b'a' + (index % 26) as u8);
+    let mut wrote = 0;
+    while wrote < 2 * PAGE_SIZE {
+        let piece = (2 * PAGE_SIZE - wrote).min(data.len());
+        wrote += write(fd, &data[..piece]).max(1) as usize;
+    }
+
+    // A private mapping of it, read before: the child's write is the child's.
+    let at = feos_user::mmap2_file(0, 2 * PAGE_SIZE, prot::READ | prot::WRITE, map::PRIVATE, fd, 0);
+    let mapped = at.max(0) as usize;
+    let first = if at > 0 { peek(mapped) } else { 0 };
+    let (_, status) = forked(|| {
+        poke(mapped, 0x5858_5858);
+        poke(mapped + PAGE_SIZE, 0x5959_5959);
+        i32::from(peek(mapped) != 0x5858_5858)
+    });
+    let mut back = [0u8; 8];
+    feos_user::pread(fd, &mut back, 0);
+    let intact = at > 0 && peek(mapped) == first && u64::from_ne_bytes(back) == first && peek(mapped + PAGE_SIZE) != 0x5959_5959;
+    report.check("fork-file-private-cow", status == 0 && intact, format_args!("child {status}, map {at:#x}, first {first:#x}"));
+    if at > 0 {
+        feos_user::munmap(mapped, 2 * PAGE_SIZE);
+    }
+
+    // One description, one offset: the child's read moves the parent's.
+    feos_user::seek(fd, 0, feos_user::abi::seek::SET);
+    let (_, status) = forked(|| {
+        let mut five = [0u8; 5];
+        i32::from(read(fd, &mut five) != 5 || &five != b"abcde")
+    });
+    let mut next = [0u8; 3];
+    let got = read(fd, &mut next);
+    report.check("fork-fds-share-offset", status == 0 && got == 3 && &next == b"fgh", format_args!("child {status}, then {got} {:?}", core::str::from_utf8(&next)));
+
+    // A `flock` is the description's: the child has it too, and another open doesn't.
+    let held = feos_user::flock(fd, lock::EX);
+    let (_, status) = forked(|| {
+        let again = feos_user::flock(fd, lock::EX | lock::NB);
+        let other = feos_user::openat(feos_user::abi::at::FDCWD, FORK_FILE, o::RDONLY, 0);
+        let refused = if other >= 0 { feos_user::flock(other as usize, lock::SH | lock::NB) } else { other };
+        i32::from(!(again == 0 && refused == -errno::EWOULDBLOCK))
+    });
+    feos_user::flock(fd, lock::UN);
+    report.check("fork-flock-shared", held == 0 && status == 0, format_args!("lock {held}, child {status}"));
+    close(fd);
+    feos_user::unlinkat(feos_user::abi::at::FDCWD, FORK_FILE, 0);
+}
+
+/// What the threads of [`test_fork_threads`] share.
+static SPIN_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SPIN_STOP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static SPIN_BAD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static WAIT_WORD: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static CLEAR_AT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Writes its own page and reads it back, over and over, until told to stop: a write the
+/// fork's copy-on-write lost would show.
+fn spinner(page: usize) -> usize {
+    use core::sync::atomic::Ordering;
+    let mut value = 1u64;
+    while !SPIN_STOP.load(Ordering::Acquire) {
+        poke(page, value);
+        if peek(page) != value {
+            SPIN_BAD.fetch_add(1, Ordering::AcqRel);
+        }
+        value += 1;
+        SPIN_COUNT.store(value, Ordering::Release);
+    }
+    0
+}
+
+/// Waits on the private word [`WAIT_WORD`] points at while it's 0, for at most `limit`
+/// milliseconds: 0 woken with it set, 1 woken without, 2 timed out.
+fn word_waiter(limit: usize) -> usize {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    // SAFETY: the test's own mapping, aligned, mapped until the join.
+    let word = unsafe { &*(WAIT_WORD.load(Ordering::Acquire) as *const AtomicU32) };
+    let result = feos_user::futex_wait(word, 0, limit);
+    match (result, word.load(Ordering::Acquire)) {
+        (_, 1) => 0,
+        (result, _) if result == -errno::ETIMEDOUT => 2,
+        _ => 1,
+    }
+}
+
+/// A thread that forks: the child's thread has no clear word, so its end clears nothing
+/// in the child's copy of this thread's start block.
+fn forking_thread(_: usize) -> usize {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    // Its clear word's address is set once the thread has started.
+    while CLEAR_AT.load(Ordering::Acquire) == 0 {
+        feos_user::sleep_ms(1);
+    }
+    let pid = feos_user::fork();
+    if pid != 0 {
+        return feos_user::wait_status(pid) as usize;
+    }
+    // The child: its copy of the parent thread's clear word is still 1, and stays so
+    // when this thread ends, as another thread of the child sees.
+    fn watch(_: usize) -> usize {
+        // SAFETY: the child's copy of the block the parent's thread started from.
+        let word = unsafe { &*(CLEAR_AT.load(Ordering::Acquire) as *const AtomicU32) };
+        let start = feos_user::uptime_ms();
+        while feos_user::uptime_ms() - start < 300 && word.load(Ordering::Acquire) == 1 {
+            feos_user::futex_wait(word, 1, 50);
+        }
+        feos_user::exit(i32::from(word.load(Ordering::Acquire) != 1));
+    }
+    if feos_user::thread::spawn(watch, 0).is_err() {
+        feos_user::exit(3);
+    }
+    feos_user::thread_exit(0, 0)
+}
+
+fn test_fork_threads(report: &mut Report, me: isize) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    // A thread writing its own page throughout: in the parent it carries on, seeing its
+    // writes; the child has only the forking thread, so nothing moves its copy.
+    let page = anonymous(1, false);
+    SPIN_STOP.store(false, Ordering::SeqCst);
+    let spinning = feos_user::thread::spawn(spinner, page);
+    feos_user::sleep_ms(10);
+    let (_, status) = forked(|| {
+        let seen = SPIN_COUNT.load(Ordering::Acquire);
+        feos_user::sleep_ms(30);
+        i32::from(SPIN_COUNT.load(Ordering::Acquire) != seen)
+    });
+    let at_fork = SPIN_COUNT.load(Ordering::Acquire);
+    feos_user::sleep_ms(20);
+    let moved = SPIN_COUNT.load(Ordering::Acquire) > at_fork;
+    SPIN_STOP.store(true, Ordering::SeqCst);
+    let joined = spinning.map(|thread| thread.join()).unwrap_or(9);
+    let bad = SPIN_BAD.load(Ordering::SeqCst);
+    report.check(
+        "fork-in-threaded-parent",
+        status == 0 && moved && bad == 0 && joined == 0,
+        format_args!("child {status}, parent's thread moved {moved}, lost writes {bad}"),
+    );
+
+    // A parent thread blocked on a private word while another forks, then wakes it.
+    poke(page, 0);
+    WAIT_WORD.store(page, Ordering::SeqCst);
+    let waiter = feos_user::thread::spawn(word_waiter, 3000);
+    feos_user::sleep_ms(20);
+    let (_, status) = forked(|| 0);
+    // SAFETY: the page mapped above, aligned.
+    let word = unsafe { &*(page as *const AtomicU32) };
+    word.store(1, Ordering::SeqCst);
+    feos_user::futex_wake(word, 1);
+    let woke = waiter.map(|thread| thread.join()).unwrap_or(9);
+    report.check("fork-while-sibling-futex-waits", status == 0 && woke == 0, format_args!("child {status}, waiter {woke}"));
+
+    // The child's wake on the same address is its own space's: the parent's waiter stays.
+    poke(page, 0);
+    let waiter = feos_user::thread::spawn(word_waiter, 300);
+    feos_user::sleep_ms(20);
+    let (_, woken) = forked(|| {
+        // SAFETY: the child's copy of the page.
+        let word = unsafe { &*(page as *const AtomicU32) };
+        feos_user::futex_wake(word, 1) as i32
+    });
+    let result = waiter.map(|thread| thread.join()).unwrap_or(9);
+    report.check("fork-child-futex-isolated", woken == 0 && result == 2, format_args!("child woke {woken}, waiter {result}"));
+
+    // A thread with a clear word forks.
+    CLEAR_AT.store(0, Ordering::SeqCst);
+    let forker = feos_user::thread::spawn_with_stack(forking_thread, 0);
+    let status = match forker {
+        Ok((thread, _, done)) => {
+            CLEAR_AT.store(done, Ordering::SeqCst);
+            thread.join() as isize
+        }
+        Err(error) => error,
+    };
+    report.check("fork-no-clear-word", status == 0, format_args!("child {status}, parent {me}"));
+    feos_user::munmap(page, PAGE_SIZE);
 }

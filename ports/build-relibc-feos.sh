@@ -60,6 +60,13 @@ if [ "$(cat "$build/.feos-spec" 2>/dev/null)" != "$stamp" ]; then
     rm -rf "$build/release" "$build/openlibm" "$build/include"
 fi
 
+# relibc's Makefile copies openlibm into the build once (its rule depends on the
+# directory's own mtime), so an edited openlibm file (ports/PATCHES.md) would never reach
+# libm: start that copy again when a file in it is newer.
+if [ -d "$build/openlibm" ] && [ -n "$(find "$P/src/relibc/openlibm" -type f -newer "$build/openlibm" -print -quit)" ]; then
+    rm -rf "$build/openlibm"
+fi
+
 cd "$P/src/relibc"
 make BUILD="$build" TARGET="$target" CARGOFLAGS="$flags" \
     headers "$build/release/libc.a" "$build/release/crt0.o" "$build/release/crti.o" \

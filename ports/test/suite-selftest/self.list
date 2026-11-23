@@ -5,4 +5,5 @@ status fail /bin/sysroot-check /nonexistent
 expect differs /bin/sysroot-check expected-not.txt -
 pending later 9z.9 never runs
 skip never not for feos
+status signal-group /bin/testrun --signal-group
 status slow /bin/testrun --sleep 10

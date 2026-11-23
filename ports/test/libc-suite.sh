@@ -6,8 +6,9 @@
 #
 #   ports/test/container.sh libc ports/test/libc-suite.sh [REF]
 #
-# REF is the base the kernels are built from, default refs/feos-checkpoints/1c.6 (any
-# later verified ref works too). It
+# REF is the base the kernels are built from, default HEAD (a verified state; through
+# stage 1c.9 when this was written). The spec wants 1c.8's KILL (testrun-self checks that
+# an overrunning test is killed), and the lists say which tests wait on later stages. It
 # 1. builds what goes into the image (build-libc-suite.sh: relibc for feos, the sysroot,
 #    testrun and sysroot-check, relibc's tests, the libc-test subset), each piece a no-op
 #    or quick when built and unchanged;
@@ -29,7 +30,7 @@
 set -eu
 cd "$(dirname "$0")/../.."
 t=ports/test
-ref=${1:-refs/feos-checkpoints/1c.6}
+ref=${1:-HEAD}
 arches=${PORTS_SUITE_ARCHES:-aarch64 x86_64}
 ports=${PORTS_SUITE_PORTS:-arm x64}
 out=${PORTS_BUILD:-/build}

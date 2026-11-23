@@ -361,6 +361,15 @@ pub trait Arch: Clock + Cpu + Power + Sized + 'static {
     /// on, since it can't always ask the CPU itself.
     fn user_hwcaps() -> (u64, u64);
 
+    /// A word from the CPU's random number instruction, if it has one that answered:
+    /// `RDSEED` (else `RDRAND`) on x86_64, `RNDRRS` (else `RNDR`) on AArch64, each
+    /// retried as its vendor advises. A trusted source for the kernel's generator.
+    fn hardware_random() -> Option<u64>;
+
+    /// The name of what [`hardware_random`](Self::hardware_random) reads, for the boot
+    /// log; `None` where the CPU has nothing.
+    fn hardware_random_name() -> Option<&'static str>;
+
     /// Whether a program can change its thread pointer without a call, so the kernel
     /// keeps what it finds there whenever the thread leaves the CPU. Where it can't
     /// (x86_64, with `CR4.FSGSBASE` clear: a selector load can still clobber the FS base,

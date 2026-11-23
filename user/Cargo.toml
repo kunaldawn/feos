@@ -14,6 +14,12 @@ path = "src/lib.rs"
 
 [dependencies]
 feos-abi = { path = "../libs/abi" }
+feos-heap = { path = "../libs/heap" }
+# `/bin/sh`: the shell language and utilities the kernel's own shell runs, over system
+# calls here.
+feos-sh = { path = "../libs/sh" }
+feos-coreutils = { path = "../libs/coreutils" }
+feos-fs = { path = "../libs/fs" }
 
 [profile.release]
 panic = "abort"

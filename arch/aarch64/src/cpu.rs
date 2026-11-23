@@ -154,3 +154,46 @@ pub fn user_tls() -> usize {
     unsafe { asm!("mrs {}, tpidr_el0", out(reg) value, options(nomem, nostack, preserves_flags)) };
     value as usize
 }
+
+/// Whether `ID_AA64ISAR0_EL1.RNDR` says there's `RNDR` and `RNDRRS` (FEAT_RNG).
+fn has_rndr() -> bool {
+    let isar0: u64;
+    // SAFETY: reading an ID register has no effect.
+    unsafe { asm!("mrs {}, id_aa64isar0_el1", out(reg) isar0, options(nomem, nostack, preserves_flags)) };
+    (isar0 >> 60) & 0xf >= 1
+}
+
+/// Tries each of the instructions this many times: a failure (`NZCV` reading `0b0100`)
+/// means the source couldn't answer in reasonable time, which a retry may fix.
+const RNDR_TRIES: u32 = 10;
+
+/// A word from `RNDRRS` (freshly reseeded from the true source), or `RNDR` where that kept
+/// failing.
+pub fn hardware_random() -> Option<u64> {
+    if !has_rndr() {
+        return None;
+    }
+    for _ in 0..RNDR_TRIES {
+        let (value, ok): (u64, u64);
+        // SAFETY: FEAT_RNG is there, by the ID register; `RNDRRS` is `s3_3_c2_c4_1`. It
+        // only writes the register named and the flags.
+        unsafe { asm!("mrs {v}, s3_3_c2_c4_1", "cset {ok}, ne", v = out(reg) value, ok = out(reg) ok, options(nomem, nostack)) };
+        if ok != 0 {
+            return Some(value);
+        }
+    }
+    for _ in 0..RNDR_TRIES {
+        let (value, ok): (u64, u64);
+        // SAFETY: as above; `RNDR` is `s3_3_c2_c4_0`.
+        unsafe { asm!("mrs {v}, s3_3_c2_c4_0", "cset {ok}, ne", v = out(reg) value, ok = out(reg) ok, options(nomem, nostack)) };
+        if ok != 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// Which instruction [`hardware_random`] reads, for the boot log.
+pub fn hardware_random_name() -> Option<&'static str> {
+    has_rndr().then_some("RNDR")
+}

@@ -1,0 +1,12 @@
+[package]
+name = "feos-csprng"
+description = "The kernel's random number generator: ChaCha20 with fast key erasure, seeded and reseeded through a BLAKE2s pool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]

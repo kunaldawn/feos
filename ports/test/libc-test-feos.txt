@@ -65,7 +65,7 @@ functional/mbc                       upstream  fails on relibc's Linux too: mbrt
 functional/pthread_cancel-points     upstream  fails on relibc's Linux too: seqno == 1 failed (blocking sem_wait, seqno)
 functional/pthread_cancel            upstream  fails on relibc's Linux too: hangs
 functional/pthread_mutex             upstream  fails on relibc's Linux too: hangs
-functional/pthread_mutex_pi          upstream  fails on relibc's Linux too: sem_timedwait failed with unexpected error: Try again
+functional/pthread_mutex_pi          upstream  fails on relibc's Linux too: relibc's ERRORCHECK relock returns EAGAIN, not EDEADLK; the NORMAL case's deadlocked thread, which the test leaves blocked on a mutex in a returned frame, is woken by relibc's unlock when the next case reuses the address and clobbers its result (relock 0, a second unlock EPERM), and strerror's one static buffer mixes up the two threads' messages ("Success" on feos)
 functional/pthread_robust            upstream  fails on relibc's Linux too: hangs
 functional/snprintf                  upstream  fails on relibc's Linux too: bad integer conversion: got " 12  ", want "+12  "
 functional/spawn                     upstream  fails on relibc's Linux too: posix_spawnp(&pid, "echo", &fa, 0, (char *[]){"echo","hello",0}, 0) failed, got 38 want 0
@@ -120,8 +120,7 @@ math/expf                            upstream  fails on relibc's Linux too: got 
 math/expl                            upstream  fails on relibc's Linux too: got 0
 math/expm1                           upstream  fails on relibc's Linux too: got INEXACT
 math/expm1l                          upstream  fails on relibc's Linux too: got INEXACT|OVERFLOW
-math/fenv                            upstream  fails on relibc's Linux too: fetestexcept(-1) should return 0 when all exceptions are cleared, got 32640
-math/fma                             upstream  fails on relibc's Linux too: got INEXACT
+math/fma@x86_64                      upstream  fails the same on relibc's Linux x86_64: got INEXACT (passes on feos arm; fails on qemu-user's Linux AArch64 too)
 math/fmaf                            upstream  fails on relibc's Linux too: got INEXACT
 math/fmal                            upstream  fails on relibc's Linux too: got INEXACT
 math/fpclassify                      upstream  fails on relibc's Linux too
@@ -141,9 +140,9 @@ math/nextafterl                      upstream  fails on relibc's Linux too: got 
 math/nexttoward                      upstream  fails on relibc's Linux too
 math/nexttowardl                     upstream  fails on relibc's Linux too: got 0
 math/pow                             upstream  fails on relibc's Linux too: got 0
-math/powf                            upstream  fails on relibc's Linux too: got 0
+math/powf@aarch64                    upstream  fails the same on relibc's Linux AArch64: got 0 (passes on feos x64; fails on relibc's Linux x86_64 too)
 math/powl                            upstream  fails on relibc's Linux too: got INEXACT
-math/round                           upstream  fails on relibc's Linux too: got INVALID
+math/round@x86_64                    upstream  fails the same on relibc's Linux x86_64: got INVALID (passes on feos arm; fails on qemu-user's Linux AArch64 too)
 math/sin                             upstream  fails on relibc's Linux too: got INEXACT
 math/sinf                            upstream  fails on relibc's Linux too: got INEXACT
 math/sinh                            upstream  fails on relibc's Linux too: got INEXACT
@@ -162,11 +161,10 @@ functional/popen               1c.12 /bin/sh
 functional/setjmp              1c.10 sigprocmask (siglongjmp restores the mask)
 functional/socket              1e.3  sockets
 regression/daemon-failure      1d.1  fork
-regression/execle-env          1c.7  exec
+regression/execle-env          1c.12 /bin/sh as a program for execle (EXEC itself is in, 1c.7)
 regression/fflush-exit         1d.1  fork
 regression/raise-race          1c.10 raise (THREAD_KILL); hangs until then
 regression/sigaltstack         1c.10 sigaltstack
-regression/sigreturn           1c.9  signal handlers
 
 # feos as designed (docs/feos-abi-v2.md), in docs/toolchain.md.
 regression/rlimit-open-files   skip  setrlimit is accepted with no effect (section 9: no limit is enforced yet)
@@ -214,3 +212,35 @@ math/sqrtl@aarch64             upstream  fails the same on relibc's Linux AArch6
 math/tanhl@aarch64             upstream  fails the same on relibc's Linux AArch64
 math/tanl@aarch64              upstream  fails the same on relibc's Linux AArch64
 math/tgammal@aarch64           upstream  fails the same on relibc's Linux AArch64
+
+# AArch64 only: openlibm built by Debian's clang 14, which has no strict floating point on
+# AArch64 and folds away the operations that raise the exceptions these tests check
+# (log(0)'s FE_DIVBYZERO, ...); the values are right. x86_64's build is strict and passes
+# (ports/build-relibc-feos.sh); clang from track T4 (LLVM 23) can be strict on AArch64 too.
+math/cosh@aarch64              skip      exception flags lost to clang 14 on AArch64 (no strict FP)
+math/coshf@aarch64             skip      exception flags lost to clang 14 on AArch64 (no strict FP)
+math/exp2f@aarch64             skip      exception flags lost to clang 14 on AArch64 (no strict FP)
+math/expm1f@aarch64            skip      exception flags lost to clang 14 on AArch64 (no strict FP)
+math/fdim@aarch64              skip      exception flags lost to clang 14 on AArch64 (no strict FP)
+math/fdimf@aarch64             skip      exception flags lost to clang 14 on AArch64 (no strict FP)
+math/lgamma@aarch64            skip      exception flags lost to clang 14 on AArch64 (no strict FP)
+math/lgamma_r@aarch64          skip      exception flags lost to clang 14 on AArch64 (no strict FP)
+math/lgammaf@aarch64           skip      exception flags lost to clang 14 on AArch64 (no strict FP)
+math/lgammaf_r@aarch64         skip      exception flags lost to clang 14 on AArch64 (no strict FP)
+math/log@aarch64               skip      exception flags lost to clang 14 on AArch64 (no strict FP)
+math/log10@aarch64             skip      exception flags lost to clang 14 on AArch64 (no strict FP)
+math/log10f@aarch64            skip      exception flags lost to clang 14 on AArch64 (no strict FP)
+math/log2@aarch64              skip      exception flags lost to clang 14 on AArch64 (no strict FP)
+math/log2f@aarch64             skip      exception flags lost to clang 14 on AArch64 (no strict FP)
+math/logf@aarch64              skip      exception flags lost to clang 14 on AArch64 (no strict FP)
+math/y0@aarch64                skip      exception flags lost to clang 14 on AArch64 (no strict FP)
+math/y0f@aarch64               skip      exception flags lost to clang 14 on AArch64 (no strict FP)
+math/y1@aarch64                skip      exception flags lost to clang 14 on AArch64 (no strict FP)
+math/y1f@aarch64               skip      exception flags lost to clang 14 on AArch64 (no strict FP)
+
+# x86_64 only: QEMU's TCG x87 (the boot tests' CPU, 7.2) leaves fprem1's quotient bits
+# clear, which openlibm's assembly remquo reads; the same binary is right on hardware (the
+# Linux reference) and wrong under qemu-x86_64 too.
+math/remquo@x86_64             skip      QEMU TCG's x87 fprem1 gives no quotient bits
+math/remquof@x86_64            skip      QEMU TCG's x87 fprem1 gives no quotient bits
+math/remquol@x86_64            skip      QEMU TCG's x87 fprem1 gives no quotient bits

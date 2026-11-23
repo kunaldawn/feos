@@ -322,6 +322,24 @@ impl<const WORDS: usize> Frames<WORDS> {
         Ok(self.free_if_unused(frame))
     }
 
+    /// Drops a map reference only if it isn't the last: `Ok(true)` if it was dropped,
+    /// `Ok(false)`, and nothing changed, if it's the only one. A frame two address spaces
+    /// share after a fork owes one promise per extra reference, and the one that finds
+    /// itself last mustn't be told it shares: the look and the drop are one step, so two
+    /// spaces letting go at once can't both think the other still has it.
+    pub fn put_if_shared(&mut self, address: u64) -> Result<bool, CountError> {
+        let frame = self.allocated(address)?;
+        let meta = self.meta_mut(frame);
+        match meta.maps() {
+            0 => Err(CountError::NotCounted),
+            1 => Ok(false),
+            _ => {
+                meta.0 -= 1;
+                Ok(true)
+            }
+        }
+    }
+
     /// Pins a counted frame that's mapped, for a copy through it.
     pub fn pin(&mut self, address: u64) -> Result<(), CountError> {
         let frame = self.allocated(address)?;
@@ -521,6 +539,23 @@ mod tests {
         assert_eq!(again, frame);
         assert_eq!(allocator.meta(again).unwrap(), Meta::default());
         allocator.free(again, 1).unwrap();
+    }
+
+    #[test]
+    fn put_if_shared_never_drops_the_last() {
+        let mut allocator = ram(4);
+        let frame = allocator.alloc_counted().unwrap();
+        allocator.get(frame).unwrap();
+        assert_eq!(allocator.put_if_shared(frame), Ok(true));
+        assert_eq!(allocator.meta(frame).unwrap().maps(), 1);
+        // The last one stays, and the frame with it, for a plain put to drop.
+        assert_eq!(allocator.put_if_shared(frame), Ok(false));
+        assert_eq!(allocator.meta(frame).unwrap().maps(), 1);
+        assert_eq!(allocator.put(frame), Ok(true));
+        assert_eq!(allocator.put_if_shared(frame), Err(CountError::NotOurs));
+        let plain = allocator.alloc(1, 1).unwrap();
+        assert_eq!(allocator.put_if_shared(plain), Err(CountError::NotCounted));
+        allocator.free(plain, 1).unwrap();
     }
 
     #[test]

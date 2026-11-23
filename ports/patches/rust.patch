@@ -1,0 +1,1707 @@
+diff --git a/compiler/rustc_codegen_ssa/src/back/link.rs b/compiler/rustc_codegen_ssa/src/back/link.rs
+index 014e3ee8..d044fd74 100644
+--- a/compiler/rustc_codegen_ssa/src/back/link.rs
++++ b/compiler/rustc_codegen_ssa/src/back/link.rs
+@@ -189,6 +189,7 @@ fn walk_native_lib_search_dirs<R>(
+     if sess.target.cfg_abi == CfgAbi::Fortanix
+         || sess.target.os == Os::Linux
+         || sess.target.os == Os::Fuchsia
++        || sess.target.os == Os::Feos
+         || sess.target.is_like_aix
+         || sess.target.is_like_darwin
+             && (!sess.sanitizers().is_empty() || has_shared_llvm_apple_darwin)
+diff --git a/compiler/rustc_target/src/spec/base/feos.rs b/compiler/rustc_target/src/spec/base/feos.rs
+new file mode 100644
+index 00000000..302e0c70
+--- /dev/null
++++ b/compiler/rustc_target/src/spec/base/feos.rs
+@@ -0,0 +1,56 @@
++use crate::spec::{
++    Cc, LinkOutputKind, LinkerFlavor, Lld, Os, PanicStrategy, RelroLevel, StackProbeType,
++    TargetOptions, crt_objects, cvs,
++};
++
++/// feos: static executables over relibc, linked by rust-lld in feos's user layout
++/// (the image at 64 GiB, every `PT_LOAD` on pages of its own).
++pub(crate) fn opts() -> TargetOptions {
++    // (Given for `ld`; `link_args` adds them for its `rust-lld` twin too.)
++    let pre_link_args = TargetOptions::link_args(
++        LinkerFlavor::Gnu(Cc::No, Lld::No),
++        &[
++            "-static",
++            "--image-base=0x1000400000",
++            "-z",
++            "separate-loadable-segments",
++            "-z",
++            "max-page-size=4096",
++            "-z",
++            "noexecstack",
++        ],
++    );
++    // relibc's `libc.a` holds renamed copies of compiler-builtins' symbols, so the C
++    // parts of a program need a `libcompiler_builtins.a` of their own.
++    let late_link_args = TargetOptions::link_args(
++        LinkerFlavor::Gnu(Cc::No, Lld::No),
++        &["-lc", "-lm", "-lcompiler_builtins"],
++    );
++
++    TargetOptions {
++        os: Os::Feos,
++        families: cvs!["unix"],
++        linker_flavor: LinkerFlavor::Gnu(Cc::No, Lld::Yes),
++        linker: Some("rust-lld".into()),
++        pre_link_args,
++        late_link_args,
++        pre_link_objects: crt_objects::new(&[(
++            LinkOutputKind::StaticNoPicExe,
++            &["crt0.o", "crti.o"],
++        )]),
++        post_link_objects: crt_objects::new(&[(LinkOutputKind::StaticNoPicExe, &["crtn.o"])]),
++        // Static executables only until the kernel loads dynamic programs.
++        dynamic_linking: false,
++        position_independent_executables: false,
++        static_position_independent_executables: false,
++        crt_static_default: true,
++        crt_static_respected: true,
++        has_rpath: false,
++        has_thread_local: true,
++        relro_level: RelroLevel::Off,
++        panic_strategy: PanicStrategy::Unwind,
++        default_uwtable: true,
++        stack_probes: StackProbeType::Inline,
++        ..Default::default()
++    }
++}
+diff --git a/compiler/rustc_target/src/spec/base/mod.rs b/compiler/rustc_target/src/spec/base/mod.rs
+index 13f364f3..66b50a25 100644
+--- a/compiler/rustc_target/src/spec/base/mod.rs
++++ b/compiler/rustc_target/src/spec/base/mod.rs
+@@ -6,6 +6,7 @@
+ pub(crate) mod bpf;
+ pub(crate) mod cygwin;
+ pub(crate) mod dragonfly;
++pub(crate) mod feos;
+ pub(crate) mod freebsd;
+ pub(crate) mod fuchsia;
+ pub(crate) mod haiku;
+diff --git a/compiler/rustc_target/src/spec/mod.rs b/compiler/rustc_target/src/spec/mod.rs
+index 97c8db07..3aa50e0b 100644
+--- a/compiler/rustc_target/src/spec/mod.rs
++++ b/compiler/rustc_target/src/spec/mod.rs
+@@ -1581,6 +1581,9 @@ fn $module() {
+     ("aarch64-unknown-managarm-mlibc", aarch64_unknown_managarm_mlibc),
+     ("riscv64gc-unknown-managarm-mlibc", riscv64gc_unknown_managarm_mlibc),
+ 
++    ("aarch64-unknown-feos", aarch64_unknown_feos),
++    ("x86_64-unknown-feos", x86_64_unknown_feos),
++
+     ("i386-apple-ios", i386_apple_ios),
+     ("x86_64-apple-ios", x86_64_apple_ios),
+     ("aarch64-apple-ios", aarch64_apple_ios),
+@@ -1982,6 +1985,7 @@ pub enum Os {
+         Dragonfly = "dragonfly",
+         Emscripten = "emscripten",
+         EspIdf = "espidf",
++        Feos = "feos",
+         FreeBsd = "freebsd",
+         Fuchsia = "fuchsia",
+         Haiku = "haiku",
+@@ -3269,7 +3273,9 @@ macro_rules! check_matches {
+                 );
+             }
+             // The UEFI targets do not support dynamic linking but still require PIC (#101377).
+-            if self.relocation_model == RelocModel::Pic && self.os != Os::Uefi {
++            // So does x86_64 feos (static executables linked above 4 GiB, which code
++            // with 32-bit absolute addresses can't reach).
++            if self.relocation_model == RelocModel::Pic && !matches!(self.os, Os::Uefi | Os::Feos) {
+                 check!(
+                     self.dynamic_linking || self.position_independent_executables,
+                     "when the relocation model is `pic`, the target must support dynamic linking or use position-independent executables. \
+diff --git a/compiler/rustc_target/src/spec/targets/aarch64_unknown_feos.rs b/compiler/rustc_target/src/spec/targets/aarch64_unknown_feos.rs
+new file mode 100644
+index 00000000..c51d922c
+--- /dev/null
++++ b/compiler/rustc_target/src/spec/targets/aarch64_unknown_feos.rs
+@@ -0,0 +1,29 @@
++use crate::spec::{
++    Arch, Cc, FramePointer, LinkerFlavor, Lld, RelocModel, Target, TargetMetadata, base,
++};
++
++pub(crate) fn target() -> Target {
++    let mut base = base::feos::opts();
++    base.features = "+v8a,+neon,+fp-armv8".into();
++    base.max_atomic_width = Some(128);
++    base.frame_pointer = FramePointer::NonLeaf;
++    // ADRP reaches the image at 64 GiB from static code.
++    base.relocation_model = RelocModel::Static;
++    base.add_pre_link_args(LinkerFlavor::Gnu(Cc::No, Lld::No), &["--fix-cortex-a53-843419"]);
++
++    Target {
++        llvm_target: "aarch64-unknown-feos".into(),
++        metadata: TargetMetadata {
++            description: Some("feos on AArch64, static executables (relibc)".into()),
++            tier: Some(3),
++            host_tools: Some(false),
++            std: Some(true),
++        },
++        pointer_width: 64,
++        data_layout:
++            "e-m:e-p270:32:32-p271:32:32-p272:64:64-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32"
++                .into(),
++        arch: Arch::AArch64,
++        options: base,
++    }
++}
+diff --git a/compiler/rustc_target/src/spec/targets/x86_64_unknown_feos.rs b/compiler/rustc_target/src/spec/targets/x86_64_unknown_feos.rs
+new file mode 100644
+index 00000000..4b48e1ad
+--- /dev/null
++++ b/compiler/rustc_target/src/spec/targets/x86_64_unknown_feos.rs
+@@ -0,0 +1,28 @@
++use crate::spec::{Arch, RelocModel, Target, TargetMetadata, base};
++
++pub(crate) fn target() -> Target {
++    let mut base = base::feos::opts();
++    base.cpu = "x86-64".into();
++    // feos keeps CR4.OSXSAVE clear and saves FP state with fxsave.
++    base.features = "+fxsr,+sse,+sse2,-avx,-avx2,-avx512f,-xsave".into();
++    base.plt_by_default = false;
++    base.max_atomic_width = Some(64);
++    // Programs are linked at 64 GiB, beyond the small code model's absolute
++    // addresses: the code is position independent, the executable is not.
++    base.relocation_model = RelocModel::Pic;
++
++    Target {
++        llvm_target: "x86_64-unknown-feos".into(),
++        metadata: TargetMetadata {
++            description: Some("feos on x86_64, static executables (relibc)".into()),
++            tier: Some(3),
++            host_tools: Some(false),
++            std: Some(true),
++        },
++        pointer_width: 64,
++        data_layout:
++            "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128".into(),
++        arch: Arch::X86_64,
++        options: base,
++    }
++}
+diff --git a/library/Cargo.lock b/library/Cargo.lock
+index d029173e..b7812cba 100644
+--- a/library/Cargo.lock
++++ b/library/Cargo.lock
+@@ -147,8 +147,6 @@ dependencies = [
+ [[package]]
+ name = "libc"
+ version = "0.2.189"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+ dependencies = [
+  "rustc-std-workspace-core",
+ ]
+diff --git a/library/Cargo.toml b/library/Cargo.toml
+index 788c990c..d77dff3d 100644
+--- a/library/Cargo.toml
++++ b/library/Cargo.toml
+@@ -88,3 +88,6 @@ rustc-std-workspace-std = { path = 'rustc-std-workspace-std' }
+ 
+ # See comments in `library/windows-sys/Cargo.toml` for why this is patched
+ windows-sys = { path = 'windows-sys' }
++
++# feos: the libc crate with its `feos` module (ports/src/libc, the same 0.2.189).
++libc = { path = '../../libc' }
+diff --git a/library/std/build.rs b/library/std/build.rs
+index 98856b58..0f640424 100644
+--- a/library/std/build.rs
++++ b/library/std/build.rs
+@@ -38,6 +38,7 @@ fn main() {
+         || target_os == "trusty"
+         || target_os == "l4re"
+         || target_os == "redox"
++        || target_os == "feos"
+         || target_os == "haiku"
+         || target_os == "vxworks"
+         || target_arch == "wasm32"
+diff --git a/library/std/src/os/feos/fs.rs b/library/std/src/os/feos/fs.rs
+new file mode 100644
+index 00000000..dba7b918
+--- /dev/null
++++ b/library/std/src/os/feos/fs.rs
+@@ -0,0 +1,398 @@
++#![stable(feature = "metadata_ext", since = "1.1.0")]
++
++use crate::fs::Metadata;
++#[allow(deprecated)]
++use crate::os::feos::raw;
++use crate::sys::AsInner;
++
++/// OS-specific extensions to [`fs::Metadata`].
++///
++/// [`fs::Metadata`]: crate::fs::Metadata
++#[stable(feature = "metadata_ext", since = "1.1.0")]
++pub trait MetadataExt {
++    /// Gain a reference to the underlying `stat` structure which contains
++    /// the raw information returned by the OS.
++    ///
++    /// The contents of the returned [`stat`] are **not** consistent across
++    /// Unix platforms. The `os::unix::fs::MetadataExt` trait contains the
++    /// cross-Unix abstractions contained within the raw stat.
++    ///
++    /// [`stat`]: crate::os::feos::raw::stat
++    ///
++    /// # Examples
++    ///
++    #[cfg_attr(target_os = "feos", doc = "```no_run")]
++    #[cfg_attr(not(target_os = "feos"), doc = "```ignore (needs feos)")]
++    /// use std::fs;
++    /// use std::io;
++    /// use std::os::feos::fs::MetadataExt;
++    ///
++    /// fn main() -> io::Result<()> {
++    ///     let meta = fs::metadata("some_file")?;
++    ///     let stat = meta.as_raw_stat();
++    ///     Ok(())
++    /// }
++    /// ```
++    #[stable(feature = "metadata_ext", since = "1.1.0")]
++    #[deprecated(
++        since = "1.8.0",
++        note = "deprecated in favor of the accessor \
++                methods of this trait"
++    )]
++    #[allow(deprecated)]
++    fn as_raw_stat(&self) -> &raw::stat;
++
++    /// Returns the device ID on which this file resides.
++    ///
++    /// # Examples
++    ///
++    #[cfg_attr(target_os = "feos", doc = "```no_run")]
++    #[cfg_attr(not(target_os = "feos"), doc = "```ignore (needs feos)")]
++    /// use std::fs;
++    /// use std::io;
++    /// use std::os::feos::fs::MetadataExt;
++    ///
++    /// fn main() -> io::Result<()> {
++    ///     let meta = fs::metadata("some_file")?;
++    ///     println!("{}", meta.st_dev());
++    ///     Ok(())
++    /// }
++    /// ```
++    #[stable(feature = "metadata_ext2", since = "1.8.0")]
++    fn st_dev(&self) -> u64;
++    /// Returns the inode number.
++    ///
++    /// # Examples
++    ///
++    #[cfg_attr(target_os = "feos", doc = "```no_run")]
++    #[cfg_attr(not(target_os = "feos"), doc = "```ignore (needs feos)")]
++    /// use std::fs;
++    /// use std::io;
++    /// use std::os::feos::fs::MetadataExt;
++    ///
++    /// fn main() -> io::Result<()> {
++    ///     let meta = fs::metadata("some_file")?;
++    ///     println!("{}", meta.st_ino());
++    ///     Ok(())
++    /// }
++    /// ```
++    #[stable(feature = "metadata_ext2", since = "1.8.0")]
++    fn st_ino(&self) -> u64;
++    /// Returns the file type and mode.
++    ///
++    /// # Examples
++    ///
++    #[cfg_attr(target_os = "feos", doc = "```no_run")]
++    #[cfg_attr(not(target_os = "feos"), doc = "```ignore (needs feos)")]
++    /// use std::fs;
++    /// use std::io;
++    /// use std::os::feos::fs::MetadataExt;
++    ///
++    /// fn main() -> io::Result<()> {
++    ///     let meta = fs::metadata("some_file")?;
++    ///     println!("{}", meta.st_mode());
++    ///     Ok(())
++    /// }
++    /// ```
++    #[stable(feature = "metadata_ext2", since = "1.8.0")]
++    fn st_mode(&self) -> u32;
++    /// Returns the number of hard links to file.
++    ///
++    /// # Examples
++    ///
++    #[cfg_attr(target_os = "feos", doc = "```no_run")]
++    #[cfg_attr(not(target_os = "feos"), doc = "```ignore (needs feos)")]
++    /// use std::fs;
++    /// use std::io;
++    /// use std::os::feos::fs::MetadataExt;
++    ///
++    /// fn main() -> io::Result<()> {
++    ///     let meta = fs::metadata("some_file")?;
++    ///     println!("{}", meta.st_nlink());
++    ///     Ok(())
++    /// }
++    /// ```
++    #[stable(feature = "metadata_ext2", since = "1.8.0")]
++    fn st_nlink(&self) -> u64;
++    /// Returns the user ID of the file owner.
++    ///
++    /// # Examples
++    ///
++    #[cfg_attr(target_os = "feos", doc = "```no_run")]
++    #[cfg_attr(not(target_os = "feos"), doc = "```ignore (needs feos)")]
++    /// use std::fs;
++    /// use std::io;
++    /// use std::os::feos::fs::MetadataExt;
++    ///
++    /// fn main() -> io::Result<()> {
++    ///     let meta = fs::metadata("some_file")?;
++    ///     println!("{}", meta.st_uid());
++    ///     Ok(())
++    /// }
++    /// ```
++    #[stable(feature = "metadata_ext2", since = "1.8.0")]
++    fn st_uid(&self) -> u32;
++    /// Returns the group ID of the file owner.
++    ///
++    /// # Examples
++    ///
++    #[cfg_attr(target_os = "feos", doc = "```no_run")]
++    #[cfg_attr(not(target_os = "feos"), doc = "```ignore (needs feos)")]
++    /// use std::fs;
++    /// use std::io;
++    /// use std::os::feos::fs::MetadataExt;
++    ///
++    /// fn main() -> io::Result<()> {
++    ///     let meta = fs::metadata("some_file")?;
++    ///     println!("{}", meta.st_gid());
++    ///     Ok(())
++    /// }
++    /// ```
++    #[stable(feature = "metadata_ext2", since = "1.8.0")]
++    fn st_gid(&self) -> u32;
++    /// Returns the device ID that this file represents. Only relevant for special file.
++    ///
++    /// # Examples
++    ///
++    #[cfg_attr(target_os = "feos", doc = "```no_run")]
++    #[cfg_attr(not(target_os = "feos"), doc = "```ignore (needs feos)")]
++    /// use std::fs;
++    /// use std::io;
++    /// use std::os::feos::fs::MetadataExt;
++    ///
++    /// fn main() -> io::Result<()> {
++    ///     let meta = fs::metadata("some_file")?;
++    ///     println!("{}", meta.st_rdev());
++    ///     Ok(())
++    /// }
++    /// ```
++    #[stable(feature = "metadata_ext2", since = "1.8.0")]
++    fn st_rdev(&self) -> u64;
++    /// Returns the size of the file (if it is a regular file or a symbolic link) in bytes.
++    ///
++    /// The size of a symbolic link is the length of the pathname it contains,
++    /// without a terminating null byte.
++    ///
++    /// # Examples
++    ///
++    #[cfg_attr(target_os = "feos", doc = "```no_run")]
++    #[cfg_attr(not(target_os = "feos"), doc = "```ignore (needs feos)")]
++    /// use std::fs;
++    /// use std::io;
++    /// use std::os::feos::fs::MetadataExt;
++    ///
++    /// fn main() -> io::Result<()> {
++    ///     let meta = fs::metadata("some_file")?;
++    ///     println!("{}", meta.st_size());
++    ///     Ok(())
++    /// }
++    /// ```
++    #[stable(feature = "metadata_ext2", since = "1.8.0")]
++    fn st_size(&self) -> u64;
++    /// Returns the last access time of the file, in seconds since Unix Epoch.
++    ///
++    /// # Examples
++    ///
++    #[cfg_attr(target_os = "feos", doc = "```no_run")]
++    #[cfg_attr(not(target_os = "feos"), doc = "```ignore (needs feos)")]
++    /// use std::fs;
++    /// use std::io;
++    /// use std::os::feos::fs::MetadataExt;
++    ///
++    /// fn main() -> io::Result<()> {
++    ///     let meta = fs::metadata("some_file")?;
++    ///     println!("{}", meta.st_atime());
++    ///     Ok(())
++    /// }
++    /// ```
++    #[stable(feature = "metadata_ext2", since = "1.8.0")]
++    fn st_atime(&self) -> i64;
++    /// Returns the last access time of the file, in nanoseconds since [`st_atime`].
++    ///
++    /// [`st_atime`]: Self::st_atime
++    ///
++    /// # Examples
++    ///
++    #[cfg_attr(target_os = "feos", doc = "```no_run")]
++    #[cfg_attr(not(target_os = "feos"), doc = "```ignore (needs feos)")]
++    /// use std::fs;
++    /// use std::io;
++    /// use std::os::feos::fs::MetadataExt;
++    ///
++    /// fn main() -> io::Result<()> {
++    ///     let meta = fs::metadata("some_file")?;
++    ///     println!("{}", meta.st_atime_nsec());
++    ///     Ok(())
++    /// }
++    /// ```
++    #[stable(feature = "metadata_ext2", since = "1.8.0")]
++    fn st_atime_nsec(&self) -> i64;
++    /// Returns the last modification time of the file, in seconds since Unix Epoch.
++    ///
++    /// # Examples
++    ///
++    #[cfg_attr(target_os = "feos", doc = "```no_run")]
++    #[cfg_attr(not(target_os = "feos"), doc = "```ignore (needs feos)")]
++    /// use std::fs;
++    /// use std::io;
++    /// use std::os::feos::fs::MetadataExt;
++    ///
++    /// fn main() -> io::Result<()> {
++    ///     let meta = fs::metadata("some_file")?;
++    ///     println!("{}", meta.st_mtime());
++    ///     Ok(())
++    /// }
++    /// ```
++    #[stable(feature = "metadata_ext2", since = "1.8.0")]
++    fn st_mtime(&self) -> i64;
++    /// Returns the last modification time of the file, in nanoseconds since [`st_mtime`].
++    ///
++    /// [`st_mtime`]: Self::st_mtime
++    ///
++    /// # Examples
++    ///
++    #[cfg_attr(target_os = "feos", doc = "```no_run")]
++    #[cfg_attr(not(target_os = "feos"), doc = "```ignore (needs feos)")]
++    /// use std::fs;
++    /// use std::io;
++    /// use std::os::feos::fs::MetadataExt;
++    ///
++    /// fn main() -> io::Result<()> {
++    ///     let meta = fs::metadata("some_file")?;
++    ///     println!("{}", meta.st_mtime_nsec());
++    ///     Ok(())
++    /// }
++    /// ```
++    #[stable(feature = "metadata_ext2", since = "1.8.0")]
++    fn st_mtime_nsec(&self) -> i64;
++    /// Returns the last status change time of the file, in seconds since Unix Epoch.
++    ///
++    /// # Examples
++    ///
++    #[cfg_attr(target_os = "feos", doc = "```no_run")]
++    #[cfg_attr(not(target_os = "feos"), doc = "```ignore (needs feos)")]
++    /// use std::fs;
++    /// use std::io;
++    /// use std::os::feos::fs::MetadataExt;
++    ///
++    /// fn main() -> io::Result<()> {
++    ///     let meta = fs::metadata("some_file")?;
++    ///     println!("{}", meta.st_ctime());
++    ///     Ok(())
++    /// }
++    /// ```
++    #[stable(feature = "metadata_ext2", since = "1.8.0")]
++    fn st_ctime(&self) -> i64;
++    /// Returns the last status change time of the file, in nanoseconds since [`st_ctime`].
++    ///
++    /// [`st_ctime`]: Self::st_ctime
++    ///
++    /// # Examples
++    ///
++    #[cfg_attr(target_os = "feos", doc = "```no_run")]
++    #[cfg_attr(not(target_os = "feos"), doc = "```ignore (needs feos)")]
++    /// use std::fs;
++    /// use std::io;
++    /// use std::os::feos::fs::MetadataExt;
++    ///
++    /// fn main() -> io::Result<()> {
++    ///     let meta = fs::metadata("some_file")?;
++    ///     println!("{}", meta.st_ctime_nsec());
++    ///     Ok(())
++    /// }
++    /// ```
++    #[stable(feature = "metadata_ext2", since = "1.8.0")]
++    fn st_ctime_nsec(&self) -> i64;
++    /// Returns the "preferred" block size for efficient filesystem I/O.
++    ///
++    /// # Examples
++    ///
++    #[cfg_attr(target_os = "feos", doc = "```no_run")]
++    #[cfg_attr(not(target_os = "feos"), doc = "```ignore (needs feos)")]
++    /// use std::fs;
++    /// use std::io;
++    /// use std::os::feos::fs::MetadataExt;
++    ///
++    /// fn main() -> io::Result<()> {
++    ///     let meta = fs::metadata("some_file")?;
++    ///     println!("{}", meta.st_blksize());
++    ///     Ok(())
++    /// }
++    /// ```
++    #[stable(feature = "metadata_ext2", since = "1.8.0")]
++    fn st_blksize(&self) -> u64;
++    /// Returns the number of blocks allocated to the file, 512-byte units.
++    ///
++    /// # Examples
++    ///
++    #[cfg_attr(target_os = "feos", doc = "```no_run")]
++    #[cfg_attr(not(target_os = "feos"), doc = "```ignore (needs feos)")]
++    /// use std::fs;
++    /// use std::io;
++    /// use std::os::feos::fs::MetadataExt;
++    ///
++    /// fn main() -> io::Result<()> {
++    ///     let meta = fs::metadata("some_file")?;
++    ///     println!("{}", meta.st_blocks());
++    ///     Ok(())
++    /// }
++    /// ```
++    #[stable(feature = "metadata_ext2", since = "1.8.0")]
++    fn st_blocks(&self) -> u64;
++}
++
++#[stable(feature = "metadata_ext", since = "1.1.0")]
++impl MetadataExt for Metadata {
++    #[allow(deprecated)]
++    fn as_raw_stat(&self) -> &raw::stat {
++        unsafe { &*(self.as_inner().as_inner() as *const libc::stat as *const raw::stat) }
++    }
++    fn st_dev(&self) -> u64 {
++        self.as_inner().as_inner().st_dev as u64
++    }
++    fn st_ino(&self) -> u64 {
++        self.as_inner().as_inner().st_ino as u64
++    }
++    fn st_mode(&self) -> u32 {
++        self.as_inner().as_inner().st_mode as u32
++    }
++    fn st_nlink(&self) -> u64 {
++        self.as_inner().as_inner().st_nlink as u64
++    }
++    fn st_uid(&self) -> u32 {
++        self.as_inner().as_inner().st_uid as u32
++    }
++    fn st_gid(&self) -> u32 {
++        self.as_inner().as_inner().st_gid as u32
++    }
++    fn st_rdev(&self) -> u64 {
++        self.as_inner().as_inner().st_rdev as u64
++    }
++    fn st_size(&self) -> u64 {
++        self.as_inner().as_inner().st_size as u64
++    }
++    fn st_atime(&self) -> i64 {
++        self.as_inner().as_inner().st_atime as i64
++    }
++    fn st_atime_nsec(&self) -> i64 {
++        self.as_inner().as_inner().st_atime_nsec as i64
++    }
++    fn st_mtime(&self) -> i64 {
++        self.as_inner().as_inner().st_mtime as i64
++    }
++    fn st_mtime_nsec(&self) -> i64 {
++        self.as_inner().as_inner().st_mtime_nsec as i64
++    }
++    fn st_ctime(&self) -> i64 {
++        self.as_inner().as_inner().st_ctime as i64
++    }
++    fn st_ctime_nsec(&self) -> i64 {
++        self.as_inner().as_inner().st_ctime_nsec as i64
++    }
++    fn st_blksize(&self) -> u64 {
++        self.as_inner().as_inner().st_blksize as u64
++    }
++    fn st_blocks(&self) -> u64 {
++        self.as_inner().as_inner().st_blocks as u64
++    }
++}
+diff --git a/library/std/src/os/feos/mod.rs b/library/std/src/os/feos/mod.rs
+new file mode 100644
+index 00000000..58f70e7b
+--- /dev/null
++++ b/library/std/src/os/feos/mod.rs
+@@ -0,0 +1,6 @@
++//! feos-specific definitions: <https://github.com/kunaldawn/feos>, with relibc
++
++#![stable(feature = "raw_ext", since = "1.1.0")]
++
++pub mod fs;
++pub mod raw;
+diff --git a/library/std/src/os/feos/raw.rs b/library/std/src/os/feos/raw.rs
+new file mode 100644
+index 00000000..2fbf7550
+--- /dev/null
++++ b/library/std/src/os/feos/raw.rs
+@@ -0,0 +1,78 @@
++//! feos-specific raw type definitions (relibc's, `docs/feos-abi-v2.md` section 5)
++
++#![stable(feature = "raw_ext", since = "1.1.0")]
++#![deprecated(
++    since = "1.8.0",
++    note = "these type aliases are no longer supported by \
++            the standard library, the `libc` crate on \
++            crates.io should be used instead for the correct \
++            definitions"
++)]
++#![allow(deprecated)]
++
++use crate::os::raw::{c_char, c_long, c_longlong, c_uint, c_ulong, c_ulonglong, c_void};
++
++#[stable(feature = "raw_ext", since = "1.1.0")]
++pub type dev_t = c_ulonglong;
++#[stable(feature = "raw_ext", since = "1.1.0")]
++pub type gid_t = c_uint;
++#[stable(feature = "raw_ext", since = "1.1.0")]
++pub type mode_t = c_uint;
++#[stable(feature = "raw_ext", since = "1.1.0")]
++pub type uid_t = c_uint;
++
++#[stable(feature = "pthread_t", since = "1.8.0")]
++pub type pthread_t = *mut c_void;
++
++#[stable(feature = "raw_ext", since = "1.1.0")]
++pub type blkcnt_t = c_longlong;
++#[stable(feature = "raw_ext", since = "1.1.0")]
++pub type blksize_t = c_long;
++#[stable(feature = "raw_ext", since = "1.1.0")]
++pub type ino_t = c_ulonglong;
++#[stable(feature = "raw_ext", since = "1.1.0")]
++pub type nlink_t = c_ulong;
++#[stable(feature = "raw_ext", since = "1.1.0")]
++pub type off_t = c_longlong;
++#[stable(feature = "raw_ext", since = "1.1.0")]
++pub type time_t = c_longlong;
++
++#[repr(C)]
++#[derive(Clone)]
++#[stable(feature = "raw_ext", since = "1.1.0")]
++pub struct stat {
++    #[stable(feature = "raw_ext", since = "1.1.0")]
++    pub st_dev: dev_t,
++    #[stable(feature = "raw_ext", since = "1.1.0")]
++    pub st_ino: ino_t,
++    #[stable(feature = "raw_ext", since = "1.1.0")]
++    pub st_nlink: nlink_t,
++    #[stable(feature = "raw_ext", since = "1.1.0")]
++    pub st_mode: mode_t,
++    #[stable(feature = "raw_ext", since = "1.1.0")]
++    pub st_uid: uid_t,
++    #[stable(feature = "raw_ext", since = "1.1.0")]
++    pub st_gid: gid_t,
++    #[stable(feature = "raw_ext", since = "1.1.0")]
++    pub st_rdev: dev_t,
++    #[stable(feature = "raw_ext", since = "1.1.0")]
++    pub st_size: off_t,
++    #[stable(feature = "raw_ext", since = "1.1.0")]
++    pub st_blksize: blksize_t,
++    #[stable(feature = "raw_ext", since = "1.1.0")]
++    pub st_blocks: blkcnt_t,
++    #[stable(feature = "raw_ext", since = "1.1.0")]
++    pub st_atime: time_t,
++    #[stable(feature = "raw_ext", since = "1.1.0")]
++    pub st_atime_nsec: c_long,
++    #[stable(feature = "raw_ext", since = "1.1.0")]
++    pub st_mtime: time_t,
++    #[stable(feature = "raw_ext", since = "1.1.0")]
++    pub st_mtime_nsec: c_long,
++    #[stable(feature = "raw_ext", since = "1.1.0")]
++    pub st_ctime: time_t,
++    #[stable(feature = "raw_ext", since = "1.1.0")]
++    pub st_ctime_nsec: c_long,
++    #[stable(feature = "raw_ext", since = "1.1.0")]
++    pub _pad: [c_char; 24],
++}
+diff --git a/library/std/src/os/mod.rs b/library/std/src/os/mod.rs
+index 8068f92b..db642531 100644
+--- a/library/std/src/os/mod.rs
++++ b/library/std/src/os/mod.rs
+@@ -99,6 +99,8 @@ pub mod windows {}
+ pub mod fortanix_sgx;
+ #[cfg(target_os = "freebsd")]
+ pub mod freebsd;
++#[cfg(target_os = "feos")]
++pub mod feos;
+ #[cfg(target_os = "fuchsia")]
+ pub mod fuchsia;
+ #[cfg(target_os = "haiku")]
+diff --git a/library/std/src/os/unix/mod.rs b/library/std/src/os/unix/mod.rs
+index c994174b..8d59e219 100644
+--- a/library/std/src/os/unix/mod.rs
++++ b/library/std/src/os/unix/mod.rs
+@@ -54,6 +54,8 @@ mod platform {
+     pub use crate::os::espidf::*;
+     #[cfg(target_os = "freebsd")]
+     pub use crate::os::freebsd::*;
++    #[cfg(target_os = "feos")]
++    pub use crate::os::feos::*;
+     #[cfg(target_os = "fuchsia")]
+     pub use crate::os::fuchsia::*;
+     #[cfg(target_os = "haiku")]
+diff --git a/library/std/src/sys/args/unix.rs b/library/std/src/sys/args/unix.rs
+index 197931d8..8ab3f534 100644
+--- a/library/std/src/sys/args/unix.rs
++++ b/library/std/src/sys/args/unix.rs
+@@ -77,6 +77,7 @@ pub fn args() -> Args {
+     target_os = "l4re",
+     target_os = "fuchsia",
+     target_os = "redox",
++    target_os = "feos",
+     target_os = "vxworks",
+     target_os = "horizon",
+     target_os = "aix",
+diff --git a/library/std/src/sys/env_consts.rs b/library/std/src/sys/env_consts.rs
+index b14160cf..d7342060 100644
+--- a/library/std/src/sys/env_consts.rs
++++ b/library/std/src/sys/env_consts.rs
+@@ -92,6 +92,17 @@ pub mod os {
+     pub const EXE_EXTENSION: &str = "";
+ }
+ 
++#[cfg(target_os = "feos")]
++pub mod os {
++    pub const FAMILY: &str = "unix";
++    pub const OS: &str = "feos";
++    pub const DLL_PREFIX: &str = "lib";
++    pub const DLL_SUFFIX: &str = ".so";
++    pub const DLL_EXTENSION: &str = "so";
++    pub const EXE_SUFFIX: &str = "";
++    pub const EXE_EXTENSION: &str = "";
++}
++
+ #[cfg(target_os = "fuchsia")]
+ pub mod os {
+     pub const FAMILY: &str = "unix";
+diff --git a/library/std/src/sys/fd/unix.rs b/library/std/src/sys/fd/unix.rs
+index d35a001b..c736f1f1 100644
+--- a/library/std/src/sys/fd/unix.rs
++++ b/library/std/src/sys/fd/unix.rs
+@@ -245,6 +245,7 @@ pub fn read_buf_at(&self, mut cursor: BorrowedCursor<'_, u8>, offset: u64) -> io
+         target_os = "hurd",
+         target_os = "illumos",
+         target_os = "linux",
++        target_os = "feos",
+         target_os = "netbsd",
+         target_os = "openbsd", // OpenBSD 2.7
+         all(target_os = "macos", target_arch = "aarch64"),
+@@ -271,6 +272,7 @@ pub fn read_vectored_at(&self, bufs: &mut [IoSliceMut<'_>], offset: u64) -> io::
+         target_os = "hurd",
+         target_os = "illumos",
+         target_os = "linux",
++        target_os = "feos",
+         target_os = "netbsd",
+         target_os = "openbsd",
+         target_vendor = "apple",
+@@ -441,6 +443,7 @@ pub fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
+         target_os = "hurd",
+         target_os = "illumos",
+         target_os = "linux",
++        target_os = "feos",
+         target_os = "netbsd",
+         target_os = "openbsd", // OpenBSD 2.7
+         all(target_os = "macos", target_arch = "aarch64"),
+@@ -467,6 +470,7 @@ pub fn write_vectored_at(&self, bufs: &[IoSlice<'_>], offset: u64) -> io::Result
+         target_os = "hurd",
+         target_os = "illumos",
+         target_os = "linux",
++        target_os = "feos",
+         target_os = "netbsd",
+         target_os = "openbsd",
+         target_vendor = "apple",
+@@ -578,6 +582,7 @@ fn pwritev(
+         target_os = "cygwin",
+         target_os = "haiku",
+         target_os = "redox",
++        target_os = "feos",
+         target_os = "vxworks",
+         target_os = "nto",
+         target_os = "qnx",
+@@ -603,6 +608,7 @@ pub fn set_cloexec(&self) -> io::Result<()> {
+         target_os = "cygwin",
+         target_os = "haiku",
+         target_os = "redox",
++        target_os = "feos",
+         target_os = "vxworks",
+         target_os = "nto",
+         target_os = "qnx",
+diff --git a/library/std/src/sys/fs/unix.rs b/library/std/src/sys/fs/unix.rs
+index cdd1ef61..3ed6d3b9 100644
+--- a/library/std/src/sys/fs/unix.rs
++++ b/library/std/src/sys/fs/unix.rs
+@@ -14,10 +14,16 @@
+     target_os = "fuchsia",
+     target_os = "hurd",
+     target_os = "illumos",
++    target_os = "feos",
+     target_vendor = "apple",
+ ))]
+ use libc::dirfd;
+-#[cfg(any(target_os = "fuchsia", target_os = "illumos", target_vendor = "apple"))]
++#[cfg(any(
++    target_os = "fuchsia",
++    target_os = "illumos",
++    target_os = "feos",
++    target_vendor = "apple"
++))]
+ use libc::fstatat as fstatat64;
+ #[cfg(any(all(target_os = "linux", not(target_env = "musl")), target_os = "hurd"))]
+ use libc::fstatat64;
+@@ -315,7 +321,12 @@ fn get_mode(fd: c_int) -> Option<(bool, bool)> {
+ }
+ 
+ fn get_path_from_fd(fd: c_int) -> Option<PathBuf> {
+-    #[cfg(any(target_os = "linux", target_os = "illumos", target_os = "solaris"))]
++    #[cfg(any(
++        target_os = "linux",
++        target_os = "illumos",
++        target_os = "solaris",
++        target_os = "feos"
++    ))]
+     fn get_path(fd: c_int) -> Option<PathBuf> {
+         let mut p = PathBuf::from("/proc/self/fd");
+         p.push(&fd.to_string());
+@@ -382,6 +393,7 @@ fn get_path(fd: c_int) -> Option<PathBuf> {
+         target_os = "netbsd",
+         target_os = "illumos",
+         target_os = "solaris",
++        target_os = "feos",
+         target_vendor = "apple",
+     )))]
+     fn get_path(_fd: c_int) -> Option<PathBuf> {
+@@ -1021,6 +1033,7 @@ pub fn file_name(&self) -> OsString {
+             target_os = "fuchsia",
+             target_os = "hurd",
+             target_os = "illumos",
++            target_os = "feos",
+             target_vendor = "apple",
+         ),
+         not(miri) // no dirfd on Miri
+@@ -1052,6 +1065,7 @@ pub fn metadata(&self) -> io::Result<FileAttr> {
+             target_os = "fuchsia",
+             target_os = "hurd",
+             target_os = "illumos",
++            target_os = "feos",
+             target_vendor = "apple",
+         )),
+         miri // no dirfd on Miri
+@@ -1295,6 +1309,7 @@ unsafe fn os_datasync(fd: c_int) -> c_int {
+             target_os = "qnx",
+             target_os = "hurd",
+             target_os = "l4re",
++            target_os = "feos",
+         ))]
+         unsafe fn os_datasync(fd: c_int) -> c_int {
+             libc::fdatasync(fd)
+@@ -1311,6 +1326,7 @@ unsafe fn os_datasync(fd: c_int) -> c_int {
+             target_os = "qnx",
+             target_os = "hurd",
+             target_os = "l4re",
++            target_os = "feos",
+             target_vendor = "apple",
+         )))]
+         unsafe fn os_datasync(fd: c_int) -> c_int {
+@@ -1331,6 +1347,7 @@ pub fn lock(&self) -> io::Result<()> {
+                 target_os = "illumos",
+                 target_os = "aix",
+                 target_os = "android",
++                target_os = "feos",
+                 target_vendor = "apple",
+             ) => {
+                 cvt(unsafe { libc::flock(self.as_raw_fd(), libc::LOCK_EX) })?;
+@@ -1355,6 +1372,7 @@ pub fn lock_shared(&self) -> io::Result<()> {
+                 target_os = "illumos",
+                 target_os = "aix",
+                 target_os = "android",
++                target_os = "feos",
+                 target_vendor = "apple",
+             ) => {
+                 cvt(unsafe { libc::flock(self.as_raw_fd(), libc::LOCK_SH) })?;
+@@ -1379,6 +1397,7 @@ pub fn try_lock(&self) -> Result<(), TryLockError> {
+                 target_os = "illumos",
+                 target_os = "aix",
+                 target_os = "android",
++                target_os = "feos",
+                 target_vendor = "apple",
+             ) => {
+                 let result = cvt(unsafe { libc::flock(self.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) });
+@@ -1414,6 +1433,7 @@ pub fn try_lock_shared(&self) -> Result<(), TryLockError> {
+                 target_os = "illumos",
+                 target_os = "aix",
+                 target_os = "android",
++                target_os = "feos",
+                 target_vendor = "apple",
+             ) => {
+                 let result = cvt(unsafe { libc::flock(self.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) });
+@@ -1449,6 +1469,7 @@ pub fn unlock(&self) -> io::Result<()> {
+                 target_os = "illumos",
+                 target_os = "aix",
+                 target_os = "android",
++                target_os = "feos",
+                 target_vendor = "apple",
+             ) => {
+                 cvt(unsafe { libc::flock(self.as_raw_fd(), libc::LOCK_UN) })?;
+diff --git a/library/std/src/sys/io/error/unix.rs b/library/std/src/sys/io/error/unix.rs
+index 5c51c570..465a95ff 100644
+--- a/library/std/src/sys/io/error/unix.rs
++++ b/library/std/src/sys/io/error/unix.rs
+@@ -18,6 +18,7 @@
+             target_os = "l4re",
+             target_os = "hurd",
+             target_os = "teeos",
++            target_os = "feos",
+         ),
+         link_name = "__errno_location"
+     )]
+diff --git a/library/std/src/sys/pal/unix/mod.rs b/library/std/src/sys/pal/unix/mod.rs
+index 2d624202..f25bb71d 100644
+--- a/library/std/src/sys/pal/unix/mod.rs
++++ b/library/std/src/sys/pal/unix/mod.rs
+@@ -97,9 +97,10 @@ unsafe fn sanitize_standard_fds() {
+             while libc::poll(pfds.as_mut_ptr(), 3, 0) == -1 {
+                 match errno() {
+                     libc::EINTR => continue,
+-                    #[cfg(target_vendor = "unikraft")]
++                    #[cfg(any(target_vendor = "unikraft", target_os = "feos"))]
+                     libc::ENOSYS => {
+-                        // Not all configurations of Unikraft enable `LIBPOSIX_EVENT`.
++                        // Not all configurations of Unikraft enable `LIBPOSIX_EVENT`;
++                        // feos kernels before stage 1c.11 have no `POLL`.
+                         break 'poll;
+                     }
+                     libc::EINVAL | libc::EAGAIN | libc::ENOMEM => {
+diff --git a/library/std/src/sys/pal/unix/stack_overflow.rs b/library/std/src/sys/pal/unix/stack_overflow.rs
+index d6d03e0d..fc583c47 100644
+--- a/library/std/src/sys/pal/unix/stack_overflow.rs
++++ b/library/std/src/sys/pal/unix/stack_overflow.rs
+@@ -36,6 +36,7 @@ fn drop(&mut self) {
+         target_os = "openbsd",
+         target_os = "solaris",
+         target_os = "illumos",
++        target_os = "feos",
+     ),
+ ))]
+ mod thread_info;
+@@ -54,6 +55,7 @@ fn drop(&mut self) {
+         target_os = "openbsd",
+         target_os = "solaris",
+         target_os = "illumos",
++        target_os = "feos",
+     )
+ ))]
+ mod imp {
+@@ -205,6 +207,7 @@ unsafe fn get_stack() -> libc::stack_t {
+             target_os = "netbsd",
+             target_os = "linux",
+             target_os = "dragonfly",
++            target_os = "feos",
+         ))]
+         let flags = MAP_PRIVATE | MAP_ANON | libc::MAP_STACK;
+         #[cfg(not(any(
+@@ -212,6 +215,7 @@ unsafe fn get_stack() -> libc::stack_t {
+             target_os = "netbsd",
+             target_os = "linux",
+             target_os = "dragonfly",
++            target_os = "feos",
+         )))]
+         let flags = MAP_PRIVATE | MAP_ANON;
+ 
+@@ -299,7 +303,10 @@ pub unsafe fn drop_handler(data: *mut libc::c_void) {
+     }
+ 
+     /// Modern kernels on modern hardware can have dynamic signal stack sizes.
+-    #[cfg(all(any(target_os = "linux", target_os = "android"), not(target_env = "uclibc")))]
++    #[cfg(any(
++        all(any(target_os = "linux", target_os = "android"), not(target_env = "uclibc")),
++        target_os = "feos"
++    ))]
+     fn sigstack_size() -> usize {
+         let dynamic_sigstksz = unsafe { libc::getauxval(libc::AT_MINSIGSTKSZ) };
+         // If getauxval couldn't find the entry, it returns 0,
+@@ -309,7 +316,10 @@ fn sigstack_size() -> usize {
+     }
+ 
+     /// Not all OS support hardware where this is needed.
+-    #[cfg(not(all(any(target_os = "linux", target_os = "android"), not(target_env = "uclibc"))))]
++    #[cfg(not(any(
++        all(any(target_os = "linux", target_os = "android"), not(target_env = "uclibc")),
++        target_os = "feos"
++    )))]
+     fn sigstack_size() -> usize {
+         libc::SIGSTKSZ
+     }
+@@ -350,7 +360,8 @@ unsafe fn get_stack_start() -> Option<*mut libc::c_void> {
+         target_os = "netbsd",
+         target_os = "hurd",
+         target_os = "linux",
+-        target_os = "l4re"
++        target_os = "l4re",
++        target_os = "feos"
+     ))]
+     unsafe fn get_stack_start() -> Option<*mut libc::c_void> {
+         let mut ret = None;
+@@ -403,7 +414,9 @@ unsafe fn install_main_guard() -> Option<Range<usize>> {
+ 
+         unsafe {
+             // this way someone on any unix-y OS can check that all these compile
+-            if cfg!(all(target_os = "linux", not(target_env = "musl"))) {
++            // feos: the kernel keeps a guard below the main stack (section 6 of its
++            // ABI) and relibc reports the stack's bottom, as glibc does on Linux.
++            if cfg!(any(all(target_os = "linux", not(target_env = "musl")), target_os = "feos")) {
+                 install_main_guard_linux(page_size)
+             } else if cfg!(all(target_os = "linux", target_env = "musl")) {
+                 install_main_guard_linux_musl(page_size)
+@@ -562,7 +575,8 @@ unsafe fn current_guard() -> Option<Range<usize>> {
+         target_os = "hurd",
+         target_os = "linux",
+         target_os = "netbsd",
+-        target_os = "l4re"
++        target_os = "l4re",
++        target_os = "feos"
+     ))]
+     // FIXME: I am probably not unsafe.
+     unsafe fn current_guard() -> Option<Range<usize>> {
+@@ -596,7 +610,13 @@ unsafe fn current_guard() -> Option<Range<usize>> {
+             assert_eq!(libc::pthread_attr_getstack(attr.as_ptr(), &mut stackptr, &mut size), 0);
+ 
+             let stackaddr = stackptr.addr();
+-            ret = if cfg!(any(target_os = "freebsd", target_os = "netbsd", target_os = "hurd")) {
++            // feos: relibc maps the guard right below the stack it reports.
++            ret = if cfg!(any(
++                target_os = "freebsd",
++                target_os = "netbsd",
++                target_os = "hurd",
++                target_os = "feos"
++            )) {
+                 Some(stackaddr - guardsize..stackaddr)
+             } else if cfg!(all(target_os = "linux", target_env = "musl")) {
+                 Some(stackaddr - guardsize..stackaddr)
+@@ -639,6 +659,7 @@ unsafe fn current_guard() -> Option<Range<usize>> {
+         target_os = "openbsd",
+         target_os = "solaris",
+         target_os = "illumos",
++        target_os = "feos",
+         target_os = "cygwin",
+     ))
+ ))]
+diff --git a/library/std/src/sys/paths/unix.rs b/library/std/src/sys/paths/unix.rs
+index e023451b..fd5e14e0 100644
+--- a/library/std/src/sys/paths/unix.rs
++++ b/library/std/src/sys/paths/unix.rs
+@@ -270,7 +270,8 @@ pub fn current_exe() -> io::Result<PathBuf> {
+     target_os = "hurd",
+     target_os = "android",
+     target_os = "nuttx",
+-    target_os = "emscripten"
++    target_os = "emscripten",
++    target_os = "feos"
+ ))]
+ pub fn current_exe() -> io::Result<PathBuf> {
+     match crate::fs::read_link("/proc/self/exe") {
+diff --git a/library/std/src/sys/pipe/unix.rs b/library/std/src/sys/pipe/unix.rs
+index bb97e806..7ebdbbe2 100644
+--- a/library/std/src/sys/pipe/unix.rs
++++ b/library/std/src/sys/pipe/unix.rs
+@@ -22,7 +22,8 @@ pub fn pipe() -> io::Result<(Pipe, Pipe)> {
+             target_os = "netbsd",
+             target_os = "openbsd",
+             target_os = "cygwin",
+-            target_os = "redox"
++            target_os = "redox",
++            target_os = "feos"
+         ) => {
+             unsafe {
+                 cvt(libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC))?;
+diff --git a/library/std/src/sys/process/unix/unix.rs b/library/std/src/sys/process/unix/unix.rs
+index 34bf78e8..a4cfee3a 100644
+--- a/library/std/src/sys/process/unix/unix.rs
++++ b/library/std/src/sys/process/unix/unix.rs
+@@ -432,6 +432,7 @@ unsafe fn do_exec(
+         target_os = "qnx",
+         target_vendor = "apple",
+         target_os = "cygwin",
++        target_os = "feos",
+     )))]
+     fn posix_spawn(
+         &mut self,
+@@ -452,6 +453,7 @@ fn posix_spawn(
+         target_os = "qnx",
+         target_vendor = "apple",
+         target_os = "cygwin",
++        target_os = "feos",
+     ))]
+     fn posix_spawn(
+         &mut self,
+@@ -603,7 +605,11 @@ unsafe fn retrying_libc_posix_spawnp(
+         /// Some platforms can set a new working directory for a spawned process in the
+         /// `posix_spawn` path. This function looks up the function pointer for adding
+         /// such an action to a `posix_spawn_file_actions_t` struct.
+-        #[cfg(not(any(all(target_os = "linux", target_env = "musl"), target_os = "cygwin")))]
++        #[cfg(not(any(
++            all(target_os = "linux", target_env = "musl"),
++            target_os = "cygwin",
++            target_os = "feos"
++        )))]
+         fn get_posix_spawn_addchdir() -> Option<PosixSpawnAddChdirFn> {
+             use crate::sys::weak::weak;
+ 
+@@ -639,7 +645,12 @@ fn posix_spawn_file_actions_addchdir(
+         /// of the symbol at compile time or know about it upfront.
+         ///
+         /// Cygwin doesn't support weak symbol, so just link it.
+-        #[cfg(any(all(target_os = "linux", target_env = "musl"), target_os = "cygwin"))]
++        // relibc for feos has it, and links statically.
++        #[cfg(any(
++            all(target_os = "linux", target_env = "musl"),
++            target_os = "cygwin",
++            target_os = "feos"
++        ))]
+         fn get_posix_spawn_addchdir() -> Option<PosixSpawnAddChdirFn> {
+             // Our minimum required musl supports this function, so we can just use it.
+             Some(libc::posix_spawn_file_actions_addchdir_np)
+@@ -755,7 +766,7 @@ fn drop(&mut self) {
+ 
+             if self.get_setsid() {
+                 cfg_select! {
+-                    all(target_os = "linux", target_env = "gnu") => {
++                    any(all(target_os = "linux", target_env = "gnu"), target_os = "feos") => {
+                         flags |= libc::POSIX_SPAWN_SETSID as i32;
+                     }
+                     _ => {
+diff --git a/library/std/src/sys/random/feos.rs b/library/std/src/sys/random/feos.rs
+new file mode 100644
+index 00000000..05752dcd
+--- /dev/null
++++ b/library/std/src/sys/random/feos.rs
+@@ -0,0 +1,98 @@
++//! Random data on feos (`docs/feos-abi-v2.md` 10.2): the kernel's CSPRNG through
++//! relibc's `getrandom` (`GETRANDOM`, kernel stage 1e.1), as Linux's arm uses it:
++//! `GRND_INSECURE` for `HashMap`'s keys, so they never wait for seeding, and plain
++//! `getrandom` for `fill_bytes`.
++//!
++//! Kernels before stage 1e.1 answer `ENOSYS` and have no `/dev/urandom`. There:
++//! - `hashmap_random_keys` takes the 16 bytes the kernel puts at `AT_RANDOM` in every
++//!   program's aux vector (section 7.2), mixed with the monotonic and wall clocks and a
++//!   per-call counter, so every `HashMap` of a process gets different keys;
++//! - `fill_bytes` reads `/dev/urandom` if there is one, and otherwise panics: nothing
++//!   that claims to be random is made up.
++
++use crate::fs::File;
++use crate::io::Read;
++use crate::sync::OnceLock;
++use crate::sync::atomic::Ordering::Relaxed;
++use crate::sync::atomic::{Atomic, AtomicBool, AtomicU64};
++use crate::sys::io::errno;
++
++static GETRANDOM_AVAILABLE: Atomic<bool> = AtomicBool::new(true);
++
++/// Fills `bytes` from `GETRANDOM`; false if the kernel has no `GETRANDOM`.
++fn getrandom(mut bytes: &mut [u8], flags: libc::c_uint) -> bool {
++    if !GETRANDOM_AVAILABLE.load(Relaxed) {
++        return false;
++    }
++    while !bytes.is_empty() {
++        let ret = unsafe { libc::getrandom(bytes.as_mut_ptr().cast(), bytes.len(), flags) };
++        if ret >= 0 {
++            bytes = &mut bytes[ret as usize..];
++        } else {
++            match errno() {
++                libc::EINTR => continue,
++                libc::ENOSYS => {
++                    GETRANDOM_AVAILABLE.store(false, Relaxed);
++                    return false;
++                }
++                other => panic!("failed to generate random data: errno={other}, flags={flags}"),
++            }
++        }
++    }
++    true
++}
++
++pub fn fill_bytes(bytes: &mut [u8]) {
++    if getrandom(bytes, 0) {
++        return;
++    }
++    static DEVICE: OnceLock<File> = OnceLock::new();
++    DEVICE
++        .get_or_try_init(|| File::open("/dev/urandom"))
++        .and_then(|mut dev| dev.read_exact(bytes))
++        .expect("no randomness source: the feos kernel has no GETRANDOM or /dev/urandom yet (stage 1e.1)");
++}
++
++pub fn hashmap_random_keys() -> (u64, u64) {
++    let mut bytes = [0; 16];
++    if !getrandom(&mut bytes, libc::GRND_INSECURE) {
++        bytes = fallback_keys();
++    }
++    let k1 = u64::from_ne_bytes(bytes[..8].try_into().unwrap());
++    let k2 = u64::from_ne_bytes(bytes[8..].try_into().unwrap());
++    (k1, k2)
++}
++
++/// `AT_RANDOM`'s bytes, the clocks and a counter, mixed (SplitMix64's finaliser, the
++/// mixing step, not a generator): `HashMap`'s DoS resistance rests on `AT_RANDOM`.
++fn fallback_keys() -> [u8; 16] {
++    static COUNTER: Atomic<u64> = AtomicU64::new(0);
++
++    fn mix(mut z: u64) -> u64 {
++        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
++        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
++        z ^ (z >> 31)
++    }
++    fn clock(id: libc::clockid_t) -> u64 {
++        let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
++        unsafe { libc::clock_gettime(id, &mut t) };
++        (t.tv_sec as u64).wrapping_mul(1_000_000_000).wrapping_add(t.tv_nsec as u64)
++    }
++
++    let mut seed = [0u64; 2];
++    let at_random =
++        crate::ptr::with_exposed_provenance::<u8>(unsafe { libc::getauxval(libc::AT_RANDOM) } as usize);
++    if !at_random.is_null() {
++        let mut raw = [0u8; 16];
++        unsafe { crate::ptr::copy_nonoverlapping(at_random, raw.as_mut_ptr(), 16) };
++        seed[0] = u64::from_ne_bytes(raw[..8].try_into().unwrap());
++        seed[1] = u64::from_ne_bytes(raw[8..].try_into().unwrap());
++    }
++    let n = COUNTER.fetch_add(1, Relaxed);
++    let k1 = mix(seed[0] ^ mix(clock(libc::CLOCK_MONOTONIC) ^ n));
++    let k2 = mix(seed[1] ^ mix(clock(libc::CLOCK_REALTIME).wrapping_add(n.rotate_left(32))));
++    let mut out = [0u8; 16];
++    out[..8].copy_from_slice(&k1.to_ne_bytes());
++    out[8..].copy_from_slice(&k2.to_ne_bytes());
++    out
++}
+diff --git a/library/std/src/sys/random/mod.rs b/library/std/src/sys/random/mod.rs
+index 5b0d19cc..283e1196 100644
+--- a/library/std/src/sys/random/mod.rs
++++ b/library/std/src/sys/random/mod.rs
+@@ -62,6 +62,10 @@
+         mod redox;
+         pub use redox::fill_bytes;
+     }
++    target_os = "feos" => {
++        mod feos;
++        pub use feos::{fill_bytes, hashmap_random_keys};
++    }
+     target_os = "motor" => {
+         mod motor;
+         pub use motor::fill_bytes;
+@@ -119,6 +123,7 @@
+ #[cfg(not(any(
+     target_os = "linux",
+     target_os = "android",
++    target_os = "feos",
+     all(target_family = "wasm", target_os = "unknown"),
+     all(target_os = "wasi", not(target_env = "p1")),
+     target_os = "xous",
+diff --git a/library/std/src/sys/sync/condvar/mod.rs b/library/std/src/sys/sync/condvar/mod.rs
+index 0e8a4ed9..e7fe6f3b 100644
+--- a/library/std/src/sys/sync/condvar/mod.rs
++++ b/library/std/src/sys/sync/condvar/mod.rs
+@@ -2,6 +2,7 @@
+     any(
+         all(target_os = "windows", not(target_vendor="win7")),
+         target_os = "linux",
++        target_os = "feos",
+         target_os = "android",
+         target_os = "freebsd",
+         target_os = "openbsd",
+diff --git a/library/std/src/sys/sync/futex/mod.rs b/library/std/src/sys/sync/futex/mod.rs
+index 0edb46cc..2c4d0a95 100644
+--- a/library/std/src/sys/sync/futex/mod.rs
++++ b/library/std/src/sys/sync/futex/mod.rs
+@@ -1,6 +1,7 @@
+ cfg_select! {
+     any(
+         target_os = "linux",
++        target_os = "feos",
+         target_os = "android",
+         all(target_os = "emscripten", target_feature = "atomics"),
+         target_os = "freebsd",
+diff --git a/library/std/src/sys/sync/futex/unix.rs b/library/std/src/sys/sync/futex/unix.rs
+index 16fda3ec..4f81093d 100644
+--- a/library/std/src/sys/sync/futex/unix.rs
++++ b/library/std/src/sys/sync/futex/unix.rs
+@@ -16,7 +16,7 @@
+ /// Returns directly if the futex doesn't hold the expected value.
+ ///
+ /// Returns false on timeout, and true in all other cases.
+-#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
++#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "feos"))]
+ pub fn futex_wait(futex: &Atomic<u32>, expected: u32, timeout: Option<Duration>) -> bool {
+     use crate::ptr::null;
+     use crate::sync::atomic::Ordering::Relaxed;
+@@ -70,6 +70,15 @@ pub fn futex_wait(futex: &Atomic<u32>, expected: u32, timeout: Option<Duration>)
+                         !0u32,         // A full bitmask, to make it behave like a regular FUTEX_WAIT.
+                     )
+                 }
++                target_os = "feos" => {
++                    // relibc's futex over feos's FUTEX_WAIT2, which takes the
++                    // same absolute CLOCK_MONOTONIC deadline.
++                    libc::__feos_futex_wait(
++                        futex as *const Atomic<u32> as *mut u32,
++                        expected,
++                        timespec.as_ref().map_or(null(), |t| t as *const libc::timespec),
++                    )
++                }
+                 _ => {
+                     compile_error!("unknown target_os");
+                 }
+@@ -107,6 +116,21 @@ pub fn futex_wake_all(futex: &Atomic<u32>) {
+     }
+ }
+ 
++/// Wakes up one thread that's blocked on `futex_wait` on this futex (feos: relibc's
++/// futex over `FUTEX_WAKE`).
++#[cfg(target_os = "feos")]
++pub fn futex_wake(futex: &Atomic<u32>) -> bool {
++    unsafe { libc::__feos_futex_wake(futex as *const Atomic<u32> as *mut u32, 1) > 0 }
++}
++
++/// Wakes up all threads that are waiting on `futex_wait` on this futex.
++#[cfg(target_os = "feos")]
++pub fn futex_wake_all(futex: &Atomic<u32>) {
++    unsafe {
++        libc::__feos_futex_wake(futex as *const Atomic<u32> as *mut u32, i32::MAX);
++    }
++}
++
+ // FreeBSD doesn't tell us how many threads are woken up, so this always returns false.
+ #[cfg(target_os = "freebsd")]
+ pub fn futex_wake(futex: &Atomic<u32>) -> bool {
+diff --git a/library/std/src/sys/sync/mutex/mod.rs b/library/std/src/sys/sync/mutex/mod.rs
+index 9ec251b7..58b9da99 100644
+--- a/library/std/src/sys/sync/mutex/mod.rs
++++ b/library/std/src/sys/sync/mutex/mod.rs
+@@ -2,6 +2,7 @@
+     any(
+         all(target_os = "windows", not(target_vendor = "win7")),
+         target_os = "linux",
++        target_os = "feos",
+         target_os = "android",
+         target_os = "freebsd",
+         target_os = "openbsd",
+diff --git a/library/std/src/sys/sync/once/mod.rs b/library/std/src/sys/sync/once/mod.rs
+index 3bdb6c9f..2dc306af 100644
+--- a/library/std/src/sys/sync/once/mod.rs
++++ b/library/std/src/sys/sync/once/mod.rs
+@@ -11,6 +11,7 @@
+     any(
+         all(target_os = "windows", not(target_vendor="win7")),
+         target_os = "linux",
++        target_os = "feos",
+         target_os = "android",
+         all(target_family = "wasm", target_feature = "atomics"),
+         target_os = "freebsd",
+diff --git a/library/std/src/sys/sync/rwlock/mod.rs b/library/std/src/sys/sync/rwlock/mod.rs
+index 9991f290..bc9dabe0 100644
+--- a/library/std/src/sys/sync/rwlock/mod.rs
++++ b/library/std/src/sys/sync/rwlock/mod.rs
+@@ -2,6 +2,7 @@
+     any(
+         all(target_os = "windows", not(target_vendor = "win7")),
+         target_os = "linux",
++        target_os = "feos",
+         target_os = "android",
+         target_os = "freebsd",
+         target_os = "openbsd",
+diff --git a/library/std/src/sys/sync/thread_parking/mod.rs b/library/std/src/sys/sync/thread_parking/mod.rs
+index fe4c830c..396135f2 100644
+--- a/library/std/src/sys/sync/thread_parking/mod.rs
++++ b/library/std/src/sys/sync/thread_parking/mod.rs
+@@ -2,6 +2,7 @@
+     any(
+         all(target_os = "windows", not(target_vendor = "win7")),
+         target_os = "linux",
++        target_os = "feos",
+         target_os = "android",
+         all(target_family = "wasm", target_feature = "atomics"),
+         target_os = "freebsd",
+diff --git a/library/std/src/sys/thread/mod.rs b/library/std/src/sys/thread/mod.rs
+index 9816981c..499a5074 100644
+--- a/library/std/src/sys/thread/mod.rs
++++ b/library/std/src/sys/thread/mod.rs
+@@ -56,6 +56,7 @@
+             target_os = "l4re",
+             target_os = "emscripten",
+             target_os = "redox",
++            target_os = "feos",
+             target_os = "hurd",
+             target_os = "aix",
+             target_os = "wasi",
+@@ -82,6 +83,7 @@
+             target_os = "l4re",
+             target_os = "emscripten",
+             target_os = "redox",
++            target_os = "feos",
+             target_os = "hurd",
+             target_os = "aix",
+             target_os = "wasi",
+diff --git a/library/std/src/sys/thread/unix.rs b/library/std/src/sys/thread/unix.rs
+index 2dbb0314..f5216f06 100644
+--- a/library/std/src/sys/thread/unix.rs
++++ b/library/std/src/sys/thread/unix.rs
+@@ -3,6 +3,7 @@
+     target_os = "l4re",
+     target_os = "emscripten",
+     target_os = "redox",
++    target_os = "feos",
+     target_os = "hurd",
+     target_os = "aix",
+     target_os = "wasi",
+@@ -161,6 +162,7 @@ pub fn available_parallelism() -> io::Result<NonZero<usize>> {
+             target_vendor = "apple",
+             target_os = "cygwin",
+             target_os = "redox",
++            target_os = "feos",
+             target_os = "wasi",
+         ) => {
+             #[allow(unused_assignments)]
+diff --git a/library/std_detect/src/detect/mod.rs b/library/std_detect/src/detect/mod.rs
+index c888dd34..fb5288b2 100644
+--- a/library/std_detect/src/detect/mod.rs
++++ b/library/std_detect/src/detect/mod.rs
+@@ -47,7 +47,8 @@
+         #[path = "os/x86.rs"]
+         mod os;
+     }
+-    any(target_os = "linux", target_os = "android") => {
++    // feos passes Linux's AT_HWCAP and AT_HWCAP2 bits (`docs/feos-abi-v2.md` 7.2).
++    any(target_os = "linux", target_os = "android", target_os = "feos") => {
+         #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+         #[path = "os/riscv.rs"]
+         mod riscv;
+diff --git a/library/std_detect/src/detect/os/linux/auxvec.rs b/library/std_detect/src/detect/os/linux/auxvec.rs
+index c0bbc7d4..f4f81f8b 100644
+--- a/library/std_detect/src/detect/os/linux/auxvec.rs
++++ b/library/std_detect/src/detect/os/linux/auxvec.rs
+@@ -128,6 +128,7 @@ fn getauxval(key: usize) -> Result<usize, ()> {
+                 any(target_env = "gnu", target_env = "musl", target_env = "ohos"),
+             ),
+             target_os = "android",
++            target_os = "feos",
+         ) => {
+             let ffi_getauxval: F = libc::getauxval;
+         }
+diff --git a/library/unwind/src/lib.rs b/library/unwind/src/lib.rs
+index 69b5e81a..9b96c53b 100644
+--- a/library/unwind/src/lib.rs
++++ b/library/unwind/src/lib.rs
+@@ -162,6 +162,12 @@
+ #[link(name = "gcc_s", cfg(not(target_feature = "crt-static")))]
+ unsafe extern "C" {}
+ 
++// feos: LLVM's libunwind, built static from rust's src/llvm-project for each
++// architecture (`ports/build-libunwind.sh` in feos), in the target's sysroot.
++#[cfg(target_os = "feos")]
++#[link(name = "unwind", kind = "static", modifiers = "-bundle")]
++unsafe extern "C" {}
++
+ #[cfg(all(target_vendor = "fortanix", target_env = "sgx"))]
+ #[link(name = "unwind", kind = "static", modifiers = "-bundle")]
+ unsafe extern "C" {}
+diff --git a/src/bootstrap/src/core/build_steps/compile.rs b/src/bootstrap/src/core/build_steps/compile.rs
+index 6b659206..fc4410ee 100644
+--- a/src/bootstrap/src/core/build_steps/compile.rs
++++ b/src/bootstrap/src/core/build_steps/compile.rs
+@@ -360,6 +360,7 @@ fn copy_third_party_objects(
+         || builder.config.llvm_libunwind(target) == LlvmLibunwind::InTree
+             && (target.contains("linux")
+                 || target.contains("fuchsia")
++                || target.contains("feos")
+                 || target.contains("aix")
+                 || target.contains("hexagon"))
+     {
+@@ -368,6 +369,19 @@ fn copy_third_party_objects(
+         target_deps.push((libunwind_path, DependencyType::Target));
+     }
+ 
++    // feos's libc is relibc, from the target C compiler's sysroot: its start files and
++    // static libraries go into the target's library directory, which rustc searches
++    // for them (`walk_native_lib_search_dirs`), so a program links with rustc alone.
++    if target.contains("feos") {
++        let libdir = builder.sysroot_target_libdir(*compiler, target);
++        for obj in ["crt0.o", "crti.o", "crtn.o", "libc.a", "libm.a", "libcompiler_builtins.a"] {
++            let src = compiler_file(builder, &builder.cc(target), target, CLang::C, obj);
++            let dst = libdir.join(obj);
++            builder.copy_link(&src, &dst, FileType::NativeLibrary);
++            target_deps.push((dst, DependencyType::Target));
++        }
++    }
++
+     target_deps
+ }
+ 
+diff --git a/src/bootstrap/src/core/config/config.rs b/src/bootstrap/src/core/config/config.rs
+index 20319e4f..4081b0b5 100644
+--- a/src/bootstrap/src/core/config/config.rs
++++ b/src/bootstrap/src/core/config/config.rs
+@@ -1993,9 +1993,10 @@ pub fn llvm_libunwind(&self, target: TargetSelection) -> LlvmLibunwind {
+             .or(self.llvm_libunwind_default)
+             .unwrap_or(
+                 if target.contains("fuchsia")
++                    || target.contains("feos")
+                     || (target.contains("hexagon") && !target.contains("qurt"))
+                 {
+-                    // Fuchsia and Hexagon Linux use in-tree llvm-libunwind.
++                    // Fuchsia, feos and Hexagon Linux use in-tree llvm-libunwind.
+                     // Hexagon QuRT uses libc_eh from the Hexagon SDK instead.
+                     LlvmLibunwind::InTree
+                 } else {
+diff --git a/src/bootstrap/src/core/sanity.rs b/src/bootstrap/src/core/sanity.rs
+index 0256aabe..4f635560 100644
+--- a/src/bootstrap/src/core/sanity.rs
++++ b/src/bootstrap/src/core/sanity.rs
+@@ -36,6 +36,8 @@ pub struct Finder {
+ const STAGE0_MISSING_TARGETS: &[&str] = &[
+     // just a dummy comment so the list doesn't get onelined
+     "aarch64-unknown-l4re-uclibc",
++    "aarch64-unknown-feos",
++    "x86_64-unknown-feos",
+ ];
+ 
+ /// Minimum version threshold for libstdc++ required when using prebuilt LLVM
+diff --git a/src/doc/rustc/src/SUMMARY.md b/src/doc/rustc/src/SUMMARY.md
+index bedfa65a..4a686fb2 100644
+--- a/src/doc/rustc/src/SUMMARY.md
++++ b/src/doc/rustc/src/SUMMARY.md
+@@ -131,6 +131,7 @@
+     - [\*-unikraft-linux-musl](platform-support/unikraft-linux-musl.md)
+     - [\*-unknown-helenos](platform-support/helenos.md)
+     - [\*-unknown-hermit](platform-support/hermit.md)
++    - [\*-unknown-feos](platform-support/feos.md)
+     - [\*-unknown-freebsd](platform-support/freebsd.md)
+     - [\*-unknown-managarm-mlibc](platform-support/managarm.md)
+     - [\*-unknown-motor](platform-support/motor.md)
+diff --git a/src/doc/rustc/src/platform-support.md b/src/doc/rustc/src/platform-support.md
+index c8ae02b0..cb3bb0d9 100644
+--- a/src/doc/rustc/src/platform-support.md
++++ b/src/doc/rustc/src/platform-support.md
+@@ -270,6 +270,7 @@ target | std | host | notes
+ [`aarch64-kmc-solid_asp3`](platform-support/kmc-solid.md) | ✓ |  | ARM64 SOLID with TOPPERS/ASP3
+ [`aarch64-nintendo-switch-freestanding`](platform-support/aarch64-nintendo-switch-freestanding.md) | * |  | ARM64 Nintendo Switch, Horizon
+ [`aarch64-oe-linux-gnu`](platform-support/oe-linux-gnu.md) | ✓ |  | ARM64 OpenEmbedded/Yocto Linux (GNU)
++[`aarch64-unknown-feos`](platform-support/feos.md) | ✓ |  | ARM64 feos, static (relibc)
+ [`aarch64-unknown-helenos`](platform-support/helenos.md) | ✓ |  | ARM64 HelenOS
+ [`aarch64-unknown-hermit`](platform-support/hermit.md) | ✓ |  | ARM64 Hermit
+ [`aarch64-unknown-illumos`](platform-support/illumos.md) | ✓ | ✓ | ARM64 illumos
+@@ -456,6 +457,7 @@ target | std | host | notes
+ [`x86_64-pc-qnx`](platform-support/nto-qnx.md) | ✓ |  | x86 64-bit QNX SDP 8.0+ |
+ [`x86_64-unikraft-linux-musl`](platform-support/unikraft-linux-musl.md) | ✓ |  | 64-bit Unikraft with musl 1.2.5
+ `x86_64-unknown-dragonfly` | ✓ | ✓ | 64-bit DragonFlyBSD
++[`x86_64-unknown-feos`](platform-support/feos.md) | ✓ |  | 64-bit feos, static (relibc)
+ `x86_64-unknown-haiku` | ✓ | ✓ | 64-bit Haiku
+ [`x86_64-unknown-hermit`](platform-support/hermit.md) | ✓ |  | x86_64 Hermit
+ [`x86_64-unknown-helenos`](platform-support/helenos.md) | ✓ |  | x86_64 (amd64) HelenOS
+diff --git a/src/doc/rustc/src/platform-support/feos.md b/src/doc/rustc/src/platform-support/feos.md
+new file mode 100644
+index 00000000..cd37d10c
+--- /dev/null
++++ b/src/doc/rustc/src/platform-support/feos.md
+@@ -0,0 +1,72 @@
++# `*-unknown-feos`
++
++**Tier: 3**
++
++Targets for [feos](https://github.com/kunaldawn/feos), a `no_std` Rust operating
++system for QEMU's AArch64 `virt` and x86_64 `q35` machines. User programs are static
++ELF executables over [relibc](https://gitlab.redox-os.org/redox-os/relibc), whose
++`platform/feos` maps POSIX onto feos's system calls.
++
++Target triples:
++
++- `x86_64-unknown-feos`
++- `aarch64-unknown-feos`
++
++## Target maintainers
++
++- Kunal Dawn ([@kunaldawn](https://github.com/kunaldawn))
++
++## Requirements
++
++These targets only support cross-compilation for now, and static executables only:
++`crt-static` is the default and the only linkage, programs are `ET_EXEC` linked at
++`0x1000400000` with every loadable segment on pages of its own, and `rust-lld` links
++them. x86_64 code is position independent (the image is beyond the small code model's
++reach) and uses no AVX or XSAVE state; AArch64 code is static and uses no outline
++atomics. `std` is supported (`panic=unwind` over LLVM's libunwind); threads,
++synchronisation, files, processes (`posix_spawn`) and time work, `std::net` needs
++the kernel's socket calls.
++
++The C side is relibc for feos, built as a sysroot with `crt0.o`, `crti.o`, `crtn.o`,
++`libc.a`, `libm.a` and `libcompiler_builtins.a`, and a C compiler driver for the
++target that finds them (`-print-file-name`).
++
++## Building the target
++
++Set the target's C compiler to a driver for the relibc sysroot and build `std` for it:
++
++```toml
++[build]
++target = ["x86_64-unknown-linux-gnu", "x86_64-unknown-feos", "aarch64-unknown-feos"]
++
++[rust]
++lld = true
++
++[target.x86_64-unknown-feos]
++cc = "/path/to/x86_64-unknown-feos-cc"
++cxx = "/path/to/x86_64-unknown-feos-cc"
++ar = "llvm-ar"
++ranlib = "llvm-ranlib"
++```
++
++Bootstrap builds LLVM's libunwind for the target and copies relibc's start files and
++libraries, found through the C compiler, into the target's library directory, where
++rustc looks for them.
++
++## Building Rust programs
++
++```sh
++cargo build --target x86_64-unknown-feos
++```
++
++The result runs on feos as it is (copy it into the image's `/bin`).
++
++## Testing
++
++The feos tree's `ports/test` boots both machines in QEMU and runs Rust programs and
++their checks in the feos shell. The Rust test suite is not run for these targets.
++
++## Cross-compilation toolchains and C code
++
++C code for these targets is built against the relibc sysroot with clang for
++`<arch>-unknown-none-elf`, `-D__feos__ -D__unix__`, `-fPIC` on x86_64.
+diff --git a/tests/assembly-llvm/targets/targets-elf.rs b/tests/assembly-llvm/targets/targets-elf.rs
+index 49bced1d..1e0509f6 100644
+--- a/tests/assembly-llvm/targets/targets-elf.rs
++++ b/tests/assembly-llvm/targets/targets-elf.rs
+@@ -37,6 +37,9 @@
+ //@ revisions: aarch64_unknown_fuchsia
+ //@ [aarch64_unknown_fuchsia] compile-flags: --target aarch64-unknown-fuchsia
+ //@ [aarch64_unknown_fuchsia] needs-llvm-components: aarch64
++//@ revisions: aarch64_unknown_feos
++//@ [aarch64_unknown_feos] compile-flags: --target aarch64-unknown-feos
++//@ [aarch64_unknown_feos] needs-llvm-components: aarch64
+ //@ revisions: aarch64_unknown_helenos
+ //@ [aarch64_unknown_helenos] compile-flags: --target aarch64-unknown-helenos
+ //@ [aarch64_unknown_helenos] needs-llvm-components: aarch64
+@@ -709,6 +712,9 @@
+ //@ revisions: x86_64_unknown_fuchsia
+ //@ [x86_64_unknown_fuchsia] compile-flags: --target x86_64-unknown-fuchsia
+ //@ [x86_64_unknown_fuchsia] needs-llvm-components: x86
++//@ revisions: x86_64_unknown_feos
++//@ [x86_64_unknown_feos] compile-flags: --target x86_64-unknown-feos
++//@ [x86_64_unknown_feos] needs-llvm-components: x86
+ //@ revisions: x86_64_unknown_haiku
+ //@ [x86_64_unknown_haiku] compile-flags: --target x86_64-unknown-haiku
+ //@ [x86_64_unknown_haiku] needs-llvm-components: x86

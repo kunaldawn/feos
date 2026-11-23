@@ -41,12 +41,14 @@ feos-coreutils = { path = "libs/coreutils" }
 feos-desktop = { path = "libs/desktop" }
 feos-desktop-app = { path = "apps/desktop" }
 feos-dosbox = { path = "libs/dosbox" }
+feos-csprng = { path = "libs/csprng" }
 feos-elf = { path = "libs/elf" }
 feos-vm = { path = "libs/vm" }
 feos-pagecache = { path = "libs/pagecache" }
 feos-fdtable = { path = "libs/fdtable" }
 feos-locks = { path = "libs/locks" }
 feos-signal = { path = "libs/signal" }
+feos-tty = { path = "libs/tty" }
 feos-dosbox-app = { path = "apps/dosbox" }
 feos-driver-apic = { path = "drivers/interrupt/apic" }
 feos-driver-fw-cfg = { path = "drivers/firmware/fw-cfg" }

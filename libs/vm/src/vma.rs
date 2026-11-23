@@ -235,16 +235,26 @@ impl VmaList {
             .map_err(|_| VmaError::Full)
     }
 
-    /// Splits whatever VMA holds `at` so that a VMA starts there. Room must have been
-    /// made with [`reserve_for`](Self::reserve_for).
-    pub(crate) fn split(&mut self, at: usize) {
-        if let Some(index) = self.find(at) {
-            if self.list[index].start != at {
-                let high = self.list[index].split_off(at);
-                self.list.insert(index + 1, high);
-                self.skip = self.skip.min(index);
-            }
+    /// Room for `count` more VMAs, within the cap: for a fork's copy of another list.
+    pub(crate) fn reserve(&mut self, count: usize) -> Result<(), VmaError> {
+        if self.list.len().saturating_add(count) > self.cap {
+            return Err(VmaError::Full);
         }
+        self.list.try_reserve(count).map_err(|_| VmaError::Full)
+    }
+
+    /// Splits whatever VMA holds `at` so that a VMA starts there, and says where the new
+    /// one is if it made one. Room must have been made with
+    /// [`reserve_for`](Self::reserve_for).
+    pub(crate) fn split(&mut self, at: usize) -> Option<&Vma> {
+        let index = self.find(at)?;
+        if self.list[index].start == at {
+            return None;
+        }
+        let high = self.list[index].split_off(at);
+        self.list.insert(index + 1, high);
+        self.skip = self.skip.min(index);
+        self.list.get(index + 1)
     }
 
     /// Takes the VMAs in `range` out, for the caller to finish off.
@@ -254,22 +264,25 @@ impl VmaList {
     }
 
     /// Puts a VMA into a gap, joining it to its neighbours where it can. Room must have
-    /// been made with [`reserve_for`](Self::reserve_for).
-    pub(crate) fn insert(&mut self, vma: Vma) {
+    /// been made with [`reserve_for`](Self::reserve_for). `joined` is told of each VMA
+    /// that a join takes in.
+    pub(crate) fn insert(&mut self, vma: Vma, joined: &mut dyn FnMut(&Vma)) {
         let index = self.list.partition_point(|other| other.end <= vma.start);
         debug_assert!(index == self.list.len() || self.list[index].start >= vma.end);
         self.list.insert(index, vma);
         self.skip = self.skip.min(index);
-        self.join_around(index, index + 1);
+        self.join_around(index, index + 1, joined);
     }
 
-    /// Joins neighbours in `[first - 1, last]` that have come to match.
-    pub(crate) fn join_around(&mut self, first: usize, last: usize) {
+    /// Joins neighbours in `[first - 1, last]` that have come to match. `joined` is told
+    /// of each VMA taken into the one before it.
+    pub(crate) fn join_around(&mut self, first: usize, last: usize, joined: &mut dyn FnMut(&Vma)) {
         let mut index = first.saturating_sub(1);
         let mut last = last.min(self.list.len());
         while index + 1 < self.list.len() && index < last {
             if self.list[index].joins(&self.list[index + 1]) {
                 let next = self.list.remove(index + 1);
+                joined(&next);
                 self.list[index].end = next.end;
                 self.skip = self.skip.min(index);
                 last = last.saturating_sub(1);

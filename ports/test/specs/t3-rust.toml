@@ -1,0 +1,128 @@
+# Stage T3: Rust programs built with std for feos (ports/test/rust/t3/*.rs, by
+# ports/test/rust/build.sh), injected as /bin/t3-*, run on feos. Each prints
+# "<name>: ok" when every check passed; a failed assertion panics (status 101).
+# Base: refs/feos-checkpoints/1c.11 or later (EXEC, WAIT4/KILL, signal handlers and
+# SIGALTSTACK for the process and stack overflow cases, POLL for Command::output).
+
+# A native-format disk at /native0, for hard links and permissions (the RAM root has
+# neither: LINKAT is EOPNOTSUPP there, by design), and 1 GiB of RAM: t3-heap's 128 MiB
+# block doesn't fit beside its other allocations in the boot tests' default 512 MiB
+# (half of which is the kernel heap).
+[boot]
+native_disk = 64
+memory = "1G"
+
+[[case]]
+name = "hello"
+run = "/bin/t3-hello one 'two three'"
+expect = ["hello from Rust std on feos", "arg[1]=one", "arg[2]=two three", "t3-hello: ok"]
+reject = ["panicked"]
+status = 0
+
+[[case]]
+name = "exit-status"
+run = "/bin/t3-hello --exit 42"
+status = 42
+
+[[case]]
+name = "args-env"
+run = "T3_ENV=from-shell /bin/t3-args-env one 'two three'"
+expect = ["args: [\"one\", \"two three\"]", "env: T3_ENV=from-shell", "current_exe: /bin/t3-args-env",
+          "os: feos unix", "t3-args-env: ok"]
+reject = ["panicked"]
+status = 0
+
+[[case]]
+name = "fs"
+run = "/bin/t3-fs /tmp/t3-fs"
+expect = ["files: ok", "times: ok", "rename: ok", "symlink: ok", "locks: ok", "remove_dir_all: ok", "t3-fs: ok"]
+reject = ["panicked"]
+status = 0
+
+[[case]]
+name = "fs-links"
+run = "/bin/t3-fs --links /native0/t3-links"
+expect = ["hard_link: ino=", "hard_link of a symlink: ok", "permissions: 600, read-only 400, 755", "t3-fs --links: ok"]
+reject = ["panicked"]
+status = 0
+
+[[case]]
+name = "threads"
+run = "/bin/t3-threads"
+expect = ["available_parallelism:", "mutex: 8 threads x 10000 = 80000", "rwlock, once, lazy: ok",
+          "stack_size(1): a 16384 byte stack", "builder, scope, park: ok", "200 short threads: ok", "t3-threads: ok"]
+reject = ["panicked"]
+status = 0
+timeout = 120
+
+[[case]]
+name = "time"
+run = "/bin/t3-time"
+expect = ["sleep(200 ms):", "SystemTime:", "t3-time: ok"]
+reject = ["panicked"]
+status = 0
+
+[[case]]
+name = "heap"
+run = "/bin/t3-heap"
+expect = ["200000 small blocks: ok", "64 MiB vector, 128 MiB block: ok",
+          "RandomState: AT_RANDOM differs per program, keys differ per thread (8) and per program (2)", "t3-heap: ok"]
+reject = ["panicked"]
+status = 0
+timeout = 180
+
+[[case]]
+name = "panic-unwind"
+run = "/bin/t3-panic 2>/dev/null"
+expect = ["catch_unwind: 21 frames unwound, 21 destructors ran", "hook: 1 call; resume_unwind carried 1234",
+          "thread panic: joined with its payload", "nested, index, expect: ok", "t3-panic: ok"]
+status = 0
+
+# The default hook's report, on stderr (the last panic t3-panic catches).
+[[case]]
+name = "panic-report"
+run = "/bin/t3-panic 2>&1 | grep -e 'panicked at' -e 'default hook'"
+expect = ["panicked at", "reported by the default hook"]
+status = 0
+
+# An uncaught panic: the report, then exit status 101.
+[[case]]
+name = "panic-exit"
+run = "/bin/t3-hello --panic"
+expect = ["t3-hello was asked to panic"]
+status = 101
+
+[[case]]
+name = "stdin-pipe"
+run = "printf 'first\\nsecond\\nthird\\n' | /bin/t3-stdin"
+expect = ["t3-stdin: 3 lines, 19 bytes, first \"first\""]
+status = 0
+
+[[case]]
+name = "process"
+run = "/bin/t3-process"
+expect = ["stdout piped:", "status: exit code Some(7)", "stderr: piped apart", "env and current_dir: ok",
+          "stdin pipe: t3-stdin: 1000 lines, 8890 bytes", "kill: signal: 9", "child panic: exit 101",
+          "not found, PATH: ok", "t3-process: ok"]
+reject = ["panicked"]
+status = 0
+timeout = 120
+
+# Command::output: std reads the stdout and stderr pipes together through poll(2)
+# (POLL, stage 1c.11: on an older base this case fails with ENOSYS).
+[[case]]
+name = "process-output"
+run = "/bin/t3-process output"
+expect = ["output: ", "t3-process output: ok"]
+reject = ["panicked"]
+status = 0
+
+# Stack overflow on the main thread and on another: std's SIGSEGV handler on its
+# alternate stack reports it, then aborts (SIGABRT).
+[[case]]
+name = "stack-overflow"
+run = "/bin/t3-process overflow"
+expect = ["stack overflow (main): reported", "stack overflow (thread): reported", "t3-process overflow: ok"]
+reject = ["panicked"]
+status = 0
+timeout = 120

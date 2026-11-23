@@ -42,6 +42,34 @@ pub enum DeviceKind {
     /// The caller's terminal (`/dev/tty`): opening it is the kernel's to say, and, until
     /// programs have terminals, is refused there. Here as `Null`.
     Tty,
+    /// `/dev/random`: the kernel's random number generator, which a program's read waits
+    /// to be seeded (the kernel's to say). Here, whatever [`set_random_source`] installed
+    /// gives the bytes; writes are taken and discarded, as `/dev/urandom`'s are.
+    Random,
+    /// `/dev/urandom`: the generator, never waiting.
+    Urandom,
+}
+
+/// What reading `/dev/random` and `/dev/urandom` through the tree fills a buffer with:
+/// the kernel's generator, never waiting. None reads as empty.
+static RANDOM_SOURCE: feos_sync::SpinLock<Option<fn(&mut [u8])>> = feos_sync::SpinLock::new(None);
+
+/// Makes `fill` what reads of the random devices through the tree give. The kernel's
+/// own reads for programs don't come this way, but kernel apps' (a shell's `head -c 16
+/// /dev/urandom`) do. Called with the tree's lock held, so `fill` mustn't call the tree.
+pub fn set_random_source(fill: fn(&mut [u8])) {
+    *RANDOM_SOURCE.lock() = Some(fill);
+}
+
+fn random_fill(out: &mut [u8]) -> usize {
+    let source = *RANDOM_SOURCE.lock();
+    match source {
+        Some(fill) => {
+            fill(out);
+            out.len()
+        }
+        None => 0,
+    }
 }
 
 impl DeviceKind {
@@ -52,11 +80,13 @@ impl DeviceKind {
             Self::Zero => 1 << 8 | 5,
             Self::Full => 1 << 8 | 7,
             Self::Tty => 5 << 8,
+            Self::Random => 1 << 8 | 8,
+            Self::Urandom => 1 << 8 | 9,
             Self::Console => 5 << 8 | 1,
         }
     }
 
-    /// What reading it at any offset gives: zeros to fill `out`, or nothing.
+    /// What reading it at any offset gives: zeros to fill `out`, random bytes, or nothing.
     pub fn read(self, out: &mut [u8]) -> usize {
         match self {
             Self::Zero | Self::Full => {
@@ -64,6 +94,7 @@ impl DeviceKind {
                 out.len()
             }
             Self::Null | Self::Console | Self::Tty => 0,
+            Self::Random | Self::Urandom => random_fill(out),
         }
     }
 

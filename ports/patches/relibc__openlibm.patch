@@ -1,0 +1,45 @@
+diff --git a/amd64/fenv.c b/amd64/fenv.c
+index ddf7dba..b30e83a 100644
+--- a/amd64/fenv.c
++++ b/amd64/fenv.c
+@@ -56,6 +56,8 @@ fesetexceptflag(const fexcept_t *flagp, int excepts)
+ {
+ 	fenv_t env;
+ 
++	/* See feclearexcept: only the supported flags. */
++	excepts &= FE_ALL_EXCEPT;
+ 	__fnstenv(&env.__x87);
+ 	env.__x87.__status &= ~excepts;
+ 	env.__x87.__status |= *flagp & excepts;
+diff --git a/include/openlibm_fenv_amd64.h b/include/openlibm_fenv_amd64.h
+index c6db210..0bf4cc6 100644
+--- a/include/openlibm_fenv_amd64.h
++++ b/include/openlibm_fenv_amd64.h
+@@ -99,6 +99,9 @@ feclearexcept(int __excepts)
+ {
+ 	fenv_t __env;
+ 
++	/* Only the supported flags: other bits (the x87 status word's ES, B and TOP)
++	 * aren't exceptions, and a loaded ES traps the next FWAIT on some x87s. */
++	__excepts &= FE_ALL_EXCEPT;
+ 	if (__excepts == FE_ALL_EXCEPT) {
+ 		__fnclex();
+ 	} else {
+@@ -120,7 +123,7 @@ fegetexceptflag(fexcept_t *__flagp, int __excepts)
+ 
+ 	__stmxcsr(&__mxcsr);
+ 	__fnstsw(&__status);
+-	*__flagp = (__mxcsr | __status) & __excepts;
++	*__flagp = (__mxcsr | __status) & __excepts & FE_ALL_EXCEPT;
+ 	return (0);
+ }
+ 
+@@ -135,7 +138,7 @@ fetestexcept(int __excepts)
+ 
+ 	__stmxcsr(&__mxcsr);
+ 	__fnstsw(&__status);
+-	return ((__status | __mxcsr) & __excepts);
++	return ((__status | __mxcsr) & __excepts & FE_ALL_EXCEPT);
+ }
+ 
+ __fenv_static inline int

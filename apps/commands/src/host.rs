@@ -18,8 +18,8 @@ use core::sync::atomic::{AtomicPtr, Ordering};
 
 use feos_app::pipe::{self, PipeReader, PipeWriter, Transfer};
 use feos_app::{
-    shell, App, ArgBlock, Context, Platform, ProcessSnapshot, Processes, SpawnError, SpawnIo, WaitStatus,
-    MAX_ARGC, PROCESS_ARGS_MAX,
+    shell, App, ArgBlock, Context, Platform, ProcessSnapshot, Processes, SpawnError, SpawnIo, TerminalStreams,
+    WaitStatus, MAX_ARGC, PROCESS_ARGS_MAX,
 };
 use feos_coreutils::{Available, Input, MemoryInfo, Output, System};
 use feos_gfx::Canvas;
@@ -241,6 +241,11 @@ pub trait ConsoleSource: Send + Sync {
     fn take_quit(&self) -> bool {
         false
     }
+
+    /// The terminal's size in cells, rows then columns, if it knows it.
+    fn size(&self) -> Option<(u16, u16)> {
+        None
+    }
 }
 
 /// The serial console's streams, which any task can use.
@@ -264,10 +269,30 @@ impl ConsoleSource for SerialConsole {
     }
 }
 
+/// What a terminal says its size is when the console doesn't know: the serial line's.
+const DEFAULT_SIZE: (u16, u16) = (24, 80);
+
+/// The shell's hold on a kernel terminal it opened for a job, let go with the job.
+struct HostTerminal {
+    id: u32,
+    processes: &'static dyn Processes,
+}
+
+impl Drop for HostTerminal {
+    fn drop(&mut self) {
+        self.processes.close_terminal(self.id);
+    }
+}
+
 /// A command running in the foreground, or stopped by Ctrl-Z: its process and what
 /// connects it to the shell's streams.
 struct ForegroundJob {
     pid: u32,
+    /// The kernel terminal its standard input is on, if it has one: typed keys go there
+    /// raw, rather than cooked into its input pipe.
+    terminal: Option<HostTerminal>,
+    /// The size that terminal was last told.
+    size: (u16, u16),
     output: PipeReader,
     errors: PipeReader,
     output_open: bool,
@@ -405,7 +430,7 @@ impl<'d> ProcessHost<'d> {
     ) -> Result<i32, SpawnError> {
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
         let processes = self.platform.processes;
-        self.start_foreground(stdin, stdout, stderr, |io| processes.spawn_argv(app, &argv, io))
+        self.start_foreground(stdin, stdout, stderr, false, |io| processes.spawn_argv(app, &argv, io))
     }
 
     /// Starts a user program and looks after its streams until it ends.
@@ -421,14 +446,20 @@ impl<'d> ProcessHost<'d> {
         stderr: &mut dyn Output,
     ) -> Result<i32, SpawnError> {
         let processes = self.platform.processes;
-        self.start_foreground(stdin, stdout, stderr, |io| processes.spawn_user(path, argv, env, cwd, io))
+        self.start_foreground(stdin, stdout, stderr, true, |io| processes.spawn_user(path, argv, env, cwd, io))
     }
 
+    /// Starts a command with its streams on pipes, and looks after them. A user program
+    /// (`program`) run by the shell's own host with its input and some output on the
+    /// console gets a terminal of the kernel's for those streams (stage 1c.11), which
+    /// this feeds the console's raw keys: its line discipline cooks them, and its `ISIG`
+    /// raises Ctrl-C's `SIGINT` on the program's group.
     fn start_foreground(
         &mut self,
         stdin: &mut dyn Input,
         stdout: &mut dyn Output,
         stderr: &mut dyn Output,
+        program: bool,
         spawn: impl FnOnce(SpawnIo<'_>) -> Result<u32, SpawnError>,
     ) -> Result<i32, SpawnError> {
         let (Some((output, out_writer)), Some((errors, err_writer)), Some((in_reader, in_writer))) =
@@ -436,15 +467,32 @@ impl<'d> ProcessHost<'d> {
         else {
             return Err(SpawnError::NoFreeSlot);
         };
+        let processes = self.platform.processes;
+        let size = self.console.size().unwrap_or(DEFAULT_SIZE);
+        // What it echoes goes where its output is shown, its standard output's pipe if
+        // that's the console, or its error's.
+        let echo = match (stdout.is_terminal(), stderr.is_terminal()) {
+            (true, _) => Some(out_writer.id()),
+            (false, true) => Some(err_writer.id()),
+            (false, false) => None,
+        };
+        let terminal = echo
+            .filter(|_| program && self.foreground && stdin.is_terminal())
+            .and_then(|echo| processes.open_terminal(echo, size.0, size.1))
+            .map(|id| HostTerminal { id, processes });
+        let streams = 1 | u8::from(stdout.is_terminal()) << 1 | u8::from(stderr.is_terminal()) << 2;
         let pid = spawn(SpawnIo {
             stdin: Some(&in_reader),
             stdout: Some(&out_writer),
             stderr: Some(&err_writer),
+            terminal: terminal.as_ref().map(|terminal| TerminalStreams { terminal: terminal.id, streams }),
             ..SpawnIo::default()
         })?;
         drop(out_writer);
         drop(err_writer);
         let job = ForegroundJob {
+            terminal,
+            size,
             pid,
             unread: in_reader,
             output,
@@ -465,6 +513,11 @@ impl<'d> ProcessHost<'d> {
     /// ahead of a command that never reads stays for the next reader, and isn't echoed.
     /// Only a command with nothing between it and the terminal can be stopped: anything
     /// else has a shell waiting for it that a stopped command would hang.
+    ///
+    /// A job on a kernel terminal is fed the console's raw keys instead, which the
+    /// terminal takes only as its readers want them, or up to a character that raises a
+    /// signal; Ctrl-C, Ctrl-\\ and Ctrl-Z are its line discipline's, and a stop the
+    /// kernel made is noticed here.
     fn supervise(
         &mut self,
         mut job: ForegroundJob,
@@ -476,6 +529,11 @@ impl<'d> ProcessHost<'d> {
         let terminal = stdin.is_terminal();
         let stoppable =
             self.foreground && terminal && stdout.is_terminal() && stderr.is_terminal();
+        let on_terminal = job.terminal.is_some();
+        // The keys are the program's terminal's, Ctrl-C included.
+        if on_terminal {
+            stdin.set_raw(true);
+        }
         // Only keys pressed for this command count.
         let _ = self.console.take_suspend();
         let _ = self.console.take_quit();
@@ -492,19 +550,53 @@ impl<'d> ProcessHost<'d> {
                 &mut buffer,
                 [&mut *stdout, &mut *stderr],
             );
-            moved |= feed_stdin(&mut job, stdin, terminal, &mut buffer);
+            moved |= match &job.terminal {
+                Some(_) => feed_terminal(processes, &mut job, stdin, &mut buffer),
+                None => feed_stdin(&mut job, stdin, terminal, &mut buffer),
+            };
 
             if (!job.output_open && !job.errors_open) && exited || (exited && !moved) {
                 break;
             }
-            if !killed {
+            if let Some(held) = &job.terminal {
+                if let Some(size) = self.console.size().filter(|&size| size != job.size) {
+                    processes.resize_terminal(held.id, size.0, size.1);
+                    job.size = size;
+                }
+            }
+            if !killed && on_terminal {
+                // Its own keys are its terminal's: only the shell going, or output with
+                // nowhere to go, is this host's to act on. The serial console isn't
+                // polled for Ctrl-C, which would take its keys.
+                interrupted = self.stop.cancel.is_cancelled() || processes.kill_requested();
+                if interrupted || stdout.is_broken() {
+                    killed = true;
+                    let _ = match interrupted {
+                        true => processes.send_signal(job.pid, feos_app::signal::INT),
+                        false => processes.try_kill(job.pid),
+                    };
+                } else if !exited && processes.is_stopped(job.pid) {
+                    // Its terminal's `VSUSP` (or anyone's `SIGSTOP`) stopped it. A job the
+                    // shell can't leave stopped is let go on again.
+                    if stoppable {
+                        stdin.set_raw(false);
+                        self.for_tree(job.pid, |member| {
+                            processes.set_stopped(member, true);
+                        });
+                        self.just_suspended = Some(job.pid);
+                        self.suspended.push(job);
+                        return 148;
+                    }
+                    processes.set_stopped(job.pid, false);
+                }
+            } else if !killed {
                 interrupted = self.poll_cancel();
                 if self.console.take_quit() {
                     quit = true;
                 }
                 if interrupted || quit || stdout.is_broken() {
                     killed = true;
-                    // Ctrl-C is `SIGINT` and Ctrl-\ `SIGQUIT`, as a terminal's line
+                    // Ctrl-C is `SIGINT` and Ctrl-\\ `SIGQUIT`, as a terminal's line
                     // discipline would send them: a program ends with that signal as its
                     // status, a kernel app is killed. Output with nowhere to go kills it.
                     let _ = match (interrupted, quit) {
@@ -532,11 +624,20 @@ impl<'d> ProcessHost<'d> {
                 }
             }
         }
+        if on_terminal {
+            stdin.set_raw(false);
+        }
         // Keys it was given and didn't read belong to whoever reads next. Only a
-        // terminal keeps them: a pipe's reader could never see them anyway.
+        // terminal keeps them: a pipe's reader could never see them anyway. A kernel
+        // terminal's are as it left them, ahead of those it was never offered.
         if terminal {
             let mut rest = core::mem::take(&mut job.waiting);
             let mut taken = Vec::new();
+            if let Some(held) = &job.terminal {
+                let mut left = [0u8; TYPED_AHEAD_MAX];
+                let count = processes.take_terminal_input(held.id, &mut left);
+                taken.extend_from_slice(&left[..count]);
+            }
             while let Transfer::Moved(count) = job.unread.try_read(&mut buffer) {
                 taken.extend_from_slice(&buffer[..count]);
             }
@@ -560,6 +661,29 @@ impl<'d> ProcessHost<'d> {
     fn forget_job(&mut self, pid: u32) {
         self.suspended.retain(|job| job.pid != pid);
     }
+}
+
+/// Most typed-ahead bytes a job on a kernel terminal is held to: past this the console
+/// is left to hold them.
+const TYPED_AHEAD_MAX: usize = 4096;
+
+/// Offers the console's raw keys to a job's kernel terminal, which takes what its readers
+/// want and any signal's character. Returns `true` if any were taken.
+fn feed_terminal(processes: &dyn Processes, job: &mut ForegroundJob, stdin: &mut dyn Input, buffer: &mut [u8]) -> bool {
+    let Some(terminal) = &job.terminal else {
+        return false;
+    };
+    if job.waiting.len() < TYPED_AHEAD_MAX {
+        if let Available::Bytes(count) = stdin.try_read_raw(buffer) {
+            job.waiting.extend_from_slice(&buffer[..count]);
+        }
+    }
+    if job.waiting.is_empty() {
+        return false;
+    }
+    let taken = processes.terminal_input(terminal.id, &job.waiting);
+    job.waiting.drain(..taken);
+    taken > 0
 }
 
 /// Moves a chunk of standard input towards a process. Returns `true` if any moved.

@@ -1,0 +1,13 @@
+[package]
+name = "feos-tty"
+description = "A terminal's line discipline: canonical lines and their editing, echo, the characters that raise signals, VMIN and VTIME, and who may read"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+feos-abi = { workspace = true }

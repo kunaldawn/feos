@@ -74,6 +74,7 @@ pub mod line;
 pub mod parser;
 #[cfg(test)]
 mod regress;
+mod spawn;
 pub mod vt;
 
 use alloc::collections::BTreeMap;
@@ -83,7 +84,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 pub use console::{ConsoleInput, ConsoleOutput};
-use feos_coreutils::{Env, Input, Output, OverlayFs, System, Var, Vfs, COMMANDS};
+use feos_coreutils::{Env, Input, Output, OverlayFs, Processes, System, Var, Vfs, COMMANDS};
 use feos_fs::FileSystem;
 use parser::Command;
 
@@ -203,6 +204,16 @@ pub trait Host {
     /// Concurrent tasks, when this host has them. Without them pipelines buffer
     /// and `&` runs in the foreground.
     fn tasks(&mut self) -> Option<&mut dyn TaskHost> {
+        None
+    }
+
+    /// Programs as processes of their own, when this host starts them so: its streams
+    /// are its own descriptors 0, 1 and 2. A program then gets its descriptors from the
+    /// shell's through spawn actions, pipelines of programs are real pipes between
+    /// processes, `&` is a background job of processes, `exec` replaces the shell, and
+    /// `kill` signals processes, groups and jobs (see `spawn.rs`).
+    /// [`run_program`](Self::run_program) isn't called then.
+    fn processes(&mut self) -> Option<&mut dyn Processes> {
         None
     }
 }
@@ -400,6 +411,10 @@ pub struct Shell<'a> {
     pub(crate) next_job: usize,
     pub(crate) traps: BTreeMap<String, String>,
     pub(crate) in_trap: bool,
+    /// `exec` is running its command, which replaces the shell if it's a program.
+    pub(crate) exec_next: bool,
+    /// The pipeline of programs being started wants its next stage left running.
+    pub(crate) stage: Option<spawn::StageSpawn>,
 }
 
 impl<'a> Shell<'a> {
@@ -457,6 +472,8 @@ impl<'a> Shell<'a> {
             next_job: 0,
             traps: BTreeMap::new(),
             in_trap: false,
+            exec_next: false,
+            stage: None,
         };
         // What scripts assume exists. A failure only means the base image
         // already provides the path, or does not allow it.
@@ -474,6 +491,12 @@ impl<'a> Shell<'a> {
     /// A handle that stops whatever this shell is running.
     pub fn cancel_token(&self) -> CancelToken {
         self.cancel.clone()
+    }
+
+    /// Enters descriptor `fd` (3 to 9), which a host running programs as processes found
+    /// open without close-on-exec when it started, so the programs it runs get it too.
+    pub fn inherit_descriptor(&mut self, fd: usize) {
+        self.fds.inherit(fd);
     }
 
     /// Sets how much stack the interpreter may use, for hosts that know theirs.
@@ -726,6 +749,25 @@ impl<'a> Shell<'a> {
     /// Takes a pending `exit` status, if the shell was asked to leave.
     pub fn take_exit_status(&mut self) -> Option<i32> {
         self.exit_requested.take()
+    }
+
+    /// Runs what `sh`'s arguments say, as the `sh` builtin does: `-c` and a command
+    /// string, a script file and its arguments, or the commands on standard input, with
+    /// `-e`, `-x`, `-o name` and the other options. What `/bin/sh` does with its own
+    /// arguments.
+    pub fn run_arguments(&mut self, args: &[String], io: &mut Io<'_>, host: &mut dyn Host) -> i32 {
+        let outermost = self.note_stack_base();
+        let status = self.builtin_sh(args, io, host);
+        if outermost {
+            self.stack_base = None;
+        }
+        status
+    }
+
+    /// Says whether this shell is reading commands typed at a prompt: it reports jobs,
+    /// and Ctrl-C ending a job ends the line it was on.
+    pub fn set_interactive(&mut self, interactive: bool) {
+        self.interactive = interactive;
     }
 }
 

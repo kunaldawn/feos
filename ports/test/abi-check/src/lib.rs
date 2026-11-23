@@ -110,6 +110,93 @@ mod tests {
         assert_eq!(seen, 108 - 31 + 1, "the design's table has every number from 31 to 108");
     }
 
+    /// `pub const NAME: TYPE = VALUE;` in a relibc header module that apply to feos:
+    /// those with no `#[cfg]`, a `#[cfg]` naming feos, or a `#[cfg(not(..))]` that
+    /// doesn't (other `#[cfg]`s, by architecture say, are left out). Values that aren't
+    /// plain numbers are left out too.
+    fn feos_header_consts(paths: &[&str]) -> BTreeMap<String, i64> {
+        let mut out = BTreeMap::new();
+        for path in paths {
+            let text = fs::read_to_string(repo().join("ports/src/relibc/src/header").join(path)).unwrap();
+            let mut cfg: Option<String> = None;
+            for line in text.lines().map(str::trim) {
+                if line.starts_with("#[cfg(") {
+                    cfg = Some(line.to_string());
+                    continue;
+                }
+                let Some(rest) = line.strip_prefix("pub const ") else {
+                    // A `#[cfg]` holds over doc comments and other attributes only.
+                    if !(line.starts_with("//") || line.starts_with("#[")) {
+                        cfg = None;
+                    }
+                    continue;
+                };
+                let applies = match cfg.take() {
+                    None => true,
+                    Some(c) if c.starts_with("#[cfg(not(") => !c.contains("\"feos\""),
+                    Some(c) => c.contains("target_os = \"feos\""),
+                };
+                let (Some((name, _)), Some((_, value))) = (rest.split_once(':'), rest.split_once('=')) else {
+                    continue;
+                };
+                let value = value.trim().trim_end_matches(';').replace('_', "");
+                let parsed = match value.strip_prefix("0x") {
+                    Some(hex) => i64::from_str_radix(hex, 16).ok(),
+                    None => value.parse::<i64>().ok(),
+                };
+                if let (true, Some(v)) = (applies, parsed) {
+                    let old = out.insert(name.trim().to_string(), v);
+                    assert!(old.is_none() || old == Some(v), "{path}: two feos values of {name}");
+                }
+            }
+        }
+        out
+    }
+
+    /// Section 5's signal constants (`SA_*`, `SIG_BLOCK`.., `SS_*`, `MINSIGSTKSZ`,
+    /// `SIGSTKSZ`, `ITIMER_*`) and section 10.2's `PTHREAD_STACK_MIN`, as relibc's
+    /// headers give them to feos programs (and, through libc-check, the libc crate),
+    /// against the design; and the alternate stack's against the kernel's `ss` when
+    /// the base has it (stage 1c.9).
+    #[test]
+    fn header_constants_match_the_design() {
+        let path = env::var("FEOS_ABI_DOC")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| repo().join("docs/feos-abi-v2.md"));
+        let doc = fs::read_to_string(path).unwrap();
+        let ours = feos_header_consts(&[
+            "signal/constants.rs", "signal/mod.rs", "signal/feos.rs", "sys_time/mod.rs", "limits/mod.rs",
+        ]);
+        let start = doc.find("`SA_NOCLDSTOP` 1").expect("section 5's constants");
+        let end = doc[start..].find("\n\n").unwrap() + start;
+        let words: Vec<&str> = doc[start..end].split_whitespace().collect();
+        let mut seen = 0;
+        for pair in words.windows(2) {
+            let Some(name) = pair[0].strip_prefix('`').and_then(|n| n.strip_suffix('`')) else { continue };
+            let value = pair[1].trim_end_matches([',', '.']).replace('_', "");
+            let value = match value.strip_prefix("0x") {
+                Some(hex) => i64::from_str_radix(hex, 16).unwrap(),
+                None => value.parse::<i64>().unwrap(),
+            };
+            assert_eq!(ours.get(name), Some(&value), "section 5's `{name}` {value}");
+            seen += 1;
+        }
+        assert_eq!(seen, 18, "section 5's constants paragraph");
+        let min = doc.find("`PTHREAD_STACK_MIN` (").expect("section 10.2's PTHREAD_STACK_MIN");
+        let value = doc[min..].split(['(', ')']).nth(1).unwrap().parse::<i64>().unwrap();
+        assert_eq!(ours.get("PTHREAD_STACK_MIN"), Some(&value), "section 10.2's PTHREAD_STACK_MIN");
+        let kernel = kernel_lib();
+        if kernel.contains("pub mod ss {") {
+            let ss = consts_of(&kernel, "ss");
+            for name in ["MINSIGSTKSZ", "SIGSTKSZ"] {
+                assert_eq!(ours.get(name), ss.get(name), "{name} against the kernel's ss");
+            }
+            assert_eq!(ours.get("SS_ONSTACK"), ss.get("ONSTACK"));
+            assert_eq!(ours.get("SS_DISABLE"), ss.get("DISABLE"));
+            println!("signal stack sizes compared with the kernel's feos-abi");
+        }
+    }
+
     #[test]
     fn error_numbers_match_the_kernel() {
         let kernel = consts_of(&kernel_lib(), "errno");

@@ -36,9 +36,9 @@ pub const ABI_VERSION: u32 = 2;
 
 /// The stage feature mask (section 1 and the table in section 12 of
 /// `docs/feos-abi-v2.md`): bit `n` is set once stage `n` is in. Bits are never reused or
-/// cleared. Up to bit 20, stage 1c.10 (masks, `THREAD_KILL`, alternate stacks,
-/// interruption and restart, `SETITIMER`).
-pub const FEATURES: u64 = (1 << 21) - 1;
+/// cleared. Up to bit 24, stage 1e.1 (the random number generator, `GETRANDOM` and
+/// `CLOCK_SETTIME`).
+pub const FEATURES: u64 = (1 << 25) - 1;
 
 /// Most children a process may have that it hasn't reaped, running or ended: past this
 /// `SPAWN2` (and `FORK`) are `EAGAIN`.
@@ -357,6 +357,20 @@ pub mod nr {
     /// one. A regular file or a directory, any access mode (`EINVAL` for anything else);
     /// `ENOLCK` past the lock table's caps.
     pub const FLOCK: usize = 69;
+    /// `ioctl(fd, request, arg) -> value`: feos's own requests, from [`ioctl`](super::ioctl),
+    /// not Linux's. The terminal's ([`Termios`](super::Termios), [`WinSize`](super::WinSize),
+    /// the foreground group, drain, flush, flow, the session) are `ENOTTY` on anything but
+    /// a terminal, which is how `isatty` answers; [`ioctl::FD_NREAD`](super::ioctl::FD_NREAD)
+    /// works on pipes, files and the terminal. An unknown request is `EINVAL`.
+    pub const IOCTL: usize = 70;
+    /// `poll(fds: *mut [PollFd], count, timeout_ns, sigmask: *const u64) -> ready`: `count`
+    /// at most [`MAX_FDS`](super::MAX_FDS) (`EINVAL`); `timeout_ns` as an `i64`, negative
+    /// to wait forever and 0 not to wait; `sigmask` zero, or the mask to wait with
+    /// (`ppoll`). How many entries have a non-zero `revents`, 0 on timeout, `EINTR` if a
+    /// handler ran. A negative `fd` is skipped; a closed one is
+    /// [`poll::NVAL`](super::poll::NVAL). Level-triggered; `events` bits nothing reports
+    /// are accepted.
+    pub const POLL: usize = 71;
     /// `ftruncate(fd, length) -> 0`: a regular file open for writing.
     pub const FTRUNCATE: usize = 55;
     /// `fsync(fd, flags) -> 0`: flags zero, or [`FSYNC_DATA`](super::FSYNC_DATA) for
@@ -486,19 +500,36 @@ pub mod nr {
     /// zero `new` only reads; a zero `value` disarms; `usec` outside `0..1_000_000` (or a
     /// negative `sec`) is `EINVAL`. Kept across `EXEC`, not inherited by `SPAWN2`.
     pub const SETITIMER: usize = 108;
+    /// `fork() -> pid`, 0 in the child: a new process whose one thread is a copy of the
+    /// caller (registers, thread pointer, mask, alternate stack), with a copy of its
+    /// descriptor table sharing the open file descriptions, its dispositions, working
+    /// directory, umask, group and session, and its address space copied on write.
+    /// Nothing pending, no clear word, no interval timer, no window surface, no `fcntl`
+    /// locks. Every page the child could need a frame of its own for is promised at once
+    /// (`ENOMEM`); `EAGAIN` with no task free to programs or at [`MAX_CHILDREN`](super::MAX_CHILDREN).
+    pub const FORK: usize = 90;
+    /// `clock_settime(clock, time: *const Timespec) -> 0`: sets the wall clock, moving its
+    /// offset from the monotonic clock, which is untouched. [`clock::REALTIME`](super::clock::REALTIME)
+    /// only (`EINVAL`), a valid time (`EINVAL`), root only (`EPERM`). The RTC isn't
+    /// written. A `CLOCK_REALTIME` deadline already being waited for doesn't move.
+    pub const CLOCK_SETTIME: usize = 91;
+    /// `getrandom(buffer, length, flags) -> count`: bytes from the kernel's generator, up
+    /// to [`IO_CHUNK`](super::IO_CHUNK) per call; a request of 256 bytes or fewer is never
+    /// short. Until the generator is seeded it waits (`EAGAIN` with
+    /// [`grnd::NONBLOCK`](super::grnd::NONBLOCK), `EINTR` for a handler), except with
+    /// [`grnd::INSECURE`](super::grnd::INSECURE), which never waits and can't be given
+    /// with [`grnd::RANDOM`](super::grnd::RANDOM) (`EINVAL`).
+    pub const GETRANDOM: usize = 92;
     /// The first number of the calls `docs/feos-abi-v2.md` adds. Every number from here
     /// to [`LAST_RESERVED`] is taken, and is `ENOSYS` until the stage that brings it.
     pub const FIRST_V2: usize = 31;
     /// The last number `docs/feos-abi-v2.md` gives out.
     pub const LAST_RESERVED: usize = 108;
     /// The first reserved number with no call behind it yet.
-    pub const FIRST_UNIMPLEMENTED: usize = 70;
+    pub const FIRST_UNIMPLEMENTED: usize = 93;
     /// The calls past [`FIRST_UNIMPLEMENTED`] that have landed anyway, a stage having
     /// brought them ahead of the numbers before them.
-    pub const IMPLEMENTED_LATER: [usize; 20] = [
-        CLOSE_RANGE, SPAWN2, EXEC, WAIT4, GETPPID, GETPGID, SETPGID, GETSID, SETSID, GETRUSAGE, SYSINFO, KILL, THREAD_KILL,
-        SIGACTION, SIGPROCMASK, SIGALTSTACK, SIGPENDING, SIGSUSPEND, SIGRETURN, SETITIMER,
-    ];
+    pub const IMPLEMENTED_LATER: [usize; 2] = [CLOSE_RANGE, SETITIMER];
 
     /// Whether `number` is one the design reserves with no call behind it yet.
     pub const fn is_unimplemented(number: usize) -> bool {
@@ -739,6 +770,8 @@ pub mod errno {
     pub const ESRCH: isize = 3;
     /// The arguments and environment are too big (stage 1c.6).
     pub const E2BIG: isize = 7;
+    /// Not a terminal: a terminal's `IOCTL` on anything else (stage 1c.11).
+    pub const ENOTTY: isize = 25;
 }
 
 /// `O_*` flags of the v2 calls, and of `F_GETFL` and `F_SETFL`: Linux's values (the
@@ -886,6 +919,317 @@ impl Flock {
         out[8..16].copy_from_slice(&self.start.to_ne_bytes());
         out[16..24].copy_from_slice(&self.length.to_ne_bytes());
         out[24..28].copy_from_slice(&self.pid.to_ne_bytes());
+        out
+    }
+}
+
+/// Requests of [`nr::IOCTL`]: feos's own numbers, not Linux's (relibc translates `TCGETS`
+/// and the rest to these).
+pub mod ioctl {
+    /// `*mut Termios`: the terminal's settings (`tcgetattr`).
+    pub const TTY_GET_ATTR: usize = 1;
+    /// `*const Termios`: set them now (`TCSANOW`).
+    pub const TTY_SET_ATTR: usize = 2;
+    /// `*const Termios`: set them once output has drained (`TCSADRAIN`).
+    pub const TTY_SET_ATTR_DRAIN: usize = 3;
+    /// `*const Termios`: set them once output has drained, pending input dropped
+    /// (`TCSAFLUSH`).
+    pub const TTY_SET_ATTR_FLUSH: usize = 4;
+    /// `*mut WinSize`: the terminal's size.
+    pub const TTY_GET_WINSIZE: usize = 5;
+    /// `*const WinSize`: stored and reported, with `SIGWINCH` to the foreground group if
+    /// it changed.
+    pub const TTY_SET_WINSIZE: usize = 6;
+    /// `*mut i32`: the foreground process group.
+    pub const TTY_GET_PGRP: usize = 7;
+    /// `*const i32`: makes a group in the caller's session the foreground one (`EPERM`).
+    pub const TTY_SET_PGRP: usize = 8;
+    /// `*mut i32`: bytes a read would return now, of a pipe, the terminal or a file (its
+    /// size less the offset, at most `i32::MAX`). The one request that isn't the
+    /// terminal's alone.
+    pub const FD_NREAD: usize = 9;
+    /// 0: waits until what was written has gone out (`tcdrain`).
+    pub const TTY_DRAIN: usize = 10;
+    /// [`tc::IFLUSH`](super::tc::IFLUSH), [`tc::OFLUSH`](super::tc::OFLUSH) or
+    /// [`tc::IOFLUSH`](super::tc::IOFLUSH): drops pending input, output or both.
+    pub const TTY_FLUSH: usize = 11;
+    /// [`tc::OOFF`](super::tc::OOFF) to [`tc::ION`](super::tc::ION): suspends or resumes
+    /// output; the input ones are accepted and do nothing.
+    pub const TTY_FLOW: usize = 12;
+    /// `*mut i32`: the session the terminal belongs to (`tcgetsid`).
+    pub const TTY_GET_SID: usize = 13;
+    /// Whether `request` is one only a terminal answers: `ENOTTY` anywhere else.
+    pub const fn is_terminal_request(request: usize) -> bool {
+        matches!(request, 1..=8 | 10..=13)
+    }
+}
+
+/// [`PollFd`] `events` and `revents` bits: Linux's values.
+pub mod poll {
+    pub const IN: i16 = 0x1;
+    /// Never reported.
+    pub const PRI: i16 = 0x2;
+    pub const OUT: i16 = 0x4;
+    /// Reported whether asked for or not.
+    pub const ERR: i16 = 0x8;
+    /// Reported whether asked for or not.
+    pub const HUP: i16 = 0x10;
+    /// A descriptor that isn't open: reported whether asked for or not.
+    pub const NVAL: i16 = 0x20;
+    /// As [`IN`].
+    pub const RDNORM: i16 = 0x40;
+    /// Accepted, never reported.
+    pub const RDBAND: i16 = 0x80;
+    /// As [`OUT`].
+    pub const WRNORM: i16 = 0x100;
+    /// Accepted, never reported.
+    pub const WRBAND: i16 = 0x200;
+    /// Accepted, never reported.
+    pub const MSG: i16 = 0x400;
+    /// Accepted, never reported.
+    pub const RDHUP: i16 = 0x2000;
+}
+
+/// [`PollFd`]: Linux's `struct pollfd`. A Linux-layout struct with no padding.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct PollFd {
+    /// The descriptor; a negative one is skipped.
+    pub fd: i32,
+    /// What's asked for, from [`poll`].
+    pub events: i16,
+    /// What's so: what was asked for, and `ERR`, `HUP` and `NVAL` whatever was.
+    pub revents: i16,
+}
+
+const _: () = assert!(core::mem::size_of::<PollFd>() == 8);
+const _: () = assert!(core::mem::offset_of!(PollFd, fd) == 0);
+const _: () = assert!(core::mem::offset_of!(PollFd, events) == 4);
+const _: () = assert!(core::mem::offset_of!(PollFd, revents) == 6);
+
+impl PollFd {
+    /// Bytes of one, in user memory.
+    pub const SIZE: usize = 8;
+
+    /// From its bytes in memory, on both ports.
+    pub fn from_bytes(bytes: [u8; Self::SIZE]) -> Self {
+        Self {
+            fd: i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            events: i16::from_ne_bytes([bytes[4], bytes[5]]),
+            revents: i16::from_ne_bytes([bytes[6], bytes[7]]),
+        }
+    }
+
+    /// As it is in memory, on both ports.
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut out = [0u8; Self::SIZE];
+        out[0..4].copy_from_slice(&self.fd.to_ne_bytes());
+        out[4..6].copy_from_slice(&self.events.to_ne_bytes());
+        out[6..8].copy_from_slice(&self.revents.to_ne_bytes());
+        out
+    }
+}
+
+/// [`Termios`] flags, `cc` indexes and the arguments of [`ioctl::TTY_FLUSH`] and
+/// [`ioctl::TTY_FLOW`]: Linux's generic values, which are relibc's. Of the flags the
+/// terminal honours `ICRNL`, `OPOST | ONLCR`, `ISIG`, `ICANON`, `ECHO` and `ECHOE`, and
+/// `VMIN` and `VTIME` without `ICANON`; the rest are kept and reported as set.
+pub mod tc {
+    // `iflag`.
+    pub const IGNBRK: u32 = 0o1;
+    pub const BRKINT: u32 = 0o2;
+    pub const IGNPAR: u32 = 0o4;
+    pub const PARMRK: u32 = 0o10;
+    pub const INPCK: u32 = 0o20;
+    pub const ISTRIP: u32 = 0o40;
+    pub const INLCR: u32 = 0o100;
+    pub const IGNCR: u32 = 0o200;
+    /// A typed carriage return reads as a newline.
+    pub const ICRNL: u32 = 0o400;
+    pub const IXON: u32 = 0o2000;
+    pub const IXANY: u32 = 0o4000;
+    pub const IXOFF: u32 = 0o10000;
+    pub const IMAXBEL: u32 = 0o20000;
+    pub const IUTF8: u32 = 0o40000;
+    // `oflag`.
+    /// Output processing, of which there's [`ONLCR`].
+    pub const OPOST: u32 = 0o1;
+    /// A newline written goes out as a carriage return and a newline.
+    pub const ONLCR: u32 = 0o4;
+    // `cflag`.
+    pub const B38400: u32 = 0o17;
+    pub const CS8: u32 = 0o60;
+    pub const CREAD: u32 = 0o200;
+    pub const HUPCL: u32 = 0o2000;
+    pub const CLOCAL: u32 = 0o4000;
+    // `lflag`.
+    /// `VINTR`, `VQUIT` and `VSUSP` raise `SIGINT`, `SIGQUIT` and `SIGTSTP` on the
+    /// foreground group.
+    pub const ISIG: u32 = 0o1;
+    /// Lines: input is read a line at a time, edited by `VERASE` and `VKILL`, `VEOF`
+    /// ending it.
+    pub const ICANON: u32 = 0o2;
+    pub const ECHO: u32 = 0o10;
+    /// `VERASE` rubs out what it erased.
+    pub const ECHOE: u32 = 0o20;
+    pub const ECHOK: u32 = 0o40;
+    pub const ECHONL: u32 = 0o100;
+    pub const NOFLSH: u32 = 0o200;
+    /// Kept, not honoured: a background group may write.
+    pub const TOSTOP: u32 = 0o400;
+    pub const ECHOCTL: u32 = 0o1000;
+    pub const ECHOKE: u32 = 0o4000;
+    pub const IEXTEN: u32 = 0o100000;
+    // `cc` indexes.
+    pub const VINTR: usize = 0;
+    pub const VQUIT: usize = 1;
+    pub const VERASE: usize = 2;
+    pub const VKILL: usize = 3;
+    pub const VEOF: usize = 4;
+    pub const VTIME: usize = 5;
+    pub const VMIN: usize = 6;
+    pub const VSTART: usize = 8;
+    pub const VSTOP: usize = 9;
+    pub const VSUSP: usize = 10;
+    pub const VEOL: usize = 11;
+    pub const VREPRINT: usize = 12;
+    pub const VDISCARD: usize = 13;
+    pub const VWERASE: usize = 14;
+    pub const VLNEXT: usize = 15;
+    pub const VEOL2: usize = 16;
+    /// Entries of `cc`, as relibc's `NCCS`.
+    pub const NCCS: usize = 32;
+    // `TTY_FLUSH`'s queue.
+    pub const IFLUSH: usize = 0;
+    pub const OFLUSH: usize = 1;
+    pub const IOFLUSH: usize = 2;
+    // `TTY_FLOW`'s action.
+    pub const OOFF: usize = 0;
+    pub const OON: usize = 1;
+    pub const IOFF: usize = 2;
+    pub const ION: usize = 3;
+}
+
+/// Linux's `struct termios` as relibc lays it out: 60 bytes, the three bytes after `cc`
+/// C's padding. A Linux-layout struct: that padding is ignored on input and written as
+/// zero.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Termios {
+    pub iflag: u32,
+    pub oflag: u32,
+    pub cflag: u32,
+    pub lflag: u32,
+    pub line: u8,
+    /// Indexed by [`tc`]'s `V*` constants.
+    pub cc: [u8; tc::NCCS],
+    pub reserved: [u8; 3],
+    pub ispeed: u32,
+    pub ospeed: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<Termios>() == 60);
+const _: () = assert!(core::mem::offset_of!(Termios, iflag) == 0);
+const _: () = assert!(core::mem::offset_of!(Termios, oflag) == 4);
+const _: () = assert!(core::mem::offset_of!(Termios, cflag) == 8);
+const _: () = assert!(core::mem::offset_of!(Termios, lflag) == 12);
+const _: () = assert!(core::mem::offset_of!(Termios, line) == 16);
+const _: () = assert!(core::mem::offset_of!(Termios, cc) == 17);
+const _: () = assert!(core::mem::offset_of!(Termios, reserved) == 49);
+const _: () = assert!(core::mem::offset_of!(Termios, ispeed) == 52);
+const _: () = assert!(core::mem::offset_of!(Termios, ospeed) == 56);
+
+impl Default for Termios {
+    /// What a terminal starts with, as Linux's: lines, echo, signals, `ICRNL` and
+    /// `ONLCR`, the usual control characters, `VMIN` 1 and `VTIME` 0.
+    fn default() -> Self {
+        let mut cc = [0u8; tc::NCCS];
+        cc[tc::VINTR] = 0x03;
+        cc[tc::VQUIT] = 0x1c;
+        cc[tc::VERASE] = 0x7f;
+        cc[tc::VKILL] = 0x15;
+        cc[tc::VEOF] = 0x04;
+        cc[tc::VTIME] = 0;
+        cc[tc::VMIN] = 1;
+        cc[tc::VSTART] = 0x11;
+        cc[tc::VSTOP] = 0x13;
+        cc[tc::VSUSP] = 0x1a;
+        cc[tc::VREPRINT] = 0x12;
+        cc[tc::VDISCARD] = 0x0f;
+        cc[tc::VWERASE] = 0x17;
+        cc[tc::VLNEXT] = 0x16;
+        Self {
+            iflag: tc::ICRNL | tc::IXON | tc::IUTF8,
+            oflag: tc::OPOST | tc::ONLCR,
+            cflag: tc::B38400 | tc::CS8 | tc::CREAD | tc::HUPCL,
+            lflag: tc::ISIG | tc::ICANON | tc::ECHO | tc::ECHOE | tc::ECHOK | tc::ECHOCTL | tc::ECHOKE | tc::IEXTEN,
+            line: 0,
+            cc,
+            reserved: [0; 3],
+            ispeed: tc::B38400,
+            ospeed: tc::B38400,
+        }
+    }
+}
+
+impl Termios {
+    /// Bytes of one, in user memory.
+    pub const SIZE: usize = 60;
+
+    /// From its bytes in memory, on both ports, the padding dropped.
+    pub fn from_bytes(bytes: [u8; Self::SIZE]) -> Self {
+        let word = |at: usize| u32::from_ne_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+        let mut cc = [0u8; tc::NCCS];
+        cc.copy_from_slice(&bytes[17..17 + tc::NCCS]);
+        Self { iflag: word(0), oflag: word(4), cflag: word(8), lflag: word(12), line: bytes[16], cc, reserved: [0; 3], ispeed: word(52), ospeed: word(56) }
+    }
+
+    /// As it is in memory, on both ports, the padding zero.
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut out = [0u8; Self::SIZE];
+        out[0..4].copy_from_slice(&self.iflag.to_ne_bytes());
+        out[4..8].copy_from_slice(&self.oflag.to_ne_bytes());
+        out[8..12].copy_from_slice(&self.cflag.to_ne_bytes());
+        out[12..16].copy_from_slice(&self.lflag.to_ne_bytes());
+        out[16] = self.line;
+        out[17..17 + tc::NCCS].copy_from_slice(&self.cc);
+        out[52..56].copy_from_slice(&self.ispeed.to_ne_bytes());
+        out[56..60].copy_from_slice(&self.ospeed.to_ne_bytes());
+        out
+    }
+}
+
+/// Linux's `struct winsize`: a terminal's size in characters, and in pixels or 0.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct WinSize {
+    pub rows: u16,
+    pub columns: u16,
+    pub x_pixels: u16,
+    pub y_pixels: u16,
+}
+
+const _: () = assert!(core::mem::size_of::<WinSize>() == 8);
+const _: () = assert!(core::mem::offset_of!(WinSize, columns) == 2);
+const _: () = assert!(core::mem::offset_of!(WinSize, y_pixels) == 6);
+
+impl WinSize {
+    /// Bytes of one, in user memory.
+    pub const SIZE: usize = 8;
+
+    /// From its bytes in memory, on both ports.
+    pub fn from_bytes(bytes: [u8; Self::SIZE]) -> Self {
+        let half = |at: usize| u16::from_ne_bytes([bytes[at], bytes[at + 1]]);
+        Self { rows: half(0), columns: half(2), x_pixels: half(4), y_pixels: half(6) }
+    }
+
+    /// As it is in memory, on both ports.
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut out = [0u8; Self::SIZE];
+        out[0..2].copy_from_slice(&self.rows.to_ne_bytes());
+        out[2..4].copy_from_slice(&self.columns.to_ne_bytes());
+        out[4..6].copy_from_slice(&self.x_pixels.to_ne_bytes());
+        out[6..8].copy_from_slice(&self.y_pixels.to_ne_bytes());
         out
     }
 }
@@ -1145,6 +1489,20 @@ pub mod clock {
     pub const MONOTONIC_COARSE: usize = 6;
     /// `CLOCK_BOOTTIME`: [`MONOTONIC`], since the machine never suspends.
     pub const BOOTTIME: usize = 7;
+}
+
+/// Flags for [`nr::GETRANDOM`]. Linux's values.
+pub mod grnd {
+    /// `GRND_NONBLOCK`: `EAGAIN` rather than waiting for the generator to be seeded.
+    pub const NONBLOCK: usize = 1;
+    /// `GRND_RANDOM`: the same generator; accepted for what it says on Linux.
+    pub const RANDOM: usize = 2;
+    /// `GRND_INSECURE`: never waits, seeded or not.
+    pub const INSECURE: usize = 4;
+    /// Every flag there is.
+    pub const ALL: usize = NONBLOCK | RANDOM | INSECURE;
+    /// The most a request is never short of.
+    pub const NEVER_SHORT: usize = 256;
 }
 
 /// Flags for [`nr::NANOSLEEP`].
@@ -2390,8 +2748,12 @@ pub mod aux {
     pub const MINSIGSTKSZ: u64 = 51;
     /// [`ABI_VERSION`](super::ABI_VERSION).
     pub const FEOS_ABI: u64 = 0x6665_0001;
-    /// Bit 0: `AT_RANDOM`'s bytes came from the CSPRNG (clear before stage 1e.1).
+    /// Bit 0 ([`FEOS_FLAG_RANDOM`]): `AT_RANDOM`'s bytes came from the CSPRNG (clear
+    /// before stage 1e.1).
     pub const FEOS_FLAGS: u64 = 0x6665_0002;
+    /// [`FEOS_FLAGS`]'s bit 0: `AT_RANDOM` is the generator's (unseeded, it's what
+    /// `GRND_INSECURE` gives).
+    pub const FEOS_FLAG_RANDOM: u64 = 1;
     /// [`FEATURES`](super::FEATURES), as [`SysInfo::features`](super::SysInfo::features).
     pub const FEOS_FEATURES: u64 = 0x6665_0003;
     /// The program's canonical absolute path, NUL-terminated: what `CURRENT_EXE` says.
@@ -2458,6 +2820,7 @@ mod tests {
             (errno::ENFILE, 23), (errno::ESPIPE, 29), (errno::EFBIG, 27), (errno::EWOULDBLOCK, 11),
             (errno::ENOTDIR, 20), (errno::ENOTEMPTY, 39), (errno::ELOOP, 40), (errno::EILSEQ, 84),
             (errno::EROFS, 30), (errno::ERANGE, 34), (errno::EXDEV, 18), (errno::ENOLCK, 37), (errno::ESRCH, 3), (errno::E2BIG, 7),
+            (errno::ENOTTY, 25), (errno::ENXIO, 6),
         ];
         for (ours, theirs) in linux {
             assert_eq!(ours, theirs);
@@ -2488,7 +2851,11 @@ mod tests {
         assert_eq!((nr::FCHMODAT, nr::FCHOWNAT, nr::UTIMENSAT, nr::FACCESSAT), (51, 52, 53, 54));
         assert_eq!((nr::FSTATVFS, nr::SYNC), (67, 68));
         assert_eq!(nr::FLOCK, 69);
-        assert_eq!(nr::FIRST_UNIMPLEMENTED, nr::FLOCK + 1);
+        assert_eq!((nr::IOCTL, nr::POLL), (70, 71));
+        // Everything from 31 up to the sockets is in.
+        assert_eq!(nr::FIRST_UNIMPLEMENTED, nr::GETRANDOM + 1);
+        assert_eq!(nr::FORK, 90);
+        assert!(!nr::is_unimplemented(nr::FORK));
         assert!(nr::FIRST_UNIMPLEMENTED <= nr::LAST_RESERVED);
         assert_eq!((nr::DUP3, nr::FCNTL, nr::PIPE2, nr::CLOSE_RANGE), (59, 60, 61, 107));
         assert_eq!((nr::OPENAT, nr::FSTATAT, nr::GETDENTS, nr::MKDIRAT, nr::UNLINKAT), (42, 43, 44, 45, 46));
@@ -2497,7 +2864,8 @@ mod tests {
         assert!(!nr::is_unimplemented(nr::NANOSLEEP) && !nr::is_unimplemented(nr::UNLINKAT));
         assert!(nr::is_unimplemented(nr::FIRST_UNIMPLEMENTED));
         assert!(!nr::is_unimplemented(54) && !nr::is_unimplemented(67) && !nr::is_unimplemented(68));
-        assert!(!nr::is_unimplemented(69) && nr::is_unimplemented(70) && nr::is_unimplemented(106) && !nr::is_unimplemented(nr::LAST_RESERVED));
+        assert!(!nr::is_unimplemented(69) && !nr::is_unimplemented(70) && !nr::is_unimplemented(71));
+        assert!(nr::is_unimplemented(106) && !nr::is_unimplemented(nr::LAST_RESERVED));
         assert!(!nr::is_unimplemented(58) && !nr::is_unimplemented(62) && !nr::is_unimplemented(66));
         assert_eq!((nr::SPAWN2, nr::GETPPID, nr::GETPGID, nr::SETPGID, nr::GETSID, nr::SETSID), (72, 75, 76, 77, 78, 79));
         assert_eq!((nr::GETRUSAGE, nr::SYSINFO), (80, 81));
@@ -2506,7 +2874,7 @@ mod tests {
         assert!(!nr::is_unimplemented(nr::KILL) && !nr::is_unimplemented(83) && !nr::is_unimplemented(84));
         assert_eq!((nr::SIGACTION, nr::SIGRETURN), (84, 89));
         assert_eq!((nr::THREAD_KILL, nr::SIGPROCMASK, nr::SIGALTSTACK, nr::SIGPENDING, nr::SIGSUSPEND, nr::SETITIMER), (83, 85, 86, 87, 88, 108));
-        assert!((83..=89).all(|number| !nr::is_unimplemented(number)) && nr::is_unimplemented(90) && !nr::is_unimplemented(108));
+        assert!((83..=92).all(|number| !nr::is_unimplemented(number)) && nr::is_unimplemented(93) && !nr::is_unimplemented(108));
         for number in nr::IMPLEMENTED_LATER {
             assert!(number > nr::FIRST_UNIMPLEMENTED && !nr::is_unimplemented(number));
         }
@@ -2752,6 +3120,15 @@ mod tests {
     }
 
     #[test]
+    fn randomness_and_settime_are_linuxs() {
+        assert_eq!((nr::CLOCK_SETTIME, nr::GETRANDOM), (91, 92));
+        assert_eq!((grnd::NONBLOCK, grnd::RANDOM, grnd::INSECURE), (1, 2, 4));
+        assert_eq!((sysinfo::RNG_SEEDED, sysinfo::RNG_TRUSTED), (2, 4));
+        assert_eq!(aux::FEOS_FLAG_RANDOM, 1);
+        assert!(!nr::is_unimplemented(nr::GETRANDOM) && nr::is_unimplemented(93));
+    }
+
+    #[test]
     fn signals_and_wait_statuses_are_linuxs() {
         assert_eq!((sig::HUP, sig::INT, sig::KILL, sig::SEGV, sig::TERM, sig::CHLD), (1, 2, 9, 11, 15, 17));
         assert_eq!((sig::CONT, sig::STOP, sig::TSTP, sig::TTIN, sig::TTOU, sig::WINCH), (18, 19, 20, 21, 22, 28));
@@ -2765,10 +3142,37 @@ mod tests {
     }
 
     #[test]
+    fn terminal_structs_and_values_are_linuxs() {
+        assert_eq!((poll::IN, poll::PRI, poll::OUT, poll::ERR, poll::HUP, poll::NVAL), (1, 2, 4, 8, 0x10, 0x20));
+        assert_eq!((poll::RDNORM, poll::RDBAND, poll::WRNORM, poll::WRBAND, poll::MSG, poll::RDHUP), (0x40, 0x80, 0x100, 0x200, 0x400, 0x2000));
+        let entry = PollFd { fd: -7, events: poll::IN | poll::OUT, revents: poll::HUP };
+        // SAFETY: a `repr(C)` struct of integers with no padding.
+        let bytes: [u8; PollFd::SIZE] = unsafe { core::mem::transmute(entry) };
+        assert_eq!(entry.to_bytes(), bytes);
+        assert_eq!(PollFd::from_bytes(bytes), entry);
+        assert_eq!((tc::ICRNL, tc::OPOST, tc::ONLCR, tc::ISIG, tc::ICANON, tc::ECHO, tc::ECHOE), (0o400, 1, 4, 1, 2, 0o10, 0o20));
+        assert_eq!((tc::VINTR, tc::VQUIT, tc::VERASE, tc::VKILL, tc::VEOF, tc::VTIME, tc::VMIN, tc::VSUSP), (0, 1, 2, 3, 4, 5, 6, 10));
+        let mut termios = Termios { cc: [9; tc::NCCS], ..Termios::default() };
+        termios.lflag = 0x1234_5678;
+        let mut bytes = termios.to_bytes();
+        // SAFETY: as above; the padding is zero here.
+        assert_eq!(bytes, unsafe { core::mem::transmute::<Termios, [u8; Termios::SIZE]>(termios) });
+        bytes[50] = 0xee;
+        assert_eq!(Termios::from_bytes(bytes), termios, "the padding after cc is ignored");
+        let size = WinSize { rows: 24, columns: 80, x_pixels: 1, y_pixels: 2 };
+        // SAFETY: as above.
+        let bytes: [u8; WinSize::SIZE] = unsafe { core::mem::transmute(size) };
+        assert_eq!(size.to_bytes(), bytes);
+        assert_eq!(WinSize::from_bytes(bytes), size);
+        assert!(ioctl::is_terminal_request(ioctl::TTY_GET_ATTR) && ioctl::is_terminal_request(ioctl::TTY_GET_SID));
+        assert!(!ioctl::is_terminal_request(ioctl::FD_NREAD) && !ioctl::is_terminal_request(14) && !ioctl::is_terminal_request(0));
+    }
+
+    #[test]
     fn features_cover_every_stage_so_far() {
-        // 1a.1 to 1c.10: bits 0 to 20, and nothing beyond.
-        assert_eq!(FEATURES.count_ones(), 21);
-        assert_eq!(FEATURES >> 21, 0);
+        // 1a.1 to 1e.1: bits 0 to 24, and nothing beyond.
+        assert_eq!(FEATURES.count_ones(), 25);
+        assert_eq!(FEATURES >> 25, 0);
     }
 
     #[test]

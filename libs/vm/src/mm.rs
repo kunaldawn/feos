@@ -10,14 +10,37 @@
 //! `charged` without frames, which is exactly what this space holds in [`Promises`].
 //!
 //! A private charged range's share of `unbacked` is its pages less the frames of its
-//! own it has; a shared object's is its pages less its frames, counted once, by the
-//! space that made it. Every change below keeps both in step.
+//! own it has. Every change below keeps both in step.
+//!
+//! A shared-anonymous object's promise is the object's own (see [`SharedAnon`]), since
+//! after a fork several spaces map it and any of them may touch a page or be the last to
+//! let it go. What it counts against a space's limit is kept per space, in the space's
+//! list of the objects it maps: the object's pages while it's charged, otherwise the
+//! frames this space's touches made for it, and its heap; a space's count goes when its
+//! last mapping of the object does.
+//!
+//! # Fork
+//!
+//! [`Mm::fork`] copies a space for a child. Shared mappings share their object or file;
+//! a private page with a frame of the space's own is shared copy-on-write, both entries
+//! read-only with the [`COW`](crate::COW) bit, and the frame's map count raised; a
+//! private page some copy of the kernel's has pinned while it's writable is copied for
+//! the child at once, so what the kernel writes through the pin can't show up there.
+//!
+//! Charging follows frames, not spaces: every extra reference a fork adds to a frame of a
+//! space's own holds one promise, so the debt is always the sum over such frames of their
+//! map count less one, beside every charged page without a frame. The first write to a
+//! shared frame copies it with that promise; a space letting go of one that another
+//! still has gives one back ([`FrameSource::put_shared`] says which, in one step); the
+//! last reference gives back nothing more. So whoever writes first, its copy was
+//! promised. A frame at map count one, pinned by nothing, is taken back in place by a
+//! write; a page-cache frame never is, as it's the file's.
 
 use alloc::vec::Vec;
 
 use crate::shared::{ObjectRef, SharedAnon};
 use crate::vma::{Backing, Prot, Vma, VmaList};
-use crate::{AddressSpace, Entry, FileKey, FileRef, FrameSource, PageBits, Promises, PAGE_SIZE};
+use crate::{AddressSpace, Entry, FileKey, FileRef, FrameSource, PageBits, Promises, LEAF_SPAN, PAGE_SIZE};
 
 /// What a fault, or a copy the kernel is about to make, wants to do with a page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -226,28 +249,112 @@ pub struct Mm {
     unbacked: usize,
     /// Frames the kernel holds for the process outside the space: see [`hold`](Self::hold).
     held: usize,
-    /// Heap the shared objects this space made hold, by [`SharedAnon::heap_cost`].
-    object_heap: usize,
+    /// The shared objects it maps, each once, what each counts here, and their heap.
+    objects: Objects,
 }
 
-/// The entry a page of `frame` gets under `prot`. The zero frame and the page cache's
-/// frames (`cached`) are never writable through it.
-fn page_entry(frame: usize, prot: Prot, zero: usize, cached: bool) -> Entry {
+/// The entry a page of `frame` gets under `prot`. The zero frame, the page cache's
+/// frames (`cached`) and frames shared copy-on-write (`cow`) are never writable through
+/// it.
+fn page_entry(frame: usize, prot: Prot, zero: usize, cached: bool, cow: bool) -> Entry {
     if prot.is_none() {
-        return Entry::Hidden { frame, cached };
+        return Entry::Hidden { frame, cached, cow };
     }
     Entry::Present {
         frame,
-        writable: prot.write && frame != zero && !cached,
+        writable: prot.write && frame != zero && !cached && !cow,
         executable: prot.exec,
         cached,
+        cow,
     }
 }
 
 /// The entry of a writable shared mapping's page of the cache once it's dirty: the one
 /// entry of the cache's frames that's writable.
 const fn dirty_entry(frame: usize, prot: Prot) -> Entry {
-    Entry::Present { frame, writable: true, executable: prot.exec, cached: true }
+    Entry::Present { frame, writable: true, executable: prot.exec, cached: true, cow: false }
+}
+
+/// Whether an entry's frame is shared copy-on-write.
+const fn entry_cow(entry: Entry) -> bool {
+    matches!(entry, Entry::Present { cow: true, .. } | Entry::Hidden { cow: true, .. })
+}
+
+/// The same entry, marked as shared copy-on-write: read-only, whatever its range is.
+const fn shared_entry(entry: Entry) -> Entry {
+    match entry {
+        Entry::Present { frame, executable, cached, .. } => Entry::Present { frame, writable: false, executable, cached, cow: true },
+        Entry::Hidden { frame, cached, .. } => Entry::Hidden { frame, cached, cow: true },
+        Entry::Empty => Entry::Empty,
+    }
+}
+
+/// A shared object a space maps, and what it counts against that space's limit: its
+/// pages while it's charged, otherwise the frames this space's touches made for it.
+/// Named by its address, which stays the object's while any VMA of the space holds it.
+#[derive(Debug, Clone, Copy)]
+struct Attributed {
+    object: usize,
+    charged: usize,
+    owned: usize,
+    /// The space's VMAs that map part of it: it stops counting here with the last.
+    pieces: usize,
+}
+
+/// The shared objects a space maps, each once, sorted by address so a fault, a split or
+/// an unmap finds one in a few steps however many there are, and what they count here.
+#[derive(Debug, Default)]
+struct Objects {
+    list: Vec<Attributed>,
+    /// The sums of their counts, which `charged` and `owned` add.
+    charged: usize,
+    owned: usize,
+    /// Heap they hold, by [`SharedAnon::heap_cost`].
+    heap: usize,
+}
+
+impl Objects {
+    fn find(&mut self, object: usize) -> Option<&mut Attributed> {
+        let at = self.list.binary_search_by_key(&object, |counted| counted.object).ok()?;
+        self.list.get_mut(at)
+    }
+
+    /// Counts `object` here, if it isn't already: `charged` pages, and its heap. Room in
+    /// the list must have been made.
+    fn attribute(&mut self, object: &ObjectRef, charged: usize) {
+        let address = ObjectRef::as_ptr(object) as usize;
+        let Err(at) = self.list.binary_search_by_key(&address, |counted| counted.object) else {
+            return;
+        };
+        debug_assert!(self.list.len() < self.list.capacity(), "no room made for an object");
+        self.list.insert(at, Attributed { object: address, charged, owned: 0, pieces: 0 });
+        self.charged += charged;
+        self.heap += SharedAnon::heap_cost(object.pages());
+    }
+
+    /// One more or one fewer VMA of this space maps part of the object `vma` does, if
+    /// it's a shared one: the last going takes what the object counted here with it.
+    fn piece(&mut self, vma: &Vma, more: bool) {
+        let Backing::Shared { object, .. } = &vma.backing else {
+            return;
+        };
+        let address = ObjectRef::as_ptr(object) as usize;
+        let Ok(at) = self.list.binary_search_by_key(&address, |counted| counted.object) else {
+            return;
+        };
+        let counted = &mut self.list[at];
+        if more {
+            counted.pieces += 1;
+            return;
+        }
+        counted.pieces -= 1;
+        if counted.pieces == 0 {
+            let counted = self.list.remove(at);
+            self.charged -= counted.charged;
+            self.owned -= counted.owned;
+            self.heap -= SharedAnon::heap_cost(object.pages());
+        }
+    }
 }
 
 const fn allowed(prot: Prot, access: Access) -> bool {
@@ -258,8 +365,19 @@ const fn allowed(prot: Prot, access: Access) -> bool {
 const fn entry_frame(entry: Entry) -> Option<(usize, bool, bool)> {
     match entry {
         Entry::Present { frame, cached, .. } => Some((frame, true, cached)),
-        Entry::Hidden { frame, cached } => Some((frame, false, cached)),
+        Entry::Hidden { frame, cached, .. } => Some((frame, false, cached)),
         Entry::Empty => None,
+    }
+}
+
+/// Lets go of an entry's reference to a frame of a space's own. One a fork left another
+/// space sharing gives back the promise its extra reference held (see [`Mm::fork`]); the
+/// last reference is an ordinary put.
+fn put_own(frames: &mut dyn FrameSource, promises: &Promises, frame: usize) {
+    if frames.put_shared(frame) {
+        promises.release(1);
+    } else {
+        frames.put(frame);
     }
 }
 
@@ -279,7 +397,7 @@ impl Mm {
             owned: 0,
             unbacked: 0,
             held: 0,
-            object_heap: 0,
+            objects: Objects::default(),
         })
     }
 
@@ -298,19 +416,35 @@ impl Mm {
         &self.vmas
     }
 
-    /// Pages promised to this space.
+    /// Pages promised to this space, a charged shared object's among them.
     pub const fn charged(&self) -> usize {
-        self.charged
+        self.charged + self.objects.charged
     }
 
     /// Frames this space has that no promise covers.
     pub const fn owned(&self) -> usize {
-        self.owned
+        self.owned + self.objects.owned
     }
 
     /// Of the pages promised, those still without frames: what this space holds in
-    /// [`Promises`].
-    pub const fn unbacked(&self) -> usize {
+    /// [`Promises`], with the promises of the charged objects it maps. An object shared
+    /// with another space after a fork is in both spaces' counts, but promised once.
+    pub fn unbacked(&self) -> usize {
+        self.unbacked + self.objects.list.iter().filter(|counted| counted.charged > 0).map(|counted| {
+            // SAFETY: an object in the list is one a VMA of this space holds a reference
+            // to, and the list loses it before the last such VMA goes.
+            let object = unsafe { &*(counted.object as *const SharedAnon) };
+            if object.charged() {
+                object.pages() - object.frames()
+            } else {
+                0
+            }
+        }).sum::<usize>()
+    }
+
+    /// Of the pages promised, those of private ranges without frames: this space's own
+    /// share of [`Promises`], whatever objects it maps.
+    pub const fn private_unbacked(&self) -> usize {
         self.unbacked
     }
 
@@ -321,7 +455,14 @@ impl Mm {
 
     /// Heap the shared objects this space made hold, besides their leaves.
     pub const fn object_heap(&self) -> usize {
-        self.object_heap
+        self.objects.heap
+    }
+
+    /// Pages this space has frames for, as far as it's cheap to say: its private pages'
+    /// frames, and those its touches made for uncharged objects. For `maxrss`, on every
+    /// fault, so a charged object's frames, which any sharer may have made, aren't counted.
+    pub const fn resident(&self) -> usize {
+        (self.charged - self.unbacked) + self.owned + self.objects.owned
     }
 
     /// Frames the kernel holds for the process outside the space.
@@ -331,7 +472,7 @@ impl Mm {
 
     /// What counts against the limit: pages charged or owned, tables, and frames held.
     pub const fn committed(&self) -> usize {
-        self.charged + self.owned + self.space.tables() + self.held
+        self.charged() + self.owned() + self.space.tables() + self.held
     }
 
     /// Counts `pages` frames the kernel takes for the process outside the space (a
@@ -467,10 +608,51 @@ impl Mm {
             self.space.set(page, Entry::Empty);
             (ctx.flush)(page);
         }
-        self.space.set(page, page_entry(frame, prot, self.zero, false));
+        self.space.set(page, page_entry(frame, prot, self.zero, false, false));
         // A page of the cache's that the copy replaces lets go of it.
         if let Some((old_frame, _, true)) = entry_frame(old) {
             ctx.frames.put(old_frame);
+        }
+        Ok(())
+    }
+
+    /// The first write to a private page whose frame a fork shared. Nothing else maps it
+    /// any more, and no copy is in flight through it: the frame is this space's again,
+    /// written in place (nothing else can come to map it but a fork of this space, which
+    /// would need its lock). Otherwise a copy, which the promise the extra reference held
+    /// pays for; a frame only this space maps, that a copy in flight keeps it from taking
+    /// back, has its copy promised now.
+    fn break_cow(&mut self, page: usize, frame: usize, prot: Prot, ctx: &mut Ctx<'_>) -> Result<(), FaultError> {
+        let own = |frame: usize| Entry::Present { frame, writable: prot.write, executable: prot.exec, cached: false, cow: false };
+        let sole = ctx.frames.maps(frame) == 1;
+        if sole && ctx.frames.pins(frame) == 0 {
+            self.space.set(page, own(frame));
+            (ctx.flush)(page);
+            return Ok(());
+        }
+        if sole && !ctx.promises.promise(1, ctx.frames.free_count()) {
+            return Err(FaultError::Bus);
+        }
+        let copy = ctx.frames.alloc();
+        if sole {
+            ctx.promises.release(1);
+        }
+        let copy = copy.ok_or(FaultError::Bus)?;
+        // The frame can't change meanwhile: while this space still has its reference, the
+        // others that share it can only copy it too.
+        // SAFETY: both are frames a page long: one just given, the other one this space's
+        // entry holds a reference to.
+        unsafe { core::ptr::copy_nonoverlapping(frame as *const u8, copy as *mut u8, PAGE_SIZE) };
+        // Break before make, as in `own_page`.
+        self.space.set(page, Entry::Empty);
+        (ctx.flush)(page);
+        self.space.set(page, own(copy));
+        // The reference goes. If another space still has the frame, the promise this one
+        // held is what the copy used; if not, the frame goes once no CPU can reach it.
+        if ctx.frames.put_shared(frame) {
+            ctx.promises.release(1);
+        } else {
+            ctx.frames.put(frame);
         }
         Ok(())
     }
@@ -515,6 +697,10 @@ impl Mm {
                 // The first write to a private page of a file: a copy of the space's own.
                 self.own_page(page, prot, charged, Some(frame), ctx)
             }
+            (Entry::Present { frame, cow: true, .. }, Source::Private | Source::File(_, _, false)) if access.write => {
+                // The first write to a frame a fork shares: a copy, or the frame back.
+                self.break_cow(page, frame, prot, ctx)
+            }
             (Entry::Present { frame, cached: true, writable: false, .. }, Source::File(file, index, true)) if access.write => {
                 // The first write through a writable shared mapping since the page was
                 // mapped: dirty before the entry lets it be written, so write-back knows.
@@ -529,7 +715,7 @@ impl Mm {
                 let Some((frame, _, cached)) = entry_frame(old) else {
                     return Ok(());
                 };
-                let mut new = page_entry(frame, prot, self.zero, cached);
+                let mut new = page_entry(frame, prot, self.zero, cached, entry_cow(old));
                 // A shared page made writable by a write stays so while its range is.
                 if let (Entry::Present { writable: true, cached: true, .. }, Entry::Present { writable, .. }) = (old, &mut new) {
                     *writable = prot.write;
@@ -547,22 +733,47 @@ impl Mm {
                 if !self.tables_for(page, ctx) {
                     return Err(FaultError::Bus);
                 }
-                self.space.set(page, page_entry(self.zero, prot, self.zero, false));
+                self.space.set(page, page_entry(self.zero, prot, self.zero, false, false));
                 Ok(())
             }
             (Entry::Empty, Source::Object(object, index)) => {
                 if !self.tables_for(page, ctx) {
                     return Err(FaultError::Bus);
                 }
-                let object_charged = object.charged();
                 let fits = self.fits(1);
-                let (owned, unbacked) = (&mut self.owned, &mut self.unbacked);
-                let mut make = || Self::alloc_page(object_charged, (&mut *owned, &mut *unbacked), fits, ctx);
-                let (frame, _) = object.frame_or_make(index, &mut make).map_err(|_| FaultError::Bus)?;
+                let mut uncharged = false;
+                // A charged object's page takes its frame from the object's promise; an
+                // uncharged one's is promised now, and counts against this space's limit.
+                let mut make = |charged: bool| {
+                    let frame = if charged {
+                        let frame = ctx.frames.alloc()?;
+                        ctx.promises.release(1);
+                        frame
+                    } else {
+                        if !fits || !ctx.promises.promise(1, ctx.frames.free_count()) {
+                            return None;
+                        }
+                        let frame = ctx.frames.alloc();
+                        ctx.promises.release(1);
+                        uncharged = true;
+                        frame?
+                    };
+                    // SAFETY: the source just gave this frame, and it's a page long.
+                    unsafe { core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE) };
+                    Some(frame)
+                };
+                let (frame, made) = object.frame_or_make(index, &mut make).map_err(|_| FaultError::Bus)?;
+                if made && uncharged {
+                    let address = ObjectRef::as_ptr(&object) as usize;
+                    if let Some(counted) = self.objects.find(address) {
+                        counted.owned += 1;
+                        self.objects.owned += 1;
+                    }
+                }
                 if !ctx.frames.get(frame) {
                     return Err(FaultError::Bus);
                 }
-                self.space.set(page, page_entry(frame, prot, self.zero, false));
+                self.space.set(page, page_entry(frame, prot, self.zero, false, false));
                 Ok(())
             }
             (Entry::Empty, Source::File(file, index, shared)) => {
@@ -587,7 +798,7 @@ impl Mm {
                     self.space.set(page, dirty_entry(frame, prot));
                     return Ok(());
                 }
-                self.space.set(page, page_entry(frame, prot, self.zero, true));
+                self.space.set(page, page_entry(frame, prot, self.zero, true, false));
                 Ok(())
             }
         }
@@ -784,7 +995,8 @@ impl Mm {
         let anonymous_shared = request.shared && request.file.is_none();
         let heap = if anonymous_shared { SharedAnon::heap_cost(pages) } else { 0 };
         let object = if anonymous_shared {
-            let room = self.object_heap.checked_add(heap).is_some_and(|total| total <= self.layout.object_heap_limit);
+            let room = self.objects.heap.checked_add(heap).is_some_and(|total| total <= self.layout.object_heap_limit)
+                && self.objects.list.try_reserve(1).is_ok();
             let object = room.then(|| SharedAnon::new(pages, charged)).flatten().and_then(ObjectRef::new);
             if object.is_none() {
                 if charged {
@@ -816,12 +1028,16 @@ impl Mm {
         if replace {
             self.remove(start, end, ctx);
         }
-        if charged {
-            self.charged += pages;
-            self.unbacked += pages;
+        match &backing {
+            // The object's promise is its own; this space counts its pages, and its heap.
+            Backing::Shared { object, .. } => self.objects.attribute(object, if charged { pages } else { 0 }),
+            _ if charged => {
+                self.charged += pages;
+                self.unbacked += pages;
+            }
+            _ => {}
         }
-        self.object_heap += heap;
-        self.vmas.insert(Vma {
+        let vma = Vma {
             start,
             end,
             prot: request.prot,
@@ -830,7 +1046,10 @@ impl Mm {
             noreserve: request.noreserve,
             image: request.image,
             written: request.prot.write,
-        });
+        };
+        self.objects.piece(&vma, true);
+        let objects = &mut self.objects;
+        self.vmas.insert(vma, &mut |joined| objects.piece(joined, false));
         if replace {
             self.sweep(start, end, ctx);
         }
@@ -888,7 +1107,7 @@ impl Mm {
         self.owned += pages;
         let mut page = start;
         while page < end {
-            let entry = Entry::Present { frame: first_frame + (page - start), writable: true, executable: false, cached: false };
+            let entry = Entry::Present { frame: first_frame + (page - start), writable: true, executable: false, cached: false, cow: false };
             self.space.set(page, entry);
             page += PAGE_SIZE;
         }
@@ -901,7 +1120,7 @@ impl Mm {
             noreserve: false,
             image: false,
             written: true,
-        });
+        }, &mut |_| {});
         Ok(start)
     }
 
@@ -917,23 +1136,33 @@ impl Mm {
         Ok(())
     }
 
+    /// Splits the VMA holding `at` so that one starts there, as [`VmaList::split`] does,
+    /// counting a new piece of a shared object.
+    fn split(&mut self, at: usize) {
+        if let Some(high) = self.vmas.split(at) {
+            self.objects.piece(high, true);
+        }
+    }
+
     /// Takes `[start, end)` out of the VMAs and gives back what its pages hold. Room for
     /// the splits must have been made.
     fn remove(&mut self, start: usize, end: usize, ctx: &mut Ctx<'_>) {
-        self.vmas.split(start);
-        self.vmas.split(end);
+        self.split(start);
+        self.split(end);
         let range = self.vmas.overlapping(start, end);
         for index in range.clone() {
             if let Some(vma) = self.vmas.get(index).cloned() {
                 self.drop_pages(&vma, ctx);
             }
         }
-        let counts = (&mut self.charged, &mut self.owned, &mut self.unbacked, &mut self.object_heap);
         for vma in self.vmas.drain(range) {
+            // An object whose last mapping here this is stops counting here.
+            self.objects.piece(&vma, false);
             if let Backing::Shared { object, .. } = vma.backing {
-                // The last reference: the object goes with its last mapping.
-                if ObjectRef::count(&object) == 1 {
-                    Self::object_gone(&object, (&mut *counts.0, &mut *counts.1, &mut *counts.2, &mut *counts.3), ctx);
+                // The last reference: the object goes with its last mapping, whichever
+                // space that's in.
+                if let Some(last) = object.release() {
+                    last.release_all(ctx.frames, ctx.promises);
                 }
             }
         }
@@ -945,6 +1174,7 @@ impl Mm {
         let mut own = 0;
         let frames = &mut *ctx.frames;
         let flush = &mut *ctx.flush;
+        let promises = ctx.promises;
         let backing = &vma.backing;
         self.space.update(vma.start, vma.end, &mut |_, _| Entry::Empty, &mut |page, old, _| {
             let Some((frame, present, cached)) = entry_frame(old) else {
@@ -958,11 +1188,11 @@ impl Mm {
                 Backing::Private if frame == zero => {}
                 Backing::Private => {
                     own += 1;
-                    frames.put(frame);
+                    put_own(frames, promises, frame);
                 }
                 Backing::File { .. } if !cached => {
                     own += 1;
-                    frames.put(frame);
+                    put_own(frames, promises, frame);
                 }
                 Backing::Shared { .. } | Backing::File { .. } => frames.put(frame),
             }
@@ -990,22 +1220,6 @@ impl Mm {
                 file.unmap_shared_write(vma.pages());
             }
             file.remove_mapper(self.layout.space, vma.pages());
-        }
-    }
-
-    /// A shared object's last mapping has gone: its frames and its promise go too.
-    fn object_gone(object: &SharedAnon, counts: (&mut usize, &mut usize, &mut usize, &mut usize), ctx: &mut Ctx<'_>) {
-        let (charged, owned, unbacked, heap) = counts;
-        *heap -= SharedAnon::heap_cost(object.pages());
-        let was_charged = object.charged();
-        let frames = object.release_all(ctx.frames);
-        if was_charged {
-            let held = object.pages() - frames;
-            *unbacked -= held;
-            *charged -= object.pages();
-            ctx.promises.release(held);
-        } else {
-            *owned -= frames;
         }
     }
 
@@ -1164,24 +1378,50 @@ impl Mm {
             // SAFETY: each is an object a VMA of this space holds a reference to, and
             // nothing can drop a VMA while `self` is borrowed here.
             let object = unsafe { &*object };
-            let frames = object.frames();
             pages += object.pages();
-            covered += frames;
-            promise += object.pages() - frames;
+            // What this space's touches made of it, which it counts already.
+            covered += self.objects.find(object as *const SharedAnon as usize).map_or(0, |counted| counted.owned);
         }
-        drop(objects);
+        // Each object charges itself, its promise taken under its own lock (another space
+        // sharing it may be doing the same); undone if anything after fails.
+        let mut charged_here = 0;
+        let undo_objects = |objects: &[*const SharedAnon], count: usize, promises: &Promises| {
+            for &object in objects.iter().take(count) {
+                // SAFETY: as above.
+                unsafe { &*object }.uncharge(promises);
+            }
+        };
         if newly {
             let tables = self.space.tables_wanted(start, end);
             if !self.fits((pages - covered) + tables) || !ctx.promises.promise(promise, ctx.frames.free_count()) {
                 undo_exec(&self.vmas);
                 return Err(MmError::NoMemory);
             }
-            if !self.make_tables(start, end, ctx) {
+            let mut refused = false;
+            for index in 0..objects.len() {
+                let object = objects[index];
+                // SAFETY: as above.
+                match unsafe { &*object }.charge(ctx.promises, ctx.frames.free_count()) {
+                    Ok(true) => {
+                        // Those charged here come first, for the undo.
+                        objects.swap(charged_here, index);
+                        charged_here += 1;
+                    }
+                    Ok(false) => {}
+                    Err(()) => {
+                        refused = true;
+                        break;
+                    }
+                }
+            }
+            if refused || !self.make_tables(start, end, ctx) {
+                undo_objects(&objects, charged_here, ctx.promises);
                 ctx.promises.release(promise);
                 undo_exec(&self.vmas);
                 return Err(MmError::NoMemory);
             }
         }
+        drop(objects);
 
         // Nothing fails from here. The entries change first, so that a shared file piece
         // made read-only has no writable entry left when it stops counting as a writer.
@@ -1191,7 +1431,7 @@ impl Mm {
             start,
             end,
             &mut |_, old| match entry_frame(old) {
-                Some((frame, _, cached)) => page_entry(frame, prot, zero, cached),
+                Some((frame, _, cached)) => page_entry(frame, prot, zero, cached, entry_cow(old)),
                 None => old,
             },
             &mut |page, old, _| {
@@ -1200,8 +1440,8 @@ impl Mm {
                 }
             },
         );
-        self.vmas.split(start);
-        self.vmas.split(end);
+        self.split(start);
+        self.split(end);
         let range = self.vmas.overlapping(start, end);
         for index in range.clone() {
             let (piece_start, piece_end) = match self.vmas.get(index) {
@@ -1231,12 +1471,16 @@ impl Mm {
                         self.owned -= own;
                     }
                     Backing::Shared { object, .. } => {
-                        if !object.charged() {
-                            object.set_charged();
-                            let frames = object.frames();
-                            self.charged += object.pages();
-                            self.unbacked += object.pages() - frames;
-                            self.owned -= frames;
+                        // Charged now, by this call or another space's: here it counts its
+                        // pages from now on, in place of the frames this space made.
+                        let address = ObjectRef::as_ptr(object) as usize;
+                        if let Some(counted) = self.objects.find(address) {
+                            if counted.charged == 0 {
+                                counted.charged = object.pages();
+                                let owned = core::mem::take(&mut counted.owned);
+                                self.objects.charged += object.pages();
+                                self.objects.owned -= owned;
+                            }
                         }
                     }
                     Backing::Lent => {}
@@ -1246,7 +1490,8 @@ impl Mm {
             vma.prot = prot;
             vma.written |= prot.write;
         }
-        self.vmas.join_around(range.start, range.end);
+        let objects = &mut self.objects;
+        self.vmas.join_around(range.start, range.end, &mut |joined| objects.piece(joined, false));
         Ok(())
     }
 
@@ -1298,6 +1543,8 @@ impl Mm {
                 if vma.charged {
                     promises.hold(1);
                 }
+                put_own(frames, promises, frame);
+                return;
             }
             frames.put(frame);
         });
@@ -1333,27 +1580,222 @@ impl Mm {
         }
     }
 
+    /// A copy of this space for a forked child, which file reverse maps know as `space`
+    /// (see the module's Fork). Under this space's lock: `ctx.flush` forgets the entries
+    /// made read-only here, which this space's other threads may have cached, and
+    /// `ctx.frames` is where the child's frames and tables come from too.
+    ///
+    /// `ENOMEM` if the promises can't all be taken, or there's no frame for a copy or a
+    /// table, no heap for the lists, or a file's counts are full. Then nothing of the
+    /// child is left, and this space is as it was but for entries marked copy-on-write,
+    /// whose next write takes their frame back in place.
+    pub fn fork(&mut self, space: u32, ctx: &mut Ctx<'_>) -> Result<Mm, MmError> {
+        let layout = Layout { space, ..self.layout };
+        let mut child = Mm::new(ctx.frames, self.space.bits, layout, self.zero).ok_or(MmError::NoMemory)?;
+        if child.vmas.reserve(self.vmas.len()).is_err() || child.objects.list.try_reserve(self.objects.list.len()).is_err() {
+            child.destroy_with(ctx);
+            return Err(MmError::NoMemory);
+        }
+        // One promise for each page the child is charged for, and one for each frame of
+        // this space's own the child is about to share, or have a copy of.
+        let zero = self.zero;
+        let mut units = 0;
+        for vma in self.vmas.iter() {
+            if matches!(vma.backing, Backing::Private | Backing::File { shared: false, .. }) {
+                units += if vma.charged { vma.pages() } else { self.own_frames(vma.start, vma.end) };
+            }
+        }
+        if !ctx.promises.promise(units, ctx.frames.free_count()) {
+            child.destroy_with(ctx);
+            return Err(MmError::NoMemory);
+        }
+        // What's promised and not yet handed to the child: given back if it fails.
+        let mut left = units;
+        let failed = |child: Mm, left: usize, ctx: &mut Ctx<'_>| {
+            ctx.promises.release(left);
+            child.destroy_with(ctx);
+            Err(MmError::NoMemory)
+        };
+        for index in 0..self.vmas.len() {
+            let Some(vma) = self.vmas.get(index).cloned() else {
+                continue;
+            };
+            // The window surface isn't inherited: the child's is unmapped.
+            if matches!(vma.backing, Backing::Lent) {
+                continue;
+            }
+            let pages = vma.pages();
+            // A file's counts, as the mapping took them, for the child's copy of it.
+            if let Backing::File { file, .. } = &vma.backing {
+                let exec = vma.prot.exec;
+                let shared_write = vma.shared_file_writable();
+                if exec && file.map_exec(pages).is_err() {
+                    return failed(child, left, ctx);
+                }
+                if shared_write && file.map_shared_write(pages).is_err() {
+                    if exec {
+                        file.unmap_exec(pages);
+                    }
+                    return failed(child, left, ctx);
+                }
+                if !file.add_mapper(space, pages) {
+                    if exec {
+                        file.unmap_exec(pages);
+                    }
+                    if shared_write {
+                        file.unmap_shared_write(pages);
+                    }
+                    return failed(child, left, ctx);
+                }
+            }
+            // In the child from here, so a failure gives back what its pages have.
+            if child.vmas.reserve_for(vma.start, vma.end, 1, true).is_err() {
+                return failed(child, left, ctx);
+            }
+            match &vma.backing {
+                Backing::Shared { object, .. } => child.objects.attribute(object, if object.charged() { object.pages() } else { 0 }),
+                _ if vma.charged => {
+                    child.charged += pages;
+                    child.unbacked += pages;
+                    left -= pages;
+                }
+                _ => {}
+            }
+            child.objects.piece(&vma, true);
+            let objects = &mut child.objects;
+            child.vmas.insert(vma.clone(), &mut |joined| objects.piece(joined, false));
+            // A charged range's tables are made with it; an uncharged one's where this
+            // space has them, for the entries about to be copied into them.
+            let made = if vma.charged {
+                child.make_tables(vma.start, vma.end, ctx)
+            } else {
+                let mut at = vma.start;
+                let mut made = true;
+                while made && at < vma.end {
+                    if self.space.leaf_slot(at).is_some() {
+                        made = child.tables_for(at, ctx);
+                    }
+                    at = (at & !(LEAF_SPAN - 1)) + LEAF_SPAN;
+                }
+                made
+            };
+            if !made {
+                return failed(child, left, ctx);
+            }
+
+            // The entries: this space's own frames shared copy-on-write, or copied when a
+            // copy of the kernel's is in flight through them while they're writable; every
+            // other frame shared as it is.
+            let mut refused = false;
+            let mut own = 0;
+            let frames = &mut *ctx.frames;
+            let flush = &mut *ctx.flush;
+            let promises = ctx.promises;
+            let into = &mut child.space;
+            let private = matches!(vma.backing, Backing::Private | Backing::File { shared: false, .. });
+            let shared_file = vma.shared_file();
+            let prot = vma.prot;
+            self.space.update(
+                vma.start,
+                vma.end,
+                &mut |page, old| {
+                    let Some((frame, _, cached)) = entry_frame(old) else {
+                        return old;
+                    };
+                    if refused || into.leaf_slot(page).is_none() {
+                        refused = true;
+                        return old;
+                    }
+                    let (kept, given) = if private && frame != zero && !cached {
+                        let pinned_writable = matches!(old, Entry::Present { writable: true, .. }) && frames.pins(frame) > 0;
+                        if pinned_writable {
+                            let Some(copy) = frames.alloc() else {
+                                refused = true;
+                                return old;
+                            };
+                            // SAFETY: both are frames a page long: one just given, the
+                            // other one this space's entry holds.
+                            unsafe { core::ptr::copy_nonoverlapping(frame as *const u8, copy as *mut u8, PAGE_SIZE) };
+                            promises.release(1);
+                            (old, page_entry(copy, prot, zero, false, false))
+                        } else {
+                            if !frames.get(frame) {
+                                refused = true;
+                                return old;
+                            }
+                            (shared_entry(old), shared_entry(old))
+                        }
+                    } else if frame == zero {
+                        (old, old)
+                    } else {
+                        if !frames.get(frame) {
+                            refused = true;
+                            return old;
+                        }
+                        // A shared file's page comes read-only, so the child's first
+                        // write marks it dirty again for write-back.
+                        let given = if shared_file { page_entry(frame, prot, zero, true, false) } else { old };
+                        (old, given)
+                    };
+                    if private && frame != zero && !cached {
+                        own += 1;
+                    }
+                    into.set(page, given);
+                    kept
+                },
+                &mut |page, old, new| {
+                    if matches!(old, Entry::Present { writable: true, .. }) && !matches!(new, Entry::Present { writable: true, .. }) {
+                        flush(page);
+                    }
+                },
+            );
+            // Each frame given promised its page: from the range's charge, or from what's
+            // left.
+            if vma.charged {
+                child.unbacked -= own;
+            } else if private {
+                child.owned += own;
+                left -= own;
+            }
+            if refused {
+                return failed(child, left, ctx);
+            }
+        }
+        debug_assert_eq!(left, 0, "a fork promised more than it handed over");
+        ctx.promises.release(left);
+        Ok(child)
+    }
+
     /// Gives everything back: every page, object, promise and table. No CPU has these
     /// tables loaded any more, so nothing needs flushing.
-    pub fn destroy(mut self, frames: &mut dyn FrameSource, promises: &Promises) {
+    pub fn destroy(self, frames: &mut dyn FrameSource, promises: &Promises) {
         let mut flush = |_: usize| {};
         let mut files = NoFiles;
         let mut ctx = Ctx { frames, promises, flush: &mut flush, files: &mut files };
+        self.destroy_with(&mut ctx);
+    }
+
+    /// [`destroy`](Self::destroy), with what a change has: for a fork that failed part
+    /// way, whose child nothing has loaded.
+    fn destroy_with(mut self, ctx: &mut Ctx<'_>) {
         for index in 0..self.vmas.len() {
             if let Some(vma) = self.vmas.get(index).cloned() {
-                self.drop_pages(&vma, &mut ctx);
+                self.drop_pages(&vma, ctx);
             }
         }
-        let counts = (&mut self.charged, &mut self.owned, &mut self.unbacked, &mut self.object_heap);
         let all = 0..self.vmas.len();
         for vma in self.vmas.drain(all) {
+            self.objects.piece(&vma, false);
             if let Backing::Shared { object, .. } = vma.backing {
-                if ObjectRef::count(&object) == 1 {
-                    Self::object_gone(&object, (&mut *counts.0, &mut *counts.1, &mut *counts.2, &mut *counts.3), &mut ctx);
+                if let Some(last) = object.release() {
+                    last.release_all(ctx.frames, ctx.promises);
                 }
             }
         }
-        debug_assert_eq!((self.charged, self.owned, self.unbacked, self.held, self.object_heap), (0, 0, 0, 0, 0));
+        debug_assert_eq!(
+            (self.charged, self.owned, self.unbacked, self.held, self.objects.heap, self.objects.charged, self.objects.owned),
+            (0, 0, 0, 0, 0, 0, 0)
+        );
         // Anything left would be a bug above; the machine keeps its promises either way.
         ctx.promises.release(self.unbacked);
         self.space.destroy(ctx.frames);

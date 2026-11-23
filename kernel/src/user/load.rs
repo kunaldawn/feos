@@ -571,6 +571,9 @@ pub struct UserStart {
     /// Its descriptor table and working directory, as `SPAWN2` built them; otherwise
     /// the standard streams.
     files: Option<Files>,
+    /// The terminal the standard streams it's given are on, and which of them (a bit
+    /// each): from a kernel app's spawn, or v1's for a stream inherited from a terminal.
+    terminal: Option<(super::tty::TerminalRef, u8)>,
 }
 
 /// A copy of `text` on the heap, fallibly.
@@ -610,7 +613,13 @@ impl UserStart {
         strings: Staged,
         files: Option<Files>,
     ) -> Option<Box<Self>> {
-        Some(Box::new(Self { path: copy(path)?, image, given: copy(given)?, cwd: copy(cwd)?, umask, strings, files }))
+        Some(Box::new(Self { path: copy(path)?, image, given: copy(given)?, cwd: copy(cwd)?, umask, strings, files, terminal: None }))
+    }
+
+    /// Puts the standard streams `streams` names (a bit each) on `terminal`. With no
+    /// terminal, or no streams, they're the plain streams they always were.
+    pub fn set_terminal(&mut self, terminal: Option<super::tty::TerminalRef>, streams: u8) {
+        self.terminal = terminal.filter(|_| streams != 0).map(|terminal| (terminal, streams & 0b111));
     }
 }
 
@@ -626,7 +635,7 @@ pub fn start(slot: usize, start: Box<UserStart>) -> i32 {
 }
 
 fn load(slot: usize, start: Box<UserStart>) -> Result<(&'static Process, Frame), i32> {
-    let UserStart { path, image, given, cwd, umask, strings, files } = *start;
+    let UserStart { path, image, given, cwd, umask, strings, files, terminal } = *start;
     let Some(tree) = tree() else {
         say(format_args!("{path}: no filesystem"));
         return Err(feos_abi::EXIT_NOT_FOUND);
@@ -653,12 +662,12 @@ fn load(slot: usize, start: Box<UserStart>) -> Result<(&'static Process, Frame),
         Some(_) => None,
         None => tree.resolve_path(&cwd, true).ok().map(|found| found.canonical),
     };
-    let made = process::create(slot, super::current_pid(), home.as_deref().unwrap_or(&cwd), umask, &image.canonical, files);
+    let made = process::create(slot, super::current_pid(), home.as_deref().unwrap_or(&cwd), umask, &image.canonical, files, terminal);
     let Some(process) = made else {
         say(format_args!("{path}: out of memory"));
         return Err(feos_abi::EXIT_NOT_EXECUTABLE);
     };
-    let frame = build_image(slot, process.pid(), process.mm(), tree, &image, &strings, &given).map_err(refused)?;
+    let frame = build_image(slot, process.mm(), tree, &image, &strings, &given).map_err(refused)?;
     // The staged strings are in the program now.
     drop(strings);
     drop(image);
@@ -667,9 +676,9 @@ fn load(slot: usize, start: Box<UserStart>) -> Result<(&'static Process, Frame),
 
 /// Builds the image of the program `image` holds in `user`, a space nothing runs on yet:
 /// its segments, then its argument area and stack, with `strings` copied to the System V
-/// initial stack there, `given` as `AT_EXECFN`. The frame it starts from. `pid` is the
-/// process it's for, `slot` its thread.
-pub fn build_image(slot: usize, pid: u32, user: &UserMm, tree: &dyn VfsTree, image: &Image, strings: &Staged, given: &str) -> Result<Frame, Refused> {
+/// initial stack there, `given` as `AT_EXECFN`. The frame it starts from. `slot` is the
+/// thread it's for.
+pub fn build_image(slot: usize, user: &UserMm, tree: &dyn VfsTree, image: &Image, strings: &Staged, given: &str) -> Result<Frame, Refused> {
     // Read again from the file held: it was checked, but may have been written since,
     // and what's loaded is what's read now.
     let mut head = [0u8; feos_elf::HEADER_BYTES];
@@ -698,7 +707,7 @@ pub fn build_image(slot: usize, pid: u32, user: &UserMm, tree: &dyn VfsTree, ima
         }
     }
 
-    let place = build_stack(slot, pid, user, strings, given, &image.canonical, &program)
+    let place = build_stack(slot, user, strings, given, &image.canonical, &program)
         .map_err(|error| Refused { errno: error, message: "out of memory for its arguments" })?;
     Port::sync_user_tables();
     Ok(Frame::new_user(program.entry as usize, place.sp, place.argc, place.strings))
@@ -816,20 +825,11 @@ impl<'a> Words<'a> {
     }
 }
 
-/// 16 bytes for `AT_RANDOM`. There's no CSPRNG before stage 1e.1, and `AT_FEOS_FLAGS`
-/// says so: these are only different for every program.
-fn random_bytes(pid: u32) -> [u8; 16] {
-    let mut state = crate::time::monotonic_ns() ^ (u64::from(pid) << 32) ^ 0x9e37_79b9_7f4a_7c15;
-    let mut next = || {
-        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut mixed = state;
-        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        mixed ^ (mixed >> 31)
-    };
+/// 16 bytes for `AT_RANDOM`, from the generator as `GRND_INSECURE` gives them: a program
+/// never waits to start, and `AT_FEOS_FLAGS` says where they came from.
+fn random_bytes() -> [u8; 16] {
     let mut out = [0u8; 16];
-    out[..8].copy_from_slice(&next().to_ne_bytes());
-    out[8..].copy_from_slice(&next().to_ne_bytes());
+    crate::random::fill_insecure(&mut out);
     out
 }
 
@@ -837,7 +837,7 @@ fn random_bytes(pid: u32) -> [u8; 16] {
 /// the ABI design): from the stack pointer up, `argc`, the `argv` pointers and a zero,
 /// the `envp` pointers and a zero, the aux vector, the `UserStr`s of the arguments for
 /// v1's convention, the random bytes, and the strings.
-fn build_stack(slot: usize, pid: u32, user: &UserMm, strings: &Staged, given: &str, exe: &str, program: &feos_elf::Program) -> Result<StackPlace, isize> {
+fn build_stack(slot: usize, user: &UserMm, strings: &Staged, given: &str, exe: &str, program: &feos_elf::Program) -> Result<StackPlace, isize> {
     let top = feos_abi::USER_STACK_TOP;
     let low = top - feos_abi::USER_ARGS_SIZE;
     let text_length = strings.length + given.len() + 1 + exe.len() + 1 + PLATFORM.len() + 1;
@@ -872,7 +872,7 @@ fn build_stack(slot: usize, pid: u32, user: &UserMm, strings: &Staged, given: &s
         (aux::EXECFN, execfn as u64),
         (aux::MINSIGSTKSZ, SIGNAL_FRAME_MAX),
         (aux::FEOS_ABI, u64::from(feos_abi::ABI_VERSION)),
-        (aux::FEOS_FLAGS, 0),
+        (aux::FEOS_FLAGS, aux::FEOS_FLAG_RANDOM),
         (aux::FEOS_FEATURES, feos_abi::FEATURES),
         (aux::FEOS_EXE, exe_at as u64),
     ];
@@ -889,7 +889,7 @@ fn build_stack(slot: usize, pid: u32, user: &UserMm, strings: &Staged, given: &s
         user.copy_out(at, string.as_bytes())?;
         user.copy_out(at + string.len(), &[0])?;
     }
-    user.copy_out(random, &random_bytes(pid))?;
+    user.copy_out(random, &random_bytes())?;
 
     let mut out = Words::new(user, sp);
     out.push(argc as u64)?;

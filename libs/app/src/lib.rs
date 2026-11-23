@@ -343,6 +343,21 @@ pub struct SpawnIo<'a> {
     pub console: Option<&'a pipe::PipeWriter>,
     /// Spared by an interrupt to the parent: see [`ProcessInfo::background`].
     pub background: bool,
+    /// The terminal a user program's streams are on, those that are: see
+    /// [`Processes::open_terminal`].
+    pub terminal: Option<TerminalStreams>,
+}
+
+/// Which of a user program's standard streams are a terminal the kernel keeps (stage
+/// 1c.11 of `docs/feos-abi-v2.md`): their descriptors are terminal-marked, `isatty`
+/// says so, a read of standard input goes through the terminal's line discipline, and
+/// writes through its output processing. The others are the pipes they always were.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TerminalStreams {
+    /// From [`Processes::open_terminal`], still open.
+    pub terminal: u32,
+    /// Bit `n` for standard stream `n`.
+    pub streams: u8,
 }
 
 /// Reasons a process could not be started.
@@ -429,6 +444,12 @@ pub trait Processes: Sync {
         WaitStatus::Unknown
     }
 
+    /// Whether the process is held off the CPU by job control: a stop signal taken,
+    /// or [`set_stopped`](Self::set_stopped). Cheap enough to ask often.
+    fn is_stopped(&self, _pid: u32) -> bool {
+        false
+    }
+
     /// Holds a process off the CPU (`stopped`) or lets it run again. Returns
     /// `false` when there's no such process, or it may not be stopped. A user program
     /// stops as for `SIGTSTP` and continues as for `SIGCONT`, which its parent sees.
@@ -454,6 +475,41 @@ pub trait Processes: Sync {
             _ => self.try_kill(pid),
         }
     }
+
+    /// A terminal for a user program in the foreground, which the kernel keeps: its line
+    /// discipline, settings, size and foreground group (stage 1c.11). What it echoes, and
+    /// what's written to it but not to a stream of its own, goes to the pipe `echo`. The
+    /// caller feeds it typed keys with [`terminal_input`](Self::terminal_input), passes
+    /// it to [`spawn_user`](Self::spawn_user) in [`SpawnIo::terminal`], and closes it
+    /// once the program has ended with [`close_terminal`](Self::close_terminal). `None`
+    /// if there's no room for another, or no kernel.
+    fn open_terminal(&self, _echo: pipe::PipeId, _rows: u16, _columns: u16) -> Option<u32> {
+        None
+    }
+
+    /// Offers typed bytes to a terminal, which takes what it wants of them: every byte
+    /// while a program is reading it (or polling it, or has found nothing to read since
+    /// the last offer), and otherwise only up to a character that raises a signal, if
+    /// one's there. What it leaves is the caller's, typed ahead for whoever reads next.
+    /// How many it took.
+    fn terminal_input(&self, _terminal: u32, _bytes: &[u8]) -> usize {
+        0
+    }
+
+    /// Takes back what was typed on a terminal and never read, the line being typed
+    /// too, into `out`: once its program has ended, for the caller to keep for whoever
+    /// reads its console next. How many bytes.
+    fn take_terminal_input(&self, _terminal: u32, _out: &mut [u8]) -> usize {
+        0
+    }
+
+    /// The terminal's size changed: stored, and `SIGWINCH` raised on its foreground
+    /// group.
+    fn resize_terminal(&self, _terminal: u32, _rows: u16, _columns: u16) {}
+
+    /// Lets go of a terminal from [`open_terminal`](Self::open_terminal). It lasts while
+    /// any program's descriptor refers to it.
+    fn close_terminal(&self, _terminal: u32) {}
 
     /// The calling process's standard input, when it was given one.
     fn stdin(&self) -> Option<pipe::PipeId> {

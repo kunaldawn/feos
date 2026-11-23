@@ -7,8 +7,105 @@ name = "feos-abi"
 version = "0.1.0"
 
 [[package]]
+name = "feos-archive"
+version = "0.1.0"
+dependencies = [
+ "feos-compress",
+]
+
+[[package]]
+name = "feos-bundle"
+version = "0.1.0"
+dependencies = [
+ "feos-archive",
+ "feos-compress",
+ "feos-image",
+ "feos-sync",
+ "feos-text",
+ "feos-yaml",
+]
+
+[[package]]
+name = "feos-compress"
+version = "0.1.0"
+
+[[package]]
+name = "feos-console"
+version = "0.1.0"
+dependencies = [
+ "feos-sync",
+]
+
+[[package]]
+name = "feos-coreutils"
+version = "0.1.0"
+dependencies = [
+ "feos-archive",
+ "feos-bundle",
+ "feos-compress",
+ "feos-fs",
+ "feos-hal",
+ "feos-text",
+]
+
+[[package]]
+name = "feos-fs"
+version = "0.1.0"
+dependencies = [
+ "feos-hal",
+ "feos-sync",
+]
+
+[[package]]
+name = "feos-hal"
+version = "0.1.0"
+
+[[package]]
+name = "feos-heap"
+version = "0.1.0"
+
+[[package]]
+name = "feos-image"
+version = "0.1.0"
+dependencies = [
+ "feos-compress",
+]
+
+[[package]]
+name = "feos-keys"
+version = "0.1.0"
+
+[[package]]
+name = "feos-sh"
+version = "0.1.0"
+dependencies = [
+ "feos-console",
+ "feos-coreutils",
+ "feos-fs",
+ "feos-keys",
+ "feos-sync",
+ "feos-text",
+]
+
+[[package]]
+name = "feos-sync"
+version = "0.1.0"
+
+[[package]]
+name = "feos-text"
+version = "0.1.0"
+
+[[package]]
 name = "feos-user"
 version = "0.1.0"
 dependencies = [
  "feos-abi",
+ "feos-coreutils",
+ "feos-fs",
+ "feos-heap",
+ "feos-sh",
 ]
+
+[[package]]
+name = "feos-yaml"
+version = "0.1.0"

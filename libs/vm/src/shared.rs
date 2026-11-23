@@ -7,6 +7,11 @@
 //! object holds one map count on each of its frames; each page-table entry pointing at
 //! one holds another. It's filled under its own lock.
 //!
+//! A charged object's promise is its own, not a space's: its pages less its frames,
+//! taken when it's made or first made writable, used up by the first touches, and given
+//! back with it. So it's the same promise whichever of the spaces sharing it after a fork
+//! touches a page, or is the last to let it go.
+//!
 //! The kernel heap an object holds is bounded two ways. Its header and directory are
 //! sized by the object, touched or not, so they're counted against the
 //! [budget](feos_abi::OBJECT_HEAP_LIMIT) of the space that made it, from when it's made
@@ -22,7 +27,7 @@ use core::sync::atomic::{fence, AtomicUsize, Ordering};
 
 use feos_sync::SpinLock;
 
-use crate::FrameSource;
+use crate::{FrameSource, Promises};
 
 /// Pages per leaf of the object's table. Small, so that one frame touched alone costs
 /// little heap: 256 bytes.
@@ -110,8 +115,30 @@ impl SharedAnon {
         self.inner.lock().charged
     }
 
-    pub(crate) fn set_charged(&self) {
-        self.inner.lock().charged = true;
+    /// Promises the pages that have no frames and marks the object charged, as one step
+    /// under its lock, so that however many spaces sharing it after a fork do this at
+    /// once, its promise is taken once and matches its frames: `Ok(true)` if this did it,
+    /// `Ok(false)` if it was charged already, `Err` if the promise couldn't be made.
+    pub(crate) fn charge(&self, promises: &Promises, free: usize) -> Result<bool, ()> {
+        let mut inner = self.inner.lock();
+        if inner.charged {
+            return Ok(false);
+        }
+        if !promises.promise(self.pages - inner.frames, free) {
+            return Err(());
+        }
+        inner.charged = true;
+        Ok(true)
+    }
+
+    /// Undoes a [`charge`](Self::charge) that returned `Ok(true)`, for a change that
+    /// failed after it: what's promised now, its pages less its frames, goes back.
+    pub(crate) fn uncharge(&self, promises: &Promises) {
+        let mut inner = self.inner.lock();
+        if inner.charged {
+            promises.release(self.pages - inner.frames);
+            inner.charged = false;
+        }
     }
 
     /// The frame of page `index`, if it has one.
@@ -123,16 +150,19 @@ impl SharedAnon {
 
     /// The frame of page `index`, given one by `make` if it has none: `Ok((frame,
     /// made))`. `make` runs under the object's lock, so two first touches can't make
-    /// two frames. A frame `make` returns belongs to the object, with its one count.
+    /// two frames, and is told whether the object is charged as of then, so a charged
+    /// object's page takes its frame from the object's own promise. A frame `make`
+    /// returns belongs to the object, with its one count.
     pub(crate) fn frame_or_make(
         &self,
         index: usize,
-        make: &mut dyn FnMut() -> Option<usize>,
+        make: &mut dyn FnMut(bool) -> Option<usize>,
     ) -> Result<(usize, bool), ObjectError> {
         if index >= self.pages {
             return Err(ObjectError::OutOfRange);
         }
         let mut inner = self.inner.lock();
+        let charged = inner.charged;
         let Some(slot) = inner.leaves.get_mut(index / LEAF) else {
             return Err(ObjectError::OutOfRange);
         };
@@ -146,16 +176,20 @@ impl SharedAnon {
         if *entry != 0 {
             return Ok((*entry, false));
         }
-        let frame = make().ok_or(ObjectError::NoFrame)?;
+        let frame = make(charged).ok_or(ObjectError::NoFrame)?;
         *entry = frame;
         inner.frames += 1;
         Ok((frame, true))
     }
 
-    /// Gives every frame back, for the object's last mapping going. Returns how many
-    /// there were.
-    pub(crate) fn release_all(&self, frames: &mut dyn FrameSource) -> usize {
+    /// Gives every frame back, and the promise for the pages that had none, for the
+    /// object's last mapping going. Returns how many frames there were.
+    pub(crate) fn release_all(&self, frames: &mut dyn FrameSource, promises: &Promises) -> usize {
         let mut inner = self.inner.lock();
+        if inner.charged {
+            promises.release(self.pages - inner.frames);
+            inner.charged = false;
+        }
         let mut count = 0;
         for slot in inner.leaves.iter_mut() {
             let Some(leaf) = slot.take() else {
@@ -220,6 +254,47 @@ impl ObjectRef {
     /// References to the object, this one included.
     pub fn count(this: &Self) -> usize {
         this.counted().count.load(Ordering::Acquire)
+    }
+}
+
+impl ObjectRef {
+    /// Gives up this reference, and if it was the last, hands back the object so the
+    /// caller can give back its frames and promise before it goes: as one step, so of two
+    /// spaces sharing it after a fork that let go at once, exactly one is told it was
+    /// the last (a look at [`count`](Self::count) first would let both think the other
+    /// still had it).
+    pub(crate) fn release(self) -> Option<LastRef> {
+        let this = core::mem::ManuallyDrop::new(self);
+        if this.counted().count.fetch_sub(1, Ordering::Release) != 1 {
+            return None;
+        }
+        // Everything any other reference did to the object happens before it goes.
+        fence(Ordering::Acquire);
+        Some(LastRef(this.0))
+    }
+}
+
+/// The last reference to an object, from [`ObjectRef::release`]: the object goes when
+/// this does.
+pub(crate) struct LastRef(NonNull<Counted>);
+
+impl core::ops::Deref for LastRef {
+    type Target = SharedAnon;
+
+    fn deref(&self) -> &SharedAnon {
+        // SAFETY: the allocation lives until this goes.
+        unsafe { &self.0.as_ref().object }
+    }
+}
+
+impl Drop for LastRef {
+    fn drop(&mut self) {
+        // SAFETY: the last reference, so nothing else can reach the allocation, which was
+        // made by `ObjectRef::new` with this layout.
+        unsafe {
+            core::ptr::drop_in_place(self.0.as_ptr());
+            dealloc(self.0.as_ptr().cast(), Layout::new::<Counted>());
+        }
     }
 }
 

@@ -228,7 +228,18 @@ fn change_dir(slot: usize, files: &mut Files, joined: &str) -> Result<(), isize>
 
 /// Runs one action against the child's table, its working directory and umask. What
 /// it closes goes in `closed`, to be let go once the table is done with.
-fn run_action(slot: usize, process: &Process, files: &mut Files, action: &SpawnAction, closed: &mut Vec<OfdRef>) -> Result<(), isize> {
+///
+/// `TCSETPGRP` is checked here, in its turn, and leaves its terminal in `foreground`, for
+/// the scheduler to make the child's group its foreground one as the child is made: the
+/// group doesn't exist before then.
+fn run_action(
+    slot: usize,
+    process: &Process,
+    files: &mut Files,
+    action: &SpawnAction,
+    closed: &mut Vec<OfdRef>,
+    foreground: &mut Option<super::tty::TerminalRef>,
+) -> Result<(), isize> {
     let mut keep = |ofd: Option<OfdRef>| -> Result<(), isize> {
         if let Some(ofd) = ofd {
             closed.try_reserve(1).map_err(|_| -errno::ENOMEM)?;
@@ -296,7 +307,20 @@ fn run_action(slot: usize, process: &Process, files: &mut Files, action: &SpawnA
             result.map_err(|_| -errno::EBADF)?;
             failed
         }
-        // A terminal's foreground group is stage 1c.11's, which has terminals.
+        kind::TCSETPGRP => {
+            let fd = action_fd(action.fd)?;
+            let ofd = files.table.get(fd).ok_or(-errno::EBADF)?;
+            let Object::Terminal { terminal, .. } = &ofd.object else {
+                return Err(-errno::ENOTTY);
+            };
+            // As `TTY_SET_PGRP`: only a terminal of the caller's own session.
+            let (_, sid) = sched::group_of(slot, 0)?;
+            if terminal.session() != sid {
+                return Err(-errno::ENOTTY);
+            }
+            *foreground = Some(terminal.clone());
+            Ok(())
+        }
         _ => Err(-errno::EINVAL),
     }
 }
@@ -318,8 +342,13 @@ fn spawn2(slot: usize, process: &Process, address: usize) -> Result<u32, isize> 
     // close on exec closed. What closes is let go here, with no table held.
     let mut files = process.files().try_clone()?;
     let mut closed = Vec::new();
+    let mut foreground = None;
     for action in &actions.list {
-        run_action(slot, process, &mut files, action, &mut closed)?;
+        run_action(slot, process, &mut files, action, &mut closed, &mut foreground)?;
+    }
+    // A new session isn't the terminal's: its group can't be the foreground one.
+    if foreground.is_some() && request.flags & spawn::SETSID != 0 {
+        return Err(-errno::EPERM);
     }
     drop(closed);
     drop(files.table.cloexec_sweep());
@@ -352,7 +381,17 @@ fn spawn2(slot: usize, process: &Process, address: usize) -> Result<u32, isize> 
     // names, which starts at its default.
     let sigmask = (request.flags & spawn::SETSIGMASK != 0).then_some(request.sigmask & !UNBLOCKABLE);
     let sigdefault = if request.flags & spawn::SETSIGDEF != 0 { request.sigdefault } else { 0 };
-    let raw = RawStreams { stdin: 0, stdout: 0, umask: Some(files.umask), group, sigmask, sigdefault };
+    // The terminal's word is in its static table, and `foreground` holds the terminal
+    // until the child, made, has set it.
+    let raw = RawStreams {
+        stdin: 0,
+        stdout: 0,
+        umask: Some(files.umask),
+        group,
+        sigmask,
+        sigdefault,
+        foreground: foreground.as_ref().map(super::tty::TerminalRef::foreground_word),
+    };
     let shown = strings.shown();
     let given = given.unwrap_or_default();
     let cwd = load::copy(files.cwd()).ok_or(-errno::ENOMEM)?;
@@ -464,7 +503,7 @@ fn exec(slot: usize, process: &Process, address: usize) -> Result<core::convert:
     let tree = tree().ok_or(-errno::EIO)?;
     let space = UserMm::new(true).ok_or(-errno::ENOMEM)?;
     let shown_as = given.as_deref().unwrap_or(&program);
-    let frame = load::build_image(slot, process.pid(), &space, tree, &image, &strings, shown_as).map_err(|refused| refused.errno)?;
+    let frame = load::build_image(slot, &space, tree, &image, &strings, shown_as).map_err(|refused| refused.errno)?;
     drop((strings, image, pages, script_pages, given, program));
 
     // The point of no return. Alone, under the creation lock, so no thread can start.
@@ -509,6 +548,86 @@ fn exec(slot: usize, process: &Process, address: usize) -> Result<core::convert:
     fs_calls::sweep_orphans();
     // SAFETY: the space is the process's now, and lives as long as it does.
     sched::enter_user(slot, root, unsafe { &*tlb }, frame)
+}
+
+/// What a forked child starts from, made by its parent's `FORK`: its space, copied on
+/// write; its descriptor table, sharing the parent's open file descriptions; its program
+/// path and dispositions; and the calling thread's registers (the call's result 0 in
+/// them), thread pointer and alternate stack.
+pub struct Forked {
+    mm: alloc::sync::Arc<UserMm>,
+    files: Files,
+    exe: String,
+    signals: super::signal::Signals,
+    frame: crate::Frame,
+    tls: usize,
+    alt_stack: (u64, u64),
+}
+
+/// `fork`.
+pub fn sys_fork(slot: usize, process: &Process) -> isize {
+    // What the child is made in comes off the heap before any lock is held: a heap that's
+    // run out panics, which with a lock held would stop the machine rather than end this.
+    let cell = alloc::sync::Arc::<UserMm>::new_uninit();
+    let boxed = alloc::boxed::Box::<Forked>::new_uninit();
+    // Held throughout, so no thread of this process is half made in the copy, nor an
+    // `EXEC` under way: the copy is of the calling thread and a whole process.
+    let Some(_creating) = process.creating() else {
+        return KILLED;
+    };
+    let record = match process.reserve_child() {
+        Ok(record) => record,
+        Err(error) => return error,
+    };
+    match fork(slot, process, cell, boxed, &record) {
+        Ok(pid) => pid as isize,
+        Err(error) => {
+            process.child_failed(&record);
+            error
+        }
+    }
+}
+
+fn fork(
+    slot: usize,
+    process: &Process,
+    cell: alloc::sync::Arc<core::mem::MaybeUninit<UserMm>>,
+    boxed: alloc::boxed::Box<core::mem::MaybeUninit<Forked>>,
+    record: &feos_sync::TryArc<super::ChildRecord>,
+) -> Result<u32, isize> {
+    // The table, sharing every description (and so offsets and `flock` locks); record
+    // locks are the process's, by pid, so the child has none.
+    let files = process.files().try_clone()?;
+    let umask = files.umask;
+    let exe = load::copy(process.exe()).ok_or(-errno::ENOMEM)?;
+    let signals = process.signals().fork_copy();
+    // The space last: what it promises is held from here, and given back with it.
+    let mm = process.mm().fork(cell)?;
+    // SAFETY: the calling task is in this call, so nothing else is using its user frame.
+    let mut frame = unsafe { *sched::user_frame(slot) };
+    feos_hal::TrapContext::set_syscall_result(&mut frame, 0);
+    let forked = alloc::boxed::Box::write(
+        boxed,
+        Forked { mm, files, exe, signals, frame, tls: sched::current_tls(slot), alt_stack: sched::alt_stack(slot) },
+    );
+    // Its group, session and mask are the caller's; its streams' pipes are held by it too.
+    let raw = RawStreams { umask: Some(umask), ..RawStreams::default() };
+    sched::spawn_fork(forked, raw, record.clone()).map_err(spawn_errno)
+}
+
+/// A forked child's first steps, on its own task: its process from what its parent
+/// copied, its thread pointer and alternate stack as the forking thread had them, and
+/// then its program, where the parent was, with `FORK` returning 0. Only returns if
+/// there's no memory for the process, with the status it ends with.
+pub fn start_forked(slot: usize, forked: alloc::boxed::Box<Forked>) -> i32 {
+    let Forked { mm, files, exe, signals, frame, tls, alt_stack } = *forked;
+    let Some(process) = super::process::create_forked(slot, super::current_pid(), mm, files, exe, signals) else {
+        super::say(format_args!("fork: out of memory"));
+        return feos_abi::EXIT_NOT_EXECUTABLE;
+    };
+    sched::set_tls(slot, tls);
+    sched::set_alt_stack(slot, alt_stack.0, alt_stack.1);
+    sched::enter_user(slot, process.mm().root(), process.mm().tlb(), frame)
 }
 
 /// v1's `spawn`: copies everything from the program before anything happens, and keeps
@@ -575,9 +694,27 @@ pub fn sys_spawn(process: &Process, args: [usize; 6]) -> isize {
     let Some(cwd) = cwd else {
         return -errno::ENOMEM;
     };
-    let Ok(start) = UserStart::new(&path, &block, &[], &cwd, umask) else {
+    let Ok(mut start) = UserStart::new(&path, &block, &[], &cwd, umask) else {
         return -errno::ENOMEM;
     };
+    // A stream from a terminal-marked descriptor (an inherited one is this process's
+    // own, 0 or 1; stderr always is its 2) is on that terminal in the child too.
+    let sources = [
+        if stdin_fd == feos_abi::INHERIT { 0 } else { stdin_fd },
+        if stdout_fd == feos_abi::INHERIT { 1 } else { stdout_fd },
+        2,
+    ];
+    let mut terminal: Option<super::tty::TerminalRef> = None;
+    let mut streams = 0u8;
+    for (stream, fd) in sources.into_iter().enumerate() {
+        if let Some(found) = files::terminal_of_fd(process, fd) {
+            if terminal.as_ref().is_none_or(|terminal| terminal.same(&found)) {
+                streams |= 1 << stream;
+                terminal.get_or_insert(found);
+            }
+        }
+    }
+    start.set_terminal(terminal, streams);
     // The program's stream of its own, if it inherits, is the scheduler's business.
     let raw = RawStreams { stdin, stdout, umask: Some(umask), ..RawStreams::default() };
     // A parent with as many children as it may have is as full as a table with no slot.
@@ -915,7 +1052,9 @@ pub fn sys_sysinfo(process: &Process, out: usize, size: usize) -> isize {
         path_max: feos_abi::PATH_MAX as u32,
         name_max: feos_abi::NAME_MAX as u32,
         memory_limit: feos_abi::USER_MEMORY_LIMIT as u64,
-        flags: if time::unix_time().is_none() { sysinfo::NO_RTC } else { 0 },
+        flags: if time::have_rtc() { 0 } else { sysinfo::NO_RTC }
+            | if crate::random::seeded() { sysinfo::RNG_SEEDED } else { 0 }
+            | if crate::random::trusted() { sysinfo::RNG_TRUSTED } else { 0 },
         features: feos_abi::FEATURES,
         ..SysInfo::default()
     };

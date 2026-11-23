@@ -18,6 +18,12 @@ out=${PORTS_BUILD:-/build}
 export RUSTUP_TOOLCHAIN=1.99.1 RUSTC_BOOTSTRAP=1 CARGO_NET_OFFLINE=true
 export PATH="$out/bin:$PATH"
 export CARGO_TARGET_DIR="$out/relibc-target"
+# relibc's Makefile copies openlibm into the build once (its rule depends on the
+# directory's own mtime), so an edited openlibm file (ports/PATCHES.md) would never reach
+# libm: start that copy again when a file in it is newer.
+if [ -d "$CARGO_TARGET_DIR/$target/openlibm" ] && [ -n "$(find "$P/src/relibc/openlibm" -type f -newer "$CARGO_TARGET_DIR/$target/openlibm" -print -quit)" ]; then
+    rm -rf "$CARGO_TARGET_DIR/$target/openlibm"
+fi
 cd "$P/src/relibc"
 make TARGET="$target" all
 rm -rf "$out/relibc/$target.partial"

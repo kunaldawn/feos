@@ -528,6 +528,43 @@ goes to the new program in the same thread, which keeps its tid. A `#!` script
 interpreter, its argument and the script's path in place of `argv[0]`
 (`load::Staged::with_heads`), for every way of starting a program.
 
+**Forking.** `FORK` (`proc::sys_fork`) holds the process's creation lock throughout, so no
+thread is half made in the copy and no `EXEC` is under way, takes the child's exit record,
+copies the descriptor table (sharing every description, so offsets and `flock` locks; record
+locks are by pid, so the child has none), the dispositions (`Signals::fork_copy`: nothing
+pending, no interval timer) and the program path, and copies the space last
+(`UserMm::fork`, under its lock, counted as a revoke). The child's task starts in the kernel
+like a spawned program's, with `user::Start::Fork` in its slot in place of a program to load:
+it makes its `Process` from the copies (`process::create_forked`), takes the forking thread's
+thread pointer and alternate stack, and enters its program from a copy of that thread's user
+frame with the call's result 0. Its group, session, mask, credentials and streams are the
+forking thread's, as a spawn's are; it has no clear word and no window surface.
+
+`feos_vm::Mm::fork` copies the VMAs and page tables. Shared-anonymous objects and shared
+file mappings are shared (a shared file's page comes to the child read-only, so its first
+write dirties it again); a page-cache frame of a private file mapping is shared as it is;
+a frame of the space's own is shared copy-on-write: both entries read-only with the
+port-independent software bit `COW` (bit 56; the page cache's is 57), the frame's map count
+raised, and the parent's writable entries flushed from every CPU before the call returns. A
+writable own page some kernel copy has pinned is copied for the child at once, so data the
+kernel writes through the pin later stays the parent's. The first write to a shared frame
+copies it, or, if nothing else maps it and nothing pins it, takes it back in place; a
+page-cache frame is always copied. A kernel copy that writes readies its page as a write
+fault would, so it breaks the sharing first and never writes a shared frame.
+
+Charging is strict and follows frames: each extra reference a fork adds to a frame of a
+space's own holds a promise (the debt is the sum over such frames of their map count less
+one), besides the child's charged pages without frames. A copy uses the promise its
+reference held; a space letting go of a frame another still maps gives one back
+(`FrameSource::put_shared`, one step under the frames lock, so of two letting go at once
+only one is the last); the last reference gives back nothing more. So a copy never fails
+later, and a fork whose promises can't all be taken is `ENOMEM` with nothing of the child
+left. Every own frame shared is charged, read-only ones too, since `mprotect` could make one
+writable without asking the fork again. A charged shared-anonymous object holds its own
+promise (its pages less its frames), which any space sharing it uses up or gives back with
+its last mapping; what an object counts against `USER_MEMORY_LIMIT` is kept per space, the
+object's pages while it's charged.
+
 **Process groups and sessions.** Each slot's group and session are `sched`'s `SLOT_PGID` and
 `SLOT_SID`, the same in every thread of a process and changed only under the scheduler's
 lock (`SETPGID`, `SETSID`, a spawn's `SETPGROUP` or `SETSID`, which is refused there, before
@@ -558,7 +595,8 @@ and otherwise waits on the counter every exit, stop and continue moves on; v1's 
 for one pid, reporting the v1 status. Statuses are a `feos_signal::Status` throughout, encoded
 per caller: the POSIX word for `WAIT4`, the code or 128 plus the signal for v1, kernel apps
 and the shell, whose waits still use the ring of recent exits. `KILL` (and the shell's `kill`,
-Ctrl-C and Ctrl-\\ through `Processes::send_signal`) carries out a signal's default action
+Ctrl-C and Ctrl-\\ through `Processes::send_signal` for a command not on a kernel terminal,
+and a terminal's `ISIG` for one that is) carries out a signal's default action
 (`feos_signal::default_action`) in `sched`: a terminating signal ends the process through the
 kill path with the signal as its status; a stop (`SIGSTOP`, and job control's Ctrl-Z as
 `SIGTSTP`) holds each thread at its next way back to its program, never in a call, and is
@@ -596,8 +634,77 @@ noted, and with `SIG_IGN` or `SA_NOCLDWAIT` the record is marked detached and dr
 has settled; `WAIT4(WNOHANG)` waits for a child that has ended but not settled, so a handler's
 reap always finds it. `EXEC` resets handlers, and a spawned program starts ignoring what its
 spawner ignores (but for `SETSIGDEF`); either way `SIGCHLD`'s flags are worked out again from
-what's kept, so an inherited or kept `SIG_IGN` of it reaps too. Masks beyond a handler's own, alternate stacks,
-interrupted calls and restart are stage 1c.10.
+what's kept, so an inherited or kept `SIG_IGN` of it reaps too.
+
+**Masks, interruption and restart.** `SIGPROCMASK`, `SIGSUSPEND` and `SIGRETURN` change a
+thread's mask (never `SIGKILL` or `SIGSTOP`), and one that unblocks something pending has it
+delivered on that call's way back, before the program goes on; a default that ends or stops
+the process waits pending while every thread blocks the signal. `SIGSUSPEND`'s old mask goes
+back in the first handler's frame. A signal made pending asks each thread that may take it:
+one running on another CPU by an IPI, one blocked by a wake. Every wait a signal may end (a
+pipe, the console, a sleep, a lock, a child) looks with `sched::interrupted`, which claims a
+process signal for the thread that looks, so of several woken exactly one leaves its call; and
+no program's thread blocks while it has a signal due. Such a call returns `EINTR`, or what it
+had moved so far; with nothing moved and a handler with `SA_RESTART` (or none), the call is
+made again by rewinding the user frame before the handler's frame is built
+(`UserFrame::rewind_syscall`: the number back in `rax` on x86_64, the first argument back in
+`x0` on AArch64), so the handler's `SIGRETURN` comes back to it (`signal::restart_of`,
+`deliver_after`). A handler runs on the thread's alternate stack (`SIGALTSTACK`, per slot)
+when it asks to and isn't already on it, which is how a main-stack overflow is caught.
+`THREAD_KILL` pends a signal on one thread of the caller's process. `SPAWN2`'s `SETSIGMASK`
+and `SETSIGDEF` set the child's first mask and defaults. `ITIMER_REAL` (`SETITIMER`) is a
+deadline and interval in the process's signals, which one kernel task (`alarms` in `sched`)
+sleeps towards and raises `SIGALRM` for, re-arming by the interval, but never more often than
+once a millisecond (`itimer::MIN_PERIOD_NS`): that task runs above every program and takes the
+scheduler's lock each time it looks.
+
+**Terminals, `POLL` and `IOCTL`.** A user program the shell runs in the foreground with its
+input on the console (the serial line or a Terminal window) gets a terminal of the kernel's
+(`kernel/src/user/tty.rs`, a static table of 16): the host (`apps/commands/src/host.rs`)
+opens one with `Processes::open_terminal`, names it in `SpawnIo::terminal` with the streams
+that are on the console, and those descriptors are terminal-marked (`Object::Terminal`), so
+`isatty` holds, reads go through the line discipline (`libs/tty`: canonical lines, erase and
+kill, echo, `VMIN`/`VTIME`, `ICRNL`) and writes through `OPOST | ONLCR` to the stream's pipe.
+The host feeds the console's raw keys (`Input::try_read_raw`; a window is put in raw mode for
+it) with `terminal_input`, which takes them only while a reader or poller wants input, or up to
+a character `ISIG` makes a signal: Ctrl-C, Ctrl-\ and Ctrl-Z raise `SIGINT`, `SIGQUIT` and
+`SIGTSTP` on the terminal's foreground group from the kernel, and a kernel stop is noticed by
+the host (`Processes::is_stopped`) as Ctrl-Z was; keys typed ahead of a program that never
+reads stay the shell's. The foreground group is the job's first program's, changed by
+`TTY_SET_PGRP` or `SPAWN2`'s `TCSETPGRP` (set under the scheduler's lock as the child gets its
+group, before it can run); a read from another group of the session raises `SIGTTIN` on it and
+is `EINTR`, or `EIO` if it ignores or blocks that or is orphaned. The window's size reaches the
+terminal from the window (`ConsoleSource::size`), with `SIGWINCH`. Descriptors are inherited,
+so a program's children share its terminal, and `/dev/tty` opens the one a caller's marked
+descriptors refer to (`ENXIO` with none); the terminal goes with its last hold, the host's or a
+description's. `POLL` (`files::sys_poll`) copies its array once, looks at every entry, and
+waits on one machine-wide readiness word (`feos_app::pipe::readiness`) that every pipe change
+and the terminal move, waking pollers only when some are counted; `ppoll`'s mask is set and
+put back as `SIGSUSPEND`'s is.
+
+**`/bin/sh`.** feos-sh also runs as a user program (`user/src/bin/sh.rs`, stage 1c.12): the
+same interpreter and utilities (`libs/sh`, `libs/coreutils`) over a backend of system calls,
+not the kernel's. Files go through `UserTree`, a `feos_fs::VfsTree` the utilities'
+`OverlayFs` sees in place of the kernel's shared tree; programs through
+`feos_coreutils::Processes`, which a host offers with `Host::processes` (the kernel's shell
+host doesn't). With it, `libs/sh/src/spawn.rs` turns the shell's descriptor table into
+`SPAWN2` actions (copies, opens of redirected files, closes, and a close of everything above
+the last named descriptor, so a child has only what the table says; the descriptors the
+shell inherited without close-on-exec are in the table, or above it kept open, so a child
+gets them as POSIX has it, and every descriptor the shell opens of its own is
+close-on-exec), feeds or drains a pipe
+only for what the shell holds in memory (a here-document, a capture), runs a pipeline whose
+stages are all programs as processes joined by real pipes, makes `exec` an `EXEC`, and keeps
+background and stopped jobs as processes for `wait`, `fg`, `bg`, `jobs` and `kill`. On a
+terminal at a prompt it does job control: each job is a process group of its own, made the
+terminal's foreground group by `SPAWN2`'s `TCSETPGRP` before it runs and given back with
+`TTY_SET_PGRP` after, so Ctrl-C and Ctrl-Z reach the job and not the shell. A signal the
+shell was started with ignored stays ignored for what it starts (`SETSIGDEF` resets only what
+the shell ignores of its own accord), and without a prompt for the shell too, `trap` or
+not. Its heap is
+`feos-heap` over one `MAP_NORESERVE` arena (`feos_user::heap`). The kernel's feos-sh stays
+the console shell; `#!/bin/sh` scripts the kernel starts, and `execvp`'s `ENOEXEC` fallback,
+run this one.
 
 **Threads.** `THREAD_CREATE` checks every argument, takes the process's creation lock and
 has `sched::spawn_thread` reserve a slot (refused at the thread cap, with too few slots, or
@@ -630,7 +737,10 @@ so that's all. x86_64's `invlpg` reaches only its own CPU: a change to a space l
 another CPU is a shootdown. Every change runs through a `Gather` that flushes locally and
 notes who else has the space; the frames it gives back are held until those CPUs have taken
 `IPI_TLB`, flushed and acknowledged, with the initiator waiting with interrupts on and no
-spin lock held. A CPU publishes that it's loading a space (`SeqCst`) before loading its
+spin lock held. A reference to a frame a fork shared is dropped at once (that's
+what gives its promise back), but the frame is pinned first and the pin is what's held: the
+other sharer could otherwise put the last reference, waiting only for its own CPUs, and free
+a frame this space's CPUs can still reach, or, seeing itself the only one, write it in place. A CPU publishes that it's loading a space (`SeqCst`) before loading its
 tables and withdraws only after loading others, and the initiator reads who has it after
 clearing the entry, so every CPU either walks the new tables or is asked. Loading the tables
 a CPU already has (another thread of the same space) reloads nothing. `ktest tlb` and `ktest
@@ -683,7 +793,33 @@ for one reaped), both under the scheduler lock the sum is read under. `CLOCK_GET
 deadline into a counter value, which is what the scheduler waits for (`Wait::Until`,
 `Wait::UserKeyUntil`, with the one-shot timer armed for the earliest); a `CLOCK_REALTIME`
 deadline is converted as the call starts. A sleep that's woken early sleeps again, unless
-it was woken by a kill, when the call unwinds and the thread ends.
+it was woken by a kill, when the call unwinds and the thread ends. `CLOCK_SETTIME` (root,
+`CLOCK_REALTIME` only) replaces the wall clock's offset, which is signed so a clock can be set
+earlier than the machine's uptime, and from then on the `rtc` task leaves it alone; monotonic
+time and deadlines already converted don't move, and a machine with no RTC knows the date
+once it's set (files are stamped from then on, though `SYSINFO` still says `NO_RTC`).
+
+**Randomness.** `kernel/src/random.rs` keeps one generator for the machine, `libs/csprng`'s
+ChaCha20 with fast key erasure: each request runs one block under the generator's key, keeps
+half as the next key and gives the other half to the request's own `Stream`, so the lock
+(an `IrqSpinLock`) is held for one block and the bytes are made outside it, and nothing
+captured later leads back to what was given. Input goes into a BLAKE2s pool. At boot the
+trusted sources are read and credited: `Arch::hardware_random` (`RDSEED`, else `RDRAND`, on
+x86_64; `RNDRRS`, else `RNDR`, on AArch64) and `Board::take_firmware_seed` (the device tree's
+`/chosen/rng-seed`, which the `virt` board copies at boot info time and gives once); 256 bits
+fold the pool into the key and seed it. Each interrupt folds the counter into its CPU's jitter
+word (`random::on_interrupt`, an atomic per CPU, no lock), mixed into the pool uncounted at
+every reseed and every request before seeding. Once seeded the pool is folded again, with a
+fresh word set from the instruction, every five minutes or gibibyte of output. With no trusted
+source the boot log warns: the generator is never seeded, `GETRANDOM` without `GRND_INSECURE`
+waits forever (on a futex word `mark_seeded` wakes), and `GRND_INSECURE`, `/dev/urandom` and
+`AT_RANDOM` (every program's 16 bytes, `AT_FEOS_FLAGS` bit 0) get what the timings make of the
+key. `GETRANDOM` (`kernel/src/user/random_calls.rs`) checks its flags and buffer before it
+waits, caps a request at `IO_CHUNK` and fills it through the bounce buffer page by page, and
+a program's reads of `/dev/random` (waits, or `EAGAIN` with `O_NONBLOCK`) and `/dev/urandom`
+are answered there rather than by the tree (`Object::File::random`). Kernel apps reading the
+devices through the tree get `random::fill_insecure` (`feos_fs::vfs::set_random_source`);
+writes to them are discarded.
 
 **File mappings and the page cache.** `mmap2` of a file open for reading maps its pages from
 the page cache (`libs/pagecache`, glued to frames and the tree by `kernel/src/pagecache.rs`),
@@ -760,8 +896,8 @@ its frames are taken, and counted against the limit as frames it owns.
 
 **Kernel heap a program can make the kernel hold** is bounded too. The VMA list is capped
 at `MAX_VMAS`. A shared-anonymous object's header and directory, sized by the object
-whether it's touched or not, count against `OBJECT_HEAP_LIMIT` for the space that made it,
-until the object's last VMA goes; past it, a shared `mmap` is `ENOMEM`. Its leaves are made
+whether it's touched or not, count against `OBJECT_HEAP_LIMIT` for each space that maps it
+(the one that made it, and a forked child), until that space's last VMA of it goes; past it, a shared `mmap` is `ENOMEM`. Its leaves are made
 by first touches, 256 bytes per 32 pages, so they're at most a 16th of the frames the
 object holds, and frames are bounded machine-wide by the promises. The object itself is
 made fallibly (`feos_vm::ObjectRef` in place of an `Arc`), since a failed allocation inside
@@ -831,8 +967,8 @@ user frees them.
 - **Side channels.** Nothing here tries, and there's no page table isolation.
 - **The x86_64 NMI window.** An NMI in the few instructions around `swapgs` would run with the wrong GS base. The only NMI is the fatal path's stop.
 
-Other limits: no `fork`, and shared memory only within a process (or through a shared mapping of a file); a program reading a terminal gets the
-shell's cooked lines, with no way to ask for raw keys; and
+Other limits: no `fork`, and shared memory only within a process (or through a shared mapping of a file); no pseudo-terminals, and a
+program's terminal is the one it was started on; and
 surfaces are a fixed size, with no way to hear about a resize.
 
 Adding a program is a file in `user/src/bin/` and its name in `USER_BINS` in the `Makefile`. A
@@ -1231,7 +1367,7 @@ instructions or touches MMIO. The split makes most logic host-testable:
   QEMU.
 - The kernel is tested by booting. `scripts/boot-test.py` boots a kernel headless and
   drives the serial shell, through phases `FEOS_BOOT_TEST_ONLY` can select: `storage`,
-  `milestone`, `partition`, `format`, `install`, `persistence`, `gpu`, `transport`, `smp`, `irq`, `ram`, `fault`, `sched`, `gicv3`, `net`, `usb`, `efi`, `el`, `input`, `user`, `hosted`, `jobs`, `names`, `settings`, `terminal`, `search`, `resolution`, `fonts`, `native`. `FEOS_BOOT_TEST_SMP`, `FEOS_BOOT_TEST_CPU` and `FEOS_BOOT_TEST_MEM` set a guest's CPUs, CPU model and RAM where a phase doesn't choose (4, `cortex-a53` or `max`, 512M). The `efi`
+  `milestone`, `partition`, `format`, `install`, `persistence`, `gpu`, `transport`, `smp`, `irq`, `ram`, `fault`, `sched`, `gicv3`, `net`, `usb`, `efi`, `el`, `input`, `user`, `poll`, `usersh`, `hosted`, `jobs`, `names`, `settings`, `terminal`, `search`, `resolution`, `fonts`, `native`. `FEOS_BOOT_TEST_SMP`, `FEOS_BOOT_TEST_CPU` and `FEOS_BOOT_TEST_MEM` set a guest's CPUs, CPU model and RAM where a phase doesn't choose (4, `cortex-a53` or `max`, 512M). The `efi`
   phase needs the loader built, and everything in it runs on OVMF or AAVMF from the image. What can only be seen from inside the
   kernel, such as which CPU a task ran on or what's in an XMM register across a
   preemption, is in `kernel/src/ktest.rs`, the `ktest` shell command. Some of it stops
